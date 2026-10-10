@@ -1,25 +1,16 @@
-//! The stub and module join: one module's stub and implementation answer as one
-//! declaration set.
+//! Stub and implementation associations retained beside normalized declarations.
 //!
-//! A package can ship one module twice: as implementation source (`mod.py`, `index.js`)
-//! and as a stub declaring its types (`mod.pyi`, `index.d.ts`). Analyzed apart, a function
-//! both files declare answers twice, under two identities that differ only by the file
-//! extension. The join pairs the two files of one module and joins their declarations by
-//! qualified name, so one symbol answers at the implementation address with the stub's
-//! signatures and types.
-//!
-//! The join runs on the parsed documents before the semantic build and acts on the records
-//! the analyzer emits. Both documents still reach the build under their own identities, so
-//! no two contributions share one identity.
+//! Physical suffixes select candidate files. Declarations join only when current
+//! placement assigns the same established canonical identity to both declarations.
+//! Original source bindings and stub diagnostic identities remain separate.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_core::symbol_identity;
-use rift_protocol::read::{ProjectPath, Symbol, SymbolId, TextRange};
+use rift_protocol::read::{ProjectPath, SymbolId, TextRange};
 use rift_syntax::SyntaxSymbol;
 
 use super::AnalyzedFile;
-use crate::semantic::WorkspaceSemantics;
 
 /// Stub suffixes and the implementation suffixes each pairs with, in pairing order.
 ///
@@ -36,9 +27,6 @@ const STUB_IMPLEMENTATIONS: [(&str, &[&str]); 4] = [
 
 /// The most implementation candidates one stub suffix names.
 const CANDIDATES_MAX: usize = 3;
-
-/// The provider's suffix marker: a repeated qualified name `f` becomes `f~1`, `f~2`.
-const FORM_SUFFIX_MARKER: char = '~';
 
 /// One stub declaration a joined declaration answers for: its identity, and where the stub
 /// declares it.
@@ -79,12 +67,8 @@ pub(super) enum ModuleRole {
     /// No stub or implementation pairs with the file; its declarations answer as parsed.
     #[default]
     Unpaired,
-    /// A stub whose joined declarations answer at the implementation address.
-    Stub {
-        /// Each joined stub declaration's qualified name, and the implementation identity
-        /// that answers for it.
-        answered_by: BTreeMap<String, SymbolId>,
-    },
+    /// A stub with established implementation associations.
+    Stub,
     /// An implementation whose joined declarations take the stub's signatures and types.
     Implementation {
         /// Each joined implementation declaration's qualified name, and the stub forms it
@@ -94,29 +78,13 @@ pub(super) enum ModuleRole {
 }
 
 impl ModuleRole {
-    /// Whether the declaration spelled `qualified_name` answers at another address.
-    pub(super) fn answers_elsewhere(&self, qualified_name: &str) -> bool {
-        match self {
-            Self::Stub { answered_by } => answered_by.contains_key(qualified_name),
-            Self::Unpaired | Self::Implementation { .. } => false,
-        }
-    }
-
-    /// The identity answering for a stub container that joined its implementation.
-    fn joined_container(&self, container: &str) -> Option<&SymbolId> {
-        match self {
-            Self::Stub { answered_by } => answered_by.get(container),
-            Self::Unpaired | Self::Implementation { .. } => None,
-        }
-    }
-
     /// The stub forms one implementation declaration joins; empty for any other.
     pub(super) fn stub_forms(&self, qualified_name: &str) -> &[StubForm] {
         match self {
             Self::Implementation { stub_forms } => {
                 stub_forms.get(qualified_name).map_or(&[], Vec::as_slice)
             }
-            Self::Unpaired | Self::Stub { .. } => &[],
+            Self::Unpaired | Self::Stub => &[],
         }
     }
 }
@@ -137,6 +105,10 @@ pub(super) fn join_modules(analyzed: &mut [AnalyzedFile]) {
     let pairs = module_pairs(analyzed.iter().map(|held| held.file.path().as_str()));
     for pair in pairs {
         let joined = pair.join(analyzed);
+        if matches!(&joined.implementation, ModuleRole::Implementation { stub_forms } if stub_forms.is_empty())
+        {
+            continue;
+        }
         analyzed[pair.stub].role = joined.stub;
         let implementation = &mut analyzed[pair.implementation];
         implementation.role = joined.implementation;
@@ -220,27 +192,18 @@ struct JoinedModule {
 }
 
 impl ModulePair {
-    /// Joins the pair's declarations by qualified name, with a name's `~N` forms grouped.
-    ///
-    /// A stub's overloads (`f~1`, `f~2`) join one implementation declaration. When the
-    /// implementation repeats the name, as a Python module repeating its `typing.overload`
-    /// forms before the implementation does, the last form in source order is the one the
-    /// module binds, so it answers.
+    /// Joins declarations carrying the same current established canonical identity.
+    /// The last implementation form in source order supplies the diagnostic target.
     fn join(self, analyzed: &[AnalyzedFile]) -> JoinedModule {
         let stub = &analyzed[self.stub];
         let implementation = &analyzed[self.implementation];
         let bound = bound_names(implementation);
-        let mut answered_by = BTreeMap::new();
         let mut stub_forms = BTreeMap::new();
         let mut implementation_public = BTreeSet::new();
         for (name, declared) in stub_forms_by_name(stub) {
             let Some(target) = bound.get(name) else {
                 continue;
             };
-            let target_identity = identity_of(implementation, &target.qualified_name);
-            for form in &declared {
-                answered_by.insert(form.qualified_name.clone(), target_identity.clone());
-            }
             if declared
                 .iter()
                 .any(|form| stub.is_public(&form.qualified_name))
@@ -251,33 +214,36 @@ impl ModulePair {
             stub_forms.insert(target.qualified_name.clone(), forms);
         }
         JoinedModule {
-            stub: ModuleRole::Stub { answered_by },
+            stub: ModuleRole::Stub,
             implementation: ModuleRole::Implementation { stub_forms },
             implementation_public,
         }
     }
 }
 
-/// Each name the implementation binds, `~N` forms grouped, and the declaration that binds
-/// it: the last form in source order.
-fn bound_names(implementation: &AnalyzedFile) -> BTreeMap<&str, &SyntaxSymbol> {
+/// Each current established identity and its last implementation form in source order.
+fn bound_names(implementation: &AnalyzedFile) -> BTreeMap<&rift_core::SymbolId, &SyntaxSymbol> {
     implementation
         .file
         .syntax()
         .symbols()
         .iter()
-        .map(|symbol| (base_name(&symbol.qualified_name), symbol))
+        .filter_map(|symbol| {
+            implementation
+                .placement
+                .logical_identity(&symbol.qualified_name)
+                .map(|identity| (identity, symbol))
+        })
         .collect()
 }
 
-/// Each name the stub declares, `~N` forms grouped, and its forms in source order.
-fn stub_forms_by_name(stub: &AnalyzedFile) -> BTreeMap<&str, Vec<&SyntaxSymbol>> {
-    let mut forms: BTreeMap<&str, Vec<&SyntaxSymbol>> = BTreeMap::new();
+/// Stub forms grouped only by current established canonical identity.
+fn stub_forms_by_name(stub: &AnalyzedFile) -> BTreeMap<&rift_core::SymbolId, Vec<&SyntaxSymbol>> {
+    let mut forms: BTreeMap<&rift_core::SymbolId, Vec<&SyntaxSymbol>> = BTreeMap::new();
     for symbol in stub.file.syntax().symbols() {
-        forms
-            .entry(base_name(&symbol.qualified_name))
-            .or_default()
-            .push(symbol);
+        if let Some(identity) = stub.placement.logical_identity(&symbol.qualified_name) {
+            forms.entry(identity).or_default().push(symbol);
+        }
     }
     forms
 }
@@ -294,75 +260,6 @@ fn stub_form(stub: &AnalyzedFile, form: &SyntaxSymbol) -> StubForm {
     }
 }
 
-/// Lays what the join decided for `declaration` over its assembled presentation, and
-/// reports whether the declaration joined stub forms.
-///
-/// A joined implementation declaration takes the stub's facts; a stub declaration whose
-/// container joined names the implementation identity that answers for it as its
-/// container.
-pub(super) fn lay_join(
-    presentation: &mut Symbol,
-    semantics: &WorkspaceSemantics,
-    role: &ModuleRole,
-    declaration: &SyntaxSymbol,
-) -> bool {
-    if let Some(container) = declaration
-        .container
-        .as_deref()
-        .and_then(|container| role.joined_container(container))
-    {
-        presentation.container = Some(container.clone());
-    }
-    let forms = role.stub_forms(&declaration.qualified_name);
-    if forms.is_empty() {
-        return false;
-    }
-    lay_stub_facts(presentation, semantics, forms);
-    true
-}
-
-/// Lays the stub's facts over one joined implementation declaration.
-///
-/// The stub's signatures replace the implementation's when the stub renders any; a stub
-/// declaring a name without a signature, such as a `.d.ts` variable over a `.js` function,
-/// leaves the implementation's own. The syntax publication the join reads leaves every
-/// declaration's `types` empty, so a stub's types reach the joined declaration through the
-/// `parameters` and `returns` of its signatures. Source, range, and documentation stay the
-/// implementation's.
-fn lay_stub_facts(presentation: &mut Symbol, semantics: &WorkspaceSemantics, forms: &[StubForm]) {
-    let stub: Vec<Symbol> = forms
-        .iter()
-        .filter_map(|form| {
-            let assembled = semantics.assembled(&form.identity.0)?;
-            assembled
-                .facts()
-                .map(|facts| assembled.to_protocol_symbol(facts))
-        })
-        .collect();
-    let signatures: Vec<_> = stub
-        .iter()
-        .flat_map(|form| form.signatures.iter().cloned())
-        .collect();
-    if !signatures.is_empty() {
-        presentation.signatures = signatures;
-    }
-}
-
-/// The name a declaration's `~N` forms share: `f~2` is a form of `f`.
-///
-/// The paired languages spell no `~` in an identifier, so a `~` followed by digits alone is
-/// always the provider's suffix.
-fn base_name(qualified_name: &str) -> &str {
-    match qualified_name.rsplit_once(FORM_SUFFIX_MARKER) {
-        Some((base, number))
-            if !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            base
-        }
-        _ => qualified_name,
-    }
-}
-
 /// The identity one declaration of `held` carries.
 fn identity_of(held: &AnalyzedFile, qualified_name: &str) -> SymbolId {
     SymbolId(symbol_identity(
@@ -374,7 +271,7 @@ fn identity_of(held: &AnalyzedFile, qualified_name: &str) -> SymbolId {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModulePair, base_name, module_pairs};
+    use super::{ModulePair, module_pairs};
 
     fn pairs(paths: &[&str]) -> Vec<(String, String)> {
         module_pairs(paths.iter().copied())
@@ -439,11 +336,37 @@ mod tests {
     }
 
     #[test]
-    fn test_base_name_strips_only_a_numeric_form_suffix() {
-        assert_eq!(base_name("readFile~5"), "readFile");
-        assert_eq!(base_name("C.m~12"), "C.m");
-        assert_eq!(base_name("f"), "f");
-        assert_eq!(base_name("f~"), "f~");
-        assert_eq!(base_name("f~x"), "f~x");
+    fn test_repeated_declarations_without_overload_proof_do_not_join() {
+        let analysis = super::super::fixture::package_result(
+            rift_syntax::ShippedLanguage::Python,
+            vec![
+                (
+                    "mod.py",
+                    "def repeat(value): return value\ndef repeat(value): return value + 1\n",
+                ),
+                (
+                    "mod.pyi",
+                    "def repeat(value: int) -> int: ...\ndef repeat(value: str) -> str: ...\n",
+                ),
+            ],
+            None,
+        )
+        .expect("bounded repeated declarations");
+        let implementation = analysis
+            .files()
+            .iter()
+            .find(|held| held.file.path().as_str() == "mod.py")
+            .expect("retained implementation");
+        for symbol in implementation.file.syntax().symbols() {
+            assert!(implementation.stub_forms(&symbol.qualified_name).is_empty());
+        }
+        assert_eq!(analysis.publication().declarations.len(), 4);
+        let identities = analysis
+            .publication()
+            .declarations
+            .iter()
+            .map(|declaration| &declaration.symbol)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), 4);
     }
 }

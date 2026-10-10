@@ -11,7 +11,7 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Most characters a declaration lookup name carries.
+/// Most characters a public symbol name or declaration lookup name carries.
 pub const SYMBOL_NAME_CHARACTERS_MAX: usize = 4096;
 /// Most project declarations proposed when a lookup finds no match.
 pub const SYMBOL_ALTERNATIVES_MAX: usize = 3;
@@ -437,7 +437,7 @@ fn default_get_symbol_params_page_index() -> u64 {
         "hits": [
             {
                 "symbol": {
-                    "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "id": "rift://symbol/local/rust/app/config/load_config",
                     "language": "rust",
                     "name": "load_config",
                     "kind": "function",
@@ -466,7 +466,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                                         "start": 42,
                                         "end": 48
                                     },
-                                    "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                    "symbol": "rift://symbol/local/rust/app/config/Config"
                                 }
                             ],
                             "language": "rust",
@@ -515,7 +515,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                 "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
                 "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
                 "history": {
-                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                    "symbol": "rift://symbol/local/rust/app/config/load_config",
                     "versions": [
                         {
                             "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
@@ -940,18 +940,100 @@ pub struct NodesResult {
 }
 
 /// One package as its package manager identifies it.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageIdentity {
     /// Package manager or ecosystem name.
     #[schemars(length(max = 128))]
     pub manager: String,
+    /// Canonical registry endpoint, including its path when that path identifies the registry.
+    /// Credentials, query and fragment are never part of this owner.
+    #[schemars(length(min = 1, max = 4096))]
+    pub registry: String,
     /// Package name in that ecosystem.
     #[schemars(length(max = 4096))]
     pub name: String,
     /// Resolved package version.
     #[schemars(length(max = 4096))]
     pub version: String,
+}
+
+/// One exact runtime or compiler release.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    /// Canonical runtime or compiler name.
+    #[schemars(length(min = 1, max = 128))]
+    pub runtime: String,
+    /// Exact runtime or compiler version.
+    #[schemars(length(min = 1, max = 4096))]
+    pub version: String,
+}
+
+impl PackageIdentity {
+    /// Validated defining registry owner of this exact package release.
+    ///
+    /// # Errors
+    /// Returns the violated owner or length bound.
+    pub fn owner(&self) -> Result<crate::identity::SymbolOwner, rift_error::RiftError> {
+        if self.manager.len() > 128
+            || self.registry.len() > 4096
+            || self.name.len() > 4096
+            || self.version.len() > 4096
+        {
+            return Err(crate::identity::SymbolIdentityViolation::Length.into());
+        }
+        let owner = crate::identity::SymbolOwner::Package {
+            manager: self.manager.clone(),
+            registry: self.registry.clone(),
+            name: self.name.clone(),
+            version: self.version.clone(),
+        };
+        owner.validate()?;
+        Ok(owner)
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            manager: String,
+            registry: String,
+            name: String,
+            version: String,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        let package = Self {
+            manager: fields.manager,
+            registry: fields.registry,
+            name: fields.name,
+            version: fields.version,
+        };
+        package
+            .owner()
+            .map_err(|_| serde::de::Error::custom("package owner is invalid"))?;
+        Ok(package)
+    }
+}
+
+impl RuntimeIdentity {
+    /// Validated defining runtime or compiler owner of this exact release.
+    ///
+    /// # Errors
+    /// Returns the violated owner or length bound.
+    pub fn owner(&self) -> Result<crate::identity::SymbolOwner, rift_error::RiftError> {
+        if self.runtime.len() > 128 || self.version.len() > 4096 {
+            return Err(crate::identity::SymbolIdentityViolation::Length.into());
+        }
+        let owner = crate::identity::SymbolOwner::Runtime {
+            runtime: self.runtime.clone(),
+            version: self.version.clone(),
+        };
+        owner.validate()?;
+        Ok(owner)
+    }
 }
 
 /// Default `page_index` for a paginated request: the first page.
@@ -1574,6 +1656,10 @@ pub struct Relationship {
     /// The nodes this edge was read from. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<NodeId>,
+    /// Exact physical occurrence when this edge was read from source, independent of
+    /// whether the provider supplied a source node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<SourceUnitSpan>,
     /// How this edge was established.
     pub derivation: RelationshipDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
@@ -1884,7 +1970,7 @@ pub enum SourceKind {
 /// generated. `rift-core`'s `ContributionOrigin` carries this exact type as its own
 /// working representation; no served tool schema reaches it, so it carries no wire
 /// examples of its own - [`SourceLocationKind`] is what a caller reads on `SymbolOrigin`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SourceLocation {
     /// Source owned by the current workspace.
@@ -1900,7 +1986,11 @@ pub enum SourceLocation {
         package: PackageIdentity,
     },
     /// Source installed with the language toolchain.
-    Stdlib {},
+    Stdlib {
+        /// Exact owning runtime or compiler, absent when accepted evidence does not name a release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<RuntimeIdentity>,
+    },
     /// Source outside the project, dependency graph, and standard library.
     External {},
 }
@@ -1935,25 +2025,75 @@ pub struct SourceSpan {
     pub range: TextRange,
 }
 
-/// Stable identity of one source unit in the source catalog: a resolver identity, then that
-/// resolver's canonical unit key in canonical percent-encoding - for the project resolver, the
-/// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
-/// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
-/// where byte-identity is required.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+/// Identity of one physical source unit: its defining package or runtime owner and original
+/// root-relative path, or its source resolver and canonical unit key. Project sources use
+/// `rift://source/project/src/lib.rs`. The codec validates ownership, UTF-8, relative paths
+/// and canonical percent-encoding before lookup. Content digests remain separate from source
+/// addresses.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-#[schemars(transparent)]
-pub struct SourceUnitId(
-    #[schemars(length(min = 17, max = 8192))]
-    #[schemars(regex(
-        pattern = concat!(
-            r"^rift://source/[a-z][a-z0-9_.-]{0,127}/",
-            identity_path_character!(),
-            r"{1,8192}$"
-        )
-    ))]
-    pub String,
-);
+pub struct SourceUnitId(pub String);
+
+impl JsonSchema for SourceUnitId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SourceUnitId".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 17,
+            "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX,
+            "pattern": crate::identity::SOURCE_UNIT_ID_PATTERN,
+            "if": {"pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"},
+            "then": {"pattern": crate::identity::RELEASED_SOURCE_UNIT_ID_PATTERN},
+            "else": {"pattern": crate::identity::GENERIC_SOURCE_UNIT_ID_PATTERN},
+            "not": {"anyOf": [
+                {"pattern": "/\\.{1,2}(?:/|$)"},
+                {"pattern": "^rift://source/[^/]+/[A-Za-z]:"},
+                {"pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"},
+                {"pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"}
+            ]},
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+                "rift://source/project/src/lib.rs",
+                "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+                "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ]
+        })
+    }
+}
+
+impl SourceUnitId {
+    /// Accepts one canonical physical source identity.
+    ///
+    /// # Errors
+    /// Returns a violation for malformed ownership, paths, UTF-8 or encoding.
+    pub fn parse(value: &str) -> Result<Self, rift_error::RiftError> {
+        crate::identity::parse_source_unit_identity(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the canonical physical source address.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether this canonical physical source identity uses the project resolver.
+    #[must_use]
+    pub fn is_project(&self) -> bool {
+        crate::identity::source_unit_is_project(&self.0).is_ok_and(|project| project)
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceUnitId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        crate::identity::parse_source_unit_identity(&value).map_err(serde::de::Error::custom)?;
+        Ok(Self(value))
+    }
+}
 
 /// One byte range in a source-catalog unit.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -2030,6 +2170,22 @@ pub struct Symbol {
     /// provider classifies locality from its language model; absent when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub document_local: bool,
+}
+
+impl Symbol {
+    /// Whether the name fits the public character bound.
+    ///
+    /// This checks the name's length independently of the declaration's export visibility.
+    /// Package artifacts retain names outside this bound when the provider's byte bound permits
+    /// them; public directories omit those objects.
+    #[must_use]
+    pub fn name_is_public(&self) -> bool {
+        self.name
+            .chars()
+            .take(SYMBOL_NAME_CHARACTERS_MAX + 1)
+            .count()
+            <= SYMBOL_NAME_CHARACTERS_MAX
+    }
 }
 
 /// One portable category a symbol falls into. Kinds are language-specific; facets are
@@ -2120,28 +2276,63 @@ pub struct SymbolHistory {
     pub complete: bool,
 }
 
-/// Identity of one symbol: the language, the path of the declaring file, and the provider's
-/// stable qualified name for the declaration. No shipped provider puts the file path into a
-/// qualified name, so a declaration moved to another file keeps its qualified name while its
-/// identity names the new path. A `~N` suffix separates declarations the qualified name
-/// alone cannot, such as overloads that dispatch separately.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct SymbolId(
-    #[schemars(example = &"rift://symbol/rust/crates/rift-server/src/read.rs/ReadService")]
-    #[schemars(length(min = 17, max = 8192))]
-    #[schemars(regex(
-        pattern = concat!(
-            r"^rift://symbol/",
-            identity_language_segment!(),
-            r"/",
-            identity_path_character!(),
-            r"{1,1000}$"
-        )
-    ))]
-    pub String,
-);
+/// Canonical logical symbol identity with local, registered local, package or runtime ownership.
+/// The shared codec validates ownership, hierarchy and encoding at the read boundary.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SymbolId(pub String);
+
+impl JsonSchema for SymbolId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SymbolId".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::identity::SymbolIdentity::json_schema(generator)
+    }
+}
+
+impl Serialize for SymbolId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let identity = crate::identity::SymbolIdentity::parse(self.as_str())
+            .map_err(serde::ser::Error::custom)?;
+        identity.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SymbolId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::identity::SymbolIdentity::deserialize(deserializer)
+            .map(|identity| Self::from_identity(&identity))
+    }
+}
+
+impl SymbolId {
+    /// Parses one canonical logical symbol identity without lookup or I/O.
+    ///
+    /// # Errors
+    /// Returns the codec violation when ownership, hierarchy or encoding is invalid.
+    pub fn parse(value: &str) -> Result<Self, rift_error::RiftError> {
+        crate::identity::SymbolIdentity::parse(value).map(|identity| Self(identity.wire_identity()))
+    }
+
+    /// Builds a wire identifier from an already validated logical identity.
+    #[must_use]
+    pub fn from_identity(identity: &crate::identity::SymbolIdentity) -> Self {
+        Self(identity.wire_identity())
+    }
+
+    /// The canonical wire spelling of this identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Takes the canonical wire spelling of this identifier.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
 
 /// Where a symbol belongs and how its declaration came to exist. Source location and
 /// generation are separate: generated code can belong to the project or to a dependency.
@@ -2157,6 +2348,10 @@ pub struct SymbolOrigin {
     /// for `project`. Absent for `stdlib`, `external`, and a synthetic declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package: Option<PackageIdentity>,
+    /// Exact runtime or compiler release that owns a standard-library declaration.
+    /// Mutually exclusive with `package`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeIdentity>,
     /// Whether the declaration is authored, generated, or synthetic.
     pub source_kind: SourceKind,
 }
@@ -2167,6 +2362,7 @@ fn default_symbol_origin() -> SymbolOrigin {
     SymbolOrigin {
         location: Some(SourceLocationKind::Project),
         package: None,
+        runtime: None,
         source_kind: SourceKind::Authored,
     }
 }
@@ -2334,10 +2530,10 @@ mod tests {
 
     use super::{
         Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
-        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER,
-        LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
-        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
-        RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol, SymbolId,
+        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, NodeId,
+        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
+        RelationshipFacet, RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope,
+        SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2660,7 +2856,7 @@ mod tests {
             "facets": ["type"],
             "origin": {
                 "location": "dependency",
-                "package": { "manager": "cargo", "name": "beacon-core", "version": "0.1.0" },
+                "package": { "manager": "cargo", "registry": "crates.io", "name": "beacon-core", "version": "0.1.0" },
                 "source_kind": "authored"
             }
         });
@@ -2766,13 +2962,13 @@ mod tests {
         assert_eq!(
             schema["pattern"],
             json!(
-                r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$"
+                r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$"
             )
         );
     }
 
-    /// Every served identity spells its path with the one shared character class, and each
-    /// accepts an `@` inside that path. `rift_core::encode_path` keeps `@` literal because RFC
+    /// Every served identity accepts an `@` inside its path. `rift_core::encode_path`
+    /// keeps `@` literal because RFC
     /// 3986 lists it in the path set, so a pattern that left it out refused an identity the
     /// server had itself minted: every npm scoped package directory reached it.
     #[test]
@@ -2792,18 +2988,13 @@ mod tests {
             ),
             (
                 serde_json::to_value(schema_for!(SymbolId)).expect("symbol schema"),
-                "rift://symbol/json/packages/@scope/name/package.json/name",
+                "rift://symbol/local/json/packages/@scope/name/name",
             ),
         ];
         for (schema, identity) in cases {
             let pattern = schema["pattern"].as_str().expect("an advertised pattern");
-            assert!(
-                pattern.contains(IDENTITY_PATH_CHARACTER),
-                "an identity pattern spells its path with the shared class: {pattern}"
-            );
-            let validator =
-                jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
-                    .expect("the advertised pattern compiles");
+            let validator = jsonschema::validator_for(&schema)
+                .expect("the advertised identity schema compiles");
             assert!(
                 validator.is_valid(&json!(identity)),
                 "{pattern} must accept {identity}"
@@ -2886,7 +3077,7 @@ mod tests {
             ),
             (
                 ReadWarning::SymbolDisagreement {
-                    symbol: SymbolId("rift://symbol/rust/src/lib.rs/Beacon".to_owned()),
+                    symbol: SymbolId("rift://symbol/local/rust/app/Beacon".to_owned()),
                     providers: vec!["history".to_owned(), "syntax".to_owned()],
                     detail: "normalization selected one presentation for this symbol; \
                              history, syntax disagree on at least one field"
@@ -2894,7 +3085,7 @@ mod tests {
                 },
                 json!({
                     "code": "symbol_disagreement",
-                    "symbol": "rift://symbol/rust/src/lib.rs/Beacon",
+                    "symbol": "rift://symbol/local/rust/app/Beacon",
                     "providers": ["history", "syntax"],
                     "detail": "normalization selected one presentation for this symbol; \
                                history, syntax disagree on at least one field",
@@ -2958,6 +3149,7 @@ mod tests {
                 ReadWarning::PackageAbsent {
                     package: PackageIdentity {
                         manager: "cargo".to_owned(),
+                        registry: "crates.io".to_owned(),
                         name: "missing-helper".to_owned(),
                         version: "0.1.0".to_owned(),
                     },
@@ -2966,6 +3158,7 @@ mod tests {
                     "code": "package_absent",
                     "package": {
                         "manager": "cargo",
+                        "registry": "crates.io",
                         "name": "missing-helper",
                         "version": "0.1.0",
                     },
@@ -3000,6 +3193,7 @@ mod tests {
                     ),
                     package: PackageIdentity {
                         manager: "npm".to_owned(),
+                        registry: "registry.npmjs.org".to_owned(),
                         name: "typescript".to_owned(),
                         version: "5.9.3".to_owned(),
                     },
@@ -3014,6 +3208,7 @@ mod tests {
                     },
                     "package": {
                         "manager": "npm",
+                        "registry": "registry.npmjs.org",
                         "name": "typescript",
                         "version": "5.9.3",
                     },
@@ -3318,6 +3513,43 @@ mod tests {
                 json!("required_field_set"),
             ]
         );
+    }
+
+    #[test]
+    fn ordinary_symbol_id_serde_and_schema_use_the_canonical_codec() {
+        let schema = serde_json::to_value(schema_for!(SymbolId)).expect("symbol schema");
+        let validator = jsonschema::validator_for(&schema).expect("symbol validator");
+        for value in [
+            "rift://symbol/local/python/app/member",
+            "rift://symbol/cargo/crates.io/example@1.0.0/rust/example/member",
+            "rift://symbol/stdlib/python@3.14.3/python/sys/version",
+        ] {
+            let parsed: SymbolId = serde_json::from_value(json!(value)).expect("canonical ID");
+            assert_eq!(
+                serde_json::to_value(parsed).expect("symbol serialization"),
+                json!(value)
+            );
+            assert!(validator.is_valid(&json!(value)), "{value}");
+        }
+        for value in [
+            "rift://symbol/rust/src/lib.rs/member",
+            "rift://symbol/local/python/app//member",
+            "rift://symbol/local/python/app/../member",
+        ] {
+            assert!(
+                serde_json::from_value::<SymbolId>(json!(value)).is_err(),
+                "{value}"
+            );
+            assert!(
+                serde_json::to_value(SymbolId(value.to_owned())).is_err(),
+                "{value}"
+            );
+            assert!(!validator.is_valid(&json!(value)), "{value}");
+        }
+        let overbound = format!("rift://symbol/local/python/app/{}", "S".repeat(8192));
+        assert!(serde_json::from_value::<SymbolId>(json!(overbound)).is_err());
+        assert!(serde_json::to_value(SymbolId(overbound.clone())).is_err());
+        assert!(!validator.is_valid(&json!(overbound)));
     }
 
     #[test]

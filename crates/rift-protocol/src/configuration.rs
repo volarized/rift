@@ -21,15 +21,21 @@ use crate::search::path_pattern_violation;
 use crate::source::SourceConfiguration;
 
 mod archive;
+mod mcp;
 mod package;
 
 #[cfg(test)]
 mod collection_tests;
 
 pub use archive::*;
+pub use mcp::McpConfiguration;
 pub use package::PackageConfiguration;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
+
+/// Bytes a configuration document may hold, at most. The document states
+/// bounded tables and entries; one this large is not configuration.
+pub const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
 
 /// Workers the server's blocking pool may hold, at most.
 pub const SERVER_NUM_WORKERS_MAX: u64 = 64;
@@ -503,6 +509,8 @@ pub struct WorkspaceConfiguration {
     pub server: ServerConfiguration,
     /// Whether package reads use the configured global REST API and its request bounds.
     pub global: GlobalConfiguration,
+    /// Named local projects registered by the primary project's MCP connection.
+    pub mcp: McpConfiguration,
     /// Bounds and switches for the built-in providers.
     pub providers: ProvidersConfiguration,
     /// Enablement and limits for caller-provided code.
@@ -568,6 +576,7 @@ impl WorkspaceConfiguration {
         self.server
             .violation()
             .or_else(|| self.global.violation())
+            .or_else(|| self.mcp.violation())
             .or_else(|| self.execution.violation())
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.providers.syntax.violation())
@@ -3041,11 +3050,36 @@ impl Default for LanguageConfiguration {
     }
 }
 
+fn limit_evidence(
+    field: &'static str,
+    value: u64,
+    min: u64,
+    max: u64,
+) -> Vec<(&'static str, String)> {
+    vec![
+        ("field", field.to_owned()),
+        ("value", value.to_string()),
+        ("range", format!("{min}..={max}")),
+    ]
+}
+
+mod failure;
+pub use failure::configuration_violation_error;
+
 /// The first bound a configuration file breaks. Field paths name keys as
 /// the file spells them, so the refusal points at the line to fix.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConfigurationViolation {
+    /// An `mcp.extra` entry has an invalid registration name or path.
+    McpRegistrationInvalid {
+        /// Configuration table carrying the entry.
+        field: &'static str,
+        /// Registration name carrying the entry.
+        name: String,
+        /// The registration rule the entry breaks.
+        detail: &'static str,
+    },
     /// A numeric key sits outside its documented range.
     LimitOutOfRange {
         /// The key's path in the file, such as `execution.max_code`.
@@ -3219,6 +3253,13 @@ pub enum ConfigurationViolation {
         /// The rejected entry, spelled `<manager>/<name>`.
         package: String,
     },
+    /// A `dependencies.packages.registry` value is not a canonical registry endpoint.
+    PackageRegistryInvalid {
+        /// Configuration key carrying the registry.
+        field: &'static str,
+        /// The rejected entry, spelled `<manager>/<name>`.
+        package: String,
+    },
     /// A `logs.capture` value is not a tracing filter directive.
     LogCaptureInvalid {
         /// The rejected filter.
@@ -3266,16 +3307,17 @@ impl ConfigurationViolation {
     #[must_use]
     pub fn evidence(&self) -> Vec<(&'static str, String)> {
         match self {
+            Self::McpRegistrationInvalid {
+                field,
+                name,
+                detail,
+            } => mcp::registration_evidence(field, name, detail),
             Self::LimitOutOfRange {
                 field,
                 value,
                 min,
                 max,
-            } => vec![
-                ("field", (*field).to_owned()),
-                ("value", value.to_string()),
-                ("range", format!("{min}..={max}")),
-            ],
+            } => limit_evidence(field, *value, *min, *max),
             Self::LanguageIdentityInvalid { language } => vec![("language", language.clone())],
             Self::LanguageLspUnknown { language, lsp } => {
                 vec![("language", language.clone()), ("lsp", lsp.clone())]
@@ -3337,7 +3379,8 @@ impl ConfigurationViolation {
             Self::FileNameInvalid { field, name } => {
                 vec![("field", (*field).to_owned()), ("name", name.clone())]
             }
-            Self::PackageSelectorInvalid { field, package } => {
+            Self::PackageSelectorInvalid { field, package }
+            | Self::PackageRegistryInvalid { field, package } => {
                 vec![("field", (*field).to_owned()), ("package", package.clone())]
             }
             Self::LogCaptureInvalid { capture, detail } => vec![

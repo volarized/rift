@@ -336,6 +336,17 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    configuration_package_registry_invalid,
+    slug = "rift.core.configuration_package_registry_invalid",
+    message = "dependency package registry is not a canonical endpoint",
+    action = "correct the reported configuration field, then retry",
+    fields = {
+        field: optional(string),
+        package: optional(string),
+    },
+);
+
+__rift_error_definition!(
     configuration_package_selector_invalid,
     slug = "rift.core.configuration_package_selector_invalid",
     message = "dependency package has conflicting or missing version selector",
@@ -784,5 +795,15 @@ __rift_error_definition!(
     action = "correct the reported field and resend the request",
     fields = {
         identity: required(string),
+    },
+);
+
+__rift_error_definition!(
+    symbol_identity_invalid,
+    slug = "rift.core.symbol_identity_invalid",
+    message = "symbol identity is not canonical: {violation}",
+    action = "supply a canonical rift://symbol/ address",
+    fields = {
+        violation: required(string),
     },
 );

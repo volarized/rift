@@ -142,6 +142,34 @@ impl WorkspaceIndex {
         selection: &dyn Fn(&str) -> bool,
         read: &mut CommittedBytes<'_>,
     ) -> Result<Self, RiftError> {
+        Self::at_revision_with_owner(
+            (repository, rift_protocol::identity::SymbolOwner::Local),
+            revision,
+            limits,
+            visibility,
+            (text_inclusion, languages),
+            selection,
+            read,
+        )
+    }
+
+    /// Builds a committed-tree index under one fixed local owner.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for invalid owner, paths, configuration, bounds, or history reads.
+    pub fn at_revision_with_owner(
+        (repository, owner): (&Repository, rift_protocol::identity::SymbolOwner),
+        revision: &ResolvedRevision,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        (text_inclusion, languages): (
+            &rift_core::TextFileInclusion,
+            &rift_core::LanguageFileSelections,
+        ),
+        selection: &dyn Fn(&str) -> bool,
+        read: &mut CommittedBytes<'_>,
+    ) -> Result<Self, RiftError> {
+        super::workspace::validate_project_owner(&owner)?;
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let language = std::sync::Arc::new(crate::WorkspaceLanguagePolicy::build(
@@ -215,8 +243,8 @@ impl WorkspaceIndex {
                 ClassifiedPath::Text => contents.hold_text_file(text_file),
             }
         }
-        Self::from_parts(
-            root,
+        Self::from_parts_with_owner(
+            (root, owner),
             contents,
             composition,
             limits,

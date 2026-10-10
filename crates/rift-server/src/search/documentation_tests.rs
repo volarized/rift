@@ -13,6 +13,11 @@ use super::{ReadService, SearchHitTarget, StoreAnswer};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 fn service(root: &std::path::Path) -> TestResult<ReadService> {
+    if root.join("src/lib.rs").is_file() {
+        crate::read::tests::captured_rust_library(root, "src/lib.rs")?;
+    } else if root.join("lib.rs").is_file() {
+        crate::read::tests::captured_rust_library(root, "lib.rs")?;
+    }
     Ok(ReadService::build(
         root,
         WorkspaceIndexLimits::default(),
@@ -433,7 +438,7 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             &["Navigation API"][..],
             "6aa1b2916828c61e9ea5023fbe94e58ae6467a0c81ad4e3b95448222b7fa6ada",
             &["docs/api.md"][..],
-            &["rift://symbol/markdown/docs/api.md/Navigation%20API"][..],
+            &["Navigation API"][..],
         ),
         (
             "lunar drift",
@@ -441,7 +446,7 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             &["Field Tutorial"][..],
             "97e7e5894ad3524019eb636fdbc15f9c23694e8cf98c2caef4aa8c3dad748e02",
             &["docs/tutorial.md"][..],
-            &["rift://symbol/markdown/docs/tutorial.md/Field%20Tutorial"][..],
+            &["Field Tutorial"][..],
         ),
         (
             "records",
@@ -449,7 +454,7 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             &["Examples", "Examples > Calibration~2"][..],
             "f029465cd85732d93c71c1c5529623413a989f85526db2c5f79c9082470b899f",
             &["docs/repeated.md"][..],
-            &["rift://symbol/markdown/docs/repeated.md/Examples%20%3E%20Calibration~2"][..],
+            &["Examples > Calibration~2"][..],
         ),
         (
             "orbital_route",
@@ -457,7 +462,7 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
             &["Rust Example"][..],
             "0f6ff8c17f7f5e80fb03a0d9e73667bb629b52b42ad5d6aa8b2b4e98f98a4ae2",
             &["docs/rust.md"][..],
-            &["rift://symbol/markdown/docs/rust.md/Rust%20Example"][..],
+            &["Rust Example"][..],
         ),
     ]
 }
@@ -497,13 +502,36 @@ async fn assert_document_question(
         symbol_baseline
             .results
             .iter()
-            .map(hit_identity)
+            .map(|hit| match &hit.hit {
+                SearchHitTarget::Symbol { symbol } => {
+                    assert!(
+                        symbol.id.is_none(),
+                        "a heading has no established semantic identity"
+                    );
+                    assert_eq!(hit.path.as_ref().map(|path| path.0.as_str()), Some(path));
+                    let range = hit.range.as_ref().expect("a heading retains its range");
+                    let file = service
+                        .index()
+                        .files()
+                        .find(|file| file.path().as_str() == path)
+                        .expect("the captured index retains the heading file");
+                    let declaration = file
+                        .syntax()
+                        .symbols()
+                        .iter()
+                        .find(|declaration| {
+                            declaration.range.start == range.start
+                                && declaration.range.end == range.end
+                        })
+                        .expect("the hit retains its exact physical declaration range");
+                    assert_eq!(symbol.name, declaration.name);
+                    declaration.qualified_name.as_str()
+                }
+                _ => panic!("baseline must retain a physical heading declaration"),
+            })
             .collect::<Vec<_>>(),
-        expected_baseline_symbols
-            .iter()
-            .map(|identity| Some((*identity).to_owned()))
-            .collect::<Vec<_>>(),
-        "symbol baseline identities for {question}"
+        expected_baseline_symbols,
+        "symbol baseline declarations for {question}"
     );
 
     let result = search_for(with_documentation, service, question, "documentation").await?;
@@ -538,14 +566,14 @@ async fn assert_symbol_query_unchanged(
 ) -> TestResult {
     let baseline_symbols = search_for(baseline, service, "Compass", "symbol").await?;
     let documented_symbols = search_for(with_documentation, service, "Compass", "symbol").await?;
-    let expected_symbol = "rift://symbol/rust/src/lib.rs/Compass";
+    let expected_symbol = crate::read::tests::local_identity("rust", &["beacon", "Compass"]);
     assert_eq!(
         baseline_symbols
             .results
             .iter()
             .map(hit_identity)
             .collect::<Vec<_>>(),
-        [Some(expected_symbol.to_owned())]
+        [Some(expected_symbol.clone())]
     );
     assert_eq!(
         baseline_symbols
@@ -643,7 +671,10 @@ async fn attached_comment_overlap_keeps_one_existing_rank_and_symbol_owner() -> 
     assert_eq!(all.results.len(), 1, "{all:#?}");
     assert_eq!(
         hit_identity(&all.results[0]),
-        Some("rift://symbol/rust/src/lib.rs/calibrate".to_owned())
+        Some(crate::read::tests::local_identity(
+            "rust",
+            &["beacon", "calibrate"]
+        ))
     );
     Ok(())
 }

@@ -26,6 +26,7 @@ use rift_core::{
 use rift_error::{ErrorSlug, RiftError, ctx, errors};
 use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
 use rift_protocol::documentation::{DocumentationContentIdentity, DocumentationSourceIdentity};
+use rift_protocol::identity::SymbolOwner;
 use rift_protocol::search::FORCE_INCLUDE_FIELD;
 use rift_protocol::source::{
     SOURCE_DECLARATIONS_FIELD, SOURCE_FILES_FIELD, SOURCE_WORKSPACE_SIZE_FIELD,
@@ -601,9 +602,15 @@ impl WorkspaceFingerprint {
     fn from_files(
         files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
         text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+        framework_sources: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
         left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
     ) -> Self {
-        Self::from_digests(&keyed_digests(files, text_files, left_out))
+        Self::from_digests(&keyed_digests(
+            files,
+            text_files,
+            framework_sources,
+            left_out,
+        ))
     }
 
     /// Folds every visible file's digest in project-path order.
@@ -1269,15 +1276,97 @@ pub(crate) struct IndexContents {
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     framework_sources: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    build_path_requests: BTreeSet<rift_protocol::read::ProjectPath>,
+    build_paths:
+        BTreeMap<rift_protocol::read::ProjectPath, Option<rift_analysis::ArchiveMemberKind>>,
     raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     warnings: Vec<WorkspaceIndexWarning>,
 }
 
 impl IndexContents {
+    fn capture_build_paths(
+        &mut self,
+        root: &Path,
+        limits: WorkspaceIndexLimits,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), RiftError> {
+        let files = self
+            .files
+            .values()
+            .map(|file| rift_analysis::PackageSource::new(file.path(), file.source()))
+            .collect::<Vec<_>>();
+        let metadata = self
+            .text_files
+            .iter()
+            .chain(&self.framework_sources)
+            .filter(|(path, _)| !self.files.contains_key(*path))
+            .collect::<BTreeMap<_, _>>();
+        let mut bytes = 0_usize;
+        for file in self.files.values() {
+            count_workspace_bytes(&mut bytes, file.source().len(), root, limits)?;
+        }
+        for file in metadata.values() {
+            count_workspace_bytes(&mut bytes, file.content().len(), root, limits)?;
+        }
+        let mut paths = BTreeSet::new();
+        for file in files.iter().copied().chain(
+            metadata
+                .values()
+                .map(|file| rift_analysis::PackageSource::new(file.path(), file.content())),
+        ) {
+            check_cancelled(cancelled)?;
+            if let Some(requested) = rift_analysis::build_paths(file, &files, limits.syntax()) {
+                for path in requested {
+                    if !paths.insert(path.clone()) {
+                        continue;
+                    }
+                    let count = files
+                        .len()
+                        .checked_add(metadata.len())
+                        .and_then(|count| count.checked_add(paths.len()))
+                        .ok_or_else(|| {
+                            errors::analysis::package_input_too_many_files()
+                                .field("package_files_max")
+                                .bound(limits.files_max())
+                                .observed(usize::MAX)
+                                .error()
+                        })?;
+                    if count > limits.files_max() {
+                        return errors::analysis::package_input_too_many_files()
+                            .field("package_files_max")
+                            .bound(limits.files_max())
+                            .observed(count)
+                            .fail();
+                    }
+                    count_workspace_bytes(&mut bytes, path.0.len(), root, limits)?;
+                }
+            }
+        }
+        let mut observed = BTreeMap::new();
+        for path in &paths {
+            check_cancelled(cancelled)?;
+            let kind = match fs::symlink_metadata(root.join(path.0.as_str())) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    Some(rift_analysis::ArchiveMemberKind::Link)
+                }
+                Ok(metadata) if metadata.is_dir() => {
+                    Some(rift_analysis::ArchiveMemberKind::Directory)
+                }
+                Ok(metadata) if metadata.is_file() => Some(rift_analysis::ArchiveMemberKind::File),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Ok(_) | Err(_) => continue,
+            };
+            observed.insert(path.clone(), kind);
+        }
+        self.build_path_requests = paths;
+        self.build_paths = observed;
+        Ok(())
+    }
+
     fn build_with_frameworks(
         mut self,
-        root: &Path,
+        (root, owner): (&Path, &SymbolOwner),
         language: &WorkspaceLanguagePolicy,
         limits: WorkspaceIndexLimits,
         previous: Option<&WorkspaceIndex>,
@@ -1285,11 +1374,11 @@ impl IndexContents {
     ) -> Result<(BuiltContents, rift_analysis::FrameworkContext), RiftError> {
         let context =
             self.apply_frameworks(root, language, limits.syntax(), previous, cancelled)?;
-        built_contents(
-            root,
+        self.capture_build_paths(root, limits, cancelled)?;
+        built_contents_with_owner(
+            (root, owner),
             self.sorted(),
-            limits.declarations_max(),
-            limits.relationships_max(),
+            limits,
             previous.map(|index| index.semantics.graph()),
         )
         .map(|built| (built, context))
@@ -1459,6 +1548,7 @@ pub struct WorkspaceMapPaths {
 /// immutable snapshots.
 pub struct WorkspaceIndexPreparation {
     root: PathBuf,
+    owner: SymbolOwner,
     limits: WorkspaceIndexLimits,
     composition: ProviderComposition,
     language: Arc<WorkspaceLanguagePolicy>,
@@ -1497,6 +1587,21 @@ impl WorkspaceIndexPreparation {
         text_inclusion: &TextFileInclusion,
         languages: &LanguageFileSelections,
     ) -> Result<Self, RiftError> {
+        Self::new_with_owner(root, SymbolOwner::Local, limits, text_inclusion, languages)
+    }
+
+    /// Creates immutable views under one fixed local owner.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid local owner, root, configuration, or composition.
+    pub fn new_with_owner(
+        root: &Path,
+        owner: SymbolOwner,
+        limits: WorkspaceIndexLimits,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+    ) -> Result<Self, RiftError> {
+        validate_project_owner(&owner)?;
         let root = canonical_root(root)?;
         let composition = composition()?;
         let language = Arc::new(WorkspaceLanguagePolicy::build(
@@ -1506,6 +1611,7 @@ impl WorkspaceIndexPreparation {
         )?);
         Ok(Self {
             root,
+            owner,
             limits,
             composition,
             language,
@@ -1533,8 +1639,8 @@ impl WorkspaceIndexPreparation {
     ///
     /// Returns [`RiftError`] when the empty index cannot be assembled.
     pub fn empty_snapshot(&self) -> Result<WorkspaceIndex, RiftError> {
-        WorkspaceIndex::from_parts(
-            self.root.clone(),
+        WorkspaceIndex::from_parts_with_owner(
+            (self.root.clone(), self.owner.clone()),
             IndexContents::default(),
             self.composition.clone(),
             self.limits,
@@ -1921,9 +2027,11 @@ impl WorkspaceIndexPreparation {
     }
 
     fn snapshot(&self, previous: Option<&WorkspaceIndex>) -> Result<WorkspaceIndex, RiftError> {
-        WorkspaceIndex::from_parts(
-            self.root.clone(),
-            self.contents.clone(),
+        let mut contents = self.contents.clone();
+        contents.capture_build_paths(&self.root, self.limits, &|| false)?;
+        WorkspaceIndex::from_parts_with_owner(
+            (self.root.clone(), self.owner.clone()),
+            contents,
             self.composition.clone(),
             self.limits,
             Arc::clone(&self.language),
@@ -1935,6 +2043,7 @@ impl WorkspaceIndexPreparation {
 
     fn accepts_previous(&self, previous: &WorkspaceIndex) -> bool {
         self.root == previous.root
+            && self.owner == previous.owner
             && self.limits == previous.limits
             && self.text_inclusion == previous.text_inclusion
             && Arc::ptr_eq(&self.language, &previous.language)
@@ -1955,6 +2064,8 @@ impl IndexContents {
             files: index.files.clone(),
             text_files: index.text_files.clone(),
             framework_sources: index.framework_sources.clone(),
+            build_path_requests: index.build_path_requests.clone(),
+            build_paths: index.build_paths.clone(),
             raw_syntax: index.raw_syntax.clone(),
             left_out: index.left_out.clone(),
             warnings: index.warnings.clone(),
@@ -1969,6 +2080,8 @@ impl IndexContents {
             files: index.files.clone(),
             text_files: index.text_files.clone(),
             framework_sources: index.framework_sources.clone(),
+            build_path_requests: index.build_path_requests.clone(),
+            build_paths: index.build_paths.clone(),
             raw_syntax: index.raw_syntax.clone(),
             left_out: index.left_out.clone(),
             warnings: index
@@ -2391,9 +2504,13 @@ impl WorkspaceIndexWarning {
 #[derive(Debug)]
 pub struct WorkspaceIndex {
     root: PathBuf,
+    owner: SymbolOwner,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     framework_sources: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    build_path_requests: BTreeSet<rift_protocol::read::ProjectPath>,
+    build_paths:
+        BTreeMap<rift_protocol::read::ProjectPath, Option<rift_analysis::ArchiveMemberKind>>,
     raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     composition: ProviderComposition,
@@ -2411,12 +2528,19 @@ pub struct WorkspaceIndex {
     /// The documentation layer over `documentation`, built by the first read that projects
     /// onto it; the next publication is a new index and builds its own.
     documentation_layer: OnceLock<Result<DocumentationLayer<'static>, RiftError>>,
+    symbol_declarations: OnceLock<Result<SymbolDeclarations, RiftError>>,
     /// The held text files holding a line longer than `[search.text] max_chunk`, found by
     /// the first pattern search that asks; the next publication is a new index and finds
     /// its own.
     split_line_files: OnceLock<BTreeSet<ProjectPath>>,
     notebooks: NotebookFiles,
     warnings: Vec<WorkspaceIndexWarning>,
+}
+
+#[derive(Debug, Default)]
+struct SymbolDeclarations {
+    canonical: BTreeMap<SymbolId, Vec<(ProjectPath, usize)>>,
+    provider: BTreeMap<String, Vec<(ProjectPath, usize)>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2524,20 +2648,46 @@ impl WorkspaceIndex {
         cache: &WorkspaceContentCache,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
+        Self::build_with_owner(
+            (root, SymbolOwner::Local),
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            Some(cache),
+            cancelled,
+        )
+    }
+
+    /// Scans captured sources under a fixed local owner.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for invalid owner, root, configuration, bounds, or cancellation.
+    pub fn build_with_owner(
+        (root, owner): (&Path, SymbolOwner),
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        cache: Option<&WorkspaceContentCache>,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, RiftError> {
+        validate_project_owner(&owner)?;
         let root = canonical_root(root)?;
+        let cache = cache.cloned().unwrap_or_default();
         let language = Arc::new(WorkspaceLanguagePolicy::build(
             &root,
             languages,
             text_inclusion,
         )?);
         Self::scanned(
-            root,
+            (root, owner),
             limits,
             visibility,
             language,
             text_inclusion,
             None,
-            cache,
+            &cache,
             cancelled,
         )
     }
@@ -2572,7 +2722,7 @@ impl WorkspaceIndex {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
         Self::scanned(
-            self.root.clone(),
+            (self.root.clone(), self.owner.clone()),
             self.limits,
             visibility,
             Arc::clone(&self.language),
@@ -2590,7 +2740,7 @@ impl WorkspaceIndex {
         reason = "Inputs define one workspace scan and its cancellation boundary."
     )]
     fn scanned(
-        root: PathBuf,
+        (root, owner): (PathBuf, SymbolOwner),
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         language: Arc<WorkspaceLanguagePolicy>,
@@ -2610,6 +2760,8 @@ impl WorkspaceIndex {
                 files,
                 text_files,
                 framework_sources,
+                build_path_requests,
+                build_paths,
                 raw_syntax,
                 left_out,
                 warnings,
@@ -2644,7 +2796,7 @@ impl WorkspaceIndex {
                 cancelled,
             )?;
             check_cancelled(cancelled)?;
-            contents.build_with_frameworks(&root, &language, limits, previous, cancelled)
+            contents.build_with_frameworks((&root, &owner), &language, limits, previous, cancelled)
         })?;
         let declarations = rift_tracing::traced!(
             component = "documentation",
@@ -2668,9 +2820,12 @@ impl WorkspaceIndex {
             observed_symbol_documents(previous, &files, limits.syntax());
         Ok(Self {
             root,
+            owner,
             files,
             text_files,
             framework_sources,
+            build_path_requests,
+            build_paths,
             raw_syntax,
             left_out,
             composition,
@@ -2686,6 +2841,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            symbol_declarations: OnceLock::new(),
             split_line_files: OnceLock::new(),
             notebooks,
             warnings,
@@ -2753,20 +2909,22 @@ impl WorkspaceIndex {
             Some(self),
             cancelled,
         )?;
+        contents.capture_build_paths(&self.root, self.limits, cancelled)?;
         let BuiltContents {
             files,
             text_files,
             framework_sources,
+            build_path_requests,
+            build_paths,
             raw_syntax,
             left_out,
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(
-            &self.root,
+        } = built_contents_with_owner(
+            (&self.root, &self.owner),
             contents.sorted(),
-            self.limits.declarations_max(),
-            self.limits.relationships_max(),
+            self.limits,
             Some(self.semantics.graph()),
         )?;
         check_cancelled(cancelled)?;
@@ -2788,9 +2946,12 @@ impl WorkspaceIndex {
             observed_symbol_documents(Some(self), &files, self.limits.syntax());
         Ok(Self {
             root: self.root.clone(),
+            owner: self.owner.clone(),
             files,
             text_files,
             framework_sources,
+            build_path_requests,
+            build_paths,
             raw_syntax,
             left_out,
             composition: composition()?,
@@ -2806,6 +2967,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            symbol_declarations: OnceLock::new(),
             split_line_files: OnceLock::new(),
             notebooks,
             warnings,
@@ -2876,8 +3038,8 @@ impl WorkspaceIndex {
         clippy::too_many_arguments,
         reason = "Inputs define one index publication over already accepted files."
     )]
-    pub(crate) fn from_parts(
-        root: PathBuf,
+    pub(crate) fn from_parts_with_owner(
+        (root, owner): (PathBuf, SymbolOwner),
         mut contents: IndexContents,
         composition: ProviderComposition,
         limits: WorkspaceIndexLimits,
@@ -2886,22 +3048,25 @@ impl WorkspaceIndex {
         content_cache: WorkspaceContentCache,
         previous: Option<&Self>,
     ) -> Result<Self, RiftError> {
+        validate_project_owner(&owner)?;
+        let previous = previous.filter(|index| index.root == root && index.owner == owner);
         let frameworks =
             contents.apply_frameworks(&root, &language, limits.syntax(), previous, &|| false)?;
         let BuiltContents {
             files,
             text_files,
             framework_sources,
+            build_path_requests,
+            build_paths,
             raw_syntax,
             left_out,
             warnings,
             fingerprint,
             semantics,
-        } = built_contents(
-            &root,
+        } = built_contents_with_owner(
+            (&root, &owner),
             contents.sorted(),
-            limits.declarations_max(),
-            limits.relationships_max(),
+            limits,
             previous.map(|index| index.semantics.graph()),
         )?;
         let declarations = accepted_declarations(&files, &semantics);
@@ -2920,9 +3085,12 @@ impl WorkspaceIndex {
             observed_symbol_documents(previous, &files, limits.syntax());
         Ok(Self {
             root,
+            owner,
             files,
             text_files,
             framework_sources,
+            build_path_requests,
+            build_paths,
             raw_syntax,
             left_out,
             composition,
@@ -2938,6 +3106,7 @@ impl WorkspaceIndex {
             semantics,
             documentation: Arc::new(documentation),
             documentation_layer: OnceLock::new(),
+            symbol_declarations: OnceLock::new(),
             split_line_files: OnceLock::new(),
             notebooks,
             warnings,
@@ -2948,6 +3117,27 @@ impl WorkspaceIndex {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Paths whose captured entry kinds decide the Python import roots.
+    #[must_use]
+    pub const fn build_path_requests(&self) -> &BTreeSet<rift_protocol::read::ProjectPath> {
+        &self.build_path_requests
+    }
+
+    /// Entry kinds captured before this immutable index was built.
+    /// A missing key is unknown; a present `None` records a missing path.
+    #[must_use]
+    pub const fn build_paths(
+        &self,
+    ) -> &BTreeMap<rift_protocol::read::ProjectPath, Option<rift_analysis::ArchiveMemberKind>> {
+        &self.build_paths
+    }
+
+    /// Fixed local owner used before this index normalizes declarations.
+    #[must_use]
+    pub const fn owner(&self) -> &SymbolOwner {
+        &self.owner
     }
 
     /// The bounds this index was built under.
@@ -2999,14 +3189,49 @@ impl WorkspaceIndex {
                             rift_analysis::documentation::DocumentationLimits::from_configuration(
                                 self.text_inclusion.documentation(),
                             )?;
-                        DocumentationLayer::shared_with_limits(
+                        let mut layer = DocumentationLayer::shared_with_limits(
                             [Arc::clone(&self.documentation)],
                             &limits,
-                        )
+                        )?;
+                        self.associate_documentation_owners(&mut layer)?;
+                        Ok(layer)
                     }
                 )
             })
             .as_ref()
+    }
+
+    fn associate_documentation_owners(
+        &self,
+        layer: &mut DocumentationLayer<'static>,
+    ) -> Result<(), RiftError> {
+        if !self
+            .documentation
+            .index()
+            .blocks
+            .iter()
+            .any(|block| block.symbol.is_some())
+        {
+            return Ok(());
+        }
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        for block in &self.documentation.index().blocks {
+            let Some(owner) = &block.symbol else {
+                continue;
+            };
+            let identity = SymbolId::new(owner.as_str())?;
+            for (path, index) in declarations.canonical.get(&identity).into_iter().flatten() {
+                let Some(matched) = self.declaration_match(path, *index) else {
+                    continue;
+                };
+                layer.associate_document(declaration_identity(matched), &block.identity)?;
+            }
+        }
+        Ok(())
     }
 
     /// Keeps this snapshot's documentation collection alive for one publication.
@@ -3060,7 +3285,12 @@ impl WorkspaceIndex {
     /// reads it without parsing and would otherwise report it as new on every read.
     #[must_use]
     pub fn digests(&self) -> WorkspaceDigests {
-        keyed_digests(&self.files, &self.text_files, &self.left_out)
+        keyed_digests(
+            &self.files,
+            &self.text_files,
+            &self.framework_sources,
+            &self.left_out,
+        )
     }
 
     /// Every file's content digest this build holds, the files it left out included, in
@@ -3433,6 +3663,108 @@ impl WorkspaceIndex {
     pub fn symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolMatch<'_>>, RiftError> {
         self.validate_result_limit(limit)?;
         Ok(symbol_matches(self.files(), query, limit))
+    }
+
+    /// Finds physical declarations carrying one established canonical identity.
+    ///
+    /// The directory belongs to this immutable index and is built once from its
+    /// captured declarations. Objects without a physical declaration answer no match.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid result limit or failed symbol assembly.
+    pub fn symbols_by_identity(
+        &self,
+        identity: &SymbolId,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch<'_>>, RiftError> {
+        self.validate_result_limit(limit)?;
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(declarations
+            .canonical
+            .get(identity)
+            .into_iter()
+            .flatten()
+            .take(limit)
+            .filter_map(|(path, index)| self.declaration_match(path, *index))
+            .collect())
+    }
+
+    /// Finds declarations by the provider-local key held in an index document.
+    ///
+    /// This lookup does not establish a canonical symbol identity. Its directory
+    /// belongs to the same immutable physical declaration inventory.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid result limit or failed symbol assembly.
+    pub fn symbols_by_provider_identity(
+        &self,
+        identity: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolMatch<'_>>, RiftError> {
+        self.validate_result_limit(limit)?;
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations())
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(declarations
+            .provider
+            .get(identity)
+            .into_iter()
+            .flatten()
+            .take(limit)
+            .filter_map(|(path, index)| self.declaration_match(path, *index))
+            .collect())
+    }
+
+    fn declaration_match(&self, path: &ProjectPath, index: usize) -> Option<SymbolMatch<'_>> {
+        let file = self.file(path)?;
+        let symbol = file.syntax().symbols().get(index)?;
+        let rank = symbol_rank(symbol, &IdentifierMatcher::new(&symbol.qualified_name))?;
+        Some(SymbolMatch { file, symbol, rank })
+    }
+
+    fn build_symbol_declarations(&self) -> Result<SymbolDeclarations, RiftError> {
+        let mut declarations = SymbolDeclarations::default();
+        for file in self.files() {
+            for index in 0..file.syntax().symbols().len() {
+                let Some(matched) = self.declaration_match(file.path(), index) else {
+                    continue;
+                };
+                let provider = symbol_identity(
+                    &file.syntax().language().identity_segment(),
+                    file.path().as_str(),
+                    &matched.symbol.qualified_name,
+                );
+                declarations
+                    .provider
+                    .entry(provider)
+                    .or_default()
+                    .push((file.path().clone(), index));
+                if let Some(identity) = self.assembled_symbol(matched)?.identity() {
+                    declarations
+                        .canonical
+                        .entry(identity.clone())
+                        .or_default()
+                        .push((file.path().clone(), index));
+                }
+            }
+        }
+        for bindings in declarations
+            .canonical
+            .values_mut()
+            .chain(declarations.provider.values_mut())
+        {
+            bindings.sort_by_key(|(path, index)| {
+                self.declaration_match(path, *index)
+                    .map(|matched| (matched.rank, matched.symbol.qualified_name.as_str()))
+            });
+        }
+        Ok(declarations)
     }
 
     /// Finds lexical source lines containing query.
@@ -3843,8 +4175,8 @@ impl WorkspaceIndex {
                 files.push(indexed);
             }
         }
-        Self::from_parts(
-            self.root.clone(),
+        Self::from_parts_with_owner(
+            (self.root.clone(), self.owner.clone()),
             IndexContents {
                 files: keyed_by_path(files, IndexedFile::path),
                 text_files: keyed_by_path(text_files, TextSourceFile::path),
@@ -4001,6 +4333,9 @@ struct BuiltContents {
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     framework_sources: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    build_path_requests: BTreeSet<rift_protocol::read::ProjectPath>,
+    build_paths:
+        BTreeMap<rift_protocol::read::ProjectPath, Option<rift_analysis::ArchiveMemberKind>>,
     raw_syntax: BTreeMap<ProjectPath, Arc<rift_syntax::SyntaxFacts>>,
     left_out: BTreeMap<ProjectPath, LeftOutFileState>,
     warnings: Vec<WorkspaceIndexWarning>,
@@ -4008,25 +4343,182 @@ struct BuiltContents {
     semantics: WorkspaceSemantics,
 }
 
-/// Builds the semantics graph over `contents`, leaving out every held file whose
-/// declarations the Contribution contract refuses.
+fn captured_project_semantics(
+    root: &Path,
+    contents: &IndexContents,
+    limits: WorkspaceIndexLimits,
+    fingerprint: &WorkspaceFingerprint,
+    previous: Option<&NormalizedGraph>,
+    owner: &SymbolOwner,
+) -> Result<BuiltSemantics, RiftError> {
+    let revision = captured_semantic_revision(fingerprint, root, owner)?;
+    let revision = captured_build_paths_revision(
+        revision,
+        &contents.build_path_requests,
+        &contents.build_paths,
+    );
+    let documents = contents.files.values().map(Arc::as_ref).collect::<Vec<_>>();
+    let Some(first) = documents.first() else {
+        return WorkspaceSemantics::build_project_facts_with_relationships(
+            std::iter::empty(),
+            limits.declarations_max(),
+            limits.relationships_max(),
+            revision,
+            previous,
+        );
+    };
+    let files = documents
+        .iter()
+        .map(|file| rift_analysis::PackageSource::new(file.path(), file.source()))
+        .collect::<Vec<_>>();
+    let metadata = contents
+        .text_files
+        .iter()
+        .chain(&contents.framework_sources)
+        .filter(|(path, _)| !contents.files.contains_key(*path))
+        .collect::<BTreeMap<_, _>>();
+    let metadata = metadata
+        .values()
+        .map(|file| rift_analysis::PackageSource::new(file.path(), file.content()))
+        .collect::<Vec<_>>();
+    let input = rift_analysis::NamespaceInput::workspace(
+        owner,
+        first.syntax().language(),
+        &files,
+        &metadata,
+        &[],
+        (
+            limits.files_max(),
+            u64::try_from(limits.workspace_bytes_max()).unwrap_or(u64::MAX),
+            limits.syntax(),
+        ),
+    )?
+    .with_build_paths(&contents.build_paths)?;
+    WorkspaceSemantics::build_captured_project_facts(
+        input,
+        &documents,
+        limits.declarations_max(),
+        limits.relationships_max(),
+        revision,
+        previous,
+    )
+}
+
+fn validate_captured_source_bytes(contents: &IndexContents) -> Result<(), RiftError> {
+    for (path, file) in contents
+        .text_files
+        .iter()
+        .chain(&contents.framework_sources)
+    {
+        if path != file.path()
+            || contents.files.get(path).is_some_and(|source| {
+                source.source() != file.content() || source.executable() != file.executable()
+            })
+            || contents.text_files.get(path).is_some_and(|source| {
+                source.content() != file.content() || source.executable() != file.executable()
+            })
+        {
+            return errors::analysis::package_input_identity_invalid().fail();
+        }
+    }
+    Ok(())
+}
+
+/// Validates the fixed local owner before a workspace capture or repository read.
 ///
-/// The graph is built over every held document at once. Refused Contributions name their
-/// documents, so the build leaves all such files out together, keeps their digests, then
-/// builds the graph again. A failure the left-out rule does not route fails the build with
-/// the fault, path attached when known.
+/// # Errors
+/// Returns [`RiftError`] for a released owner or invalid named registration.
+pub fn validate_project_owner(owner: &SymbolOwner) -> Result<(), RiftError> {
+    let scope = match owner {
+        SymbolOwner::Local => "local".to_owned(),
+        SymbolOwner::NamedLocal { name } => {
+            owner
+                .validate()
+                .map_err(|_| errors::analysis::package_input_identity_invalid().error())?;
+            format!("local@{name}")
+        }
+        _ => return errors::analysis::package_input_identity_invalid().fail(),
+    };
+    if rift_protocol::identity::parse_local_scope(&scope)
+        .map_err(|_| errors::analysis::package_input_identity_invalid().error())?
+        != *owner
+    {
+        return errors::analysis::package_input_identity_invalid().fail();
+    }
+    Ok(())
+}
+
+fn captured_semantic_revision(
+    fingerprint: &WorkspaceFingerprint,
+    root: &Path,
+    owner: &SymbolOwner,
+) -> Result<u64, RiftError> {
+    let mut hasher = Sha256::new();
+    hasher.update(fingerprint.0);
+    hasher.update(root.as_os_str().as_encoded_bytes());
+    hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+    match owner {
+        SymbolOwner::Local => hasher.update(b"local"),
+        SymbolOwner::NamedLocal { name } => {
+            hasher.update(b"local@");
+            hasher.update(name.as_bytes());
+        }
+        _ => return errors::analysis::package_input_identity_invalid().fail(),
+    }
+    Ok(WorkspaceFingerprint(hasher.finalize().into()).revision_number())
+}
+
+fn captured_build_paths_revision(
+    revision: u64,
+    requested: &BTreeSet<rift_protocol::read::ProjectPath>,
+    paths: &BTreeMap<rift_protocol::read::ProjectPath, Option<rift_analysis::ArchiveMemberKind>>,
+) -> u64 {
+    if requested.is_empty() && paths.is_empty() {
+        return revision;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(revision.to_be_bytes());
+    for path in requested {
+        hasher.update(path.0.as_bytes());
+        hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+    }
+    hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+    for (path, kind) in paths {
+        hasher.update(path.0.as_bytes());
+        hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+        hasher.update(match kind {
+            None => b"missing".as_slice(),
+            Some(rift_analysis::ArchiveMemberKind::File) => b"file".as_slice(),
+            Some(rift_analysis::ArchiveMemberKind::Directory) => b"directory".as_slice(),
+            Some(rift_analysis::ArchiveMemberKind::Link) => b"link".as_slice(),
+        });
+        hasher.update([FINGERPRINT_PATH_SEPARATOR]);
+    }
+    WorkspaceFingerprint(hasher.finalize().into()).revision_number()
+}
+
+/// Builds the semantics graph over captured sources and metadata.
 ///
-/// `declarations_max` is the publication's own capacity, the `[source]` table's
-/// `declarations`. A workspace carrying more declarations than that publishes the files
-/// that fit and leaves the rest out, so the index serves what it can instead of refusing
-/// the whole build.
+/// Refused contributions and declarations past the bound retain their file digests
+/// while the build omits their documents. Each retry uses the same captured bytes.
+#[cfg(test)]
 fn built_contents(
     root: &Path,
-    mut contents: IndexContents,
-    declarations_max: usize,
-    relationships_max: usize,
+    contents: IndexContents,
+    limits: WorkspaceIndexLimits,
     previous: Option<&NormalizedGraph>,
 ) -> Result<BuiltContents, RiftError> {
+    built_contents_with_owner((root, &SymbolOwner::Local), contents, limits, previous)
+}
+
+fn built_contents_with_owner(
+    (root, owner): (&Path, &SymbolOwner),
+    mut contents: IndexContents,
+    limits: WorkspaceIndexLimits,
+    previous: Option<&NormalizedGraph>,
+) -> Result<BuiltContents, RiftError> {
+    validate_project_owner(owner)?;
+    validate_captured_source_bytes(&contents)?;
     let passes_max = contents.files.len().saturating_add(1);
     let mut passes = 0_usize;
     rift_tracing::traced!(
@@ -4038,6 +4530,7 @@ fn built_contents(
                 let fingerprint = WorkspaceFingerprint::from_files(
                     &contents.files,
                     &contents.text_files,
+                    &contents.framework_sources,
                     &contents.left_out,
                 );
                 let built = rift_tracing::traced!(
@@ -4046,15 +4539,13 @@ fn built_contents(
                     phase = "WorkspaceSemantics::build_project_facts",
                     files = contents.files.len(),
                     {
-                        WorkspaceSemantics::build_project_facts_with_relationships(
-                            contents
-                                .files
-                                .values()
-                                .map(|file| (file.syntax(), file.path())),
-                            declarations_max,
-                            relationships_max,
-                            fingerprint.revision_number(),
+                        captured_project_semantics(
+                            root,
+                            &contents,
+                            limits,
+                            &fingerprint,
                             previous,
+                            owner,
                         )
                     }
                 );
@@ -4083,6 +4574,8 @@ fn built_contents(
                             files,
                             text_files,
                             framework_sources,
+                            build_path_requests,
+                            build_paths,
                             raw_syntax,
                             left_out,
                             warnings,
@@ -4091,6 +4584,8 @@ fn built_contents(
                             files,
                             text_files,
                             framework_sources,
+                            build_path_requests,
+                            build_paths,
                             raw_syntax,
                             left_out,
                             warnings,
@@ -4950,6 +5445,7 @@ impl WorkspaceDigests {
 fn keyed_digests(
     files: &BTreeMap<ProjectPath, Arc<IndexedFile>>,
     text_files: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
+    framework_sources: &BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     left_out: &BTreeMap<ProjectPath, LeftOutFileState>,
 ) -> WorkspaceDigests {
     WorkspaceDigests::classified(
@@ -4962,6 +5458,7 @@ fn keyed_digests(
         }),
         text_files
             .iter()
+            .chain(framework_sources)
             .map(|(path, file)| {
                 (
                     path.clone(),
@@ -8686,6 +9183,57 @@ mod tests {
         );
     }
 
+    fn readable_with_current_anchor(
+        index: &WorkspaceIndex,
+        readable: &super::ReadableSymbol,
+        identity: &str,
+    ) -> super::ReadableSymbol {
+        let graph = index.semantics.graph();
+        let key = readable
+            .assembled()
+            .contributions()
+            .first()
+            .expect("syntax key");
+        let current = graph
+            .contribution(key)
+            .expect("captured syntax contribution");
+        let anchored = rift_core::Contribution::builder(
+            current.key().clone(),
+            current.applicability(),
+            current.facts().expect("portable facts").clone(),
+            current.origin().clone(),
+        )
+        .source(current.source().expect("physical declaration").clone())
+        .identity_anchor(rift_core::SymbolId::new(identity).expect("bounded anchor"))
+        .build()
+        .expect("current anchored contribution");
+        let limits = rift_provider::PublicationLimits::new(1, 1, 1).expect("fixture bounds");
+        let publication = rift_provider::ProviderPublication::new(
+            key.reference().provider().clone(),
+            key.publication(),
+            vec![anchored],
+            limits,
+        )
+        .expect("current publication");
+        let publications = Arc::new(
+            rift_provider::PublicationSet::empty(limits)
+                .replaced(publication)
+                .expect("captured publication"),
+        );
+        let anchored_graph = rift_provider::Normalizer::normalize(
+            graph.index_revision(),
+            graph.source_revision(),
+            graph.tree_revision(),
+            &publications,
+            None,
+        )
+        .expect("current normalized anchor");
+        let record = anchored_graph.records().first().expect("normalized record");
+        let assembled = rift_provider::SymbolAssembler::assemble(&anchored_graph, record, &[])
+            .expect("current assembly");
+        super::ReadableSymbol::new(assembled).expect("portable readable")
+    }
+
     #[test]
     fn assembled_symbol_requires_normalized_record_and_portable_facts() {
         let directory = fixture();
@@ -8705,12 +9253,30 @@ mod tests {
         let readable = index
             .assembled_symbol(matched)
             .expect("normalized readable symbol");
-        assert_eq!(
-            readable.identity().map(rift_core::SymbolId::as_str),
-            Some("rift://symbol/rust/src/lib.rs/Rift::update")
-        );
+        assert!(readable.identity().is_none());
         assert_eq!(readable.facts().name(), "update");
         assert!(!readable.assembled().contributions().is_empty());
+
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            rift_protocol::read::Language::from_identity_segment("rust").expect("Rust language"),
+            vec!["fixture".into(), "Rift".into(), "update".into()],
+        )
+        .expect("canonical current anchor")
+        .wire_identity();
+        let anchored_readable = readable_with_current_anchor(&index, &readable, &identity);
+        assert_eq!(
+            anchored_readable
+                .identity()
+                .map(rift_core::SymbolId::as_str),
+            Some(identity.as_str())
+        );
+        assert_eq!(anchored_readable.facts().name(), readable.facts().name());
+        assert_eq!(
+            anchored_readable.assembled().contributions(),
+            readable.assembled().contributions()
+        );
+        assert!(readable.identity().is_none());
 
         let other_directory = tempfile::tempdir().expect("other workspace");
         fs::write(
@@ -9565,6 +10131,44 @@ mod tests {
         assert_eq!(index.left_out_file_count(), 2);
     }
 
+    #[test]
+    fn binary_archive_does_not_stop_neighboring_source_or_raw_capture() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        let archive = project(
+            "test/cli/install/registry/packages/no-deps-backward-tags/no-deps-backward-tags-1.0.0-rc.1.tgz",
+        );
+        let archive_path = root.join(archive.as_str());
+        fs::create_dir_all(archive_path.parent().expect("archive directory"))
+            .expect("archive directory");
+        let bytes = b"archive\0bytes";
+        fs::write(&archive_path, bytes).expect("binary archive");
+        fs::write(root.join("valid.rs"), "pub fn kept() {}\n").expect("valid source");
+        let index = indexed(root, &TextFileInclusion::default());
+        assert!(index.file(&project("valid.rs")).is_some());
+        assert_eq!(index.left_out_file_count(), 1);
+        assert_eq!(
+            index.warnings(),
+            [WorkspaceIndexWarning::BinarySource(archive.clone())]
+        );
+        assert!(index.digest(&archive).is_none());
+        let archive_path = index.root().join(archive.as_str());
+        let (first, captured) = captured_after(root, &LastCapture::default());
+        let raw = captured.captured(&archive_path).expect("captured archive");
+        assert!(raw.file().is_none());
+        assert_eq!(raw.content(), Some((bytes.len(), FileDigest::of(bytes))));
+        assert_eq!(first.fingerprint(), *index.fingerprint());
+        let (second, reused) = captured_after(root, &captured);
+        assert_eq!(second.fingerprint(), first.fingerprint());
+        assert_eq!(
+            reused
+                .captured(&archive_path)
+                .expect("unchanged archive")
+                .content(),
+            raw.content()
+        );
+    }
+
     /// Parenthesis nesting past the shipped syntax depth bound of 512.
     const DEEP_NESTING: usize = 600;
 
@@ -9679,9 +10283,8 @@ mod tests {
         assert_eq!(repaired.digests().fingerprint(), *repaired.fingerprint());
     }
 
-    /// A declaration named exactly `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes: the document
-    /// keeps it, and the identity minted from it passes the bound, so the Contribution
-    /// contract refuses `provider_symbol`.
+    /// A declaration at the portable-name bound remains valid. Its overbound physical
+    /// address uses a bounded provider key and cannot establish a logical identity.
     fn wide_source() -> String {
         format!(
             "pub struct {};\n",
@@ -9690,7 +10293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_leaves_a_file_whose_declaration_the_contract_refuses_out_and_keeps_the_rest() {
+    fn test_build_keeps_exact_bound_names_with_unresolved_logical_identity() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();
         fs::create_dir_all(root.join("src")).expect("fixture directory");
@@ -9698,18 +10301,30 @@ mod tests {
         fs::write(root.join("src/wide.rs"), wide_source()).expect("wide source");
         let index = indexed(root, &TextFileInclusion::default());
         let wide = ProjectPath::new("src/wide.rs").expect("path");
-        assert!(index.file(&wide).is_none(), "the wide file is not indexed");
+        let held = index
+            .file(&wide)
+            .expect("valid exact-bound source stays indexed");
+        assert_eq!(held.source(), wide_source());
         assert!(
-            index.text_file(&wide).is_none(),
-            "the wide file is absent from the text catalog too"
+            index.text_file(&wide).is_some(),
+            "the original source remains in the text catalog"
         );
         assert!(has_symbol(&index, "kept"), "the normal file still serves");
-        assert_eq!(index.file_count(), 1);
-        assert_eq!(index.left_out_file_count(), 1);
-        assert!(
-            matches!(index.warnings(), [WorkspaceIndexWarning::Contribution { path, error }]
-            if path == &wide && error.context().any(|(key, value)| key == "field" && value == "provider_symbol"))
-        );
+        assert_eq!(index.file_count(), 2);
+        assert_eq!(index.left_out_file_count(), 0);
+        assert!(index.warnings().is_empty());
+        let records = index.semantics.graph().records();
+        assert!(records.iter().any(|record| record.identity().is_none()
+            && record.contributions().iter().any(|key| {
+                index
+                    .semantics
+                    .graph()
+                    .contribution(key)
+                    .and_then(rift_core::Contribution::facts)
+                    .is_some_and(|facts| {
+                        facts.name().len() == rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX
+                    })
+            })));
         let capture = capture_digests(
             root,
             WorkspaceIndexLimits::default(),
@@ -9725,7 +10340,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_leaves_a_file_turned_wide_out_and_holds_it_again_once_repaired() {
+    fn test_rebuild_keeps_exact_bound_source_and_restores_established_identity_when_repaired() {
         let directory = fixture();
         let root = directory.path();
         let index = indexed(root, &TextFileInclusion::default());
@@ -9735,13 +10350,20 @@ mod tests {
         let changes = resolved(&index, root, &["src/lib.rs"]);
         let wide = index
             .rebuilt(&changes)
-            .expect("one refused declaration must not fail rebuild");
-        assert!(wide.file(&lib_path).is_none());
-        assert!(wide.text_file(&lib_path).is_none());
-        assert_eq!(wide.left_out_file_count(), 1);
+            .expect("one unresolved identity must not fail rebuild");
+        assert_eq!(
+            wide.file(&lib_path).expect("source held").source(),
+            wide_source()
+        );
+        assert!(wide.text_file(&lib_path).is_some());
+        assert_eq!(wide.left_out_file_count(), 0);
+        assert!(wide.warnings().is_empty());
         assert!(
-            matches!(wide.warnings(), [WorkspaceIndexWarning::Contribution { path, error }]
-            if path == &lib_path && error.context().any(|(key, value)| key == "field" && value == "provider_symbol"))
+            wide.semantics
+                .graph()
+                .records()
+                .iter()
+                .any(|record| record.identity().is_none())
         );
         assert_eq!(wide.digests().fingerprint(), *wide.fingerprint());
 
@@ -9752,6 +10374,7 @@ mod tests {
             .expect("the repaired file must rebuild");
         assert!(repaired.file(&lib_path).is_some());
         assert_eq!(repaired.left_out_file_count(), 0);
+        assert!(has_symbol(&repaired, "Rift"));
     }
 
     /// A provider error leaves a file out only when one document's Contribution was
@@ -10745,6 +11368,845 @@ mod tests {
         }
     }
 
+    fn captured_rust_contents(root: &Path, metadata: &str) -> IndexContents {
+        let mut contents = IndexContents::default();
+        contents
+            .hold_source_file(
+                declaring_file("src/lib.rs", 1),
+                &root.join("src/lib.rs"),
+                registry::provider_for_extension("rs").expect("Rust provider"),
+                SyntaxLimits::default(),
+            )
+            .expect("captured source");
+        contents.hold_text_file(TextSourceFile::from_content(
+            ProjectPath::new("Cargo.toml").expect("manifest path"),
+            metadata.to_owned(),
+        ));
+        contents
+    }
+
+    #[test]
+    fn fixed_named_owner_survives_capture_rescan_and_incremental_rebuild() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/lib.rs"), "pub fn beacon_0() {}").expect("source bytes");
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'",
+        )
+        .expect("captured manifest");
+        let limits = WorkspaceIndexLimits::default();
+        let visibility = SourceVisibility::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        let owner = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let named = WorkspaceIndex::build_with_owner(
+            (root.path(), owner.clone()),
+            limits,
+            &visibility,
+            &text,
+            &languages,
+            None,
+            &|| false,
+        )
+        .expect("named capture");
+        let primary = WorkspaceIndex::build(root.path(), limits, &visibility, &text)
+            .expect("primary capture");
+        let provider = symbol_identity("rust", "src/lib.rs", "beacon_0");
+        let identity = named
+            .semantics
+            .assembled(&provider)
+            .expect("named declaration")
+            .identity()
+            .expect("proved named identity")
+            .clone();
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(identity.as_str())
+            .expect("canonical named identity");
+        assert_eq!(parsed.owner(), &owner);
+        assert_eq!(named.owner(), &owner);
+        assert_ne!(
+            primary
+                .semantics
+                .assembled(&provider)
+                .expect("primary declaration")
+                .identity(),
+            Some(&identity)
+        );
+        assert_eq!(primary.fingerprint, named.fingerprint);
+        let rebuilt = named
+            .rebuilt(&PathChanges::default())
+            .expect("incremental publication");
+        let rescanned = named
+            .rescanned_cancellable(&visibility, &|| false)
+            .expect("rescan");
+        for held in [&named, &rebuilt, &rescanned] {
+            assert_eq!(held.owner(), &owner);
+            assert_eq!(
+                held.semantics
+                    .assembled(&provider)
+                    .expect("held declaration")
+                    .identity(),
+                Some(&identity)
+            );
+            assert_eq!(
+                held.files
+                    .get(&ProjectPath::new("src/lib.rs").expect("source path"))
+                    .expect("physical source")
+                    .source(),
+                "pub fn beacon_0() {}"
+            );
+        }
+        let preparation = WorkspaceIndexPreparation::new_with_owner(
+            root.path(),
+            owner.clone(),
+            limits,
+            &text,
+            &languages,
+        )
+        .expect("fixed preparation");
+        assert_eq!(
+            preparation
+                .empty_snapshot()
+                .expect("empty captured view")
+                .owner(),
+            &owner
+        );
+        assert!(!preparation.accepts_previous(&primary));
+    }
+
+    #[test]
+    fn invalid_fixed_owner_refuses_before_root_capture() {
+        let root = Path::new("captured-owner-refusal");
+        let limits = WorkspaceIndexLimits::default();
+        let text = TextFileInclusion::default();
+        let languages = LanguageFileSelections::default();
+        for owner in [
+            SymbolOwner::NamedLocal {
+                name: "Invalid".to_owned(),
+            },
+            SymbolOwner::Runtime {
+                runtime: "rust".to_owned(),
+                version: "1.98.1".to_owned(),
+            },
+        ] {
+            let Err(error) = WorkspaceIndexPreparation::new_with_owner(
+                root,
+                owner.clone(),
+                limits,
+                &text,
+                &languages,
+            ) else {
+                panic!("owner refused");
+            };
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.analysis.package_input_identity_invalid"
+            );
+            let error = WorkspaceIndex::build_with_owner(
+                (root, owner),
+                limits,
+                &SourceVisibility::default(),
+                &text,
+                &languages,
+                None,
+                &|| false,
+            )
+            .expect_err("owner refused before root lookup");
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.analysis.package_input_identity_invalid"
+            );
+        }
+    }
+
+    fn captured_python_contents(
+        root: &Path,
+        path: &str,
+        text: &str,
+        metadata: &str,
+    ) -> IndexContents {
+        let mut contents = IndexContents::default();
+        contents
+            .hold_source_file(
+                TextSourceFile::from_content(
+                    ProjectPath::new(path).expect("source path"),
+                    text.to_owned(),
+                ),
+                &root.join(path),
+                registry::provider_for_extension("py").expect("Python provider"),
+                SyntaxLimits::default(),
+            )
+            .expect("captured Python source");
+        contents.hold_text_file(TextSourceFile::from_content(
+            ProjectPath::new("pyproject.toml").expect("metadata path"),
+            metadata.to_owned(),
+        ));
+        contents
+    }
+
+    #[test]
+    fn captured_pdm_entry_changes_preserve_file_digests_and_old_view() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("fastapi")).expect("package directory");
+        let source = "def serve():\n    return 1\n";
+        let metadata = "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n";
+        fs::write(root.path().join("fastapi/__init__.py"), source).expect("package source");
+        fs::write(root.path().join("pyproject.toml"), metadata).expect("captured metadata");
+        let mut contents =
+            captured_python_contents(root.path(), "fastapi/__init__.py", source, metadata);
+        contents
+            .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
+            .expect("captured entry kinds");
+        let provider = symbol_identity("python", "fastapi/__init__.py", "serve");
+        let first = built_contents(
+            root.path(),
+            contents.clone(),
+            WorkspaceIndexLimits::default(),
+            None,
+        )
+        .expect("root package publication");
+        let identity = first
+            .semantics
+            .assembled(&provider)
+            .expect("retained facts")
+            .identity()
+            .expect("captured package identity")
+            .clone();
+        assert_eq!(
+            contents
+                .build_paths
+                .get(&rift_protocol::read::ProjectPath("src".to_owned())),
+            Some(&None)
+        );
+        fs::create_dir(root.path().join("src")).expect("empty source directory");
+        contents
+            .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
+            .expect("changed directory observation");
+        let second = built_contents(
+            root.path(),
+            contents,
+            WorkspaceIndexLimits::default(),
+            Some(first.semantics.graph()),
+        )
+        .expect("empty source directory publication");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_ne!(
+            first.semantics.graph().source_revision(),
+            second.semantics.graph().source_revision()
+        );
+        assert!(
+            second
+                .semantics
+                .assembled(&provider)
+                .expect("retained unproved facts")
+                .identity()
+                .is_none()
+        );
+        assert_eq!(
+            first
+                .semantics
+                .assembled(&provider)
+                .expect("old captured view")
+                .identity(),
+            Some(&identity)
+        );
+        fs::remove_dir(root.path().join("src")).expect("remove empty source directory");
+        let mut restored =
+            captured_python_contents(root.path(), "fastapi/__init__.py", source, metadata);
+        restored
+            .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
+            .expect("restored observations");
+        let third = built_contents(
+            root.path(),
+            restored.clone(),
+            WorkspaceIndexLimits::default(),
+            None,
+        )
+        .expect("restored package publication");
+        assert_eq!(
+            third
+                .semantics
+                .assembled(&provider)
+                .expect("restored facts")
+                .identity(),
+            Some(&identity)
+        );
+    }
+
+    #[test]
+    fn captured_pdm_hook_preserves_unproved_source_facts() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("fastapi")).expect("package directory");
+        let source = "def serve():\n    return 1\n";
+        let metadata = "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n";
+        fs::write(root.path().join("fastapi/__init__.py"), source).expect("package source");
+        fs::write(root.path().join("pyproject.toml"), metadata).expect("metadata");
+        fs::write(root.path().join("pdm_build.py"), "pass\n").expect("build hook");
+        let mut contents =
+            captured_python_contents(root.path(), "fastapi/__init__.py", source, metadata);
+        contents
+            .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
+            .expect("present hook observation");
+        let hooked = built_contents(root.path(), contents, WorkspaceIndexLimits::default(), None)
+            .expect("hook keeps unproved facts");
+        let provider = symbol_identity("python", "fastapi/__init__.py", "serve");
+        assert!(
+            hooked
+                .semantics
+                .assembled(&provider)
+                .expect("retained facts")
+                .identity()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn static_module_capture_uses_parsed_metadata_from_full_workspace_build() {
+        let directory = tempfile::tempdir().expect("workspace");
+        fs::write(
+            directory.path().join("main.py"),
+            "def serve():\n    return 1\n",
+        )
+        .expect("module source");
+        fs::write(
+            directory.path().join("pyproject.toml"),
+            "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['main']\n",
+        )
+        .expect("static module metadata");
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("complete workspace capture");
+        assert!(
+            index
+                .file(&ProjectPath::new("pyproject.toml").expect("metadata path"))
+                .is_some()
+        );
+        for path in ["setup.py", "setup.cfg"] {
+            assert_eq!(
+                index
+                    .build_paths()
+                    .get(&rift_protocol::read::ProjectPath(path.to_owned())),
+                Some(&None)
+            );
+        }
+        let provider = symbol_identity("python", "main.py", "serve");
+        let matches = index
+            .symbols_by_provider_identity(&provider, 1)
+            .expect("captured provider directory");
+        assert_eq!(matches.len(), 1);
+        assert!(
+            index
+                .assembled_symbol(matches[0])
+                .expect("retained module facts")
+                .identity()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn captured_unknown_build_paths_spend_count_and_byte_bounds() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path().join("not-directory");
+        fs::write(&root, "retained").expect("regular root refuses child observations");
+        let source = "def serve():\n    return 1\n";
+        let metadata = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['main']\n";
+        let mut contents = captured_python_contents(&root, "main.py", source, metadata);
+        contents
+            .capture_build_paths(&root, WorkspaceIndexLimits::default(), &|| false)
+            .expect("unknown child observations retain requests");
+        assert!(contents.build_paths.len() < contents.build_path_requests.len());
+        let count = 2 + contents.build_path_requests.len();
+        let bytes = source.len()
+            + metadata.len()
+            + contents
+                .build_path_requests
+                .iter()
+                .map(|path| path.0.len())
+                .sum::<usize>();
+        let limits = WorkspaceIndexLimits {
+            files_max: count,
+            workspace_bytes_max: bytes,
+            ..WorkspaceIndexLimits::default()
+        };
+        contents
+            .capture_build_paths(&root, limits, &|| false)
+            .expect("exact count and byte bounds admit unknown requests");
+        let old_requests = contents.build_path_requests.clone();
+        let old_observations = contents.build_paths.clone();
+        let error = contents
+            .capture_build_paths(
+                &root,
+                WorkspaceIndexLimits {
+                    files_max: count - 1,
+                    ..limits
+                },
+                &|| false,
+            )
+            .expect_err("unknown paths spend the count bound");
+        assert_eq!(
+            error.slug(),
+            errors::analysis::package_input_too_many_files::SLUG
+        );
+        let error = contents
+            .capture_build_paths(
+                &root,
+                WorkspaceIndexLimits {
+                    workspace_bytes_max: bytes - 1,
+                    ..limits
+                },
+                &|| false,
+            )
+            .expect_err("unknown paths spend the byte bound");
+        assert_eq!(
+            error.slug(),
+            errors::index::workspace_workspace_too_large::SLUG
+        );
+        assert_eq!(contents.build_path_requests, old_requests);
+        assert_eq!(contents.build_paths, old_observations);
+    }
+
+    #[test]
+    fn captured_static_modules_require_complete_configuration_observations() {
+        let root = tempfile::tempdir().expect("workspace");
+        let source = "def serve():\n    return 1\n";
+        let metadata = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['main']\n";
+        fs::write(root.path().join("main.py"), source).expect("module source");
+        fs::write(root.path().join("pyproject.toml"), metadata).expect("static metadata");
+        let mut contents = captured_python_contents(root.path(), "main.py", source, metadata);
+        let provider = symbol_identity("python", "main.py", "serve");
+        let unknown = built_contents(
+            root.path(),
+            contents.clone(),
+            WorkspaceIndexLimits::default(),
+            None,
+        )
+        .expect("unknown observations preserve facts");
+        assert!(
+            unknown
+                .semantics
+                .assembled(&provider)
+                .expect("retained facts")
+                .identity()
+                .is_none()
+        );
+        contents
+            .capture_build_paths(root.path(), WorkspaceIndexLimits::default(), &|| false)
+            .expect("complete requested observations");
+        let current = built_contents(
+            root.path(),
+            contents.clone(),
+            WorkspaceIndexLimits::default(),
+            None,
+        )
+        .expect("explicit module publication");
+        assert!(
+            current
+                .semantics
+                .assembled(&provider)
+                .expect("module facts")
+                .identity()
+                .is_some()
+        );
+        let key = rift_protocol::read::ProjectPath("setup.cfg".to_owned());
+        contents.build_paths.remove(&key);
+        let unknown = built_contents(root.path(), contents, WorkspaceIndexLimits::default(), None)
+            .expect("unknown configuration preserves facts");
+        assert!(
+            unknown
+                .semantics
+                .assembled(&provider)
+                .expect("retained facts")
+                .identity()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn captured_metadata_invalidates_local_identity_without_changing_source_or_history() {
+        let root = tempfile::tempdir().expect("workspace");
+        let first = built_contents(
+            root.path(),
+            captured_rust_contents(root.path(), "[package]\nname='beacon'\nversion='1.0.0'"),
+            WorkspaceIndexLimits::default(),
+            None,
+        )
+        .expect("first captured publication");
+        let second = built_contents(
+            root.path(),
+            captured_rust_contents(root.path(), "[package]\nname='compass'\nversion='1.0.0'"),
+            WorkspaceIndexLimits::default(),
+            Some(first.semantics.graph()),
+        )
+        .expect("changed metadata publication");
+        let provider = symbol_identity("rust", "src/lib.rs", "beacon_0");
+        let before = first.semantics.assembled(&provider).expect("first symbol");
+        let after = second
+            .semantics
+            .assembled(&provider)
+            .expect("current symbol");
+        let expected = |name: &str| {
+            rift_protocol::identity::SymbolIdentity::new(
+                SymbolOwner::Local,
+                rift_protocol::read::Language::from_identity_segment("rust")
+                    .expect("Rust language"),
+                vec![name.to_owned(), "beacon_0".to_owned()],
+            )
+            .expect("canonical identity")
+            .wire_identity()
+        };
+        assert_eq!(
+            before.identity().map(SymbolId::as_str),
+            Some(expected("beacon").as_str())
+        );
+        assert_eq!(
+            after.identity().map(SymbolId::as_str),
+            Some(expected("compass").as_str())
+        );
+        assert_ne!(first.fingerprint, second.fingerprint);
+        assert_eq!(
+            first.files.values().next().expect("first file").source(),
+            second.files.values().next().expect("current file").source()
+        );
+        assert_eq!(
+            first
+                .semantics
+                .assembled(&provider)
+                .expect("retained view")
+                .identity(),
+            before.identity()
+        );
+    }
+
+    #[test]
+    fn canonical_identity_directory_retains_physical_bindings_and_fixed_owner() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::write(
+            root.path().join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+        )
+        .expect("captured package metadata");
+        fs::write(
+            root.path().join("index.js"),
+            "export function open(path) {}\n",
+        )
+        .expect("implementation");
+        fs::write(
+            root.path().join("index.d.ts"),
+            "export declare function open(path: string): void;\n",
+        )
+        .expect("declaration");
+        let build = |owner| {
+            WorkspaceIndex::build_with_owner(
+                (root.path(), owner),
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+                &LanguageFileSelections::default(),
+                Some(&WorkspaceContentCache::default()),
+                &|| false,
+            )
+            .expect("captured index")
+        };
+        let primary = build(SymbolOwner::Local);
+        let named = build(SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        });
+        let identity = |index: &WorkspaceIndex| {
+            let matched = index.symbols("open", 10).expect("name lookup");
+            assert_eq!(matched.len(), 2);
+            let first = index.assembled_symbol(matched[0]).expect("first binding");
+            let second = index.assembled_symbol(matched[1]).expect("second binding");
+            assert_eq!(first.identity(), second.identity());
+            first.identity().expect("established identity").clone()
+        };
+        let primary_id = identity(&primary);
+        let named_id = identity(&named);
+        assert_ne!(primary_id, named_id);
+        assert_eq!(
+            rift_protocol::identity::SymbolIdentity::parse(primary_id.as_str())
+                .expect("established logical identity")
+                .language()
+                .name,
+            "javascript"
+        );
+        for (index, id) in [(&primary, &primary_id), (&named, &named_id)] {
+            let bindings = index.symbols_by_identity(id, 10).expect("exact bindings");
+            assert_eq!(bindings.len(), 2);
+            assert_eq!(bindings[0].file.path().as_str(), "index.d.ts");
+            assert_eq!(bindings[1].file.path().as_str(), "index.js");
+            assert_eq!(bindings[0].file.syntax().language().name, "typescript");
+            assert_eq!(bindings[1].file.syntax().language().name, "javascript");
+            assert_eq!(
+                bindings[0]
+                    .symbol
+                    .signatures
+                    .first()
+                    .map(|signature| signature.display.as_str()),
+                Some("function open(path: string): void")
+            );
+            assert_eq!(
+                bindings[1]
+                    .symbol
+                    .signatures
+                    .first()
+                    .map(|signature| signature.display.as_str()),
+                Some("function open(path)")
+            );
+            assert_eq!(
+                index
+                    .symbols_by_identity(id, 1)
+                    .expect("bounded page")
+                    .len(),
+                1
+            );
+            assert!(index.symbols_by_identity(id, 0).is_err());
+            assert!(
+                index
+                    .symbols_by_identity(id, index.results_max() + 1)
+                    .is_err()
+            );
+        }
+        assert!(
+            primary
+                .symbols_by_identity(&named_id, 10)
+                .expect("foreign owner")
+                .is_empty()
+        );
+        assert!(
+            named
+                .symbols_by_identity(&primary_id, 10)
+                .expect("foreign owner")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn documentation_owner_associations_are_cached_deduplicated_and_bounded() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(
+            root.path().join("src/lib.rs"),
+            "/// Measures transit bearings.\npub fn calibrate() {}\n",
+        )
+        .expect("attached source");
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )
+        .expect("captured namespace");
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("captured index");
+        let limits = rift_analysis::documentation::DocumentationLimits::from_configuration(
+            index.text_inclusion.documentation(),
+        )
+        .expect("documentation bounds");
+        let mut layer =
+            DocumentationLayer::shared_with_limits([Arc::clone(&index.documentation)], &limits)
+                .expect("canonical owner layer");
+        let original_count = layer.mapping_count();
+        assert_eq!(
+            index
+                .documentation
+                .index()
+                .blocks
+                .iter()
+                .filter(|block| block.symbol.is_some())
+                .count(),
+            1
+        );
+        index
+            .associate_documentation_owners(&mut layer)
+            .expect("physical owner association");
+        assert_eq!(layer.mapping_count(), original_count + 1);
+        index
+            .associate_documentation_owners(&mut layer)
+            .expect("existing association");
+        assert_eq!(layer.mapping_count(), original_count + 1);
+        let cached = index.documentation_layer().expect("cached layer");
+        assert_eq!(cached.mapping_count(), layer.mapping_count());
+        assert!(std::ptr::eq(
+            cached,
+            index.documentation_layer().expect("same layer")
+        ));
+        let configuration = rift_protocol::documentation::DocumentationConfiguration {
+            max_mappings: u32::try_from(original_count).expect("admitted mapping count"),
+            ..rift_protocol::documentation::DocumentationConfiguration::default()
+        };
+        let limits =
+            rift_analysis::documentation::DocumentationLimits::from_configuration(&configuration)
+                .expect("exact mapping bound");
+        let mut bounded =
+            DocumentationLayer::shared_with_limits([Arc::clone(&index.documentation)], &limits)
+                .expect("original mappings fit");
+        let error = index
+            .associate_documentation_owners(&mut bounded)
+            .expect_err("new mapping exceeds bound");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.documentation_limit_exceeded"
+        );
+        assert_eq!(bounded.mapping_count(), original_count);
+    }
+
+    #[test]
+    fn canonical_identity_directory_does_not_promote_unproved_source_or_previous_view() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        fs::write(root.path().join("src/lib.rs"), "pub fn open() {}\n").expect("source");
+        let build = || {
+            WorkspaceIndex::build(
+                root.path(),
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("index")
+        };
+        let previous = build();
+        let matched = previous.symbols("open", 1).expect("physical declaration");
+        let provider = symbol_identity("rust", "src/lib.rs", "open");
+        let retained = previous
+            .symbols_by_provider_identity(&provider, 1)
+            .expect("opaque provider identity");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].symbol.item_range, matched[0].symbol.item_range);
+        assert!(
+            previous
+                .assembled_symbol(matched[0])
+                .expect("retained facts")
+                .identity()
+                .is_none()
+        );
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )
+        .expect("captured root metadata");
+        let current = build();
+        let matched = current.symbols("open", 1).expect("current declaration");
+        let readable = current.assembled_symbol(matched[0]).expect("current facts");
+        let id = readable.identity().expect("current identity");
+        assert_eq!(
+            current
+                .symbols_by_identity(id, 1)
+                .expect("current binding")
+                .len(),
+            1
+        );
+        assert!(
+            previous
+                .symbols_by_identity(id, 1)
+                .expect("unproved prior view")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn captured_framework_digest_preserves_request_fingerprint_and_semantic_owner_context() {
+        let root = tempfile::tempdir().expect("workspace");
+        fs::create_dir(root.path().join("src")).expect("source directory");
+        let source = declaring_file("src/lib.rs", 1);
+        fs::write(root.path().join("src/lib.rs"), source.content()).expect("source bytes");
+        let metadata = "[package]\nname='beacon'\nversion='1.0.0'";
+        fs::write(root.path().join("Cargo.toml"), metadata).expect("metadata bytes");
+        let mut contents = captured_rust_contents(root.path(), metadata);
+        let lock = TextSourceFile::from_content(
+            ProjectPath::new("package-lock.json").expect("captured metadata path"),
+            "{\"lockfileVersion\":3,\"packages\":{}}".to_owned(),
+        );
+        fs::write(root.path().join("package-lock.json"), lock.content()).expect("lock bytes");
+        contents
+            .framework_sources
+            .insert(lock.path().clone(), Arc::new(lock));
+        let fingerprint = WorkspaceFingerprint::from_files(
+            &contents.files,
+            &contents.text_files,
+            &contents.framework_sources,
+            &contents.left_out,
+        );
+        assert_eq!(
+            fingerprint,
+            WorkspaceFingerprint::capture(
+                root.path(),
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+            )
+            .expect("request capture")
+        );
+        let primary = captured_semantic_revision(&fingerprint, root.path(), &SymbolOwner::Local)
+            .expect("primary context");
+        let named = captured_semantic_revision(
+            &fingerprint,
+            root.path(),
+            &SymbolOwner::NamedLocal {
+                name: "cloud".to_owned(),
+            },
+        )
+        .expect("named context");
+        assert_ne!(primary, named);
+        assert_ne!(
+            primary,
+            captured_semantic_revision(
+                &fingerprint,
+                &root.path().join("other"),
+                &SymbolOwner::Local,
+            )
+            .expect("different fixed root")
+        );
+        let without_framework = WorkspaceFingerprint::from_files(
+            &contents.files,
+            &contents.text_files,
+            &BTreeMap::new(),
+            &contents.left_out,
+        );
+        assert_ne!(fingerprint, without_framework);
+    }
+
+    #[test]
+    fn captured_metadata_duplicates_require_same_source_bytes() {
+        let root = tempfile::tempdir().expect("workspace");
+        let metadata = "[package]\nname='beacon'\nversion='1.0.0'";
+        let mut contents = captured_rust_contents(root.path(), metadata);
+        let path = ProjectPath::new("Cargo.toml").expect("metadata path");
+        let same = Arc::clone(contents.text_files.get(&path).expect("captured metadata"));
+        contents.framework_sources.insert(path.clone(), same);
+        let without_duplicate = WorkspaceFingerprint::from_files(
+            &contents.files,
+            &contents.text_files,
+            &BTreeMap::new(),
+            &contents.left_out,
+        );
+        let with_duplicate = WorkspaceFingerprint::from_files(
+            &contents.files,
+            &contents.text_files,
+            &contents.framework_sources,
+            &contents.left_out,
+        );
+        assert_eq!(without_duplicate, with_duplicate);
+        validate_captured_source_bytes(&contents).expect("same captured bytes");
+        contents.framework_sources.insert(
+            path.clone(),
+            Arc::new(TextSourceFile::from_content(
+                path,
+                "[package]\nname='compass'\nversion='1.0.0'".to_owned(),
+            )),
+        );
+        assert!(
+            built_contents(root.path(), contents, WorkspaceIndexLimits::default(), None).is_err()
+        );
+    }
+
     /// A workspace declaring more than the publication holds keeps the files that fit and
     /// leaves the rest out, so a large workspace is served rather than refused. The
     /// production bound is a million declarations, which no test tree reaches, so the build
@@ -10768,8 +12230,10 @@ mod tests {
         let built = built_contents(
             root.path(),
             contents.sorted(),
-            4,
-            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            WorkspaceIndexLimits {
+                declarations_max: 4,
+                ..WorkspaceIndexLimits::default()
+            },
             None,
         )
         .expect("the build publishes the files that fit");
@@ -10825,8 +12289,10 @@ mod tests {
         let built = built_contents(
             root.path(),
             contents.sorted(),
-            6,
-            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            WorkspaceIndexLimits {
+                declarations_max: 6,
+                ..WorkspaceIndexLimits::default()
+            },
             None,
         )
         .expect("the build publishes every file");
@@ -10836,7 +12302,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_python_contributions_leave_out_in_one_batch() {
+    fn exact_bound_python_names_keep_bounded_provider_keys_in_one_batch() {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = registry::provider_for_extension("py").expect("the Python provider");
         let limits = SyntaxLimits::default();
@@ -10873,52 +12339,66 @@ mod tests {
                 .expect("provider parses exact-bound name");
         }
 
-        let mut expected = contents.clone();
-        for path in ["src/wide_a.py", "src/wide_b.py"] {
-            let path = ProjectPath::new(path).expect("path");
-            assert!(
-                expected.leave_out_held(
-                    &path,
-                    WorkspaceIndexWarning::Contribution {
-                        path: path.clone(),
-                        error: Arc::new(
-                            errors::core::contribution_invalid_name()
-                                .field("provider_symbol")
-                                .error()
-                        ),
-                    },
-                )
-            );
-        }
         let built = built_contents(
             root.path(),
             contents.sorted(),
-            10,
-            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            WorkspaceIndexLimits {
+                declarations_max: 10,
+                ..WorkspaceIndexLimits::default()
+            },
             None,
         )
-        .expect("all refused declarations leave out together");
-        let expected = built_contents(
-            root.path(),
-            expected.sorted(),
-            10,
-            rift_analysis::RELATIONSHIP_EDGES_MAX,
-            None,
-        )
-        .expect("valid source alone builds");
-        assert_eq!(built.left_out.len(), 2);
-        assert!(matches!(built.warnings.as_slice(), [
-            WorkspaceIndexWarning::Contribution { path: first, error: first_error },
-            WorkspaceIndexWarning::Contribution { path: second, error: second_error },
-        ] if first.as_str() == "src/wide_a.py"
-            && second.as_str() == "src/wide_b.py"
-            && first_error.context().any(|(key, value)| key == "field" && value == "provider_symbol")
-            && second_error.context().any(|(key, value)| key == "field" && value == "provider_symbol")));
-        assert_eq!(
-            built.semantics.graph().records(),
-            expected.semantics.graph().records(),
-            "accepted graph matches build without refused files"
+        .expect("valid exact-bound names build together");
+        assert_eq!(built.left_out.len(), 0);
+        assert!(built.warnings.is_empty());
+        let graph = built.semantics.graph();
+        assert_eq!(graph.records().len(), 3);
+        let wide_records = graph
+            .records()
+            .iter()
+            .filter(|record| {
+                record.contributions().iter().any(|key| {
+                    graph
+                        .contribution(key)
+                        .and_then(|value| value.source())
+                        .is_some_and(|binding| {
+                            matches!(
+                                binding.unit().key().as_str(),
+                                "src/wide_a.py" | "src/wide_b.py"
+                            )
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(wide_records.len(), 2);
+        assert!(
+            graph
+                .records()
+                .iter()
+                .any(|record| record.contributions().iter().any(|key| {
+                    graph.contribution(key).is_some_and(|value| {
+                        value
+                            .source()
+                            .is_some_and(|binding| binding.unit().key().as_str() == "src/valid.py")
+                            && value.facts().is_some_and(|facts| facts.name() == "beacon")
+                    })
+                }))
         );
+        for record in wide_records {
+            assert!(record.identity().is_none());
+            assert_eq!(record.contributions().len(), 1);
+            let key = &record.contributions()[0];
+            assert_eq!(key.reference().symbol().as_str().len(), 71);
+            assert!(key.reference().symbol().as_str().starts_with("sha256:"));
+            let contribution = graph.contribution(key).expect("retained contribution");
+            assert_eq!(contribution.facts().expect("retained facts").name(), name);
+            let binding = contribution.source().expect("original physical binding");
+            assert!(matches!(
+                binding.unit().key().as_str(),
+                "src/wide_a.py" | "src/wide_b.py"
+            ));
+            assert!(binding.range().end() > binding.range().start());
+        }
     }
 
     /// A semantics build the publication refuses fails the index build, naming the
@@ -10930,8 +12410,10 @@ mod tests {
         let error = built_contents(
             root.path(),
             IndexContents::default(),
-            0,
-            rift_analysis::RELATIONSHIP_EDGES_MAX,
+            WorkspaceIndexLimits {
+                declarations_max: 0,
+                ..WorkspaceIndexLimits::default()
+            },
             None,
         )
         .err()

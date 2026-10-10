@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+mod captured;
+
 use rift_core::{
     ContributionReference, IndexRevision, ProjectPath, ProviderId, ProviderRevision,
     ProviderSymbolId, SourceRevision, TreeRevision,
@@ -242,7 +244,13 @@ impl WorkspaceSemantics {
         let mut beyond_declaration_bound = Vec::new();
         let mut refused_contributions = Vec::new();
         for (offered, placed) in documents.iter().enumerate() {
-            if placed.facts.symbols().len() > builder.declarations_remaining() {
+            if placed
+                .facts
+                .symbols()
+                .len()
+                .saturating_add(placed.placement.aliases_count())
+                > builder.declarations_remaining()
+            {
                 beyond_declaration_bound = documents[offered..]
                     .iter()
                     .map(|left_out| left_out.path.clone())
@@ -304,14 +312,40 @@ impl WorkspaceSemantics {
         &self.relationships
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_graph(
+        graph: NormalizedGraph,
+        syntax_provider: ProviderId,
+        relationships_max: usize,
+    ) -> Self {
+        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
+        Self {
+            graph,
+            relationships,
+            syntax_provider,
+        }
+    }
+
     /// Assembles readable symbol for syntax provider-local identity.
     #[must_use]
     pub fn assembled(&self, provider_symbol: &str) -> Option<AssembledSymbol> {
         let reference = ContributionReference::new(
             self.syntax_provider.clone(),
-            ProviderSymbolId::new(provider_symbol).ok()?,
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
         );
         let record = self.graph.record_for(&reference)?;
+        SymbolAssembler::assemble(
+            &self.graph,
+            record,
+            std::slice::from_ref(&self.syntax_provider),
+        )
+    }
+
+    /// Assembles one captured record, including records with no source declaration.
+    pub(crate) fn assembled_record(
+        &self,
+        record: &rift_core::SymbolRecord,
+    ) -> Option<AssembledSymbol> {
         SymbolAssembler::assemble(
             &self.graph,
             record,
@@ -365,14 +399,36 @@ mod tests {
     #[test]
     fn syntax_graph_assembles_existing_symbol_identity() {
         let document = document();
-        let semantics = WorkspaceSemantics::build([&document], 1, 7, None)
-            .expect("semantics")
-            .semantics;
-        let identity = "rift://symbol/rust/src/lib.rs/beacon";
-        let assembled = semantics.assembled(identity).expect("assembled symbol");
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            document.language().clone(),
+            vec!["fixture".to_owned(), "beacon".to_owned()],
+        )
+        .expect("canonical fixture identity");
+        let identity = rift_core::SymbolId::new(identity.wire_identity()).expect("fixture symbol");
+        let placement = DocumentPlacement::project(&document)
+            .expect("physical project placement")
+            .with_identity_anchors(std::collections::BTreeMap::from([(
+                "beacon".to_owned(),
+                identity.clone(),
+            )]));
+        let semantics = WorkspaceSemantics::build_placed(
+            &[PlacedDocument {
+                document: &document,
+                placement,
+            }],
+            1,
+            7,
+            None,
+        )
+        .expect("semantics")
+        .semantics;
+        let assembled = semantics
+            .assembled("rift://symbol/rust/src/lib.rs/beacon")
+            .expect("assembled symbol");
         assert_eq!(
             assembled.identity().map(rift_core::SymbolId::as_str),
-            Some(identity)
+            Some(identity.as_str())
         );
         assert_eq!(assembled.index_revision().get(), 7);
         assert_eq!(semantics.graph().records().len(), 1);

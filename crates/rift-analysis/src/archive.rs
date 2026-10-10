@@ -8,6 +8,7 @@ use std::{
     io::{Cursor, Read, Seek, SeekFrom},
 };
 
+use crate::input::ArchiveMemberKind;
 use rift_core::{FileDigest, ProjectPath};
 use sha2::{Digest, Sha256, Sha512};
 
@@ -139,6 +140,7 @@ impl Default for ArchiveLimits {
 pub struct ArchiveFiles {
     digest: FileDigest,
     files: BTreeMap<ProjectPath, Vec<u8>>,
+    members: BTreeMap<String, ArchiveMemberKind>,
     skipped_links: Vec<ProjectPath>,
 }
 
@@ -147,6 +149,13 @@ impl ArchiveFiles {
     #[must_use]
     pub const fn digest(&self) -> FileDigest {
         self.digest
+    }
+
+    /// Admitted normalized member paths and entry kinds before source selection.
+    /// Paths retain the original archive root even when regular files remove it.
+    #[must_use]
+    pub const fn members(&self) -> &BTreeMap<String, ArchiveMemberKind> {
+        &self.members
     }
 
     /// Regular files after removing the caller's exact archive root, when supplied.
@@ -241,13 +250,21 @@ pub fn read_archive(
     if bytes.is_empty() || bytes.len() > limits.compressed_bytes {
         return Err(ArchiveError::CompressedLimit);
     }
-    let verified = match expected {
-        ArchiveDigest::Sha256(expected) => <[u8; 32]>::from(Sha256::digest(bytes)) == *expected,
-        ArchiveDigest::Sha512(expected) => <[u8; 64]>::from(Sha512::digest(bytes)) == *expected,
+    let digest = match expected {
+        ArchiveDigest::Sha256(expected) => {
+            let actual = <[u8; 32]>::from(Sha256::digest(bytes));
+            if actual != *expected {
+                return Err(ArchiveError::DigestMismatch);
+            }
+            FileDigest::from_bytes(actual)
+        }
+        ArchiveDigest::Sha512(expected) => {
+            if <[u8; 64]>::from(Sha512::digest(bytes)) != *expected {
+                return Err(ArchiveError::DigestMismatch);
+            }
+            FileDigest::of(bytes)
+        }
     };
-    if !verified {
-        return Err(ArchiveError::DigestMismatch);
-    }
     if let Some(root) = root {
         let path = ProjectPath::new(root).map_err(|_| ArchiveError::UnsafePath)?;
         if path.as_str().is_empty() || root.contains('/') {
@@ -257,21 +274,26 @@ pub fn read_archive(
     let expanded_max = limits
         .expanded_bytes
         .min(bytes.len().saturating_mul(limits.expansion_ratio));
-    let (files, skipped_links) = match format {
+    let (files, skipped_links, members) = match format {
         ArchiveFormat::TarGzip => read_tar(bytes, root, limits, expanded_max)?,
         ArchiveFormat::Zip => read_zip(bytes, root, limits, expanded_max)?,
     };
     Ok(ArchiveFiles {
-        digest: FileDigest::of(bytes),
+        digest,
         files,
+        members,
         skipped_links,
     })
 }
 
 const TAR_EXTENSION_BYTES_MAX: u64 = rift_protocol::configuration::ARCHIVE_EXTENSION_BYTES_DEFAULT;
 
-/// Regular files and skipped-link paths extracted from one archive container.
-type ArchiveContents = (BTreeMap<ProjectPath, Vec<u8>>, Vec<ProjectPath>);
+/// Regular files, skipped links, and admitted member kinds from one archive container.
+type ArchiveContents = (
+    BTreeMap<ProjectPath, Vec<u8>>,
+    Vec<ProjectPath>,
+    BTreeMap<String, ArchiveMemberKind>,
+);
 
 fn read_tar(
     bytes: &[u8],
@@ -691,13 +713,6 @@ impl Seek for ZipReadGuard<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArchiveMemberKind {
-    File,
-    Directory,
-    Link,
-}
-
 struct ArchiveOutput<'a> {
     root: Option<&'a str>,
     limits: ArchiveLimits,
@@ -839,7 +854,7 @@ impl<'a> ArchiveOutput<'a> {
     }
 
     fn into_files_and_skipped_links(self) -> ArchiveContents {
-        (self.files, self.skipped_links)
+        (self.files, self.skipped_links, self.seen)
     }
 }
 

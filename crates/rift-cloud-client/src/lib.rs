@@ -2,9 +2,10 @@
 
 mod cache;
 pub mod contract;
-mod declaration;
 mod pattern;
 mod response;
+mod source;
+mod symbol;
 
 use std::{
     collections::HashSet,
@@ -52,29 +53,33 @@ pub use generated::{
     DocumentationContentIdentity, DocumentationContext, DocumentationFormat, DocumentationHit,
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
-    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions,
-    FindPackageDeclarationsRequest, FindPackageDeclarationsResponse, GetCapabilitiesRequest,
+    DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
     GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
     ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
-    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDeclarationRequest,
-    PackageDeclarationRequestPositionEncoding, PackageDeclarationResponse,
-    PackageDeclarationResult, PackageDocumentationHit, PackageDocumentationHitContributingField,
-    PackageIdentity, PackagePatternDeclaration, PackagePatternHit, PackagePatternPage,
-    PackagePatternRequest, PackagePosition, PackageResolutionRequest, PackageResolutionResponse,
-    PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage,
-    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
-    PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
-    ProblemDetails, PublicationFormat, QueryTerm, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
-    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
-    SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
-    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
+    NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
+    PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
+    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
+    PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
+    PackageSearchItem, PackageSearchPage, PackageSearchRequest, PackageSearchRequestPhase,
+    PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage, PackageSymbolRequest,
+    PackageSymbolRequestInclude, Parameter,
+    PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
+    PublicationFormat, QueryTerm, ResolvePackageContextRequest, ResolvePackageContextResponse,
+    ResolvedRequirement, SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery,
+    SearchPackagePatternsResponse, SearchPackagesRequest, SearchPackagesRequestQuery,
+    SearchPackagesResponse, Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId,
+    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin,
+    TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
-pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};
 pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
 pub use pattern::PATTERN_PAGE_FILES_MAX;
+
+/// Most positions one declaration request carries.
+pub const DECLARATION_POSITIONS_MAX: usize = rift_protocol::source_read::SOURCE_POSITIONS_MAX;
+
+/// Largest line or character one source position carries.
+pub const POSITION_COMPONENT_MAX: u64 = rift_protocol::source_read::SOURCE_POSITION_MAX;
 
 /// Default bound for bytes one encoded request body carries.
 // The 4 MiB configuration default fits a 32-bit usize.
@@ -96,6 +101,9 @@ pub const DEPENDENCY_ENTRIES_MAX: usize = 20_000;
 pub const PACKAGE_MANAGER_CHARS_MAX: usize = 128;
 /// Most characters one package name carries, the contract's `maxLength`.
 pub const PACKAGE_NAME_CHARS_MAX: usize = 4_096;
+
+/// Most characters one canonical registry endpoint carries.
+pub const PACKAGE_REGISTRY_CHARS_MAX: usize = 4_096;
 /// Most characters one package version, or one version requirement, carries: the contract's
 /// `maxLength`.
 pub const PACKAGE_VERSION_CHARS_MAX: usize = 4_096;
@@ -1128,7 +1136,10 @@ impl GlobalClient {
                     response_bytes = response.body.len(),
                     "global response"
                 );
-                if should_retry(response.status, attempt, attempts) {
+                let exact_outcome = operation == contract::Endpoint::Symbols
+                    && response.status == StatusCode::SERVICE_UNAVAILABLE
+                    && is_media(&response.meta, "application/json");
+                if !exact_outcome && should_retry(response.status, attempt, attempts) {
                     rift_tracing::debug!(
                         operation = operation.operation_id(),
                         attempt,
@@ -1460,7 +1471,12 @@ fn validate_search_request_for_capabilities(
             field: "identifiers",
         });
     }
-    validate_read_bounds(request.packages.len(), limit, cursor, capabilities)
+    validate_read_bounds(
+        request.packages.as_ref().map_or(0, Vec::len),
+        limit,
+        cursor,
+        capabilities,
+    )
 }
 
 fn validate_symbol_request_for_capabilities(
@@ -1549,8 +1565,11 @@ fn validate_resolution_response(
     let expected: HashSet<_> = request.entries.iter().map(context_key).collect();
     let mut seen = HashSet::new();
     for package in &response.available_exact {
+        validate_package_identity(package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
         let key = (
             package.manager.clone(),
+            Some(package.registry.clone()),
             package.name.clone(),
             Some(package.version.clone()),
             None,
@@ -1562,8 +1581,11 @@ fn validate_resolution_response(
         }
     }
     for package in &response.missing_exact {
+        validate_package_identity(package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
         let key = (
             package.manager.clone(),
+            Some(package.registry.clone()),
             package.name.clone(),
             Some(package.version.clone()),
             None,
@@ -1575,6 +1597,8 @@ fn validate_resolution_response(
         }
     }
     for resolved in &response.resolved_requirements {
+        validate_package_identity(&resolved.package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
         if !resolved.answers_its_entry() {
             return Err(ClientError::InvalidResponseField {
                 field: "resolved_requirement",
@@ -1656,8 +1680,9 @@ impl ResolvedRequirement {
     /// version or an exact version at another one. An exact entry answered at its own version
     /// belongs in `available_exact`.
     fn answers_its_entry(&self) -> bool {
-        let names_the_package =
-            self.package.manager == self.entry.manager && self.package.name == self.entry.name;
+        let names_the_package = self.package.manager == self.entry.manager
+            && self.entry.registry.as_ref() == Some(&self.package.registry)
+            && self.package.name == self.entry.name;
         let selector_holds = match (&self.entry.version, &self.entry.requirement) {
             (None, Some(_)) => true,
             (Some(requested), None) => requested != &self.package.version,
@@ -1776,7 +1801,7 @@ fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientE
     {
         return Err(ClientError::InvalidRequest { field: "include" });
     }
-    validate_packages(&request.packages)?;
+    validate_packages(request.packages.as_deref().unwrap_or_default())?;
     if matches!(request.phase, PackageSearchRequestPhase::Broad)
         && request.terms.iter().filter(|term| !term.phrase).count() < 2
     {
@@ -1799,8 +1824,7 @@ fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), ClientE
     validate_packages(&request.packages)
 }
 
-/// Checks one package identity against the contract's bounds, which count characters: a
-/// package name the resolution answered in any script reaches the read that names it.
+/// Checks contract character bounds and the validated exact defining registry owner.
 fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientError> {
     bounded_nonempty_characters(
         &package.manager,
@@ -1808,11 +1832,16 @@ fn validate_package_identity(package: &PackageIdentity) -> Result<(), ClientErro
         "package_manager",
     )?;
     bounded_nonempty_characters(&package.name, PACKAGE_NAME_CHARS_MAX, "package_name")?;
+    bounded_nonempty_characters(&package.registry, PACKAGE_REGISTRY_CHARS_MAX, "registry")?;
     bounded_nonempty_characters(
         &package.version,
         PACKAGE_VERSION_CHARS_MAX,
         "package_version",
-    )
+    )?;
+    domain::package_identity(package)
+        .owner()
+        .map(|_| ())
+        .map_err(|_| ClientError::InvalidRequest { field: "package" })
 }
 
 fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
@@ -1824,6 +1853,7 @@ fn validate_packages(packages: &[PackageIdentity]) -> Result<(), ClientError> {
         validate_package_identity(package)?;
         if !seen.insert((
             package.manager.as_str(),
+            package.registry.as_str(),
             package.name.as_str(),
             package.version.as_str(),
         )) {
@@ -1875,7 +1905,14 @@ fn validate_search_page(
         warnings: &page.warnings,
     }
     .validate(capabilities, documentation_requested)?;
-    let packages: HashSet<_> = request.packages.iter().map(package_key).collect();
+    let packages: HashSet<_> = request
+        .packages
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(package_key)
+        .collect();
+    let selection = (!packages.is_empty()).then_some(&packages);
     let mut seen = HashSet::new();
     let mut documentation_bytes = 0_usize;
     for hit in &page.items {
@@ -1896,12 +1933,14 @@ fn validate_search_page(
                         line: hit.line,
                         source: hit.source.as_deref(),
                     },
-                    &packages,
+                    selection,
                     smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
                 )?;
                 validate_search_match_class(request, hit, &qualified_name)?;
             }
             PackageSearchItem::Documentation(hit) => {
+                validate_package_identity(&hit.package)
+                    .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
                 if hit.source.is_some() && !includes_source(request.include.as_deref()) {
                     return Err(ClientError::InvalidResponseField { field: "source" });
                 }
@@ -1913,7 +1952,8 @@ fn validate_search_page(
                 validate_documentation_bytes(documentation_bytes)?;
                 if !documentation_requested
                     || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
-                    || !packages.contains(&package_key(&hit.package))
+                    || selection
+                        .is_some_and(|packages| !packages.contains(&package_key(&hit.package)))
                 {
                     return Err(ClientError::InvalidResponseField {
                         field: "documentation",
@@ -1990,7 +2030,7 @@ fn validate_symbol_page(
                 line: hit.line,
                 source: hit.source.as_deref(),
             },
-            &packages,
+            Some(&packages),
             smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
         )?;
         validate_symbol_match_class(request, hit, &qualified_name)?;
@@ -2120,10 +2160,12 @@ fn validate_hit_common(
     package: &PackageIdentity,
     symbol: &Symbol,
     location: HitLocation<'_>,
-    packages: &HashSet<(String, String, String)>,
+    packages: Option<&HashSet<(String, String, String, String)>>,
     source_bytes_max: usize,
 ) -> Result<String, ClientError> {
-    if !packages.contains(&package_key(package)) {
+    validate_package_identity(package)
+        .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
+    if packages.is_some_and(|packages| !packages.contains(&package_key(package))) {
         return Err(ClientError::InvalidResponseField { field: "package" });
     }
     if location.line < 1 || location.range.end < location.range.start {
@@ -2147,23 +2189,19 @@ fn validate_hit_common(
     validate_symbol_identity(symbol, package, &source_path)
 }
 
-/// The package-relative path of `unit`, a file of `package`: its key after `name@version/`,
-/// under the package's manager as resolver.
+/// The package-relative path of `unit`, after its exact defining registry owner is validated.
 fn package_source_path(package: &PackageIdentity, unit: &str) -> Result<String, ClientError> {
     let invalid = ClientError::InvalidResponseField {
         field: "source_identity",
     };
     let unit = rift_core::SourceUnitId::parse(unit).map_err(|_| invalid.clone())?;
-    if unit.resolver().as_str() != package.manager {
+    let owner = domain::package_identity(package)
+        .owner()
+        .map_err(|_| invalid.clone())?;
+    if unit.source_owner() != Some(&owner) {
         return Err(invalid);
     }
-    let package_prefix = format!("{}@{}/", package.name, package.version);
-    unit.key()
-        .as_str()
-        .strip_prefix(&package_prefix)
-        .filter(|path| !path.is_empty())
-        .map(str::to_owned)
-        .ok_or(invalid)
+    Ok(unit.key().as_str().to_owned())
 }
 
 /// Checks that a package hit's symbol identity is the one its unit mints, and returns its
@@ -2321,17 +2359,27 @@ fn within_characters(value: &str, max: usize) -> bool {
     !value.is_empty() && value.chars().count() <= max
 }
 
-fn package_key(package: &PackageIdentity) -> (String, String, String) {
+fn package_key(package: &PackageIdentity) -> (String, String, String, String) {
     (
         package.manager.clone(),
+        package.registry.clone(),
         package.name.clone(),
         package.version.clone(),
     )
 }
 
-fn context_key(entry: &PackageContextEntry) -> (String, String, Option<String>, Option<String>) {
+fn context_key(
+    entry: &PackageContextEntry,
+) -> (
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+) {
     (
         entry.manager.clone(),
+        entry.registry.clone(),
         entry.name.clone(),
         entry.version.clone(),
         entry.requirement.clone(),

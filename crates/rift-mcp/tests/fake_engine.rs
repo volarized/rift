@@ -36,7 +36,7 @@ done
 /// `CALLEE_LINE` as the one callee, and answers references with `beacon`'s own occurrence
 /// on line 0 beside a call at line `CALLER_LINE`. `PROGRESS` runs once `initialize` is
 /// answered.
-const SCRIPTED_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+pub(crate) const SCRIPTED_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
   length=$(printf '%s' "$header" | tr -dc 0-9)

@@ -1,4 +1,6 @@
 use super::{Records, RetainedSourceLimits};
+
+const CARGO_MANIFEST: &str = "[package]\nname = 'beacon'\nversion = '1.0.0'\n";
 use crate::{ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageSource};
 use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
 use rift_protocol::{index::PACKAGE_SOURCE_BYTES_MAX, read::Language};
@@ -9,7 +11,7 @@ fn explicit_retention_keeps_complete_source_and_current_declaration_ranges() {
         "pub fn run() {{ /*{}*/ }}",
         "x".repeat(PACKAGE_SOURCE_BYTES_MAX as usize)
     );
-    let defaults = ExactPackageLimits::new(1, source.len() as u64);
+    let defaults = ExactPackageLimits::new(2, (source.len() + CARGO_MANIFEST.len()) as u64);
     let cut = analyze(&source, defaults).expect("default analysis");
     assert!(!cut.units[0].source_complete);
     assert_eq!(cut.units[0].source.len(), PACKAGE_SOURCE_BYTES_MAX as usize);
@@ -32,11 +34,11 @@ fn explicit_retention_keeps_complete_source_and_current_declaration_ranges() {
         complete.units[0].content_digest,
         cut.units[0].content_digest
     );
-    assert_eq!(complete.symbols.len(), 1);
-    assert_eq!(complete.symbols[0].symbol, cut.symbols[0].symbol);
-    assert_eq!(complete.symbols[0].range, cut.symbols[0].range);
-    assert!(complete.symbols[0].source_complete);
-    assert_eq!(complete.symbols[0].source, source);
+    assert_eq!(complete.declarations.len(), 1);
+    assert_eq!(complete.declarations[0].symbol, cut.declarations[0].symbol);
+    assert_eq!(complete.declarations[0].range, cut.declarations[0].range);
+    assert!(complete.declarations[0].source_complete);
+    assert_eq!(complete.declarations[0].source, source);
     assert_eq!(
         complete
             .documents
@@ -146,7 +148,7 @@ fn publication_retention_counts_file_documents_and_public_declaration_copies() {
     for (source, copies) in [("fn run() {}", 3), ("pub fn run() {}", 4)] {
         let source_bytes = source.len() as u64;
         let maximum = source_bytes * copies;
-        let defaults = ExactPackageLimits::new(1, source_bytes);
+        let defaults = ExactPackageLimits::new(2, source_bytes + CARGO_MANIFEST.len() as u64);
         let accepted_limits = defaults
             .with_retained_source_bytes(u32::try_from(source.len()).expect("fixture size"), maximum)
             .expect("exact retention total");
@@ -157,7 +159,7 @@ fn publication_retention_counts_file_documents_and_public_declaration_copies() {
             .map(|unit| unit.source.len())
             .sum::<usize>()
             + accepted
-                .symbols
+                .declarations
                 .iter()
                 .map(|symbol| symbol.source.len())
                 .sum::<usize>()
@@ -189,6 +191,7 @@ fn analyze(
     limits: ExactPackageLimits,
 ) -> Result<rift_protocol::index::PackagePublication, rift_error::RiftError> {
     let package = super::fixture::identity();
+    let owner = package.owner().expect("fixture owner");
     let language = Language {
         name: "rust".to_owned(),
         dialect: None,
@@ -201,6 +204,9 @@ fn analyze(
     )?;
     let path = ProjectPath::new("src/lib.rs")?;
     let files = [PackageSource::new(&path, source)];
-    let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+    let manifest_path = ProjectPath::new("Cargo.toml")?;
+    let context = [PackageSource::new(&manifest_path, CARGO_MANIFEST)];
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?
+        .with_framework_context(&context, &[])?;
     Ok(PackageAnalyzer::analyze(input, 1)?.into_parts().0)
 }

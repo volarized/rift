@@ -501,8 +501,30 @@ mod tests {
         )
         .expect("dependency context");
         assert!(!exact.is_degraded(), "{:?}", exact.degradations());
-        assert_eq!(exact.entries().len(), 1);
-        assert_eq!(exact.entries()[0].version.as_deref(), Some("1.0.228"));
+        assert_eq!(exact.entries().len(), 2);
+        let requirement = exact
+            .entries()
+            .iter()
+            .find(|entry| entry.registry.is_none())
+            .expect("manifest requirement without registry evidence");
+        assert_eq!(requirement.name, "serde");
+        assert_eq!(requirement.version, None);
+        assert_eq!(requirement.requirement.as_deref(), Some("1"));
+        assert_eq!(
+            requirement.availability,
+            rift_protocol::dependencies::PackageAvailability::RegistryUnresolved
+        );
+        let locked = exact
+            .entries()
+            .iter()
+            .find(|entry| entry.registry.as_deref() == Some("crates.io"))
+            .expect("lockfile defining registry");
+        assert_eq!(locked.name, "serde");
+        assert_eq!(locked.version.as_deref(), Some("1.0.228"));
+        assert_eq!(
+            locked.availability,
+            rift_protocol::dependencies::PackageAvailability::Canonical
+        );
     }
 
     #[test]
@@ -1010,12 +1032,30 @@ mod tests {
             named,
             [
                 "cargo/serde",
+                "cargo/serde",
                 "npm/typescript",
                 "stdlib/node",
                 "stdlib/python",
                 "stdlib/rust"
             ]
         );
+        let cargo: Vec<_> = context
+            .entries()
+            .iter()
+            .filter(|entry| entry.manager == "cargo")
+            .collect();
+        assert_eq!(cargo.len(), 2);
+        assert!(cargo.iter().any(|entry| {
+            entry.registry.is_none()
+                && entry.requirement.as_deref() == Some("1")
+                && entry.availability
+                    == rift_protocol::dependencies::PackageAvailability::RegistryUnresolved
+        }));
+        assert!(cargo.iter().any(|entry| {
+            entry.registry.as_deref() == Some("crates.io")
+                && entry.version.as_deref() == Some("1.0.228")
+                && entry.availability == rift_protocol::dependencies::PackageAvailability::Canonical
+        }));
         let selector = |name: &str| {
             context
                 .entries()

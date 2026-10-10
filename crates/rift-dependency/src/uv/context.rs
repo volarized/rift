@@ -142,16 +142,31 @@ fn pin_lockfile(
         let Some(version) = package.version.clone() else {
             continue;
         };
-        if let Some(site_packages) = &environment.site_packages {
+        let registry = package.source.registry.as_deref().and_then(|endpoint| {
+            if endpoint.trim_end_matches('/') == PYPI_REGISTRY_URL {
+                Some("pypi.org".to_owned())
+            } else {
+                rift_protocol::identity::canonical_registry_endpoint(endpoint).ok()
+            }
+        });
+        if package.source.registry.is_some() && registry.is_none() {
+            answer
+                .degradations
+                .push("package registry endpoint is unresolved".to_owned());
+        }
+        if let (Some(site_packages), Some(registry)) = (&environment.site_packages, &registry) {
             answer.install_folders.extend(
                 site_packages
                     .import_roots(&name, &version, inputs)
                     .into_iter()
                     .map(|root| InstallFolder {
-                        package: PackageIdentity {
-                            manager: PYPI_MANAGER.to_owned(),
-                            name: name.clone(),
-                            version: version.clone(),
+                        origin: rift_protocol::read::SourceLocation::Dependency {
+                            package: PackageIdentity {
+                                manager: PYPI_MANAGER.to_owned(),
+                                registry: registry.clone(),
+                                name: name.clone(),
+                                version: version.clone(),
+                            },
                         },
                         location: InstallLocation::ImportRoot {
                             site_packages: site_packages.directory().to_path_buf(),
@@ -160,12 +175,18 @@ fn pin_lockfile(
                     }),
             );
         }
-        answer.entries.push(PackageContextEntry::new(
+        let mut entry = PackageContextEntry::new(
             PYPI_MANAGER,
             &name,
             PackageSelector::Version(version),
-            package.source.availability(),
-        ));
+            if package.source.registry.is_some() && registry.is_none() {
+                PackageAvailability::RegistryUnresolved
+            } else {
+                package.source.availability()
+            },
+        );
+        entry.registry = registry;
+        answer.entries.push(entry);
     }
     answer.environments.push(environment);
 }
@@ -1080,7 +1101,10 @@ typing_extensions-4.15.0.dist-info/RECORD,,
             .install_folders
             .iter()
             .map(|folder| {
-                let package = &folder.package;
+                let rift_protocol::read::SourceLocation::Dependency { package } = &folder.origin
+                else {
+                    panic!("dependency install folder")
+                };
                 (
                     format!("{}/{}@{}", package.manager, package.name, package.version),
                     &folder.location,

@@ -24,8 +24,7 @@ use rift_error::{RiftError, errors};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::uri::{EngineAddress, EngineRoots, PackageRoot, TreeRoot};
 use rift_protocol::read::{
-    ExactKind, Language, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
-    SymbolOrigin,
+    ExactKind, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolId, SymbolOrigin,
 };
 
 use crate::engine::EnginePool;
@@ -57,12 +56,13 @@ const PACKAGE_MANIFEST_FILE_NAME: &str = "package.json";
 
 /// The installed packages an outgoing walk addresses a callee's file through.
 ///
-/// Built from the dependency context's install folders, the Cargo registry source folders,
-/// and the `typescript` package a TypeScript engine runs. A package root nested in the
+/// Built from the dependency context's accepted install folders and the `typescript`
+/// package a TypeScript engine runs. A package root nested in the
 /// served tree, an install under `node_modules` or `.venv`, answers before the tree.
 #[derive(Clone, Debug, Default)]
 pub struct CalleeRoots {
     packages: Arc<[PackageRoot]>,
+    registry_unresolved: bool,
 }
 
 impl CalleeRoots {
@@ -72,10 +72,9 @@ impl CalleeRoots {
     /// Each install folder becomes one root, and a folder below the root the index reads
     /// the tree by also becomes one below each engine's own spelling of the workspace
     /// root, since an engine names the files it reads by the root it was started at. A
-    /// Cargo registry package becomes one root below each registry source folder of
-    /// `$CARGO_HOME`, at most `REGISTRY_SOURCES_MAX` of them. A TypeScript engine adds the
-    /// `typescript` package its program resolves, whose `lib.*.d.ts` files declare the
-    /// built-ins it answers.
+    /// Cargo cache folder without an accepted defining registry remains unresolved.
+    /// A TypeScript engine adds the `typescript` package its program resolves when an
+    /// accepted install folder establishes its owner.
     ///
     /// The work is one directory listing, one program lookup and at most one ancestor walk
     /// per TypeScript engine, and one pass over the context's install folders, which the
@@ -100,11 +99,14 @@ impl CalleeRoots {
             .install_folders()
             .flat_map(|folder| folder_roots(folder, &registries, spellings))
             .collect();
-        packages.extend(engine_typescript_roots(engines));
+        packages.extend(engine_typescript_roots(engines, &packages));
         packages.sort_by(|left, right| root_order(left).cmp(&root_order(right)));
         packages.dedup();
         Self {
             packages: packages.into(),
+            registry_unresolved: context
+                .install_folders()
+                .any(|folder| matches!(folder.location, InstallLocation::CargoRegistry(_))),
         }
     }
 
@@ -113,7 +115,12 @@ impl CalleeRoots {
     pub(crate) fn from_packages(packages: Vec<PackageRoot>) -> Self {
         Self {
             packages: packages.into(),
+            registry_unresolved: false,
         }
+    }
+
+    pub(crate) const fn registry_unresolved(&self) -> bool {
+        self.registry_unresolved
     }
 
     /// Where `uri` points: a project file below one of `trees`, the first spelling
@@ -141,15 +148,9 @@ impl CalleeRoots {
     }
 }
 
-/// The order package roots keep: root, then manager, name, and version.
-fn root_order(root: &PackageRoot) -> (&TreeRoot, &str, &str, &str) {
-    let package = root.package();
-    (
-        root.root(),
-        &package.manager,
-        &package.name,
-        &package.version,
-    )
+/// The order source roots keep: root, then defining origin.
+fn root_order(root: &PackageRoot) -> (&TreeRoot, &rift_protocol::read::SourceLocation) {
+    (root.root(), root.origin())
 }
 
 /// The spellings one workspace root takes: the one the index reads the tree by, and each
@@ -172,25 +173,19 @@ impl RootSpellings<'_> {
     }
 }
 
-/// The package roots one install folder names: one per spelling, and for a Cargo registry
-/// package one per registry source folder.
+/// The package roots an accepted install folder names, one per spelling.
 fn folder_roots(
     folder: &InstallFolder,
-    registries: &[PathBuf],
+    _registries: &[PathBuf],
     spellings: RootSpellings<'_>,
 ) -> Vec<PackageRoot> {
-    let package = &folder.package;
-    let identity = PackageIdentity {
-        manager: package.manager.clone(),
-        name: package.name.clone(),
-        version: package.version.clone(),
-    };
+    let origin = &folder.origin;
     match &folder.location {
         InstallLocation::Path(path) => spellings
             .of(path)
             .iter()
             .filter_map(|spelled| TreeRoot::new(spelled).ok())
-            .map(|root| PackageRoot::new(root, identity.clone()))
+            .map(|root| PackageRoot::with_origin(root, origin.clone()))
             .collect(),
         InstallLocation::ImportRoot {
             site_packages,
@@ -203,14 +198,11 @@ fn folder_roots(
                 .of(site_packages)
                 .iter()
                 .filter_map(|spelled| TreeRoot::new(spelled).ok())
-                .map(|base| PackageRoot::within(&base, within.clone(), identity.clone()))
+                .map(|base| PackageRoot::within_origin(&base, within.clone(), origin.clone()))
                 .collect()
         }
-        InstallLocation::CargoRegistry(unpacked) => registries
-            .iter()
-            .filter_map(|source| TreeRoot::new(&source.join(unpacked)).ok())
-            .map(|root| PackageRoot::new(root, identity.clone()))
-            .collect(),
+        // Cache folder presence does not establish its defining registry endpoint.
+        InstallLocation::CargoRegistry(_) => Vec::new(),
     }
 }
 
@@ -257,7 +249,7 @@ fn registry_sources(cargo_home: Option<&Path>) -> Vec<PathBuf> {
 /// package ships a server, and from the one its own program resolves otherwise, such as
 /// 5.9.3 beside a workspace pinning 7.0.2. The workspace's copy is an install folder the
 /// context already names; this names the other.
-fn engine_typescript_roots(engines: &EnginePool) -> Vec<PackageRoot> {
+fn engine_typescript_roots(engines: &EnginePool, known: &[PackageRoot]) -> Vec<PackageRoot> {
     engines
         .served_slots()
         .filter(|(language, _)| {
@@ -273,7 +265,7 @@ fn engine_typescript_roots(engines: &EnginePool) -> Vec<PackageRoot> {
                 .or_else(|| std::env::var_os("PATH"));
             let program =
                 which::which_in(command.program(), search_path, slot.workspace_root()).ok()?;
-            node_package_root(&fs::canonicalize(program).ok()?, TYPESCRIPT_PACKAGE)
+            node_package_root(&fs::canonicalize(program).ok()?, TYPESCRIPT_PACKAGE, known)
         })
         .collect()
 }
@@ -281,16 +273,16 @@ fn engine_typescript_roots(engines: &EnginePool) -> Vec<PackageRoot> {
 /// The package `name` Node.js resolves for a module at `module`: the first
 /// `node_modules/<name>` holding a `package.json` with a version, over the module's
 /// ancestors. The walk is bounded by the module path's own depth.
-fn node_package_root(module: &Path, name: &str) -> Option<PackageRoot> {
+fn node_package_root(module: &Path, name: &str, known: &[PackageRoot]) -> Option<PackageRoot> {
     module.ancestors().skip(1).find_map(|folder| {
         let package = folder.join(NODE_MODULES_DIRECTORY_NAME).join(name);
         let version = package_version(&package.join(PACKAGE_MANIFEST_FILE_NAME))?;
-        let identity = PackageIdentity {
-            manager: NPM_MANAGER.to_owned(),
-            name: name.to_owned(),
-            version,
-        };
-        Some(PackageRoot::new(TreeRoot::new(&package).ok()?, identity))
+        let root = TreeRoot::new(&package).ok()?;
+        known.iter().find(|candidate| {
+            candidate.root() == &root && matches!(candidate.origin(),
+                rift_core::SourceLocation::Dependency { package }
+                if package.manager == NPM_MANAGER && package.name == name && package.version == version)
+        }).cloned()
     })
 }
 
@@ -315,6 +307,8 @@ fn package_version(manifest: &Path) -> Option<String> {
 pub enum CalleePackage {
     /// An installed package, at the exact version its install folder names.
     Installed(PackageIdentity),
+    /// An exact runtime or compiler release holding the callee.
+    Runtime(rift_protocol::read::RuntimeIdentity),
     /// A standard library whose release the global API resolves from the context's
     /// requirement: Python's, whose typeshed stubs every supported release shares.
     StandardLibrary(StandardLibrary),
@@ -326,7 +320,7 @@ impl CalleePackage {
     pub fn manager(&self) -> &str {
         match self {
             Self::Installed(package) => &package.manager,
-            Self::StandardLibrary(_) => STANDARD_LIBRARY_MANAGER,
+            Self::Runtime(_) | Self::StandardLibrary(_) => STANDARD_LIBRARY_MANAGER,
         }
     }
 
@@ -335,6 +329,7 @@ impl CalleePackage {
     pub fn name(&self) -> &str {
         match self {
             Self::Installed(package) => &package.name,
+            Self::Runtime(runtime) => &runtime.runtime,
             Self::StandardLibrary(library) => library.name(),
         }
     }
@@ -360,8 +355,8 @@ pub struct CalleeDeclaration {
     /// What the declaration is in its provider's vocabulary, as package analysis stored
     /// it, such as `function`.
     pub kind: ExactKind,
-    /// The exact package holding the declaration.
-    pub package: PackageIdentity,
+    /// The defining package or runtime release holding the declaration.
+    pub origin: rift_core::SourceLocation,
 }
 
 impl PackageCallee {
@@ -396,26 +391,44 @@ impl PackageCallee {
 
     /// The symbol a walk's hit for this callee carries, once the global API named its
     /// `declaration`: the name is the engine's, and the kind the one package analysis
-    /// stored, as every other hit carries its provider's kind. The origin is the one
-    /// package analysis gives the package's declarations: `stdlib` for a standard library,
-    /// the Rust one included although its callees reach it through an install folder, and
-    /// `dependency` naming the package otherwise. `None` for an id naming no language.
+    /// stored, as every other hit carries its provider's kind. The logical origin comes
+    /// from the canonical identity. A mapped stub keeps its physical declaration origin
+    /// separately for source reads. `None` for an invalid or local identity.
     pub(crate) fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
-        let CalleeDeclaration { id, kind, package } = declaration;
-        let parsed = rift_core::parse_symbol_identity(&id.0).ok()?;
-        let language = Language::from_identity_segment(parsed.language_segment()).ok()?;
-        let origin = if package.manager == STANDARD_LIBRARY_MANAGER {
-            SymbolOrigin {
+        let CalleeDeclaration {
+            id,
+            kind,
+            origin: _,
+        } = declaration;
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(id.as_str()).ok()?;
+        let language = parsed.language().clone();
+        let origin = match parsed.owner() {
+            rift_protocol::identity::SymbolOwner::Package {
+                manager,
+                registry,
+                name,
+                version,
+            } => SymbolOrigin {
+                location: Some(SourceLocationKind::Dependency),
+                package: Some(PackageIdentity {
+                    manager: manager.clone(),
+                    registry: registry.clone(),
+                    name: name.clone(),
+                    version: version.clone(),
+                }),
+                runtime: None,
+                source_kind: SourceKind::Authored,
+            },
+            rift_protocol::identity::SymbolOwner::Runtime { runtime, version } => SymbolOrigin {
                 location: Some(SourceLocationKind::Stdlib),
                 package: None,
+                runtime: Some(rift_protocol::read::RuntimeIdentity {
+                    runtime: runtime.clone(),
+                    version: version.clone(),
+                }),
                 source_kind: SourceKind::Authored,
-            }
-        } else {
-            SymbolOrigin {
-                location: Some(SourceLocationKind::Dependency),
-                package: Some(package.clone()),
-                source_kind: SourceKind::Authored,
-            }
+            },
+            _ => return None,
         };
         Some(Symbol {
             id: Some(id.clone()),
@@ -435,9 +448,9 @@ impl PackageCallee {
         })
     }
 
-    /// The source unit of the callee's file in `package`.
-    pub(crate) fn unit(&self, package: &PackageIdentity) -> Option<SourceUnitId> {
-        rift_core::SourceUnitId::for_package(package, &self.path)
+    /// The source unit of the callee's file in its defining origin.
+    pub(crate) fn unit(&self, origin: &rift_core::SourceLocation) -> Option<SourceUnitId> {
+        rift_core::SourceUnitId::for_origin(origin, &self.path)
             .ok()
             .map(|unit| SourceUnitId(unit.to_string()))
     }
@@ -505,7 +518,15 @@ pub(crate) fn callee_file(
     Ok(match roots.address(trees, call.uri)? {
         Some(EngineAddress::Project(path)) => CalleeFile::Project(path),
         Some(EngineAddress::Package(file)) => held(
-            CalleePackage::Installed(file.package().clone()),
+            match file.origin() {
+                rift_core::SourceLocation::Dependency { package } => {
+                    CalleePackage::Installed(package.clone())
+                }
+                rift_core::SourceLocation::Stdlib {
+                    runtime: Some(runtime),
+                } => CalleePackage::Runtime(runtime.clone()),
+                _ => return Ok(CalleeFile::Unaddressed),
+            },
             file.path().clone(),
         ),
         None => CalleeFile::Unaddressed,
@@ -536,13 +557,35 @@ mod tests {
     fn identity(manager: &str, name: &str, version: &str) -> PackageIdentity {
         PackageIdentity {
             manager: manager.to_owned(),
+            registry: match manager {
+                "cargo" => "crates.io",
+                "npm" => "npmjs.org",
+                "pypi" => "pypi.org",
+                _ => "registry.example",
+            }
+            .to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         }
     }
 
     fn installed(package: PackageIdentity, location: InstallLocation) -> InstallFolder {
-        InstallFolder { package, location }
+        InstallFolder {
+            origin: rift_core::SourceLocation::Dependency { package },
+            location,
+        }
+    }
+
+    fn runtime_installed(runtime: &str, version: &str, location: InstallLocation) -> InstallFolder {
+        InstallFolder {
+            origin: rift_core::SourceLocation::Stdlib {
+                runtime: Some(rift_protocol::read::RuntimeIdentity {
+                    runtime: runtime.to_owned(),
+                    version: version.to_owned(),
+                }),
+            },
+            location,
+        }
     }
 
     /// Each root's slash form and the package it names, as `manager/name@version`.
@@ -554,11 +597,16 @@ mod tests {
                     .root()
                     .root_uri()
                     .expect("an absolute root forms a URI");
-                let package = root.package();
-                (
-                    uri.as_str().to_owned(),
-                    format!("{}/{}@{}", package.manager, package.name, package.version),
-                )
+                let name = match root.origin() {
+                    rift_core::SourceLocation::Dependency { package } => {
+                        format!("{}/{}@{}", package.manager, package.name, package.version)
+                    }
+                    rift_core::SourceLocation::Stdlib {
+                        runtime: Some(runtime),
+                    } => format!("stdlib/{}@{}", runtime.runtime, runtime.version),
+                    _ => panic!("released source root"),
+                };
+                (uri.as_str().to_owned(), name)
             })
             .collect()
     }
@@ -574,8 +622,9 @@ mod tests {
             identity("npm", "nanoid", "5.1.6"),
             InstallLocation::Path(PathBuf::from("/private/var/ws/node_modules/nanoid")),
         );
-        let sysroot = installed(
-            identity("stdlib", "rust", "1.98.1"),
+        let sysroot = runtime_installed(
+            "rustc",
+            "1.98.1",
             InstallLocation::Path(PathBuf::from("/toolchain/lib/rustlib/src/rust/library")),
         );
         assert_eq!(
@@ -595,15 +644,14 @@ mod tests {
             spelled(&folder_roots(&sysroot, &[], spellings)),
             [(
                 "file:///toolchain/lib/rustlib/src/rust/library".to_owned(),
-                "stdlib/rust@1.98.1".to_owned()
+                "stdlib/rustc@1.98.1".to_owned()
             )],
             "a folder outside the tree has one spelling"
         );
     }
 
     #[test]
-    fn a_registry_package_is_rooted_below_every_registry_source_and_an_import_root_below_site_packages()
-     {
+    fn registry_cache_folders_require_an_accepted_origin_while_paths_and_import_roots_serve() {
         let spellings = RootSpellings {
             index_root: Path::new("/ws"),
             engine_roots: &[],
@@ -616,19 +664,31 @@ mod tests {
             identity("cargo", "serde", "1.0.228"),
             InstallLocation::CargoRegistry("serde-1.0.228".to_owned()),
         );
+        assert!(
+            folder_roots(&serde, &registries, spellings).is_empty(),
+            "cache folders do not establish registry ownership"
+        );
+        let mut private = serde.clone();
+        private.origin = rift_core::SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "registry.example/team".to_owned(),
+                name: "serde".to_owned(),
+                version: "1.0.228".to_owned(),
+            },
+        };
+        assert!(
+            folder_roots(&private, &registries, spellings).is_empty(),
+            "same name and version establish no shared owner"
+        );
+        let verified = installed(
+            identity("cargo", "serde", "1.0.228"),
+            InstallLocation::Path(PathBuf::from("/verified/serde")),
+        );
         assert_eq!(
-            spelled(&folder_roots(&serde, &registries, spellings)),
-            [
-                (
-                    "file:///cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228"
-                        .to_owned(),
-                    "cargo/serde@1.0.228".to_owned()
-                ),
-                (
-                    "file:///cargo/registry/src/mirror-0123/serde-1.0.228".to_owned(),
-                    "cargo/serde@1.0.228".to_owned()
-                ),
-            ]
+            folder_roots(&verified, &[], spellings).len(),
+            1,
+            "accepted path origin serves its root"
         );
         let jwt = installed(
             identity("pypi", "pyjwt", "2.10.1"),
@@ -684,6 +744,7 @@ mod tests {
 "#;
         std::fs::write(root.join("package.json"), manifest)?;
         std::fs::write(root.join("package-lock.json"), lockfile)?;
+        std::fs::write(root.join(".npmrc"), "registry=https://registry.npmjs.org\n")?;
         let limits = rift_index::WorkspaceIndexLimits::default();
         let visibility = rift_core::SourceVisibility::default();
         let inclusion = rift_core::TextFileInclusion::default();
@@ -692,7 +753,10 @@ mod tests {
         let context: Vec<String> = reads
             .dependency_context()
             .install_folders()
-            .map(|folder| folder.package.name.clone())
+            .filter_map(|folder| match &folder.origin {
+                rift_core::SourceLocation::Dependency { package } => Some(package.name.clone()),
+                _ => None,
+            })
             .collect();
         assert_eq!(context, ["left-pad", "zod"], "the context's package order");
 
@@ -760,10 +824,19 @@ mod tests {
         std::fs::create_dir_all(&typescript)?;
         std::fs::write(typescript.join("package.json"), r#"{"version": "5.9.3"}"#)?;
 
-        let found = node_package_root(&module, "typescript").ok_or("typescript resolves")?;
+        assert!(
+            node_package_root(&module, "typescript", &[]).is_none(),
+            "manifest alone establishes no registry"
+        );
+        let known = [PackageRoot::new(
+            TreeRoot::new(&typescript)?,
+            identity("npm", "typescript", "5.9.3"),
+        )];
+        let found =
+            node_package_root(&module, "typescript", &known).ok_or("typescript resolves")?;
         assert_eq!(found.root(), &TreeRoot::new(&typescript)?);
-        assert_eq!(found.package(), &identity("npm", "typescript", "5.9.3"));
-        assert!(node_package_root(&module, "absent").is_none());
+        assert_eq!(found.origin(), known[0].origin());
+        assert!(node_package_root(&module, "absent", &known).is_none());
         Ok(())
     }
 
@@ -818,7 +891,12 @@ mod tests {
             ("rust".to_owned(), LspProcessKey::named("rust")),
         ]);
         let engines = EnginePool::new(root, definitions, bindings);
-        let roots = super::engine_typescript_roots(&engines);
+        let known = [PackageRoot::new(
+            TreeRoot::new(&std::fs::canonicalize(&typescript)?)?,
+            identity("npm", "typescript", "5.9.3"),
+        )];
+        assert!(super::engine_typescript_roots(&engines, &[]).is_empty());
+        let roots = super::engine_typescript_roots(&engines, &known);
         assert_eq!(
             spelled(&roots),
             [(
@@ -851,7 +929,9 @@ mod tests {
         CalleeDeclaration {
             id: SymbolId(id.to_owned()),
             kind: ExactKind(kind.to_owned()),
-            package: package.clone(),
+            origin: rift_core::SourceLocation::Dependency {
+                package: package.clone(),
+            },
         }
     }
 
@@ -863,7 +943,7 @@ mod tests {
             CalleePackage::Installed(greeting.clone()),
             "greeting/core.py",
         );
-        let id = "rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet";
+        let id = "rift://symbol/pypi/pypi.org/greeting@1.0.0/python/greeting/core/greet";
         let symbol = held
             .symbol(&declaration(id, "function", &greeting))
             .ok_or("the id names a language")?;
@@ -877,30 +957,42 @@ mod tests {
                 "kind": "function",
                 "origin": {
                     "location": "dependency",
-                    "package": {"manager": "pypi", "name": "greeting", "version": "1.0.0"},
+                    "package": {"manager": "pypi", "registry": "pypi.org", "name": "greeting", "version": "1.0.0"},
                     "source_kind": "authored"
                 }
             })
         );
         assert_eq!(
-            held.unit(&greeting).map(|unit| unit.0),
-            Some("rift://source/pypi/greeting@1.0.0/greeting/core.py".to_owned())
+            held.unit(&rift_core::SourceLocation::Dependency {
+                package: greeting.clone()
+            })
+            .map(|unit| unit.0),
+            Some("rift://source/pypi/pypi.org/greeting@1.0.0/greeting/core.py".to_owned())
         );
 
-        let python = identity("stdlib", "python", "3.12.9");
+        let python = rift_core::SourceLocation::Stdlib {
+            runtime: Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "cpython".to_owned(),
+                version: "3.12.9".to_owned(),
+            }),
+        };
         let stub = callee(
             CalleePackage::StandardLibrary(StandardLibrary::Python),
             "builtins.pyi",
         );
-        let len = "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len";
+        let len = "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len";
         let symbol = stub
-            .symbol(&declaration(len, "class", &python))
+            .symbol(&CalleeDeclaration {
+                id: SymbolId(len.to_owned()),
+                kind: ExactKind("class".to_owned()),
+                origin: python.clone(),
+            })
             .ok_or("the id names a language")?;
         let wire = serde_json::to_value(&symbol)?;
         assert_eq!(wire["kind"], "class", "the stored kind, whatever it is");
         assert_eq!(
             wire["origin"],
-            serde_json::json!({"location": "stdlib", "source_kind": "authored"})
+            serde_json::json!({"location": "stdlib", "runtime": {"runtime": "cpython", "version": "3.12.9"}, "source_kind": "authored"})
         );
         assert_eq!(stub.package().manager(), "stdlib");
         assert_eq!(stub.package().name(), "python");
@@ -912,26 +1004,99 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mapped_stub_keeps_physical_unit_and_logical_owner_separate() -> TestResult {
+        let package = identity("pypi", "runtime-stubs", "1.0.0");
+        let held = callee(CalleePackage::Installed(package.clone()), "sys.pyi");
+        let physical = rift_core::SourceLocation::Dependency {
+            package: package.clone(),
+        };
+        let runtime_id = "rift://symbol/stdlib/python@3.14.3/python/sys/getsizeof";
+        let symbol = held
+            .symbol(&CalleeDeclaration {
+                id: SymbolId(runtime_id.to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: physical.clone(),
+            })
+            .ok_or("canonical runtime identity")?;
+        assert_eq!(symbol.id.as_ref().map(|id| id.0.as_str()), Some(runtime_id));
+        assert_eq!(symbol.language.name, "python");
+        assert_eq!(symbol.origin.package, None);
+        assert_eq!(
+            symbol.origin.runtime,
+            Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "python".to_owned(),
+                version: "3.14.3".to_owned(),
+            })
+        );
+        assert_eq!(
+            held.unit(&physical).map(|unit| unit.0),
+            Some("rift://source/pypi/pypi.org/runtime-stubs@1.0.0/sys.pyi".to_owned())
+        );
+
+        let runtime = rift_core::SourceLocation::Stdlib {
+            runtime: symbol.origin.runtime.clone(),
+        };
+        let package_id = "rift://symbol/pypi/pypi.org/runtime-stubs@1.0.0/python/helpers/size";
+        let inverse = held
+            .symbol(&CalleeDeclaration {
+                id: SymbolId(package_id.to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: runtime.clone(),
+            })
+            .ok_or("canonical package identity")?;
+        assert_eq!(inverse.origin.package, Some(package));
+        assert_eq!(inverse.origin.runtime, None);
+        assert_eq!(
+            held.unit(&runtime).map(|unit| unit.0),
+            Some("rift://source/stdlib/python@3.14.3/sys.pyi".to_owned())
+        );
+        assert!(
+            held.symbol(&CalleeDeclaration {
+                id: SymbolId("rift://symbol/local/python/helpers/size".to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: runtime,
+            })
+            .is_none()
+        );
+        Ok(())
+    }
+
     /// A Rust standard library callee reaches the sysroot's folder as an installed
     /// package, and its hit carries the origin package analysis gives the standard library:
     /// `stdlib`, naming no package.
     #[test]
     fn a_standard_library_callee_below_the_sysroot_carries_the_stdlib_origin() -> TestResult {
-        let rust = identity("stdlib", "rust", "1.98.1");
-        let held = callee(CalleePackage::Installed(rust.clone()), "std/src/fs.rs");
-        let id = "rift://symbol/rust/stdlib/rust@1.98.1/std/src/fs.rs/read_to_string";
+        let rust = rift_core::SourceLocation::Stdlib {
+            runtime: Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "rustc".to_owned(),
+                version: "1.98.1".to_owned(),
+            }),
+        };
+        let held = callee(
+            CalleePackage::Runtime(rift_protocol::read::RuntimeIdentity {
+                runtime: "rustc".to_owned(),
+                version: "1.98.1".to_owned(),
+            }),
+            "std/src/fs.rs",
+        );
+        let id = "rift://symbol/stdlib/rustc@1.98.1/rust/std/fs/read_to_string";
         let symbol = held
-            .symbol(&declaration(id, "function", &rust))
+            .symbol(&CalleeDeclaration {
+                id: SymbolId(id.to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: rust.clone(),
+            })
             .ok_or("the id names a language")?;
         let wire = serde_json::to_value(symbol)?;
         assert_eq!(
             wire["origin"],
-            serde_json::json!({"location": "stdlib", "source_kind": "authored"})
+            serde_json::json!({"location": "stdlib", "runtime": {"runtime": "rustc", "version": "1.98.1"}, "source_kind": "authored"})
         );
         assert_eq!(wire["language"], "rust");
         assert_eq!(
             held.unit(&rust).map(|unit| unit.0),
-            Some("rift://source/stdlib/rust@1.98.1/std/src/fs.rs".to_owned())
+            Some("rift://source/stdlib/rustc@1.98.1/std/src/fs.rs".to_owned())
         );
         Ok(())
     }
@@ -948,8 +1113,9 @@ mod tests {
         };
         let library = "/toolchain/lib/rustlib/src/rust/library";
         let installs = [
-            installed(
-                identity("stdlib", "rust", "1.98.1"),
+            runtime_installed(
+                "rustc",
+                "1.98.1",
                 InstallLocation::Path(PathBuf::from(library)),
             ),
             installed(
@@ -976,6 +1142,11 @@ mod tests {
                     "{}/{}@{} {path}",
                     package.manager, package.name, package.version
                 ),
+                CalleeFile::Package(PackageCallee {
+                    package: CalleePackage::Runtime(runtime),
+                    path,
+                    ..
+                }) => format!("stdlib/{}@{} {path}", runtime.runtime, runtime.version),
                 CalleeFile::Package(_) | CalleeFile::Project(_) | CalleeFile::Unaddressed => {
                     "not an installed package".to_owned()
                 }
@@ -987,11 +1158,11 @@ mod tests {
         );
         assert_eq!(
             classify("std/src/fs.rs")?,
-            "stdlib/rust@1.98.1 std/src/fs.rs"
+            "stdlib/rustc@1.98.1 std/src/fs.rs"
         );
         assert_eq!(
             classify("vendor/stray/src/lib.rs")?,
-            "stdlib/rust@1.98.1 vendor/stray/src/lib.rs"
+            "stdlib/rustc@1.98.1 vendor/stray/src/lib.rs"
         );
         Ok(())
     }

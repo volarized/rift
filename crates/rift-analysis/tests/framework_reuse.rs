@@ -16,9 +16,11 @@ use rift_syntax::{
 fn supplied_enriched_facts_are_refused_after_framework_context_is_removed() {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -54,7 +56,7 @@ fn supplied_enriched_facts_are_refused_after_framework_context_is_removed() {
     );
     let language = ShippedLanguage::TypeScript.language();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,
@@ -85,8 +87,10 @@ fn supplied_angular_template_facts_are_refused_when_current_context_is_unresolve
     let package = PackageIdentity {
         manager: "npm".to_owned(),
         name: "beacon".to_owned(),
+        registry: "npmjs.org".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -125,7 +129,7 @@ fn supplied_angular_template_facts_are_refused_when_current_context_is_unresolve
         });
     let language = ShippedLanguage::TypeScript.language();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,
@@ -165,6 +169,7 @@ fn checked_facts(text: &str, limits: SyntaxLimits, facts: &SyntaxFacts) -> Synta
             has_errors: facts.has_errors(),
             left_out_declarations: facts.left_out_declaration_count(),
             markdown_facts: facts.markdown_facts().cloned(),
+            export_bindings: facts.export_bindings().map(<[_]>::to_vec),
             source_digest: *facts.source_digest().expect("source witness"),
         },
     )
@@ -176,8 +181,10 @@ fn raw_embedded_provider_facts_remain_reusable_after_checked_restoration() {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
         name: "beacon".to_owned(),
+        registry: "npmjs.org".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -209,7 +216,7 @@ fn raw_embedded_provider_facts_remain_reusable_after_checked_restoration() {
         let sources = [PackageSource::new(&path, text)];
         let language = ShippedLanguage::TypeScript.language();
         let input = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &sources,

@@ -42,6 +42,28 @@ pub struct SyntaxNode {
     pub has_error: bool,
 }
 
+/// Python overload state established from the original import and decorator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonOverload {
+    /// Ordinary function declaration without an overload decorator.
+    Ordinary,
+    /// Import or decorator association was not established.
+    Unknown,
+    /// A typing overload import supplies this decorator.
+    Overload {
+        /// Whole original import statement.
+        import_statement: ByteRange,
+        /// Imported typing module token.
+        module: ByteRange,
+        /// Imported overload token, absent for a module import.
+        imported: Option<ByteRange>,
+        /// Name bound by the import.
+        binding: ByteRange,
+        /// Original decorator expression, excluding the leading `@`.
+        decorator: ByteRange,
+    },
+}
+
 /// One named declaration extracted from a source file.
 ///
 /// `Eq` is not derived: `signatures` and `documentation` carry
@@ -87,6 +109,58 @@ pub struct SyntaxSymbol {
     pub documentation: Arc<[Documentation]>,
     /// Exact source ranges for attached documentation.
     pub documentation_ranges: Vec<ByteRange>,
+    /// Captured Rust module path state. Missing state remains unknown when facts are restored.
+    pub module_path: Option<RustModulePath>,
+    /// Captured Python overload state; absent for older or other language facts.
+    pub python_overload: Option<PythonOverload>,
+}
+
+/// Form of one captured export binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntaxExportKind {
+    /// Named local export or named reexport.
+    Named,
+    /// All exports from another module.
+    All,
+    /// A namespace export from another module.
+    Namespace,
+    /// A default export.
+    Default,
+}
+
+/// Exact source ranges retained for one export binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxExportBinding {
+    /// Authored export form.
+    pub kind: SyntaxExportKind,
+    /// Complete export statement.
+    pub range: ByteRange,
+    /// Defining local name or imported name.
+    pub local: Option<ByteRange>,
+    /// Exported name, when the statement names it.
+    pub exported: Option<ByteRange>,
+    /// Module source token, when the statement names another module.
+    pub source: Option<ByteRange>,
+    /// Existing declaration container, when present.
+    pub container: Option<String>,
+    /// Whether the binding exports only a type.
+    pub type_only: bool,
+}
+
+/// Path attributes captured for one Rust module during the original syntax walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustModulePath {
+    /// The semantic attribute run contains no module path or conditional path attribute.
+    Absent,
+    /// An accepted literal path and its exact unescaped source content.
+    Literal {
+        /// Validated path below the source root.
+        path: rift_core::ProjectPath,
+        /// Original literal content, before the module item.
+        range: ByteRange,
+    },
+    /// Unsupported or conflicting attributes prevent an established module path.
+    Unknown,
 }
 
 /// Origin of syntax facts before or after framework context applies.
@@ -106,6 +180,7 @@ pub struct SyntaxFacts {
     origin: SyntaxOrigin,
     language: Language,
     symbols: Vec<SyntaxSymbol>,
+    export_bindings: Option<Vec<SyntaxExportBinding>>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -247,6 +322,7 @@ impl SyntaxDocument {
                 origin: SyntaxOrigin::Provider,
                 language,
                 symbols,
+                export_bindings: None,
                 has_errors,
                 left_out_declarations,
                 markdown_facts: None,
@@ -275,6 +351,12 @@ impl SyntaxDocument {
         let shared = Arc::make_mut(&mut self.facts);
         shared.has_errors |= !facts.error_ranges().is_empty();
         shared.markdown_facts = Some(facts);
+        self
+    }
+
+    /// Attaches export bindings extracted from the same syntax tree.
+    pub(crate) fn with_export_bindings(mut self, bindings: Vec<SyntaxExportBinding>) -> Self {
+        Arc::make_mut(&mut self.facts).export_bindings = Some(bindings);
         self
     }
 
@@ -363,6 +445,11 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Returns recorded export bindings, or `None` for unrecorded facts.
+    #[must_use]
+    pub fn export_bindings(&self) -> Option<&[SyntaxExportBinding]> {
+        self.export_bindings.as_deref()
+    }
     /// Returns whether these facts came from a provider or framework context.
     #[must_use]
     pub const fn origin(&self) -> SyntaxOrigin {
@@ -457,6 +544,7 @@ impl SyntaxFacts {
             origin: parts.origin,
             language: parts.language,
             symbols: parts.symbols,
+            export_bindings: parts.export_bindings,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,
@@ -519,6 +607,8 @@ mod tests {
             signatures: Arc::from([]),
             documentation: Arc::from([]),
             documentation_ranges: Vec::new(),
+            module_path: None,
+            python_overload: None,
         }
     }
 

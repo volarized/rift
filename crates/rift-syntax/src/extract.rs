@@ -114,6 +114,15 @@ impl<'tree> Visited<'_, 'tree> {
 
 /// Per-grammar decisions the shared walk delegates.
 pub(crate) trait GrammarRules {
+    /// Export binding recorded at this visited node, when the grammar supplies one.
+    fn export_binding(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+        _qualification: &str,
+    ) -> Result<Option<crate::SyntaxExportBinding>, RiftError> {
+        Ok(None)
+    }
     /// The declaration facts behind the visited node; `None` for a node that
     /// declares nothing.
     ///
@@ -140,8 +149,31 @@ pub(crate) trait GrammarRules {
         visited.node()
     }
 
+    /// Whether the declaration renders a callable signature.
+    fn renders_signature(&self, _visited: Visited<'_, '_>) -> bool {
+        true
+    }
+
     /// The grammar's exact declaration name field, absent for providers without one.
     fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
+        Ok(None)
+    }
+
+    /// Captured Rust module path state; unsupported grammars leave it unknown.
+    fn module_path(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+    ) -> Result<Option<crate::RustModulePath>, RiftError> {
+        Ok(None)
+    }
+
+    /// Captured Python import and overload decorator association.
+    fn python_overload(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+    ) -> Result<Option<crate::PythonOverload>, RiftError> {
         Ok(None)
     }
 
@@ -193,6 +225,24 @@ pub(crate) fn extract(
     language: &Language,
     rules: &dyn GrammarRules,
 ) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), RiftError> {
+    let (nodes, symbols, _) = extract_with_export_bindings(root, source, limits, language, rules)?;
+    Ok((nodes, symbols))
+}
+
+pub(crate) type Extraction = (
+    Vec<SyntaxNode>,
+    Vec<SyntaxSymbol>,
+    Vec<crate::SyntaxExportBinding>,
+);
+
+/// Records export bindings in the same bounded tree walk as nodes and declarations.
+pub(crate) fn extract_with_export_bindings(
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    language: &Language,
+    rules: &dyn GrammarRules,
+) -> Result<Extraction, RiftError> {
     let text = source.text;
     let names = SyntaxNames::new(language).expect("a syntax provider uses a shipped grammar");
     let grammar = names.grammar();
@@ -203,6 +253,7 @@ pub(crate) fn extract(
     );
     let mut nodes = Vec::new();
     let mut symbols = Vec::new();
+    let mut export_bindings = Vec::new();
     let mut visits = Visits::default();
     let mut pending = vec![Queued {
         node: root,
@@ -246,6 +297,9 @@ pub(crate) fn extract(
         });
 
         let visited = visits.visited(node_index);
+        if let Some(binding) = rules.export_binding(visited, text, &qualification)? {
+            export_bindings.push(binding);
+        }
         if let Some(declaration) = rules.declaration(visited, text)? {
             symbols.push(qualified_symbol(
                 declaration,
@@ -276,7 +330,7 @@ pub(crate) fn extract(
             depth + 1,
         );
     }
-    Ok((nodes, symbols))
+    Ok((nodes, symbols, export_bindings))
 }
 
 /// One node the walk has queued, with what its visit needs from its parent.
@@ -335,7 +389,10 @@ fn qualified_symbol(
     let item_range = byte_range(node)?;
     let start = rules.declaration_start(visited, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
-    let signatures: Vec<Signature> = callable_signature(&declaration, node, text, language)
+    let signatures: Vec<Signature> = rules
+        .renders_signature(visited)
+        .then(|| callable_signature(&declaration, node, text, language))
+        .flatten()
         .into_iter()
         .collect();
     Ok(SyntaxSymbol {
@@ -360,6 +417,8 @@ fn qualified_symbol(
         signatures: Arc::from(signatures),
         documentation: Arc::from(declaration.documentation),
         documentation_ranges: declaration.documentation_ranges,
+        module_path: rules.module_path(visited, text)?,
+        python_overload: rules.python_overload(visited, text)?,
     })
 }
 

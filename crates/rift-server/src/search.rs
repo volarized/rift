@@ -45,12 +45,12 @@ use rift_search::{Declaration, DescribedUnit};
 use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use crate::engine_read::EngineReferences;
+use crate::read::file_id;
 use crate::read::{
     CURRENT_TREE_ALONE, ReadService, RiftError, accepted_limit, excerpt, page, project_path,
     results_truncation_warning, source_warnings, text_range, validate_common,
     validate_requested_packages, wire_symbol,
 };
-use crate::read::{file_id, parse_symbol_address};
 use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
 };
@@ -1089,7 +1089,7 @@ impl CandidateScreen<'_> {
                 let screened =
                     rift_tracing::traced!(component = "search", operation = "search.screened", {
                         self.screened(inputs)
-                    });
+                    })?;
                 rift_tracing::traced!(
                     component = "search",
                     operation = "search.documentation_project",
@@ -1108,37 +1108,39 @@ impl CandidateScreen<'_> {
     /// `inputs` with every identity this request's filters exclude removed, each input
     /// keeping the order it answered in. An input screened down to nothing no longer
     /// answers, so fusion redistributes its share across the inputs that did.
-    fn screened(&self, inputs: &[RankingInput]) -> Vec<RankingInput> {
-        inputs
-            .iter()
-            .map(|input| {
-                let order = input
-                    .order()
-                    .iter()
-                    .filter(|ranked| self.admits(ranked.identity()))
-                    .cloned()
-                    .collect();
-                RankingInput::new(input.kind(), order)
-            })
-            .collect()
+    fn screened(&self, inputs: &[RankingInput]) -> Result<Vec<RankingInput>, RiftError> {
+        let mut screened = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            let mut order = Vec::with_capacity(input.order().len());
+            for ranked in input.order() {
+                if self.admits(ranked.identity())? {
+                    order.push(ranked.clone());
+                }
+            }
+            screened.push(RankingInput::new(input.kind(), order));
+        }
+        Ok(screened)
     }
 
     /// Whether this request answers `identity`. It does not when no selected index holds
     /// it, when the `paths` selector excludes the path it names, or when `target`
     /// excludes the kind it names. A file row stays under a `target` naming declarations
     /// alone while body matching can answer through the declarations inside it.
-    fn admits(&self, identity: &DocumentIdentity) -> bool {
+    fn admits(&self, identity: &DocumentIdentity) -> Result<bool, RiftError> {
         if let Some(admitted) = self
             .documentation
             .and_then(|documentation| documentation.admits(identity, self.matcher, self.root))
         {
-            return admitted;
+            return Ok(admitted);
         }
-        resolve_candidate(self.index, self.resolution, identity).is_some_and(|resolved| {
-            let carries_body_matches = self.body.is_some() && resolved.answered_path().is_some();
-            resolved.reaches(self.index, self.matcher, self.root)
-                && (resolved.answers(self.target) || carries_body_matches)
-        })
+        Ok(
+            resolve_candidate(self.index, self.resolution, identity)?.is_some_and(|resolved| {
+                let carries_body_matches =
+                    self.body.is_some() && resolved.answered_path().is_some();
+                resolved.reaches(self.index, self.matcher, self.root)
+                    && (resolved.answers(self.target) || carries_body_matches)
+            }),
+        )
     }
 
     /// `ranked` with the declarations its first file rows hold placed at the first file
@@ -1153,10 +1155,9 @@ impl CandidateScreen<'_> {
 
 /// Resolves every fused identity into a hit, in the order fusion produced.
 ///
-/// Resolution reads the identity alone: a `rift://symbol/` address names a project or
-/// `force_include` declaration, and anything else is a project path, optionally carrying
-/// the chunk index a large text file was split at. [`CandidateScreen`] resolved each identity once already, so the
-/// identities that reach here are the ones this snapshot holds and this request answers.
+/// Declaration candidates use the captured provider identity directory. File candidates
+/// carry a project path, optionally carrying the chunk index a large text file was split
+/// at. [`CandidateScreen`] checked each identity against this snapshot and request.
 fn resolve_ranked_hits(
     index: &WorkspaceIndex,
     criteria: SearchCriteria<'_>,
@@ -1171,7 +1172,7 @@ fn resolve_ranked_hits(
             results.push(hit);
             continue;
         }
-        let Some(resolved) = resolve_candidate(index, resolution, candidate.identity()) else {
+        let Some(resolved) = resolve_candidate(index, resolution, candidate.identity())? else {
             continue;
         };
         // A text file past the chunk bound publishes one document per chunk, and each
@@ -1316,40 +1317,41 @@ fn resolve_candidate<'a>(
     index: &'a WorkspaceIndex,
     resolution: Resolution<'a>,
     identity: &DocumentIdentity,
-) -> Option<ResolvedCandidate<'a>> {
+) -> Result<Option<ResolvedCandidate<'a>>, RiftError> {
     let value = identity.as_str();
     if value.starts_with(SYMBOL_URI_PREFIX) {
         return resolve_declaration(index, resolution.force_include, value);
     }
-    resolve_file(index, value)
+    Ok(resolve_file(index, value))
 }
 
-/// The declaration one `rift://symbol/` identity names, in the project index or in the
-/// `force_include` index this request built.
+/// Resolves a provider-local ranking key in the admitted declaration inventory.
 fn resolve_declaration<'a>(
     index: &'a WorkspaceIndex,
     force_include: Option<&'a WorkspaceIndex>,
     identity: &str,
-) -> Option<ResolvedCandidate<'a>> {
-    let address = parse_symbol_address(identity).ok()?;
-    if let Some((file, symbol)) = resolve_symbol(index, &address.path, identity) {
-        return Some(ResolvedCandidate::Declaration(
-            index,
-            declared(file, symbol),
-        ));
+) -> Result<Option<ResolvedCandidate<'a>>, RiftError> {
+    if let Some(matched) = index
+        .symbols_by_provider_identity(identity, 1)?
+        .into_iter()
+        .next()
+    {
+        return Ok(Some(ResolvedCandidate::Declaration(index, matched)));
     }
-    let extra = force_include?;
-    let (file, symbol) = resolve_symbol(extra, &address.path, identity)?;
-    Some(ResolvedCandidate::Declaration(
-        extra,
-        declared(file, symbol),
-    ))
+    let Some(extra) = force_include else {
+        return Ok(None);
+    };
+    Ok(extra
+        .symbols_by_provider_identity(identity, 1)?
+        .into_iter()
+        .next()
+        .map(|matched| ResolvedCandidate::Declaration(extra, matched)))
 }
 
 /// One resolved declaration as a match. The class is the strongest one, because
 /// resolution answers the identity fusion already placed rather than classing a
 /// name again.
-fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> SymbolMatch<'a> {
+pub(crate) fn declared<'a>(file: &'a IndexedFile, symbol: &'a SyntaxSymbol) -> SymbolMatch<'a> {
     SymbolMatch {
         file,
         symbol,
@@ -1544,27 +1546,19 @@ fn text_file_hit(
     }
 }
 
-/// Resolves one ranked symbol unit's identity back to its declaration in `index`. `path`
-/// narrows the search to the one file the unit named, so this stays a scan of that file's
-/// own symbols rather than the whole index. The address is decoded once, names are
-/// compared without encoding, and the resolved declaration's identity is checked last.
+/// Resolves one provider-local ranking key within its captured file.
+/// The key remains internal to ranking; public identities come from assembled records.
 pub(crate) fn resolve_symbol<'a>(
     index: &'a WorkspaceIndex,
     path: &ProjectPath,
     identity: &str,
 ) -> Option<(&'a IndexedFile, &'a SyntaxSymbol)> {
     let file = index.file(path)?;
-    let language_segment = file.syntax().language().identity_segment();
-    let address = parse_symbol_address(identity).ok()?;
-    if address.path != *path || address.language_segment != language_segment {
-        return None;
-    }
-    let symbol = file
-        .syntax()
-        .symbols()
-        .iter()
-        .find(|symbol| symbol.qualified_name == address.qualified_name)?;
-    (address.wire_symbol().0 == identity).then_some((file, symbol))
+    let language = file.syntax().language().identity_segment();
+    let symbol = file.syntax().symbols().iter().find(|symbol| {
+        rift_core::symbol_identity(&language, path.as_str(), &symbol.qualified_name) == identity
+    })?;
+    Some((file, symbol))
 }
 
 /// Finds the first line of `content` carrying one of the query's parsed members,
@@ -1607,23 +1601,19 @@ fn query_line<'source>(
     None
 }
 
-/// Finds `results`' existing hit for `file`/`symbol`'s wire identity, if a lexical or
-/// traversal-walk lane already placed one. `merge_symbol_hit` and the traversal module's
-/// `merge_traversal_hit` share this: both recompute the same identity and must not create two
-/// hits for one symbol.
+/// Finds an existing hit for the captured declaration's established identity.
+/// A declaration without an identity does not match another unresolved declaration.
 pub(crate) fn find_symbol_hit_mut<'a>(
+    index: &WorkspaceIndex,
     results: &'a mut [SearchHit],
-    file: &IndexedFile,
-    symbol: &SyntaxSymbol,
-) -> Option<&'a mut SearchHit> {
-    let identity = SymbolId(rift_core::symbol_identity(
-        &file.syntax().language().identity_segment(),
-        file.path().as_str(),
-        &symbol.qualified_name,
-    ));
-    results
+    matched: SymbolMatch<'_>,
+) -> Result<Option<&'a mut SearchHit>, RiftError> {
+    let Some(identity) = crate::read::symbol_id(index, matched)? else {
+        return Ok(None);
+    };
+    Ok(results
         .iter_mut()
-        .find(|hit| hit_symbol_id(hit) == Some(&identity))
+        .find(|hit| hit_symbol_id(hit) == Some(&identity)))
 }
 
 /// One hit's declaration identity: absent for a node, file, documentation, or commit
@@ -1733,7 +1723,7 @@ mod tests {
         ReadService, Resolution, SearchCriteria, SearchHit, SearchHitTarget, StoreAnswer,
         declaration_text, resolve_symbol,
     };
-    use crate::read::tests::project_fixture;
+    use crate::read::tests::{captured_rust_library, local_identity, project_fixture};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -1830,7 +1820,7 @@ mod tests {
             body: None,
         };
         let ranked = fuse(
-            &screen.screened(inputs),
+            &screen.screened(inputs)?,
             configured_weights(),
             QueryPhase::Precise,
             32,
@@ -1905,7 +1895,15 @@ mod tests {
     }
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
+        fixture_with_package("beacon")
+    }
+
+    fn fixture_with_package(package: &str) -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            format!("[package]\nname = \"{package}\"\nversion = \"1.0.0\"\n"),
+        )?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -1956,6 +1954,10 @@ pub fn compute() -> i32 {
 
     fn rich_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+        )?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
         let service = ReadService::build(
@@ -1985,6 +1987,10 @@ impl Tower {
 
     fn match_class_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+        )?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), MATCH_CLASS_SOURCE)?;
         let service = ReadService::build(
@@ -2001,6 +2007,10 @@ impl Tower {
     /// something to disagree about.
     fn multi_file_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+        )?;
         fs::create_dir_all(directory.path().join("src/nested"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -2186,6 +2196,10 @@ impl Tower {
     fn search_symbol_hits_carry_the_typescript_language() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","types":"./routes.ts"}"#,
+        )?;
+        fs::write(
             directory.path().join("routes.ts"),
             "export interface Route {\n  path: string;\n}\n",
         )?;
@@ -2210,13 +2224,13 @@ impl Tower {
         assert_eq!(symbol["kind"], json!("interface"));
         assert_eq!(
             symbol["id"],
-            json!("rift://symbol/typescript/routes.ts/Route")
+            json!(local_identity("typescript", &["beacon", "Route"]))
         );
         Ok(())
     }
 
     /// Symbol hits from a markdown file carry the `markdown` language, the composed wire
-    /// kind, and an id escaping the heading text. The heading is two plain words, which
+    /// kind, and its physical path and range. The heading is two plain words, which
     /// the identifier ranking never extracts, so the store's full-text input places it.
     #[tokio::test]
     async fn search_symbol_hits_carry_the_markdown_language() -> TestResult {
@@ -2243,15 +2257,14 @@ impl Tower {
         let symbol = &results[0]["hit"]["symbol"];
         assert_eq!(symbol["language"], json!("markdown"));
         assert_eq!(symbol["kind"], json!("heading"));
-        assert_eq!(
-            symbol["id"],
-            json!("rift://symbol/markdown/notes.md/Beacon%20Notes")
-        );
+        assert!(symbol.get("id").is_none());
+        assert_eq!(results[0]["path"], json!("notes.md"));
+        assert!(results[0]["range"]["end"].is_u64());
         Ok(())
     }
 
     /// Symbol hits from JSON and YAML files carry their languages, the
-    /// composed wire kinds, and ids escaping the key path.
+    /// composed wire kinds, and physical paths and ranges.
     #[tokio::test]
     async fn search_symbol_hits_carry_the_json_and_yaml_languages() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -2269,20 +2282,10 @@ impl Tower {
         )?;
         let store = published_store(&directory.path().join("search.db"), &service).await?;
         let expectations = [
-            (
-                "beacon port",
-                "json",
-                "member",
-                "rift://symbol/json/config.json/beacon%20port",
-            ),
-            (
-                "beacon retries",
-                "yaml",
-                "mapping_entry",
-                "rift://symbol/yaml/deploy.yaml/beacon%20retries",
-            ),
+            ("beacon port", "json", "member", "config.json"),
+            ("beacon retries", "yaml", "mapping_entry", "deploy.yaml"),
         ];
-        for (query, language, kind, id) in expectations {
+        for (query, language, kind, path) in expectations {
             let answer = store_answer(&store, service.tree_revision(), query).await?;
             let request = json!({
                 "query": query,
@@ -2296,7 +2299,9 @@ impl Tower {
             let symbol = &results[0]["hit"]["symbol"];
             assert_eq!(symbol["language"], json!(language));
             assert_eq!(symbol["kind"], json!(kind));
-            assert_eq!(symbol["id"], json!(id));
+            assert!(symbol.get("id").is_none());
+            assert_eq!(results[0]["path"], json!(path));
+            assert!(results[0]["range"]["end"].is_u64());
         }
         Ok(())
     }
@@ -2305,7 +2310,7 @@ impl Tower {
     /// The README block retains its baseline document mapping and the fused score.
     #[tokio::test]
     async fn search_combines_symbol_file_and_documentation_hits_on_one_page() -> TestResult {
-        let (directory, service) = fixture()?;
+        let (directory, service) = fixture_with_package("lantern")?;
         let store = answered(&directory.path().join("search.db"), &service, "Beacon").await?;
         let params: SearchParams = serde_json::from_value(json!({
             "query": "Beacon",
@@ -2324,7 +2329,12 @@ impl Tower {
                 }
             })
             .collect();
-        assert_eq!(documentation.len(), 1);
+        assert_eq!(
+            documentation.len(),
+            1,
+            "captured documentation: {:#?}; search result: {result:#?}",
+            service.index().documentation()
+        );
         let (hit, documentation) = documentation[0];
         assert_eq!(
             hit.path.as_ref().map(|path| path.0.as_str()),
@@ -2346,9 +2356,9 @@ impl Tower {
         assert_eq!(
             identities,
             [
-                "rift://symbol/rust/src/lib.rs/Beacon",
-                "rift://symbol/rust/src/lib.rs/Beacon::signal",
-                "src/lib.rs",
+                local_identity("rust", &["lantern", "Beacon"]),
+                local_identity("rust", &["lantern", "Beacon", "signal"]),
+                "src/lib.rs".to_owned(),
             ],
             "{result:#?}"
         );
@@ -2377,6 +2387,7 @@ impl Tower {
     #[test]
     fn search_pool_stops_at_the_result_bound_and_leaves_a_later_candidate_out() -> TestResult {
         let directory = tempfile::tempdir()?;
+        captured_rust_library(directory.path(), "lib.rs")?;
         fs::write(
             directory.path().join("lib.rs"),
             "pub fn beacon_alpha() {}\npub fn beacon_beta() {}\npub fn beacon_gamma() {}\n",
@@ -2397,8 +2408,8 @@ impl Tower {
         assert_eq!(
             hit_identities(&result),
             [
-                "rift://symbol/rust/lib.rs/beacon_alpha",
-                "rift://symbol/rust/lib.rs/beacon_beta",
+                local_identity("rust", &["beacon", "beacon_alpha"]),
+                local_identity("rust", &["beacon", "beacon_beta"]),
             ],
             "{result:#?}"
         );
@@ -2709,10 +2720,10 @@ impl Tower {
         assert_eq!(
             hit_identities(&result),
             [
-                declaration_identity("src/lib.rs", "beacon")?.as_str(),
-                declaration_identity("src/lib.rs", "Tower::beacon")?.as_str(),
-                declaration_identity("src/lib.rs", "beacon_relay")?.as_str(),
-                declaration_identity("src/lib.rs", "Tower::relay_to_beacon")?.as_str(),
+                local_identity("rust", &["beacon", "beacon"]),
+                local_identity("rust", &["beacon", "Tower", "beacon"]),
+                local_identity("rust", &["beacon", "beacon_relay"]),
+                local_identity("rust", &["beacon", "Tower", "relay_to_beacon"]),
             ],
             "{result:#?}"
         );
@@ -2746,6 +2757,7 @@ impl Tower {
     #[test]
     fn search_ties_at_one_match_class_order_by_the_declarations_identity() -> TestResult {
         let directory = tempfile::tempdir()?;
+        captured_rust_library(directory.path(), "lib.rs")?;
         fs::write(
             directory.path().join("lib.rs"),
             "pub fn beacon_beta() {}\npub fn beacon_alpha() {}\n",
@@ -2766,8 +2778,8 @@ impl Tower {
         assert_eq!(
             hit_identities(&result),
             [
-                "rift://symbol/rust/lib.rs/beacon_alpha",
-                "rift://symbol/rust/lib.rs/beacon_beta",
+                local_identity("rust", &["beacon", "beacon_alpha"]),
+                local_identity("rust", &["beacon", "beacon_beta"]),
             ],
             "{result:#?}"
         );
@@ -3138,7 +3150,7 @@ impl Tower {
             "kind": "field",
             "field": {"field": "name", "op": "eq", "value": "Beacon"}
         });
-        let traversal = json!({"seed": "rift://symbol/rust/src/lib.rs/Beacon"});
+        let traversal = json!({"seed": local_identity("rust", &["beacon","Beacon"])});
         let paths = json!({"include": ["src/lib.rs"]});
         let refused = [
             json!({"query": "Beacon", "filter": filter.clone()}),
@@ -3186,9 +3198,10 @@ impl Tower {
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert!(!result.results.is_empty());
         assert!(
-            hit_identities(&result)
+            result
+                .results
                 .iter()
-                .all(|identity| identity.contains("other.rs")),
+                .all(|hit| hit.path.as_ref().is_some_and(|path| path.0 == "other.rs")),
             "{result:#?}"
         );
         Ok(())
@@ -3226,7 +3239,7 @@ impl Tower {
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
             hit_identities(&result),
-            ["rift://symbol/rust/src/lib.rs/beacon_top"],
+            [local_identity("rust", &["beacon", "beacon_top"])],
             "{result:#?}"
         );
         Ok(())
@@ -3244,7 +3257,7 @@ impl Tower {
         let result = service.search(&params, &StoreAnswer::identifier_only())?;
         assert_eq!(
             hit_identities(&result),
-            ["rift://symbol/rust/src/lib.rs/beacon_top"],
+            [local_identity("rust", &["beacon", "beacon_top"])],
             "{result:#?}"
         );
         Ok(())
@@ -3360,12 +3373,28 @@ impl Tower {
                 value["pagination"],
                 json!({ "page_index": page_index, "total_pages": 3 })
             );
-            let id = value["results"][0]["hit"]["symbol"]["id"]
+            assert!(
+                value["results"][0]["hit"]["symbol"]["name"]
+                    .as_str()
+                    .is_some()
+            );
+            let path = value["results"][0]["path"]
                 .as_str()
-                .ok_or("every page must carry one symbol hit")?
+                .ok_or("every page must carry one physical symbol path")?
                 .to_owned();
-            assert!(!seen.contains(&id), "pages must not overlap: {id}");
-            seen.push(id);
+            let range = &value["results"][0]["range"];
+            let declaration = (
+                path,
+                range["start"]
+                    .as_u64()
+                    .ok_or("physical range start required")?,
+                range["end"].as_u64().ok_or("physical range end required")?,
+            );
+            assert!(
+                !seen.contains(&declaration),
+                "pages must not overlap: {declaration:?}"
+            );
+            seen.push(declaration);
         }
         Ok(())
     }
@@ -3440,6 +3469,7 @@ impl Tower {
     fn search_order_path_keeps_tied_hits_in_the_same_relative_order_across_page_sizes() -> TestResult
     {
         let directory = tempfile::tempdir()?;
+        captured_rust_library(directory.path(), "src/lib.rs")?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -3479,8 +3509,8 @@ impl Tower {
         assert_eq!(
             wide_ids,
             [
-                "rift://symbol/rust/src/lib.rs/beacon_alpha",
-                "rift://symbol/rust/src/lib.rs/beacon_beta"
+                local_identity("rust", &["beacon", "beacon_alpha"]),
+                local_identity("rust", &["beacon", "beacon_beta"])
             ]
         );
         Ok(())
@@ -3500,10 +3530,14 @@ impl Tower {
         assert_eq!(results.len(), 2);
         for hit in results {
             assert!(hit["range"]["start"].is_u64());
-            let id = hit["hit"]["symbol"]["id"]
+            assert!(
+                hit["hit"]["symbol"].get("id").is_none(),
+                "a force-included file without captured namespace metadata remains unresolved"
+            );
+            let path = hit["path"]
                 .as_str()
-                .ok_or("force_include hit must carry a symbol id")?;
-            assert!(id.contains("gitignored.rs") || id.contains("configured_out.rs"));
+                .ok_or("force_include hit must carry its physical path")?;
+            assert!(path == "gitignored.rs" || path == "configured_out.rs");
         }
         Ok(())
     }
@@ -3540,21 +3574,17 @@ impl Tower {
         Ok(())
     }
 
-    /// A force-included file holding a declaration the Contribution contract refuses is
-    /// left out of the on-demand index, and the answer names it in `source_unavailable`
-    /// instead of failing the request.
+    /// A force-included declaration at the portable name bound retains its original
+    /// source and bounded provider key, even when its logical identity is unresolved.
     #[test]
-    fn search_force_include_leaves_out_a_file_the_contract_refuses_and_warns() -> TestResult {
+    fn search_force_include_keeps_an_exact_bound_name_without_a_false_source_warning() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join(".gitignore"), "wide.rs\n")?;
         fs::write(directory.path().join("lib.rs"), "pub fn kept() {}\n")?;
-        fs::write(
-            directory.path().join("wide.rs"),
-            format!(
-                "pub struct {};\n",
-                "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
-            ),
-        )?;
+        let name = "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX);
+        let source = format!("pub struct {name};\n");
+        fs::write(directory.path().join("wide.rs"), &source)?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -3586,16 +3616,25 @@ impl Tower {
                 .is_some_and(|results| results.iter().any(|hit| hit["path"] == "lib.rs")),
             "{value:#}"
         );
-        let names_wide = value["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning["code"] == "source_unavailable"
-                    && warning["unit"] == "rift://file/wide.rs"
-                    && warning["detail"]
-                        .as_str()
-                        .is_some_and(|detail| detail.contains("provider_symbol"))
-            })
+        let no_false_source_warning = value["warnings"].as_array().is_none_or(|warnings| {
+            warnings
+                .iter()
+                .all(|warning| warning["code"] != "source_unavailable")
         });
-        assert!(names_wide, "{value:#}");
+        assert!(no_false_source_warning, "{value:#}");
+        let selected = service.selected_paths(params.paths.as_ref())?;
+        let included = selected.force_include.expect("force-included index");
+        let path = rift_core::ProjectPath::new("wide.rs")?;
+        let held = included.file(&path).expect("exact-bound source remains");
+        assert_eq!(held.source(), source);
+        assert_eq!(held.syntax().symbols()[0].name, name);
+        assert!(
+            included
+                .normalized_graph()
+                .records()
+                .iter()
+                .any(|record| record.identity().is_none())
+        );
         Ok(())
     }
 
@@ -4410,10 +4449,29 @@ impl Tower {
         let identities = hit_identities(&answer);
         for input in store.precise() {
             for entry in input.order() {
+                let declaration = service
+                    .index()
+                    .symbols_by_provider_identity(entry.identity().as_str(), 1)?
+                    .into_iter()
+                    .next();
+                let physical_hit = declaration.is_some_and(|matched| {
+                    answer.results.iter().any(|hit| {
+                        matches!(hit.hit, SearchHitTarget::Symbol { .. })
+                            && hit
+                                .path
+                                .as_ref()
+                                .is_some_and(|path| path.0 == matched.file.path().as_str())
+                            && hit.range.as_ref().is_some_and(|range| {
+                                range.start == matched.symbol.range.start
+                                    && range.end == matched.symbol.range.end
+                            })
+                    })
+                });
                 assert!(
-                    identities
-                        .iter()
-                        .any(|held| held == entry.identity().as_str())
+                    physical_hit
+                        || identities
+                            .iter()
+                            .any(|held| held == entry.identity().as_str())
                         || answer.results.iter().any(|hit| match &hit.hit {
                             SearchHitTarget::Documentation { documentation } => documentation
                                 .block
@@ -4758,7 +4816,7 @@ impl Tower {
         let params: SearchParams = serde_json::from_value(json!({
             "query": "beacon",
             "scope": "global",
-            "traversal": { "seed": "rift://symbol/rust/src/lib.rs/beacon" }
+            "traversal": { "seed": local_identity("rust", &["beacon","beacon"]) }
         }))?;
 
         let error = service
@@ -4817,7 +4875,7 @@ impl Tower {
         ] {
             let params: SearchParams = serde_json::from_value(json!({
                 "change": change,
-                "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+                "traversal": {"seed": local_identity("rust", &["beacon","beacon"])}
             }))
             .expect("the request parses");
 
@@ -4836,7 +4894,8 @@ impl Tower {
     /// A walk standing without a comparison and naming its seed passes the rule.
     #[test]
     fn validate_search_accepts_a_seeded_walk_standing_alone() {
-        let arguments = json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}});
+        let arguments =
+            json!({"traversal": {"seed": local_identity("rust", &["beacon","beacon"])}});
         let params: SearchParams =
             serde_json::from_value(arguments.clone()).expect("the request parses");
         assert!(

@@ -28,7 +28,7 @@ impl<'a> SearchDocumentation<'a> {
     /// `force_include` files'.
     ///
     /// Each layer was built once by the index that owns it, so joining one costs a
-    /// reference. A layer whose build crossed a bound is left out and the answer warns
+    /// reference. A layer whose build fails is left out and the answer warns
     /// `documentation_unavailable` naming it; the search itself is answered.
     pub(super) fn new(
         index: &'a WorkspaceIndex,
@@ -88,8 +88,15 @@ impl<'a> SearchDocumentation<'a> {
             SearchParamsTarget::All => DocumentationProjectionTarget::All,
             _ => return Ok(inputs.to_vec()),
         };
-        self.projection.project(inputs, target, |identity, source| {
-            let range = self.document_range(identity)?;
+        let mut failure = None;
+        let projected = self.projection.project(inputs, target, |identity, source| {
+            let range = match self.document_range(identity) {
+                Ok(range) => range?,
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    return None;
+                }
+            };
             let content = captured_content(self.index, self.resolution, source)?;
             let start = usize::try_from(range.start).ok()?;
             let end = usize::try_from(range.end).ok()?;
@@ -98,18 +105,25 @@ impl<'a> SearchDocumentation<'a> {
                 start: range.start.checked_add(found.start)?,
                 end: range.start.checked_add(found.end)?,
             })
-        })
+        });
+        if let Some(error) = failure {
+            return error.fail();
+        }
+        projected
     }
 
-    fn document_range(&self, identity: &DocumentIdentity) -> Option<TextRange> {
+    fn document_range(&self, identity: &DocumentIdentity) -> Result<Option<TextRange>, RiftError> {
         if let Some(range) = self.projection.document_range(identity) {
-            return Some(range.clone());
+            return Ok(Some(range.clone()));
         }
-        let range = match resolve_candidate(self.index, self.resolution, identity)? {
-            ResolvedCandidate::Declaration(_, found) => found.symbol.range,
-            ResolvedCandidate::SourceFile(_) | ResolvedCandidate::TextFile(_) => return None,
+        let Some(resolved) = resolve_candidate(self.index, self.resolution, identity)? else {
+            return Ok(None);
         };
-        Some(text_range(range))
+        let range = match resolved {
+            ResolvedCandidate::Declaration(_, found) => found.symbol.range,
+            ResolvedCandidate::SourceFile(_) | ResolvedCandidate::TextFile(_) => return Ok(None),
+        };
+        Ok(Some(text_range(range)))
     }
 
     pub(super) fn hit(&self, candidate: &FusedCandidate) -> Option<SearchHit> {
@@ -160,7 +174,7 @@ impl<'a> JoinedLayers<'a> {
                     operation = "search.documentation",
                     documentation,
                     %error,
-                    "a documentation layer crossed a bound and was left out of the search"
+                    "a documentation layer was left out of the search"
                 );
                 self.warnings.push(ReadWarning::DocumentationUnavailable {
                     detail: format!(
@@ -297,6 +311,10 @@ mod tests {
         let collection = index.documentation();
         let refused = DocumentationLayer::borrowed(&[collection, collection])
             .expect_err("one source held by two collections refuses the layer");
+        assert_eq!(
+            refused.slug(),
+            rift_error::errors::analysis::documentation_duplicate_source::SLUG
+        );
 
         let mut joined = JoinedLayers::default();
         joined.join("project", Err(&refused));
@@ -311,6 +329,7 @@ mod tests {
             detail.starts_with("the project documentation was left out of this answer: "),
             "the warning names the layer and carries the refusal: {detail}"
         );
+        assert!(detail.ends_with(&refused.to_string()));
         Ok(())
     }
 }

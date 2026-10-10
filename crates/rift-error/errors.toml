@@ -70,6 +70,36 @@ fields = { subject = { type = "string" } }
 message = "identity is empty or contains a control character"
 action = "correct the reported field and resend the request"
 
+[error.core.symbol_identity_invalid]
+message = "symbol identity is not canonical: {violation}"
+action = "supply a canonical rift://symbol/ address"
+fields = { violation = { type = "string" } }
+
+[error.analysis.package_artifact_invalid]
+message = "selected artifact field {field} is invalid: {violation}"
+action = "replace or rebuild the invalid publication, then retry"
+fields = { field = { type = "string" }, violation = { type = "string" }, cause = { type = "rift_error", role = "cause", optional = true } }
+
+[error.server.search_exact_release_unavailable]
+message = "exact release {release} has no accepted publication"
+action = "supply an accepted publication for the exact release, then retry"
+fields = { release = { type = "string" }, operation = { type = "string" } }
+
+[error.server.search_coverage_unavailable]
+message = "accepted facts do not cover {operation} in the captured selection"
+action = "supply a publication covering the requested selection, then retry"
+fields = { operation = { type = "string" }, view = { type = "string", optional = true } }
+
+[error.server.search_view_expired]
+message = "captured view {view} expired or was removed"
+action = "capture a new view and resend the request with its key"
+fields = { view = { type = "string" }, operation = { type = "string" } }
+
+[error.server.search_view_context]
+message = "captured view {view} belongs to another workspace or scope mapping"
+action = "use the matching workspace, scope mapping, and captured view"
+fields = { view = { type = "string" }, operation = { type = "string" } }
+
 [error.core.revision_zero]
 message = "revision is zero"
 action = "correct the reported field and resend the request"
@@ -361,6 +391,11 @@ fields = { field = { type = "string", optional = true }, name = { type = "string
 
 [error.core.configuration_package_selector_invalid]
 message = 'dependency package has conflicting or missing version selector'
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string", optional = true }, package = { type = "string", optional = true } }
+
+[error.core.configuration_package_registry_invalid]
+message = 'dependency package registry is not a canonical endpoint'
 action = "correct the reported configuration field, then retry"
 fields = { field = { type = "string", optional = true }, package = { type = "string", optional = true } }
 

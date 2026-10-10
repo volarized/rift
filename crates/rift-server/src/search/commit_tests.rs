@@ -374,7 +374,7 @@ fn a_commit_search_refuses_every_field_beside_query() -> TestResult {
     let refused = [
         (json!({"pattern": "beacon"}), "pattern"),
         (
-            json!({"traversal": {"seed": "rift://symbol/rust/src/lib.rs/beacon"}}),
+            json!({"traversal": {"seed": crate::read::tests::local_identity("rust", &["beacon", "beacon"])}}),
             "traversal",
         ),
         (json!({"change": {"base": "HEAD~1"}}), "change"),

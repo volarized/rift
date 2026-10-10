@@ -73,7 +73,7 @@ type AttachedDeclaration = (
 );
 type AttachedDeclarations =
     BTreeMap<rift_protocol::documentation::DocumentationContentIdentity, Vec<AttachedDeclaration>>;
-type AttachedSymbols = BTreeSet<rift_protocol::read::SymbolId>;
+type AttachedSymbols = BTreeMap<(u64, u64), BTreeSet<rift_protocol::read::SymbolId>>;
 
 /// Extracts every source's facts, in source order.
 ///
@@ -310,7 +310,7 @@ fn extraction_key(
     attached: &[AttachedDeclaration],
     symbols: &AttachedSymbols,
 ) -> Result<DocumentationDigest, RiftError> {
-    let syntax_facts = attached_syntax_facts(input, symbols)?;
+    let syntax_facts = attached_syntax_facts(input, symbols);
     canonical_digest(&(
         input.source(),
         input.chunks(),
@@ -324,24 +324,13 @@ fn extraction_key(
 fn attached_syntax_facts(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
-) -> Result<AttachedSyntaxFacts, RiftError> {
-    let Some(syntax) = input.syntax() else {
-        return Ok(None);
-    };
-    let path = super::references::declaration_path(&input.source().identity)?;
+) -> AttachedSyntaxFacts {
+    let syntax = input.syntax()?;
     let facts = syntax
         .symbols()
         .iter()
         .filter_map(|symbol| {
-            let identity = rift_core::symbol_identity(
-                &syntax.language().identity_segment(),
-                path.as_str(),
-                &symbol.qualified_name,
-            );
-            let identity = rift_protocol::read::SymbolId(identity);
-            if !symbols.contains(&identity) {
-                return None;
-            }
+            let identity = attached_identity(symbols, symbol)?;
             Some((
                 identity,
                 symbol
@@ -352,7 +341,75 @@ fn attached_syntax_facts(
             ))
         })
         .collect();
-    Ok(Some((syntax.language().identity_segment(), facts)))
+    Some((syntax.language().identity_segment(), facts))
+}
+
+fn attached_identity(
+    symbols: &AttachedSymbols,
+    symbol: &rift_syntax::SyntaxSymbol,
+) -> Option<rift_protocol::read::SymbolId> {
+    let identities = symbols
+        .get(&(symbol.range.start, symbol.range.end))
+        .into_iter()
+        .chain(symbols.get(&(symbol.item_range.start, symbol.item_range.end)))
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    identities
+        .first()
+        .filter(|_| identities.len() == 1)
+        .map(|identity| (**identity).clone())
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::{AttachedSymbols, attached_identity};
+
+    #[test]
+    fn attached_identity_accepts_original_item_range_and_refuses_distinct_ids() {
+        let language = rift_syntax::ShippedLanguage::Rust.language();
+        let path = rift_core::ProjectPath::new("src/lib.rs").expect("source path");
+        let text = "/// Original comment.\npub fn start() {}\n";
+        let document = rift_syntax::registry::provider_for_language(&language)
+            .expect("Rust provider")
+            .analyze(
+                rift_syntax::SyntaxSource { path: &path, text },
+                rift_syntax::SyntaxLimits::default(),
+            )
+            .expect("original syntax facts");
+        let symbol = &document.facts().symbols()[0];
+        assert_ne!(symbol.range, symbol.item_range);
+        let identity = |name: &str| {
+            let identity = rift_protocol::identity::SymbolIdentity::new(
+                rift_protocol::identity::SymbolOwner::Local,
+                language.clone(),
+                vec!["fixture".to_owned(), name.to_owned()],
+            )
+            .expect("canonical current identity");
+            rift_protocol::read::SymbolId::parse(&identity.wire_identity())
+                .expect("symbol identity")
+        };
+        let start = identity("start");
+        let mut attached = AttachedSymbols::new();
+        attached.insert(
+            (symbol.item_range.start, symbol.item_range.end),
+            std::collections::BTreeSet::from([start.clone()]),
+        );
+        assert_eq!(attached_identity(&attached, symbol), Some(start.clone()));
+        attached.insert(
+            (symbol.range.start, symbol.range.end),
+            std::collections::BTreeSet::from([start.clone()]),
+        );
+        assert_eq!(attached_identity(&attached, symbol), Some(start));
+        attached.insert(
+            (symbol.item_range.start, symbol.item_range.end),
+            std::collections::BTreeSet::from([identity("other")]),
+        );
+        assert!(attached_identity(&attached, symbol).is_none());
+        assert_eq!(
+            document.source_digest(),
+            Some(&rift_core::FileDigest::of(text.as_bytes()))
+        );
+    }
 }
 
 fn attached_declaration_facts(
@@ -374,7 +431,14 @@ fn attached_declaration_facts(
 }
 
 fn attached_symbols(attached: &[AttachedDeclaration]) -> AttachedSymbols {
-    attached.iter().map(|(symbol, _)| symbol.clone()).collect()
+    let mut symbols = AttachedSymbols::new();
+    for (symbol, range) in attached {
+        symbols
+            .entry((range.start, range.end))
+            .or_default()
+            .insert(symbol.clone());
+    }
+    symbols
 }
 
 fn extract_source_facts(
@@ -497,19 +561,12 @@ fn extract_attached_comments(
         );
         return Ok(());
     };
-    let path = super::references::declaration_path(&input.source().identity)?;
     let starts = line_starts(input.text());
     let mut ordinals = BTreeMap::new();
     for symbol in syntax.symbols() {
-        let identity = rift_core::symbol_identity(
-            &syntax.language().identity_segment(),
-            path.as_str(),
-            &symbol.qualified_name,
-        );
-        let symbol_identity = rift_protocol::read::SymbolId(identity);
-        if !symbols.contains(&symbol_identity) {
+        let Some(symbol_identity) = attached_identity(symbols, symbol) else {
             continue;
-        }
+        };
         for range in &symbol.documentation_ranges {
             let draft = BlockDraft {
                 range: TextRange {
@@ -1092,6 +1149,7 @@ mod tests {
             origin: SymbolOrigin {
                 location: Some(SourceLocationKind::Project),
                 package: None,
+                runtime: None,
                 source_kind: SourceKind::Authored,
             },
             format: DocumentationSourceFormat::Markdown,
@@ -1186,6 +1244,7 @@ mod tests {
             origin: SymbolOrigin {
                 location: Some(SourceLocationKind::Project),
                 package: None,
+                runtime: None,
                 source_kind: SourceKind::Authored,
             },
             format: DocumentationSourceFormat::Markdown,

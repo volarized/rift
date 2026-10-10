@@ -7,6 +7,7 @@ fn exact_entry(version: &str) -> PackageContextEntry {
     PackageContextEntry {
         availability: PackageAvailability::Canonical,
         manager: "cargo".to_owned(),
+        registry: Some("crates.io".to_owned()),
         name: "demo".to_owned(),
         requirement: None,
         version: Some(version.to_owned()),
@@ -17,6 +18,7 @@ fn requirement_entry() -> PackageContextEntry {
     PackageContextEntry {
         availability: PackageAvailability::Canonical,
         manager: "cargo".to_owned(),
+        registry: Some("crates.io".to_owned()),
         name: "demo".to_owned(),
         requirement: Some(RANGE.to_owned()),
         version: None,
@@ -26,6 +28,7 @@ fn requirement_entry() -> PackageContextEntry {
 fn served(version: &str) -> PackageIdentity {
     PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: "demo".to_owned(),
         version: version.to_owned(),
     }
@@ -275,21 +278,20 @@ fn test_resolution_refuses_a_resolved_entry_with_both_selectors_or_neither() {
     }
 }
 
-/// A `requirement_unsatisfied` detail for an entry at every package field's bound fills the
-/// warning detail bound exactly, and the resolution naming it is accepted. The bounds count
-/// characters, as the contract's `maxLength` does, so a name in a multi-byte script at its
-/// bound passes the request check too, at twice the bytes.
+/// A warning detail meets its character bound while the exact package owner is refused.
 #[test]
-fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
+fn test_warning_detail_bound_does_not_admit_invalid_package_owner() {
     let requirement = PackageContextEntry {
         availability: PackageAvailability::Canonical,
         manager: "m".repeat(PACKAGE_MANAGER_CHARS_MAX),
+        registry: Some("registry.example".to_owned()),
         name: "\u{e9}".repeat(PACKAGE_NAME_CHARS_MAX),
         requirement: Some("r".repeat(PACKAGE_VERSION_CHARS_MAX)),
         version: None,
     };
     let package = PackageIdentity {
         manager: requirement.manager.clone(),
+        registry: "registry.example".to_owned(),
         name: requirement.name.clone(),
         version: "v".repeat(PACKAGE_VERSION_CHARS_MAX),
     };
@@ -312,14 +314,14 @@ fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
         entries: vec![requirement.clone()],
     };
     assert_eq!(validate_resolution_request(&request), Ok(()));
-    assert_eq!(validate_packages(std::slice::from_ref(&package)), Ok(()));
-    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
     assert_eq!(
-        response.substitutions(),
-        [Substitution {
-            requested: requirement,
-            served: package,
-        }]
+        validate_packages(std::slice::from_ref(&package)),
+        Err(ClientError::InvalidRequest { field: "package" })
+    );
+    assert_eq!(validate_resolution_warnings(&response), Ok(()));
+    assert_eq!(
+        validate_resolution_response(&request, &response),
+        Err(ClientError::InvalidResponseField { field: "package" })
     );
 }
 
@@ -343,6 +345,7 @@ impl PackageFields {
         PackageContextEntry {
             availability: PackageAvailability::Canonical,
             manager: self.manager.clone(),
+            registry: Some("registry.example".to_owned()),
             name: self.name.clone(),
             requirement: None,
             version: Some(self.version.clone()),
@@ -352,6 +355,7 @@ impl PackageFields {
     fn identity(&self) -> PackageIdentity {
         PackageIdentity {
             manager: self.manager.clone(),
+            registry: "registry.example".to_owned(),
             name: self.name.clone(),
             version: self.version.clone(),
         }
@@ -371,7 +375,10 @@ fn test_package_fields_past_their_character_bound_are_refused() {
         entries: vec![at_bound.entry()],
     };
     assert_eq!(validate_resolution_request(&request), Ok(()));
-    assert_eq!(validate_packages(&[at_bound.identity()]), Ok(()));
+    assert_eq!(
+        validate_packages(&[at_bound.identity()]),
+        Err(ClientError::InvalidRequest { field: "package" })
+    );
 
     let past: [FieldPastItsBound; 3] = [
         ("manager", "package_manager", |fields| {

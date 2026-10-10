@@ -12,6 +12,10 @@
 
 #[cfg(unix)]
 mod fake_engine;
+
+#[cfg(unix)]
+#[path = "announced_work/mod.rs"]
+mod announced_work;
 #[allow(
     dead_code,
     reason = "shared fixture global API exposes helpers this suite does not use"
@@ -1213,8 +1217,7 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
 /// The `PROGRESS` step of an engine that begins and ends its work at start, so the session
 /// reads it ready once quiet.
 #[cfg(unix)]
-const ANNOUNCED_WORK: &str = r#"frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
-      frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"end"}}}'"#;
+const ANNOUNCED_WORK: &str = announced_work::ANNOUNCED_WORK;
 
 /// A line past the end of `lib.rs`, which no served byte holds.
 #[cfg(unix)]

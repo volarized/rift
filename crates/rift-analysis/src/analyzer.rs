@@ -26,7 +26,7 @@ use rift_core::constants::DIGEST_WIRE_CHARS;
 use rift_core::line::{line_of, line_starts};
 use rift_core::{
     ContributionOrigin, ProjectPath as CoreProjectPath, SourceKind,
-    SourceUnitId as CoreSourceUnitId, symbol_identity,
+    SourceUnitId as CoreSourceUnitId,
 };
 use rift_error::{RiftError, errors};
 use rift_protocol::canonical::canonical_json;
@@ -35,13 +35,15 @@ use rift_protocol::documentation::{
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
     DocumentationWarningKind, NotebookCellKind,
 };
+use rift_protocol::identity::SymbolOwner;
 use rift_protocol::index::{
     PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning,
-    PackageDocument, PackageDocumentKind, PackagePublication, PackageSourceUnit, PackageSymbol,
+    PackageCoverage, PackageDocument, PackageDocumentKind, PackagePublication, PackageSourceUnit,
+    PackageSymbol,
 };
 use rift_protocol::read::{
-    Digest, ExactKind, Language, PackageIdentity, ProjectPath, SourceLocationKind, SourceUnitId,
-    SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    Digest, Language, ProjectPath, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId,
+    SymbolOrigin, TextRange,
 };
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
@@ -56,14 +58,27 @@ mod join;
 mod join_tests;
 #[cfg(test)]
 mod limits_tests;
+pub(crate) mod namespace;
+#[cfg(test)]
+mod publication_tests;
 #[cfg(test)]
 mod retained_tests;
 
 use join::ModuleRole;
 pub use join::StubForm;
 
-pub(super) fn package_label(package: &PackageIdentity) -> String {
-    format!("{}/{}@{}", package.manager, package.name, package.version)
+pub(super) fn package_label(owner: &SymbolOwner) -> String {
+    match owner {
+        SymbolOwner::Package {
+            manager,
+            name,
+            version,
+            ..
+        } => format!("{manager}/{name}@{version}"),
+        SymbolOwner::Runtime { runtime, version } => format!("stdlib/{runtime}@{version}"),
+        SymbolOwner::Local => "local".to_owned(),
+        SymbolOwner::NamedLocal { name } => format!("local@{name}"),
+    }
 }
 
 /// One package file as the analyzer holds it: the parsed document, where it is filed, the
@@ -178,7 +193,7 @@ fn analyzed_file(
 ) -> Result<AnalyzedFile, RiftError> {
     let source = crate::PackageSyntaxSource::new(
         file,
-        input.package(),
+        input.owner(),
         input.language(),
         input.limits().syntax(),
     );
@@ -218,7 +233,8 @@ fn analyzed_file(
         false,
         facts,
     );
-    let placement = placement_of(input.package(), input.origin(), file.path())?;
+    let placement =
+        placement_of(input.owner(), input.origin(), file)?.with_identity_anchors(BTreeMap::new());
     let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
     Ok(AnalyzedFile {
         file: parsed,
@@ -231,9 +247,8 @@ fn analyzed_file(
 impl PackageAnalyzer {
     /// Analyzes one exact package's selected files.
     ///
-    /// Each file is placed under `rift://source/<manager>/<name>@<version>/<path>` with
-    /// the identity path `<manager>/<name>@<version>/<path>`, and its origin is the
-    /// input origin: a dependency carrying the package identity, or the standard library.
+    /// Each file retains its original path under the exact package or runtime source
+    /// owner. Its origin is the input origin with the same complete owner.
     /// A stub and the module it declares (`mod.pyi` and `mod.py`, `index.d.ts` and
     /// `index.js`) join: each name both declare answers once, at the module, with the
     /// stub's signatures and types. Records are emitted in unit, symbol, and document
@@ -276,7 +291,7 @@ impl PackageAnalyzer {
         revision: u64,
         mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     ) -> Result<PackageAnalysis, RiftError> {
-        let package = input.package();
+        let package = input.owner();
         let sources = input
             .files()
             .iter()
@@ -306,6 +321,7 @@ impl PackageAnalyzer {
             )?);
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
+        let unresolved_exports = place_namespace(&input, &mut analyzed)?;
         join::join_modules(&mut analyzed);
         let placed = analyzed
             .iter()
@@ -334,14 +350,8 @@ impl PackageAnalyzer {
                 .path(path.as_str())
                 .fail();
         }
-        let (publication, notebook_cells) = publish(
-            package,
-            input.origin(),
-            input.language(),
-            &analyzed,
-            &built.semantics,
-            input.limits(),
-        )?;
+        let (publication, notebook_cells) =
+            publish(&input, &analyzed, &built.semantics, unresolved_exports)?;
         Ok(PackageAnalysis {
             publication,
             files: analyzed,
@@ -353,6 +363,70 @@ impl PackageAnalyzer {
     }
 }
 
+fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read::RelationshipFacet {
+    match kind {
+        rift_core::RelationshipKind::Reference => {
+            rift_protocol::read::RelationshipFacet::References
+        }
+        rift_core::RelationshipKind::Definition => rift_protocol::read::RelationshipFacet::Declares,
+        rift_core::RelationshipKind::Implementation => {
+            rift_protocol::read::RelationshipFacet::Implements
+        }
+        rift_core::RelationshipKind::TypeDefinition => {
+            rift_protocol::read::RelationshipFacet::HasType
+        }
+        rift_core::RelationshipKind::Alias => rift_protocol::read::RelationshipFacet::Aliases,
+    }
+}
+
+fn place_namespace(
+    input: &ExactPackageInput<'_>,
+    analyzed: &mut [AnalyzedFile],
+) -> Result<bool, RiftError> {
+    let package = input.owner();
+    let selected = analyzed
+        .iter()
+        .map(|held| namespace::SelectedFile {
+            path: held.file.path(),
+            source: held.file.source(),
+            syntax: held.file.syntax(),
+        })
+        .collect::<Vec<_>>();
+    let mut namespace = namespace::prepare(input, &selected);
+    let placements = analyzed
+        .iter()
+        .map(|held| &held.placement)
+        .collect::<Vec<_>>();
+    let mut aliases = namespace::placed_aliases(&namespace, &selected, &placements, || {
+        errors::analysis::package_provider_failed()
+            .package(package_label(package))
+            .error()
+    })?;
+    for held in analyzed {
+        let assigned = namespace
+            .anchors
+            .remove(held.file.path().as_str())
+            .unwrap_or_default();
+        held.placement = held
+            .placement
+            .clone()
+            .with_identity_anchors(assigned)
+            .with_logical_declarations(
+                namespace
+                    .mappings
+                    .remove(held.file.path().as_str())
+                    .unwrap_or_default(),
+            )
+            .with_aliases(
+                aliases
+                    .remove(held.file.path().as_str())
+                    .unwrap_or_default(),
+            );
+    }
+
+    Ok(namespace.unresolved_exports)
+}
+
 /// Renders the canonical publication over the analyzed files.
 ///
 /// One pass over the files emits every record: a file's unit, the declarations it
@@ -360,12 +434,10 @@ impl PackageAnalyzer {
 /// identity afterwards, so the publication's order is the identities' order and not the
 /// order the files arrived in.
 fn publish(
-    package: &PackageIdentity,
-    source_origin: &ContributionOrigin,
-    package_language: &Language,
+    input: &ExactPackageInput<'_>,
     analyzed: &[AnalyzedFile],
     semantics: &WorkspaceSemantics,
-    limits: crate::ExactPackageLimits,
+    unresolved_exports: bool,
 ) -> Result<
     (
         PackagePublication,
@@ -373,7 +445,10 @@ fn publish(
     ),
     RiftError,
 > {
-    let origin = symbol_origin(package, source_origin)?;
+    let package = input.owner();
+    let package_language = input.language();
+    let limits = input.limits();
+    let origin = symbol_origin(package, input.origin())?;
     let mut records = Records {
         retained_source: limits.retained_source(),
         publication: limits.publication(),
@@ -385,16 +460,38 @@ fn publish(
             records.warn(truncation("units", u64::from(records.publication.units)));
             break;
         }
-        records.file(package, &origin, semantics, held)?;
+        records.file(package, held)?;
     }
-    let (documentation, notebook_cells) =
-        package_documentation(package, package_language, &origin, analyzed, &mut records)?;
+    records.graph(package, &origin, semantics, analyzed)?;
+    records.relationships(package, semantics, analyzed, limits.relationships_max())?;
+    let (documentation, notebook_cells) = package_documentation(
+        package,
+        package_language,
+        &origin,
+        analyzed,
+        semantics,
+        &mut records,
+    )?;
     records
         .units
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));
+    records.declarations.sort_by(|left, right| {
+        (
+            &left.symbol.0,
+            &left.unit.0,
+            left.range.start,
+            left.range.end,
+        )
+            .cmp(&(
+                &right.symbol.0,
+                &right.unit.0,
+                right.range.start,
+                right.range.end,
+            ))
+    });
     records
-        .symbols
-        .sort_by(|left, right| left.symbol.0.cmp(&right.symbol.0));
+        .objects
+        .sort_by(|left, right| left.id.cmp(&right.id));
     records
         .documents
         .sort_by(|left, right| (left.kind, &left.identity).cmp(&(right.kind, &right.identity)));
@@ -408,14 +505,20 @@ fn publish(
         },
         package,
     )?;
+    let coverage = publication_coverage(analyzed, &records, unresolved_exports);
     Ok((
         PackagePublication {
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
+            identity_format: rift_protocol::identity::SYMBOL_IDENTITY_FORMAT_REVISION,
             analyzer_revision: analyzer_revision(),
-            package: package.clone(),
+            owner: package.clone(),
             source_digest,
             units: records.units,
-            symbols: records.symbols,
+            coverage,
+            objects: records.objects,
+            declarations: records.declarations,
+            relationships: records.relationships,
+            artifact: input.artifact().cloned(),
             documents: records.documents,
             documentation,
             warnings: records.warnings,
@@ -424,11 +527,84 @@ fn publish(
     ))
 }
 
+fn stub_document_signature<'graph>(
+    semantics: &'graph WorkspaceSemantics,
+    contributions: &[rift_core::ContributionKey],
+    files: &BTreeMap<String, (&AnalyzedFile, Vec<usize>)>,
+    admitted: &BTreeSet<String>,
+) -> Option<&'graph str> {
+    contributions
+        .iter()
+        .filter_map(|key| {
+            let contribution = semantics.graph().contribution(key)?;
+            let binding = contribution.source()?;
+            let unit = binding.unit().to_string();
+            let (held, _) = files.get(&unit).filter(|_| admitted.contains(&unit))?;
+            if !matches!(held.role, ModuleRole::Stub) {
+                return None;
+            }
+            let signature = contribution.facts()?.signatures_slice().first()?;
+            Some((unit, binding.range().start(), signature.display.as_str()))
+        })
+        .min_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)))
+        .map(|(_, _, signature)| signature)
+}
+
+fn publication_coverage(
+    analyzed: &[AnalyzedFile],
+    records: &Records,
+    unresolved_exports: bool,
+) -> Vec<PackageCoverage> {
+    let languages = analyzed
+        .iter()
+        .map(|held| {
+            let language = held.file.syntax().language().clone();
+            ((language.name.clone(), language.dialect.clone()), language)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let units = records
+        .units
+        .iter()
+        .map(|unit| (&unit.unit.0, unit.source_complete))
+        .collect::<BTreeMap<_, _>>();
+    languages
+        .into_values()
+        .map(|language| {
+            let selected = analyzed
+                .iter()
+                .filter(|held| held.file.syntax().language() == &language);
+            let mut inventory_complete = true;
+            let mut syntax_complete = true;
+            for held in selected {
+                inventory_complete &= units.get(&held.placement.unit().to_string()) == Some(&true);
+                syntax_complete &= !held.file.syntax().has_errors()
+                    && held.file.syntax().left_out_declaration_count() == 0;
+            }
+            PackageCoverage {
+                inventory_complete: inventory_complete && syntax_complete,
+                identity_complete: !records.symbols_truncated
+                    && !records.identity_incomplete
+                    && records
+                        .objects
+                        .iter()
+                        .filter(|object| object.language == language)
+                        .all(|object| object.id.is_some())
+                    && syntax_complete
+                    && !unresolved_exports,
+                language,
+                applicability_complete: false,
+                relationships: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
 fn package_documentation(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     origin: &SymbolOrigin,
     analyzed: &[AnalyzedFile],
+    semantics: &WorkspaceSemantics,
     records: &mut Records,
 ) -> Result<
     (
@@ -475,7 +651,7 @@ fn package_documentation(
                 .cause(error)
                 .error()
         })?;
-    let declarations = package_declarations(package, analyzed, records)?;
+    let declarations = package_declarations(package, semantics, records)?;
     let notebook_cells = package_notebook_cells(analyzed, &notebooks);
     let collection = collect_documentation(&sources, &declarations)
         .map_err(|error| {
@@ -524,7 +700,7 @@ impl PackageDocumentationInputs<'_> {
 }
 
 fn append_notebook_inputs<'source>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     origin: &SymbolOrigin,
     analyzed: &[AnalyzedFile],
@@ -552,7 +728,7 @@ fn append_notebook_inputs<'source>(
 }
 
 fn append_notebook_cell<'source>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     origin: &SymbolOrigin,
     held: &AnalyzedFile,
@@ -657,7 +833,7 @@ fn append_notebook_cell<'source>(
 }
 
 fn add_notebook_document(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     held: &AnalyzedFile,
     cell: &crate::documentation::notebook::NotebookCellContent,
@@ -684,7 +860,7 @@ fn add_notebook_document(
         kind: PackageDocumentKind::File,
         unit: unit.clone(),
         language,
-        package: package.clone(),
+        owner: package.clone(),
         content_digest: text_digest(&retained.text),
         identifier_terms: identifier_terms_with_limit(
             &[&name],
@@ -701,7 +877,7 @@ fn add_notebook_document(
 }
 
 fn append_regular_inputs<'source>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     origin: &SymbolOrigin,
     analyzed: &'source [AnalyzedFile],
     inputs: &mut PackageDocumentationInputs<'source>,
@@ -848,7 +1024,7 @@ fn decode_package_notebooks(
 fn append_attached_comment_inputs<'source>(
     analyzed: &'source [AnalyzedFile],
     origin: &SymbolOrigin,
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     inputs: &mut PackageDocumentationInputs<'source>,
 ) -> Result<(), RiftError> {
     for held in analyzed {
@@ -875,7 +1051,7 @@ fn append_attached_comment_inputs<'source>(
 fn append_attached_comment<'source>(
     held: &'source AnalyzedFile,
     origin: &SymbolOrigin,
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     inputs: &mut PackageDocumentationInputs<'source>,
 ) -> Result<(), RiftError> {
     let source_text = held.file.source();
@@ -950,44 +1126,60 @@ fn append_attached_comment<'source>(
 }
 
 fn package_declarations<'declaration>(
-    package: &PackageIdentity,
-    analyzed: &'declaration [AnalyzedFile],
+    owner: &SymbolOwner,
+    semantics: &'declaration WorkspaceSemantics,
     records: &'declaration Records,
 ) -> Result<Vec<DocumentationDeclaration<'declaration>>, RiftError> {
-    let languages: BTreeMap<_, _> = analyzed
-        .iter()
-        .map(|held| {
-            (
-                wire_unit(held.placement.unit()).0,
-                held.file.syntax().language(),
-            )
-        })
-        .collect();
-    let mut declarations = Vec::with_capacity(records.symbols.len());
-    for symbol in &records.symbols {
-        let language = languages.get(&symbol.unit.0).copied().ok_or_else(|| {
-            errors::analysis::package_provider_failed()
-                .package(package_label(package))
-                .error()
-        })?;
+    let mut bindings = BTreeMap::new();
+    for record in semantics.graph().records() {
+        for key in record.contributions() {
+            let Some(contribution) = semantics.graph().contribution(key) else {
+                continue;
+            };
+            let (Some(binding), Some(facts)) = (contribution.source(), contribution.facts()) else {
+                continue;
+            };
+            bindings.insert(
+                (
+                    binding.unit().to_string(),
+                    binding.range().start(),
+                    binding.range().end(),
+                ),
+                facts,
+            );
+        }
+    }
+    let mut declarations = Vec::with_capacity(records.declarations.len());
+    for declaration in &records.declarations {
+        let facts = bindings
+            .get(&(
+                declaration.unit.0.clone(),
+                declaration.range.start,
+                declaration.range.end,
+            ))
+            .ok_or_else(|| {
+                errors::analysis::package_provider_failed()
+                    .package(package_label(owner))
+                    .error()
+            })?;
         let identity = DocumentationContentIdentity {
             source: DocumentationSourceIdentity::Package {
-                unit: symbol.unit.clone(),
+                unit: declaration.unit.clone(),
             },
             cell: None,
         };
         declarations.push(
             DocumentationDeclaration::new(
-                &symbol.symbol,
-                language,
-                &symbol.name,
-                &symbol.qualified_name,
+                &declaration.symbol,
+                facts.language(),
+                facts.name(),
+                facts.qualified_name(),
                 &identity,
-                symbol.range.clone(),
+                declaration.range.clone(),
             )
             .map_err(|error| {
                 errors::analysis::package_provider_failed()
-                    .package(package_label(package))
+                    .package(package_label(owner))
                     .cause(error)
                     .error()
             })?,
@@ -1081,10 +1273,14 @@ struct SourceFingerprint<'analysis> {
 #[derive(Default)]
 struct Records {
     units: Vec<PackageSourceUnit>,
-    symbols: Vec<PackageSymbol>,
+    objects: Vec<Symbol>,
+    declarations: Vec<PackageSymbol>,
+    relationships: Vec<rift_protocol::read::Relationship>,
     documents: Vec<PackageDocument>,
     warnings: Vec<PackageAnalysisWarning>,
     symbols_truncated: bool,
+    identity_incomplete: bool,
+    symbol_documents: BTreeSet<String>,
     documents_truncated: bool,
     retained_source: Option<RetainedSourceLimits>,
     retained_source_bytes: u64,
@@ -1102,15 +1298,9 @@ impl Records {
     }
 
     /// Emits one file's unit record, its declarations, and the documents they rank under.
-    fn file(
-        &mut self,
-        package: &PackageIdentity,
-        origin: &SymbolOrigin,
-        semantics: &WorkspaceSemantics,
-        held: &AnalyzedFile,
-    ) -> Result<(), RiftError> {
+    fn file(&mut self, package: &SymbolOwner, held: &AnalyzedFile) -> Result<(), RiftError> {
         let language = held.file.syntax().language().clone();
-        let path = wire_path(held.file.path());
+        let path = ProjectPath(held.placement.unit().key().as_str().to_owned());
         let unit = wire_unit(held.placement.unit());
         let source = held.file.source();
         let needs_document = documentation_format(held.file.path().as_str())
@@ -1139,22 +1329,13 @@ impl Records {
         } else if needs_document {
             self.warn_document_full();
         }
-        let context = FileContext {
-            language: &language,
-            unit: &unit,
-            path: &path,
-            line_starts: &line_starts(source),
-        };
-        for declaration in held.file.syntax().symbols() {
-            self.declaration(package, origin, semantics, held, &context, declaration)?;
-        }
         Ok(())
     }
 
     /// Emits one file's own search document, ranked by its content.
     fn file_document(
         &mut self,
-        package: &PackageIdentity,
+        package: &SymbolOwner,
         language: &Language,
         unit: &SourceUnitId,
         path: &ProjectPath,
@@ -1167,7 +1348,7 @@ impl Records {
             kind: PackageDocumentKind::File,
             unit: unit.clone(),
             language: language.clone(),
-            package: package.clone(),
+            owner: package.clone(),
             content_digest,
             identifier_terms: identifier_terms_with_limit(
                 &[&name],
@@ -1184,121 +1365,449 @@ impl Records {
         self.document(document)
     }
 
-    /// Emits one declaration's record, and its search document when the package exports
-    /// it.
-    // The record and its document share one retained-source budget decision.
-    #[allow(clippy::too_many_lines)]
+    /// Retains separate reference occurrences from the captured adjacency.
+    fn relationships(
+        &mut self,
+        owner: &SymbolOwner,
+        semantics: &WorkspaceSemantics,
+        analyzed: &[AnalyzedFile],
+        limit: usize,
+    ) -> Result<(), RiftError> {
+        let objects = self
+            .objects
+            .iter()
+            .filter_map(|object| object.id.as_ref())
+            .map(|id| id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let units = self
+            .units
+            .iter()
+            .map(|unit| unit.unit.0.clone())
+            .collect::<BTreeSet<_>>();
+        let sources = analyzed
+            .iter()
+            .map(|held| (held.placement.unit().to_string(), held.file.source()))
+            .collect::<BTreeMap<_, _>>();
+        if self.outgoing_relationships(owner, semantics, &objects, &units, &sources, limit)? {
+            return Ok(());
+        }
+        self.graph_relationships(owner, semantics, &objects, &units, &sources, limit)?;
+        if semantics.relationships().dropped_edges() > 0 {
+            self.warn(truncation(
+                "relationships",
+                u64::try_from(limit).unwrap_or(u64::MAX),
+            ));
+        }
+        Ok(())
+    }
+
+    fn outgoing_relationships(
+        &mut self,
+        owner: &SymbolOwner,
+        semantics: &WorkspaceSemantics,
+        objects: &BTreeSet<String>,
+        units: &BTreeSet<String>,
+        sources: &BTreeMap<String, &str>,
+        limit: usize,
+    ) -> Result<bool, RiftError> {
+        for record in semantics.graph().records() {
+            let Some(id) = record.identity().filter(|id| objects.contains(id.as_str())) else {
+                continue;
+            };
+            for edge in semantics.relationships().outgoing(id) {
+                if self.relationships.len() >= limit {
+                    self.warn(truncation(
+                        "relationships",
+                        u64::try_from(limit).unwrap_or(u64::MAX),
+                    ));
+                    return Ok(true);
+                }
+                let relationship = edge.to_protocol();
+                if SymbolId::parse(&relationship.from.0).is_err()
+                    || SymbolId::parse(&relationship.to.0).is_err()
+                {
+                    self.identity_incomplete = true;
+                    continue;
+                }
+                if let Some(span) = relationship.occurrence.as_ref() {
+                    let valid = usize::try_from(span.range.start)
+                        .ok()
+                        .zip(usize::try_from(span.range.end).ok())
+                        .filter(|(start, end)| start <= end)
+                        .and_then(|(start, end)| sources.get(&span.unit.0)?.get(start..end))
+                        .is_some();
+                    if !units.contains(&span.unit.0) {
+                        self.identity_incomplete = true;
+                        continue;
+                    }
+                    if !valid {
+                        return Err(errors::analysis::package_provider_failed()
+                            .package(package_label(owner))
+                            .error());
+                    }
+                }
+                self.relationships.push(relationship);
+            }
+        }
+        Ok(false)
+    }
+
+    fn graph_relationships(
+        &mut self,
+        owner: &SymbolOwner,
+        semantics: &WorkspaceSemantics,
+        objects: &BTreeSet<String>,
+        units: &BTreeSet<String>,
+        sources: &BTreeMap<String, &str>,
+        limit: usize,
+    ) -> Result<(), RiftError> {
+        for edge in semantics.graph().relationships() {
+            let Some(from) = semantics
+                .graph()
+                .record_for(edge.source().reference())
+                .and_then(rift_core::SymbolRecord::identity)
+                .filter(|id| objects.contains(id.as_str()))
+            else {
+                self.identity_incomplete = true;
+                continue;
+            };
+            let rift_provider::NormalizedTarget::Symbol(to) = edge.target() else {
+                self.identity_incomplete = true;
+                continue;
+            };
+            let Some(derivation) = edge.derivation().filter(|derivation| {
+                *derivation != rift_protocol::read::RelationshipDerivation::Heuristic
+            }) else {
+                continue;
+            };
+            if self.relationships.len() >= limit {
+                self.warn(truncation(
+                    "relationships",
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                ));
+                break;
+            }
+            let occurrence = edge
+                .occurrence()
+                .map(|binding| rift_protocol::read::SourceUnitSpan {
+                    unit: wire_unit(binding.unit()),
+                    range: TextRange {
+                        start: binding.range().start(),
+                        end: binding.range().end(),
+                    },
+                });
+            if let Some(span) = occurrence.as_ref() {
+                let valid = usize::try_from(span.range.start)
+                    .ok()
+                    .zip(usize::try_from(span.range.end).ok())
+                    .filter(|(start, end)| start < end)
+                    .and_then(|(start, end)| sources.get(&span.unit.0)?.get(start..end))
+                    .is_some();
+                if !units.contains(&span.unit.0) {
+                    self.identity_incomplete = true;
+                    continue;
+                }
+                if !valid {
+                    return errors::analysis::package_provider_failed()
+                        .package(package_label(owner))
+                        .fail();
+                }
+            }
+            let facet = relationship_facet(edge.kind());
+            self.relationships.push(rift_protocol::read::Relationship {
+                from: SymbolId::parse(from.as_str()).map_err(|_| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(owner))
+                        .error()
+                })?,
+                to: SymbolId::parse(to.as_str()).map_err(|_| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(owner))
+                        .error()
+                })?,
+                kind: rift_protocol::read::ExactKind(facet.as_ref().to_owned()),
+                facets: vec![facet],
+                evidence: edge
+                    .occurrence()
+                    .and_then(rift_core::DeclarationBinding::node)
+                    .cloned()
+                    .into_iter()
+                    .collect(),
+                occurrence,
+                derivation,
+                confidence: None,
+                extensions: rift_protocol::read::Extensions::default(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Projects captured logical records and every established physical binding.
+    fn graph(
+        &mut self,
+        owner: &SymbolOwner,
+        origin: &rift_protocol::read::SymbolOrigin,
+        semantics: &WorkspaceSemantics,
+        analyzed: &[AnalyzedFile],
+    ) -> Result<(), RiftError> {
+        let files = analyzed
+            .iter()
+            .map(|held| {
+                (
+                    held.placement.unit().to_string(),
+                    (held, line_starts(held.file.source())),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let admitted = self
+            .units
+            .iter()
+            .map(|unit| unit.unit.0.clone())
+            .collect::<BTreeSet<_>>();
+        for record in semantics.graph().records() {
+            if self.objects.len() >= bound(self.publication.symbols) {
+                self.symbols_truncated = true;
+                self.warn(truncation("objects", u64::from(self.publication.symbols)));
+                break;
+            }
+            let assembled = semantics.assembled_record(record).ok_or_else(|| {
+                errors::analysis::package_provider_failed()
+                    .package(package_label(owner))
+                    .error()
+            })?;
+            let facts = assembled.facts().ok_or_else(|| {
+                errors::analysis::package_provider_failed()
+                    .package(package_label(owner))
+                    .error()
+            })?;
+            let mut object = assembled.to_protocol_symbol(facts);
+            self.object_identity(owner, origin, &mut object);
+            let document_signature =
+                stub_document_signature(semantics, assembled.contributions(), &files, &admitted);
+            let mut has_source = false;
+            for key in assembled.contributions() {
+                let contribution = semantics.graph().contribution(key).ok_or_else(|| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(owner))
+                        .error()
+                })?;
+                let Some(binding) = contribution.source() else {
+                    continue;
+                };
+                has_source = true;
+                let unit = binding.unit().to_string();
+                let Some((held, starts)) = files.get(&unit).filter(|_| admitted.contains(&unit))
+                else {
+                    self.identity_incomplete = true;
+                    continue;
+                };
+                self.object_unavailable(&object, facts.qualified_name(), Some(contribution));
+                let Some(_) = object
+                    .id
+                    .as_ref()
+                    .filter(|id| SymbolId::parse(&id.0).is_ok())
+                else {
+                    self.identity_incomplete = true;
+                    self.warn(PackageAnalysisWarning::IdentityUnresolved {
+                        unit: Some(wire_unit(binding.unit())),
+                        range: Some(TextRange {
+                            start: binding.range().start(),
+                            end: binding.range().end(),
+                        }),
+                        qualified_name: contribution
+                            .facts()
+                            .map_or_else(String::new, |facts| facts.qualified_name().to_owned()),
+                    });
+                    continue;
+                };
+                self.declaration(
+                    owner,
+                    &object,
+                    document_signature,
+                    contribution,
+                    held,
+                    starts,
+                )?;
+            }
+            if object.id.is_none() && !has_source {
+                self.unresolved_object(facts.qualified_name());
+            }
+            if !has_source {
+                self.object_unavailable(&object, facts.qualified_name(), None);
+            }
+            self.objects.push(object);
+        }
+        Ok(())
+    }
+
+    fn object_identity(&mut self, owner: &SymbolOwner, origin: &SymbolOrigin, object: &mut Symbol) {
+        if object.id.as_ref().is_some_and(|id| {
+            !rift_protocol::identity::SymbolIdentity::parse(id.as_str()).is_ok_and(|identity| {
+                identity.owner() == owner && identity.language() == &object.language
+            })
+        }) {
+            object.id = None;
+            self.identity_incomplete = true;
+        }
+        if object.container.as_ref().is_some_and(|id| {
+            !rift_protocol::identity::SymbolIdentity::parse(id.as_str()).is_ok_and(|identity| {
+                identity.owner() == owner && identity.language() == &object.language
+            })
+        }) {
+            object.container = None;
+        }
+        object.origin.location = origin.location;
+        object.origin.package.clone_from(&origin.package);
+        object.origin.runtime.clone_from(&origin.runtime);
+    }
+
+    fn unresolved_object(&mut self, qualified_name: &str) {
+        self.identity_incomplete = true;
+        self.warn(PackageAnalysisWarning::IdentityUnresolved {
+            unit: None,
+            range: None,
+            qualified_name: qualified_name.to_owned(),
+        });
+    }
+
+    fn object_unavailable(
+        &mut self,
+        object: &Symbol,
+        qualified_name: &str,
+        contribution: Option<&rift_core::Contribution>,
+    ) {
+        if object.name_is_public() {
+            return;
+        }
+        self.identity_incomplete = true;
+        let (unit, range) = contribution
+            .and_then(rift_core::Contribution::source)
+            .map_or((None, None), |binding| {
+                (
+                    Some(wire_unit(binding.unit())),
+                    Some(TextRange {
+                        start: binding.range().start(),
+                        end: binding.range().end(),
+                    }),
+                )
+            });
+        self.warn(PackageAnalysisWarning::ObjectUnavailable {
+            unit,
+            range,
+            qualified_name: contribution
+                .and_then(rift_core::Contribution::facts)
+                .map_or(
+                    qualified_name,
+                    rift_core::PortableSymbolFacts::qualified_name,
+                )
+                .to_owned(),
+            field: "name".to_owned(),
+            bound: u64::try_from(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+                .expect("public symbol name bound fits u64"),
+        });
+    }
+
+    /// Stores one binding and its array references without duplicating logical facts.
     fn declaration(
         &mut self,
-        package: &PackageIdentity,
-        origin: &SymbolOrigin,
-        semantics: &WorkspaceSemantics,
+        owner: &SymbolOwner,
+        object: &Symbol,
+        document_signature: Option<&str>,
+        contribution: &rift_core::Contribution,
         held: &AnalyzedFile,
-        context: &FileContext<'_>,
-        declaration: &SyntaxSymbol,
+        starts: &[usize],
     ) -> Result<(), RiftError> {
-        let FileContext {
-            language,
-            unit,
-            path,
-            line_starts,
-        } = *context;
-        if held.role.answers_elsewhere(&declaration.qualified_name) {
+        let id = object
+            .id
+            .as_ref()
+            .expect("established declaration identity");
+        if self.declarations.len() >= bound(self.publication.symbols) {
+            self.symbols_truncated = true;
+            self.warn(truncation(
+                "declarations",
+                u64::from(self.publication.symbols),
+            ));
             return Ok(());
         }
-        if self.symbols.len() >= bound(self.publication.symbols) {
-            if !self.symbols_truncated {
-                self.symbols_truncated = true;
-                self.warn(truncation("symbols", u64::from(self.publication.symbols)));
-            }
-            return Ok(());
-        }
-        let source = held.file.source();
-        let declared = declaration_source(source, declaration).ok_or_else(|| {
+        let binding = contribution.source().expect("captured source binding");
+        let facts = contribution.facts().ok_or_else(|| {
             errors::analysis::package_provider_failed()
-                .package(package_label(package))
+                .package(package_label(owner))
+                .error()
+        })?;
+        let start = offset_in(binding.range().start());
+        let end = offset_in(binding.range().end());
+        let source = held.file.source().get(start..end).ok_or_else(|| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(owner))
                 .path(Path::new(held.file.path().as_str()))
                 .error()
         })?;
-        let public = held.is_public(&declaration.qualified_name);
-        let publishes_document = public && self.document_capacity();
-        let retained = self.retained(declared, path, if publishes_document { 2 } else { 1 })?;
-        let content_digest = text_digest(&retained.text);
-        let symbol = SymbolId(symbol_identity(
-            &language.identity_segment(),
-            held.placement.identity_path(),
-            &declaration.qualified_name,
-        ));
-        let mut presentation = semantics
-            .assembled(&symbol.0)
-            .and_then(|assembled| {
-                assembled
-                    .facts()
-                    .map(|facts| assembled.to_protocol_symbol(facts))
-            })
-            .ok_or_else(|| {
-                errors::analysis::package_provider_failed()
-                    .package(package_label(package))
-                    .path(Path::new(held.file.path().as_str()))
-                    .error()
-            })?;
-        let signature = if join::lay_join(&mut presentation, semantics, &held.role, declaration) {
-            presentation.signatures.first().cloned()
-        } else {
-            declaration.signatures.first().cloned()
-        };
+        let unit = wire_unit(binding.unit());
+        let path = wire_path(held.file.path());
+        let public = held.is_public(facts.qualified_name());
+        let publishes_document = public
+            && object.name_is_public()
+            && self.document_capacity()
+            && self.symbol_documents.insert(id.0.clone());
+        let retained = self.retained(source, &path, if publishes_document { 2 } else { 1 })?;
         let mut record = PackageSymbol {
-            symbol,
-            presentation,
-            origin: origin.clone(),
+            symbol: id.clone(),
+            origin: rift_provider::AssembledSymbol::wire_origin(contribution.origin()),
             unit: unit.clone(),
-            name: declaration.name.clone(),
-            qualified_name: declaration.qualified_name.clone(),
-            kind: ExactKind(declaration.kind.to_owned()),
             range: TextRange {
-                start: declaration.range.start,
-                end: declaration.range.end,
+                start: binding.range().start(),
+                end: binding.range().end(),
             },
-            line: line_of(line_starts, declaration.range.start),
-            signature,
-            documentation: declaration.documentation.first().cloned(),
+            line: line_of(starts, binding.range().start()),
+            signature_indices: fact_indices(owner, &object.signatures, facts.signatures_slice())?,
+            type_indices: fact_indices(owner, &object.types, facts.type_bindings())?,
+            documentation_indices: fact_indices(
+                owner,
+                &object.documentation,
+                facts.documentation_blocks(),
+            )?,
             source: retained.text,
             source_complete: retained.complete,
             public,
             digest: Digest(String::new()),
         };
-        record.digest = digest_of(&record, package)?;
+        record.digest = digest_of(&record, owner)?;
         if publishes_document {
             let document = PackageDocument {
-                identity: record.symbol.0.clone(),
+                identity: id.0.clone(),
                 kind: PackageDocumentKind::Symbol,
-                unit: unit.clone(),
-                language: language.clone(),
-                package: package.clone(),
-                content_digest,
+                unit,
+                language: facts.language().clone(),
+                owner: owner.clone(),
+                content_digest: text_digest(&record.source),
                 identifier_terms: identifier_terms_with_limit(
-                    &[&record.name, &record.qualified_name],
+                    &[facts.name(), facts.qualified_name()],
                     self.publication.identifier_terms,
                 ),
-                name: record.name.clone(),
-                qualified_name: Some(record.qualified_name.clone()),
-                signature: record
-                    .signature
-                    .as_ref()
-                    .map(|signature| signature.display.clone()),
-                documentation: record
-                    .documentation
-                    .as_ref()
+                name: facts.name().to_owned(),
+                qualified_name: Some(facts.qualified_name().to_owned()),
+                signature: document_signature
+                    .or_else(|| {
+                        facts
+                            .signatures_slice()
+                            .first()
+                            .map(|signature| signature.display.as_str())
+                    })
+                    .map(str::to_owned),
+                documentation: facts
+                    .documentation_blocks()
+                    .first()
                     .map(|documentation| documentation.text.clone()),
                 declaration_source: Some(record.source.clone()),
                 file_content: None,
                 digest: Digest(String::new()),
             };
             self.document(document)?;
-        } else if public {
+        } else if public && object.name_is_public() && !self.document_capacity() {
             self.warn_document_full();
         }
-        self.symbols.push(record);
+        self.declarations.push(record);
         Ok(())
     }
 
@@ -1308,7 +1817,7 @@ impl Records {
             self.warn_document_full();
             return Ok(());
         }
-        document.digest = digest_of(&document, &document.package.clone())?;
+        document.digest = digest_of(&document, &document.owner.clone())?;
         self.documents.push(document);
         Ok(())
     }
@@ -1370,13 +1879,25 @@ impl Records {
     }
 }
 
-/// What every record of one file shares: how it is addressed, and where its lines start.
-#[derive(Clone, Copy)]
-struct FileContext<'file> {
-    language: &'file Language,
-    unit: &'file SourceUnitId,
-    path: &'file ProjectPath,
-    line_starts: &'file [usize],
+fn fact_indices<T: PartialEq>(
+    owner: &SymbolOwner,
+    combined: &[T],
+    supplied: &[T],
+) -> Result<Vec<u64>, RiftError> {
+    supplied
+        .iter()
+        .map(|fact| {
+            combined
+                .iter()
+                .position(|value| value == fact)
+                .and_then(|index| u64::try_from(index).ok())
+                .ok_or_else(|| {
+                    errors::analysis::package_provider_failed()
+                        .package(package_label(owner))
+                        .error()
+                })
+        })
+        .collect()
 }
 
 /// One record's retained source: the bytes it keeps, and whether they are the whole
@@ -1385,20 +1906,6 @@ struct FileContext<'file> {
 struct RetainedSource {
     text: String,
     complete: bool,
-}
-
-/// The declaration's own bytes, absent when its range lies outside the file it names.
-///
-/// The caller refuses the package rather than publishing the empty string: a record
-/// carrying no source and claiming to be complete would verify against a digest over
-/// nothing, and the address it names would resolve to a declaration no reader can see.
-fn declaration_source<'source>(
-    source: &'source str,
-    declaration: &SyntaxSymbol,
-) -> Option<&'source str> {
-    let start = offset_in(declaration.range.start);
-    let end = offset_in(declaration.range.end);
-    source.get(start..end)
 }
 
 /// One byte offset into a file this process holds in memory. An offset past `usize` names
@@ -1452,25 +1959,31 @@ fn identifier_terms_with_limit(names: &[&str], maximum: u32) -> Vec<String> {
 
 /// The origin every declaration of one analyzed package carries.
 fn symbol_origin(
-    package: &PackageIdentity,
+    owner: &SymbolOwner,
     origin: &ContributionOrigin,
 ) -> Result<SymbolOrigin, RiftError> {
     let result = match origin.location() {
-        Some(rift_core::SourceLocation::Dependency { package: owner }) if owner == package => {
+        Some(rift_core::SourceLocation::Dependency { package })
+            if package.owner().ok().as_ref() == Some(owner) =>
+        {
             SymbolOrigin {
                 location: Some(SourceLocationKind::Dependency),
                 package: Some(package.clone()),
+                runtime: None,
                 source_kind: SourceKind::Authored,
             }
         }
-        Some(rift_core::SourceLocation::Stdlib {}) => SymbolOrigin {
+        Some(rift_core::SourceLocation::Stdlib {
+            runtime: Some(runtime),
+        }) if runtime.owner().ok().as_ref() == Some(owner) => SymbolOrigin {
             location: Some(SourceLocationKind::Stdlib),
             package: None,
+            runtime: Some(runtime.clone()),
             source_kind: SourceKind::Authored,
         },
         _ => {
             return errors::analysis::package_identity_invalid()
-                .package(package_label(package))
+                .package(package_label(owner))
                 .fail();
         }
     };
@@ -1490,7 +2003,7 @@ fn truncation(collection: &str, bound: u64) -> PackageAnalysisWarning {
 ///
 /// The member is dropped rather than left empty so a record's digest covers what the
 /// record says and nothing about the digest field itself.
-fn digest_of<T: Serialize>(record: &T, package: &PackageIdentity) -> Result<Digest, RiftError> {
+fn digest_of<T: Serialize>(record: &T, package: &SymbolOwner) -> Result<Digest, RiftError> {
     let mut value = serde_json::to_value(record).map_err(|error| {
         errors::analysis::package_provider_failed()
             .package(package_label(package))
@@ -1535,7 +2048,7 @@ fn wire_path(path: &CoreProjectPath) -> ProjectPath {
 #[cfg(test)]
 fn parsed_file(
     file: crate::input::PackageSource<'_>,
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     syntax_limits: rift_syntax::SyntaxLimits,
 ) -> Result<IndexedFile, RiftError> {
@@ -1573,19 +2086,36 @@ pub(super) fn source_language(extension: &str, package_language: &Language) -> L
 
 /// The placement of one package file: its unit, identity path, and origin.
 fn placement_of(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     origin: &ContributionOrigin,
-    path: &CoreProjectPath,
+    file: crate::PackageSource<'_>,
 ) -> Result<DocumentPlacement, RiftError> {
-    let unit = CoreSourceUnitId::for_package(package, path).map_err(|error| {
-        errors::analysis::package_identity_invalid()
-            .package(package_label(package))
-            .path(Path::new(path.as_str()))
-            .cause(error)
-            .error()
-    })?;
-    let identity_path = format!("{}/{path}", package_segment(package));
-    Ok(DocumentPlacement::new(origin.clone(), unit, identity_path))
+    let path = file.path();
+    let unit = match file.source_unit() {
+        Some(unit) => unit.clone(),
+        None => CoreSourceUnitId::for_owner(package.clone(), path.as_str()).map_err(|error| {
+            errors::analysis::package_identity_invalid()
+                .package(package_label(package))
+                .path(Path::new(path.as_str()))
+                .cause(error)
+                .error()
+        })?,
+    };
+    let address = unit.to_string();
+    let identity_path = address
+        .strip_prefix("rift://source/")
+        .ok_or_else(|| {
+            errors::analysis::package_identity_invalid()
+                .package(package_label(package))
+                .path(Path::new(path.as_str()))
+                .error()
+        })?
+        .to_owned();
+    Ok(DocumentPlacement::new(
+        file.origin().unwrap_or(origin).clone(),
+        unit,
+        identity_path,
+    ))
 }
 
 /// The languages package analysis reads an API from, and each one's rules.
@@ -1800,13 +2330,6 @@ pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTree
         .collect()
 }
 
-fn package_segment(identity: &PackageIdentity) -> String {
-    format!(
-        "{}/{}@{}",
-        identity.manager, identity.name, identity.version
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
@@ -1833,6 +2356,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_publication_preserves_exact_owner_and_document_origin() {
+        let runtime = rift_protocol::read::RuntimeIdentity {
+            runtime: "cpython".to_owned(),
+            version: "3.14.3".to_owned(),
+        };
+        let owner = runtime.owner().expect("runtime owner");
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            }),
+            SourceKind::Authored,
+        )
+        .expect("exact runtime origin");
+        let source_language = language(ShippedLanguage::Python);
+        let path = ProjectPath::new("sys/__init__.pyi").expect("runtime unit");
+        let readme_path = ProjectPath::new("README.md").expect("runtime documentation");
+        let source = "def exit(status: int) -> None: ...\n";
+        let readme = "# Runtime\n\nExact selected runtime documentation.\n";
+        let files = [
+            PackageSource::new(&path, source),
+            PackageSource::new(&readme_path, readme),
+        ];
+        let input = ExactPackageInput::new(
+            &owner,
+            &source_language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(
+                2,
+                u64::try_from(source.len() + readme.len()).expect("source bytes"),
+            ),
+        )
+        .expect("runtime input");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("runtime publication");
+        let publication = analysis.publication();
+        assert_eq!(publication.owner, owner);
+        assert_eq!(publication.units.len(), 2);
+        assert!(publication.units.iter().any(|unit| {
+            unit.unit.as_str() == "rift://source/stdlib/cpython@3.14.3/sys/__init__.pyi"
+        }));
+        assert!(!publication.objects.is_empty());
+        assert!(publication.objects.iter().all(|object| {
+            object.origin.package.is_none() && object.origin.runtime.as_ref() == Some(&runtime)
+        }));
+        assert!(!publication.documents.is_empty());
+        assert!(
+            publication
+                .documents
+                .iter()
+                .all(|document| document.owner == owner)
+        );
+        assert!(publication.documentation.sources.iter().any(|source| {
+            source.origin.package.is_none()
+                && source.origin.runtime.as_ref() == Some(&runtime)
+                && matches!(&source.identity.source,
+                    DocumentationSourceIdentity::Package { unit }
+                    if unit.as_str() == "rift://source/stdlib/cpython@3.14.3/README.md")
+        }));
+    }
+
+    #[test]
     fn package_failures_keep_registered_identity_and_ambient_context() {
         let package = identity();
         let child = RiftError::new(
@@ -1842,7 +2426,7 @@ mod tests {
             vec![],
         );
         let provider = errors::analysis::package_provider_failed()
-            .package(package_label(&package))
+            .package(package_label(&package.owner().expect("fixture owner")))
             .cause(child)
             .error();
         assert_eq!(
@@ -1872,7 +2456,9 @@ mod tests {
         let wrapped = syntax
             .with(rift_error::ErrorContext::new(
                 "package",
-                rift_error::ErrorValue::formatted(package_label(&package)),
+                rift_error::ErrorValue::formatted(package_label(
+                    &package.owner().expect("fixture owner"),
+                )),
             ))
             .with(rift_error::ErrorContext::new(
                 "path",
@@ -1887,7 +2473,7 @@ mod tests {
 
         let unsupported = super::parsed_file(
             PackageSource::new(&ProjectPath::new("guide.unknown").expect("path"), "source"),
-            &package,
+            &package.owner().expect("fixture owner"),
             &language(ShippedLanguage::Rust),
             SyntaxLimits::default(),
         )
@@ -1986,26 +2572,26 @@ mod tests {
         assert_eq!(publication.units[0].path.0, "src/lib.rs");
         assert!(publication.units[0].source_complete);
         let named: Vec<&str> = publication
-            .symbols
+            .objects
             .iter()
-            .map(|symbol| symbol.qualified_name.as_str())
+            .map(|symbol| symbol.name.as_str())
             .collect();
         assert_eq!(named, ["hidden", "spawn"]);
         let public: Vec<&str> = publication
-            .symbols
+            .objects
             .iter()
-            .filter(|symbol| symbol.public)
-            .map(|symbol| symbol.qualified_name.as_str())
+            .filter(|symbol| symbol.visibility.as_deref() == Some("pub"))
+            .map(|symbol| symbol.name.as_str())
             .collect();
         assert_eq!(public, ["spawn"], "the export rule keeps `pub` alone");
         assert_eq!(
             document_identities(&publication, PackageDocumentKind::Symbol),
-            ["rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/spawn"],
+            ["rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/spawn"],
             "a document stands for every public declaration and no other"
         );
         assert_eq!(
             document_identities(&publication, PackageDocumentKind::File),
-            ["rift://source/cargo/beacon@1.0.0/src/lib.rs"]
+            ["rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs"]
         );
     }
 
@@ -2059,6 +2645,13 @@ mod tests {
         let index = &analysis.publication().documentation;
         let block = index.blocks.first().expect("attached comment block");
         let expected_end = u64::try_from("/// Spawns a task.\n".len()).expect("fixture length");
+        let expected_symbol = rift_protocol::identity::SymbolIdentity::new(
+            super::fixture::identity().owner().expect("fixture owner"),
+            ShippedLanguage::Rust.language(),
+            vec!["beacon".to_owned(), "spawn_task".to_owned()],
+        )
+        .expect("current logical identity")
+        .wire_identity();
 
         assert_eq!(
             block.kind,
@@ -2078,11 +2671,11 @@ mod tests {
         );
         assert_eq!(
             block.symbol.as_ref().map(|symbol| symbol.0.as_str()),
-            Some("rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/spawn_task")
+            Some(expected_symbol.as_str())
         );
         assert_eq!(
             block.chunks[0].identity,
-            "rift://source/cargo/beacon@1.0.0/src/lib.rs"
+            "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs"
         );
     }
 
@@ -2112,15 +2705,10 @@ mod tests {
             ),
         ];
         for (shipped, path, source, expected) in cases {
+            assert_eq!(public_names(shipped, path, source), expected, "{path}");
             let publication = analyzed(shipped, vec![(path, source)]);
-            let public: Vec<&str> = publication
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.public)
-                .map(|symbol| symbol.qualified_name.as_str())
-                .collect();
-            assert_eq!(public, expected, "{path}");
             assert_eq!(publication.units.len(), 1, "{path}");
+            assert!(!publication.objects.is_empty(), "{path}");
         }
     }
 
@@ -2130,19 +2718,15 @@ mod tests {
     /// package index schema Rift serves.
     #[test]
     fn test_a_tsx_declaration_kind_is_the_provider_word_the_schema_accepts() {
-        let publication = analyzed(
-            ShippedLanguage::TypeScriptTsx,
-            vec![(
-                "index.tsx",
-                "export class Panel {\n  render(): null {\n    return null;\n  }\n}\n\
-                 export function mount(): void {}\n",
-            )],
-        );
-
-        let kinds: Vec<(&str, &str)> = publication
-            .symbols
+        let source = "export class Panel {\n  render(): null {\n    return null;\n  }\n}\nexport function mount(): void {}\n";
+        let analysis =
+            package_analysis(ShippedLanguage::TypeScriptTsx, vec![("index.tsx", source)]);
+        let kinds: Vec<(&str, &str)> = analysis.files()[0]
+            .file()
+            .syntax()
+            .symbols()
             .iter()
-            .map(|symbol| (symbol.qualified_name.as_str(), symbol.kind.0.as_str()))
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.kind))
             .collect();
         assert_eq!(
             kinds,
@@ -2152,38 +2736,55 @@ mod tests {
                 ("mount", "function")
             ]
         );
-        for symbol in &publication.symbols {
-            assert_eq!(
-                symbol.kind, symbol.presentation.kind,
-                "the record and its presentation carry one kind: {}",
-                symbol.qualified_name
-            );
-            assert_eq!(
-                symbol.presentation.language,
-                language(ShippedLanguage::TypeScriptTsx)
-            );
-        }
-        let schema: serde_json::Value = serde_json::from_str(&package_index_schema_document())
-            .expect("the package index schema parses");
-        let validator = jsonschema::validator_for(&schema).expect("the schema compiles");
-        let instance = serde_json::to_value(&publication).expect("the publication serializes");
+        let publication = analysis.publication();
+        let mut object_kinds: Vec<(&str, &str)> = publication
+            .objects
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.0.as_str()))
+            .collect();
+        object_kinds.sort_unstable();
+        assert_eq!(
+            object_kinds,
+            [
+                ("Panel", "class"),
+                ("mount", "function"),
+                ("render", "method")
+            ]
+        );
+        assert!(
+            publication
+                .objects
+                .iter()
+                .all(|symbol| symbol.language == language(ShippedLanguage::TypeScriptTsx))
+        );
+        let schema: serde_json::Value =
+            serde_json::from_str(&package_index_schema_document()).expect("schema parses");
+        let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+        let instance = serde_json::to_value(publication).expect("publication serializes");
         let refusals: Vec<String> = validator
             .iter_errors(&instance)
             .map(|refusal| format!("{}: {refusal}", refusal.instance_path()))
             .collect();
         assert!(
             refusals.is_empty(),
-            "a TSX publication validates against the package index schema: {refusals:#?}"
+            "TSX publication validates: {refusals:#?}"
         );
     }
 
     /// The public names of the one file `path` holds, analyzed alone under `shipped`.
     fn public_names(shipped: ShippedLanguage, path: &str, source: &str) -> Vec<String> {
-        analyzed(shipped, vec![(path, source)])
-            .symbols
+        let analysis = package_analysis(shipped, vec![(path, source)]);
+        analysis
+            .files()
             .iter()
-            .filter(|symbol| symbol.public)
-            .map(|symbol| symbol.qualified_name.clone())
+            .flat_map(|file| {
+                file.file()
+                    .syntax()
+                    .symbols()
+                    .iter()
+                    .filter(move |symbol| file.is_public(&symbol.qualified_name))
+                    .map(|symbol| symbol.qualified_name.clone())
+            })
             .collect()
     }
 
@@ -2219,12 +2820,7 @@ mod tests {
             ]
         );
         for shipped in [ShippedLanguage::TypeScript, ShippedLanguage::TypeScriptTsx] {
-            let publication = analyzed(shipped, vec![("lib/index.mjs", source)]);
-            let module_public = publication
-                .symbols
-                .iter()
-                .filter(|symbol| symbol.public)
-                .count();
+            let module_public = public_names(shipped, "lib/index.mjs", source).len();
             assert_eq!(
                 module_public,
                 public.len(),
@@ -2246,11 +2842,18 @@ mod tests {
                       module.exports = { helper, Runner, start() {} };\n\
                       exports.read = load;\n\
                       exports.extra = function extra() {};\n";
-        let publication = analyzed(ShippedLanguage::JavaScript, vec![("index.cjs", source)]);
-        let mut declared: Vec<(&str, bool)> = publication
-            .symbols
+        let analysis = package_analysis(ShippedLanguage::JavaScript, vec![("index.cjs", source)]);
+        let mut declared: Vec<(&str, bool)> = analysis
+            .files()
             .iter()
-            .map(|symbol| (symbol.qualified_name.as_str(), symbol.public))
+            .flat_map(|held| {
+                held.file().syntax().symbols().iter().map(move |symbol| {
+                    (
+                        symbol.qualified_name.as_str(),
+                        held.is_public(&symbol.qualified_name),
+                    )
+                })
+            })
             .collect();
         declared.sort_unstable();
         assert_eq!(
@@ -2271,7 +2874,7 @@ mod tests {
     /// `export` the stub does not declare leaves the set.
     #[test]
     fn test_a_paired_javascript_module_keeps_the_stub_public_set() {
-        let publication = analyzed(
+        let analysis = package_analysis(
             ShippedLanguage::TypeScript,
             vec![
                 ("index.d.ts", "export declare function open(): void;\n"),
@@ -2281,18 +2884,32 @@ mod tests {
                 ),
             ],
         );
-        let public: Vec<&str> = publication
-            .symbols
+        let mut public: Vec<&str> = analysis
+            .files()
             .iter()
-            .filter(|symbol| symbol.public)
-            .map(|symbol| symbol.qualified_name.as_str())
+            .flat_map(|file| {
+                file.file()
+                    .syntax()
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| file.is_public(&symbol.qualified_name))
+                    .map(|symbol| symbol.qualified_name.as_str())
+            })
             .collect();
+        public.sort_unstable();
+        public.dedup();
         assert_eq!(public, ["open"]);
+        assert!(analysis.files().iter().any(|file| {
+            file.file().syntax().symbols().iter().any(|symbol| {
+                symbol.qualified_name == "internal" && !file.is_public(&symbol.qualified_name)
+            })
+        }));
         assert!(
-            publication
-                .symbols
+            analysis
+                .publication()
+                .objects
                 .iter()
-                .any(|symbol| symbol.qualified_name == "internal" && !symbol.public)
+                .any(|symbol| symbol.name == "internal")
         );
     }
 
@@ -2337,6 +2954,7 @@ mod tests {
         let before = analyzed(
             ShippedLanguage::Rust,
             vec![
+                ("src/lib.rs", "mod a; mod b;\n"),
                 ("src/a.rs", "pub fn alpha() {}\n"),
                 ("src/b.rs", "pub fn beta() {}\n"),
             ],
@@ -2344,6 +2962,7 @@ mod tests {
         let after = analyzed(
             ShippedLanguage::Rust,
             vec![
+                ("src/lib.rs", "mod a; mod b;\n"),
                 ("src/a.rs", "pub fn alpha(count: u8) {}\n"),
                 ("src/b.rs", "pub fn beta() {}\n"),
             ],
@@ -2358,13 +2977,16 @@ mod tests {
             .collect();
         assert_eq!(changed_units, ["src/a.rs"]);
         let changed_symbols: Vec<&str> = before
-            .symbols
+            .declarations
             .iter()
-            .zip(&after.symbols)
+            .zip(&after.declarations)
             .filter(|(before, after)| before.digest != after.digest)
-            .map(|(before, _)| before.qualified_name.as_str())
+            .map(|(before, _)| before.symbol.as_str())
             .collect();
-        assert_eq!(changed_symbols, ["alpha"]);
+        assert_eq!(
+            changed_symbols,
+            ["rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a/alpha"]
+        );
         let changed_documents: Vec<&str> = before
             .documents
             .iter()
@@ -2375,8 +2997,8 @@ mod tests {
         assert_eq!(
             changed_documents,
             [
-                "rift://symbol/rust/cargo/beacon@1.0.0/src/a.rs/alpha",
-                "rift://source/cargo/beacon@1.0.0/src/a.rs",
+                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a/alpha",
+                "rift://source/cargo/crates.io/beacon@1.0.0/src/a.rs",
             ],
             "the changed declaration's own document and its file's document move"
         );
@@ -2390,23 +3012,27 @@ mod tests {
     fn test_publications_compare_by_stable_identity_and_digest() {
         let before = analyzed(
             ShippedLanguage::Rust,
-            vec![("src/a.rs", "pub fn alpha() {}\n")],
+            vec![
+                ("src/lib.rs", "mod a;\n"),
+                ("src/a.rs", "pub fn alpha() {}\n"),
+            ],
         );
         let after = analyzed(
             ShippedLanguage::Rust,
             vec![
+                ("src/lib.rs", "mod a; mod b;\n"),
                 ("src/a.rs", "pub fn alpha() {}\n"),
                 ("src/b.rs", "pub fn beta() {}\n"),
             ],
         );
 
         let held: Vec<(&str, &str)> = before
-            .symbols
+            .declarations
             .iter()
             .map(|symbol| (symbol.symbol.0.as_str(), symbol.digest.0.as_str()))
             .collect();
         let arrived: Vec<(&str, &str)> = after
-            .symbols
+            .declarations
             .iter()
             .map(|symbol| (symbol.symbol.0.as_str(), symbol.digest.0.as_str()))
             .collect();
@@ -2417,7 +3043,10 @@ mod tests {
             .collect();
         assert_eq!(
             added,
-            ["rift://symbol/rust/cargo/beacon@1.0.0/src/b.rs/beta"]
+            [
+                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/b",
+                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/b/beta"
+            ]
         );
         let unchanged: Vec<&str> = arrived
             .iter()
@@ -2426,7 +3055,10 @@ mod tests {
             .collect();
         assert_eq!(
             unchanged,
-            ["rift://symbol/rust/cargo/beacon@1.0.0/src/a.rs/alpha"],
+            [
+                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a",
+                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a/alpha"
+            ],
             "an untouched declaration keeps its digest"
         );
     }
@@ -2460,7 +3092,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].file().path().as_str(), "src/lib.rs");
         assert!(files[0].is_public("spawn"));
-        assert_eq!(analysis.publication().symbols.len(), 1);
+        assert_eq!(analysis.publication().objects.len(), 1);
     }
 
     #[test]
@@ -2518,13 +3150,13 @@ mod tests {
             block.source.source
                 == DocumentationSourceIdentity::Package {
                     unit: rift_protocol::read::SourceUnitId(
-                        "rift://source/cargo/beacon@1.0.0/README.md".to_owned(),
+                        "rift://source/cargo/crates.io/beacon@1.0.0/README.md".to_owned(),
                     ),
                 }
         }));
         assert!(
             publication
-                .symbols
+                .objects
                 .iter()
                 .any(|symbol| symbol.name == "serve")
         );
@@ -2543,7 +3175,9 @@ mod tests {
     #[test]
     fn long_package_identity_omits_notebook_cell_and_keeps_readme() {
         let mut package = identity();
-        package.name = "~".repeat(3_000);
+        package.name = "p".repeat(4_040);
+        package.registry = format!("r.example/{}", "a".repeat(4_086));
+        let owner = package.owner().expect("bounded canonical owner");
         let language = language(ShippedLanguage::Rust);
         let origin = ContributionOrigin::new(
             Some(SourceLocation::Dependency {
@@ -2565,13 +3199,14 @@ mod tests {
         assert_eq!(
             unit.to_string(),
             format!(
-                "rift://source/cargo/{}@1.0.0/notebooks/guide.ipynb",
+                "rift://source/cargo/r.example%2F{}/{}@1.0.0/notebooks/guide.ipynb",
+                "a".repeat(4_086),
                 package.name
             )
         );
         let byte_limit = u64::try_from(readme.len() + notebook.len()).expect("byte count");
         let input = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &files,
@@ -2666,7 +3301,10 @@ mod tests {
         ProjectPath::new(&markdown_path).expect("bounded Markdown path");
         ProjectPath::new(&rst_path).expect("bounded RST path");
         ProjectPath::new(&attached_path).expect("bounded Rust path");
-        let publication = analyzed(
+        let manifest = format!(
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"{attached_path}\"\n"
+        );
+        let analysis = super::fixture::package_result_with_metadata(
             ShippedLanguage::Rust,
             vec![
                 (&markdown_path, "# Package guide\n\nMarkdown retained.\n"),
@@ -2676,11 +3314,15 @@ mod tests {
                     "/// Attached retained.\npub fn serve() {}\n",
                 ),
             ],
-        );
+            None,
+            Some(("Cargo.toml", &manifest)),
+        )
+        .expect("captured bounded library root");
+        let publication = analysis.publication();
         let documentation = &publication.documentation;
-        let markdown_unit = format!("rift://source/cargo/beacon@1.0.0/{markdown_path}");
-        let rst_unit = format!("rift://source/cargo/beacon@1.0.0/{rst_path}");
-        let attached_unit = format!("rift://source/cargo/beacon@1.0.0/{attached_path}");
+        let markdown_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{markdown_path}");
+        let rst_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{rst_path}");
+        let attached_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{attached_path}");
 
         assert_eq!(documentation.coverage.selected, 3);
         assert_eq!(documentation.coverage.parsed, 3);
@@ -2749,11 +3391,16 @@ mod tests {
 
         let publication = analyzed(ShippedLanguage::Rust, vec![("src/lib.rs", &source)]);
 
-        let symbol = publication
-            .symbols
+        let object = publication
+            .objects
             .iter()
-            .find(|symbol| symbol.name == "spawn")
+            .find(|object| object.name == "spawn")
             .expect("the declaration is published");
+        let symbol = publication
+            .declarations
+            .iter()
+            .find(|binding| Some(&binding.symbol) == object.id.as_ref())
+            .expect("the declaration binding is published");
         assert!(!symbol.source_complete, "{symbol:?}");
         assert!(
             symbol.source.len() <= bound(PACKAGE_SOURCE_BYTES_MAX),

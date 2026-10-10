@@ -27,6 +27,8 @@ rift-ranking.workspace = true
 rift-syntax = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
+unicode-normalization.workspace = true
 semver = { workspace = true, optional = true }
 sha2.workspace = true
 tree-sitter = { workspace = true, optional = true }

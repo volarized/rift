@@ -5,7 +5,7 @@ use crate::pattern::{
 use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Value, json};
 
-const UNIT: &str = "rift://source/cargo/demo@1.0.0/src/first.rs";
+const UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs";
 
 /// One edit to a pattern page fixture, beside the field the client names when it refuses it.
 type PageEdit = (&'static str, fn(&mut Value));
@@ -38,7 +38,7 @@ pub(super) fn pattern_page_json(cursor: Option<&str>) -> Value {
 pub(super) fn pattern_request() -> PackagePatternRequest {
     PackagePatternRequest {
         pattern: r"fn\s+demo".to_owned(),
-        packages: vec![package_request()],
+        packages: Some(vec![package_request()]),
         include: None,
     }
 }
@@ -162,7 +162,7 @@ async fn test_fixture_pattern_search_requires_the_advertised_capability() {
 async fn test_fixture_pattern_failure_marks_the_endpoint_unavailable() {
     let (_server, client) = operation_client(OperationFixture::Patterns).await;
     let mut request = pattern_request();
-    request.packages[0].name = "other".to_owned();
+    request.packages.as_mut().expect("selected packages")[0].name = "other".to_owned();
     assert_eq!(
         client.search_package_patterns(&request, 20, None).await,
         Err(ClientError::InvalidResponseField { field: "package" })
@@ -223,7 +223,7 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
         );
     }
     let mut request = pattern_request();
-    request.packages.push(package_request());
+    request.packages = Some(vec![package_request(), package_request()]);
     assert_eq!(
         validate_pattern_request(&request),
         Err(ClientError::InvalidRequest {
@@ -234,6 +234,41 @@ fn test_pattern_requests_refuse_bounds_before_transport() {
     assert_eq!(
         validate_pattern_request_for_capabilities(&pattern_request(), 0, None, &capabilities),
         Err(ClientError::InvalidRequest { field: "limit" })
+    );
+}
+
+#[test]
+fn test_discovery_patterns_accept_omitted_or_empty_package_selection() {
+    for packages in [None, Some(Vec::new())] {
+        let mut request = pattern_request();
+        request.packages = packages;
+        assert_eq!(validate_pattern_request(&request), Ok(()));
+        let serialized = serde_json::to_value(&request).expect("pattern request");
+        if request.packages.is_none() {
+            assert!(serialized.get("packages").is_none());
+        }
+        assert_eq!(
+            check(
+                &request,
+                &pattern_capabilities(),
+                pattern_page_json(None),
+                None
+            ),
+            Ok(())
+        );
+    }
+    let mut request = pattern_request();
+    let mut other = package_request();
+    other.name = "other".to_owned();
+    request.packages = Some(vec![other]);
+    assert_eq!(
+        check(
+            &request,
+            &pattern_capabilities(),
+            pattern_page_json(None),
+            None
+        ),
+        Err(ClientError::InvalidResponseField { field: "package" })
     );
 }
 
@@ -274,7 +309,8 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
             page["items"][0]["source"] = json!("fn demo");
         }),
         ("source_identity", |page| {
-            page["items"][0]["unit"] = json!("rift://source/cargo/other@1.0.0/src/first.rs");
+            page["items"][0]["unit"] =
+                json!("rift://source/cargo/crates.io/other@1.0.0/src/first.rs");
         }),
         ("source_identity", |page| {
             page["items"][0]["unit"] = json!("rift://source/npm/demo@1.0.0/src/first.rs");
@@ -340,7 +376,7 @@ fn test_pattern_pages_refuse_past_their_bounds() {
             (0..count)
                 .map(|file| {
                     pattern_hit_json(
-                        &format!("rift://source/cargo/demo@1.0.0/src/first{file}.rs"),
+                        &format!("rift://source/cargo/crates.io/demo@1.0.0/src/first{file}.rs"),
                         10,
                     )
                 })
@@ -437,7 +473,7 @@ fn test_a_pattern_match_converts_into_a_file_hit_and_its_declaration() {
         Err(ClientError::InvalidResponseField { field: "location" })
     );
     let mut foreign = hit;
-    foreign.unit = "rift://source/cargo/other@1.0.0/src/first.rs".to_owned();
+    foreign.unit = "rift://source/cargo/crates.io/other@1.0.0/src/first.rs".to_owned();
     assert_eq!(
         PackagePatternMatch::try_from(&foreign),
         Err(ClientError::InvalidResponseField {

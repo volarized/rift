@@ -5,15 +5,13 @@ use std::path::Path;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
 use rift_protocol::read::ProjectPath;
 
-use super::{BUN_LOCK_FILE_NAME, LockedPackage, Pin, install_path_with_limit, parse_lockfile};
+use super::{BUN_LOCK_FILE_NAME, Pin, install_path_with_limit, parse_lockfile};
 use crate::context::ContextAnswer;
 use crate::manifest::{WorkspacePaths, file_beside, manifest_directory_path, read_static_file};
 use crate::node::{NPM_MANAGER, installed_folder, npm_selector, version_availability};
+use crate::node::{RegistryConfig, RegistryDegradations, npm_registry};
 use crate::resolver::{ContextRequest, StaticInputs};
-
-/// The default registry a Bun tuple may name, trailing separator dropped. Bun leaves the
-/// registry element empty for it; every other registry is a private one.
-const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org";
+use rift_protocol::read::PackageIdentity;
 
 /// Reports the packages every `bun.lock` beside a listed manifest pins, each exact one
 /// with the install folder its key spells.
@@ -44,6 +42,7 @@ fn pin_lockfile(
     answer: &mut ContextAnswer,
 ) {
     let directory = manifest_directory_path(root, manifest);
+    let registries = RegistryConfig::read(&directory, manifest, true, inputs, answer);
     let observed = read_static_file(&directory, BUN_LOCK_FILE_NAME, inputs);
     if let Err(failure) = &observed
         && failure.is_absent()
@@ -63,52 +62,82 @@ fn pin_lockfile(
             return;
         }
     };
+    let mut registry_degradations = RegistryDegradations::default();
     for (key, package) in &lockfile.packages {
         let Pin::Package { name, version } = package.pin() else {
             continue;
         };
-        let Some(availability) = pin_availability(package, version, &directory, workspace, inputs)
-        else {
+        let Some(availability) = pin_availability(version, &directory, workspace, inputs) else {
             continue;
         };
         let selector = npm_selector(version);
+        let registry = if matches!(
+            availability,
+            PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
+        ) {
+            match package.registry() {
+                Some(registry) => npm_registry(registry),
+                None => registries.registry(name).map(str::to_owned),
+            }
+        } else {
+            None
+        };
+        if matches!(
+            availability,
+            PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
+        ) && registry.is_none()
+        {
+            registry_degradations.unresolved(manifest, name);
+        }
         let nesting_depth_max =
             usize::try_from(inputs.collection().nesting_depth).unwrap_or(usize::MAX);
         if let (PackageSelector::Version(exact), Some(path)) =
             (&selector, install_path_with_limit(key, nesting_depth_max))
+            && let Some(registry) = &registry
         {
-            answer
-                .install_folders
-                .push(installed_folder(&directory, &path, (name, exact), inputs));
+            let package = PackageIdentity {
+                manager: NPM_MANAGER.to_owned(),
+                registry: registry.clone(),
+                name: name.to_owned(),
+                version: exact.clone(),
+            };
+            if let Some(folder) = installed_folder(&directory, &path, package, inputs) {
+                answer.install_folders.push(folder);
+            }
         }
-        answer.entries.push(PackageContextEntry::new(
+        let mut entry = PackageContextEntry::new(
             NPM_MANAGER,
             name,
             selector,
-            availability,
-        ));
+            match registry.as_deref() {
+                Some("npmjs.org") => PackageAvailability::Canonical,
+                Some(_) => PackageAvailability::PrivateRegistry,
+                None if matches!(
+                    availability,
+                    PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
+                ) =>
+                {
+                    PackageAvailability::RegistryUnresolved
+                }
+                None => availability,
+            },
+        );
+        entry.registry = registry;
+        answer.entries.push(entry);
     }
+    registry_degradations.report(answer);
 }
 
 /// Whether a global package index can answer for one pinned tuple: its version text
-/// decides, and a registry package fetched from a registry the tuple names other than
-/// npm's is a private one. `None` for project source.
+/// decides. The tuple or observed configuration establishes the registry separately.
+/// `None` for project source.
 fn pin_availability(
-    package: &LockedPackage,
     version: &str,
     directory: &Path,
     workspace: &WorkspacePaths,
     inputs: &mut dyn StaticInputs,
 ) -> Option<PackageAvailability> {
-    let availability = version_availability(version, directory, workspace, inputs)?;
-    let private = package
-        .registry()
-        .is_some_and(|registry| registry.trim_end_matches('/') != NPM_REGISTRY_URL);
-    if availability == PackageAvailability::Canonical && private {
-        Some(PackageAvailability::PrivateRegistry)
-    } else {
-        Some(availability)
-    }
+    version_availability(version, directory, workspace, inputs)
 }
 
 #[cfg(test)]
@@ -120,6 +149,85 @@ mod tests {
     use crate::resolver::{DependencyResolver, LOCKFILE_BYTES_MAX};
 
     const ROOT: &str = "/workspace";
+
+    fn package_name(folder: &crate::context::InstallFolder) -> &str {
+        let rift_protocol::read::SourceLocation::Dependency { package } = &folder.origin else {
+            panic!("dependency fixture");
+        };
+        &package.name
+    }
+
+    #[test]
+    fn explicit_bun_registry_and_scoped_configuration_define_distinct_owners() {
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/.npmrc"), "registry=https://registry.npmjs.org/\n")
+            .with_file(format!("{ROOT}/bunfig.toml"), "[install.scopes]\norg={url='https://registry.example/releases',token='secret'}\n")
+            .with_file(format!("{ROOT}/bun.lock"), r#"{"packages":{"demo":["demo@1.0.0",""],"@org/demo":["@org/demo@1.0.0",""],"explicit":["explicit@1.0.0","https://other.example/npm"]}}"#);
+        let answer = context(&["package.json"], &mut inspector);
+        assert!(answer.degradations.is_empty());
+        assert_eq!(
+            answer
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.registry.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("@org/demo", Some("registry.example/releases")),
+                ("demo", Some("npmjs.org")),
+                ("explicit", Some("other.example/npm"))
+            ]
+        );
+        assert_eq!(answer.install_folders.len(), 3);
+        assert!(
+            inspector
+                .asked
+                .iter()
+                .all(|question| !question.starts_with("command "))
+        );
+    }
+
+    #[test]
+    fn empty_bun_registry_without_configuration_has_no_owner() {
+        let mut inspector = RecordedInspector::default().with_file(
+            format!("{ROOT}/bun.lock"),
+            r#"{"packages":{"demo":["demo@1.0.0",""]}}"#,
+        );
+        let answer = context(&["package.json"], &mut inspector);
+        assert!(answer.install_folders.is_empty());
+        assert_eq!(answer.entries.len(), 1);
+        assert_eq!(
+            answer.entries[0].availability,
+            PackageAvailability::RegistryUnresolved
+        );
+        assert_eq!(answer.entries[0].registry, None);
+        assert!(answer.degradations[0].contains("registry unresolved"));
+    }
+
+    #[test]
+    fn registry_degradation_keeps_all_unresolved_bun_observations_with_one_count() {
+        let packages: std::collections::BTreeMap<_, _> = (0..3000)
+            .map(|index| {
+                (
+                    format!("package-{index}"),
+                    serde_json::json!([format!("package-{index}@1.0.0"), ""]),
+                )
+            })
+            .collect();
+        let lockfile = serde_json::to_vec(&serde_json::json!({"packages": packages}))
+            .expect("bounded lockfile fixture");
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/bun.lock"), lockfile);
+        let answer = context(&["package.json"], &mut inspector);
+        assert_eq!(answer.entries.len(), 3000);
+        assert!(answer.entries.iter().all(|entry| {
+            entry.registry.is_none()
+                && entry.availability == PackageAvailability::RegistryUnresolved
+        }));
+        assert!(answer.install_folders.is_empty());
+        assert_eq!(answer.degradations.len(), 1);
+        assert!(answer.degradations[0].contains("3000 packages"));
+        assert!(answer.degradations[0].len() < 1024);
+    }
 
     /// A lockfile pinning one registry package, one package from a private registry, one
     /// nested copy, one repository package, a directory inside the root, and the
@@ -159,8 +267,14 @@ mod tests {
     fn configured_bun_nesting_bound_controls_installed_folders() {
         use rift_protocol::dependencies::DependenciesCollectionConfiguration;
 
-        let recorded =
-            || RecordedInspector::default().with_file(format!("{ROOT}/bun.lock"), LOCKFILE);
+        let recorded = || {
+            RecordedInspector::default()
+                .with_file(
+                    format!("{ROOT}/.npmrc"),
+                    "registry=https://registry.npmjs.org/\n",
+                )
+                .with_file(format!("{ROOT}/bun.lock"), LOCKFILE)
+        };
         let mut low = recorded().with_collection(DependenciesCollectionConfiguration {
             nesting_depth: 1,
             ..Default::default()
@@ -170,7 +284,7 @@ mod tests {
             answer
                 .install_folders
                 .iter()
-                .all(|folder| folder.package.name != "@types/node")
+                .all(|folder| package_name(folder) != "@types/node")
         );
         let mut exact = recorded().with_collection(DependenciesCollectionConfiguration {
             nesting_depth: 2,
@@ -181,14 +295,18 @@ mod tests {
             answer
                 .install_folders
                 .iter()
-                .any(|folder| folder.package.name == "@types/node")
+                .any(|folder| package_name(folder) == "@types/node")
         );
     }
 
     #[test]
     fn test_a_lockfile_pins_exact_versions_and_sorts_every_reference_by_kind() {
-        let mut inspector =
-            RecordedInspector::default().with_file(format!("{ROOT}/bun.lock"), LOCKFILE);
+        let mut inspector = RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/.npmrc"),
+                "registry=https://registry.npmjs.org/\n",
+            )
+            .with_file(format!("{ROOT}/bun.lock"), LOCKFILE);
 
         let answer = context(&["package.json"], &mut inspector);
 
@@ -223,7 +341,7 @@ mod tests {
         let folders: Vec<(String, &InstallLocation)> = answer
             .install_folders
             .iter()
-            .map(|folder| (folder.package.name.clone(), &folder.location))
+            .map(|folder| (package_name(folder).to_owned(), &folder.location))
             .collect();
         let at = |path: &str| InstallLocation::Path(Path::new(ROOT).join(path));
         assert_eq!(
@@ -245,7 +363,7 @@ mod tests {
                 .iter()
                 .all(|entry| entry.violation().is_none())
         );
-        assert_eq!(answer.inputs, [project("bun.lock")]);
+        assert_eq!(answer.inputs, [project(".npmrc"), project("bun.lock")]);
         assert!(answer.degradations.is_empty());
         assert_eq!(
             answer.entries[3].availability,

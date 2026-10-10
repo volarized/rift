@@ -41,11 +41,13 @@
               {
                 "manager": "cargo",
                 "name": "tokio",
+                "registry": "crates.io",
                 "version": "1.47.1"
               },
               {
                 "manager": "npm",
-                "name": "zod"
+                "name": "zod",
+                "registry": "npmjs.org"
               }
             ],
             "properties": {
@@ -57,6 +59,12 @@
               },
               "name": {
                 "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "registry": {
+                "description": "Accepted defining registry endpoint. Absent when the registry is unresolved.",
                 "maxLength": 4096,
                 "minLength": 1,
                 "type": "string"
@@ -1191,6 +1199,11 @@
                 "const": "url",
                 "description": "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL.",
                 "type": "string"
+              },
+              {
+                "const": "registry_unresolved",
+                "description": "Accepted source evidence does not name the registry serving this entry.",
+                "type": "string"
               }
             ]
           },
@@ -1228,6 +1241,12 @@
                 "maxLength": 4096,
                 "type": "string"
               },
+              "registry": {
+                "description": "Accepted registry endpoint. Absent for a path, Git repository or direct URL source.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
               "requirement": {
                 "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
                 "maxLength": 4096,
@@ -1260,6 +1279,12 @@
                 "maxLength": 4096,
                 "type": "string"
               },
+              "registry": {
+                "description": "Canonical registry endpoint, including its path when that path identifies the registry.\nCredentials, query and fragment are never part of this owner.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
               "version": {
                 "description": "Resolved package version.",
                 "maxLength": 4096,
@@ -1268,6 +1293,7 @@
             },
             "required": [
               "manager",
+              "registry",
               "name",
               "version"
             ],
@@ -2440,6 +2466,29 @@
             "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
+          "RuntimeIdentity": {
+            "additionalProperties": false,
+            "description": "One exact runtime or compiler release.",
+            "properties": {
+              "runtime": {
+                "description": "Canonical runtime or compiler name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "version": {
+                "description": "Exact runtime or compiler version.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "runtime",
+              "version"
+            ],
+            "type": "object"
+          },
           "Signature": {
             "description": "One callable form of a symbol: the text it renders as, the symbols that text points at,\nand its structure. Overloads are separate entries.",
             "properties": {
@@ -2579,10 +2628,40 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "else": {
+              "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "examples": [
+              "rift://source/project/src/lib.rs",
+              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ],
+            "if": {
+              "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+            },
             "maxLength": 8192,
             "minLength": 17,
-            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+            "not": {
+              "anyOf": [
+                {
+                  "pattern": "/\\.{1,2}(?:/|$)"
+                },
+                {
+                  "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                }
+              ]
+            },
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+            "then": {
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
             "type": "string"
           },
           "Symbol": {
@@ -2862,13 +2941,19 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolOrigin": {
@@ -2881,6 +2966,10 @@
               "package": {
                 "$ref": "#/$defs/PackageIdentity",
                 "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
+              },
+              "runtime": {
+                "$ref": "#/$defs/RuntimeIdentity",
+                "description": "Exact runtime or compiler release that owns a standard-library declaration.\nMutually exclusive with `package`."
               },
               "source_kind": {
                 "$ref": "#/$defs/SourceKind",
@@ -3150,7 +3239,7 @@
               {
                 "history": {
                   "complete": true,
-                  "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                  "symbol": "rift://symbol/local/rust/app/config/load_config",
                   "versions": [
                     {
                       "author": {
@@ -3196,7 +3285,7 @@
                     "callable",
                     "public"
                   ],
-                  "id": "rift://symbol/rust/src/config.rs/load_config",
+                  "id": "rift://symbol/local/rust/app/config/load_config",
                   "kind": "function",
                   "language": "rust",
                   "name": "load_config",
@@ -3210,7 +3299,7 @@
                             "end": 48,
                             "start": 42
                           },
-                          "symbol": "rift://symbol/rust/src/config.rs/Config"
+                          "symbol": "rift://symbol/local/rust/app/config/Config"
                         }
                       ],
                       "parameters": [
@@ -3956,6 +4045,11 @@
                 "const": "url",
                 "description": "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL.",
                 "type": "string"
+              },
+              {
+                "const": "registry_unresolved",
+                "description": "Accepted source evidence does not name the registry serving this entry.",
+                "type": "string"
               }
             ]
           },
@@ -3993,6 +4087,12 @@
                 "maxLength": 4096,
                 "type": "string"
               },
+              "registry": {
+                "description": "Accepted registry endpoint. Absent for a path, Git repository or direct URL source.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
               "requirement": {
                 "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
                 "maxLength": 4096,
@@ -4025,6 +4125,12 @@
                 "maxLength": 4096,
                 "type": "string"
               },
+              "registry": {
+                "description": "Canonical registry endpoint, including its path when that path identifies the registry.\nCredentials, query and fragment are never part of this owner.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
               "version": {
                 "description": "Resolved package version.",
                 "maxLength": 4096,
@@ -4033,6 +4139,7 @@
             },
             "required": [
               "manager",
+              "registry",
               "name",
               "version"
             ],
@@ -5168,20 +5275,56 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "else": {
+              "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "examples": [
+              "rift://source/project/src/lib.rs",
+              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ],
+            "if": {
+              "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+            },
             "maxLength": 8192,
             "minLength": 17,
-            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+            "not": {
+              "anyOf": [
+                {
+                  "pattern": "/\\.{1,2}(?:/|$)"
+                },
+                {
+                  "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                }
+              ]
+            },
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+            "then": {
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
             "type": "string"
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SyntaxFramework": {
@@ -5590,11 +5733,13 @@
               {
                 "manager": "cargo",
                 "name": "tokio",
+                "registry": "crates.io",
                 "version": "1.47.1"
               },
               {
                 "manager": "npm",
-                "name": "zod"
+                "name": "zod",
+                "registry": "npmjs.org"
               }
             ],
             "properties": {
@@ -5606,6 +5751,12 @@
               },
               "name": {
                 "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "registry": {
+                "description": "Accepted defining registry endpoint. Absent when the registry is unresolved.",
                 "maxLength": 4096,
                 "minLength": 1,
                 "type": "string"
@@ -5756,7 +5907,7 @@
               {
                 "depth": 1,
                 "direction": "incoming",
-                "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+                "seed": "rift://symbol/local/rust/rift_server/read/ReadService"
               }
             ],
             "properties": {
@@ -5793,13 +5944,19 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "TraversalDirection": {
@@ -5905,7 +6062,7 @@
               "facets": [
                 "references"
               ],
-              "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "seed": "rift://symbol/local/rust/rift_server/read/ReadService"
             }
           },
           {
@@ -5916,7 +6073,7 @@
               "facets": [
                 "calls"
               ],
-              "seed": "rift://symbol/rust/crates/rift-server/src/engine_read.rs/resolve_symbol_callees"
+              "seed": "rift://symbol/local/rust/rift_server/engine_read/resolve_symbol_callees"
             }
           },
           {
@@ -6969,6 +7126,11 @@
                 "const": "url",
                 "description": "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL.",
                 "type": "string"
+              },
+              {
+                "const": "registry_unresolved",
+                "description": "Accepted source evidence does not name the registry serving this entry.",
+                "type": "string"
               }
             ]
           },
@@ -7006,6 +7168,12 @@
                 "maxLength": 4096,
                 "type": "string"
               },
+              "registry": {
+                "description": "Accepted registry endpoint. Absent for a path, Git repository or direct URL source.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
               "requirement": {
                 "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
                 "maxLength": 4096,
@@ -7038,6 +7206,12 @@
                 "maxLength": 4096,
                 "type": "string"
               },
+              "registry": {
+                "description": "Canonical registry endpoint, including its path when that path identifies the registry.\nCredentials, query and fragment are never part of this owner.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
               "version": {
                 "description": "Resolved package version.",
                 "maxLength": 4096,
@@ -7046,6 +7220,7 @@
             },
             "required": [
               "manager",
+              "registry",
               "name",
               "version"
             ],
@@ -8296,6 +8471,29 @@
             "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
+          "RuntimeIdentity": {
+            "additionalProperties": false,
+            "description": "One exact runtime or compiler release.",
+            "properties": {
+              "runtime": {
+                "description": "Canonical runtime or compiler name.",
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              "version": {
+                "description": "Exact runtime or compiler version.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "runtime",
+              "version"
+            ],
+            "type": "object"
+          },
           "SearchHit": {
             "additionalProperties": false,
             "allOf": [
@@ -8665,10 +8863,40 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "else": {
+              "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "examples": [
+              "rift://source/project/src/lib.rs",
+              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ],
+            "if": {
+              "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+            },
             "maxLength": 8192,
             "minLength": 17,
-            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+            "not": {
+              "anyOf": [
+                {
+                  "pattern": "/\\.{1,2}(?:/|$)"
+                },
+                {
+                  "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                }
+              ]
+            },
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+            "then": {
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
             "type": "string"
           },
           "Symbol": {
@@ -8943,13 +9171,19 @@
             ]
           },
           "SymbolId": {
-            "description": "Identity of one symbol: the language, the path of the declaring file, and the provider's\nstable qualified name for the declaration. No shipped provider puts the file path into a\nqualified name, so a declaration moved to another file keeps its qualified name while its\nidentity names the new path. A `~N` suffix separates declarations the qualified name\nalone cannot, such as overloads that dispatch separately.",
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
-              "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService"
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
             "maxLength": 8192,
-            "minLength": 17,
-            "pattern": "^rift://symbol/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolOrigin": {
@@ -8962,6 +9196,10 @@
               "package": {
                 "$ref": "#/$defs/PackageIdentity",
                 "description": "The package that owns the declaration: present for `dependency`, and optionally\nfor `project`. Absent for `stdlib`, `external`, and a synthetic declaration."
+              },
+              "runtime": {
+                "$ref": "#/$defs/RuntimeIdentity",
+                "description": "Exact runtime or compiler release that owns a standard-library declaration.\nMutually exclusive with `package`."
               },
               "source_kind": {
                 "$ref": "#/$defs/SourceKind",
@@ -9206,7 +9444,7 @@
                       "callable",
                       "public"
                     ],
-                    "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "id": "rift://symbol/local/rust/app/config/load_config",
                     "kind": "function",
                     "language": "rust",
                     "name": "load_config",
@@ -9220,7 +9458,7 @@
                               "end": 48,
                               "start": 42
                             },
-                            "symbol": "rift://symbol/rust/src/config.rs/Config"
+                            "symbol": "rift://symbol/local/rust/app/config/Config"
                           }
                         ],
                         "parameters": [

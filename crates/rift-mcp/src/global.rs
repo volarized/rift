@@ -10,13 +10,12 @@ use std::sync::{Arc, Mutex as StdMutex, Weak};
 use percent_encoding::percent_decode_str;
 use rift_cloud_client::{
     ClientError, Config, ConfigError, DECLARATION_POSITIONS_MAX, GlobalClient, PACKAGES_MAX,
-    POSITION_COMPONENT_MAX, PackageAvailability as WireAvailability,
-    PackageContextEntry as WireContextEntry, PackageDeclarationRequest,
+    PackageAvailability as WireAvailability, PackageContextEntry as WireContextEntry,
     PackageDeclarationRequestPositionEncoding, PackageIdentity as WirePackageIdentity,
-    PackagePatternMatch, PackagePatternRequest, PackagePosition, PackageResolutionRequest,
-    PackageSearchCandidate, PackageSearchRequest, PackageSearchRequestPhase,
-    PackageSearchRequestTarget, PackageSymbolCandidate, PackageSymbolRequest,
-    PackageSymbolRequestInclude, PreparedPackageResolutionRequest, QueryTerm, Warning, WarningCode,
+    PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget,
+    PackageSymbolCandidate, PackageSymbolRequest, PackageSymbolRequestInclude,
+    PreparedPackageResolutionRequest, QueryTerm, Warning, WarningCode,
 };
 use rift_dependency::DependencyContext;
 use rift_error::{RiftError, errors};
@@ -219,6 +218,75 @@ impl GlobalState {
         route
     }
 
+    /// Routes exact callee source owners through the configured global client.
+    /// Runtime owners need no package resolution. Installed package owners retain
+    /// exact resolution; unversioned standard libraries establish no source owner.
+    pub(crate) async fn callee_route(
+        &self,
+        configuration: &GlobalConfiguration,
+        read: &ReadContext<'_>,
+        callees: &[PackageCallee],
+    ) -> GlobalRoute {
+        let route = self.callee_route_inner(configuration, read, callees).await;
+        route.record_observation();
+        route
+    }
+
+    async fn callee_route_inner(
+        &self,
+        configuration: &GlobalConfiguration,
+        read: &ReadContext<'_>,
+        callees: &[PackageCallee],
+    ) -> GlobalRoute {
+        let context = &read.context;
+        let unanswered =
+            |state| GlobalRoute::unanswered(context, state, Arc::clone(&self.observation));
+        if !configuration.enabled {
+            return unanswered(RouteState::Disabled);
+        }
+        if !callees.iter().any(|callee| callee_origin(callee).is_some()) {
+            return unanswered(RouteState::Available);
+        }
+        let client = match self.client(configuration).await {
+            Ok(client) => client,
+            Err(error) => return unanswered(failure_state(&ClientError::Config(error))),
+        };
+        if let Err(error) = client.get_capabilities().await {
+            return unanswered(failure_state(&error));
+        }
+        let mut entries = Vec::new();
+        for callee in callees {
+            let CalleePackage::Installed(package) = callee.package() else {
+                continue;
+            };
+            let entry = rift_cloud_client::PackageContextEntry {
+                availability: rift_cloud_client::PackageAvailability::Canonical,
+                manager: package.manager.clone(),
+                registry: Some(package.registry.clone()),
+                name: package.name.clone(),
+                version: Some(package.version.clone()),
+                requirement: None,
+            };
+            if !entries.contains(&entry) {
+                entries.push(entry);
+            }
+        }
+        if entries.is_empty() {
+            let mut route = unanswered(RouteState::Available);
+            route.client = Some(client);
+            return route;
+        }
+        match client
+            .resolve_package_context(&rift_cloud_client::PackageResolutionRequest { entries })
+            .await
+        {
+            Ok(resolution) => {
+                resolved_route(context, client, resolution, Arc::clone(&self.observation))
+            }
+            Err(error) => unanswered(failure_state(&error)),
+        }
+    }
+
     /// The route of one read. The capabilities come first, so the resolution request
     /// holds the context cut at the entry bound they advertise; a read past it would
     /// otherwise answer no package at all.
@@ -386,17 +454,14 @@ pub(crate) struct CalleeDeclarations {
     /// encoding and key.
     named:
         HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), (SymbolId, ExactKind)>,
-    /// The releases the resolution served, which name a standard library's version.
-    served: Vec<WirePackageIdentity>,
 }
 
 /// One package position as a request carries it and its answer names it.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CalleePosition {
-    package: (String, String, String),
-    path: String,
-    line: i64,
-    character: i64,
+    unit: String,
+    line: u64,
+    character: u64,
 }
 
 impl CalleeDeclarations {
@@ -404,13 +469,13 @@ impl CalleeDeclarations {
     /// exact package holding it; `None` for a position it answered no declaration at, or
     /// one left unasked.
     pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
-        let package = callee_package(callee, &self.served)?;
-        let key = (wire_encoding(callee), callee_position(callee, &package)?);
+        let origin = callee_origin(callee)?;
+        let key = (wire_encoding(callee), callee_position(callee, &origin)?);
         let (id, kind) = self.named.get(&key)?;
         Some(CalleeDeclaration {
             id: id.clone(),
             kind: kind.clone(),
-            package: protocol_package_identity(package),
+            origin,
         })
     }
 }
@@ -419,9 +484,10 @@ impl CalleeDeclarations {
 /// position encoding the walk's engines counted in.
 ///
 /// A callee in an installed package is asked at the exact version its install folder
-/// names, since a position belongs to one version of a file. A standard library callee is
-/// asked at the release the resolution `served` for the library's context entry; a callee
-/// of a library the resolution served no release of is left unasked. Past
+/// names, since a position belongs to one version of a file. A runtime callee is asked
+/// only when its source root establishes an exact runtime version. Unversioned standard
+/// library positions remain unasked. Each encoding batch reuses the preceding captured
+/// view; conflicting views discard the answer. Past
 /// [`DECLARATION_POSITIONS_MAX`] distinct positions in one encoding the rest are left
 /// unasked too.
 ///
@@ -432,48 +498,64 @@ impl CalleeDeclarations {
 pub(crate) async fn callee_declarations(
     client: &GlobalClient,
     callees: &[PackageCallee],
-    served: &[WirePackageIdentity],
+    _served: &[WirePackageIdentity],
 ) -> Result<CalleeDeclarations, ClientError> {
+    use rift_protocol::source_read::DeclarationPositionResult;
     let mut named = HashMap::new();
-    for request in declaration_requests(callees, served) {
-        let answer = client.find_package_declarations(&request).await?;
-        let encoding = request.position_encoding;
+    let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
+    for mut request in declaration_requests(callees) {
+        request.view = selected.as_ref().map(|view| view.id.clone());
+        let answer = client.find_declarations(&request).await?;
+        let next_view = answer
+            .results
+            .iter()
+            .find_map(DeclarationPositionResult::view);
+        if selected
+            .as_ref()
+            .is_some_and(|view| next_view.is_some_and(|next| next != view))
+        {
+            return Err(ClientError::InvalidResponseField { field: "view" });
+        }
+        if selected.is_none() {
+            selected = next_view.cloned();
+        }
+        let encoding = match request.position_encoding {
+            rift_protocol::source_read::PositionEncoding::Utf8 => {
+                PackageDeclarationRequestPositionEncoding::Utf8
+            }
+            rift_protocol::source_read::PositionEncoding::Utf16 => {
+                PackageDeclarationRequestPositionEncoding::Utf16
+            }
+        };
         for result in answer.results {
-            let (Some(declaration), Some(kind)) = (result.declaration, result.kind) else {
+            let DeclarationPositionResult::Found {
+                position, id, kind, ..
+            } = result
+            else {
                 continue;
             };
-            let position = result.position;
             let key = CalleePosition {
-                package: (
-                    position.package.manager,
-                    position.package.name,
-                    position.package.version,
-                ),
-                path: position.path,
+                unit: position.unit.as_str().to_owned(),
                 line: position.line,
                 character: position.character,
             };
-            named.insert(
-                (encoding.clone(), key),
-                (SymbolId(declaration), ExactKind(kind)),
-            );
+            named.insert((encoding.clone(), key), (id, kind));
+        }
+        if selected.is_none() {
+            break;
         }
     }
-    Ok(CalleeDeclarations {
-        named,
-        served: served.to_vec(),
-    })
+    Ok(CalleeDeclarations { named })
 }
 
 /// The requests asking for `callees`' positions: one per position encoding, each within
 /// the positions bound, every position once.
 fn declaration_requests(
     callees: &[PackageCallee],
-    served: &[WirePackageIdentity],
-) -> Vec<PackageDeclarationRequest> {
+) -> Vec<rift_protocol::source_read::FindDeclarationsParams> {
     batched_positions(callees.iter().filter_map(|callee| {
-        let package = callee_package(callee, served)?;
-        Some((wire_encoding(callee), callee_position(callee, &package)?))
+        let origin = callee_origin(callee)?;
+        Some((wire_encoding(callee), callee_position(callee, &origin)?))
     }))
 }
 
@@ -494,17 +576,29 @@ const _: () = assert!(DECLARATION_POSITIONS_MAX <= PACKAGES_MAX);
 /// past it stay unasked.
 fn batched_positions(
     positions: impl IntoIterator<Item = (PackageDeclarationRequestPositionEncoding, CalleePosition)>,
-) -> Vec<PackageDeclarationRequest> {
-    let mut requests: Vec<PackageDeclarationRequest> = Vec::new();
+) -> Vec<rift_protocol::source_read::FindDeclarationsParams> {
+    use rift_protocol::source_read::{
+        FindDeclarationsParams, PositionEncoding as Encoding, SourcePosition,
+    };
+    let mut requests: Vec<FindDeclarationsParams> = Vec::new();
     let mut asked = HashSet::new();
     for (position_encoding, key) in positions {
+        let Ok(unit) = rift_protocol::read::SourceUnitId::parse(&key.unit) else {
+            continue;
+        };
+        let encoding = match position_encoding {
+            PackageDeclarationRequestPositionEncoding::Utf8 => Encoding::Utf8,
+            PackageDeclarationRequestPositionEncoding::Utf16 => Encoding::Utf16,
+        };
         let held = requests
             .iter()
-            .position(|request| request.position_encoding == position_encoding);
+            .position(|request| request.position_encoding == encoding);
         let index = held.unwrap_or_else(|| {
-            requests.push(PackageDeclarationRequest {
-                position_encoding: position_encoding.clone(),
+            requests.push(FindDeclarationsParams {
+                position_encoding: encoding,
                 positions: Vec::new(),
+                view: None,
+                rev: None,
             });
             requests.len() - 1
         });
@@ -514,14 +608,8 @@ fn batched_positions(
         {
             continue;
         }
-        let (manager, name, version) = key.package;
-        request.positions.push(PackagePosition {
-            package: WirePackageIdentity {
-                manager,
-                name,
-                version,
-            },
-            path: key.path,
+        request.positions.push(SourcePosition {
+            unit,
             line: key.line,
             character: key.character,
         });
@@ -529,45 +617,39 @@ fn batched_positions(
     requests
 }
 
-/// The exact package a callee's position is asked in: its installed version, or the
-/// release the resolution served for its standard library.
-fn callee_package(
-    callee: &PackageCallee,
-    served: &[WirePackageIdentity],
-) -> Option<WirePackageIdentity> {
+/// The exact physical source origin established by the callee's installed root.
+/// Unversioned standard libraries establish no released source identity.
+fn callee_origin(callee: &PackageCallee) -> Option<rift_protocol::read::SourceLocation> {
     match callee.package() {
-        CalleePackage::Installed(package) => Some(WirePackageIdentity {
-            manager: package.manager.clone(),
-            name: package.name.clone(),
-            version: package.version.clone(),
-        }),
-        CalleePackage::StandardLibrary(_) => served
-            .iter()
-            .find(|release| {
-                let package = callee.package();
-                release.manager == package.manager() && release.name == package.name()
+        CalleePackage::Installed(package) => {
+            Some(rift_protocol::read::SourceLocation::Dependency {
+                package: package.clone(),
             })
-            .cloned(),
+        }
+        CalleePackage::Runtime(runtime) => Some(rift_protocol::read::SourceLocation::Stdlib {
+            runtime: Some(runtime.clone()),
+        }),
+        CalleePackage::StandardLibrary(_) => None,
     }
 }
 
-/// The key of `callee`'s position in `package`; `None` for a line or character past the
+/// The key of `callee`'s position in its source origin; `None` for a line or character past the
 /// bound a request carries.
 fn callee_position(
     callee: &PackageCallee,
-    package: &WirePackageIdentity,
+    origin: &rift_protocol::read::SourceLocation,
 ) -> Option<CalleePosition> {
     let position = callee.position();
-    let line = i64::from(position.line);
-    let character = i64::from(position.character);
-    let within_bound = line <= POSITION_COMPONENT_MAX && character <= POSITION_COMPONENT_MAX;
-    within_bound.then(|| CalleePosition {
-        package: (
-            package.manager.clone(),
-            package.name.clone(),
-            package.version.clone(),
-        ),
-        path: callee.path().as_str().to_owned(),
+    let line = u64::from(position.line);
+    let character = u64::from(position.character);
+    let within_bound = line <= rift_protocol::source_read::SOURCE_POSITION_MAX
+        && character <= rift_protocol::source_read::SOURCE_POSITION_MAX;
+    if !within_bound {
+        return None;
+    }
+    let unit = rift_core::SourceUnitId::for_origin(origin, callee.path()).ok()?;
+    Some(CalleePosition {
+        unit: unit.to_string(),
         line,
         character,
     })
@@ -650,7 +732,7 @@ pub(crate) async fn package_patterns(
     };
     let request = PackagePatternRequest {
         pattern,
-        packages: packages.to_vec(),
+        packages: Some(packages.to_vec()),
         include: includes_source(params).then(|| vec!["source".to_owned()]),
     };
     let page = client
@@ -744,7 +826,7 @@ fn search_request(
             .map(|candidate| candidate.text().to_owned())
             .collect(),
         include: includes_source(params).then(|| vec!["source".to_owned()]),
-        packages: packages.to_vec(),
+        packages: Some(packages.to_vec()),
         phase: match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,
@@ -1430,6 +1512,7 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
     WireContextEntry {
         availability: WireAvailability::Canonical,
         manager: entry.manager.clone(),
+        registry: entry.registry.clone(),
         name: entry.name.clone(),
         requirement: entry.requirement.clone(),
         version: entry.version.clone(),
@@ -1441,6 +1524,7 @@ fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
 fn protocol_context_entry(entry: WireContextEntry) -> PackageContextEntry {
     PackageContextEntry {
         manager: entry.manager,
+        registry: entry.registry,
         name: entry.name,
         version: entry.version,
         requirement: entry.requirement,
@@ -1495,6 +1579,7 @@ fn resolved_route(
 fn push_distinct_package(packages: &mut Vec<WirePackageIdentity>, candidate: WirePackageIdentity) {
     if packages.iter().any(|held| {
         held.manager == candidate.manager
+            && held.registry == candidate.registry
             && held.name == candidate.name
             && held.version == candidate.version
     }) {
@@ -1506,6 +1591,7 @@ fn push_distinct_package(packages: &mut Vec<WirePackageIdentity>, candidate: Wir
 fn protocol_package_identity(package: WirePackageIdentity) -> PackageIdentity {
     PackageIdentity {
         manager: package.manager,
+        registry: package.registry,
         name: package.name,
         version: package.version,
     }
@@ -2068,6 +2154,23 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn distinct_packages_keep_registry_owners() {
+        let package = |registry: &str| rift_cloud_client::PackageIdentity {
+            manager: "cargo".to_owned(),
+            registry: registry.to_owned(),
+            name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let public = package("crates.io");
+        let other = package("registry.example/releases");
+        let mut packages = Vec::new();
+        super::push_distinct_package(&mut packages, public.clone());
+        super::push_distinct_package(&mut packages, other.clone());
+        super::push_distinct_package(&mut packages, public.clone());
+        assert_eq!(packages, [public, other]);
+    }
+
     #[tokio::test]
     async fn resolution_request_cache_invalidates_on_limit_snapshot_and_requested_packages()
     -> Result<(), rift_cloud_client::ClientError> {
@@ -2113,6 +2216,7 @@ mod tests {
         );
         let requested = [rift_protocol::dependencies::RequestedPackage {
             manager: "cargo".to_owned(),
+            registry: Some("crates.io".to_owned()),
             name: "tokio".to_owned(),
             version: Some("1.0.0".to_owned()),
         }];
@@ -2359,6 +2463,7 @@ mod tests {
         // The operator's list stands in for a lockfile pinning `typescript`.
         let configured = [ConfiguredPackage {
             manager: "npm".to_owned(),
+            registry: Some("npmjs.org".to_owned()),
             name: "typescript".to_owned(),
             version: Some("5.9.3".to_owned()),
             requirement: None,
@@ -2508,6 +2613,7 @@ mod tests {
             .missing_exact
             .push(rift_protocol::read::PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: "absent".to_owned(),
                 version: "1.0.0".to_owned(),
             });
@@ -2562,10 +2668,9 @@ mod tests {
         assert_eq!(codes, ["\"global_page_warning\""]);
     }
 
-    fn position(name: &str, line: i64) -> super::CalleePosition {
+    fn position(name: &str, line: u64) -> super::CalleePosition {
         super::CalleePosition {
-            package: ("pypi".to_owned(), name.to_owned(), "1.0.0".to_owned()),
-            path: format!("{name}/core.py"),
+            unit: format!("rift://source/pypi/pypi.org/{name}@1.0.0/{name}/core.py"),
             line,
             character: 4,
         }
@@ -2582,13 +2687,16 @@ mod tests {
             (Encoding::Utf16, position("greeting", 0)),
             (Encoding::Utf16, position("other", 3)),
         ]);
-        let batched: Vec<(Encoding, Vec<(String, i64)>)> = requests
+        let batched: Vec<(
+            rift_protocol::source_read::PositionEncoding,
+            Vec<(String, u64)>,
+        )> = requests
             .into_iter()
             .map(|request| {
                 let positions = request
                     .positions
                     .into_iter()
-                    .map(|position| (position.package.name, position.line))
+                    .map(|position| (position.unit.as_str().to_owned(), position.line))
                     .collect();
                 (request.position_encoding, positions)
             })
@@ -2597,10 +2705,16 @@ mod tests {
             batched,
             [
                 (
-                    Encoding::Utf16,
-                    vec![("greeting".to_owned(), 0), ("other".to_owned(), 3)]
+                    rift_protocol::source_read::PositionEncoding::Utf16,
+                    vec![
+                        (position("greeting", 0).unit, 0),
+                        (position("other", 3).unit, 3)
+                    ]
                 ),
-                (Encoding::Utf8, vec![("greeting".to_owned(), 0)]),
+                (
+                    rift_protocol::source_read::PositionEncoding::Utf8,
+                    vec![(position("greeting", 0).unit, 0)]
+                ),
             ]
         );
         assert!(super::batched_positions([]).is_empty());
@@ -2611,7 +2725,7 @@ mod tests {
     fn positions_past_the_bound_stay_unasked() {
         use rift_cloud_client::PackageDeclarationRequestPositionEncoding as Encoding;
 
-        let lines = 0..=i64::try_from(rift_cloud_client::DECLARATION_POSITIONS_MAX)
+        let lines = 0..=u64::try_from(rift_cloud_client::DECLARATION_POSITIONS_MAX)
             .expect("the bound fits a line");
         let requests = super::batched_positions(
             lines.map(|line| (Encoding::Utf8, position("greeting", line))),
@@ -2623,7 +2737,7 @@ mod tests {
         );
         assert_eq!(
             requests[0].positions.last().map(|position| position.line),
-            i64::try_from(rift_cloud_client::DECLARATION_POSITIONS_MAX - 1).ok()
+            u64::try_from(rift_cloud_client::DECLARATION_POSITIONS_MAX - 1).ok()
         );
     }
 
@@ -2649,22 +2763,22 @@ mod tests {
                 "available_exact": [],
                 "resolved_requirements": [
                     {
-                        "entry": {"manager": "cargo", "name": "demo", "version": "1.0.3",
+                        "entry": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.3",
                                   "availability": "canonical"},
-                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.2"}
+                        "package": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.2"}
                     },
                     {
-                        "entry": {"manager": "npm", "name": "typescript", "requirement": "~5.7.2",
+                        "entry": {"manager": "npm", "registry": "npmjs.org", "name": "typescript", "requirement": "~5.7.2",
                                   "availability": "canonical"},
-                        "package": {"manager": "npm", "name": "typescript", "version": "5.9.3"}
+                        "package": {"manager": "npm", "registry": "npmjs.org", "name": "typescript", "version": "5.9.3"}
                     },
                     {
-                        "entry": {"manager": "npm", "name": "react", "requirement": "^19",
+                        "entry": {"manager": "npm", "registry": "npmjs.org", "name": "react", "requirement": "^19",
                                   "availability": "canonical"},
-                        "package": {"manager": "npm", "name": "react", "version": "19.1.0"}
+                        "package": {"manager": "npm", "registry": "npmjs.org", "name": "react", "version": "19.1.0"}
                     }
                 ],
-                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_exact": [{"manager": "cargo", "registry": "crates.io", "name": "absent", "version": "1.0.0"}],
                 "missing_requirements": [],
                 "warnings": [{
                     "code": "requirement_unsatisfied",
@@ -2692,8 +2806,9 @@ mod tests {
                 "package_substituted"
             ]
         );
-        let package = |manager: &str, name: &str, version: &str| PackageIdentity {
+        let package = |manager: &str, registry: &str, name: &str, version: &str| PackageIdentity {
             manager: manager.to_owned(),
+            registry: registry.to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         };
@@ -2705,22 +2820,28 @@ mod tests {
             route.warnings()[1..],
             [
                 substituted(
-                    PackageContextEntry::new(
-                        "cargo",
-                        "demo",
-                        PackageSelector::Version("1.0.3".to_owned()),
-                        PackageAvailability::Canonical,
-                    ),
-                    package("cargo", "demo", "1.0.2"),
+                    PackageContextEntry {
+                        registry: Some("crates.io".to_owned()),
+                        ..PackageContextEntry::new(
+                            "cargo",
+                            "demo",
+                            PackageSelector::Version("1.0.3".to_owned()),
+                            PackageAvailability::Canonical,
+                        )
+                    },
+                    package("cargo", "crates.io", "demo", "1.0.2"),
                 ),
                 substituted(
-                    PackageContextEntry::new(
-                        "npm",
-                        "typescript",
-                        PackageSelector::Requirement("~5.7.2".to_owned()),
-                        PackageAvailability::Canonical,
-                    ),
-                    package("npm", "typescript", "5.9.3"),
+                    PackageContextEntry {
+                        registry: Some("npmjs.org".to_owned()),
+                        ..PackageContextEntry::new(
+                            "npm",
+                            "typescript",
+                            PackageSelector::Requirement("~5.7.2".to_owned()),
+                            PackageAvailability::Canonical,
+                        )
+                    },
+                    package("npm", "npmjs.org", "typescript", "5.9.3"),
                 ),
             ]
         );
@@ -2744,9 +2865,9 @@ mod tests {
         .expect("disabled client");
         let resolution: rift_cloud_client::PackageResolutionResponse =
             serde_json::from_value(serde_json::json!({
-                "available_exact": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "available_exact": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
                 "resolved_requirements": [],
-                "missing_exact": [{"manager": "cargo", "name": "absent", "version": "1.0.0"}],
+                "missing_exact": [{"manager": "cargo", "registry": "crates.io", "name": "absent", "version": "1.0.0"}],
                 "missing_requirements": []
             }))
             .expect("resolution fixture");
@@ -2790,8 +2911,8 @@ mod tests {
         use rift_protocol::read::{Pagination, ReadWarning, SearchHit, SearchParams, SearchResult};
         use serde_json::json;
 
-        let unit = "rift://source/cargo/demo@1.0.0/src/lib.rs";
-        let package = json!({"manager": "cargo", "name": "demo", "version": "1.0.0"});
+        let unit = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+        let package = json!({"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"});
         let hit = |value: serde_json::Value| -> SearchHit {
             serde_json::from_value(value).expect("search hit fixture")
         };
@@ -2816,6 +2937,7 @@ mod tests {
         let matched = |start: u64| rift_cloud_client::PackagePatternMatch {
             package: rift_protocol::read::PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: "demo".to_owned(),
                 version: "1.0.0".to_owned(),
             },

@@ -12,8 +12,7 @@ fn capabilities() -> Capabilities {
 }
 
 fn hit() -> Value {
-    let owner =
-        json!({"source":{"kind":"package","unit":"rift://source/cargo/demo@1.0.0/README.md"}});
+    let owner = json!({"source":{"kind":"package","unit":"rift://source/cargo/crates.io/demo@1.0.0/README.md"}});
     json!({
         "documentation_revision":"0123abcd",
         "block":{"identity":"1".repeat(64),"source":owner,"content_digest":"2".repeat(64),
@@ -50,7 +49,7 @@ fn stored_pages() -> (Value, Value) {
     current["documentation"]["block"]["identity"] = json!("6".repeat(64));
     current["documentation"]["source"]["origin"]["package"] = package_json("other");
     current["documentation"]["source"]["identity"]["source"]["unit"] =
-        json!("rift://source/cargo/other@1.0.0/README.md");
+        json!("rift://source/cargo/crates.io/other@1.0.0/README.md");
     current["documentation"]["block"]["source"] =
         current["documentation"]["source"]["identity"].clone();
     search["items"]
@@ -86,7 +85,7 @@ fn mixed_search_request() -> PackageSearchRequest {
     let mut request = request();
     let mut other = package_request();
     other.name = "other".to_owned();
-    request.packages.push(other);
+    request.packages = Some(vec![package_request(), other]);
     request
 }
 
@@ -96,7 +95,7 @@ fn mixed_symbol_request() -> PackageSymbolRequest {
         PackageSymbolRequestInclude::Source,
         PackageSymbolRequestInclude::Documentation,
     ]);
-    request.packages = mixed_search_request().packages;
+    request.packages = mixed_search_request().packages.expect("selected packages");
     request
 }
 
@@ -318,6 +317,27 @@ fn documentation_pages_validate_identity_fields_and_requested_source() {
         .supported_features
         .retain(|feature| feature != "documentation_search");
     assert!(validate_search_page(&request(), &no_feature, &value, None, SOURCE_BYTES_MAX).is_err());
+}
+
+#[test]
+fn discovery_documentation_accepts_omitted_or_empty_package_selection() {
+    let value: PackageSearchPage = serde_json::from_value(page()).expect("documentation page");
+    for packages in [None, Some(Vec::new())] {
+        let mut request = request();
+        request.packages = packages;
+        validate_search_page(&request, &capabilities(), &value, None, SOURCE_BYTES_MAX)
+            .expect("discovery documentation");
+    }
+    let mut request = request();
+    let mut other = package_request();
+    other.name = "other".to_owned();
+    request.packages = Some(vec![other]);
+    assert_eq!(
+        validate_search_page(&request, &capabilities(), &value, None, SOURCE_BYTES_MAX),
+        Err(ClientError::InvalidResponseField {
+            field: "documentation"
+        })
+    );
 }
 
 #[test]

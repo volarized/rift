@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -23,9 +23,9 @@ use rift_protocol::dependencies::{
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     Digest, ExactKind, Extensions, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams,
-    GetSymbolResult, Language, Node, NodeFacet, NodeId, NodesParams, NodesResult, PAGE_LIMIT_MAX,
-    Pagination, ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolId, TextRange,
+    GetSymbolResult, Language, Node, NodeId, NodesParams, NodesResult, PAGE_LIMIT_MAX, Pagination,
+    ProjectPath, ReadWarning, RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind,
+    SourceUnitId, Symbol, SymbolId, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 use sha2::{Digest as _, Sha256};
@@ -153,6 +153,17 @@ impl ReadService {
     pub fn build_with_languages_cancellable(
         build: ReadServiceBuild<'_>,
     ) -> Result<Self, RiftError> {
+        Self::build_with_owner(build, rift_protocol::identity::SymbolOwner::Local)
+    }
+
+    /// Builds a current-tree snapshot under one fixed local owner.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for invalid owner, configuration, root, bounds, or cancellation.
+    pub fn build_with_owner(
+        build: ReadServiceBuild<'_>,
+        owner: rift_protocol::identity::SymbolOwner,
+    ) -> Result<Self, RiftError> {
         let ReadServiceBuild {
             root,
             limits,
@@ -174,14 +185,13 @@ impl ReadService {
             outcome = rift_tracing::empty!(),
         );
         span.in_scope(|| -> Result<Self, RiftError> {
-            let cache = content_cache.cloned().unwrap_or_default();
-            let index = WorkspaceIndex::build_with_languages_cancellable_and_cache(
-                root,
+            let index = WorkspaceIndex::build_with_owner(
+                (root, owner),
                 limits,
                 visibility,
                 text_inclusion,
                 languages,
-                &cache,
+                content_cache,
                 cancelled,
             )
             .inspect_err(|_| {
@@ -658,6 +668,31 @@ impl ReadService {
         languages: &LanguageFileSelections,
         history: HistoryConfiguration,
     ) -> Result<Self, RiftError> {
+        Self::at_revision_with_owner(
+            (root, rift_protocol::identity::SymbolOwner::Local),
+            rev,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            history,
+        )
+    }
+
+    /// Builds a revision snapshot under one fixed local owner.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid owner, revision, or configuration.
+    pub fn at_revision_with_owner(
+        (root, owner): (&Path, rift_protocol::identity::SymbolOwner),
+        rev: &RevisionId,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        text_inclusion: &TextFileInclusion,
+        languages: &LanguageFileSelections,
+        history: HistoryConfiguration,
+    ) -> Result<Self, RiftError> {
+        rift_index::validate_project_owner(&owner)?;
         if let Some(violation) = rev.violation() {
             return errors::server::read_invalid()
                 .field("rev")
@@ -669,13 +704,14 @@ impl ReadService {
         let limits = limits.with_revision_tree_entries(
             usize::try_from(history.tree_entries).unwrap_or(usize::MAX),
         )?;
-        let index = WorkspaceIndex::at_revision_with_languages(
-            &repository,
+        let index = WorkspaceIndex::at_revision_with_owner(
+            (&repository, owner),
             &resolved,
             limits,
             visibility,
-            text_inclusion,
-            languages,
+            (text_inclusion, languages),
+            &|_| true,
+            &mut |file, bytes_max| repository.blob_bytes(file, bytes_max).map(Some),
         )?;
         let revisions = captured_revisions(&index);
         Ok(Self {
@@ -693,6 +729,21 @@ impl ReadService {
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index
+    }
+
+    /// Paths whose captured entry kinds decide the Python import roots.
+    #[must_use]
+    pub const fn build_path_requests(&self) -> &BTreeSet<ProjectPath> {
+        self.index.build_path_requests()
+    }
+
+    /// Entry kinds captured before this immutable read snapshot was built.
+    /// A missing key is unknown; a present `None` records a missing path.
+    #[must_use]
+    pub const fn build_paths(
+        &self,
+    ) -> &BTreeMap<ProjectPath, Option<rift_index::ArchiveMemberKind>> {
+        self.index.build_paths()
     }
 
     /// Advances local workspace preparation, reusing derived data from this snapshot when
@@ -897,7 +948,7 @@ impl ReadService {
                 })
                 .map(wire_index_warning),
         );
-        Ok(nodes_at_file(file, &nodes, warnings))
+        nodes_at_file(&self.index, file, &nodes, warnings)
     }
 
     /// Reads syntax nodes for a path selected by workspace discovery but not yet included in
@@ -976,7 +1027,7 @@ impl ReadService {
         validate_node_position(&parsed.file, params.position)?;
         let mut warnings = self.revisions.warnings();
         warnings.extend(parsed.warnings);
-        Ok(nodes_at_file(&parsed.file, &parsed.nodes, warnings))
+        nodes_at_file(&self.index, &parsed.file, &parsed.nodes, warnings)
     }
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
@@ -1129,7 +1180,7 @@ impl ReadService {
         let mut warnings = self.warnings();
         warnings.extend(disagreements);
         if absent {
-            warnings.push(self.symbol_not_found(params));
+            warnings.push(self.symbol_not_found(params)?);
         }
         if bound_reached {
             warnings.push(results_truncation_warning(results_max));
@@ -1142,11 +1193,12 @@ impl ReadService {
     }
 
     /// Names an absent lookup and complete alternatives, or their work-bound failure.
-    fn symbol_not_found(&self, params: &GetSymbolParams) -> ReadWarning {
+    fn symbol_not_found(&self, params: &GetSymbolParams) -> Result<ReadWarning, RiftError> {
         let proposed = if params.scope == SearchScope::Global {
             Ok(Vec::new())
         } else {
             crate::alternatives::symbols(
+                &self.index,
                 self.index.files(),
                 &params.name,
                 params.language.as_ref(),
@@ -1155,13 +1207,18 @@ impl ReadService {
         };
         let (alternatives, detail) = match proposed {
             Ok(alternatives) => (alternatives, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
+            Err(error)
+                if error.slug() == errors::server::read_symbol_alternatives_unavailable::SLUG =>
+            {
+                (Vec::new(), Some(error.to_string()))
+            }
+            Err(error) => return error.fail(),
         };
-        ReadWarning::SymbolNotFound {
+        Ok(ReadWarning::SymbolNotFound {
             name: params.name.clone(),
             alternatives,
             detail,
-        }
+        })
     }
 
     /// Refuses a `scope` that reaches packages on a revision read - one the request's
@@ -1197,13 +1254,15 @@ impl ReadService {
         include_source: bool,
         timelines: Option<&mut SymbolTimelines>,
     ) -> Result<(GetSymbolHit, Option<ReadWarning>), RiftError> {
-        let history = match timelines {
-            Some(timelines) => Some(
-                timelines.timeline(language_provider(matched.file.syntax().language()), matched)?,
-            ),
-            None => None,
-        };
         let (symbol, disagreement) = wire_symbol(&self.index, matched)?;
+        let history = match (timelines, symbol.id.as_ref()) {
+            (Some(timelines), Some(identity)) => Some(timelines.timeline(
+                language_provider(matched.file.syntax().language()),
+                matched,
+                identity.clone(),
+            )?),
+            _ => None,
+        };
         let (path, unit) = hit_location(symbol.origin.location, matched.file.path());
         let hit = GetSymbolHit {
             symbol,
@@ -1211,7 +1270,7 @@ impl ReadService {
             unit,
             range: text_range(matched.symbol.range),
             line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
-            node: include_source.then(|| symbol_node(matched).id),
+            node: include_source.then(|| node_id(matched.file, matched.symbol.range)),
             source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
             history,
             documentation: None,
@@ -1382,15 +1441,31 @@ pub(crate) fn results_truncation_warning(results_max: usize) -> ReadWarning {
     }
 }
 
-fn wire_node(file: &IndexedFile, node: &SyntaxNode) -> Node {
-    wire_node_facts(file, node.range, node.kind)
+fn wire_node(
+    index: &WorkspaceIndex,
+    file: &IndexedFile,
+    node: &SyntaxNode,
+) -> Result<Node, RiftError> {
+    wire_node_facts(index, file, node.range, node.kind)
 }
 
-fn wire_node_facts(file: &IndexedFile, range: ByteRange, kind: &'static str) -> Node {
+fn wire_node_facts(
+    index: &WorkspaceIndex,
+    file: &IndexedFile,
+    range: ByteRange,
+    kind: &'static str,
+) -> Result<Node, RiftError> {
     let language = file.syntax().language();
-    Node {
+    let symbol = index
+        .file(file.path())
+        .filter(|captured| captured.digest() == file.digest())
+        .and_then(|_| symbol_for_range(file, range))
+        .map(|symbol| symbol_id(index, crate::search::declared(file, symbol)))
+        .transpose()?
+        .flatten();
+    Ok(Node {
         id: node_id(file, range),
-        symbol: symbol_for_range(file, range).map(|symbol| symbol_id(file, symbol)),
+        symbol,
         unit: file_id(file.path()),
         language: language.clone(),
         kind: wire_kind(kind),
@@ -1399,28 +1474,7 @@ fn wire_node_facts(file: &IndexedFile, range: ByteRange, kind: &'static str) -> 
         regions: Vec::new(),
         parent: None,
         extensions: Extensions(BTreeMap::new()),
-    }
-}
-
-fn symbol_node(matched: SymbolMatch<'_>) -> Node {
-    matched.symbol.node_kind.map_or_else(
-        || {
-            let language = matched.file.syntax().language();
-            Node {
-                id: NodeId(node_address(matched.file, matched.symbol.range)),
-                symbol: Some(symbol_id(matched.file, matched.symbol)),
-                unit: file_id(matched.file.path()),
-                language: language.clone(),
-                kind: wire_kind(matched.symbol.kind),
-                facets: vec![NodeFacet::Declaration, NodeFacet::Definition],
-                range: text_range(matched.symbol.range),
-                regions: Vec::new(),
-                parent: None,
-                extensions: Extensions(BTreeMap::new()),
-            }
-        },
-        |kind| wire_node_facts(matched.file, matched.symbol.range, kind),
-    )
+    })
 }
 
 /// Builds one hit's wire symbol, and the `symbol_disagreement` warning its retained
@@ -1464,7 +1518,7 @@ fn wire_source_location_kind(location: &rift_core::SourceLocation) -> SourceLoca
     match location {
         rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
         rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
-        rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+        rift_core::SourceLocation::Stdlib { .. } => SourceLocationKind::Stdlib,
         rift_core::SourceLocation::External {} => SourceLocationKind::External,
     }
 }
@@ -1681,29 +1735,35 @@ pub(crate) fn project_path(path: &CoreProjectPath) -> ProjectPath {
     ProjectPath(path.as_str().to_owned())
 }
 
-pub(crate) fn symbol_id(file: &IndexedFile, symbol: &SyntaxSymbol) -> SymbolId {
-    SymbolId(rift_core::symbol_identity(
-        &file.syntax().language().identity_segment(),
-        file.path().as_str(),
-        &symbol.qualified_name,
-    ))
+pub(crate) fn symbol_id(
+    index: &WorkspaceIndex,
+    matched: SymbolMatch<'_>,
+) -> Result<Option<SymbolId>, RiftError> {
+    Ok(index
+        .assembled_symbol(matched)?
+        .identity()
+        .map(|identity| SymbolId(identity.as_str().to_owned())))
 }
 
 fn nodes_at_file(
+    index: &WorkspaceIndex,
     file: &IndexedFile,
     matched: &[SyntaxNode],
     warnings: Vec<ReadWarning>,
-) -> NodesResult {
-    let nodes = matched.iter().map(|node| wire_node(file, node)).collect();
+) -> Result<NodesResult, RiftError> {
+    let nodes = matched
+        .iter()
+        .map(|node| wire_node(index, file, node))
+        .collect::<Result<Vec<_>, _>>()?;
     let source = matched
         .iter()
         .map(|node| excerpt(file, node.range))
         .collect();
-    NodesResult {
+    Ok(NodesResult {
         nodes,
         source,
         warnings,
-    }
+    })
 }
 
 fn validate_node_position(file: &IndexedFile, position: u64) -> Result<(), RiftError> {
@@ -1915,89 +1975,6 @@ pub(crate) fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&
         .find(|symbol| symbol.range == range || symbol.item_range == range)
 }
 
-/// A parsed symbol address: the language segment it files under, and its
-/// decoded path and qualified name.
-#[derive(Debug)]
-pub(crate) struct SymbolAddress {
-    pub(crate) language_segment: String,
-    pub(crate) path: CoreProjectPath,
-    pub(crate) qualified_name: String,
-}
-
-impl SymbolAddress {
-    /// The wire symbol identity this address spells, re-encoded.
-    pub(crate) fn wire_symbol(&self) -> rift_protocol::read::SymbolId {
-        rift_protocol::read::SymbolId(rift_core::symbol_identity(
-            &self.language_segment,
-            self.path.as_str(),
-            &self.qualified_name,
-        ))
-    }
-}
-
-/// Splits `rift://symbol/<language>/<path>/<qualified-name>` into its
-/// decoded parts. The language segment is taken as spelled; resolution
-/// verifies it against the addressed file's document.
-pub(crate) fn parse_symbol_address(address: &str) -> Result<SymbolAddress, RiftError> {
-    let remainder = address
-        .strip_prefix(rift_core::constants::SYMBOL_URI_PREFIX)
-        .ok_or_else(|| {
-            errors::server::read_invalid()
-                .field("symbol")
-                .violation("not a rift symbol address")
-                .error()
-        })?;
-    let (language_segment, remainder) = remainder.split_once('/').ok_or_else(|| {
-        errors::server::read_invalid()
-            .field("symbol")
-            .violation("not a rift symbol address")
-            .error()
-    })?;
-    if language_segment.is_empty() {
-        return errors::server::read_invalid()
-            .field("symbol")
-            .violation("not a rift symbol address")
-            .fail();
-    }
-    let (encoded_path, encoded_name) = remainder.rsplit_once('/').ok_or_else(|| {
-        errors::server::read_invalid()
-            .field("symbol")
-            .violation("not a rift symbol address")
-            .error()
-    })?;
-    let path = decoded(encoded_path).ok_or_else(|| {
-        errors::server::read_invalid()
-            .field("symbol")
-            .violation("not a rift symbol address")
-            .error()
-    })?;
-    let qualified_name = decoded(encoded_name).ok_or_else(|| {
-        errors::server::read_invalid()
-            .field("symbol")
-            .violation("not a rift symbol address")
-            .error()
-    })?;
-    let path = CoreProjectPath::new(path).map_err(|error| {
-        errors::server::read_invalid()
-            .field("symbol")
-            .violation(error.detail())
-            .cause(error)
-            .error()
-    })?;
-    Ok(SymbolAddress {
-        language_segment: language_segment.to_owned(),
-        path,
-        qualified_name,
-    })
-}
-
-fn decoded(encoded: &str) -> Option<String> {
-    percent_encoding::percent_decode_str(encoded)
-        .decode_utf8()
-        .ok()
-        .map(std::borrow::Cow::into_owned)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::error::Error;
@@ -2029,50 +2006,108 @@ pub(crate) mod tests {
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    #[test]
-    fn symbol_address_refuses_empty_language_and_decoded_invalid_paths() {
-        for (address, expected_violation, expected_cause) in [
-            (
-                "rift://symbol//lib.rs/beacon",
-                Some("not a rift symbol address"),
-                None,
-            ),
-            (
-                "rift://symbol/rust/%2Flib.rs/beacon",
-                None,
-                Some(rift_error::errors::core::path_absolute::SLUG),
-            ),
-            (
-                "rift://symbol/rust/src%2F..%2Flib.rs/beacon",
-                None,
-                Some(rift_error::errors::core::path_dot_segment::SLUG),
-            ),
-        ] {
-            let error = super::parse_symbol_address(address)
-                .map(|_| ())
-                .expect_err("invalid address");
-            assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
-            assert!(
-                error
-                    .context()
-                    .any(|(key, value)| key == "field" && value == "symbol")
-            );
-            if let Some(expected) = expected_violation {
-                assert!(
-                    error
-                        .context()
-                        .any(|(key, value)| key == "violation" && value == expected)
-                );
-            }
-            if let Some(expected) = expected_cause {
-                let cause = std::error::Error::source(&error)
-                    .and_then(|source| source.downcast_ref::<RiftError>())
-                    .expect("invalid path error remains its cause");
-                assert_eq!(cause.slug(), expected);
-            }
-        }
+    pub(crate) fn local_identity(language: &str, names: &[&str]) -> String {
+        rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            Language {
+                name: language.to_owned(),
+                dialect: None,
+            },
+            names.iter().map(|name| (*name).to_owned()).collect(),
+        )
+        .expect("canonical fixture identity")
+        .wire_identity()
     }
 
+    pub(crate) fn captured_rust_library(root: &Path, path: &str) -> TestResult {
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"{path}\"\n"
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn captured_rust_package(root: &Path) -> TestResult {
+        captured_rust_library(root, "src/lib.rs")
+    }
+
+    fn captured_typescript_package(root: &Path) -> TestResult {
+        fs::write(
+            root.join("package.json"),
+            r#"{"name":"beacon","version":"1.0.0","types":"./src/routes.ts"}"#,
+        )?;
+        Ok(())
+    }
+
+    fn structural_changes(root: &Path, path: &str, name: &str) -> TestResult {
+        let older = revision_service(root, "HEAD~1")?;
+        let newer = revision_service(root, "HEAD")?;
+        let state = |service: &ReadService| -> TestResult<crate::history::SymbolState> {
+            let path = rift_core::ProjectPath::new(path)?;
+            let file = service
+                .index()
+                .file(&path)
+                .ok_or("captured structural file")?;
+            let symbol = file
+                .syntax()
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.qualified_name == name)
+                .ok_or("captured structural declaration")?;
+            assert!(
+                super::symbol_id(service.index(), crate::search::declared(file, symbol))?.is_none()
+            );
+            Ok(crate::history::SymbolState::Present(
+                crate::history::SymbolShape::from_source(file.source(), symbol),
+            ))
+        };
+        let older = state(&older)?;
+        let newer = state(&newer)?;
+        assert_eq!(
+            crate::history::classify(&older, &newer),
+            Some(rift_protocol::read::SymbolVersionKind::BodyChanged)
+        );
+        assert_eq!(
+            crate::history::classify(&crate::history::SymbolState::Absent, &older),
+            Some(rift_protocol::read::SymbolVersionKind::Introduced)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_symbol_lookup_refuses_another_captured_owner() -> TestResult {
+        let (_, service) = fixture()?;
+        let local = rift_core::SymbolId::new(local_identity("rust", &["beacon", "Beacon"]))?;
+        let local_matches = service.index().symbols_by_identity(&local, 10)?;
+        assert!(!local_matches.is_empty());
+        assert!(
+            local_matches
+                .iter()
+                .all(|matched| matched.file.path().as_str() == "src/lib.rs")
+        );
+        let owner = rift_protocol::identity::parse_local_scope("local@cloud")
+            .expect("registered local scope");
+        let foreign = rift_protocol::identity::SymbolIdentity::new(
+            owner,
+            Language {
+                name: "rust".into(),
+                dialect: None,
+            },
+            vec!["beacon".into(), "Beacon".into()],
+        )
+        .expect("canonical named identity")
+        .wire_identity();
+        let foreign = rift_core::SymbolId::new(foreign)?;
+        assert!(
+            service
+                .index()
+                .symbols_by_identity(&foreign, 10)?
+                .is_empty()
+        );
+        Ok(())
+    }
     /// A read snapshot over `root` under `limits` and `languages`, built through the
     /// same entry point the server itself uses.
     fn reads_with(
@@ -2340,6 +2375,10 @@ pub(crate) mod tests {
 
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+        )?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -2376,6 +2415,7 @@ pub(crate) mod tests {
     #[test]
     fn relationships_pass_through_serves_the_same_edges_the_index_holds() -> TestResult {
         let directory = tempfile::tempdir()?;
+        captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -2395,8 +2435,8 @@ pub(crate) mod tests {
             &rift_core::TextFileInclusion::default(),
         )?;
 
-        let beta = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/beta")?;
-        let alpha = rift_core::SymbolId::new("rift://symbol/rust/src/lib.rs/alpha")?;
+        let beta = rift_core::SymbolId::new(local_identity("rust", &["beacon", "beta"]))?;
+        let alpha = rift_core::SymbolId::new(local_identity("rust", &["beacon", "alpha"]))?;
         assert_eq!(
             service.relationships().is_empty(),
             independent_index.relationships().is_empty(),
@@ -2417,6 +2457,7 @@ pub(crate) mod tests {
 
     fn documented_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), DOCUMENTED_SOURCE)?;
         let service = ReadService::build(
@@ -2465,6 +2506,7 @@ pub fn compute() -> i32 {
 
     fn rich_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), RICH_SOURCE)?;
         let service = ReadService::build(
@@ -2550,8 +2592,8 @@ pub fn compute() -> i32 {
         let matched = complete.nodes_at(position);
         let expected_nodes = matched
             .iter()
-            .map(|node| wire_node(file, node))
-            .collect::<Vec<_>>();
+            .map(|node| wire_node(service.index(), file, node))
+            .collect::<Result<Vec<_>, _>>()?;
         let expected_source = matched
             .iter()
             .map(|node| excerpt(file, node.range))
@@ -2603,8 +2645,8 @@ pub fn compute() -> i32 {
         let matched = complete.nodes_at(position);
         let expected_nodes = matched
             .iter()
-            .map(|node| wire_node(file, node))
-            .collect::<Vec<_>>();
+            .map(|node| wire_node(service.index(), file, node))
+            .collect::<Result<Vec<_>, _>>()?;
         let actual = service.nodes(NodesParams {
             path: ProjectPath(path.as_str().to_owned()),
             position,
@@ -2664,6 +2706,7 @@ pub fn compute() -> i32 {
         assert_eq!(actual.nodes, expected.nodes);
         assert_eq!(actual.source, expected.source);
         assert!(!actual.nodes.is_empty());
+        assert!(actual.nodes.iter().all(|node| node.symbol.is_none()));
         Ok(())
     }
 
@@ -3171,7 +3214,7 @@ pub fn compute() -> i32 {
         assert_eq!(symbol["visibility"], json!("pub"));
         assert_eq!(
             symbol["container"],
-            json!("rift://symbol/rust/src/lib.rs/Beacon")
+            json!(local_identity("rust", &["beacon", "Beacon"]))
         );
 
         let node = value["hits"][0]["node"]
@@ -3252,6 +3295,10 @@ pub fn compute() -> i32 {
     fn timeline_fixture() -> TestResult<TempDir> {
         let directory = tempfile::tempdir()?;
         rift_history::fixture::init(directory.path());
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+        )?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         rift_history::fixture::commit_all(directory.path(), "introduce beacon");
@@ -3289,7 +3336,7 @@ pub fn compute() -> i32 {
         let history = &value["hits"][0]["history"];
         assert_eq!(
             history["symbol"],
-            json!("rift://symbol/rust/src/lib.rs/beacon")
+            json!(local_identity("rust", &["beacon", "beacon"]))
         );
         let versions = history["versions"]
             .as_array()
@@ -3727,6 +3774,7 @@ pub fn compute() -> i32 {
     /// One project whose `src/lib.rs` holds `source` alone.
     pub(crate) fn project_fixture(source: &str) -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), source)?;
         let visibility = SourceVisibility::default();
@@ -3896,6 +3944,7 @@ pub fn compute() -> i32 {
     fn requested_packages_refuse_past_the_bound_and_name_a_malformed_entry() {
         let package = |name: &str| RequestedPackage {
             manager: "cargo".to_owned(),
+            registry: None,
             name: name.to_owned(),
             version: None,
         };
@@ -3933,6 +3982,7 @@ pub fn compute() -> i32 {
 
         let requested = [RequestedPackage {
             manager: "cargo".to_owned(),
+            registry: None,
             name: "serde".to_owned(),
             version: Some("1.0.228".to_owned()),
         }];
@@ -4045,6 +4095,7 @@ pub fn compute() -> i32 {
     fn wire_source_location_kind_maps_every_internal_variant() {
         let package = || rift_protocol::read::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "beacon-core".to_owned(),
             version: "0.1.0".to_owned(),
         };
@@ -4058,7 +4109,7 @@ pub fn compute() -> i32 {
                 rift_protocol::read::SourceLocationKind::Dependency,
             ),
             (
-                rift_core::SourceLocation::Stdlib {},
+                rift_core::SourceLocation::Stdlib { runtime: None },
                 rift_protocol::read::SourceLocationKind::Stdlib,
             ),
             (
@@ -4147,6 +4198,8 @@ pub fn compute() -> i32 {
     /// One workspace holding every shipped source language.
     fn multi_language_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        captured_typescript_package(directory.path())?;
+        captured_rust_package(directory.path())?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
         fs::write(
@@ -4188,7 +4241,7 @@ pub fn compute() -> i32 {
         assert_eq!(symbol["facets"], json!(["type", "public"]));
         assert_eq!(
             symbol["id"],
-            json!("rift://symbol/typescript/src/routes.ts/Route")
+            json!(local_identity("typescript", &["beacon", "Route"]))
         );
         assert_eq!(
             value["hits"][0]["source"], "export interface Route {\n  path: string;\n}",
@@ -4300,6 +4353,7 @@ pub fn compute() -> i32 {
     #[test]
     fn typescript_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
+        captured_typescript_package(directory.path())?;
         rift_history::fixture::init(directory.path());
         fs::create_dir(directory.path().join("src"))?;
         fs::write(
@@ -4325,7 +4379,7 @@ pub fn compute() -> i32 {
         let history = &value["hits"][0]["history"];
         assert_eq!(
             history["symbol"],
-            json!("rift://symbol/typescript/src/routes.ts/lookup")
+            json!(local_identity("typescript", &["beacon", "lookup"]))
         );
         let versions = history["versions"]
             .as_array()
@@ -4344,7 +4398,7 @@ pub fn compute() -> i32 {
     }
 
     /// A markdown heading answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, an id escaping the heading text,
+    /// provider's kind word, empty facets, physical path and node,
     /// and the whole section as the source excerpt.
     #[test]
     fn get_symbol_finds_a_markdown_heading_beside_other_languages() -> TestResult {
@@ -4358,10 +4412,13 @@ pub fn compute() -> i32 {
             symbol.get("facets").is_none(),
             "no facets must omit the member"
         );
-        assert_eq!(
-            symbol["id"],
-            json!("rift://symbol/markdown/src/guide.md/Beacon%20Guide")
+        assert!(
+            symbol.get("id").is_none(),
+            "structural facts have no established identity"
         );
+        assert_eq!(value["hits"][0]["path"], json!("src/guide.md"));
+        assert!(value["hits"][0]["node"].as_str().is_some());
+        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         assert_eq!(
             value["hits"][0]["source"],
             "# Beacon Guide\n\nHow the beacon works.\n"
@@ -4407,7 +4464,7 @@ pub fn compute() -> i32 {
     }
 
     /// One heading introduced and then content-edited across two commits;
-    /// the timeline classifies both through the markdown provider.
+    /// structural classification retains both changes without a semantic identity.
     #[test]
     fn markdown_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4424,32 +4481,33 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "Install", "include": ["history"]});
+        let request = json!({"name": "Install", "include": ["history", "source"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        let history = &value["hits"][0]["history"];
-        assert_eq!(
-            history["symbol"],
-            json!("rift://symbol/markdown/docs.md/Install")
+        let hit = &value["hits"][0];
+        assert!(hit["symbol"].get("id").is_none());
+        assert!(
+            hit.get("history").is_none(),
+            "unresolved structural facts have no symbol timeline"
         );
-        let versions = history["versions"]
-            .as_array()
-            .ok_or("history must carry versions")?;
-        let kinds: Vec<&str> = versions
+        assert_eq!(hit["path"], json!("docs.md"));
+        assert!(hit["node"].as_str().is_some());
+        assert!(hit["source"].as_str().is_some());
+        structural_changes(directory.path(), "docs.md", "Install")?;
+        let repository = rift_history::Repository::open(directory.path())?;
+        let start = repository.resolve("HEAD")?;
+        let revisions = repository.path_revisions(&start, "docs.md", 2)?;
+        let summaries = revisions
+            .revisions()
             .iter()
-            .filter_map(|version| version["kind"].as_str())
-            .collect();
-        assert_eq!(kinds, ["body_changed", "introduced"]);
-        let summaries: Vec<&str> = versions
-            .iter()
-            .filter_map(|version| version["summary"].as_str())
-            .collect();
+            .filter_map(|revision| revision.summary())
+            .collect::<Vec<_>>();
         assert_eq!(summaries, ["grow install guide", "introduce install guide"]);
         Ok(())
     }
 
     /// A JSON member answers `get_symbol` like any declaration: the
-    /// provider's kind word, empty facets, an id escaping the key, and the
+    /// provider's kind word, empty facets, physical path and node, and the
     /// whole pair as the source excerpt.
     #[test]
     fn get_symbol_finds_a_json_member_beside_other_languages() -> TestResult {
@@ -4463,10 +4521,13 @@ pub fn compute() -> i32 {
             symbol.get("facets").is_none(),
             "no facets must omit the member"
         );
-        assert_eq!(
-            symbol["id"],
-            json!("rift://symbol/json/settings.json/beacon%20settings")
+        assert!(
+            symbol.get("id").is_none(),
+            "structural facts have no established identity"
         );
+        assert_eq!(value["hits"][0]["path"], json!("settings.json"));
+        assert!(value["hits"][0]["node"].as_str().is_some());
+        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         assert_eq!(
             value["hits"][0]["source"],
             "\"beacon settings\": {\"port\": 8080}"
@@ -4477,16 +4538,30 @@ pub fn compute() -> i32 {
             "language": "json"
         }))?;
         let value = serde_json::to_value(service.get_symbol(&nested)?)?;
-        assert_eq!(
-            value["hits"][0]["symbol"]["id"],
-            json!("rift://symbol/json/settings.json/beacon%20settings%20%3E%20port"),
-            "a nested member's id escapes its whole key path"
-        );
+        assert!(value["hits"][0]["symbol"].get("id").is_none());
+        assert_eq!(value["hits"][0]["symbol"]["name"], json!("port"));
+        let file = service
+            .index()
+            .files()
+            .find(|file| file.path().as_str() == "settings.json")
+            .ok_or("captured structural file required")?;
+        let declaration = file
+            .syntax()
+            .symbols()
+            .iter()
+            .find(|declaration| {
+                Some(declaration.range.start) == value["hits"][0]["range"]["start"].as_u64()
+                    && Some(declaration.range.end) == value["hits"][0]["range"]["end"].as_u64()
+            })
+            .ok_or("captured structural declaration required")?;
+        assert_eq!(declaration.qualified_name, "beacon settings > port");
+        assert_eq!(value["hits"][0]["path"], json!("settings.json"));
+        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         Ok(())
     }
 
     /// A YAML mapping entry answers `get_symbol` like any declaration: the
-    /// composed wire kind, empty facets, an id escaping the key, and the
+    /// composed wire kind, empty facets, physical path and node, and the
     /// whole pair as the source excerpt.
     #[test]
     fn get_symbol_finds_a_yaml_entry_beside_other_languages() -> TestResult {
@@ -4500,10 +4575,13 @@ pub fn compute() -> i32 {
             symbol.get("facets").is_none(),
             "no facets must omit the member"
         );
-        assert_eq!(
-            symbol["id"],
-            json!("rift://symbol/yaml/pipeline.yaml/beacon%20pipeline")
+        assert!(
+            symbol.get("id").is_none(),
+            "structural facts have no established identity"
         );
+        assert_eq!(value["hits"][0]["path"], json!("pipeline.yaml"));
+        assert!(value["hits"][0]["node"].as_str().is_some());
+        assert!(value["hits"][0]["range"]["end"].as_u64().is_some());
         assert_eq!(
             value["hits"][0]["source"], "beacon pipeline:\n  retries: 3\n",
             "the excerpt serves whole lines, so the pair's last line ends it"
@@ -4580,7 +4658,7 @@ pub fn compute() -> i32 {
     }
 
     /// One JSON member introduced and then value-edited across two commits;
-    /// the timeline classifies both through the JSON provider.
+    /// structural classification retains both changes without a semantic identity.
     #[test]
     fn json_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4601,27 +4679,34 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "server", "include": ["history"]});
+        let request = json!({"name": "server", "include": ["history", "source"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        let history = &value["hits"][0]["history"];
-        assert_eq!(
-            history["symbol"],
-            json!("rift://symbol/json/settings.json/server")
+        let hit = &value["hits"][0];
+        assert!(hit["symbol"].get("id").is_none());
+        assert!(
+            hit.get("history").is_none(),
+            "unresolved structural facts have no symbol timeline"
         );
-        let kinds: Vec<&str> = history["versions"]
-            .as_array()
-            .ok_or("history must carry versions")?
+        assert_eq!(hit["path"], json!("settings.json"));
+        assert!(hit["node"].as_str().is_some());
+        assert!(hit["source"].as_str().is_some());
+        structural_changes(directory.path(), "settings.json", "server")?;
+        let repository = rift_history::Repository::open(directory.path())?;
+        let start = repository.resolve("HEAD")?;
+        let revisions = repository.path_revisions(&start, "settings.json", 2)?;
+        let summaries = revisions
+            .revisions()
             .iter()
-            .filter_map(|version| version["kind"].as_str())
-            .collect();
-        assert_eq!(kinds, ["body_changed", "introduced"]);
+            .filter_map(|revision| revision.summary())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, ["grow settings", "introduce settings"]);
         Ok(())
     }
 
     /// One YAML entry introduced and then value-edited across two commits
     /// in a `.yml` file; the timeline classifies both through the YAML
-    /// provider.
+    /// provider without a semantic identity.
     #[test]
     fn yaml_symbol_history_lists_the_committed_timeline() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -4636,21 +4721,28 @@ pub fn compute() -> i32 {
         let history = HistoryConfiguration::default();
         let service =
             ReadService::build(directory.path(), limits, &visibility, &inclusion, history)?;
-        let request = json!({"name": "retries", "include": ["history"]});
+        let request = json!({"name": "retries", "include": ["history", "source"]});
         let params: GetSymbolParams = serde_json::from_value(request)?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        let history = &value["hits"][0]["history"];
-        assert_eq!(
-            history["symbol"],
-            json!("rift://symbol/yaml/deploy.yml/retries")
+        let hit = &value["hits"][0];
+        assert!(hit["symbol"].get("id").is_none());
+        assert!(
+            hit.get("history").is_none(),
+            "unresolved structural facts have no symbol timeline"
         );
-        let kinds: Vec<&str> = history["versions"]
-            .as_array()
-            .ok_or("history must carry versions")?
+        assert_eq!(hit["path"], json!("deploy.yml"));
+        assert!(hit["node"].as_str().is_some());
+        assert!(hit["source"].as_str().is_some());
+        structural_changes(directory.path(), "deploy.yml", "retries")?;
+        let repository = rift_history::Repository::open(directory.path())?;
+        let start = repository.resolve("HEAD")?;
+        let revisions = repository.path_revisions(&start, "deploy.yml", 2)?;
+        let summaries = revisions
+            .revisions()
             .iter()
-            .filter_map(|version| version["kind"].as_str())
-            .collect();
-        assert_eq!(kinds, ["body_changed", "introduced"]);
+            .filter_map(|revision| revision.summary())
+            .collect::<Vec<_>>();
+        assert_eq!(summaries, ["grow deploy", "introduce deploy"]);
         Ok(())
     }
 
@@ -4658,6 +4750,7 @@ pub fn compute() -> i32 {
     /// of it, so a revision read and a working-tree read answer differently.
     fn committed_fixture() -> TestResult<TempDir> {
         let directory = tempfile::tempdir()?;
+        captured_rust_package(directory.path())?;
         rift_history::fixture::init(directory.path());
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
@@ -5269,7 +5362,8 @@ pub fn compute() -> i32 {
 
     #[test]
     fn a_retained_disagreement_becomes_one_symbol_disagreement_warning() {
-        let assembled = disagreeing_assembly(Some("symbol:beacon"));
+        let identity = local_identity("rust", &["crate", "Beacon"]);
+        let assembled = disagreeing_assembly(Some(&identity));
         assert!(
             !assembled.disagreements().is_empty(),
             "the two-provider fixture must disagree on the name"
@@ -5284,7 +5378,7 @@ pub fn compute() -> i32 {
         else {
             panic!("the warning must carry the symbol_disagreement code");
         };
-        assert_eq!(symbol.0, "symbol:beacon");
+        assert_eq!(symbol.0, identity);
         assert_eq!(
             providers,
             ["binding"],

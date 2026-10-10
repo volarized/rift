@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 http.workspace = true
 oas3-gen-support.workspace = true
 oas3.workspace = true

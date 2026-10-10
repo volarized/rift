@@ -2854,7 +2854,11 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.global.route(&configuration, &read_context)),
+            Box::pin(self.global.callee_route(
+                &configuration,
+                &read_context,
+                references.package_callees(),
+            )),
         )
         .await
         {
@@ -3810,6 +3814,7 @@ impl RiftMcp {
             return self.capture_prepared_tree(current).await;
         }
         let root = self.root.clone();
+        let reads = Arc::clone(&current.reads);
         let limits = current.configuration.index_limits(self.limits)?;
         let visibility = current.configuration.source_visibility();
         let text_inclusion = current.configuration.text_inclusion();
@@ -3840,6 +3845,14 @@ impl RiftMcp {
                     &last,
                     &|| cancellation.is_cancelled(),
                 )?;
+                if !crate::validation::captured_build_paths_match(&root, &reads, &|| {
+                    cancellation.is_cancelled()
+                })? {
+                    return errors::server::read_unavailable()
+                        .operation("workspace fingerprint")
+                        .detail("captured build paths changed during validation")
+                        .fail();
+                }
                 *last_capture
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);

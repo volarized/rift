@@ -2,7 +2,7 @@
 
 use rapidfuzz::distance::levenshtein::{Args, BatchComparator};
 use rift_error::{RiftError, errors};
-use rift_index::{IndexedFile, WorkspaceIndexLimits};
+use rift_index::{IndexedFile, WorkspaceIndex, WorkspaceIndexLimits};
 use rift_protocol::read::{SYMBOL_ALTERNATIVES_MAX, SymbolId};
 use rift_syntax::SyntaxSymbol;
 
@@ -11,6 +11,7 @@ use rift_syntax::SyntaxSymbol;
 struct Alternative<'source> {
     file: &'source IndexedFile,
     symbol: &'source SyntaxSymbol,
+    identity: SymbolId,
     distance: usize,
 }
 
@@ -22,15 +23,6 @@ impl Alternative<'_> {
             &self.symbol.qualified_name,
             self.file.path().as_str(),
         )
-    }
-
-    /// Uses the same identity constructor as ordinary declaration reads.
-    fn identity(&self) -> SymbolId {
-        SymbolId(rift_core::symbol_identity(
-            &self.file.syntax().language().identity_segment(),
-            self.file.path().as_str(),
-            &self.symbol.qualified_name,
-        ))
     }
 }
 
@@ -104,12 +96,14 @@ impl Work {
 /// independently of publication size. Only three candidates survive. Exhaustion discards
 /// every candidate, so a prefix never claims to be the closest set.
 pub(crate) fn symbols<'source>(
+    index: &WorkspaceIndex,
     files: impl IntoIterator<Item = &'source IndexedFile>,
     name: &str,
     language: Option<&rift_protocol::read::Language>,
     limits: WorkspaceIndexLimits,
 ) -> Result<Vec<SymbolId>, RiftError> {
     rank(
+        index,
         files,
         name,
         language,
@@ -122,6 +116,7 @@ pub(crate) fn symbols<'source>(
 
 /// Compares the complete selected set under the accepted work policy.
 fn rank<'source>(
+    index: &WorkspaceIndex,
     files: impl IntoIterator<Item = &'source IndexedFile>,
     name: &str,
     language: Option<&rift_protocol::read::Language>,
@@ -134,6 +129,7 @@ fn rank<'source>(
     let mut nearest: Vec<Alternative<'_>> = Vec::with_capacity(SYMBOL_ALTERNATIVES_MAX + 1);
     for file in files {
         select_file(
+            index,
             file,
             language,
             &mut work,
@@ -142,11 +138,15 @@ fn rank<'source>(
             &mut nearest,
         )?;
     }
-    Ok(nearest.iter().map(Alternative::identity).collect())
+    Ok(nearest
+        .into_iter()
+        .map(|candidate| candidate.identity)
+        .collect())
 }
 
 /// Charges one file and its declarations before selecting its language and names.
 fn select_file<'source>(
+    index: &WorkspaceIndex,
     file: &'source IndexedFile,
     language: Option<&rift_protocol::read::Language>,
     work: &mut Work,
@@ -162,6 +162,10 @@ fn select_file<'source>(
         if !selected {
             continue;
         }
+        let assembled = index.assembled_symbol(crate::search::declared(file, symbol))?;
+        let Some(identity) = assembled.identity() else {
+            continue;
+        };
         let cutoff = nearest
             .last()
             .filter(|_| nearest.len() == SYMBOL_ALTERNATIVES_MAX)
@@ -172,6 +176,7 @@ fn select_file<'source>(
         let candidate = Alternative {
             file,
             symbol,
+            identity: SymbolId(identity.as_str().to_owned()),
             distance,
         };
         let ordering =
@@ -219,23 +224,37 @@ mod tests {
     use super::Work;
 
     fn symbols_with_work<'source>(
+        index: &WorkspaceIndex,
         files: impl IntoIterator<Item = &'source rift_index::IndexedFile>,
         name: &str,
         language: Option<&rift_protocol::read::Language>,
         allowance: usize,
     ) -> Result<Vec<rift_protocol::read::SymbolId>, rift_error::RiftError> {
-        super::rank(files, name, language, Work::new(allowance, 12))
+        super::rank(index, files, name, language, Work::new(allowance, 12))
     }
 
     type TestResult = Result<(), Box<dyn Error>>;
 
-    fn index(root: &std::path::Path) -> Result<WorkspaceIndex, rift_error::RiftError> {
-        WorkspaceIndex::build(
+    fn index(root: &std::path::Path) -> Result<WorkspaceIndex, Box<dyn Error>> {
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        if !root.join("lib.rs").exists() {
+            std::fs::write(root.join("lib.rs"), "mod a;\nmod z;\n")?;
+        }
+        Ok(WorkspaceIndex::build(
             root,
             WorkspaceIndexLimits::default(),
             &SourceVisibility::default(),
             &TextFileInclusion::default(),
-        )
+        )?)
+    }
+
+    fn rust_files(index: &WorkspaceIndex) -> impl Iterator<Item = &rift_index::IndexedFile> {
+        index
+            .files()
+            .filter(|file| file.syntax().language().name == "rust")
     }
 
     #[test]
@@ -245,16 +264,16 @@ mod tests {
         let index = index(directory.path())?;
         // Query normalization 13, file/declaration 2, candidate normalization 72,
         // distance 12, stable insertion 39: the complete ranking costs 138.
-        let complete = symbols_with_work(index.files(), "x", None, 138)
+        let complete = symbols_with_work(&index, rust_files(&index), "x", None, 138)
             .map_err(|_| "exact allowance refused")?;
         assert_eq!(complete.len(), 1);
-        assert!(symbols_with_work(index.files(), "x", None, 137).is_err());
+        assert!(symbols_with_work(&index, rust_files(&index), "x", None, 137).is_err());
         // The next file is inspected even if it contains no selected declaration.
         std::fs::write(directory.path().join("z.rs"), "")?;
         let index = super::tests::index(directory.path())?;
-        assert!(symbols_with_work(index.files(), "x", None, 138).is_err());
+        assert!(symbols_with_work(&index, rust_files(&index), "x", None, 138).is_err());
         assert_eq!(
-            symbols_with_work(index.files(), "x", None, 139).ok(),
+            symbols_with_work(&index, rust_files(&index), "x", None, 139).ok(),
             Some(complete)
         );
         Ok(())
@@ -270,10 +289,32 @@ mod tests {
             dialect: None,
         };
         assert_eq!(
-            symbols_with_work(index.files(), "x", Some(&language), 15).ok(),
+            symbols_with_work(&index, rust_files(&index), "x", Some(&language), 15).ok(),
             Some(Vec::new())
         );
-        assert!(symbols_with_work(index.files(), "x", Some(&language), 14).is_err());
+        assert!(symbols_with_work(&index, rust_files(&index), "x", Some(&language), 14).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn structural_facts_without_namespace_supply_no_symbol_alternatives() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("facts.json"), "{\"beacon\": 1}")?;
+        let index = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        let matches = index.symbols("beacon", 1)?;
+        assert_eq!(matches.len(), 1);
+        assert!(index.assembled_symbol(matches[0])?.identity().is_none());
+        assert!(super::symbols(&index, index.files(), "beaco", None, index.limits(),)?.is_empty());
+        assert_eq!(matches[0].file.path().as_str(), "facts.json");
+        let range = matches[0].symbol.item_range;
+        let start = usize::try_from(range.start)?;
+        let end = usize::try_from(range.end)?;
+        assert!(matches[0].file.source()[start..end].contains("beacon"));
         Ok(())
     }
 
@@ -411,7 +452,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let index = index(directory.path())?;
-        let higher_weight = super::symbols(index.files(), "x", None, limits)
+        let higher_weight = super::symbols(&index, rust_files(&index), "x", None, limits)
             .expect_err("higher weight exhausts allowance");
         assert_eq!(
             higher_weight.slug(),
@@ -422,7 +463,7 @@ mod tests {
             ..Default::default()
         };
         let accepted = limits.with_symbol_alternatives_configuration(&accepted)?;
-        let complete = super::symbols(index.files(), "x", None, accepted)?;
+        let complete = super::symbols(&index, rust_files(&index), "x", None, accepted)?;
         assert_eq!(complete.len(), 1);
         assert!(complete[0].0.ends_with("/beacon"));
         Ok(())
@@ -434,8 +475,8 @@ mod tests {
         std::fs::write(directory.path().join("a.rs"), "pub fn beacon() {}\n")?;
         std::fs::write(directory.path().join("z.rs"), "pub fn x() {}\n")?;
         let index = index(directory.path())?;
-        assert!(symbols_with_work(index.files(), "x", None, 132).is_err());
-        let complete = symbols_with_work(index.files(), "x", None, 1_000)
+        assert!(symbols_with_work(&index, rust_files(&index), "x", None, 132).is_err());
+        let complete = symbols_with_work(&index, rust_files(&index), "x", None, 1_000)
             .map_err(|_| "complete ranking refused")?;
         assert!(complete[0].0.ends_with("/x"));
         Ok(())
@@ -449,7 +490,9 @@ mod tests {
             "pub mod parent { pub fn x() {} }\n",
         )?;
         let index = index(directory.path())?;
-        let file = index.files().next().ok_or("parsed fixture absent")?;
+        let file = index
+            .file(&rift_core::ProjectPath::new("lib.rs")?)
+            .ok_or("parsed fixture absent")?;
         let names = file
             .syntax()
             .symbols()
@@ -480,14 +523,22 @@ mod tests {
         // Query/file/parent cost 138. After x's declaration unit, short comparison,
         // and qualified normalization, 278 is one below the qualified distance bound.
         assert!(
-            symbols_with_work(index.files(), "y", None, 278).is_err(),
+            symbols_with_work(&index, rust_files(&index), "y", None, 278).is_err(),
             "the retained parent candidate must not escape an incomplete ranking"
         );
         // Complete ranking also reserves x's 48 insertion units, ending at 327.
-        let complete = symbols_with_work(index.files(), "y", None, 327)
+        let complete = symbols_with_work(&index, rust_files(&index), "y", None, 327)
             .map_err(|_| "complete qualified ranking refused")?;
         assert_eq!(complete.len(), 2);
-        assert_eq!(complete[0].0, "rift://symbol/rust/lib.rs/parent::x");
+        let matched = index.symbols("parent::x", 1)?;
+        let assembled = index.assembled_symbol(matched[0])?;
+        assert_eq!(
+            complete[0].0,
+            assembled
+                .identity()
+                .ok_or("fixture identity absent")?
+                .as_str()
+        );
         assert!(
             error
                 .message()

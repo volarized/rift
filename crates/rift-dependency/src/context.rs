@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use rift_protocol::dependencies::{
     ConfiguredPackage, PackageAvailability, PackageContextEntry, RequestedPackage,
 };
-use rift_protocol::read::{PackageIdentity, ProjectPath};
+use rift_protocol::read::ProjectPath;
 
 use crate::manifest::claimed_manifests_with_limit;
 use crate::resolver::{
@@ -75,8 +75,8 @@ impl From<ResolverName> for Degraded {
 /// the entries alone. A caller maps a path below a folder to the package that owns it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallFolder {
-    /// The installed package, at the exact version the lockfile or the probe names.
-    pub package: PackageIdentity,
+    /// The defining package or runtime origin the lockfile or probe established.
+    pub origin: rift_protocol::read::SourceLocation,
     /// Where the package's files stand.
     pub location: InstallLocation,
 }
@@ -258,9 +258,9 @@ impl DependencyContext {
     /// names leaves, and each requested package joins as the entry
     /// [`RequestedPackage::context_entry`] builds.
     ///
-    /// A requested version therefore replaces every version the workspace pins for that
-    /// package, a `path` or `git` entry included, and a package the workspace lacks is
-    /// added. Two identical requested entries merge into one.
+    /// A requested version replaces every version held for the same manager, name and
+    /// registry. Entries with another registry or a nonregistry source remain distinct.
+    /// A package the workspace lacks is added. Identical requested entries merge.
     ///
     /// The result stays within the smaller of `entries_max` and [`PACKAGES_MAX`]: a
     /// caller passes the entry bound the global API advertises for one resolution request,
@@ -274,9 +274,15 @@ impl DependencyContext {
     #[must_use]
     pub fn with_requested(&self, requested: &[RequestedPackage], entries_max: usize) -> Self {
         let entries_max = entries_max.min(self.entries_max.unwrap_or(PACKAGES_MAX));
-        let named: BTreeSet<(&str, &str)> = requested
+        let named: BTreeSet<(&str, &str, Option<&str>)> = requested
             .iter()
-            .map(|package| (package.manager.as_str(), package.name.as_str()))
+            .map(|package| {
+                (
+                    package.manager.as_str(),
+                    package.name.as_str(),
+                    package.registry.as_deref(),
+                )
+            })
             .collect();
         let mut added: Vec<PackageContextEntry> = requested
             .iter()
@@ -287,7 +293,13 @@ impl DependencyContext {
         let mut kept: Vec<PackageContextEntry> = self
             .entries
             .iter()
-            .filter(|entry| !named.contains(&(entry.manager.as_str(), entry.name.as_str())))
+            .filter(|entry| {
+                !named.contains(&(
+                    entry.manager.as_str(),
+                    entry.name.as_str(),
+                    entry.registry.as_deref(),
+                ))
+            })
             .cloned()
             .collect();
         let requested_displaced = added.split_off(entries_max.min(added.len()));
@@ -445,15 +457,11 @@ pub fn resolve_context(
     merge.build()
 }
 
-/// The order install folders keep: manager, name, version, then location.
-fn install_order(folder: &InstallFolder) -> (&str, &str, &str, &InstallLocation) {
-    let package = &folder.package;
-    (
-        &package.manager,
-        &package.name,
-        &package.version,
-        &folder.location,
-    )
+/// The order install folders keep: defining origin, then location.
+fn install_order(
+    folder: &InstallFolder,
+) -> (&rift_protocol::read::SourceLocation, &InstallLocation) {
+    (&folder.origin, &folder.location)
 }
 
 /// The separators that open a version's pre-release and build metadata.
@@ -475,8 +483,14 @@ pub(crate) fn is_whole_version(version: &str) -> bool {
             .all(|number| !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
-/// The fields two context entries merge on: manager, name, and the selector they state.
-type EntryKey = (String, String, Option<String>, Option<String>);
+/// The fields two context entries merge on: manager, name, registry and selector.
+type EntryKey = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 /// Every resolver's answer folded into one context, under [`PACKAGES_MAX`].
 #[derive(Default)]
@@ -492,22 +506,28 @@ struct ContextMerge {
 impl ContextMerge {
     /// Takes the operator's own list.
     ///
-    /// Each configured entry is `canonical`: the operator named a package by manager and
-    /// name, which is what a public registry answers for, and the list carries no source
-    /// this machine could classify otherwise. An operator naming a package a registry
-    /// does not serve states it in the manifest instead, where the resolver reads its
-    /// source and classifies it.
+    /// A validated explicit registry establishes the owner. Missing registry evidence
+    /// retains the selector with `registry_unresolved` availability.
     fn configured(&mut self, configured: &[ConfiguredPackage]) {
         for package in configured {
             let Some(selector) = package.selector() else {
                 continue;
             };
-            self.insert(PackageContextEntry::new(
+            let registry = package.registry.as_ref().filter(|_| {
+                rift_protocol::dependencies::registry_valid(package.registry.as_deref())
+            });
+            let mut entry = PackageContextEntry::new(
                 &package.manager,
                 &package.name,
                 selector,
-                PackageAvailability::Canonical,
-            ));
+                if registry.is_some() {
+                    PackageAvailability::Canonical
+                } else {
+                    PackageAvailability::RegistryUnresolved
+                },
+            );
+            entry.registry = registry.cloned();
+            self.insert(entry);
         }
     }
 
@@ -546,6 +566,7 @@ impl ContextMerge {
         let key = (
             entry.manager.clone(),
             entry.name.clone(),
+            entry.registry.clone(),
             entry.version.clone(),
             entry.requirement.clone(),
         );
@@ -562,18 +583,28 @@ impl ContextMerge {
     /// The finished context: entries in manager, name, then selector order, with every
     /// requirement for a package some input pins already dropped.
     fn build(self) -> DependencyContext {
-        let pinned: BTreeSet<(String, String)> = self
+        let pinned: BTreeSet<(String, String, Option<String>)> = self
             .entries
             .values()
             .filter(|entry| entry.version.is_some())
-            .map(|entry| (entry.manager.clone(), entry.name.clone()))
+            .map(|entry| {
+                (
+                    entry.manager.clone(),
+                    entry.name.clone(),
+                    entry.registry.clone(),
+                )
+            })
             .collect();
         let entries = self
             .entries
             .into_values()
             .filter(|entry| {
                 entry.version.is_some()
-                    || !pinned.contains(&(entry.manager.clone(), entry.name.clone()))
+                    || !pinned.contains(&(
+                        entry.manager.clone(),
+                        entry.name.clone(),
+                        entry.registry.clone(),
+                    ))
             })
             .collect();
         let mut context = DependencyContext {
@@ -604,12 +635,14 @@ mod tests {
     }
 
     fn pinned(name: &str, version: &str) -> PackageContextEntry {
-        PackageContextEntry::new(
+        let mut entry = PackageContextEntry::new(
             "probe",
             name,
             PackageSelector::Version(version.to_owned()),
             PackageAvailability::Canonical,
-        )
+        );
+        entry.registry = Some("registry.example".to_owned());
+        entry
     }
 
     fn declared(name: &str, requirement: &str) -> PackageContextEntry {
@@ -621,10 +654,84 @@ mod tests {
         )
     }
 
+    #[test]
+    fn test_registry_owners_remain_distinct_through_merge_and_requested_replacement() {
+        let mut first = pinned("serde", "1.0.228");
+        first.registry = Some("first.example".to_owned());
+        let mut second = first.clone();
+        second.registry = Some("second.example".to_owned());
+        let mut second_requirement = second.clone();
+        second_requirement.version = None;
+        second_requirement.requirement = Some("^1".to_owned());
+        let mut third_requirement = second_requirement.clone();
+        third_requirement.registry = Some("third.example".to_owned());
+        let context = resolve(
+            &ProbeResolver {
+                entries: vec![
+                    second.clone(),
+                    first.clone(),
+                    second_requirement,
+                    third_requirement.clone(),
+                ],
+                degradations: Vec::new(),
+            },
+            &[],
+        );
+        assert_eq!(
+            context.entries(),
+            &[first.clone(), second.clone(), third_requirement]
+        );
+        let mut replacement = requested("serde", Some("2.0.0"));
+        replacement.registry = Some("first.example".to_owned());
+        let read = context.with_requested(&[replacement], PACKAGES_MAX);
+        assert_eq!(read.entries().len(), 3);
+        assert!(
+            read.entries()
+                .iter()
+                .any(|entry| entry.registry == first.registry
+                    && entry.version.as_deref() == Some("2.0.0"))
+        );
+        assert!(read.entries().contains(&second));
+
+        let mut configured_first = configured_package("same", Some("1.0.0"));
+        configured_first.registry = Some("first.example".to_owned());
+        let mut configured_second = configured_first.clone();
+        configured_second.registry = Some("second.example".to_owned());
+        let mut unresolved = configured_package("unknown", Some("1.0.0"));
+        unresolved.registry = None;
+        let mut invalid = configured_package("invalid", Some("1.0.0"));
+        invalid.registry = Some("user:secret@registry.example".to_owned());
+        let context = resolve(
+            &ProbeResolver {
+                entries: Vec::new(),
+                degradations: Vec::new(),
+            },
+            &[configured_second, configured_first, unresolved, invalid],
+        );
+        assert_eq!(context.entries().len(), 4);
+        for entry in context
+            .entries()
+            .iter()
+            .filter(|entry| entry.name != "same")
+        {
+            assert_eq!(entry.availability, PackageAvailability::RegistryUnresolved);
+            assert!(entry.registry.is_none());
+        }
+        assert_eq!(
+            context.entries()[1].registry.as_deref(),
+            Some("first.example")
+        );
+        assert_eq!(
+            context.entries()[2].registry.as_deref(),
+            Some("second.example")
+        );
+    }
+
     fn configured_package(name: &str, version: Option<&str>) -> ConfiguredPackage {
         ConfiguredPackage {
             manager: "probe".to_owned(),
             name: name.to_owned(),
+            registry: Some("registry.example".to_owned()),
             version: version.map(str::to_owned),
             requirement: None,
         }
@@ -659,10 +766,13 @@ mod tests {
                     .filter_map(|entry| {
                         let version = entry.version.clone()?;
                         Some(InstallFolder {
-                            package: PackageIdentity {
-                                manager: entry.manager.clone(),
-                                name: entry.name.clone(),
-                                version,
+                            origin: rift_protocol::read::SourceLocation::Dependency {
+                                package: rift_protocol::read::PackageIdentity {
+                                    manager: entry.manager.clone(),
+                                    registry: "crates.io".to_owned(),
+                                    name: entry.name.clone(),
+                                    version,
+                                },
                             },
                             location: InstallLocation::Path(PathBuf::from(format!(
                                 "/installed/{}",
@@ -729,9 +839,12 @@ mod tests {
 
     #[test]
     fn test_a_requirement_is_dropped_where_an_input_pins_the_same_package() {
+        let mut requirement = pinned("serde", "1.0.228");
+        requirement.version = None;
+        requirement.requirement = Some("^1.0".to_owned());
         let resolver = ProbeResolver {
             entries: vec![
-                declared("serde", "^1.0"),
+                requirement,
                 pinned("serde", "1.0.228"),
                 declared("itoa", "^1"),
             ],
@@ -824,7 +937,12 @@ mod tests {
 
         let folders: Vec<(&str, &InstallLocation)> = context
             .install_folders()
-            .map(|folder| (folder.package.name.as_str(), &folder.location))
+            .filter_map(|folder| match &folder.origin {
+                rift_protocol::read::SourceLocation::Dependency { package } => {
+                    Some((package.name.as_str(), &folder.location))
+                }
+                _ => None,
+            })
             .collect();
         assert_eq!(
             folders,
@@ -1026,6 +1144,7 @@ mod tests {
         RequestedPackage {
             manager: "probe".to_owned(),
             name: name.to_owned(),
+            registry: Some("registry.example".to_owned()),
             version: version.map(str::to_owned),
         }
     }
@@ -1046,9 +1165,8 @@ mod tests {
             .collect()
     }
 
-    /// A requested version replaces every version the context holds for the package, a
-    /// path entry included, and the entries of the packages the request leaves alone
-    /// stand as the context read them.
+    /// A requested version replaces versions with the same registry and preserves
+    /// a distinct path source alongside the requested registry release.
     #[test]
     fn test_a_requested_version_replaces_every_entry_of_its_package() {
         let resolver = ProbeResolver {
@@ -1073,12 +1191,13 @@ mod tests {
         assert_eq!(
             spelled(&read),
             [
+                "helper@^0.1 Path",
                 "helper@0.1.4 Canonical",
                 "serde@1.0.200 Canonical",
                 "tokio@1.53.1 Canonical"
             ]
         );
-        assert_eq!(read.unavailable_entries().count(), 0);
+        assert_eq!(read.unavailable_entries().count(), 1);
         assert_eq!(read.degradations(), context.degradations());
         assert_eq!(
             read.install_folders().collect::<Vec<_>>(),

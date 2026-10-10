@@ -458,7 +458,7 @@ pub enum SearchInclude {
     {
         "target": "symbol",
         "traversal": {
-            "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+            "seed": "rift://symbol/local/rust/rift_server/read/ReadService",
             "direction": "incoming",
             "depth": 2,
             "facets": [
@@ -470,7 +470,7 @@ pub enum SearchInclude {
     {
         "target": "symbol",
         "traversal": {
-            "seed": "rift://symbol/rust/crates/rift-server/src/engine_read.rs/resolve_symbol_callees",
+            "seed": "rift://symbol/local/rust/rift_server/engine_read/resolve_symbol_callees",
             "direction": "outgoing",
             "facets": [
                 "calls"
@@ -675,7 +675,7 @@ pub enum SearchParamsTarget {
                 "hit": {
                     "target": "symbol",
                     "symbol": {
-                        "id": "rift://symbol/rust/src/config.rs/load_config",
+                        "id": "rift://symbol/local/rust/app/config/load_config",
                         "language": "rust",
                         "name": "load_config",
                         "kind": "function",
@@ -704,7 +704,7 @@ pub enum SearchParamsTarget {
                                             "start": 42,
                                             "end": 48
                                         },
-                                        "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                        "symbol": "rift://symbol/local/rust/app/config/Config"
                                     }
                                 ],
                                 "language": "rust",
@@ -843,7 +843,7 @@ pub const SEARCH_TRAVERSAL_FACETS_MAX: usize = RelationshipFacet::VARIANTS.len()
 #[serde(deny_unknown_fields)]
 #[schemars(extend("examples" = [
     {
-        "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+        "seed": "rift://symbol/local/rust/rift_server/read/ReadService",
         "direction": "incoming",
         "depth": 1
     }
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn search_traversal_rejects_an_unknown_field() {
         let result: Result<SearchTraversal, _> = serde_json::from_value(json!({
-            "seed": "rift://symbol/rust/src/lib.rs/beacon",
+            "seed": "rift://symbol/local/rust/app/beacon",
             "intent": "trace"
         }));
         assert!(
@@ -1218,7 +1218,7 @@ mod tests {
     fn search_params_with_traversal_and_no_query_parses() {
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/src/lib.rs/beacon"
+                "seed": "rift://symbol/local/rust/app/beacon"
             }
         }))
         .expect("a traversal-only request must parse");

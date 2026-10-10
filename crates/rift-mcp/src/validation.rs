@@ -424,6 +424,12 @@ impl PublishedWorkspace {
         paths: &BTreeSet<ProjectPath>,
         records: &CapturedRecords,
     ) -> bool {
+        if !matches!(
+            captured_build_paths_match(root, &self.reads, &|| false),
+            Ok(true)
+        ) {
+            return false;
+        }
         self.source_policy
             .as_deref()
             .and_then(|policy| observed_records(root, paths, policy))
@@ -1273,6 +1279,33 @@ impl IndexValidation {
         )
     }
 
+    fn build_path_impact(&self, root: &Path, path: &Path, kind: EventKind) -> Option<WatchImpact> {
+        let relative = path
+            .strip_prefix(root)
+            .ok()
+            .and_then(|path| rift_index::relative_path(path).ok())?;
+        let requested = rift_protocol::read::ProjectPath(relative.as_str().to_owned());
+        let current = self.current_publication();
+        let published = current.as_ref()?;
+        if !published.reads.build_path_requests().contains(&requested) {
+            return None;
+        }
+        let directory_modified = matches!(
+            kind,
+            EventKind::Modify(
+                ModifyKind::Any | ModifyKind::Data(_) | ModifyKind::Metadata(_) | ModifyKind::Other
+            )
+        ) && published.reads.build_paths().get(&requested)
+            == Some(&Some(rift_index::ArchiveMemberKind::Directory));
+        Some(
+            if directory_modified || matches!(kind, EventKind::Access(_)) {
+                WatchImpact::None
+            } else {
+                WatchImpact::WholeWorkspace
+            },
+        )
+    }
+
     /// Returns whether current policy includes one source event path.
     fn source_path_is_relevant(&self, path: &Path) -> bool {
         self.current_publication().as_ref().is_none_or(|published| {
@@ -1927,6 +1960,9 @@ pub(crate) fn watch_path_impact(
     };
     let path = placed.as_ref();
     let root = roots.canonical();
+    if let Some(impact) = validation.build_path_impact(root, path, kind) {
+        return impact;
+    }
     if validation.is_workspace_configuration(root, path) {
         return ProjectPath::new(WORKSPACE_CONFIGURATION_FILE.to_owned())
             .map_or(WatchImpact::WholeWorkspace, |path| {
@@ -2015,9 +2051,28 @@ pub(crate) fn empty_workspace_preparation(
     epoch: u64,
     content_cache: rift_index::WorkspaceContentCache,
 ) -> Result<(Arc<PublishedWorkspace>, WorkspaceIndexPreparation), RiftError> {
+    empty_workspace_preparation_with_owner(
+        (root, &rift_protocol::identity::SymbolOwner::Local),
+        limits,
+        configuration,
+        epoch,
+        content_cache,
+    )
+}
+
+/// Creates an empty publication under one fixed local owner.
+pub(crate) fn empty_workspace_preparation_with_owner(
+    (root, owner): (&Path, &rift_protocol::identity::SymbolOwner),
+    limits: WorkspaceIndexLimits,
+    configuration: ConfigurationState,
+    epoch: u64,
+    content_cache: rift_index::WorkspaceContentCache,
+) -> Result<(Arc<PublishedWorkspace>, WorkspaceIndexPreparation), RiftError> {
+    rift_index::validate_project_owner(owner)?;
     let limits = configuration.index_limits(limits)?;
-    let preparation = WorkspaceIndexPreparation::new(
+    let preparation = WorkspaceIndexPreparation::new_with_owner(
         root,
+        owner.clone(),
         limits,
         &configuration.text_inclusion(),
         &configuration.language_file_selections(),
@@ -2054,6 +2109,31 @@ pub(crate) fn empty_workspace_preparation(
     Ok((published, preparation))
 }
 
+/// Compares captured entry kinds without reading or hashing file contents.
+pub(crate) fn captured_build_paths_match(
+    root: &Path,
+    reads: &ReadService,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<bool, RiftError> {
+    let mut observed = BTreeMap::new();
+    for path in reads.build_path_requests() {
+        if cancelled() {
+            return errors::server::read_cancelled().fail();
+        }
+        let kind = match std::fs::symlink_metadata(root.join(path.0.as_str())) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                Some(rift_index::ArchiveMemberKind::Link)
+            }
+            Ok(metadata) if metadata.is_dir() => Some(rift_index::ArchiveMemberKind::Directory),
+            Ok(metadata) if metadata.is_file() => Some(rift_index::ArchiveMemberKind::File),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) | Err(_) => continue,
+        };
+        observed.insert(path.clone(), kind);
+    }
+    Ok(observed == *reads.build_paths())
+}
+
 /// Captures only paths held by one immutable publication.
 pub(crate) fn capture_prepared_workspace(
     root: &Path,
@@ -2061,6 +2141,12 @@ pub(crate) fn capture_prepared_workspace(
     last: &LastCapture,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(WorkspaceDigests, LastCapture), RiftError> {
+    if !captured_build_paths_match(root, &published.reads, cancelled)? {
+        return errors::server::read_unavailable()
+            .operation("workspace fingerprint")
+            .detail("captured build paths changed during validation")
+            .fail();
+    }
     let limits = published.reads.workspace_limits();
     if let Some(preparation) = &published.preparation {
         return capture_selected_paths_cancellable(
@@ -2324,6 +2410,9 @@ fn build_workspace_candidate_with_cache(
     let candidate = captured?;
     if candidate.configuration.fingerprint != configuration_fingerprint(root) {
         return Ok(WorkspaceCandidate::ConfigurationChanged);
+    }
+    if !captured_build_paths_match(root, &candidate.reads, &cancelled)? {
+        return Ok(WorkspaceCandidate::Superseded);
     }
     Ok(WorkspaceCandidate::Stable {
         published: Arc::new(candidate),
@@ -4984,6 +5073,12 @@ fn answered_candidate(
     pending: &PendingWork,
     observed_epoch: u64,
 ) -> CandidateAnswer {
+    if !matches!(
+        captured_build_paths_match(root, &candidate.reads, &|| false),
+        Ok(true)
+    ) {
+        return CandidateAnswer::Rescan;
+    }
     if candidate.epoch == observed_epoch {
         return CandidateAnswer::Current(Arc::clone(candidate));
     }
@@ -6631,6 +6726,135 @@ pub(crate) mod tests {
             pending.work.covers_whole_workspace(),
             "pathless rescan must retain whole-workspace recovery"
         );
+        Ok(())
+    }
+
+    fn pdm_candidate(root: &std::path::Path) -> TestResult<Arc<PublishedWorkspace>> {
+        fs::create_dir(root.join("fastapi"))?;
+        fs::write(
+            root.join("fastapi/__init__.py"),
+            "def serve():\n    return 1\n",
+        )?;
+        fs::write(
+            root.join("pyproject.toml"),
+            "[build-system]\nrequires=['pdm-backend']\nbuild-backend='pdm.backend'\n",
+        )?;
+        stable_candidate(root, 0)
+    }
+
+    #[test]
+    fn captured_build_path_events_cover_empty_directories_and_preserve_directory_modifications()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let current = pdm_candidate(&root)?;
+        assert!(
+            current
+                .reads
+                .build_path_requests()
+                .iter()
+                .any(|path| path.0 == "src")
+        );
+        let (validation, _invalidations) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        validation.install_publication(&current);
+        let roots = super::WatchRoots::resolve(&root)?;
+        for kind in [
+            EventKind::Create(CreateKind::Folder),
+            EventKind::Remove(RemoveKind::Any),
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any)),
+        ] {
+            let event = Event::new(kind).add_path(root.join("src"));
+            assert_eq!(
+                super::watch_event_impact(&roots, &validation, &event),
+                super::WatchImpact::WholeWorkspace
+            );
+        }
+        let modified_root = Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.clone());
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &modified_root),
+            super::WatchImpact::None
+        );
+        let hook =
+            Event::new(EventKind::Create(CreateKind::File)).add_path(root.join("pdm_build.py"));
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &hook),
+            super::WatchImpact::WholeWorkspace
+        );
+        fs::create_dir(root.join("src"))?;
+        fs::write(root.join("pdm_build.py"), "pass\n")?;
+        let refreshed = stable_candidate(&root, 1)?;
+        validation.install_publication(&refreshed);
+        let directory_change =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("src"));
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &directory_change),
+            super::WatchImpact::None
+        );
+        let hook_change =
+            Event::new(EventKind::Modify(ModifyKind::Any)).add_path(root.join("pdm_build.py"));
+        assert_eq!(
+            super::watch_event_impact(&roots, &validation, &hook_change),
+            super::WatchImpact::WholeWorkspace
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_build_path_comparison_refuses_kind_changes_without_watcher_events() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        let current = pdm_candidate(&root)?;
+        assert!(super::captured_build_paths_match(
+            &root,
+            &current.reads,
+            &|| false
+        )?);
+        fs::create_dir(root.join("src"))?;
+        assert!(!super::captured_build_paths_match(
+            &root,
+            &current.reads,
+            &|| false
+        )?);
+        assert!(matches!(
+            super::answered_candidate(
+                &root,
+                &current,
+                &super::PendingWork::default(),
+                current.epoch
+            ),
+            super::CandidateAnswer::Rescan
+        ));
+        let error = super::capture_prepared_workspace(
+            &root,
+            &current,
+            &rift_index::LastCapture::default(),
+            &|| false,
+        )
+        .err()
+        .ok_or("changed entry kinds must refuse the old view")?;
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unavailable::SLUG
+        );
+        fs::remove_dir(root.join("src"))?;
+        assert!(super::captured_build_paths_match(
+            &root,
+            &current.reads,
+            &|| false
+        )?);
+        fs::write(root.join("pdm_build.py"), "pass\n")?;
+        assert!(!super::captured_build_paths_match(
+            &root,
+            &current.reads,
+            &|| false
+        )?);
+        let refreshed = stable_candidate(&root, 1)?;
+        assert!(super::captured_build_paths_match(
+            &root,
+            &refreshed.reads,
+            &|| false
+        )?);
         Ok(())
     }
 

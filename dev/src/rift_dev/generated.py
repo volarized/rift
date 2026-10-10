@@ -65,6 +65,20 @@ def write_client(destination: Path) -> None:
         destination,
     ).run()
 
+    # oas3-gen leaves these u64 bounds unsuffixed. validator also records each as an
+    # error parameter, where Rust otherwise infers i32 and refuses the literal.
+    source = destination.read_text(encoding="utf-8")
+    destination.write_text(
+        source.replace(
+            "#[validate(range(min = 0, max = 9007199254740991))]",
+            "#[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]",
+        ).replace(
+            "#[validate(range(min = 0, max = 2147483647))]",
+            "#[validate(range(min = 0_u64, max = 2_147_483_647_u64))]",
+        ),
+        encoding="utf-8",
+    )
+
 
 def check_client() -> None:
     """Fails with a unified diff when the committed client differs from a fresh one."""

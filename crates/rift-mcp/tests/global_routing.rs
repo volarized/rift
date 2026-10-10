@@ -2,6 +2,14 @@
 //! come from the served snapshot, the package hits from a fixture global API, and every
 //! context entry no public registry serves answers with its typed warning.
 
+#[allow(
+    dead_code,
+    reason = "shared integration fixture exposes helpers this suite does not use"
+)]
+mod fake_engine;
+
+#[path = "announced_work/mod.rs"]
+mod announced_work;
 mod global_api;
 mod hermetic_search;
 #[allow(
@@ -79,14 +87,13 @@ async fn get_symbol(
 
 /// The configured package list naming the collected `demo` release. The fixture tables
 /// already open `[dependencies]`, so the list lands as an array of tables below it.
-const DEMO_PACKAGE: &str =
-    "[[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n";
+const DEMO_PACKAGE: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"1.0.0\"\n";
 
 /// The configured package list naming `demo`, an exact `absent` the fixture collection
 /// lacks, and a `wanted` requirement it cannot resolve.
-const THREE_PACKAGES: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
-     [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"absent\"\nversion = \"1.0.0\"\n\n\
-     [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"wanted\"\nrequirement = \"^1\"\n";
+const THREE_PACKAGES: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
+     [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"absent\"\nversion = \"1.0.0\"\n\n\
+     [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"wanted\"\nrequirement = \"^1\"\n";
 
 /// The `[global]` connect bound under which a refused loopback port still answers as
 /// refused.
@@ -261,7 +268,7 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
 const CALLEE_HOLD: Duration = Duration::from_secs(60);
 
 /// The `[server] readiness_timeout` an outgoing walk against a held global answer runs
-/// under: the embedded engine's walk fits in the nine tenths of it the walk may spend,
+/// under: the scripted engine's walk fits in the nine tenths of it the walk may spend,
 /// and the held answer outlasts all of it.
 const CALLEE_WALK_BUDGET: &str = "5s";
 
@@ -269,27 +276,74 @@ const CALLEE_WALK_BUDGET: &str = "5s";
 /// walk asks the global API to name.
 const CALLEE_FILES: &[(&str, &str)] = &[("app.py", "def counted() -> int:\n    return len([1])\n")];
 
-/// An outgoing walk from `counted` against a fixture holding `hold` past the request
+/// An outgoing walk from `caller` against a fixture holding `hold` past the request
 /// deadline: the walk answers well before the held answer would have arrived, the
 /// standard library callee drops, and the answer carries the timeout warning.
 async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         hold: Some(hold),
-        python_collection: true,
         ..FixtureOptions::default()
     })
     .await?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"{CALLEE_WALK_BUDGET}\"\n\n\
          [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n\
-         [languages.python.lsp]\nembedded = \"ty\"\n",
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n",
         fixture.endpoint
     );
+    let runtime = matches!(hold, Hold::Declarations(_));
+    let (callee_uri, callee_line) = if runtime {
+        runtime_callee_position()?
+    } else {
+        ("${uri%/lib.rs}/node_modules/demo/index.js".to_owned(), 0)
+    };
+    let source_uri =
+        "\\\"uri\\\":\\\"$uri\\\",\\\"range\\\":{\\\"start\\\":{\\\"line\\\":CALLEE_LINE";
+    let scripted_uri = format!(
+        "\\\"uri\\\":\\\"{callee_uri}\\\",\\\"range\\\":{{\\\"start\\\":{{\\\"line\\\":CALLEE_LINE"
+    );
+    let script = fake_engine::SCRIPTED_CALLS_ENGINE
+        .replace(source_uri, &scripted_uri)
+        .replace("PROGRESS", announced_work::ANNOUNCED_WORK)
+        .replace("CALLEE_LINE", &callee_line.to_string())
+        .replace("CALLER_LINE", "3");
+    let (_engine, engine_configuration) = fake_engine::rust_engine(&script)?;
+    let configuration = format!("{configuration}\n{engine_configuration}");
+    let mut files = vec![
+        (
+            "Cargo.toml",
+            "[package]\nname = \"walk\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+        ),
+        ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.98\"\n"),
+        (
+            "lib.rs",
+            "pub fn beacon() {}\n\npub fn caller() {\n    std::cmp::max(1, 2);\n}\n",
+        ),
+    ];
+    if !runtime {
+        files.extend([
+            ("package.json", r#"{"name":"walk","dependencies":{"demo":"1.0.0"}}"#),
+            (".npmrc", "registry=https://registry.npmjs.org/\n"),
+            ("package-lock.json", r#"{"packages":{"node_modules/demo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}}}"#),
+            ("node_modules/demo/package.json", r#"{"name":"demo","version":"1.0.0"}"#),
+            ("node_modules/demo/index.js", "function beacon() {}\n"),
+        ]);
+    }
     let (_directory, client, server_task) =
-        served_workspace(CALLEE_FILES, Some(configuration)).await?;
+        workspace_client::served_prepared_workspace(&files, Some(configuration), |root| {
+            if runtime {
+                let path = root.join("rift.toml");
+                let text = fs::read_to_string(&path).expect("the fixture configuration reads");
+                fs::write(
+                    path,
+                    text.replace("resolution = \"static\"", "resolution = \"auto\""),
+                )
+                .expect("the fixture enables the existing runtime resolver");
+            }
+        })
+        .await?;
     let walk = json!({
-        "traversal": { "seed": "rift://symbol/python/app.py/counted", "direction": "outgoing" }
+        "traversal": { "seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing" }
     });
     let started = tokio::time::Instant::now();
     let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
@@ -306,9 +360,45 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         json!({"code": "global_api_unavailable", "failure_class": "timeout"}),
         "{answer:#}"
     );
+    let held_route = if runtime {
+        "/declarations"
+    } else {
+        "/resolutions"
+    };
+    assert!(
+        fixture
+            .requests()
+            .await
+            .iter()
+            .any(|request| request.uri.ends_with(held_route)),
+        "the deadline ends an actual held {held_route} request"
+    );
     client.cancel().await?;
     server_task.await?;
     Ok(())
+}
+
+fn runtime_callee_position() -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let sysroot = std::process::Command::new("rustup")
+        .args(["run", "1.98", "rustc", "--print", "sysroot"])
+        .output()?;
+    assert!(
+        sysroot.status.success(),
+        "the installed runtime names its sysroot"
+    );
+    let source = std::path::PathBuf::from(String::from_utf8(sysroot.stdout)?.trim())
+        .join("lib/rustlib/src/rust/library/core/src/cmp.rs");
+    let text = fs::read_to_string(&source)?;
+    let line = text
+        .lines()
+        .position(|line| line.starts_with("pub ") && line.contains("fn max<"))
+        .ok_or("the installed runtime source declares max")?;
+    Ok((
+        reqwest::Url::from_file_path(&source)
+            .map_err(|()| "the installed runtime source has an absolute path")?
+            .to_string(),
+        line,
+    ))
 }
 
 /// A resolution held past the request deadline names no callee.
@@ -321,6 +411,44 @@ async fn request_deadline_bounds_the_resolution_an_outgoing_walk_waits_for() -> 
 #[tokio::test]
 async fn request_deadline_bounds_the_declarations_an_outgoing_walk_waits_for() -> TestResult {
     outgoing_walk_past_a_held_global_answer(Hold::Declarations(CALLEE_HOLD)).await
+}
+
+/// A Python version pin does not establish an installed runtime owner for bundled stubs.
+#[tokio::test]
+async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
+    let fixture =
+        GlobalFixture::start_holding(SymbolFixture::Valid, Some(Hold::Declarations(CALLEE_HOLD)))
+            .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n\
+         [languages.python.lsp]\nembedded = \"ty\"\n",
+        fixture.endpoint
+    );
+    let mut files = CALLEE_FILES.to_vec();
+    files.push((".python-version", "3.12.3\n"));
+    let (_directory, client, server_task) = served_workspace(&files, Some(configuration)).await?;
+    let walk = json!({
+        "traversal": {"seed": "rift://symbol/python/app.py/counted", "direction": "outgoing"}
+    });
+    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    assert_eq!(
+        answer["warnings"][0]["code"], "callees_dropped",
+        "{answer:#}"
+    );
+    assert_eq!(answer["warnings"][0]["callees"], 1, "{answer:#}");
+    assert!(
+        answer["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.len() == 1),
+        "an unproved runtime owner does not become a global service failure: {answer:#}"
+    );
+    assert!(
+        fixture.requests().await.is_empty(),
+        "unversioned positions are unasked"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
 }
 
 /// A path dependency outside the workspace reaches no index: the package hits come from
@@ -389,7 +517,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     );
     assert_eq!(
         warnings[1]["package"],
-        json!({"manager":"cargo","name":"absent","version":"1.0.0"})
+        json!({"manager":"cargo", "registry": "crates.io","name":"absent","version":"1.0.0"})
     );
     let requirements: Vec<&Value> = warnings[2..4]
         .iter()
@@ -399,7 +527,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         requirements,
         [
             &json!({
-                "manager":"cargo",
+                "manager":"cargo", "registry": "crates.io",
                 "name":"wanted",
                 "requirement":"^1",
                 "availability":"canonical"
@@ -426,12 +554,12 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
     let cases = [
         (
             "version = \"1.0.3\"".to_owned(),
-            json!({"manager":"cargo","name":"demo","version":"1.0.3","availability":"canonical"}),
+            json!({"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.3","availability":"canonical"}),
         ),
         (
             format!("requirement = \"{UNSATISFIED_REQUIREMENT}\""),
             json!({
-                "manager":"cargo",
+                "manager":"cargo", "registry": "crates.io",
                 "name":"demo",
                 "requirement":UNSATISFIED_REQUIREMENT,
                 "availability":"canonical"
@@ -443,7 +571,7 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
         let configuration = format!(
             "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
              request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-             [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\n{selector}\n",
+             [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\n{selector}\n",
             fixture.endpoint
         );
         let (directory, client, server_task) = served_workspace(
@@ -483,7 +611,7 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             [&json!({
                 "code": "package_substituted",
                 "entry": entry,
-                "package": {"manager":"cargo","name":"demo","version":"1.0.0"}
+                "package": {"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0"}
             })],
             "{answer:#}"
         );
@@ -562,7 +690,7 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
         let body = request.body.as_ref().ok_or("search body is recorded")?;
         assert_eq!(
             body["packages"],
-            json!([{"manager":"cargo","name":"demo","version":"1.0.0"}])
+            json!([{"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0"}])
         );
         let rendered = body.to_string();
         assert!(!rendered.contains("src/lib.rs"));
@@ -764,7 +892,7 @@ fn helper_beacon_pattern_hits() -> Value {
                     "kind": "function",
                     "origin": {
                         "location": "dependency",
-                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.0"},
+                        "package": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"},
                         "source_kind": "authored"
                     }
                 }
@@ -868,12 +996,12 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
         [
             &json!({
                 "pattern": r"fn helper_\w+",
-                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
                 "include": ["source"]
             }),
             &json!({
                 "pattern": r"fn \w*beacon",
-                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+                "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
             }),
         ]
     );
@@ -1194,6 +1322,8 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
                     [[package]]\nname = \"outside\"\nversion = \"0.2.0\"\n\n\
                     [[package]]\nname = \"private\"\nversion = \"0.6.1\"\n\
                     source = \"registry+https://registry.example.test/index\"\n\n\
+                    [[package]]\nname = \"private\"\nversion = \"0.6.1\"\n\
+                    source = \"registry+https://registry.foreign.test/index\"\n\n\
                     [[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
                     [[package]]\nname = \"sourced\"\nversion = \"0.3.0\"\n\
                     source = \"git+https://example.test/sourced#0123456789abcdef\"\n";
@@ -1219,6 +1349,14 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"all"})).await?;
 
     assert_eq!(answer["hits"][0]["symbol"]["name"], "local_beacon");
+    assert_unserved_dependency_warnings(&answer)?;
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn assert_unserved_dependency_warnings(answer: &Value) -> TestResult {
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("warnings are an array")?;
@@ -1256,6 +1394,17 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
         ),
         (
             "private",
+            "registry_unresolved",
+            "Package registry endpoint is unresolved.".to_owned(),
+        ),
+        (
+            "private",
+            "private_registry",
+            "Currently rift doesn't support indexing dependencies from private registries."
+                .to_owned(),
+        ),
+        (
+            "private",
             "private_registry",
             "Currently rift doesn't support indexing dependencies from private registries."
                 .to_owned(),
@@ -1276,14 +1425,46 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     ]
     .map(|(name, availability, reason)| (name.to_owned(), availability.to_owned(), reason));
     assert_eq!(unavailable, expected, "{answer:#}");
+    assert_distinct_registry_observations(warnings, answer);
     assert!(
         !answer.to_string().contains("\"inner\""),
         "a path dependency inside the workspace is project source: {answer:#}"
     );
-    drop(directory);
-    client.cancel().await?;
-    server_task.await?;
     Ok(())
+}
+
+fn assert_distinct_registry_observations(warnings: &[Value], answer: &Value) {
+    let private: Vec<&Value> = warnings[1..]
+        .iter()
+        .filter(|warning| warning["entry"]["name"] == "private")
+        .map(|warning| &warning["entry"])
+        .collect();
+    assert_eq!(
+        private,
+        [
+            &json!({
+                "manager": "cargo",
+                "name": "private",
+                "requirement": "0.6",
+                "availability": "registry_unresolved"
+            }),
+            &json!({
+                "manager": "cargo",
+                "registry": "registry.example.test/index",
+                "name": "private",
+                "version": "0.6.1",
+                "availability": "private_registry"
+            }),
+            &json!({
+                "manager": "cargo",
+                "registry": "registry.foreign.test/index",
+                "name": "private",
+                "version": "0.6.1",
+                "availability": "private_registry"
+            })
+        ],
+        "an unresolved registry alias cannot identify the locked registry owner: {answer:#}"
+    );
 }
 
 /// A served Rust workspace with no dependency of its own, under `configuration`.
@@ -1346,7 +1527,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-         [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"0.9.0\"\n",
+         [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"0.9.0\"\n",
         fixture.endpoint
     );
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
@@ -1363,7 +1544,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         json!({
             "name": "helper_beacon",
             "scope": "global",
-            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
     )
     .await?;
@@ -1383,11 +1564,15 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     assert_eq!(resolutions.len(), 2, "{resolutions:#?}");
     assert_eq!(
         demo_entries(&resolutions[0]),
-        [&json!({"manager":"cargo","name":"demo","version":"0.9.0","availability":"canonical"})]
+        [
+            &json!({"manager":"cargo", "registry": "crates.io","name":"demo","version":"0.9.0","availability":"canonical"})
+        ]
     );
     assert_eq!(
         demo_entries(&resolutions[1]),
-        [&json!({"manager":"cargo","name":"demo","version":"1.0.0","availability":"canonical"})],
+        [
+            &json!({"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0","availability":"canonical"})
+        ],
         "the read sends the requested version in place of the pinned one"
     );
     assert!(
@@ -1428,7 +1613,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
         json!({
             "query": "helper_beacon",
             "scope": "all",
-            "packages": [{"manager": "cargo", "name": "demo"}]
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo"}]
         }),
     )
     .await?;
@@ -1443,7 +1628,9 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
     assert_eq!(resolutions.len(), 1, "{resolutions:#?}");
     assert_eq!(
         demo_entries(&resolutions[0]),
-        [&json!({"manager":"cargo","name":"demo","requirement":">=0","availability":"canonical"})]
+        [
+            &json!({"manager":"cargo", "registry": "crates.io","name":"demo","requirement":">=0","availability":"canonical"})
+        ]
     );
     let searches: Vec<Value> = fixture
         .requests()
@@ -1456,7 +1643,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
     for body in searches {
         assert_eq!(
             body["packages"],
-            json!([{"manager":"cargo","name":"demo","version":"1.0.0"}]),
+            json!([{"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0"}]),
             "the search reads the release the requirement resolved to"
         );
     }
@@ -1571,7 +1758,7 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
     let request = json!({
         "query": "helper_beacon",
         "scope": "global",
-        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
     let answer = call_tool(&client, "search", request).await?;
     assert!(
@@ -1663,8 +1850,8 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
         "query": "helper_beacon",
         "scope": "global",
         "packages": [
-            {"manager": "cargo", "name": "zlib", "version": "1.3.1"},
-            {"manager": "cargo", "name": "demo", "version": "1.0.0"}
+            {"manager": "cargo", "registry": "crates.io", "name": "zlib", "version": "1.3.1"},
+            {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}
         ]
     });
     let answer = call_tool(&client, "search", request).await?;
@@ -1680,7 +1867,7 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
         sent[0],
         [json!({
             "availability": "canonical",
-            "manager": "cargo",
+            "manager": "cargo", "registry": "crates.io",
             "name": "demo",
             "version": "1.0.0"
         })],
@@ -1770,7 +1957,7 @@ async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() ->
     let request = json!({
         "query": "helper_beacon",
         "scope": "global",
-        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
     let answer = call_tool(&client, "search", request).await?;
     assert!(
@@ -1977,7 +2164,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
             "scope": "global",
             "target": "all",
             "include": ["source"],
-            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
     )
     .await?;
@@ -1996,7 +2183,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
         bodies,
         [json!({
             "pattern": r"fn helper_\w+",
-            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
             "include": ["source"]
         })]
     );
@@ -2211,11 +2398,12 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
             .map(|candidate| candidate.text().to_owned())
             .collect(),
         include: Some(vec!["source".to_owned()]),
-        packages: vec![rift_cloud_client::PackageIdentity {
+        packages: Some(vec![rift_cloud_client::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "demo".to_owned(),
             version: "1.0.0".to_owned(),
-        }],
+        }]),
         phase: PackageSearchRequestPhase::Precise,
         target: None,
     })

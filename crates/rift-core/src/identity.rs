@@ -1,4 +1,5 @@
-use std::fmt::{self, Write as _};
+use std::fmt;
+use std::fmt::Write as _;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -7,9 +8,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_error::{RiftError, errors};
 
 use crate::constants::{
-    HEX_LETTER_VALUE_OFFSET, HEX_NIBBLE_BITS, PERCENT_ESCAPE_BYTES, PERCENT_ESCAPE_HIGH_OFFSET,
-    PERCENT_ESCAPE_LOW_OFFSET, PERCENT_ESCAPE_MARKER, SOURCE_RESOLVER_ID_BYTES_MAX,
-    SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
+    PERCENT_ESCAPE_BYTES, SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX,
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX, SYMBOL_URI_PREFIX,
 };
 use crate::{PackageIdentity, ProjectPath, SourcePath};
@@ -205,6 +204,33 @@ define_id!(WorkspaceId, "Canonical workspace identity.");
 define_id!(SymbolId, "Language-qualified symbol identity.");
 define_id!(ProviderId, "Provider component identity.");
 define_id!(ProviderSymbolId, "Provider-local symbol identity.");
+
+impl ProviderSymbolId {
+    /// Uses a syntax symbol address as its bounded provider-local identity.
+    ///
+    /// Addresses within the provider bound keep their spelling. A longer address uses
+    /// its complete SHA-256 digest. This key identifies the provider Contribution,
+    /// independently of its logical symbol identity and physical source binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the address is not a symbol address or contains control text.
+    pub fn for_symbol(address: &str) -> Result<Self, RiftError> {
+        if !address.starts_with(SYMBOL_URI_PREFIX) || address.chars().any(char::is_control) {
+            return errors::core::identity_invalid().fail();
+        }
+        if address.len() <= crate::PROVIDER_SYMBOL_ID_BYTES_MAX {
+            return Self::new(address);
+        }
+        let digest = crate::FileDigest::of(address.as_bytes());
+        let mut bounded = String::with_capacity(71);
+        bounded.push_str("sha256:");
+        for byte in digest.as_bytes() {
+            write!(&mut bounded, "{byte:02x}").expect("String accepts formatted bytes");
+        }
+        Self::new(bounded)
+    }
+}
 define_id!(CompositionId, "Provider composition identity.");
 define_id!(ModelId, "Resolved embedding model identity.");
 
@@ -230,10 +256,7 @@ impl SourceResolverId {
                 .identity("source_resolver")
                 .fail();
         }
-        let mut bytes = value.bytes();
-        if !bytes.next().is_some_and(is_resolver_first_byte)
-            || !bytes.all(is_resolver_continuation_byte)
-        {
+        if !rift_protocol::identity::source_resolver_is_valid(&value) {
             return errors::core::resolver_id_invalid_character()
                 .identity("source_resolver")
                 .fail();
@@ -248,16 +271,6 @@ impl SourceResolverId {
     }
 }
 
-const fn is_resolver_first_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase()
-}
-
-fn is_resolver_continuation_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase()
-        || byte.is_ascii_digit()
-        || SOURCE_RESOLVER_PUNCTUATION.contains(&byte)
-}
-
 impl fmt::Display for SourceResolverId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -269,6 +282,7 @@ impl fmt::Display for SourceResolverId {
 pub struct SourceUnitId {
     resolver: SourceResolverId,
     key: SourcePath,
+    owner: Option<rift_protocol::identity::SymbolOwner>,
 }
 
 impl SourceUnitId {
@@ -278,7 +292,26 @@ impl SourceUnitId {
     ///
     /// Returns [`RiftError`] when canonical URI exceeds protocol limit.
     pub fn new(resolver: SourceResolverId, key: SourcePath) -> Result<Self, RiftError> {
-        let identity = Self { resolver, key };
+        if matches!(resolver.as_str(), "cargo" | "npm" | "pypi" | "stdlib") {
+            return errors::core::source_unit_id_invalid_address()
+                .identity("source_unit")
+                .fail();
+        }
+        if !rift_protocol::identity::source_unit_path_is_valid(key.as_str()) {
+            return errors::core::source_unit_id_invalid_key()
+                .identity("source_unit")
+                .cause(
+                    errors::core::path_empty_segment()
+                        .path_kind("source")
+                        .error(),
+                )
+                .fail();
+        }
+        let identity = Self {
+            resolver,
+            key,
+            owner: None,
+        };
         if identity.encoded_len() > SOURCE_UNIT_ID_BYTES_MAX {
             return errors::core::source_unit_id_too_long()
                 .identity("source_unit")
@@ -287,34 +320,85 @@ impl SourceUnitId {
         Ok(identity)
     }
 
-    /// The unit of one file inside a package.
+    /// The unit of one file inside its defining registry package.
     ///
-    /// The resolver is the package's manager and the key is `<name>@<version>/<path>`,
-    /// so the unit renders as `rift://source/cargo/helper@0.1.0/src/lib.rs`. Package
-    /// analysis mints every package file's unit here: one file has one unit wherever it
-    /// is addressed from.
+    /// Registry endpoint, package namespace and exact version remain in the address;
+    /// the source path counts from the package root.
+    ///
+    /// # Errors
+    /// Returns an identity error for an invalid owner, path or encoded length.
+    pub fn for_package(package: &PackageIdentity, path: &ProjectPath) -> Result<Self, RiftError> {
+        let owner = package
+            .owner()
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        Self::for_owner(owner, path.as_str())
+    }
+
+    /// The unit of one file installed with an exact runtime or compiler release.
+    ///
+    /// # Errors
+    /// Returns an identity error for an invalid owner, path or encoded length.
+    pub fn for_runtime(
+        runtime: &rift_protocol::read::RuntimeIdentity,
+        path: &ProjectPath,
+    ) -> Result<Self, RiftError> {
+        let owner = runtime
+            .owner()
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        Self::for_owner(owner, path.as_str())
+    }
+
+    /// The released source unit its accepted origin and root-relative path establish.
+    ///
+    /// # Errors
+    /// Returns an identity error when the origin does not establish a released owner.
+    pub fn for_origin(
+        origin: &rift_protocol::read::SourceLocation,
+        path: &ProjectPath,
+    ) -> Result<Self, RiftError> {
+        match origin {
+            rift_protocol::read::SourceLocation::Dependency { package } => {
+                Self::for_package(package, path)
+            }
+            rift_protocol::read::SourceLocation::Stdlib {
+                runtime: Some(runtime),
+            } => Self::for_runtime(runtime, path),
+            _ => errors::core::identity_invalid().fail(),
+        }
+    }
+
+    /// Defining released owner, absent for a generic resolver unit.
+    #[must_use]
+    pub const fn source_owner(&self) -> Option<&rift_protocol::identity::SymbolOwner> {
+        self.owner.as_ref()
+    }
+
+    /// The source unit established by an exact released owner and relative path.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] when the manager is no resolver identity, when
-    /// the key breaks the source path rules, or when the canonical URI exceeds the
-    /// protocol limit.
-    pub fn for_package(package: &PackageIdentity, path: &ProjectPath) -> Result<Self, RiftError> {
-        let resolver = SourceResolverId::new(package.manager.clone()).map_err(|cause| {
-            errors::core::source_unit_id_invalid_resolver()
-                .identity("source_unit")
-                .cause(cause)
-                .error()
-        })?;
-        let key = SourcePath::new(format!("{}@{}/{path}", package.name, package.version)).map_err(
-            |cause| {
-                errors::core::source_unit_id_invalid_key()
-                    .identity("source_unit")
-                    .cause(cause)
-                    .error()
-            },
-        )?;
-        Self::new(resolver, key)
+    /// Returns an identity error for a local owner or an invalid released owner or path.
+    pub fn for_owner(
+        owner: rift_protocol::identity::SymbolOwner,
+        path: &str,
+    ) -> Result<Self, RiftError> {
+        rift_protocol::identity::released_source_identity(&owner, path)
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        let resolver = match &owner {
+            rift_protocol::identity::SymbolOwner::Package { manager, .. } => {
+                SourceResolverId::new(manager.clone())?
+            }
+            rift_protocol::identity::SymbolOwner::Runtime { .. } => {
+                SourceResolverId::new("stdlib")?
+            }
+            _ => return errors::core::identity_invalid().fail(),
+        };
+        let key = SourcePath::new(path)?;
+        Ok(Self {
+            resolver,
+            key,
+            owner: Some(owner),
+        })
     }
 
     /// Parses canonical `rift://source/` identity.
@@ -339,6 +423,15 @@ impl SourceUnitId {
                     .identity("source_unit")
                     .error()
             })?;
+        if rift_protocol::identity::released_source_resolver_is_valid(resolver) {
+            let (owner, path) = rift_protocol::identity::parse_released_source_identity(value)
+                .map_err(|_| {
+                    errors::core::source_unit_id_invalid_address()
+                        .identity("source_unit")
+                        .error()
+                })?;
+            return Self::for_owner(owner, &path);
+        }
         let resolver = SourceResolverId::new(resolver).map_err(|cause| {
             errors::core::source_unit_id_invalid_resolver()
                 .identity("source_unit")
@@ -374,6 +467,10 @@ impl SourceUnitId {
     }
 
     fn encoded_len(&self) -> usize {
+        if let Some(owner) = &self.owner {
+            return rift_protocol::identity::released_source_identity(owner, self.key.as_str())
+                .map_or(usize::MAX, |value| value.len());
+        }
         SOURCE_UNIT_URI_PREFIX.len()
             + self.resolver.as_str().len()
             + SOURCE_UNIT_SEPARATOR_BYTES
@@ -382,7 +479,7 @@ impl SourceUnitId {
                 .as_str()
                 .bytes()
                 .map(|byte| {
-                    if is_unit_key_safe(byte) {
+                    if rift_protocol::identity::source_unit_key_byte_is_safe(byte) {
                         1
                     } else {
                         PERCENT_ESCAPE_BYTES
@@ -402,74 +499,28 @@ impl FromStr for SourceUnitId {
 
 impl fmt::Display for SourceUnitId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(owner) = &self.owner {
+            let value = rift_protocol::identity::released_source_identity(owner, self.key.as_str())
+                .map_err(|_| fmt::Error)?;
+            return formatter.write_str(&value);
+        }
         write!(
             formatter,
             "{SOURCE_UNIT_URI_PREFIX}{}{SOURCE_UNIT_SEPARATOR}",
             self.resolver
         )?;
-        for byte in self.key.as_str().bytes() {
-            if is_unit_key_safe(byte) {
-                formatter.write_char(char::from(byte))?;
-            } else {
-                write!(formatter, "%{byte:02X}")?;
-            }
-        }
-        Ok(())
+        formatter.write_str(&rift_protocol::identity::encode_source_unit_key(
+            self.key.as_str(),
+        ))
     }
 }
 
 fn decode_unit_key(value: &str) -> Result<String, RiftError> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == PERCENT_ESCAPE_MARKER {
-            let high = bytes
-                .get(index + PERCENT_ESCAPE_HIGH_OFFSET)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or_else(|| {
-                    errors::core::source_unit_id_invalid_encoding()
-                        .identity("source_unit")
-                        .error()
-                })?;
-            let low = bytes
-                .get(index + PERCENT_ESCAPE_LOW_OFFSET)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or_else(|| {
-                    errors::core::source_unit_id_invalid_encoding()
-                        .identity("source_unit")
-                        .error()
-                })?;
-            decoded.push((high << HEX_NIBBLE_BITS) | low);
-            index += PERCENT_ESCAPE_BYTES;
-        } else {
-            if !is_unit_key_safe(bytes[index]) {
-                return errors::core::source_unit_id_invalid_encoding()
-                    .identity("source_unit")
-                    .fail();
-            }
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| {
+    rift_protocol::identity::decode_source_unit_key(value).map_err(|_| {
         errors::core::source_unit_id_invalid_encoding()
             .identity("source_unit")
             .error()
     })
-}
-
-const fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'A'..=b'F' => Some(byte - b'A' + HEX_LETTER_VALUE_OFFSET),
-        b'a'..=b'f' => Some(byte - b'a' + HEX_LETTER_VALUE_OFFSET),
-        _ => None,
-    }
-}
-
-fn is_unit_key_safe(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || SOURCE_UNIT_SAFE_PUNCTUATION.contains(&byte)
 }
 
 /// Invalid zero revision.
@@ -616,7 +667,7 @@ mod tests {
 
     #[test]
     fn parse_symbol_identity_accepts_bounded_package_paths() {
-        let path = format!("cargo/beacon@1.0.0/{}lib.rs", "a/".repeat(490));
+        let path = format!("cargo/crates.io/beacon@1.0.0/{}lib.rs", "a/".repeat(490));
         assert!(ProjectPath::new(&path).is_err());
         let identity = symbol_identity("rust", &path, "serve");
         let parsed = parse_symbol_identity(&identity).expect("package symbol identity");
@@ -668,6 +719,40 @@ mod tests {
                 .to_string(),
             "rust:item"
         );
+    }
+
+    #[test]
+    fn syntax_provider_identity_keeps_the_bound_and_complete_overflow_digest() {
+        let prefix = "rift://symbol/";
+        let address = format!(
+            "{prefix}{}",
+            "a".repeat(crate::PROVIDER_SYMBOL_ID_BYTES_MAX - prefix.len())
+        );
+        assert_eq!(
+            ProviderSymbolId::for_symbol(&address)
+                .expect("exact provider bound")
+                .as_str(),
+            address
+        );
+        let longer = format!("{address}a");
+        let key = ProviderSymbolId::for_symbol(&longer).expect("bounded complete digest");
+        assert_eq!(
+            key.as_str(),
+            "sha256:afca4347c349131eb81815478c51fe2fbb86a598f99fff2ae3aa45c041645319"
+        );
+        assert_eq!(key.as_str().len(), 71);
+        assert!(key.as_str().starts_with("sha256:"));
+        assert_eq!(
+            key,
+            ProviderSymbolId::for_symbol(&longer).expect("same address same key")
+        );
+        assert_ne!(
+            key,
+            ProviderSymbolId::for_symbol(&format!("{address}b"))
+                .expect("different owner or path keeps distinct key")
+        );
+        assert!(ProviderSymbolId::for_symbol("sha256:unbound").is_err());
+        assert!(ProviderSymbolId::for_symbol(&format!("{longer}\n")).is_err());
     }
 
     #[test]
@@ -798,6 +883,36 @@ mod tests {
             over_bound.slug().as_str(),
             "rift.core.source_unit_id_too_long"
         );
+    }
+
+    #[test]
+    fn source_unit_parser_keeps_custom_keys_separate_from_released_owners() {
+        for value in [
+            "rift://source/project/registry.example/demo@1.0.0/file.rs",
+            "rift://source/custom/registry.example/demo@1.0.0/file.rs",
+            "rift://source/project/src/file~2.rs",
+        ] {
+            let id = SourceUnitId::parse(value).expect("custom source key");
+            assert_eq!(id.to_string(), value);
+            assert_eq!(
+                id.key().as_str(),
+                value.splitn(5, '/').nth(4).expect("source key")
+            );
+            assert!(id.owner.is_none());
+        }
+        let runtime = "rift://source/stdlib/cpython@3.12.9/Lib/sys.py";
+        let id = SourceUnitId::parse(runtime).expect("runtime source owner");
+        assert!(matches!(
+            id.owner.as_ref(),
+            Some(rift_protocol::identity::SymbolOwner::Runtime { .. })
+        ));
+        assert_eq!(id.to_string(), runtime);
+        for value in [
+            "rift://source/project/a//b",
+            "rift://source/stdlib/python/Lib/sys.py",
+        ] {
+            assert!(SourceUnitId::parse(value).is_err(), "{value}");
+        }
     }
 
     #[test]
@@ -1003,6 +1118,13 @@ mod tests {
     fn package(manager: &str, name: &str, version: &str) -> PackageIdentity {
         PackageIdentity {
             manager: manager.to_owned(),
+            registry: match manager {
+                "cargo" => "crates.io",
+                "npm" => "npmjs.org",
+                "pypi" => "pypi.org",
+                _ => "registry.example",
+            }
+            .to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         }
@@ -1015,10 +1137,10 @@ mod tests {
             .expect("unit fits protocol bound");
         assert_eq!(
             unit.to_string(),
-            "rift://source/cargo/helper@0.1.0/src/lib.rs"
+            "rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs"
         );
         assert_eq!(unit.resolver().as_str(), "cargo");
-        assert_eq!(unit.key().as_str(), "helper@0.1.0/src/lib.rs");
+        assert_eq!(unit.key().as_str(), "src/lib.rs");
     }
 
     #[test]
@@ -1026,28 +1148,14 @@ mod tests {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
         let error = SourceUnitId::for_package(&package("Cargo", "helper", "0.1.0"), &path)
             .expect_err("uppercase manager");
-        assert_eq!(
-            error.slug().as_str(),
-            "rift.core.source_unit_id_invalid_resolver"
-        );
-        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.slug().as_str(), "rift.core.identity_invalid");
     }
 
     #[test]
     fn package_unit_refuses_a_version_that_breaks_the_source_path_rules() {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
-        let error = SourceUnitId::for_package(&package("cargo", "helper", "0.1.0\\beta"), &path)
-            .expect_err("a backslash in the version");
-        assert_eq!(
-            error.slug().as_str(),
-            "rift.core.source_unit_id_invalid_key"
+        assert!(
+            SourceUnitId::for_package(&package("cargo", "helper", "0.1.0\\beta"), &path).is_err()
         );
-        assert_eq!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<RiftError>())
-                .map(|source| source.slug().as_str()),
-            Some("rift.core.path_backslash")
-        );
-        assert!(std::error::Error::source(&error).is_some());
     }
 }

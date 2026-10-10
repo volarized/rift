@@ -1,9 +1,8 @@
 //! Generated response decoding after bounded body collection.
 
 use crate::{
-    Capabilities, ClientError, FindPackageDeclarationsRequest, FindPackageDeclarationsResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, ListPackageSymbolsRequest,
-    ListPackageSymbolsResponse, PackageDeclarationResponse, PackagePatternPage,
+    Capabilities, ClientError, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    ListPackageSymbolsRequest, ListPackageSymbolsResponse, PackagePatternPage,
     PackageResolutionResponse, PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
     ResolvePackageContextRequest, ResolvePackageContextResponse, ResponseMeta,
     SearchPackagePatternsRequest, SearchPackagePatternsResponse, SearchPackagesRequest,
@@ -94,6 +93,76 @@ pub(crate) async fn search(
     }
 }
 
+pub(crate) fn exact_symbol(
+    response: RawResponse,
+) -> Result<Parsed<rift_protocol::symbol_read::GetSymbolResult>, ClientError> {
+    use rift_protocol::symbol_read::GetSymbolResult;
+    exact_response(response, &[200, 404, 503], |status, value| {
+        matches!(
+            (status, value),
+            (200, GetSymbolResult::Found { .. })
+                | (404, GetSymbolResult::Missing { .. })
+                | (503, GetSymbolResult::Unavailable { .. })
+        )
+    })
+}
+
+pub(crate) fn exact_source(
+    response: RawResponse,
+) -> Result<Parsed<rift_protocol::source_read::GetSourceResult>, ClientError> {
+    use rift_protocol::source_read::GetSourceResult;
+    exact_response(response, &[200, 404, 503], |status, value| {
+        matches!(
+            (status, value),
+            (200, GetSourceResult::Found { .. })
+                | (404, GetSourceResult::Missing { .. })
+                | (503, GetSourceResult::Unavailable { .. })
+        )
+    })
+}
+
+pub(crate) fn source_declarations(
+    response: RawResponse,
+) -> Result<Parsed<rift_protocol::source_read::FindDeclarationsResult>, ClientError> {
+    exact_response(response, &[200], |_, _| true)
+}
+
+fn exact_response<T: serde::de::DeserializeOwned>(
+    response: RawResponse,
+    statuses: &[u16],
+    accepts: impl FnOnce(u16, &T) -> bool,
+) -> Result<Parsed<T>, ClientError> {
+    let RawResponse { status, body, meta } = response;
+    if statuses.contains(&status.as_u16()) && crate::is_media(&meta, "application/json") {
+        let value: T = serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
+            status: status.as_u16(),
+        })?;
+        if !accepts(status.as_u16(), &value) {
+            return Err(ClientError::InvalidResponse {
+                status: status.as_u16(),
+            });
+        }
+        return Ok(Parsed { value, meta });
+    }
+    if status == reqwest::StatusCode::OK {
+        return Err(ClientError::InvalidMediaType {
+            status: status.as_u16(),
+            content_type: meta.content_type,
+        });
+    }
+    if matches!(
+        status.as_u16(),
+        400 | 401 | 403 | 406 | 413 | 415 | 429 | 500 | 502 | 503 | 504
+    ) && crate::is_media(&meta, "application/problem+json")
+    {
+        let problem = serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
+            status: status.as_u16(),
+        })?;
+        return Err(http_error(meta, problem));
+    }
+    Err(unknown_http_error(meta))
+}
+
 pub(crate) async fn symbols(
     response: RawResponse,
 ) -> Result<Parsed<PackageSymbolPage>, ClientError> {
@@ -141,33 +210,6 @@ pub(crate) async fn patterns(
         | SearchPackagePatternsResponse::ServiceUnavailable(problem)
         | SearchPackagePatternsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
         SearchPackagePatternsResponse::Unknown => Err(unknown_http_error(meta)),
-    }
-}
-
-pub(crate) async fn declarations(
-    response: RawResponse,
-) -> Result<Parsed<PackageDeclarationResponse>, ClientError> {
-    let (response, meta) = generated_response(response)?;
-    let status = meta.status;
-    let response = FindPackageDeclarationsRequest::parse_response(response)
-        .await
-        .map_err(|_| ClientError::Decode { status })?;
-    match response {
-        FindPackageDeclarationsResponse::Ok(value) => Ok(Parsed { value, meta }),
-        FindPackageDeclarationsResponse::BadRequest(problem)
-        | FindPackageDeclarationsResponse::Unauthorized(problem)
-        | FindPackageDeclarationsResponse::Forbidden(problem)
-        | FindPackageDeclarationsResponse::NotAcceptable(problem)
-        | FindPackageDeclarationsResponse::ContentTooLarge(problem)
-        | FindPackageDeclarationsResponse::UnsupportedMediaType(problem)
-        | FindPackageDeclarationsResponse::TooManyRequests(problem)
-        | FindPackageDeclarationsResponse::InternalServerError(problem)
-        | FindPackageDeclarationsResponse::BadGateway(problem)
-        | FindPackageDeclarationsResponse::ServiceUnavailable(problem)
-        | FindPackageDeclarationsResponse::GatewayTimeout(problem) => {
-            Err(http_error(meta, problem))
-        }
-        FindPackageDeclarationsResponse::Unknown => Err(unknown_http_error(meta)),
     }
 }
 

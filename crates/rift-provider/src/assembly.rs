@@ -167,6 +167,13 @@ impl AssembledSymbol {
             document_local: facts.is_document_local(),
         }
     }
+
+    /// Converts a captured Contribution origin using the same read representation as
+    /// logical objects and their physical declarations.
+    #[must_use]
+    pub fn wire_origin(origin: &ContributionOrigin) -> SymbolOrigin {
+        wire_symbol_origin(origin)
+    }
 }
 
 fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
@@ -175,13 +182,19 @@ fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
         location: location.map(|location| match location {
             rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
             rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
-            rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+            rift_core::SourceLocation::Stdlib { .. } => SourceLocationKind::Stdlib,
             rift_core::SourceLocation::External {} => SourceLocationKind::External,
         }),
         package: location.and_then(|location| match location {
             rift_core::SourceLocation::Project { package } => package.clone(),
             rift_core::SourceLocation::Dependency { package } => Some(package.clone()),
-            rift_core::SourceLocation::Stdlib {} | rift_core::SourceLocation::External {} => None,
+            rift_core::SourceLocation::Stdlib { .. } | rift_core::SourceLocation::External {} => {
+                None
+            }
+        }),
+        runtime: location.and_then(|location| match location {
+            rift_core::SourceLocation::Stdlib { runtime } => runtime.clone(),
+            _ => None,
         }),
         source_kind: origin.source_kind(),
     }
@@ -513,7 +526,7 @@ mod tests {
             1,
             "syntax-beacon",
             "Beacon",
-            Some("symbol:beacon"),
+            Some("rift://symbol/local/rust/app/Beacon"),
             None,
         );
         let lsp = contribution(
@@ -578,7 +591,7 @@ mod tests {
             .expect("assembled symbol");
         assert_eq!(
             lsp_first.identity().map(SymbolId::as_str),
-            Some("symbol:beacon")
+            Some("rift://symbol/local/rust/app/Beacon")
         );
         assert_eq!(lsp_first.facts().expect("portable facts").name(), "beacon");
         assert_eq!(

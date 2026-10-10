@@ -258,10 +258,8 @@ fn package_source_unit_prefix(
     unit: &rift_protocol::read::SourceUnitId,
 ) -> Result<String, ClientError> {
     let parsed = rift_core::SourceUnitId::parse(&unit.0).map_err(|_| invalid("source_identity"))?;
-    let package_prefix = format!("{}@{}/", package.name, package.version);
-    if parsed.resolver().as_str() != package.manager
-        || !parsed.key().as_str().starts_with(&package_prefix)
-    {
+    let owner = package.owner().map_err(|_| invalid("source_identity"))?;
+    if parsed.source_owner() != Some(&owner) {
         return Err(invalid("source_identity"));
     }
     Ok(unit.0.clone())
@@ -618,7 +616,7 @@ fn validate_location(
             line,
             source,
         },
-        &packages,
+        Some(&packages),
         source_bytes_max,
     )?;
     let source_unit =
@@ -630,6 +628,7 @@ fn validate_location(
 pub(crate) fn package_identity(value: &PackageIdentity) -> rift_protocol::read::PackageIdentity {
     rift_protocol::read::PackageIdentity {
         manager: value.manager.clone(),
+        registry: value.registry.clone(),
         name: value.name.clone(),
         version: value.version.clone(),
     }
@@ -741,12 +740,20 @@ fn convert_origin(value: Option<&SymbolOrigin>) -> rift_protocol::read::SymbolOr
         return rift_protocol::read::SymbolOrigin {
             location: Some(rift_protocol::read::SourceLocationKind::Project),
             package: None,
+            runtime: None,
             source_kind: rift_protocol::read::SourceKind::Authored,
         };
     };
     rift_protocol::read::SymbolOrigin {
         location: value.location.as_ref().map(convert_location),
         package: value.package.as_ref().map(package_identity),
+        runtime: value
+            .runtime
+            .as_ref()
+            .map(|runtime| rift_protocol::read::RuntimeIdentity {
+                runtime: runtime.runtime.clone(),
+                version: runtime.version.clone(),
+            }),
         source_kind: convert_source_kind(&value.source_kind),
     }
 }
@@ -996,6 +1003,7 @@ mod tests {
     fn package() -> PackageIdentity {
         PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "helper".to_owned(),
             version: "1.0.0".to_owned(),
         }
@@ -1012,6 +1020,7 @@ mod tests {
             origin: Some(SymbolOrigin {
                 location: Some(SourceLocationKind::Dependency),
                 package: Some(package.clone()),
+                runtime: None,
                 source_kind: SourceKind::Authored,
             }),
             documentation: Some(vec![crate::generated::Documentation {
@@ -1024,7 +1033,7 @@ mod tests {
     }
 
     fn unit() -> String {
-        "rift://source/cargo/helper@1.0.0/src/lib.rs".to_owned()
+        "rift://source/cargo/crates.io/helper@1.0.0/src/lib.rs".to_owned()
     }
 
     fn documentation() -> rift_protocol::documentation::DocumentationHit {
@@ -1032,13 +1041,13 @@ mod tests {
             "documentation_revision":"0123abcd",
             "block": {
                 "identity":"1".repeat(64), "content_digest":"2".repeat(64),
-                "source":{"source":{"kind":"package","unit":"rift://source/cargo/helper@1.0.0/README.md"}},
+                "source":{"source":{"kind":"package","unit":"rift://source/cargo/crates.io/helper@1.0.0/README.md"}},
                 "range":{"start":0,"end":40}, "line":1, "kind":"prose"
             },
             "source": {
-                "identity":{"source":{"kind":"package","unit":"rift://source/cargo/helper@1.0.0/README.md"}},
+                "identity":{"source":{"kind":"package","unit":"rift://source/cargo/crates.io/helper@1.0.0/README.md"}},
                 "revision":"3".repeat(64), "content_digest":"4".repeat(64),
-                "origin":{"location":"dependency","source_kind":"authored","package":{"manager":"cargo","name":"helper","version":"1.0.0"}},
+                "origin":{"location":"dependency","source_kind":"authored","package":{"manager":"cargo","registry":"crates.io","name":"helper","version":"1.0.0"}},
                 "format":"markdown", "media_type":"text/markdown", "selection":"package_archive", "byte_length":40
             }
         })).expect("documentation fixture")
@@ -1109,7 +1118,7 @@ mod tests {
                 let mut hit = original.clone();
                 hit.block.source.source = DocumentationSourceIdentity::Package {
                     unit: rift_protocol::read::SourceUnitId(
-                        "rift://source/cargo/other@1.0.0/README.md".to_owned(),
+                        "rift://source/cargo/crates.io/other@1.0.0/README.md".to_owned(),
                     ),
                 };
                 hit
@@ -1167,7 +1176,7 @@ mod tests {
         let mut omitted = documentation().source.identity;
         omitted.source = docs::DocumentationSourceIdentity::Package {
             unit: rift_protocol::read::SourceUnitId(
-                "rift://source/cargo/other@1.0.0/README.md".to_owned(),
+                "rift://source/cargo/crates.io/other@1.0.0/README.md".to_owned(),
             ),
         };
         context.warnings.push(docs::DocumentationWarning {
@@ -1184,6 +1193,7 @@ mod tests {
         let (context, target) = documentation_context_and_target();
         let other_package = rift_protocol::read::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "other".to_owned(),
             version: "1.0.0".to_owned(),
         };
@@ -1366,7 +1376,7 @@ mod tests {
             documentation: None,
             additional_properties: HashMap::new(),
         };
-        hit.unit = "rift://source/cargo/other@1.0.0/src/lib.rs".to_owned();
+        hit.unit = "rift://source/cargo/crates.io/other@1.0.0/src/lib.rs".to_owned();
         assert_eq!(
             PackageSymbolCandidate::try_from(hit),
             Err(ClientError::InvalidResponseField {

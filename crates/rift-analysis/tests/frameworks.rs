@@ -316,9 +316,11 @@ fn analyze_package(
 ) -> PackageAnalysis {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let language = ShippedLanguage::TypeScript.language();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
@@ -337,7 +339,7 @@ fn analyze_package(
         .map(|(_, text)| u64::try_from(text.len()).expect("fixture bytes"))
         .sum();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,
@@ -411,6 +413,7 @@ fn package_framework_publication_matches_fresh_supplied_and_restored_syntax() {
                     has_errors: facts.has_errors(),
                     left_out_declarations: facts.left_out_declaration_count(),
                     markdown_facts: facts.markdown_facts().cloned(),
+                    export_bindings: facts.export_bindings().map(<[_]>::to_vec),
                     source_digest: syntax.identity().source_digest,
                 },
             )
@@ -494,9 +497,11 @@ fn framework_application_checks_source_witness_and_aggregate_bounds() {
 fn package_context_metadata_shares_source_count_bytes_and_distinct_path_bounds() {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let language = ShippedLanguage::TypeScript.language();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
@@ -516,20 +521,20 @@ fn package_context_metadata_shares_source_count_bytes_and_distinct_path_bounds()
         ExactPackageLimits::new(1, bytes),
         ExactPackageLimits::new(2, bytes - 1),
     ] {
-        let input = ExactPackageInput::new(&package, &language, &origin, &selected, limits)
+        let input = ExactPackageInput::new(&owner, &language, &origin, &selected, limits)
             .expect("selected source fits");
         assert!(input.with_framework_context(&metadata, &[]).is_err());
     }
     let limits = ExactPackageLimits::new(2, bytes);
     assert!(
-        ExactPackageInput::new(&package, &language, &origin, &selected, limits)
+        ExactPackageInput::new(&owner, &language, &origin, &selected, limits)
             .expect("selected source")
             .with_framework_context(&metadata, &[])
             .is_ok()
     );
     let duplicate = [PackageSource::new(&path, metadata_text)];
     assert!(
-        ExactPackageInput::new(&package, &language, &origin, &selected, limits)
+        ExactPackageInput::new(&owner, &language, &origin, &selected, limits)
             .expect("selected source")
             .with_framework_context(&duplicate, &[])
             .is_err()

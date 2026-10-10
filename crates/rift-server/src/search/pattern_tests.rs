@@ -423,7 +423,7 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
             rift_error::errors::server::read_invalid::SLUG,
         ),
         (
-            json!({"pattern": "TODO", "traversal": {"seed": "rift://symbol/rust/src/lib.rs/alpha"}}),
+            json!({"pattern": "TODO", "traversal": {"seed": crate::read::tests::local_identity("rust", &["beacon", "alpha"])}}),
             "a walk answers relationships",
             rift_error::errors::server::read_invalid::SLUG,
         ),

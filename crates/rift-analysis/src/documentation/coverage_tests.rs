@@ -22,6 +22,7 @@ fn source(path: &str, text: &str, format: DocumentationSourceFormat) -> Document
         origin: SymbolOrigin {
             location: Some(SourceLocationKind::Project),
             package: None,
+            runtime: None,
             source_kind: SourceKind::Authored,
         },
         format,
@@ -413,8 +414,8 @@ fn reference_candidate() -> rift_protocol::documentation::DocumentationIndex {
     )
     .identity;
     let rust = rift_protocol::read::Language::from_identity_segment("rust").expect("Rust");
-    let compass = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Compass"));
-    let beacon = SymbolId(rift_core::symbol_identity("rust", "lib.rs", "Beacon"));
+    let compass = super::collect_tests::canonical_symbol("rust", "lib.rs", "Compass");
+    let beacon = super::collect_tests::canonical_symbol("rust", "lib.rs", "Beacon");
     let declarations = [
         DocumentationDeclaration::new(
             &compass,

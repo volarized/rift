@@ -11,18 +11,16 @@ use rift_index::{
     IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, WorkspaceIndex,
 };
 use rift_protocol::read::{
-    ExactKind, Extensions, GraphHop, HopDirection, MatchedField, ReadWarning, Relationship,
-    RelationshipDerivation, RelationshipFacet, SEARCH_TRAVERSAL_DEPTH_MAX,
-    SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit, SearchHitTarget,
-    SearchTraversal, SymbolId, TraversalDirection,
+    GraphHop, HopDirection, MatchedField, ReadWarning, Relationship, RelationshipFacet,
+    SEARCH_TRAVERSAL_DEPTH_MAX, SEARCH_TRAVERSAL_DEPTH_MIN, SEARCH_TRAVERSAL_FACETS_MAX, SearchHit,
+    SearchHitTarget, SearchTraversal, SymbolId, TraversalDirection,
 };
 use rift_ranking::IdentifierMatchClass;
 use rift_syntax::SyntaxSymbol;
 
 use crate::engine_read::{EngineReferences, PackageDeclaration};
-use crate::read::parse_symbol_address;
 use crate::read::{ReadService, RiftError};
-use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes, resolve_symbol};
+use crate::search::{HitPayloads, build_symbol_hit, find_symbol_hit_mut, includes};
 
 /// Refuses `traversal` when `depth` or `facets` breaks the bound its schema advertises.
 /// `schemars`' `range`/`length` constraints are advisory only, so this mirrors them the same
@@ -157,7 +155,7 @@ pub(crate) fn merge_walk_hits(
         if merge.to.is_some_and(|to| to.0 != identity.as_str()) {
             continue;
         }
-        let Some((file, symbol)) = resolve_graph_symbol(reads.index(), &identity) else {
+        let Some((file, symbol)) = resolve_graph_symbol(reads.index(), &identity)? else {
             if let Some(declaration) = merge.references.package_declaration(&identity)
                 && merge.matcher.is_none()
             {
@@ -179,11 +177,11 @@ pub(crate) fn merge_walk_hits(
 /// Whether this snapshot can start a walk at `identity`: a relationship-store node, or a
 /// lexical declaration the store simply holds no edge for. A real, isolated declaration is
 /// walkable; its walk finds nothing.
-pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> bool {
+pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> Result<bool, RiftError> {
     let store = reads.relationships();
-    !store.outgoing(identity).is_empty()
+    Ok(!store.outgoing(identity).is_empty()
         || !store.incoming(identity).is_empty()
-        || resolve_graph_symbol(reads.index(), identity).is_some()
+        || resolve_graph_symbol(reads.index(), identity)?.is_some())
 }
 
 /// The relationship coverage `traversal` asks for that no lane populates: the requested
@@ -268,22 +266,25 @@ fn resolve_traversal_seed(reads: &ReadService, seed: &SymbolId) -> Result<CoreSy
             .path(seed.0.clone())
             .error()
     })?;
-    if walkable(reads, &identity) {
+    if walkable(reads, &identity)? {
         Ok(identity)
     } else {
         errors::server::read_not_found().path(seed.0.clone()).fail()
     }
 }
 
-/// Resolves one graph-walked identity back to its declaration, the way a ranked lexical unit
-/// resolves: parse the wire address the identity spells, then scan the addressed file for the
-/// matching declaration.
+/// Resolves a graph identity through the captured canonical declaration inventory.
+///
+/// # Errors
+/// Returns [`RiftError`] when captured declarations cannot be assembled.
 pub(crate) fn resolve_graph_symbol<'a>(
     index: &'a WorkspaceIndex,
     identity: &CoreSymbolId,
-) -> Option<(&'a IndexedFile, &'a SyntaxSymbol)> {
-    let address = parse_symbol_address(identity.as_str()).ok()?;
-    resolve_symbol(index, &address.path, identity.as_str())
+) -> Result<Option<(&'a IndexedFile, &'a SyntaxSymbol)>, RiftError> {
+    Ok(index
+        .symbols_by_identity(identity, 1)?
+        .first()
+        .map(|matched| (matched.file, matched.symbol)))
 }
 
 /// One traversal walk's outcome: each discovered symbol with its shortest path, and whether
@@ -486,22 +487,9 @@ fn combined_edges<'edge>(
 /// facet spelling, the least invented value this lane can honestly report.
 fn graph_hop(edge: &RelationshipEdge, direction: HopDirection) -> GraphHop {
     GraphHop {
-        relationship: Relationship {
-            from: wire_symbol_id(edge.from()),
-            kind: ExactKind(edge.facet().as_ref().to_owned()),
-            facets: vec![edge.facet()],
-            to: wire_symbol_id(edge.to()),
-            evidence: edge.occurrence().node().cloned().into_iter().collect(),
-            derivation: RelationshipDerivation::Resolution,
-            confidence: None,
-            extensions: Extensions::default(),
-        },
+        relationship: edge.to_protocol(),
         direction,
     }
-}
-
-fn wire_symbol_id(identity: &CoreSymbolId) -> SymbolId {
-    SymbolId(identity.as_str().to_owned())
 }
 
 /// A reached symbol's `relevance` score: a closer hit (`distance` 1) scores higher than a
@@ -524,16 +512,16 @@ fn merge_traversal_hit(
     merge: WalkMerge<'_>,
 ) -> Result<(), RiftError> {
     let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
-    if let Some(existing) = find_symbol_hit_mut(results, file, symbol) {
-        absorb_traversal_match(existing, path, distance);
-        return Ok(());
-    }
     let matched = SymbolMatch {
         file,
         symbol,
         // This lane supplies `score` from `distance` and never reads identifier rank.
         rank: IdentifierMatchClass::Substring.into(),
     };
+    if let Some(existing) = find_symbol_hit_mut(index, results, matched)? {
+        absorb_traversal_match(existing, path, distance);
+        return Ok(());
+    }
     let mut hit = build_symbol_hit(
         index,
         matched,
@@ -592,8 +580,9 @@ pub(crate) mod tests {
     use rift_index::{RelationshipStore, WorkspaceIndexLimits};
     use rift_protocol::configuration::HistoryConfiguration;
     use rift_protocol::read::{
-        MatchedField, ReadWarning, RelationshipFacet, SearchHitTarget, SearchParams, SearchResult,
-        SearchTraversal, TraversalDirection,
+        ExactKind, Extensions, MatchedField, ReadWarning, RelationshipDerivation,
+        RelationshipFacet, SearchHitTarget, SearchParams, SearchResult, SearchTraversal,
+        TraversalDirection,
     };
     use rift_provider::{
         NormalizedGraph, Normalizer, ProviderPublication, PublicationLimits, PublicationSet,
@@ -602,8 +591,8 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CoreSymbolId, EngineReferences, ExactKind, Extensions, GraphHop, Relationship,
-        RelationshipDerivation, TRAVERSAL_NODES_MAX, walk_traversal_capped,
+        CoreSymbolId, EngineReferences, GraphHop, Relationship, TRAVERSAL_NODES_MAX,
+        walk_traversal_capped,
     };
     use crate::read::ReadService;
     use crate::search::StoreAnswer;
@@ -737,6 +726,16 @@ pub(crate) mod tests {
         .expect("fixture normalized graph")
     }
 
+    pub(crate) fn graph_identity(name: &str) -> String {
+        rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            rift_protocol::read::Language::from_identity_segment("rust").expect("fixture language"),
+            vec!["beacon".to_owned(), name.to_owned()],
+        )
+        .expect("fixture identity")
+        .wire_identity()
+    }
+
     fn graph_symbol_id(text: &str) -> CoreSymbolId {
         CoreSymbolId::new(text).expect("fixture symbol identity")
     }
@@ -746,11 +745,11 @@ pub(crate) mod tests {
     /// `imports` edge.
     pub(crate) fn call_graph_store() -> RelationshipStore {
         let contributions = vec![
-            graph_definition("root", "rift://symbol/rust/lib.rs/root", (0, 40)),
-            graph_definition("branch_a", "rift://symbol/rust/lib.rs/branch_a", (40, 80)),
-            graph_definition("branch_b", "rift://symbol/rust/lib.rs/branch_b", (80, 120)),
-            graph_definition("leaf", "rift://symbol/rust/lib.rs/leaf", (120, 160)),
-            graph_definition("helper", "rift://symbol/rust/lib.rs/helper", (160, 200)),
+            graph_definition("root", graph_identity("root").as_str(), (0, 40)),
+            graph_definition("branch_a", graph_identity("branch_a").as_str(), (40, 80)),
+            graph_definition("branch_b", graph_identity("branch_b").as_str(), (80, 120)),
+            graph_definition("leaf", graph_identity("leaf").as_str(), (120, 160)),
+            graph_definition("helper", graph_identity("helper").as_str(), (160, 200)),
             graph_reference(
                 "root_calls_branch_a",
                 graph_binding("lib.rs", 5, 10),
@@ -788,8 +787,8 @@ pub(crate) mod tests {
     /// A recursive declaration: `loop_fn` calls itself, so the walk meets its own seed.
     fn recursive_store() -> RelationshipStore {
         let contributions = vec![
-            graph_definition("loop_fn", "rift://symbol/rust/lib.rs/loop_fn", (0, 40)),
-            graph_definition("caller", "rift://symbol/rust/lib.rs/caller", (40, 80)),
+            graph_definition("loop_fn", graph_identity("loop_fn").as_str(), (0, 40)),
+            graph_definition("caller", graph_identity("caller").as_str(), (40, 80)),
             graph_reference(
                 "loop_fn_calls_loop_fn",
                 graph_binding("lib.rs", 5, 10),
@@ -823,7 +822,7 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_incoming_walks_edges_backward_and_keeps_their_natural_orientation() {
         let store = call_graph_store();
-        let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
+        let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 1, vec![]);
         let discovered =
             walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
@@ -831,8 +830,8 @@ pub(crate) mod tests {
         assert_eq!(
             reached,
             [
-                "rift://symbol/rust/lib.rs/branch_a",
-                "rift://symbol/rust/lib.rs/branch_b",
+                graph_identity("branch_a").as_str(),
+                graph_identity("branch_b").as_str(),
             ]
         );
         for (reached_id, path) in &discovered {
@@ -848,7 +847,7 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_facet_filter_keeps_only_the_named_facets() {
         let store = call_graph_store();
-        let helper = graph_symbol_id("rift://symbol/rust/lib.rs/helper");
+        let helper = graph_symbol_id(graph_identity("helper").as_str());
         let reached = |facets: Vec<RelationshipFacet>| {
             let request = traversal_request(&helper, 1, facets);
             walk_traversal_capped(&store, &helper, &request, TRAVERSAL_NODES_MAX)
@@ -859,7 +858,7 @@ pub(crate) mod tests {
         };
         assert_eq!(
             reached(vec![RelationshipFacet::Imports]),
-            ["rift://symbol/rust/lib.rs/root"],
+            [graph_identity("root").as_str()],
             "the one edge arriving at helper is an imports edge"
         );
         assert!(
@@ -873,13 +872,13 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_depth_bound_and_shortest_path_win_together() {
         let store = call_graph_store();
-        let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
+        let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 2, vec![]);
         let discovered =
             walk_traversal_capped(&store, &leaf, &request, TRAVERSAL_NODES_MAX).discovered;
         let root_hits: Vec<_> = discovered
             .iter()
-            .filter(|(id, _)| id.as_str() == "rift://symbol/rust/lib.rs/root")
+            .filter(|(id, _)| id.as_str() == graph_identity("root").as_str())
             .collect();
         assert_eq!(
             root_hits.len(),
@@ -901,7 +900,7 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_capped_stops_discovering_new_nodes_past_its_bound() {
         let store = call_graph_store();
-        let leaf = graph_symbol_id("rift://symbol/rust/lib.rs/leaf");
+        let leaf = graph_symbol_id(graph_identity("leaf").as_str());
         let request = traversal_request(&leaf, 2, vec![]);
         let walk = walk_traversal_capped(&store, &leaf, &request, 2);
         assert!(
@@ -918,8 +917,8 @@ pub(crate) mod tests {
         assert_eq!(
             reached,
             [
-                "rift://symbol/rust/lib.rs/branch_a",
-                "rift://symbol/rust/lib.rs/branch_b",
+                graph_identity("branch_a").as_str(),
+                graph_identity("branch_b").as_str(),
             ],
             "the store's own sorted order makes the first two discoveries deterministic"
         );
@@ -930,7 +929,7 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_named_seed_is_never_reported_however_the_walk_reaches_it() {
         let store = recursive_store();
-        let loop_fn = graph_symbol_id("rift://symbol/rust/lib.rs/loop_fn");
+        let loop_fn = graph_symbol_id(graph_identity("loop_fn").as_str());
         let request = traversal_request(&loop_fn, 2, vec![]);
         let discovered =
             walk_traversal_capped(&store, &loop_fn, &request, TRAVERSAL_NODES_MAX).discovered;
@@ -938,7 +937,7 @@ pub(crate) mod tests {
         let reached: Vec<&str> = discovered.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(
             reached,
-            ["rift://symbol/rust/lib.rs/caller"],
+            [graph_identity("caller").as_str()],
             "a declaration that calls itself still reaches its caller: {reached:?}"
         );
         assert!(
@@ -1074,7 +1073,7 @@ pub(crate) mod tests {
     #[test]
     fn walk_traversal_from_an_edgeless_seed_finds_nothing() {
         let store = call_graph_store();
-        let root = graph_symbol_id("rift://symbol/rust/lib.rs/root");
+        let root = graph_symbol_id(graph_identity("root").as_str());
         // `root` has outgoing edges, and nothing arrives at it.
         let request = traversal_request(&root, 2, vec![]);
         let discovered =
@@ -1097,6 +1096,7 @@ pub(crate) mod tests {
                 facets: vec![RelationshipFacet::References],
                 to: rift_protocol::read::SymbolId(to.to_owned()),
                 evidence: Vec::new(),
+                occurrence: None,
                 derivation: RelationshipDerivation::Resolution,
                 confidence: None,
                 extensions: Extensions::default(),
@@ -1112,7 +1112,24 @@ pub(crate) mod tests {
     /// `WorkspaceIndex::file`; the references are what a configured language engine
     /// answers for this read, the one lane that resolves them.
     fn live_reference_graph_fixture() -> TestResult<(TempDir, ReadService, EngineReferences)> {
+        live_reference_graph_fixture_with_root(true)
+    }
+
+    fn captured_cargo_root(directory: &TempDir) -> TestResult {
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname = 'beacon'\nversion = '1.0.0'\n[lib]\npath = 'lib.rs'\n",
+        )?;
+        Ok(())
+    }
+
+    fn live_reference_graph_fixture_with_root(
+        captured_root: bool,
+    ) -> TestResult<(TempDir, ReadService, EngineReferences)> {
         let directory = tempfile::tempdir()?;
+        if captured_root {
+            captured_cargo_root(&directory)?;
+        }
         fs::write(
             directory.path().join("lib.rs"),
             "pub fn root() {\n    branch_a();\n    branch_b();\n}\n\
@@ -1128,7 +1145,7 @@ pub(crate) mod tests {
             &rift_core::TextFileInclusion::default(),
             HistoryConfiguration::default(),
         )?;
-        let symbol = |name: &str| format!("rift://symbol/rust/lib.rs/{name}");
+        let symbol = graph_identity;
         let entry = |name: &str, callers: &[&str]| {
             Ok::<_, Box<dyn Error>>((
                 CoreSymbolId::new(symbol(name))?,
@@ -1152,6 +1169,7 @@ pub(crate) mod tests {
     /// and no engine answers for a seed in it.
     fn engineless_fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        captured_cargo_root(&directory)?;
         fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
         let service = ReadService::build_with_languages(
             directory.path(),
@@ -1170,7 +1188,7 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf"
+                "seed": graph_identity("leaf").as_str()
             }
         }))?;
         let result = service.search_with_references(
@@ -1197,7 +1215,7 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf"
+                "seed": graph_identity("leaf").as_str()
             },
             "paths": { "include": ["elsewhere/**"] }
         }))?;
@@ -1219,9 +1237,9 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf",
+                "seed": graph_identity("leaf").as_str(),
                 "depth": 2,
-                "to": "rift://symbol/rust/lib.rs/root"
+                "to": graph_identity("root").as_str()
             }
         }))?;
         let result = service.search_with_references(
@@ -1244,8 +1262,8 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf",
-                "to": "rift://symbol/rust/lib.rs/root"
+                "seed": graph_identity("leaf").as_str(),
+                "to": graph_identity("root").as_str()
             }
         }))?;
         let result = service.search_with_references(
@@ -1263,7 +1281,7 @@ pub(crate) mod tests {
         let params: SearchParams = serde_json::from_value(json!({
             "target": "file",
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf"
+                "seed": graph_identity("leaf").as_str()
             }
         }))?;
         let result = service.search_with_references(
@@ -1287,7 +1305,7 @@ pub(crate) mod tests {
             "target": "symbol",
             "include": ["score"],
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf"
+                "seed": graph_identity("leaf").as_str()
             }
         }))?;
         let result = service.search_with_references(
@@ -1324,12 +1342,25 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/ghost"
+                "seed": graph_identity("ghost").as_str()
             }
         }))?;
         let error = service
             .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
             .expect_err("an unresolvable seed must refuse");
+        assert_eq!(error.slug().as_str(), "rift.server.read_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn search_traversal_without_captured_root_refuses_unproved_identity() -> TestResult {
+        let (_directory, service, references) = live_reference_graph_fixture_with_root(false)?;
+        let params: SearchParams = serde_json::from_value(json!({
+            "traversal": { "seed": graph_identity("leaf") }
+        }))?;
+        let error = service
+            .search_with_references(&params, &StoreAnswer::identifier_only(), &references)
+            .expect_err("engine references do not establish an unproved namespace");
         assert_eq!(error.slug().as_str(), "rift.server.read_not_found");
         Ok(())
     }
@@ -1342,7 +1373,7 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/isolated"
+                "seed": graph_identity("isolated").as_str()
             }
         }))?;
         let result = service.search_with_references(
@@ -1376,7 +1407,7 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let request = json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf",
+                "seed": graph_identity("leaf").as_str(),
                 "facets": ["references"]
             }
         });
@@ -1398,7 +1429,7 @@ pub(crate) mod tests {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let request = json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf",
+                "seed": graph_identity("leaf").as_str(),
                 "facets": ["implements", "references"]
             }
         });
@@ -1425,7 +1456,7 @@ pub(crate) mod tests {
         let (_directory, service) = engineless_fixture()?;
         let request = json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/beacon"
+                "seed": graph_identity("beacon").as_str()
             }
         });
         let params: SearchParams = serde_json::from_value(request)?;
@@ -1446,7 +1477,7 @@ pub(crate) mod tests {
         let params: SearchParams = serde_json::from_value(json!({
             "rev": "HEAD",
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/leaf"
+                "seed": graph_identity("leaf").as_str()
             }
         }))?;
         let error =
@@ -1462,7 +1493,7 @@ pub(crate) mod tests {
         let params: SearchParams = serde_json::from_value(json!({
             "rev": "main",
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root"
+                "seed": graph_identity("root").as_str()
             }
         }))
         .expect("well-formed request must parse");
@@ -1478,7 +1509,7 @@ pub(crate) mod tests {
     fn validate_search_refuses_traversal_depth_and_facets_out_of_bound() {
         let over_depth: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root",
+                "seed": graph_identity("root").as_str(),
                 "depth": 3
             }
         }))
@@ -1490,7 +1521,7 @@ pub(crate) mod tests {
         let padded_facets = vec![json!("calls"); super::SEARCH_TRAVERSAL_FACETS_MAX + 1];
         let over_facets: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/lib.rs/root",
+                "seed": graph_identity("root").as_str(),
                 "facets": padded_facets
             }
         }))
@@ -1501,8 +1532,8 @@ pub(crate) mod tests {
     }
     #[test]
     fn confirmed_reference_preserves_indexed_evidence_and_one_hit() {
-        let caller = graph_symbol_id("rift://symbol/rust/lib.rs/caller");
-        let target = graph_symbol_id("rift://symbol/rust/lib.rs/target");
+        let caller = graph_symbol_id(graph_identity("caller").as_str());
+        let target = graph_symbol_id(graph_identity("target").as_str());
         let store = RelationshipStore::build(&graph_normalized(vec![
             graph_definition("caller", caller.as_str(), (0, 40)),
             graph_definition("target", target.as_str(), (40, 80)),
@@ -1541,8 +1572,8 @@ pub(crate) mod tests {
     /// confirmation of the indexed edge.
     #[test]
     fn confirmed_call_preserves_indexed_evidence_and_one_hit() {
-        let caller = graph_symbol_id("rift://symbol/rust/lib.rs/caller");
-        let target = graph_symbol_id("rift://symbol/rust/lib.rs/target");
+        let caller = graph_symbol_id(graph_identity("caller").as_str());
+        let target = graph_symbol_id(graph_identity("target").as_str());
         let store = RelationshipStore::build(&graph_normalized(vec![
             graph_definition("caller", caller.as_str(), (0, 40)),
             graph_definition("target", target.as_str(), (40, 80)),

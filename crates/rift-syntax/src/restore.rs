@@ -25,6 +25,8 @@ pub struct SyntaxFactsParts {
     pub language: Language,
     /// Normalized declarations in source order.
     pub symbols: Vec<SyntaxSymbol>,
+    /// Recorded export bindings. Missing facts remain unknown.
+    pub export_bindings: Option<Vec<crate::SyntaxExportBinding>>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
     /// Number of extracted declarations the provider omitted.
@@ -377,6 +379,8 @@ fn validate_symbol(
     }
     range(source, symbol.range)?;
     range(source, symbol.item_range)?;
+    validate_module_path(source, language, symbol)?;
+    validate_python_overload(source, language, symbol)?;
     if !contains(symbol.range, symbol.item_range) {
         return Err(errors::syntax::facts_range_invalid().error());
     }
@@ -405,6 +409,104 @@ fn validate_symbol(
         validate_signature(signature, names, language, limits)?;
     }
     ordered(symbol.documentation_ranges.iter().copied())?;
+    Ok(())
+}
+
+fn validate_python_overload(
+    source: &str,
+    language: &Language,
+    symbol: &SyntaxSymbol,
+) -> Result<(), RiftError> {
+    let Some(state) = &symbol.python_overload else {
+        return Ok(());
+    };
+    if language != &ShippedLanguage::Python.language() || symbol.kind != "function" {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    let crate::PythonOverload::Overload {
+        import_statement,
+        module,
+        imported,
+        binding,
+        decorator,
+    } = state
+    else {
+        return Ok(());
+    };
+    let slice = |value: ByteRange| -> Result<&str, RiftError> {
+        range(source, value)?;
+        let start = usize::try_from(value.start)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        let end = usize::try_from(value.end)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        source
+            .get(start..end)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| errors::syntax::facts_range_invalid().error())
+    };
+    let statement = slice(*import_statement)?;
+    let module_text = slice(*module)?;
+    let binding_text = slice(*binding)?;
+    let decorator_text = slice(*decorator)?;
+    if !matches!(module_text, "typing" | "typing_extensions")
+        || !contains(*import_statement, *module)
+        || !contains(*import_statement, *binding)
+        || import_statement.end > symbol.range.start
+        || !contains(symbol.range, *decorator)
+        || decorator.end > symbol.item_range.start
+    {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    let valid = match imported {
+        Some(imported) => {
+            contains(*import_statement, *imported)
+                && slice(*imported)? == "overload"
+                && statement.starts_with("from ")
+                && decorator_text == binding_text
+        }
+        None => {
+            statement.starts_with("import ")
+                && decorator_text.strip_suffix(".overload") == Some(binding_text)
+        }
+    };
+    if !valid {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    Ok(())
+}
+
+fn validate_module_path(
+    source: &str,
+    language: &Language,
+    symbol: &SyntaxSymbol,
+) -> Result<(), RiftError> {
+    let Some(state) = &symbol.module_path else {
+        return Ok(());
+    };
+    if language != &ShippedLanguage::Rust.language()
+        || symbol.kind != "module"
+        || symbol.node_kind.is_some_and(|kind| kind != "mod_item")
+    {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    if let crate::RustModulePath::Literal {
+        path,
+        range: literal,
+    } = state
+    {
+        range(source, *literal)?;
+        let start = usize::try_from(literal.start)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        let end = usize::try_from(literal.end)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        if path.as_str().is_empty()
+            || literal.start == literal.end
+            || literal.end > symbol.item_range.start
+            || source.get(start..end) != Some(path.as_str())
+        {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+    }
     Ok(())
 }
 
@@ -602,6 +704,7 @@ impl SyntaxFacts {
         parts: SyntaxFactsParts,
     ) -> Result<Self, RiftError> {
         validate_symbols(source, limits, &parts)?;
+        validate_export_bindings(source, limits, &parts)?;
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {
                 return Err(errors::syntax::facts_structure_invalid().error());
@@ -623,6 +726,73 @@ fn embedded_symbol_kind(name: &str) -> Option<&'static str> {
             )
         })
         .or_else(|| crate::css::restored_symbol_kind(name))
+}
+
+fn validate_export_bindings(
+    source: &str,
+    limits: SyntaxLimits,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    let Some(bindings) = &parts.export_bindings else {
+        return Ok(());
+    };
+    if ![
+        ShippedLanguage::JavaScript.language(),
+        ShippedLanguage::TypeScript.language(),
+        ShippedLanguage::TypeScriptTsx.language(),
+    ]
+    .contains(&parts.language)
+    {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    count(bindings.len(), limits)?;
+    ordered(bindings.iter().map(|binding| binding.range))?;
+    let containers = parts
+        .symbols
+        .iter()
+        .map(|symbol| (symbol.qualified_name.as_str(), symbol.range))
+        .collect::<BTreeMap<_, _>>();
+    let mut previous = None;
+    for binding in bindings {
+        range(source, binding.range)?;
+        if binding.range.start == binding.range.end || previous == Some(binding) {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+        previous = Some(binding);
+        for token in binding
+            .local
+            .into_iter()
+            .chain(binding.exported)
+            .chain(binding.source)
+        {
+            range(source, token)?;
+            if token.start == token.end || !contains(binding.range, token) {
+                return Err(errors::syntax::facts_range_invalid().error());
+            }
+        }
+        if let Some(container) = &binding.container
+            && (!rift_core::is_portable_name(container)
+                || !containers
+                    .get(container.as_str())
+                    .is_some_and(|range| contains(*range, binding.range)))
+        {
+            return Err(errors::syntax::facts_reference_invalid().error());
+        }
+        let form_valid = match binding.kind {
+            crate::SyntaxExportKind::Named => binding.local.is_some() && binding.exported.is_some(),
+            crate::SyntaxExportKind::All => {
+                binding.source.is_some() && binding.local.is_none() && binding.exported.is_none()
+            }
+            crate::SyntaxExportKind::Namespace => {
+                binding.source.is_some() && binding.exported.is_some() && binding.local.is_none()
+            }
+            crate::SyntaxExportKind::Default => binding.source.is_none(),
+        };
+        if !form_valid {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+    }
+    Ok(())
 }
 
 fn grammar_node_kind(grammar: &'static tree_sitter::Language, name: &str) -> Option<&'static str> {

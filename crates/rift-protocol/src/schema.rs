@@ -80,6 +80,7 @@ mod keyword {
     pub(super) const MAX_PROPERTIES: &str = "maxProperties";
     pub(super) const MIN_ITEMS: &str = "minItems";
     pub(super) const MAX_ITEMS: &str = "maxItems";
+    pub(super) const MAX_LENGTH: &str = "maxLength";
 
     pub(super) const PATTERN: &str = "pattern";
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
@@ -797,6 +798,22 @@ fn annotate_property_in(owner: &mut Map<String, Value>, name: &str, key: &str, a
 /// extension keywords that ride a property's own clause.
 fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Value) {
     annotate_property_in(schema.ensure_object(), name, key, annotation);
+}
+
+/// Retains the existing symbol representation under the provider's name bound.
+///
+/// JSON Schema counts characters. Its ceiling permits every name within the provider's
+/// 8192 UTF-8 byte bound; artifact consumers also validate that byte bound before admission.
+/// This override applies only to artifact objects and leaves the public symbol schema intact.
+pub(crate) fn artifact_objects_schema(generator: &mut schemars::SchemaGenerator) -> Schema {
+    let mut object = <crate::read::Symbol as schemars::JsonSchema>::json_schema(generator);
+    annotate_property(
+        &mut object,
+        property!(crate::read::Symbol, name),
+        keyword::MAX_LENGTH,
+        json!(8192),
+    );
+    schemars::json_schema!({"type": "array", "items": object.to_value()})
 }
 
 /// States `default: []` on each named array property: schemars omits `default` when a
@@ -1646,6 +1663,39 @@ pub fn pair_range_with_line(schema: &mut Schema) {
             requires(&range_and_line),
         ),
     );
+}
+
+/// Analysis warnings carry a physical source unit and range together or neither.
+pub fn pair_identity_unresolved_source(schema: &mut Schema) {
+    let pair = ["unit", "range"];
+    append(
+        schema,
+        when(
+            properties(vec![(
+                "code",
+                json!({ keyword::ENUM: ["identity_unresolved", "object_unavailable"] }),
+            )]),
+            one_of(vec![
+                requires(&pair),
+                not(any_of(vec![requires(&pair[..1]), requires(&pair[1..])])),
+            ]),
+        ),
+    );
+    for (first, second) in [("unit", "range"), ("range", "unit")] {
+        append(
+            schema,
+            when(
+                properties(vec![
+                    (
+                        "code",
+                        json!({ keyword::ENUM: ["identity_unresolved", "object_unavailable"] }),
+                    ),
+                    (first, json!({"type": "null"})),
+                ]),
+                properties(vec![(second, json!({"type": "null"}))]),
+            ),
+        );
+    }
 }
 
 /// A [`GetSymbolHit`](crate::read::GetSymbolHit) addresses its declaration through
