@@ -4811,6 +4811,7 @@ dependencies = [
  "serde_json_canonicalizer",
  "serde_path_to_error",
  "strum",
+ "unicode-ident",
  "url",
 ]
 

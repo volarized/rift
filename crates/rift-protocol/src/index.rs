@@ -14,6 +14,12 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+mod artifact;
+pub use artifact::{
+    PACKAGE_ARTIFACT_BYTES_MAX, PACKAGE_ARTIFACT_TAGS_MAX, PackageArtifact,
+    PackageArtifactViolation, WheelTag, python_identifier_is_valid,
+};
+
 use crate::documentation::DocumentationIndex;
 use crate::read::{
     Digest, Documentation, ExactKind, Language, PackageIdentity, ProjectPath, Signature,

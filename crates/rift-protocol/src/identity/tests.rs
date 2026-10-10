@@ -125,6 +125,46 @@ fn test_source_unit_boundary_checks_decoded_and_encoded_limits() {
 }
 
 #[test]
+fn test_source_unit_schema_preserves_owner_boundaries_and_relative_paths() {
+    use crate::read::SourceUnitId;
+    let schema = serde_json::to_value(schemars::schema_for!(SourceUnitId)).expect("source schema");
+    let validator = jsonschema::validator_for(&schema).expect("source pattern compiles");
+    for (value, accepted) in [
+        ("rift://source/project/src/file~2.rs", true),
+        (
+            "rift://source/custom/registry.example/demo@1.0.0/file.rs",
+            true,
+        ),
+        (
+            "rift://source/npm/registry.example:8443%2Fnpm/@types/node@26.6.4/fs%7E2.d.ts",
+            true,
+        ),
+        ("rift://source/stdlib/cpython@3.12.9/Lib/sys.py", true),
+        ("rift://source/project/src/cafe%CC%81.rs", true),
+        ("rift://source/cargo/demo@1.0.0/src/lib.rs", false),
+        ("rift://source/stdlib/python/3.12.9/Lib/sys.py", false),
+        ("rift://source/project/src//lib.rs", false),
+        ("rift://source/project/src/../lib.rs", false),
+        ("rift://source/project/src%2Flib.rs", false),
+        ("rift://source/project/src%2flib.rs", false),
+        ("rift://source/project/src/%0A.rs", false),
+        ("rift://source/project/C:/file.rs", false),
+        ("rift://source/npm/npmjs.org/demo@1.0.0/file~2.ts", false),
+    ] {
+        assert_eq!(
+            validator.is_valid(&serde_json::json!(value)),
+            accepted,
+            "schema: {value}"
+        );
+        assert_eq!(
+            SourceUnitId::parse(value).is_ok(),
+            accepted,
+            "codec: {value}"
+        );
+    }
+}
+
+#[test]
 fn test_source_digest_requires_full_lowercase_sha256() {
     let digest = super::SourceDigest::parse(&"a".repeat(64)).expect("full digest");
     assert_eq!(digest.as_str(), "a".repeat(64));

@@ -7,6 +7,7 @@ use rift_error::{RiftError, errors};
 #[cfg(feature = "collector")]
 use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::index::PACKAGE_SOURCE_BYTES_CEILING;
+use rift_protocol::index::PackageArtifact;
 use rift_protocol::read::{Language, PackageIdentity};
 #[cfg(feature = "collector")]
 use rift_provider::{
@@ -14,6 +15,13 @@ use rift_provider::{
 };
 #[cfg(feature = "collector")]
 use rift_syntax::SyntaxLimits;
+
+mod import_root;
+
+pub use import_root::{
+    PACKAGE_IMPORT_BYTES_MAX, PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot,
+    PackageImportRootOrigin,
+};
 
 /// Checked retained-source bounds supplied by the package caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +307,8 @@ pub struct ExactPackageInput<'input> {
     files: &'input [PackageSource<'input>],
     context_sources: &'input [PackageSource<'input>],
     frameworks: &'input [rift_protocol::configuration::SyntaxFrameworkConfiguration],
+    import_roots: &'input [PackageImportRoot],
+    artifact: Option<&'input PackageArtifact>,
     limits: ExactPackageLimits,
 }
 
@@ -367,6 +377,8 @@ impl<'input> ExactPackageInput<'input> {
             files,
             context_sources: &[],
             frameworks: &[],
+            import_roots: &[],
+            artifact: None,
             limits,
         })
     }
@@ -375,6 +387,39 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub const fn package(self) -> &'input PackageIdentity {
         self.package
+    }
+
+    /// Adds established import roots without rewriting original source paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error for duplicate prefixes or exceeded aggregate bounds.
+    pub fn with_import_roots(
+        mut self,
+        roots: &'input [PackageImportRoot],
+    ) -> Result<Self, RiftError> {
+        import_root::validate_roots(roots)?;
+        self.import_roots = roots;
+        Ok(self)
+    }
+
+    /// Adds the validated selected artifact and its full content digest.
+    #[must_use]
+    pub const fn with_artifact(mut self, artifact: &'input PackageArtifact) -> Self {
+        self.artifact = Some(artifact);
+        self
+    }
+
+    /// Established import roots; an empty set leaves import placement unresolved.
+    #[must_use]
+    pub const fn import_roots(self) -> &'input [PackageImportRoot] {
+        self.import_roots
+    }
+
+    /// Selected artifact, when its immutable content was captured.
+    #[must_use]
+    pub const fn artifact(self) -> Option<&'input PackageArtifact> {
+        self.artifact
     }
 
     /// Catalog language.

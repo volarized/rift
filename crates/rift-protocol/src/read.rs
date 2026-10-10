@@ -2025,25 +2025,35 @@ pub struct SourceSpan {
     pub range: TextRange,
 }
 
-/// Stable identity of one source unit in the source catalog: a resolver identity, then that
-/// resolver's canonical unit key in canonical percent-encoding - for the project resolver, the
-/// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
-/// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
-/// where byte-identity is required.
-#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+/// Identity of one physical source unit: its defining package or runtime owner and original
+/// root-relative path, or its source resolver and canonical unit key. Project sources use
+/// `rift://source/project/src/lib.rs`. The codec validates ownership, UTF-8, relative paths
+/// and canonical percent-encoding before lookup. Content digests remain separate from source
+/// addresses.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
-#[schemars(transparent)]
-pub struct SourceUnitId(
-    #[schemars(length(min = 17, max = 8192))]
-    #[schemars(regex(
-        pattern = concat!(
-            r"^rift://source/[a-z][a-z0-9_.-]{0,127}/",
-            identity_path_character!(),
-            r"{1,8192}$"
-        )
-    ))]
-    pub String,
-);
+pub struct SourceUnitId(pub String);
+
+impl JsonSchema for SourceUnitId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SourceUnitId".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": 17,
+            "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX,
+            "pattern": crate::identity::SOURCE_UNIT_ID_PATTERN,
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+                "rift://source/project/src/lib.rs",
+                "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+                "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ]
+        })
+    }
+}
 
 impl SourceUnitId {
     /// Accepts one canonical physical source identity.

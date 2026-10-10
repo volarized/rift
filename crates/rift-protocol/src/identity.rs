@@ -27,6 +27,22 @@ pub const SYMBOL_ID_PATTERN: &str = concat!(
     r"(?:~[1-9][0-9]*\?rev=[0-9a-f]{64})?$"
 );
 
+/// Structural physical source pattern. The codec also validates decoded paths and spelling.
+pub const SOURCE_UNIT_ID_PATTERN: &str = concat!(
+    r"^rift://source/(?:",
+    r"(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/",
+    r"(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/",
+    r"|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)",
+    r"(?![A-Za-z]:)(?!\.{1,2}(?:/|$))",
+    r"(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?!2F|5C|0[0-9A-F]|1[0-9A-F]|7F)[0-9A-F]{2})+",
+    r"(?:/(?!\.{1,2}(?:/|$))(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?!2F|5C|0[0-9A-F]|1[0-9A-F]|7F)[0-9A-F]{2})+)*",
+    r"|(?!(?:cargo|npm|pypi|stdlib)/)[a-z][a-z0-9_.-]{0,127}/",
+    r"(?![A-Za-z]:)(?!\.{1,2}(?:/|$))",
+    r"(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?!2F|5C|0[0-9A-F]|1[0-9A-F]|7F)[0-9A-F]{2})+",
+    r"(?:/(?!\.{1,2}(?:/|$))(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?!2F|5C|0[0-9A-F]|1[0-9A-F]|7F)[0-9A-F]{2})+)*",
+    r")$"
+);
+
 /// Revision query selecting an occurrence's immutable source.
 const REVISION_QUERY_PREFIX: &str = "?rev=";
 

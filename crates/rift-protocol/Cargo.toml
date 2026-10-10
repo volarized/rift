@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 percent-encoding.workspace = true
 pep440_rs.workspace = true
+unicode-ident.workspace = true
 schemars.workspace = true
 semver.workspace = true
 serde.workspace = true

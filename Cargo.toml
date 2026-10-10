@@ -181,6 +181,7 @@ tree-sitter-yaml = "=0.7.2"
 jsonschema = { version = "0.58.5", default-features = false }
 tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
+unicode-ident = "1.0.24"
 unicode-width = "0.2.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
