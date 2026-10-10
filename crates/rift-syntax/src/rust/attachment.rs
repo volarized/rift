@@ -106,6 +106,121 @@ pub(super) fn has_attached_attribute(visited: Visited<'_, '_>, text: &str, name:
         })
 }
 
+/// Captures semantic module attributes independently of documentation attachment gaps.
+pub(super) fn module_path(
+    visited: Visited<'_, '_>,
+    text: &str,
+) -> Result<crate::RustModulePath, RiftError> {
+    let kinds = attachment_kinds();
+    if let Some(body) = visited.node().child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for node in body.named_children(&mut cursor) {
+            if node.kind() != "inner_attribute_item" {
+                continue;
+            }
+            let Some(attribute) = node
+                .named_child(0)
+                .filter(|node| node.kind() == "attribute")
+            else {
+                return Ok(crate::RustModulePath::Unknown);
+            };
+            match semantic_attribute_name(attribute, text) {
+                Some(
+                    "cfg"
+                    | "doc"
+                    | "allow"
+                    | "warn"
+                    | "deny"
+                    | "forbid"
+                    | "deprecated"
+                    | "no_implicit_prelude",
+                ) => {}
+                _ => return Ok(crate::RustModulePath::Unknown),
+            }
+        }
+    }
+    let mut state = crate::RustModulePath::Absent;
+    let mut previous = visited.previous_sibling();
+    while let Some(sibling) = previous {
+        let node = sibling.node();
+        if node.kind_id() == kinds.line_comment || node.kind_id() == kinds.block_comment {
+            previous = sibling.previous_sibling();
+            continue;
+        }
+        if node.kind_id() != kinds.attribute_item {
+            break;
+        }
+        let Some(attribute) = node
+            .named_child(0)
+            .filter(|node| node.kind() == "attribute")
+        else {
+            return Ok(crate::RustModulePath::Unknown);
+        };
+        let Some(name) = semantic_attribute_name(attribute, text) else {
+            return Ok(crate::RustModulePath::Unknown);
+        };
+        match name {
+            "path" if state == crate::RustModulePath::Absent => {
+                state = literal_path(attribute, text)?;
+                if state == crate::RustModulePath::Unknown {
+                    return Ok(state);
+                }
+            }
+            "cfg"
+            | "doc"
+            | "allow"
+            | "warn"
+            | "deny"
+            | "forbid"
+            | "deprecated"
+            | "no_implicit_prelude" => {}
+            _ => return Ok(crate::RustModulePath::Unknown),
+        }
+        previous = sibling.previous_sibling();
+    }
+    Ok(state)
+}
+
+fn semantic_attribute_name<'source>(
+    attribute: Node<'_>,
+    text: &'source str,
+) -> Option<&'source str> {
+    attribute
+        .named_child(0)
+        .filter(|node| node.kind() == "identifier")
+        .and_then(|node| text.get(node.byte_range()))
+}
+
+fn literal_path(attribute: Node<'_>, text: &str) -> Result<crate::RustModulePath, RiftError> {
+    let Some(value) = attribute.child_by_field_name("value") else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    if !matches!(value.kind(), "string_literal" | "raw_string_literal")
+        || value.named_child_count() != 1
+    {
+        return Ok(crate::RustModulePath::Unknown);
+    }
+    let Some(content) = value
+        .named_child(0)
+        .filter(|node| node.kind() == "string_content")
+    else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    let Some(path) = text.get(content.byte_range()) else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    if path.is_empty() || path.len() > rift_core::constants::PROJECT_PATH_BYTES_MAX {
+        return Ok(crate::RustModulePath::Unknown);
+    }
+    let Ok(path) = rift_core::ProjectPath::new(path) else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    Ok(crate::RustModulePath::Literal {
+        path,
+        range: extract::byte_range(content)?,
+    })
+}
+
 /// The name inside `#[...]`, trimmed; `None` for text that is not an attribute item.
 fn attribute_name(attribute_text: &str) -> Option<&str> {
     attribute_text

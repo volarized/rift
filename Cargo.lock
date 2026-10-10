@@ -4590,9 +4590,11 @@ dependencies = [
  "sha2",
  "tar",
  "tempfile",
+ "toml",
  "tree-sitter",
  "tree-sitter-json",
  "tree-sitter-rst",
+ "unicode-normalization",
  "url",
  "zip",
 ]
