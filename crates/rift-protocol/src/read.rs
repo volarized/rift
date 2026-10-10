@@ -2030,7 +2030,7 @@ pub struct SourceSpan {
 /// project-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its
 /// resolver's canonical human-readable key; digests appear on the wire only as short witnesses
 /// where byte-identity is required.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 #[schemars(transparent)]
 pub struct SourceUnitId(
@@ -2044,6 +2044,33 @@ pub struct SourceUnitId(
     ))]
     pub String,
 );
+
+impl SourceUnitId {
+    /// Accepts one canonical physical source identity.
+    ///
+    /// # Errors
+    /// Returns a violation for malformed ownership, paths, UTF-8 or encoding.
+    pub fn parse(value: &str) -> Result<Self, crate::identity::SymbolIdentityViolation> {
+        crate::identity::parse_source_unit_identity(value)?;
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the canonical physical source address.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceUnitId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        crate::identity::parse_source_unit_identity(&value).map_err(|violation| {
+            serde::de::Error::custom(format!("invalid source-unit identity: {violation:?}"))
+        })?;
+        Ok(Self(value))
+    }
+}
 
 /// One byte range in a source-catalog unit.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]

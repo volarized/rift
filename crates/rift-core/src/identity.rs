@@ -1,4 +1,4 @@
-use std::fmt::{self, Write as _};
+use std::fmt;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -7,9 +7,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use rift_error::{RiftError, errors};
 
 use crate::constants::{
-    HEX_LETTER_VALUE_OFFSET, HEX_NIBBLE_BITS, PERCENT_ESCAPE_BYTES, PERCENT_ESCAPE_HIGH_OFFSET,
-    PERCENT_ESCAPE_LOW_OFFSET, PERCENT_ESCAPE_MARKER, SOURCE_RESOLVER_ID_BYTES_MAX,
-    SOURCE_RESOLVER_PUNCTUATION, SOURCE_UNIT_ID_BYTES_MAX, SOURCE_UNIT_SAFE_PUNCTUATION,
+    PERCENT_ESCAPE_BYTES, SOURCE_RESOLVER_ID_BYTES_MAX, SOURCE_UNIT_ID_BYTES_MAX,
     SOURCE_UNIT_SEPARATOR, SOURCE_UNIT_SEPARATOR_BYTES, SOURCE_UNIT_URI_PREFIX, SYMBOL_URI_PREFIX,
 };
 use crate::{PackageIdentity, ProjectPath, SourcePath};
@@ -230,10 +228,7 @@ impl SourceResolverId {
                 .identity("source_resolver")
                 .fail();
         }
-        let mut bytes = value.bytes();
-        if !bytes.next().is_some_and(is_resolver_first_byte)
-            || !bytes.all(is_resolver_continuation_byte)
-        {
+        if !rift_protocol::identity::source_resolver_is_valid(&value) {
             return errors::core::resolver_id_invalid_character()
                 .identity("source_resolver")
                 .fail();
@@ -246,16 +241,6 @@ impl SourceResolverId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-const fn is_resolver_first_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase()
-}
-
-fn is_resolver_continuation_byte(byte: u8) -> bool {
-    byte.is_ascii_lowercase()
-        || byte.is_ascii_digit()
-        || SOURCE_RESOLVER_PUNCTUATION.contains(&byte)
 }
 
 impl fmt::Display for SourceResolverId {
@@ -282,6 +267,16 @@ impl SourceUnitId {
         if matches!(resolver.as_str(), "cargo" | "npm" | "pypi" | "stdlib") {
             return errors::core::source_unit_id_invalid_address()
                 .identity("source_unit")
+                .fail();
+        }
+        if !rift_protocol::identity::source_unit_path_is_valid(key.as_str()) {
+            return errors::core::source_unit_id_invalid_key()
+                .identity("source_unit")
+                .cause(
+                    errors::core::path_empty_segment()
+                        .path_kind("source")
+                        .error(),
+                )
                 .fail();
         }
         let identity = Self {
@@ -395,13 +390,14 @@ impl SourceUnitId {
                     .identity("source_unit")
                     .error()
             })?;
-        if let Ok((owner, path)) = rift_protocol::identity::parse_released_source_identity(value) {
+        if rift_protocol::identity::released_source_resolver_is_valid(resolver) {
+            let (owner, path) = rift_protocol::identity::parse_released_source_identity(value)
+                .map_err(|_| {
+                    errors::core::source_unit_id_invalid_address()
+                        .identity("source_unit")
+                        .error()
+                })?;
             return Self::for_owner(owner, &path);
-        }
-        if matches!(resolver, "cargo" | "npm" | "pypi" | "stdlib") {
-            return errors::core::source_unit_id_invalid_address()
-                .identity("source_unit")
-                .fail();
         }
         let resolver = SourceResolverId::new(resolver).map_err(|cause| {
             errors::core::source_unit_id_invalid_resolver()
@@ -450,7 +446,7 @@ impl SourceUnitId {
                 .as_str()
                 .bytes()
                 .map(|byte| {
-                    if is_unit_key_safe(byte) {
+                    if rift_protocol::identity::source_unit_key_byte_is_safe(byte) {
                         1
                     } else {
                         PERCENT_ESCAPE_BYTES
@@ -480,69 +476,18 @@ impl fmt::Display for SourceUnitId {
             "{SOURCE_UNIT_URI_PREFIX}{}{SOURCE_UNIT_SEPARATOR}",
             self.resolver
         )?;
-        for byte in self.key.as_str().bytes() {
-            if is_unit_key_safe(byte) {
-                formatter.write_char(char::from(byte))?;
-            } else {
-                write!(formatter, "%{byte:02X}")?;
-            }
-        }
-        Ok(())
+        formatter.write_str(&rift_protocol::identity::encode_source_unit_key(
+            self.key.as_str(),
+        ))
     }
 }
 
 fn decode_unit_key(value: &str) -> Result<String, RiftError> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == PERCENT_ESCAPE_MARKER {
-            let high = bytes
-                .get(index + PERCENT_ESCAPE_HIGH_OFFSET)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or_else(|| {
-                    errors::core::source_unit_id_invalid_encoding()
-                        .identity("source_unit")
-                        .error()
-                })?;
-            let low = bytes
-                .get(index + PERCENT_ESCAPE_LOW_OFFSET)
-                .and_then(|byte| hex_value(*byte))
-                .ok_or_else(|| {
-                    errors::core::source_unit_id_invalid_encoding()
-                        .identity("source_unit")
-                        .error()
-                })?;
-            decoded.push((high << HEX_NIBBLE_BITS) | low);
-            index += PERCENT_ESCAPE_BYTES;
-        } else {
-            if !is_unit_key_safe(bytes[index]) {
-                return errors::core::source_unit_id_invalid_encoding()
-                    .identity("source_unit")
-                    .fail();
-            }
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).map_err(|_| {
+    rift_protocol::identity::decode_source_unit_key(value).map_err(|_| {
         errors::core::source_unit_id_invalid_encoding()
             .identity("source_unit")
             .error()
     })
-}
-
-const fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'A'..=b'F' => Some(byte - b'A' + HEX_LETTER_VALUE_OFFSET),
-        b'a'..=b'f' => Some(byte - b'a' + HEX_LETTER_VALUE_OFFSET),
-        _ => None,
-    }
-}
-
-fn is_unit_key_safe(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || SOURCE_UNIT_SAFE_PUNCTUATION.contains(&byte)
 }
 
 /// Invalid zero revision.
@@ -871,6 +816,36 @@ mod tests {
             over_bound.slug().as_str(),
             "rift.core.source_unit_id_too_long"
         );
+    }
+
+    #[test]
+    fn source_unit_parser_keeps_custom_keys_separate_from_released_owners() {
+        for value in [
+            "rift://source/project/registry.example/demo@1.0.0/file.rs",
+            "rift://source/custom/registry.example/demo@1.0.0/file.rs",
+            "rift://source/project/src/file~2.rs",
+        ] {
+            let id = SourceUnitId::parse(value).expect("custom source key");
+            assert_eq!(id.to_string(), value);
+            assert_eq!(
+                id.key().as_str(),
+                value.splitn(5, '/').nth(4).expect("source key")
+            );
+            assert!(id.owner.is_none());
+        }
+        let runtime = "rift://source/stdlib/cpython@3.12.9/Lib/sys.py";
+        let id = SourceUnitId::parse(runtime).expect("runtime source owner");
+        assert!(matches!(
+            id.owner.as_ref(),
+            Some(rift_protocol::identity::SymbolOwner::Runtime { .. })
+        ));
+        assert_eq!(id.to_string(), runtime);
+        for value in [
+            "rift://source/project/a//b",
+            "rift://source/stdlib/python/Lib/sys.py",
+        ] {
+            assert!(SourceUnitId::parse(value).is_err(), "{value}");
+        }
     }
 
     #[test]

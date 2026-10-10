@@ -37,6 +37,142 @@ fn test_released_source_owner_and_path_round_trip() {
 }
 
 #[test]
+fn test_source_unit_boundary_keeps_resolvers_paths_and_released_owners_distinct() {
+    use crate::read::SourceUnitId;
+
+    for (value, released) in [
+        ("rift://source/project/src/file~2.rs", false),
+        (
+            "rift://source/project/registry.example/demo@1.0.0/file.rs",
+            false,
+        ),
+        (
+            "rift://source/custom/registry.example/demo@1.0.0/file.rs",
+            false,
+        ),
+        ("rift://source/project/src/caf%C3%A9%20file.rs", false),
+        ("rift://source/project/src/cafe%CC%81.rs", false),
+        ("rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs", true),
+        (
+            "rift://source/npm/registry.example:8443%2Fnpm/@types/node@26.6.4/fs%7E2.d.ts",
+            true,
+        ),
+        ("rift://source/stdlib/cpython@3.12.9/Lib/sys.py", true),
+        (
+            "rift://source/pypi/pypi.org/demo@1.0/notebook.ipynb/cell:2",
+            true,
+        ),
+    ] {
+        let (owner, _) = super::parse_source_unit_identity(value).expect("canonical source unit");
+        assert_eq!(owner.is_some(), released, "{value}");
+        let id = SourceUnitId::parse(value).expect("typed source unit");
+        assert_eq!(id.as_str(), value);
+        assert_eq!(
+            serde_json::from_value::<SourceUnitId>(serde_json::json!(value))
+                .expect("source unit JSON"),
+            id
+        );
+    }
+    for value in [
+        "rift://source/project/",
+        "rift://source/project/a//b",
+        "rift://source/project/../file.rs",
+        "rift://source/project/%2E/file.rs",
+        "rift://source/project/src%2Flib.rs",
+        "rift://source/project/src/%7E2.rs",
+        "rift://source/project/src/%FF.rs",
+        "rift://source/project/src/%G0.rs",
+        "rift://source/project/src/%1.rs",
+        "rift://source/project/src/%0A.rs",
+        "rift://source/project/C:/file.rs",
+        "rift://source/project/src%5Clib.rs",
+        "rift://source/Project/file.rs",
+        "rift://source/cargo/demo@1.0.0/lib.rs",
+        "rift://source/stdlib/python/Lib/sys.py",
+        "rift://source/npm/npmjs.org/demo@1.0.0/file~2.ts",
+    ] {
+        assert!(SourceUnitId::parse(value).is_err(), "{value}");
+        assert!(
+            serde_json::from_value::<SourceUnitId>(serde_json::json!(value)).is_err(),
+            "{value}"
+        );
+    }
+    let custom = SymbolOwner::Package {
+        manager: "custom".into(),
+        registry: "registry.example".into(),
+        name: "demo".into(),
+        version: "2026.10".into(),
+    };
+    assert!(super::released_source_identity(&custom, "file.rs").is_err());
+}
+
+#[test]
+fn test_source_unit_boundary_checks_decoded_and_encoded_limits() {
+    use crate::read::SourceUnitId;
+    let exact_path = format!("rift://source/project/{}", "a".repeat(4096));
+    assert!(SourceUnitId::parse(&exact_path).is_ok());
+    assert!(SourceUnitId::parse(&format!("{exact_path}a")).is_err());
+    let overhead = "rift://source/project/".len();
+    let budget = SYMBOL_ID_BYTES_MAX - overhead;
+    let encoded = format!("{}{}", "%25".repeat(budget / 3), "a".repeat(budget % 3));
+    let exact_wire = format!("rift://source/project/{encoded}");
+    assert_eq!(exact_wire.len(), SYMBOL_ID_BYTES_MAX);
+    assert!(SourceUnitId::parse(&exact_wire).is_ok());
+    assert_eq!(
+        super::parse_source_unit_identity(&format!("{exact_wire}a")),
+        Err(SymbolIdentityViolation::Length)
+    );
+}
+
+#[test]
+fn test_source_digest_requires_full_lowercase_sha256() {
+    let digest = super::SourceDigest::parse(&"a".repeat(64)).expect("full digest");
+    assert_eq!(digest.as_str(), "a".repeat(64));
+    assert_eq!(
+        serde_json::from_str::<super::SourceDigest>(
+            &serde_json::to_string(&digest).expect("serialize")
+        )
+        .expect("deserialize"),
+        digest
+    );
+    for value in [
+        "",
+        "12345678",
+        &"a".repeat(63),
+        &"a".repeat(65),
+        &"A".repeat(64),
+        &"g".repeat(64),
+    ] {
+        assert!(super::SourceDigest::parse(value).is_err());
+        assert!(serde_json::from_value::<super::SourceDigest>(serde_json::json!(value)).is_err());
+    }
+    let schema = schemars::schema_for!(super::SourceDigest);
+    assert_eq!(schema.get("minLength"), Some(&serde_json::json!(64)));
+    assert_eq!(schema.get("maxLength"), Some(&serde_json::json!(64)));
+}
+
+#[test]
+fn test_typed_symbol_identity_conversion_preserves_wire_and_rejects_incomplete_owners() {
+    let identity =
+        SymbolIdentity::parse("rift://symbol/local/rust/app/parse").expect("logical identity");
+    let wire = crate::read::SymbolId::from_identity(&identity);
+    assert_eq!(
+        SymbolIdentity::parse(wire.as_str()).expect("validated identity"),
+        identity
+    );
+    assert_eq!(wire.into_string(), identity.wire_identity());
+    for (registry, name) in [(":", "demo"), ("npmjs.org", "@scope")] {
+        let owner = SymbolOwner::Package {
+            manager: "npm".into(),
+            registry: registry.into(),
+            name: name.into(),
+            version: "1.0.0".into(),
+        };
+        assert!(SymbolIdentity::new(owner, language(), vec!["demo".into()]).is_err());
+    }
+}
+
+#[test]
 fn test_released_source_full_encoded_bound() {
     let owner = SymbolOwner::Package {
         manager: "npm".to_owned(),

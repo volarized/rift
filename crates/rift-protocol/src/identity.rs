@@ -10,6 +10,9 @@ use crate::read::Language;
 /// Maximum encoded size of a symbol identity in bytes.
 pub const SYMBOL_ID_BYTES_MAX: usize = 8_192;
 
+/// The canonical owner and logical path format this codec accepts.
+pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 1;
+
 /// Prefix shared by canonical symbol addresses.
 pub const SYMBOL_URI_PREFIX: &str = "rift://symbol/";
 
@@ -52,6 +55,9 @@ const COMPONENT_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b':')
     .remove(b'@');
 
+/// Existing generic source-unit keys retain hierarchy and literal tildes.
+const SOURCE_UNIT_ESCAPE_SET: &AsciiSet = &COMPONENT_ESCAPE_SET.remove(b'/').remove(b'~');
+
 /// Defining owner of a logical symbol.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum SymbolOwner {
@@ -82,11 +88,68 @@ pub enum SymbolOwner {
     },
 }
 
+/// Complete lowercase SHA-256 digest of immutable source bytes.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[serde(transparent)]
+pub struct SourceDigest(String);
+
+impl SourceDigest {
+    /// Accepts the complete immutable source digest.
+    ///
+    /// # Errors
+    /// Returns a revision violation for incomplete or noncanonical digests.
+    pub fn parse(value: &str) -> Result<Self, SymbolIdentityViolation> {
+        if !source_digest_is_valid(value) {
+            return Err(SymbolIdentityViolation::Revision);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the complete lowercase digest.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SourceDigest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if !source_digest_is_valid(&value) {
+            return Err(serde::de::Error::custom("invalid complete source digest"));
+        }
+        Ok(Self(value))
+    }
+}
+
+impl schemars::JsonSchema for SourceDigest {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SourceDigest".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "minLength": REVISION_HEX_BYTES,
+            "maxLength": REVISION_HEX_BYTES,
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Complete lowercase SHA-256 digest of immutable source bytes."
+        })
+    }
+}
+
+fn source_digest_is_valid(value: &str) -> bool {
+    value.len() == REVISION_HEX_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 /// Occurrence number bound to one complete immutable source digest.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct SymbolOccurrence {
     number: NonZeroU32,
-    revision: String,
+    revision: SourceDigest,
 }
 
 impl SymbolOccurrence {
@@ -96,13 +159,10 @@ impl SymbolOccurrence {
     /// Returns a violation for zero numbers or noncanonical revisions.
     pub fn new(number: u32, revision: String) -> Result<Self, SymbolIdentityViolation> {
         let number = NonZeroU32::new(number).ok_or(SymbolIdentityViolation::Occurrence)?;
-        let valid_width = revision.len() == REVISION_HEX_BYTES;
-        let valid_digits = revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
-        if !valid_width || !valid_digits {
+        if !source_digest_is_valid(&revision) {
             return Err(SymbolIdentityViolation::Revision);
         }
+        let revision = SourceDigest(revision);
         Ok(Self { number, revision })
     }
 
@@ -115,7 +175,7 @@ impl SymbolOccurrence {
     /// Returns the complete immutable source revision.
     #[must_use]
     pub fn revision(&self) -> &str {
-        &self.revision
+        self.revision.as_str()
     }
 }
 
@@ -655,6 +715,10 @@ pub fn released_source_identity(
     ) {
         return Err(SymbolIdentityViolation::Owner);
     }
+    if matches!(owner, SymbolOwner::Package { manager, .. } if !released_source_resolver_is_valid(manager))
+    {
+        return Err(SymbolIdentityViolation::Owner);
+    }
     if path.is_empty()
         || path
             .split('/')
@@ -689,6 +753,9 @@ pub fn parse_released_source_identity(
         .ok_or(SymbolIdentityViolation::Structure)?
         .split('/');
     let scope = next_segment(&mut parts)?;
+    if !released_source_resolver_is_valid(scope) {
+        return Err(SymbolIdentityViolation::Owner);
+    }
     let owner = parse_owner(scope, &mut parts)?;
     let path = parts
         .map(|part| {
@@ -704,6 +771,133 @@ pub fn parse_released_source_identity(
         return Err(SymbolIdentityViolation::Noncanonical);
     }
     Ok((owner, path))
+}
+
+/// Whether a source resolver uses its canonical lowercase spelling.
+#[must_use]
+pub fn source_resolver_is_valid(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 128
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+        })
+}
+
+/// Whether a UTF-8 byte remains literal in a generic source-unit key.
+#[must_use]
+pub fn source_unit_key_byte_is_safe(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"/!$&'()*+,;=:@-._~".contains(&byte)
+}
+
+/// Encodes the existing generic source-unit key alphabet canonically.
+#[must_use]
+pub fn encode_source_unit_key(value: &str) -> String {
+    utf8_percent_encode(value, SOURCE_UNIT_ESCAPE_SET).to_string()
+}
+
+/// Decodes the existing generic source-unit key alphabet.
+///
+/// # Errors
+/// Returns a violation for oversized input, malformed escapes or invalid UTF-8.
+pub fn decode_source_unit_key(value: &str) -> Result<String, SymbolIdentityViolation> {
+    if value.len() > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let high = bytes
+                .get(index + 1)
+                .and_then(|byte| source_hex_value(*byte))
+                .ok_or(SymbolIdentityViolation::Encoding)?;
+            let low = bytes
+                .get(index + 2)
+                .and_then(|byte| source_hex_value(*byte))
+                .ok_or(SymbolIdentityViolation::Encoding)?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            if !source_unit_key_byte_is_safe(bytes[index]) {
+                return Err(SymbolIdentityViolation::Encoding);
+            }
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| SymbolIdentityViolation::Encoding)
+}
+
+fn source_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+/// Whether a source path stays below its selected root.
+#[must_use]
+pub fn source_unit_path_is_valid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 4096
+        && !value.starts_with('/')
+        && !matches!(bytes, [drive, b':', ..] if drive.is_ascii_alphabetic())
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && !value
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+}
+
+/// Parses one canonical physical source address without reading its content.
+///
+/// Released owners reuse the symbol owner codec. Project and custom resolver
+/// keys retain their existing source-unit alphabet and root-relative paths.
+///
+/// # Errors
+/// Returns a violation for invalid ownership, paths, UTF-8 or canonical spelling.
+pub fn parse_source_unit_identity(
+    value: &str,
+) -> Result<(Option<SymbolOwner>, String), SymbolIdentityViolation> {
+    if value.len() > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    let address = value
+        .strip_prefix("rift://source/")
+        .ok_or(SymbolIdentityViolation::Structure)?;
+    let (resolver, encoded) = address
+        .split_once('/')
+        .ok_or(SymbolIdentityViolation::Structure)?;
+    if released_source_resolver_is_valid(resolver) {
+        let (owner, path) = parse_released_source_identity(value)?;
+        if !source_unit_path_is_valid(&path) {
+            return Err(SymbolIdentityViolation::QualifiedPath);
+        }
+        return Ok((Some(owner), path));
+    }
+    if !source_resolver_is_valid(resolver) {
+        return Err(SymbolIdentityViolation::Structure);
+    }
+    let path = decode_source_unit_key(encoded)?;
+    if !source_unit_path_is_valid(&path) {
+        return Err(SymbolIdentityViolation::QualifiedPath);
+    }
+    let canonical = encode_source_unit_key(&path);
+    if canonical != encoded {
+        return Err(SymbolIdentityViolation::Noncanonical);
+    }
+    Ok((None, path))
+}
+
+/// Resolvers with an established released source owner grammar.
+#[must_use]
+pub fn released_source_resolver_is_valid(value: &str) -> bool {
+    matches!(value, "cargo" | "npm" | "pypi" | "stdlib")
 }
 
 #[cfg(test)]
