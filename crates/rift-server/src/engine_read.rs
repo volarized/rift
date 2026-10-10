@@ -45,6 +45,7 @@ pub struct EngineReferences {
     /// Engines whose answer the walk took unconfirmed, quiet past `settle_delay`.
     unconfirmed: BTreeSet<String>,
     analysis_unavailable: Option<ReadWarning>,
+    registry_unresolved: bool,
 }
 
 impl EngineReferences {
@@ -62,11 +63,17 @@ impl EngineReferences {
     }
 
     /// Every warning the engine tier adds to this read, in wire order: the dropped
-    /// contribution, the callees an outgoing walk dropped, then the engines it took
-    /// unconfirmed. Empty when every consulted engine answered in full.
+    /// contribution, unresolved registry roots, the callees an outgoing walk dropped,
+    /// then the engines it took unconfirmed. Empty when every consulted engine answered in full.
     #[must_use]
     pub fn warnings(&self) -> Vec<ReadWarning> {
         let mut warnings: Vec<ReadWarning> = self.analysis_unavailable.iter().cloned().collect();
+        if self.registry_unresolved {
+            warnings.push(ReadWarning::PackageContextDegraded {
+                resolver: "cargo".to_owned(),
+                reason: "Cargo cache source folders do not establish the registry endpoint; their callees are unavailable.".to_owned(),
+            });
+        }
         if self.dropped_callees > 0 {
             warnings.push(callees_dropped_warning(self.dropped_callees));
         }
@@ -147,7 +154,7 @@ impl EngineReferences {
                 let end = CoreSymbolId::new(declaration.id.0.clone()).ok()?;
                 let held = PackageDeclaration {
                     symbol: callee.symbol(&declaration)?,
-                    unit: callee.unit(&declaration.package)?,
+                    unit: callee.unit(&declaration.origin)?,
                 };
                 Some((declaration.id, end, held))
             });
@@ -347,6 +354,8 @@ pub async fn resolve_engine_references(
     })?;
     let mut references = EngineReferences {
         revision: Some(reads.tree_revision().to_owned()),
+        registry_unresolved: matches!(traversal.direction, TraversalDirection::Outgoing)
+            && roots.registry_unresolved(),
         ..EngineReferences::default()
     };
     let mut pending = vec![seed.clone()];
@@ -1384,6 +1393,7 @@ mod tests {
         };
         let package = rift_core::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "serde".to_owned(),
             version: "1.0.228".to_owned(),
         };
@@ -1500,10 +1510,9 @@ mod tests {
     #[test]
     fn named_package_callees_end_one_edge_each_and_the_rest_drop() -> TestResult {
         let caller = rift_core::SymbolId::new("rift://symbol/python/app.py/hello")?;
-        let len = SymbolId("rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len".into());
-        let python = rift_core::PackageIdentity {
-            manager: "stdlib".to_owned(),
-            name: "python".to_owned(),
+        let len = SymbolId("rift://symbol/stdlib/cpython@3.12.9/python/builtins/len".into());
+        let python = rift_protocol::read::RuntimeIdentity {
+            runtime: "cpython".to_owned(),
             version: "3.12.9".to_owned(),
         };
         let mut references = EngineReferences {
@@ -1519,7 +1528,9 @@ mod tests {
             (callee.path().as_str() == "builtins.pyi").then(|| CalleeDeclaration {
                 id: len.clone(),
                 kind: ExactKind("function".to_owned()),
-                package: python.clone(),
+                origin: rift_core::SourceLocation::Stdlib {
+                    runtime: Some(python.clone()),
+                },
             })
         });
         let edges: Vec<&SymbolId> = references
@@ -1535,7 +1546,7 @@ mod tests {
             .ok_or("the edge's end is a package declaration")?;
         assert_eq!(
             declaration.unit.0,
-            "rift://source/stdlib/python@3.12.9/builtins.pyi"
+            "rift://source/stdlib/cpython@3.12.9/builtins.pyi"
         );
         assert_eq!(declaration.symbol.name, "len");
         assert_eq!(declaration.symbol.kind.0, "function", "the stored kind");
@@ -1599,6 +1610,31 @@ mod tests {
         );
         assert_eq!(wire[0]["code"], "engine_analysis_unavailable", "{wire}");
         assert!(EngineReferences::default().warnings().is_empty());
+    }
+
+    #[test]
+    fn unresolved_registry_roots_keep_one_warning_when_engine_answers_are_dropped() {
+        let mut references = EngineReferences {
+            registry_unresolved: true,
+            ..EngineReferences::default()
+        };
+        let warnings = references.warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            matches!(&warnings[0], rift_protocol::read::ReadWarning::PackageContextDegraded { resolver, reason } if resolver == "cargo" && reason.len() < 256)
+        );
+        references.degrade(super::engine_analysis_warning(
+            super::Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            "character out of range",
+        ));
+        let warnings = references.warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(
+            matches!(&warnings[1], rift_protocol::read::ReadWarning::PackageContextDegraded { resolver, .. } if resolver == "cargo")
+        );
     }
 
     /// An outgoing walk keeps the refusals an incoming walk draws: beside `rev`, beside

@@ -316,6 +316,7 @@ fn analyze_package(
 ) -> PackageAnalysis {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
@@ -494,6 +495,7 @@ fn framework_application_checks_source_witness_and_aggregate_bounds() {
 fn package_context_metadata_shares_source_count_bytes_and_distinct_path_bounds() {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };

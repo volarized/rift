@@ -60,6 +60,7 @@ fn test_package_source_extensions_accept_ascii_case_without_changing_source() {
             );
             let package = PackageIdentity {
                 manager: "npm".to_owned(),
+                registry: "npmjs.org".to_owned(),
                 name: "beacon".to_owned(),
                 version: "1.0.0".to_owned(),
             };
@@ -94,6 +95,7 @@ fn test_unknown_package_extension_is_unselected_and_refused() {
     assert!(selection.select([&path]).source().is_empty());
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };

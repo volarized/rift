@@ -13,6 +13,7 @@ use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
 pub(super) fn identity() -> PackageIdentity {
     PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     }

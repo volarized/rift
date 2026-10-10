@@ -683,6 +683,7 @@ mod tests {
             origin: SymbolOrigin {
                 location: Some(SourceLocationKind::Project),
                 package: None,
+                runtime: None,
                 source_kind: SourceKind::Authored,
             },
             format: DocumentationSourceFormat::Markdown,
@@ -801,6 +802,7 @@ mod tests {
         project.origin.location = Some(SourceLocationKind::Dependency);
         project.origin.package = Some(PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "beacon".to_owned(),
             version: "1.0.0".to_owned(),
         });
@@ -877,9 +879,11 @@ mod tests {
             location: Some(SourceLocationKind::Dependency),
             package: Some(PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: "beacon".to_owned(),
                 version: "1.0.0".to_owned(),
             }),
+            runtime: None,
             source_kind: SourceKind::Authored,
         };
         record.selection = DocumentationSelectionReason::PackageArchive;

@@ -16,6 +16,7 @@ use rift_syntax::{
 fn supplied_enriched_facts_are_refused_after_framework_context_is_removed() {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
@@ -85,6 +86,7 @@ fn supplied_angular_template_facts_are_refused_when_current_context_is_unresolve
     let package = PackageIdentity {
         manager: "npm".to_owned(),
         name: "beacon".to_owned(),
+        registry: "npmjs.org".to_owned(),
         version: "1.0.0".to_owned(),
     };
     let origin = ContributionOrigin::new(
@@ -176,6 +178,7 @@ fn raw_embedded_provider_facts_remain_reusable_after_checked_restoration() {
     let package = PackageIdentity {
         manager: "npm".to_owned(),
         name: "beacon".to_owned(),
+        registry: "npmjs.org".to_owned(),
         version: "1.0.0".to_owned(),
     };
     let origin = ContributionOrigin::new(

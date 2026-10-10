@@ -30,6 +30,7 @@ fn source(path: &str, text: &str) -> DocumentationSource {
         origin: SymbolOrigin {
             location: Some(SourceLocationKind::Project),
             package: None,
+            runtime: None,
             source_kind: SourceKind::Authored,
         },
         format,
@@ -349,9 +350,11 @@ fn package_input_at<'a>(
         location: Some(SourceLocationKind::Dependency),
         package: Some(rift_protocol::read::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "beacon".to_owned(),
             version: "1.0.0".to_owned(),
         }),
+        runtime: None,
         source_kind: SourceKind::Authored,
     };
     record.selection = selection;

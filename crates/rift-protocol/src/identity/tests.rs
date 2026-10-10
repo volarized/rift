@@ -5,6 +5,54 @@ use crate::read::Language;
 
 const REVISION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+#[test]
+fn test_released_source_owner_and_path_round_trip() {
+    for value in [
+        "rift://source/cargo/crates.io/example@1.0.0/src/lib.rs",
+        "rift://source/npm/npmjs.org/@types/node@26.6.2/fs.d.ts",
+        "rift://source/npm/registry.example:8443%2Fteam%2Fapi/example@1.0.0/src/file%7E2.ts",
+        "rift://source/stdlib/cpython@3.12.9/Lib/sys.py",
+    ] {
+        let (owner, path) =
+            super::parse_released_source_identity(value).expect("canonical source owner");
+        assert_eq!(
+            super::released_source_identity(&owner, &path).expect("canonical source path"),
+            value
+        );
+    }
+    for invalid in [
+        "rift://source/cargo/example@1.0.0/src/lib.rs",
+        "rift://source/stdlib/python/Lib/sys.py",
+        "rift://source/cargo/crates.io/example@1.0.0/../lib.rs",
+        "rift://source/cargo/crates.io/example@1.0.0/%2Flib.rs",
+        "rift://source/cargo/crates.io/example@1.0.0/%6Cib.rs",
+        "rift://source/cargo/crates.io/example@1.0.0/lib.rs?rev=x",
+        "rift://source/local/rust/lib.rs",
+    ] {
+        assert!(
+            super::parse_released_source_identity(invalid).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
+fn test_released_source_full_encoded_bound() {
+    let owner = SymbolOwner::Package {
+        manager: "npm".to_owned(),
+        registry: "registry.example".to_owned(),
+        name: "example".to_owned(),
+        version: "1.0.0".to_owned(),
+    };
+    let prefix = "rift://source/npm/registry.example/example@1.0.0/";
+    let path = "x".repeat(SYMBOL_ID_BYTES_MAX - prefix.len());
+    let value = super::released_source_identity(&owner, &path).expect("encoded ceiling");
+    assert_eq!(value.len(), SYMBOL_ID_BYTES_MAX);
+    assert!(super::parse_released_source_identity(&value).is_ok());
+    assert!(super::released_source_identity(&owner, &(path + "x")).is_err());
+    assert!(super::parse_released_source_identity(&(value + "x")).is_err());
+}
+
 fn language() -> Language {
     Language::from_identity_segment("rust").expect("language fixture")
 }

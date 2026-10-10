@@ -631,5 +631,74 @@ fn canonical_semver(value: &str) -> bool {
     semver::Version::parse(value).is_ok_and(|version| version.to_string() == value)
 }
 
+/// Canonical address of a released source file under its defining package or runtime.
+///
+/// # Errors
+/// Returns a violation for an unresolved owner, invalid relative path or encoded length.
+pub fn released_source_identity(
+    owner: &SymbolOwner,
+    path: &str,
+) -> Result<String, SymbolIdentityViolation> {
+    if owner.input_bytes().saturating_add(path.len()) > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    owner.validate()?;
+    if !matches!(
+        owner,
+        SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+    ) {
+        return Err(SymbolIdentityViolation::Owner);
+    }
+    if path.is_empty()
+        || path
+            .split('/')
+            .any(|part| !valid_component(part) || part.contains('\\'))
+    {
+        return Err(SymbolIdentityViolation::QualifiedPath);
+    }
+    let path = path
+        .split('/')
+        .map(encode_component)
+        .collect::<Vec<_>>()
+        .join("/");
+    let value = format!("rift://source/{}/{path}", owner.wire_owner());
+    if value.len() > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    Ok(value)
+}
+
+/// Defining owner and root-relative path of a canonical released source address.
+///
+/// # Errors
+/// Returns a violation for malformed ownership, source path, encoding or spelling.
+pub fn parse_released_source_identity(
+    value: &str,
+) -> Result<(SymbolOwner, String), SymbolIdentityViolation> {
+    if value.len() > SYMBOL_ID_BYTES_MAX {
+        return Err(SymbolIdentityViolation::Length);
+    }
+    let mut parts = value
+        .strip_prefix("rift://source/")
+        .ok_or(SymbolIdentityViolation::Structure)?
+        .split('/');
+    let scope = next_segment(&mut parts)?;
+    let owner = parse_owner(scope, &mut parts)?;
+    let path = parts
+        .map(|part| {
+            let decoded = decode_component(part)?;
+            if decoded.contains('/') {
+                return Err(SymbolIdentityViolation::QualifiedPath);
+            }
+            Ok(decoded)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    if released_source_identity(&owner, &path)? != value {
+        return Err(SymbolIdentityViolation::Noncanonical);
+    }
+    Ok((owner, path))
+}
+
 #[cfg(test)]
 mod tests;

@@ -175,13 +175,19 @@ fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
         location: location.map(|location| match location {
             rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
             rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
-            rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+            rift_core::SourceLocation::Stdlib { .. } => SourceLocationKind::Stdlib,
             rift_core::SourceLocation::External {} => SourceLocationKind::External,
         }),
         package: location.and_then(|location| match location {
             rift_core::SourceLocation::Project { package } => package.clone(),
             rift_core::SourceLocation::Dependency { package } => Some(package.clone()),
-            rift_core::SourceLocation::Stdlib {} | rift_core::SourceLocation::External {} => None,
+            rift_core::SourceLocation::Stdlib { .. } | rift_core::SourceLocation::External {} => {
+                None
+            }
+        }),
+        runtime: location.and_then(|location| match location {
+            rift_core::SourceLocation::Stdlib { runtime } => runtime.clone(),
+            _ => None,
         }),
         source_kind: origin.source_kind(),
     }

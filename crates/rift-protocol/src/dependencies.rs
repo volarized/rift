@@ -74,6 +74,8 @@ pub enum PackageAvailability {
     /// The entry names a package fetched from a URL no registry serves, such as a uv
     /// wheel URL or an npm tarball URL.
     Url,
+    /// Accepted source evidence does not name the registry serving this entry.
+    RegistryUnresolved,
 }
 
 /// The `package_unavailable` reason for a [`PackageAvailability::Path`] entry.
@@ -103,6 +105,7 @@ impl PackageAvailability {
             Self::Git => Some(GIT_UNAVAILABLE_REASON),
             Self::PrivateRegistry => Some(PRIVATE_REGISTRY_UNAVAILABLE_REASON),
             Self::Url => Some(URL_UNAVAILABLE_REASON),
+            Self::RegistryUnresolved => Some("Package registry endpoint is unresolved."),
         }
     }
 }

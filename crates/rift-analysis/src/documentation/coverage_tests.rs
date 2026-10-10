@@ -22,6 +22,7 @@ fn source(path: &str, text: &str, format: DocumentationSourceFormat) -> Document
         origin: SymbolOrigin {
             location: Some(SourceLocationKind::Project),
             package: None,
+            runtime: None,
             source_kind: SourceKind::Authored,
         },
         format,

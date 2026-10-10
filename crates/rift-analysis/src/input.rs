@@ -474,7 +474,7 @@ fn validate_origin(
 ) -> Result<(), RiftError> {
     let location_matches = match origin.location() {
         Some(SourceLocation::Dependency { package: owner }) => owner == package,
-        Some(SourceLocation::Stdlib {}) => true,
+        Some(SourceLocation::Stdlib { .. }) => true,
         Some(SourceLocation::Project { .. } | SourceLocation::External {}) | None => false,
     };
     if location_matches && origin.source_kind() == SourceKind::Authored {
@@ -493,6 +493,7 @@ mod tests {
     fn identity() -> PackageIdentity {
         PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "beacon".to_owned(),
             version: "1.0.0".to_owned(),
         }
@@ -651,6 +652,7 @@ mod tests {
 
         let long_package = PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "p".repeat(3_500),
             version: "1.0.0".to_owned(),
         };

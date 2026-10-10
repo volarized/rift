@@ -269,6 +269,7 @@ impl fmt::Display for SourceResolverId {
 pub struct SourceUnitId {
     resolver: SourceResolverId,
     key: SourcePath,
+    owner: Option<rift_protocol::identity::SymbolOwner>,
 }
 
 impl SourceUnitId {
@@ -278,7 +279,16 @@ impl SourceUnitId {
     ///
     /// Returns [`RiftError`] when canonical URI exceeds protocol limit.
     pub fn new(resolver: SourceResolverId, key: SourcePath) -> Result<Self, RiftError> {
-        let identity = Self { resolver, key };
+        if matches!(resolver.as_str(), "cargo" | "npm" | "pypi" | "stdlib") {
+            return errors::core::source_unit_id_invalid_address()
+                .identity("source_unit")
+                .fail();
+        }
+        let identity = Self {
+            resolver,
+            key,
+            owner: None,
+        };
         if identity.encoded_len() > SOURCE_UNIT_ID_BYTES_MAX {
             return errors::core::source_unit_id_too_long()
                 .identity("source_unit")
@@ -287,34 +297,80 @@ impl SourceUnitId {
         Ok(identity)
     }
 
-    /// The unit of one file inside a package.
+    /// The unit of one file inside its defining registry package.
     ///
-    /// The resolver is the package's manager and the key is `<name>@<version>/<path>`,
-    /// so the unit renders as `rift://source/cargo/helper@0.1.0/src/lib.rs`. Package
-    /// analysis mints every package file's unit here: one file has one unit wherever it
-    /// is addressed from.
+    /// Registry endpoint, package namespace and exact version remain in the address;
+    /// the source path counts from the package root.
     ///
     /// # Errors
-    ///
-    /// Returns [`RiftError`] when the manager is no resolver identity, when
-    /// the key breaks the source path rules, or when the canonical URI exceeds the
-    /// protocol limit.
+    /// Returns an identity error for an invalid owner, path or encoded length.
     pub fn for_package(package: &PackageIdentity, path: &ProjectPath) -> Result<Self, RiftError> {
-        let resolver = SourceResolverId::new(package.manager.clone()).map_err(|cause| {
-            errors::core::source_unit_id_invalid_resolver()
-                .identity("source_unit")
-                .cause(cause)
-                .error()
-        })?;
-        let key = SourcePath::new(format!("{}@{}/{path}", package.name, package.version)).map_err(
-            |cause| {
-                errors::core::source_unit_id_invalid_key()
-                    .identity("source_unit")
-                    .cause(cause)
-                    .error()
-            },
-        )?;
-        Self::new(resolver, key)
+        let owner = package
+            .owner()
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        Self::for_owner(owner, path.as_str())
+    }
+
+    /// The unit of one file installed with an exact runtime or compiler release.
+    ///
+    /// # Errors
+    /// Returns an identity error for an invalid owner, path or encoded length.
+    pub fn for_runtime(
+        runtime: &rift_protocol::read::RuntimeIdentity,
+        path: &ProjectPath,
+    ) -> Result<Self, RiftError> {
+        let owner = runtime
+            .owner()
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        Self::for_owner(owner, path.as_str())
+    }
+
+    /// The released source unit its accepted origin and root-relative path establish.
+    ///
+    /// # Errors
+    /// Returns an identity error when the origin does not establish a released owner.
+    pub fn for_origin(
+        origin: &rift_protocol::read::SourceLocation,
+        path: &ProjectPath,
+    ) -> Result<Self, RiftError> {
+        match origin {
+            rift_protocol::read::SourceLocation::Dependency { package } => {
+                Self::for_package(package, path)
+            }
+            rift_protocol::read::SourceLocation::Stdlib {
+                runtime: Some(runtime),
+            } => Self::for_runtime(runtime, path),
+            _ => errors::core::identity_invalid().fail(),
+        }
+    }
+
+    /// Defining released owner, absent for a generic resolver unit.
+    #[must_use]
+    pub const fn source_owner(&self) -> Option<&rift_protocol::identity::SymbolOwner> {
+        self.owner.as_ref()
+    }
+
+    fn for_owner(
+        owner: rift_protocol::identity::SymbolOwner,
+        path: &str,
+    ) -> Result<Self, RiftError> {
+        rift_protocol::identity::released_source_identity(&owner, path)
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        let resolver = match &owner {
+            rift_protocol::identity::SymbolOwner::Package { manager, .. } => {
+                SourceResolverId::new(manager.clone())?
+            }
+            rift_protocol::identity::SymbolOwner::Runtime { .. } => {
+                SourceResolverId::new("stdlib")?
+            }
+            _ => return errors::core::identity_invalid().fail(),
+        };
+        let key = SourcePath::new(path)?;
+        Ok(Self {
+            resolver,
+            key,
+            owner: Some(owner),
+        })
     }
 
     /// Parses canonical `rift://source/` identity.
@@ -339,6 +395,14 @@ impl SourceUnitId {
                     .identity("source_unit")
                     .error()
             })?;
+        if let Ok((owner, path)) = rift_protocol::identity::parse_released_source_identity(value) {
+            return Self::for_owner(owner, &path);
+        }
+        if matches!(resolver, "cargo" | "npm" | "pypi" | "stdlib") {
+            return errors::core::source_unit_id_invalid_address()
+                .identity("source_unit")
+                .fail();
+        }
         let resolver = SourceResolverId::new(resolver).map_err(|cause| {
             errors::core::source_unit_id_invalid_resolver()
                 .identity("source_unit")
@@ -374,6 +438,10 @@ impl SourceUnitId {
     }
 
     fn encoded_len(&self) -> usize {
+        if let Some(owner) = &self.owner {
+            return rift_protocol::identity::released_source_identity(owner, self.key.as_str())
+                .map_or(usize::MAX, |value| value.len());
+        }
         SOURCE_UNIT_URI_PREFIX.len()
             + self.resolver.as_str().len()
             + SOURCE_UNIT_SEPARATOR_BYTES
@@ -402,6 +470,11 @@ impl FromStr for SourceUnitId {
 
 impl fmt::Display for SourceUnitId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(owner) = &self.owner {
+            let value = rift_protocol::identity::released_source_identity(owner, self.key.as_str())
+                .map_err(|_| fmt::Error)?;
+            return formatter.write_str(&value);
+        }
         write!(
             formatter,
             "{SOURCE_UNIT_URI_PREFIX}{}{SOURCE_UNIT_SEPARATOR}",
@@ -616,7 +689,7 @@ mod tests {
 
     #[test]
     fn parse_symbol_identity_accepts_bounded_package_paths() {
-        let path = format!("cargo/beacon@1.0.0/{}lib.rs", "a/".repeat(490));
+        let path = format!("cargo/crates.io/beacon@1.0.0/{}lib.rs", "a/".repeat(490));
         assert!(ProjectPath::new(&path).is_err());
         let identity = symbol_identity("rust", &path, "serve");
         let parsed = parse_symbol_identity(&identity).expect("package symbol identity");
@@ -1003,6 +1076,13 @@ mod tests {
     fn package(manager: &str, name: &str, version: &str) -> PackageIdentity {
         PackageIdentity {
             manager: manager.to_owned(),
+            registry: match manager {
+                "cargo" => "crates.io",
+                "npm" => "npmjs.org",
+                "pypi" => "pypi.org",
+                _ => "registry.example",
+            }
+            .to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         }
@@ -1015,10 +1095,10 @@ mod tests {
             .expect("unit fits protocol bound");
         assert_eq!(
             unit.to_string(),
-            "rift://source/cargo/helper@0.1.0/src/lib.rs"
+            "rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs"
         );
         assert_eq!(unit.resolver().as_str(), "cargo");
-        assert_eq!(unit.key().as_str(), "helper@0.1.0/src/lib.rs");
+        assert_eq!(unit.key().as_str(), "src/lib.rs");
     }
 
     #[test]
@@ -1026,28 +1106,14 @@ mod tests {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
         let error = SourceUnitId::for_package(&package("Cargo", "helper", "0.1.0"), &path)
             .expect_err("uppercase manager");
-        assert_eq!(
-            error.slug().as_str(),
-            "rift.core.source_unit_id_invalid_resolver"
-        );
-        assert!(std::error::Error::source(&error).is_some());
+        assert_eq!(error.slug().as_str(), "rift.core.identity_invalid");
     }
 
     #[test]
     fn package_unit_refuses_a_version_that_breaks_the_source_path_rules() {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
-        let error = SourceUnitId::for_package(&package("cargo", "helper", "0.1.0\\beta"), &path)
-            .expect_err("a backslash in the version");
-        assert_eq!(
-            error.slug().as_str(),
-            "rift.core.source_unit_id_invalid_key"
+        assert!(
+            SourceUnitId::for_package(&package("cargo", "helper", "0.1.0\\beta"), &path).is_err()
         );
-        assert_eq!(
-            std::error::Error::source(&error)
-                .and_then(|source| source.downcast_ref::<RiftError>())
-                .map(|source| source.slug().as_str()),
-            Some("rift.core.path_backslash")
-        );
-        assert!(std::error::Error::source(&error).is_some());
     }
 }

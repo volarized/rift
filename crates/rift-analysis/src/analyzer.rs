@@ -1460,12 +1460,14 @@ fn symbol_origin(
             SymbolOrigin {
                 location: Some(SourceLocationKind::Dependency),
                 package: Some(package.clone()),
+                runtime: None,
                 source_kind: SourceKind::Authored,
             }
         }
-        Some(rift_core::SourceLocation::Stdlib {}) => SymbolOrigin {
+        Some(rift_core::SourceLocation::Stdlib { runtime }) => SymbolOrigin {
             location: Some(SourceLocationKind::Stdlib),
             package: None,
+            runtime: runtime.clone(),
             source_kind: SourceKind::Authored,
         },
         _ => {

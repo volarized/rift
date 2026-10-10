@@ -500,6 +500,7 @@ fn test_a_package_archive_is_selected_and_analyzed_as_global_ingestion_does() {
         .collect();
     let package = PackageIdentity {
         manager: "pypi".to_owned(),
+        registry: "pypi.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };

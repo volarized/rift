@@ -646,6 +646,7 @@ fn project_origin() -> SymbolOrigin {
     SymbolOrigin {
         location: Some(SourceLocationKind::Project),
         package: None,
+        runtime: None,
         source_kind: SourceKind::Authored,
     }
 }

@@ -1464,7 +1464,7 @@ fn wire_source_location_kind(location: &rift_core::SourceLocation) -> SourceLoca
     match location {
         rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
         rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
-        rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+        rift_core::SourceLocation::Stdlib { .. } => SourceLocationKind::Stdlib,
         rift_core::SourceLocation::External {} => SourceLocationKind::External,
     }
 }
@@ -4045,6 +4045,7 @@ pub fn compute() -> i32 {
     fn wire_source_location_kind_maps_every_internal_variant() {
         let package = || rift_protocol::read::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "beacon-core".to_owned(),
             version: "0.1.0".to_owned(),
         };
@@ -4058,7 +4059,7 @@ pub fn compute() -> i32 {
                 rift_protocol::read::SourceLocationKind::Dependency,
             ),
             (
-                rift_core::SourceLocation::Stdlib {},
+                rift_core::SourceLocation::Stdlib { runtime: None },
                 rift_protocol::read::SourceLocationKind::Stdlib,
             ),
             (

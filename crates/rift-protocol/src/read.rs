@@ -940,7 +940,7 @@ pub struct NodesResult {
 }
 
 /// One package as its package manager identifies it.
-#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PackageIdentity {
     /// Package manager or ecosystem name.
@@ -959,7 +959,7 @@ pub struct PackageIdentity {
 }
 
 /// One exact runtime or compiler release.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeIdentity {
     /// Canonical runtime or compiler name.
@@ -1970,7 +1970,7 @@ pub enum SourceKind {
 /// generated. `rift-core`'s `ContributionOrigin` carries this exact type as its own
 /// working representation; no served tool schema reaches it, so it carries no wire
 /// examples of its own - [`SourceLocationKind`] is what a caller reads on `SymbolOrigin`.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", deny_unknown_fields, rename_all = "snake_case")]
 pub enum SourceLocation {
     /// Source owned by the current workspace.
@@ -1986,7 +1986,11 @@ pub enum SourceLocation {
         package: PackageIdentity,
     },
     /// Source installed with the language toolchain.
-    Stdlib {},
+    Stdlib {
+        /// Exact owning runtime or compiler, absent when accepted evidence does not name a release.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<RuntimeIdentity>,
+    },
     /// Source outside the project, dependency graph, and standard library.
     External {},
 }

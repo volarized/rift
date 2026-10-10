@@ -1293,6 +1293,7 @@ mod tests {
             origin: SymbolOrigin {
                 location: Some(SourceLocationKind::Project),
                 package: None,
+                runtime: None,
                 source_kind: SourceKind::Authored,
             },
             format: DocumentationSourceFormat::Markdown,

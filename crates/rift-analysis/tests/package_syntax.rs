@@ -22,6 +22,7 @@ fn analyze(
 ) -> Result<PackageAnalysis, RiftError> {
     let package = PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: "beacon".to_owned(),
         version: version.to_owned(),
     };

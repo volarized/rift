@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use rift_protocol::dependencies::{
     ConfiguredPackage, PackageAvailability, PackageContextEntry, RequestedPackage,
 };
-use rift_protocol::read::{PackageIdentity, ProjectPath};
+use rift_protocol::read::ProjectPath;
 
 use crate::manifest::claimed_manifests_with_limit;
 use crate::resolver::{
@@ -75,8 +75,8 @@ impl From<ResolverName> for Degraded {
 /// the entries alone. A caller maps a path below a folder to the package that owns it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InstallFolder {
-    /// The installed package, at the exact version the lockfile or the probe names.
-    pub package: PackageIdentity,
+    /// The defining package or runtime origin the lockfile or probe established.
+    pub origin: rift_protocol::read::SourceLocation,
     /// Where the package's files stand.
     pub location: InstallLocation,
 }
@@ -445,15 +445,11 @@ pub fn resolve_context(
     merge.build()
 }
 
-/// The order install folders keep: manager, name, version, then location.
-fn install_order(folder: &InstallFolder) -> (&str, &str, &str, &InstallLocation) {
-    let package = &folder.package;
-    (
-        &package.manager,
-        &package.name,
-        &package.version,
-        &folder.location,
-    )
+/// The order install folders keep: defining origin, then location.
+fn install_order(
+    folder: &InstallFolder,
+) -> (&rift_protocol::read::SourceLocation, &InstallLocation) {
+    (&folder.origin, &folder.location)
 }
 
 /// The separators that open a version's pre-release and build metadata.
@@ -659,10 +655,13 @@ mod tests {
                     .filter_map(|entry| {
                         let version = entry.version.clone()?;
                         Some(InstallFolder {
-                            package: PackageIdentity {
-                                manager: entry.manager.clone(),
-                                name: entry.name.clone(),
-                                version,
+                            origin: rift_protocol::read::SourceLocation::Dependency {
+                                package: rift_protocol::read::PackageIdentity {
+                                    manager: entry.manager.clone(),
+                                    registry: "crates.io".to_owned(),
+                                    name: entry.name.clone(),
+                                    version,
+                                },
                             },
                             location: InstallLocation::Path(PathBuf::from(format!(
                                 "/installed/{}",
@@ -824,7 +823,12 @@ mod tests {
 
         let folders: Vec<(&str, &InstallLocation)> = context
             .install_folders()
-            .map(|folder| (folder.package.name.as_str(), &folder.location))
+            .filter_map(|folder| match &folder.origin {
+                rift_protocol::read::SourceLocation::Dependency { package } => {
+                    Some((package.name.as_str(), &folder.location))
+                }
+                _ => None,
+            })
             .collect();
         assert_eq!(
             folders,

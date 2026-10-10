@@ -142,21 +142,34 @@ fn pin_lockfile(
         Err(failure) => return report(answer, manifest, &failure),
     };
     for package in &lockfile.package {
-        let Some(availability) = source_availability(
+        let Some(mut availability) = source_availability(
             package.source.as_deref(),
             declared.get(&package.name).copied(),
         ) else {
             continue;
         };
+        let registry = source_registry(package.source.as_deref());
+        if matches!(
+            availability,
+            PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
+        ) && registry.is_none()
+        {
+            answer
+                .degradations
+                .push("package registry endpoint is unresolved".to_owned());
+            availability = PackageAvailability::RegistryUnresolved;
+        }
         if let Some(folder) = registry_folder(package, availability) {
             answer.install_folders.push(folder);
         }
-        answer.entries.push(PackageContextEntry::new(
+        let mut entry = PackageContextEntry::new(
             CARGO_MANAGER,
             &package.name,
             PackageSelector::Version(package.version.clone()),
             availability,
-        ));
+        );
+        entry.registry = registry;
+        answer.entries.push(entry);
     }
 }
 
@@ -167,7 +180,7 @@ fn registry_folder(
 ) -> Option<InstallFolder> {
     let (package, folder) = registry_package(package, availability)?;
     Some(InstallFolder {
-        package,
+        origin: rift_protocol::read::SourceLocation::Dependency { package },
         location: InstallLocation::CargoRegistry(folder),
     })
 }
@@ -184,14 +197,31 @@ fn registry_package(
         availability,
         PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
     );
-    registry.then(|| {
-        let identity = PackageIdentity {
-            manager: CARGO_MANAGER.to_owned(),
-            name: package.name.clone(),
-            version: package.version.clone(),
-        };
-        (identity, format!("{}-{}", package.name, package.version))
-    })
+    registry
+        .then(|| {
+            let registry = source_registry(package.source.as_deref())?;
+            let identity = PackageIdentity {
+                manager: CARGO_MANAGER.to_owned(),
+                registry,
+                name: package.name.clone(),
+                version: package.version.clone(),
+            };
+            identity.owner().ok()?;
+            Some((identity, format!("{}-{}", package.name, package.version)))
+        })
+        .flatten()
+}
+
+/// The defining registry the Cargo lockfile names, after accepted source normalization.
+fn source_registry(source: Option<&str>) -> Option<String> {
+    let source = source?.trim_end_matches('/');
+    if CRATES_IO_SOURCES.contains(&source) {
+        return Some("crates.io".to_owned());
+    }
+    let endpoint = source
+        .strip_prefix("registry+")
+        .or_else(|| source.strip_prefix("sparse+"))?;
+    rift_protocol::identity::canonical_registry_endpoint(endpoint).ok()
 }
 
 /// The registry packages the Rust standard library source vendors, each in its
@@ -223,7 +253,7 @@ pub(crate) fn vendored_folders(
             let availability = source_availability(package.source.as_deref(), None)?;
             let (package, folder) = registry_package(package, availability)?;
             Some(InstallFolder {
-                package,
+                origin: rift_protocol::read::SourceLocation::Dependency { package },
                 location: InstallLocation::Path(vendor.join(folder)),
             })
         })
@@ -278,7 +308,11 @@ fn source_availability(
     if source.starts_with(GIT_SOURCE_PREFIX) {
         return Some(PackageAvailability::Git);
     }
-    Some(PackageAvailability::PrivateRegistry)
+    Some(if source_registry(Some(source)).is_some() {
+        PackageAvailability::PrivateRegistry
+    } else {
+        PackageAvailability::RegistryUnresolved
+    })
 }
 
 /// The `Cargo.toml` document, the dependency tables this pass reads.
@@ -558,7 +592,12 @@ source = \"git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210\"
         let folders: Vec<(&str, &InstallLocation)> = answer
             .install_folders
             .iter()
-            .map(|folder| (folder.package.name.as_str(), &folder.location))
+            .filter_map(|folder| match &folder.origin {
+                rift_protocol::read::SourceLocation::Dependency { package } => {
+                    Some((package.name.as_str(), &folder.location))
+                }
+                _ => None,
+            })
             .collect();
         assert_eq!(
             folders,
