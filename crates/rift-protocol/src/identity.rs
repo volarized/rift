@@ -34,14 +34,12 @@ pub const SOURCE_UNIT_ID_PATTERN: &str = concat!(
     r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$"
 );
 
-
 /// Structural generic source pattern used beside released owner validation.
 pub const GENERIC_SOURCE_UNIT_ID_PATTERN: &str = concat!(
     r"^rift://source/[a-z][a-z0-9_.-]{0,127}/",
     r"(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+",
     r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
 );
-
 
 /// Structural released source pattern used beside generic source resolver validation.
 pub const RELEASED_SOURCE_UNIT_ID_PATTERN: &str = concat!(
@@ -51,7 +49,6 @@ pub const RELEASED_SOURCE_UNIT_ID_PATTERN: &str = concat!(
     r"(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+",
     r"(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
 );
-
 
 /// Revision query selecting an occurrence's immutable source.
 const REVISION_QUERY_PREFIX: &str = "?rev=";
