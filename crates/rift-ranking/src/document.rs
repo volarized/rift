@@ -923,6 +923,7 @@ mod tests {
         };
         let package = PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "registry.example".to_owned(),
             name: "helper".to_owned(),
             version: "0.1.0".to_owned(),
         };

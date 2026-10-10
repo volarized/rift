@@ -425,8 +425,7 @@ mod tests {
     #[test]
     fn test_add_document_placed_files_declarations_under_the_supplied_unit_and_path() {
         use rift_core::{
-            ContributionOrigin, SourceKind, SourceLocation, SourcePath, SourceResolverId,
-            SourceUnitId,
+            ContributionOrigin, SourceKind, SourceLocation, SourceUnitId,
         };
         use rift_protocol::read::PackageIdentity;
 
@@ -445,6 +444,7 @@ mod tests {
             .expect("syntax document");
         let package = PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "registry.example".to_owned(),
             name: "tokio".to_owned(),
             version: "1.53.1".to_owned(),
         };
@@ -455,11 +455,7 @@ mod tests {
             SourceKind::Authored,
         )
         .expect("origin");
-        let unit = SourceUnitId::new(
-            SourceResolverId::new("cargo").expect("resolver"),
-            SourcePath::new("tokio@1.53.1/src/lib.rs").expect("unit key"),
-        )
-        .expect("unit");
+        let unit = SourceUnitId::for_package(&package, &path).expect("unit");
         let placement = DocumentPlacement::new(origin, unit, "cargo/tokio@1.53.1/src/lib.rs");
         let mut builder = SyntaxPublicationBuilder::new(
             publication(1),
@@ -490,7 +486,7 @@ mod tests {
         );
         assert_eq!(
             spawn.source().map(|binding| binding.unit().to_string()),
-            Some("rift://source/cargo/tokio@1.53.1/src/lib.rs".to_owned())
+            Some("rift://source/cargo/registry.example/tokio@1.53.1/src/lib.rs".to_owned())
         );
         assert_eq!(
             spawn.origin().location(),
