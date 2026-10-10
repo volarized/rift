@@ -70,8 +70,12 @@ pub(crate) fn declarations(
                 file.path().as_str(),
                 &symbol.qualified_name,
             );
-            if crate::workspace::ReadableSymbol::assembled_by(semantics, &identity).is_some() {
-                declarations.push(DeclarationFacts::new(file, symbol));
+            if let Some(identity) =
+                crate::workspace::ReadableSymbol::assembled_by(semantics, &identity)
+                    .and_then(|readable| readable.identity().cloned())
+                    .and_then(|identity| SymbolId::parse(identity.as_str()).ok())
+            {
+                declarations.push(DeclarationFacts::new(file, symbol, identity));
             }
         }
     }
@@ -380,22 +384,29 @@ fn append_attached_inputs<'source>(
 }
 
 type AttachedSymbols<'declarations> =
-    BTreeMap<&'declarations DocumentationContentIdentity, BTreeSet<&'declarations str>>;
+    BTreeMap<&'declarations DocumentationContentIdentity, BTreeSet<(&'declarations str, u64, u64)>>;
 
 fn attached_symbols(declarations: &[DeclarationFacts]) -> AttachedSymbols<'_> {
     let mut by_source = BTreeMap::new();
     for declaration in declarations {
+        if SymbolId::parse(&declaration.symbol.0).is_err() {
+            continue;
+        }
         by_source
             .entry(&declaration.source)
             .or_insert_with(BTreeSet::new)
-            .insert(declaration.symbol.0.as_str());
+            .insert((
+                declaration.qualified_name.as_str(),
+                declaration.range.start,
+                declaration.range.end,
+            ));
     }
     by_source
 }
 
 fn has_attached_declaration(
     file: &IndexedFile,
-    path: &CoreProjectPath,
+    _path: &CoreProjectPath,
     identity: &DocumentationContentIdentity,
     attached_symbols: &AttachedSymbols<'_>,
 ) -> bool {
@@ -404,14 +415,11 @@ fn has_attached_declaration(
     };
     file.syntax().symbols().iter().any(|symbol| {
         !symbol.documentation_ranges.is_empty()
-            && accepted_symbols.contains(
-                rift_core::symbol_identity(
-                    &file.syntax().language().identity_segment(),
-                    path.as_str(),
-                    &symbol.qualified_name,
-                )
-                .as_str(),
-            )
+            && accepted_symbols.contains(&(
+                symbol.qualified_name.as_str(),
+                symbol.range.start,
+                symbol.range.end,
+            ))
     })
 }
 
@@ -550,16 +558,15 @@ pub(crate) struct DeclarationFacts {
 }
 
 impl DeclarationFacts {
-    pub(crate) fn new(file: &IndexedFile, symbol: &rift_syntax::SyntaxSymbol) -> Self {
+    pub(crate) fn new(
+        file: &IndexedFile,
+        symbol: &rift_syntax::SyntaxSymbol,
+        identity: SymbolId,
+    ) -> Self {
         let language = file.syntax().language().clone();
         let qualified_name = symbol.qualified_name.clone();
-        let identity = rift_core::symbol_identity(
-            &language.identity_segment(),
-            file.path().as_str(),
-            &qualified_name,
-        );
         Self {
-            symbol: SymbolId(identity),
+            symbol: identity,
             language,
             name: symbol.name.clone(),
             qualified_name,
@@ -1115,6 +1122,32 @@ mod tests {
     }
 
     #[test]
+    fn unproved_readable_declaration_keeps_source_without_public_identity() {
+        let directory = tempfile::tempdir().expect("temporary workspace");
+        std::fs::write(
+            directory.path().join("module.py"),
+            "def unproved():\n    return 1\n",
+        )
+        .expect("source file");
+        std::fs::write(directory.path().join("README.md"), "See `unproved`.\n")
+            .expect("documentation source");
+        let workspace = WorkspaceIndex::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("unproved declaration does not prevent documentation publication");
+        let path = rift_core::ProjectPath::new("module.py").expect("source path");
+        let file = workspace.file(&path).expect("retained source");
+        assert_eq!(file.syntax().symbols()[0].name, "unproved");
+        let index = workspace.documentation().index();
+        assert!(!index.sources.is_empty());
+        assert!(index.blocks.iter().all(|block| block.symbol.is_none()));
+        serde_json::to_string(index).expect("public documentation serializes canonically");
+    }
+
+    #[test]
     fn attached_documentation_matches_accepted_source_and_symbol() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         std::fs::create_dir_all(directory.path().join("src")).expect("source directory");
@@ -1144,7 +1177,45 @@ mod tests {
             .iter()
             .find(|symbol| symbol.qualified_name == "plain")
             .expect("plain declaration");
-        let accepted_facts = super::DeclarationFacts::new(file, accepted);
+        let canonical = |name: &str| {
+            let identity = rift_protocol::identity::SymbolIdentity::new(
+                rift_protocol::identity::SymbolOwner::Local,
+                file.syntax().language().clone(),
+                vec![name.to_owned()],
+            )
+            .expect("established local fixture identity");
+            rift_protocol::read::SymbolId::parse(&identity.wire_identity())
+                .expect("canonical identity")
+        };
+        let accepted_facts = super::DeclarationFacts::new(file, accepted, canonical("accepted"));
+        accepted_facts.validated().expect("canonical declaration");
+        serde_json::to_string(&accepted_facts.symbol).expect("canonical public identity");
+        let files = BTreeMap::from([(path.clone(), Arc::new(file.clone()))]);
+        let (collection, _) = super::build(
+            &files,
+            &BTreeMap::new(),
+            std::slice::from_ref(&accepted_facts),
+            &default_selection(),
+            1_024,
+            &rift_analysis::documentation::DocumentationLimits::default(),
+            None,
+        )
+        .expect("canonical attached documentation");
+        let block = collection
+            .index()
+            .blocks
+            .first()
+            .expect("retained attached comment");
+        assert_eq!(block.symbol.as_ref(), Some(&accepted_facts.symbol));
+        let source = "/// Accepted comment.\npub fn accepted() {}\nfn plain() {}\n";
+        assert_eq!(
+            source.get(
+                usize::try_from(block.range.start).expect("bounded comment start")
+                    ..usize::try_from(block.range.end).expect("bounded comment end"),
+            ),
+            Some("/// Accepted comment.\n"),
+        );
+        serde_json::to_string(collection.index()).expect("canonical documentation publication");
         let attached = super::attached_symbols(std::slice::from_ref(&accepted_facts));
         let owner = super::project_owner(&path, None);
 
@@ -1163,7 +1234,8 @@ mod tests {
             &attached,
         ));
 
-        let mut other_symbol_facts = super::DeclarationFacts::new(file, accepted);
+        let mut other_symbol_facts =
+            super::DeclarationFacts::new(file, accepted, canonical("accepted"));
         other_symbol_facts.symbol = rift_protocol::read::SymbolId("other-symbol".into());
         let other_symbol = super::attached_symbols(std::slice::from_ref(&other_symbol_facts));
         assert!(!super::has_attached_declaration(
@@ -1173,7 +1245,7 @@ mod tests {
             &other_symbol
         ));
 
-        let plain_facts = super::DeclarationFacts::new(file, plain);
+        let plain_facts = super::DeclarationFacts::new(file, plain, canonical("plain"));
         let no_comment = super::attached_symbols(std::slice::from_ref(&plain_facts));
         assert!(!super::has_attached_declaration(
             file,

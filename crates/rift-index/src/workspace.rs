@@ -8686,6 +8686,57 @@ mod tests {
         );
     }
 
+    fn readable_with_current_anchor(
+        index: &WorkspaceIndex,
+        readable: &super::ReadableSymbol,
+        identity: &str,
+    ) -> super::ReadableSymbol {
+        let graph = index.semantics.graph();
+        let key = readable
+            .assembled()
+            .contributions()
+            .first()
+            .expect("syntax key");
+        let current = graph
+            .contribution(key)
+            .expect("captured syntax contribution");
+        let anchored = rift_core::Contribution::builder(
+            current.key().clone(),
+            current.applicability(),
+            current.facts().expect("portable facts").clone(),
+            current.origin().clone(),
+        )
+        .source(current.source().expect("physical declaration").clone())
+        .identity_anchor(rift_core::SymbolId::new(identity).expect("bounded anchor"))
+        .build()
+        .expect("current anchored contribution");
+        let limits = rift_provider::PublicationLimits::new(1, 1, 1).expect("fixture bounds");
+        let publication = rift_provider::ProviderPublication::new(
+            key.reference().provider().clone(),
+            key.publication(),
+            vec![anchored],
+            limits,
+        )
+        .expect("current publication");
+        let publications = Arc::new(
+            rift_provider::PublicationSet::empty(limits)
+                .replaced(publication)
+                .expect("captured publication"),
+        );
+        let anchored_graph = rift_provider::Normalizer::normalize(
+            graph.index_revision(),
+            graph.source_revision(),
+            graph.tree_revision(),
+            &publications,
+            None,
+        )
+        .expect("current normalized anchor");
+        let record = anchored_graph.records().first().expect("normalized record");
+        let assembled = rift_provider::SymbolAssembler::assemble(&anchored_graph, record, &[])
+            .expect("current assembly");
+        super::ReadableSymbol::new(assembled).expect("portable readable")
+    }
+
     #[test]
     fn assembled_symbol_requires_normalized_record_and_portable_facts() {
         let directory = fixture();
@@ -8705,12 +8756,30 @@ mod tests {
         let readable = index
             .assembled_symbol(matched)
             .expect("normalized readable symbol");
-        assert_eq!(
-            readable.identity().map(rift_core::SymbolId::as_str),
-            Some("rift://symbol/rust/src/lib.rs/Rift::update")
-        );
+        assert!(readable.identity().is_none());
         assert_eq!(readable.facts().name(), "update");
         assert!(!readable.assembled().contributions().is_empty());
+
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            rift_protocol::read::Language::from_identity_segment("rust").expect("Rust language"),
+            vec!["fixture".into(), "Rift".into(), "update".into()],
+        )
+        .expect("canonical current anchor")
+        .wire_identity();
+        let anchored_readable = readable_with_current_anchor(&index, &readable, &identity);
+        assert_eq!(
+            anchored_readable
+                .identity()
+                .map(rift_core::SymbolId::as_str),
+            Some(identity.as_str())
+        );
+        assert_eq!(anchored_readable.facts().name(), readable.facts().name());
+        assert_eq!(
+            anchored_readable.assembled().contributions(),
+            readable.assembled().contributions()
+        );
+        assert!(readable.identity().is_none());
 
         let other_directory = tempfile::tempdir().expect("other workspace");
         fs::write(

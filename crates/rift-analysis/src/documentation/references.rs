@@ -51,9 +51,14 @@ impl<'declaration> DocumentationDeclaration<'declaration> {
                 .field("declaration.name")
                 .fail();
         }
-        let path = declaration_path(source)?;
-        let expected = symbol_identity(&language.identity_segment(), &path, qualified_name);
-        if symbol.0 != expected {
+        let accepted_symbol =
+            if let Ok(identity) = rift_protocol::identity::SymbolIdentity::parse(&symbol.0) {
+                identity.language() == language
+            } else {
+                let path = declaration_path(source)?;
+                symbol.0 == symbol_identity(&language.identity_segment(), &path, qualified_name)
+            };
+        if !accepted_symbol {
             return errors::analysis::documentation_identity_invalid()
                 .field("declaration.symbol")
                 .fail();
@@ -371,6 +376,21 @@ mod tests {
         }
     }
 
+    fn identity(language: &str, namespace: &str, qualified_name: &str) -> SymbolId {
+        let mut path = vec![namespace.to_owned()];
+        path.extend(qualified_name.split("::").map(str::to_owned));
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            Language {
+                name: language.to_owned(),
+                dialect: None,
+            },
+            path,
+        )
+        .expect("canonical fixture identity");
+        SymbolId::parse(&identity.wire_identity()).expect("canonical symbol")
+    }
+
     fn candidate(spelling: &str, start: u64) -> DocumentationReferenceCandidate {
         DocumentationReferenceCandidate {
             block: content_digest(b"README.md:Usage:0"),
@@ -408,12 +428,9 @@ mod tests {
         ];
         let mut identities = std::collections::BTreeSet::new();
         for owner in owners {
-            let unit = rift_core::SourceUnitId::for_owner(owner, "src/lib.rs")
+            let unit = rift_core::SourceUnitId::for_owner(owner.clone(), "src/lib.rs")
                 .expect("released source unit");
             let address = unit.to_string();
-            let identity_path = address
-                .strip_prefix("rift://source/")
-                .expect("source prefix");
             let source = DocumentationContentIdentity {
                 source: DocumentationSourceIdentity::Package {
                     unit: rift_protocol::read::SourceUnitId::parse(&address)
@@ -421,7 +438,19 @@ mod tests {
                 },
                 cell: None,
             };
-            let identity = SymbolId(rift_core::symbol_identity("rust", identity_path, "open"));
+            let identity = rift_protocol::identity::SymbolIdentity::new(
+                owner.clone(),
+                language(),
+                vec!["fixture".to_owned(), "open".to_owned()],
+            )
+            .expect("released symbol owner");
+            let identity = SymbolId::parse(&identity.wire_identity()).expect("canonical symbol");
+            assert_eq!(
+                rift_protocol::identity::SymbolIdentity::parse(&identity.0)
+                    .expect("canonical owner")
+                    .owner(),
+                &owner,
+            );
             DocumentationDeclaration::new(
                 &identity,
                 &language(),
@@ -440,11 +469,7 @@ mod tests {
     fn test_unique_bare_and_qualified_references_resolve_exact_declarations() {
         let source = source("src/lib.rs");
         let language = language();
-        let identity = SymbolId(rift_core::symbol_identity(
-            "rust",
-            "src/lib.rs",
-            "Client::open",
-        ));
+        let identity = identity("rust", "fixture", "Client::open");
         let range = TextRange { start: 0, end: 100 };
         let declaration = DocumentationDeclaration::new(
             &identity,
@@ -486,8 +511,8 @@ mod tests {
         let first_source = source("src/first.rs");
         let second_source = source("src/second.rs");
         let language = language();
-        let first_id = SymbolId(rift_core::symbol_identity("rust", "src/first.rs", "open"));
-        let second_id = SymbolId(rift_core::symbol_identity("rust", "src/second.rs", "open"));
+        let first_id = identity("rust", "first", "open");
+        let second_id = identity("rust", "second", "open");
         let range = TextRange { start: 0, end: 20 };
         let first = DocumentationDeclaration::new(
             &first_id,
@@ -525,8 +550,8 @@ mod tests {
             name: "python".to_owned(),
             dialect: None,
         };
-        let rust_id = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "open"));
-        let python_id = SymbolId(rift_core::symbol_identity("python", "src/main.py", "open"));
+        let rust_id = identity("rust", "fixture", "open");
+        let python_id = identity("python", "fixture", "open");
         let range = TextRange { start: 0, end: 20 };
         let first = DocumentationDeclaration::new(
             &rust_id,
@@ -557,7 +582,7 @@ mod tests {
     fn test_reference_identity_survives_unrelated_text_insertion() {
         let source = source("src/lib.rs");
         let language = language();
-        let identity = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "open"));
+        let identity = identity("rust", "fixture", "open");
         let range = TextRange { start: 0, end: 20 };
         let declaration =
             DocumentationDeclaration::new(&identity, &language, "open", "open", &source, range)
@@ -617,7 +642,7 @@ mod tests {
     fn test_declaration_name_range_and_candidate_count_bounds() {
         let source = source("src/lib.rs");
         let language = language();
-        let identity = SymbolId(rift_core::symbol_identity("rust", "src/lib.rs", "open"));
+        let identity = identity("rust", "fixture", "open");
         let control_name = DocumentationDeclaration::new(
             &identity,
             &language,

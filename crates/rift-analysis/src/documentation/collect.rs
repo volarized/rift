@@ -73,7 +73,7 @@ type AttachedDeclaration = (
 );
 type AttachedDeclarations =
     BTreeMap<rift_protocol::documentation::DocumentationContentIdentity, Vec<AttachedDeclaration>>;
-type AttachedSymbols = BTreeSet<rift_protocol::read::SymbolId>;
+type AttachedSymbols = BTreeMap<(u64, u64), BTreeSet<rift_protocol::read::SymbolId>>;
 
 /// Extracts every source's facts, in source order.
 ///
@@ -310,7 +310,7 @@ fn extraction_key(
     attached: &[AttachedDeclaration],
     symbols: &AttachedSymbols,
 ) -> Result<DocumentationDigest, RiftError> {
-    let syntax_facts = attached_syntax_facts(input, symbols)?;
+    let syntax_facts = attached_syntax_facts(input, symbols);
     canonical_digest(&(
         input.source(),
         input.chunks(),
@@ -324,26 +324,16 @@ fn extraction_key(
 fn attached_syntax_facts(
     input: &DocumentationInput<'_>,
     symbols: &AttachedSymbols,
-) -> Result<AttachedSyntaxFacts, RiftError> {
-    let Some(syntax) = input.syntax() else {
-        return Ok(None);
-    };
-    let path = super::references::declaration_path(&input.source().identity)?;
+) -> AttachedSyntaxFacts {
+    let syntax = input.syntax()?;
     let facts = syntax
         .symbols()
         .iter()
         .filter_map(|symbol| {
-            let identity = rift_core::symbol_identity(
-                &syntax.language().identity_segment(),
-                path.as_str(),
-                &symbol.qualified_name,
-            );
-            let identity = rift_protocol::read::SymbolId(identity);
-            if !symbols.contains(&identity) {
-                return None;
-            }
+            let identities = symbols.get(&(symbol.range.start, symbol.range.end))?;
+            let identity = identities.first().filter(|_| identities.len() == 1)?;
             Some((
-                identity,
+                identity.clone(),
                 symbol
                     .documentation_ranges
                     .iter()
@@ -352,7 +342,7 @@ fn attached_syntax_facts(
             ))
         })
         .collect();
-    Ok(Some((syntax.language().identity_segment(), facts)))
+    Some((syntax.language().identity_segment(), facts))
 }
 
 fn attached_declaration_facts(
@@ -374,7 +364,14 @@ fn attached_declaration_facts(
 }
 
 fn attached_symbols(attached: &[AttachedDeclaration]) -> AttachedSymbols {
-    attached.iter().map(|(symbol, _)| symbol.clone()).collect()
+    let mut symbols = AttachedSymbols::new();
+    for (symbol, range) in attached {
+        symbols
+            .entry((range.start, range.end))
+            .or_default()
+            .insert(symbol.clone());
+    }
+    symbols
 }
 
 fn extract_source_facts(
@@ -497,19 +494,15 @@ fn extract_attached_comments(
         );
         return Ok(());
     };
-    let path = super::references::declaration_path(&input.source().identity)?;
     let starts = line_starts(input.text());
     let mut ordinals = BTreeMap::new();
     for symbol in syntax.symbols() {
-        let identity = rift_core::symbol_identity(
-            &syntax.language().identity_segment(),
-            path.as_str(),
-            &symbol.qualified_name,
-        );
-        let symbol_identity = rift_protocol::read::SymbolId(identity);
-        if !symbols.contains(&symbol_identity) {
+        let Some(identities) = symbols.get(&(symbol.range.start, symbol.range.end)) else {
             continue;
-        }
+        };
+        let Some(symbol_identity) = identities.first().filter(|_| identities.len() == 1) else {
+            continue;
+        };
         for range in &symbol.documentation_ranges {
             let draft = BlockDraft {
                 range: TextRange {

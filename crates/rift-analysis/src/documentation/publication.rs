@@ -803,7 +803,7 @@ fn valid_text(text: &str, limits: Option<&super::DocumentationLimits>) -> bool {
 }
 
 fn valid_symbol_identity(symbol: &SymbolId) -> bool {
-    rift_core::parse_symbol_identity(&symbol.0).is_ok()
+    SymbolId::parse(&symbol.0).is_ok() || rift_core::parse_symbol_identity(&symbol.0).is_ok()
 }
 
 fn validate_headings(
