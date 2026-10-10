@@ -1,5 +1,6 @@
 use super::{
     SYMBOL_ID_BYTES_MAX, SymbolIdentity, SymbolIdentityViolation, SymbolOccurrence, SymbolOwner,
+    source_unit_is_project,
 };
 use crate::read::Language;
 
@@ -165,6 +166,44 @@ fn test_source_unit_schema_preserves_owner_boundaries_and_relative_paths() {
             accepted,
             "codec: {value}"
         );
+    }
+}
+
+#[test]
+fn source_unit_project_scope_uses_the_canonical_resolver() {
+    for (address, project) in [
+        ("rift://source/project/src/lib.rs", true),
+        ("rift://source/project2/src/lib.rs", false),
+        ("rift://source/cargo2/src/lib.rs", false),
+        (
+            "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+            false,
+        ),
+        (
+            "rift://source/npm/registry.npmjs.org/@types/node@26.6.4/index.d.ts",
+            false,
+        ),
+        ("rift://source/stdlib/python@3.14.3/sys/__init__.pyi", false),
+    ] {
+        assert_eq!(
+            source_unit_is_project(address).expect("canonical source scope"),
+            project
+        );
+        assert_eq!(
+            crate::read::SourceUnitId::parse(address)
+                .expect("canonical source")
+                .is_project(),
+            project
+        );
+    }
+    for address in [
+        "rift://source/project/../secret.rs",
+        "rift://source/%70roject/src/lib.rs",
+        "rift://source/project/src%2Flib.rs",
+        "rift://source/cargo/beacon@1.0.0/src/lib.rs",
+    ] {
+        assert!(source_unit_is_project(address).is_err());
+        assert!(!crate::read::SourceUnitId(address.to_owned()).is_project());
     }
 }
 

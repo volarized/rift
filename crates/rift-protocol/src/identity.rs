@@ -890,6 +890,22 @@ pub fn source_unit_path_is_valid(value: &str) -> bool {
 pub fn parse_source_unit_identity(
     value: &str,
 ) -> Result<(Option<SymbolOwner>, String), SymbolIdentityViolation> {
+    let (_, owner, path) = parse_source_unit_components(value)?;
+    Ok((owner, path))
+}
+
+/// Whether a canonical physical source identity uses the project resolver.
+///
+/// # Errors
+/// Returns the same refusal as [`parse_source_unit_identity`] for an invalid identity.
+pub fn source_unit_is_project(value: &str) -> Result<bool, SymbolIdentityViolation> {
+    let (resolver, _, _) = parse_source_unit_components(value)?;
+    Ok(resolver == "project")
+}
+
+fn parse_source_unit_components(
+    value: &str,
+) -> Result<(&str, Option<SymbolOwner>, String), SymbolIdentityViolation> {
     if value.len() > SYMBOL_ID_BYTES_MAX {
         return Err(SymbolIdentityViolation::Length);
     }
@@ -904,7 +920,7 @@ pub fn parse_source_unit_identity(
         if !source_unit_path_is_valid(&path) {
             return Err(SymbolIdentityViolation::QualifiedPath);
         }
-        return Ok((Some(owner), path));
+        return Ok((resolver, Some(owner), path));
     }
     if !source_resolver_is_valid(resolver) {
         return Err(SymbolIdentityViolation::Structure);
@@ -917,7 +933,7 @@ pub fn parse_source_unit_identity(
     if canonical != encoded {
         return Err(SymbolIdentityViolation::Noncanonical);
     }
-    Ok((None, path))
+    Ok((resolver, None, path))
 }
 
 /// Resolvers with an established released source owner grammar.

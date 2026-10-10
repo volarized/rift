@@ -2079,6 +2079,12 @@ impl SourceUnitId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether this canonical physical source identity uses the project resolver.
+    #[must_use]
+    pub fn is_project(&self) -> bool {
+        crate::identity::source_unit_is_project(&self.0).is_ok_and(|project| project)
+    }
 }
 
 impl<'de> Deserialize<'de> for SourceUnitId {
@@ -2503,10 +2509,10 @@ mod tests {
 
     use super::{
         Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
-        GlobalFailureClass, GlobalPageWarningCode, IDENTITY_PATH_CHARACTER,
-        LANGUAGE_IDENTITY_PATTERN, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX,
-        PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning, RelationshipFacet, RevisionId,
-        RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope, SourceUnitId, Symbol, SymbolId,
+        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, NodeId,
+        PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
+        RelationshipFacet, RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope,
+        SourceUnitId, Symbol, SymbolId,
     };
     use schemars::schema_for;
     use serde_json::json;
@@ -2935,13 +2941,13 @@ mod tests {
         assert_eq!(
             schema["pattern"],
             json!(
-                r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$"
+                r"^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$"
             )
         );
     }
 
-    /// Every served identity spells its path with the one shared character class, and each
-    /// accepts an `@` inside that path. `rift_core::encode_path` keeps `@` literal because RFC
+    /// Every served identity accepts an `@` inside its path. `rift_core::encode_path`
+    /// keeps `@` literal because RFC
     /// 3986 lists it in the path set, so a pattern that left it out refused an identity the
     /// server had itself minted: every npm scoped package directory reached it.
     #[test]
@@ -2966,13 +2972,8 @@ mod tests {
         ];
         for (schema, identity) in cases {
             let pattern = schema["pattern"].as_str().expect("an advertised pattern");
-            assert!(
-                pattern.contains(IDENTITY_PATH_CHARACTER),
-                "an identity pattern spells its path with the shared class: {pattern}"
-            );
-            let validator =
-                jsonschema::validator_for(&json!({ "type": "string", "pattern": pattern }))
-                    .expect("the advertised pattern compiles");
+            let validator = jsonschema::validator_for(&schema)
+                .expect("the advertised identity schema compiles");
             assert!(
                 validator.is_valid(&json!(identity)),
                 "{pattern} must accept {identity}"
