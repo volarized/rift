@@ -711,6 +711,34 @@ async fn live_walk(
     Err(format!("{label} never answered {expected:?}").into())
 }
 
+/// Reads the established seed from the captured fixture before the first engine walk.
+async fn live_seed(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    language: &str,
+) -> TestResult<String> {
+    let answer = call_retrying_acceptance(
+        client,
+        tool_request("get_symbol", &json!({"name": name, "language": language})),
+    )
+    .await?;
+    let hits = answer["hits"].as_array().ok_or("captured symbol hits")?;
+    let mut exact = hits.iter().filter(|hit| hit["symbol"]["name"] == name);
+    let hit = exact.next().ok_or("captured seed declaration")?;
+    assert!(exact.next().is_none(), "one exact fixture seed: {answer}");
+    let identity = hit["symbol"]["id"]
+        .as_str()
+        .ok_or("captured seed has an established identity")?;
+    let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
+    assert_eq!(
+        parsed.owner(),
+        &rift_protocol::identity::SymbolOwner::Local,
+        "fixture owner: {answer}"
+    );
+    assert_eq!(parsed.wire_identity(), identity);
+    Ok(identity.to_owned())
+}
+
 /// Walks one live answer may take while rust-analyzer loads the fixture.
 const LIVE_WALK_ATTEMPTS_MAX: usize = 10;
 
@@ -729,9 +757,10 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     let (directory, client, _server_task) =
         served_workspace(LIVE_RUST_FILES, Some(LIVE_RUST_ENGINE.to_owned())).await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
-    let larger = "rift://symbol/rust/walk.rs/larger";
+    let larger = live_seed(&client, "larger", "rust").await?;
+    let beacon = live_seed(&client, "beacon", "rust").await?;
     let (cold, answer) =
-        live_walk(&client, "outgoing before", larger, "outgoing", &["beacon"]).await?;
+        live_walk(&client, "outgoing before", &larger, "outgoing", &["beacon"]).await?;
     assert_eq!(
         cold, 1,
         "the first walk waits out rust-analyzer's load instead of taking the empty prepare \
@@ -753,7 +782,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     live_walk(
         &client,
         "incoming before",
-        "rift://symbol/rust/hub.rs/beacon",
+        &beacon,
         "incoming",
         &["larger", "total"],
     )
@@ -779,12 +808,13 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     }
     eprintln!("live: published after {:?}", edited.elapsed());
     let (outgoing, _) =
-        live_walk(&client, "outgoing after", larger, "outgoing", &["beacon2"]).await?;
+        live_walk(&client, "outgoing after", &larger, "outgoing", &["beacon2"]).await?;
     eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
+    let beacon2 = live_seed(&client, "beacon2", "rust").await?;
     let (incoming, _) = live_walk(
         &client,
         "incoming after",
-        "rift://symbol/rust/hub.rs/beacon2",
+        &beacon2,
         "incoming",
         &["again", "larger", "total"],
     )
@@ -861,10 +891,12 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     )
     .await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    let larger = live_seed(&client, "larger", "typescript").await?;
+    let beacon = live_seed(&client, "beacon", "typescript").await?;
     let (outgoing, answer) = live_walk(
         &client,
         "typescript outgoing",
-        "rift://symbol/typescript/walk.ts/larger",
+        &larger,
         "outgoing",
         &["beacon"],
     )
@@ -891,7 +923,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     let (incoming, answer) = live_walk(
         &client,
         "typescript incoming",
-        "rift://symbol/typescript/hub.ts/beacon",
+        &beacon,
         "incoming",
         &["Banner", "larger", "total"],
     )
