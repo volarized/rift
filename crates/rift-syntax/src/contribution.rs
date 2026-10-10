@@ -265,21 +265,8 @@ impl SyntaxPublicationBuilder {
                     None => Some(SymbolId::new(identity)?),
                 }
             };
-            let mut facts = PortableSymbolFacts::new(
-                logical.map_or_else(
-                    || syntax.language().clone(),
-                    |logical| logical.language.clone(),
-                ),
-                symbol.name.clone(),
-                symbol.qualified_name.clone(),
-                ExactKind(symbol.kind.to_owned()),
-            )
-            .facets(symbol.facets.clone())
-            .with_shared_signatures(Arc::clone(&symbol.signatures))
-            .with_shared_documentation(Arc::clone(&symbol.documentation));
-            if let Some(visibility) = &symbol.visibility {
-                facts = facts.visibility(visibility.clone());
-            }
+            let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
+            let mut facts = symbol.facts(language);
             if let Some(container) = &symbol.container {
                 let container_identity =
                     symbol_identity(&language_segment, placement.identity_path(), container);
@@ -411,6 +398,26 @@ pub fn source_unit_for_path(path: &ProjectPath) -> Result<SourceUnitId, RiftErro
         "rift://source/project/{}",
         encode_path(path.as_str())
     ))
+}
+
+impl crate::SyntaxSymbol {
+    /// Copies retained declaration facts without admitting a portable identity.
+    #[must_use]
+    pub fn facts(&self, language: &rift_protocol::read::Language) -> PortableSymbolFacts {
+        let mut facts = PortableSymbolFacts::new(
+            language.clone(),
+            self.name.clone(),
+            self.qualified_name.clone(),
+            ExactKind(self.kind.to_owned()),
+        )
+        .facets(self.facets.clone())
+        .with_shared_signatures(Arc::clone(&self.signatures))
+        .with_shared_documentation(Arc::clone(&self.documentation));
+        if let Some(visibility) = &self.visibility {
+            facts = facts.visibility(visibility.clone());
+        }
+        facts
+    }
 }
 
 #[cfg(test)]

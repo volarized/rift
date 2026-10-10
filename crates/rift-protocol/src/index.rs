@@ -88,8 +88,9 @@ pub struct PackagePublication {
     #[schemars(length(max = 5_000_000))]
     pub units: Vec<PackageSourceUnit>,
     /// Every normalized logical object, including objects omitted from public directories.
-    /// Unresolved objects retain their facts with no ID. Names follow the provider's byte
-    /// bound; public directories apply the smaller public character bound separately.
+    /// Unresolved objects retain their facts with no ID. Artifact consumers enforce aggregate
+    /// and complete-record byte bounds before parsing and restoration. Public directories
+    /// apply the public character bound separately.
     #[schemars(
         schema_with = "crate::schema::artifact_objects_schema",
         length(max = 50_000_000)
@@ -442,10 +443,9 @@ mod tests {
             json!(crate::read::SYMBOL_NAME_CHARACTERS_MAX),
             "public object names retain the public character bound"
         );
-        assert_eq!(
-            schema["properties"]["objects"]["items"]["properties"]["name"]["maxLength"],
-            json!(8192),
-            "artifact schema allows names retained under the provider byte bound"
+        assert!(
+            schema["properties"]["objects"]["items"]["properties"]["name"]["maxLength"].is_null(),
+            "artifact complete-record byte bounds remain independent of public character bounds"
         );
     }
 

@@ -137,6 +137,7 @@ fn selected_anchors_for_owner(
                     origin: facts.origin(),
                     language: facts.language().clone(),
                     symbols,
+                    left_out_symbols: facts.left_out_symbols().to_vec(),
                     has_errors: facts.has_errors(),
                     left_out_declarations: 0,
                     markdown_facts: None,

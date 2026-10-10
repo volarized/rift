@@ -800,19 +800,19 @@ fn annotate_property(schema: &mut Schema, name: &str, key: &str, annotation: Val
     annotate_property_in(schema.ensure_object(), name, key, annotation);
 }
 
-/// Retains the existing symbol representation under the provider's name bound.
-///
-/// JSON Schema counts characters. Its ceiling permits every name within the provider's
-/// 8192 UTF-8 byte bound; artifact consumers also validate that byte bound before admission.
-/// This override applies only to artifact objects and leaves the public symbol schema intact.
+/// Retains full symbol facts within the artifact's aggregate and complete-record byte bounds.
+/// Artifact consumers check those bounds before parsing and restoration. Public reads
+/// retain their independent character bound.
 pub(crate) fn artifact_objects_schema(generator: &mut schemars::SchemaGenerator) -> Schema {
     let mut object = <crate::read::Symbol as schemars::JsonSchema>::json_schema(generator);
-    annotate_property(
-        &mut object,
-        property!(crate::read::Symbol, name),
-        keyword::MAX_LENGTH,
-        json!(8192),
-    );
+    if let Some(name) = object
+        .ensure_object()
+        .get_mut(keyword::PROPERTIES)
+        .and_then(|properties| properties.get_mut(property!(crate::read::Symbol, name)))
+        .and_then(Value::as_object_mut)
+    {
+        name.remove(keyword::MAX_LENGTH);
+    }
     schemars::json_schema!({"type": "array", "items": object.to_value()})
 }
 

@@ -116,15 +116,22 @@ impl PackageAnalysisWarning {
                 field,
                 bound,
                 ..
-            } => {
-                source_is_valid(unit.as_ref(), range.as_ref())
-                    && !field.is_empty()
-                    && field.chars().take(129).count() <= 128
-                    && *bound > 0
-            }
+            } => object_is_valid(unit.as_ref(), range.as_ref(), field, *bound),
             _ => true,
         }
     }
+}
+
+pub(crate) fn object_is_valid(
+    unit: Option<&SourceUnitId>,
+    range: Option<&TextRange>,
+    field: &str,
+    bound: u64,
+) -> bool {
+    source_is_valid(unit, range)
+        && !field.is_empty()
+        && field.chars().take(129).count() <= 128
+        && bound > 0
 }
 
 fn source_is_valid(unit: Option<&SourceUnitId>, range: Option<&TextRange>) -> bool {

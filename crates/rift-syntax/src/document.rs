@@ -180,6 +180,7 @@ pub struct SyntaxFacts {
     origin: SyntaxOrigin,
     language: Language,
     symbols: Vec<SyntaxSymbol>,
+    left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
     has_errors: bool,
     left_out_declarations: usize,
@@ -267,26 +268,18 @@ fn unused_suffixed_name(name: &str, count: &mut u32, taken: &HashSet<String>) ->
     }
 }
 
-/// Leaves out every declaration whose `name` or `qualified_name` the
-/// Contribution contract refuses - empty, past `PROVIDER_SYMBOL_ID_BYTES_MAX`
-/// bytes, or holding a control character - and returns how many left.
-///
-/// The rule is `rift_core::is_portable_name`, the predicate the contract
-/// itself checks a Contribution's name with, so a declaration this pass
-/// keeps is one the contract accepts. A declaration nested under a refused
-/// one carries the refused bytes in its own qualified name, so the same rule
-/// leaves it out. The pass runs after the suffix pass, so the bound holds
-/// for the qualified name the Contribution carries.
-///
-/// Every provider funnels through [`SyntaxDocument::new`], so no provider
-/// can emit a name the contract refuses. Work is one predicate per
-/// declaration, already bounded by the provider's node bound.
-fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> usize {
-    let extracted = symbols.len();
-    symbols.retain(|symbol| {
-        is_portable_name(&symbol.name) && is_portable_name(&symbol.qualified_name)
-    });
-    extracted - symbols.len()
+/// Keeps Contribution-admitted declarations in `symbols` and retains the full omitted facts.
+/// The provider's source and node bounds apply to both collections.
+fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> Vec<SyntaxSymbol> {
+    let mut left_out = Vec::new();
+    for symbol in std::mem::take(symbols) {
+        if is_portable_name(&symbol.name) && is_portable_name(&symbol.qualified_name) {
+            symbols.push(symbol);
+        } else {
+            left_out.push(symbol);
+        }
+    }
+    left_out
 }
 
 impl SyntaxDocument {
@@ -301,8 +294,8 @@ impl SyntaxDocument {
 
     /// Assembles one document from a provider's extracted facts, suffixing
     /// every repeated qualified name apart so each declaration addresses
-    /// one identity, then leaving out every declaration whose name the
-    /// Contribution contract refuses.
+    /// one identity. Declarations outside the Contribution name bounds retain
+    /// their complete syntax facts in the omitted collection.
     pub(crate) fn new(
         language: Language,
         path: ProjectPath,
@@ -311,17 +304,19 @@ impl SyntaxDocument {
         has_errors: bool,
     ) -> Self {
         suffix_duplicate_qualified_names(&mut symbols);
-        let left_out_declarations = leave_out_refused_names(&mut symbols);
         let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
         for symbol in &mut symbols {
             symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
         }
+        let left_out_symbols = leave_out_refused_names(&mut symbols);
+        let left_out_declarations = left_out_symbols.len();
         Self {
             path,
             facts: Arc::new(SyntaxFacts {
                 origin: SyntaxOrigin::Provider,
                 language,
                 symbols,
+                left_out_symbols,
                 export_bindings: None,
                 has_errors,
                 left_out_declarations,
@@ -474,6 +469,12 @@ impl SyntaxFacts {
         &self.symbols
     }
 
+    /// Full declarations omitted from the portable Contribution collection.
+    #[must_use]
+    pub fn left_out_symbols(&self) -> &[SyntaxSymbol] {
+        &self.left_out_symbols
+    }
+
     /// How many extracted declarations this document leaves out.
     #[must_use]
     pub const fn left_out_declaration_count(&self) -> usize {
@@ -544,6 +545,7 @@ impl SyntaxFacts {
             origin: parts.origin,
             language: parts.language,
             symbols: parts.symbols,
+            left_out_symbols: parts.left_out_symbols,
             export_bindings: parts.export_bindings,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,

@@ -463,6 +463,7 @@ fn publish(
         records.file(package, held)?;
     }
     records.graph(package, &origin, semantics, analyzed)?;
+    records.retained_syntax(analyzed);
     records.relationships(package, semantics, analyzed, limits.relationships_max())?;
     let (documentation, notebook_cells) = package_documentation(
         package,
@@ -1638,6 +1639,51 @@ impl Records {
             self.objects.push(object);
         }
         Ok(())
+    }
+
+    fn retained_syntax(&mut self, analyzed: &[AnalyzedFile]) {
+        let admitted = self
+            .units
+            .iter()
+            .map(|unit| unit.unit.0.clone())
+            .collect::<BTreeSet<_>>();
+        for held in analyzed {
+            let unit = wire_unit(held.placement.unit());
+            if !admitted.contains(&unit.0) {
+                continue;
+            }
+            for symbol in held.file.syntax().left_out_symbols() {
+                if self.objects.len() >= bound(self.publication.symbols) {
+                    self.symbols_truncated = true;
+                    self.warn(truncation("objects", u64::from(self.publication.symbols)));
+                    return;
+                }
+                let facts = symbol.facts(held.file.syntax().language());
+                let object =
+                    rift_provider::AssembledSymbol::wire_facts(&facts, held.placement.origin());
+                let range = TextRange {
+                    start: symbol.item_range.start,
+                    end: symbol.item_range.end,
+                };
+                self.identity_incomplete = true;
+                self.warn(PackageAnalysisWarning::IdentityUnresolved {
+                    unit: Some(unit.clone()),
+                    range: Some(range.clone()),
+                    qualified_name: symbol.qualified_name.clone(),
+                });
+                if !object.name_is_public() {
+                    self.warn(PackageAnalysisWarning::ObjectUnavailable {
+                        unit: Some(unit.clone()),
+                        range: Some(range),
+                        qualified_name: symbol.qualified_name.clone(),
+                        field: "name".to_owned(),
+                        bound: u64::try_from(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+                            .expect("public symbol name bound fits u64"),
+                    });
+                }
+                self.objects.push(object);
+            }
+        }
     }
 
     fn object_identity(&mut self, owner: &SymbolOwner, origin: &SymbolOrigin, object: &mut Symbol) {

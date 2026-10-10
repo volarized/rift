@@ -342,10 +342,8 @@ impl WorkspaceSemantics {
     }
 
     /// Assembles one captured record, including records with no source declaration.
-    pub(crate) fn assembled_record(
-        &self,
-        record: &rift_core::SymbolRecord,
-    ) -> Option<AssembledSymbol> {
+    #[must_use]
+    pub fn assembled_record(&self, record: &rift_core::SymbolRecord) -> Option<AssembledSymbol> {
         SymbolAssembler::assemble(
             &self.graph,
             record,

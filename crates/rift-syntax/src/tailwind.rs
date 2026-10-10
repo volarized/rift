@@ -644,6 +644,7 @@ pub fn append_framework_symbols(
             .fail();
     }
     let mut combined = document.symbols().to_vec();
+    combined.extend_from_slice(document.facts().left_out_symbols());
     combined.extend(symbols);
     combined.sort_by_key(|symbol| symbol.range.start);
     let mut result = SyntaxDocument::new(
@@ -655,7 +656,7 @@ pub fn append_framework_symbols(
     )
     .with_source_witness(source.text)
     .with_syntax_limits(limits)
-    .with_left_out_declarations(omitted)
+    .with_left_out_declarations(omitted - document.facts().left_out_symbols().len())
     .with_framework_context();
     if let Some(bindings) = document.facts().export_bindings() {
         result = result.with_export_bindings(bindings.to_vec());
@@ -664,6 +665,7 @@ pub fn append_framework_symbols(
         origin: result.facts().origin(),
         language: result.language().clone(),
         symbols: result.symbols().to_vec(),
+        left_out_symbols: result.facts().left_out_symbols().to_vec(),
         has_errors: result.has_errors(),
         left_out_declarations: result.left_out_declaration_count(),
         markdown_facts: None,

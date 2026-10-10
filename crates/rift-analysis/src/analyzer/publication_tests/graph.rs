@@ -441,6 +441,40 @@ fn source_less_objects_keep_logical_runtime_origin() {
 }
 
 #[test]
+fn captured_records_assemble_source_less_facts_without_assigning_unknown_identity() {
+    let fixture = GraphFixture::new();
+    for established in [true, false] {
+        let semantics = GraphFixture::graph_with_contributions(vec![
+            fixture
+                .named_contribution("wide", Vec::new(), established)
+                .expect("source-less contribution"),
+        ]);
+        let record = &semantics.graph().records()[0];
+        for key in record.contributions() {
+            assert!(
+                semantics
+                    .graph()
+                    .contribution(key)
+                    .expect("captured contribution")
+                    .source()
+                    .is_none()
+            );
+        }
+        let object = semantics
+            .assembled_record(record)
+            .expect("source-less object assembly");
+        assert_eq!(object.identity().is_some(), established);
+        if established {
+            assert_eq!(object.identity(), Some(&fixture.identity("wide")));
+        }
+        let facts = object.facts().expect("retained facts");
+        assert_eq!(facts.name(), "wide");
+        assert_eq!(facts.signatures_slice().len(), 2);
+        assert_eq!(facts.documentation_blocks().len(), 1);
+    }
+}
+
+#[test]
 fn foreign_logical_owner_cannot_receive_publication_origin() {
     let fixture = GraphFixture::new();
     let mut foreign = GraphFixture::new();
@@ -650,4 +684,83 @@ fn relationship_bound_keeps_captured_graph_immutable() {
     assert!(publication.warnings.iter().any(|warning| matches!(warning,
         PackageAnalysisWarning::PublicationTruncated { collection, bound }
             if collection == "relationships" && *bound == 1)));
+}
+
+#[test]
+fn four_byte_names_keep_full_artifact_facts_and_neighbor_publication() {
+    for characters in [3000, 4097] {
+        let name = "𐐀".repeat(characters);
+        let source = format!(
+            "/// Original callable documentation.\npub fn {name}(value: u8) -> u8 {{ value }}\npub fn finish() {{}}\n"
+        );
+        let analysis = fixture::package_result(
+            rift_syntax::ShippedLanguage::Rust,
+            vec![("src/lib.rs", &source)],
+            None,
+        )
+        .expect("captured full source and package metadata");
+        let publication = analysis.publication();
+        let object = publication
+            .objects
+            .iter()
+            .find(|object| object.name == name)
+            .expect("full omitted object");
+        assert!(object.id.is_none());
+        assert_eq!(object.name_is_public(), characters <= 4096);
+        assert_eq!(object.signatures.len(), 1);
+        assert!(object.signatures[0].display.contains(&name));
+        assert_eq!(
+            object.documentation[0].text,
+            "Original callable documentation."
+        );
+        assert!(
+            publication
+                .objects
+                .iter()
+                .any(|object| object.name == "finish" && object.id.is_some())
+        );
+        assert!(
+            publication
+                .documents
+                .iter()
+                .any(|document| document.kind == PackageDocumentKind::Symbol
+                    && document.name == "finish")
+        );
+        assert!(
+            !publication
+                .documents
+                .iter()
+                .any(|document| document.name == name)
+        );
+        assert_eq!(publication.units[0].source, source);
+        assert!(publication.units[0].source_complete);
+        assert!(
+            publication
+                .coverage
+                .iter()
+                .all(|coverage| !coverage.identity_complete)
+        );
+        assert!(publication.warnings.iter().any(|warning| matches!(warning,
+            PackageAnalysisWarning::IdentityUnresolved { unit: Some(unit), range: Some(range), qualified_name }
+            if unit == &publication.units[0].unit && qualified_name == &name
+                && source[usize::try_from(range.start).expect("item start")..usize::try_from(range.end).expect("item end")].contains(&name))));
+        assert_eq!(
+            publication.warnings.iter().any(|warning| matches!(warning,
+            PackageAnalysisWarning::ObjectUnavailable { field, bound, qualified_name, .. }
+            if field == "name" && *bound == 4096 && qualified_name == &name)),
+            characters > 4096
+        );
+        let wire = serde_json::to_value(publication).expect("full artifact encoding");
+        let schema: serde_json::Value =
+            serde_json::from_str(&rift_protocol::schema::package_index_schema_document())
+                .expect("artifact schema");
+        assert!(
+            jsonschema::validator_for(&schema)
+                .expect("schema validator")
+                .is_valid(&wire)
+        );
+        let restored: PackagePublication =
+            serde_json::from_value(wire).expect("full artifact restore");
+        assert_eq!(&restored, publication);
+    }
 }

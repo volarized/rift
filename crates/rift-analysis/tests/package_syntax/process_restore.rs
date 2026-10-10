@@ -184,6 +184,7 @@ impl CapturedFacts {
                     .into_iter()
                     .map(|symbol| symbol.restore(&names))
                     .collect(),
+                left_out_symbols: Vec::new(),
                 has_errors: self.has_errors,
                 left_out_declarations: usize::try_from(self.left_out_declarations)
                     .expect("bounded omissions"),

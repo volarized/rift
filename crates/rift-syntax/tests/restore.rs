@@ -27,6 +27,7 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         origin: facts.origin(),
         language: facts.language().clone(),
         symbols: facts.symbols().to_vec(),
+        left_out_symbols: facts.left_out_symbols().to_vec(),
         has_errors: facts.has_errors(),
         left_out_declarations: facts.left_out_declaration_count(),
         markdown_facts: facts.markdown_facts().cloned(),
@@ -861,5 +862,92 @@ fn restored_markdown_code_language_uses_source_bound() {
         )
         .map_err(|error| error.slug()),
         Err(errors::syntax::facts_text_exceeded::SLUG)
+    );
+}
+
+#[test]
+fn full_omitted_names_restore_with_source_ranges_and_parent_validation() {
+    for characters in [3000, 4097] {
+        let name = "𐐀".repeat(characters);
+        let source = format!(
+            "/// Retained original declaration.\npub fn {name}(value: u8) -> u8 {{ value }}\npub fn finish() {{}}\n"
+        );
+        let document = parsed(ShippedLanguage::Rust, &source);
+        assert!(!document.has_errors());
+        assert!(name.len() > rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX);
+        let original = document.facts();
+        assert_eq!(original.symbols().len(), 1);
+        assert_eq!(original.symbols()[0].name, "finish");
+        assert_eq!(original.left_out_symbols().len(), 1);
+        assert_eq!(original.left_out_declaration_count(), 1);
+        let omitted = &original.left_out_symbols()[0];
+        assert_eq!(omitted.name, name);
+        let start = usize::try_from(omitted.item_range.start).expect("item start");
+        let end = usize::try_from(omitted.item_range.end).expect("item end");
+        assert!(source[start..end].contains(&name));
+        assert_eq!(omitted.signatures.len(), 1);
+        assert_eq!(
+            omitted.documentation[0].text,
+            "Retained original declaration."
+        );
+        let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(original))
+            .expect("full omitted facts restore");
+        assert_eq!(&restored, original);
+        let mut invalid = parts(original);
+        invalid.left_out_declarations = 0;
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+                .expect_err("omitted inventory count")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_count_exceeded"
+        );
+        let mut invalid = parts(original);
+        invalid.left_out_symbols[0].container = Some("finish".to_owned());
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+                .expect_err("parent occurs after omitted declaration")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_reference_invalid"
+        );
+    }
+}
+
+#[test]
+fn retained_namespace_export_bindings_resolve_original_container_facts() {
+    let name = "𐐀".repeat(3000);
+    let source = format!(
+        "declare module \"{name}\" {{ export function open(): void; }}\nexport function finish(): void;\n"
+    );
+    let document = parsed(ShippedLanguage::TypeScript, &source);
+    assert!(!document.has_errors());
+    let original = document.facts();
+    let bindings = original
+        .export_bindings()
+        .expect("recorded original exports");
+    let container = bindings
+        .iter()
+        .find_map(|binding| binding.container.as_ref())
+        .expect("original ambient namespace container");
+    assert!(!rift_core::is_portable_name(container));
+    assert!(
+        original
+            .left_out_symbols()
+            .iter()
+            .any(|symbol| &symbol.qualified_name == container)
+    );
+    let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(original))
+        .expect("retained container and export bindings restore together");
+    assert_eq!(&restored, original);
+    let mut invalid = parts(original);
+    invalid.export_bindings.as_mut().expect("recorded exports")[0].container =
+        Some("absent".to_owned());
+    assert_eq!(
+        SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+            .expect_err("missing export container")
+            .slug()
+            .as_str(),
+        "rift.syntax.facts_reference_invalid"
     );
 }

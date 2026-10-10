@@ -72,6 +72,7 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
             origin: enriched.facts().origin(),
             language: enriched.language().clone(),
             symbols: enriched.symbols().to_vec(),
+            left_out_symbols: enriched.facts().left_out_symbols().to_vec(),
             has_errors: enriched.has_errors(),
             left_out_declarations: enriched.left_out_declaration_count(),
             markdown_facts: None,

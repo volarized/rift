@@ -25,6 +25,8 @@ pub struct SyntaxFactsParts {
     pub language: Language,
     /// Normalized declarations in source order.
     pub symbols: Vec<SyntaxSymbol>,
+    /// Full declarations omitted by the portable name bounds, in source order.
+    pub left_out_symbols: Vec<SyntaxSymbol>,
     /// Recorded export bindings. Missing facts remain unknown.
     pub export_bindings: Option<Vec<crate::SyntaxExportBinding>>,
     /// Whether the provider reported parser errors.
@@ -315,20 +317,63 @@ pub(crate) fn validate_symbols(
     )?;
     let names = SyntaxNames::new(&parts.language)
         .ok_or_else(|| errors::syntax::facts_kind_invalid().error())?;
+    if parts.left_out_symbols.len() > parts.left_out_declarations {
+        return errors::syntax::facts_count_exceeded().fail();
+    }
     ordered(parts.symbols.iter().map(|symbol| symbol.range))?;
+    ordered(parts.left_out_symbols.iter().map(|symbol| symbol.range))?;
     let mut positions = BTreeMap::new();
-    for (position, symbol) in parts.symbols.iter().enumerate() {
+    for symbol in &parts.symbols {
         if !rift_core::is_portable_name(&symbol.name)
             || !rift_core::is_portable_name(&symbol.qualified_name)
-            || positions
-                .insert(symbol.qualified_name.as_str(), position)
-                .is_some()
         {
             return Err(errors::syntax::facts_name_invalid().error());
         }
         validate_symbol(source, limits, &names, &parts.language, symbol)?;
     }
-    validate_symbol_parents(&parts.symbols, limits, &positions)
+    let mut symbols = parts
+        .symbols
+        .iter()
+        .chain(&parts.left_out_symbols)
+        .collect::<Vec<_>>();
+    symbols.sort_by_key(|symbol| symbol.range.start);
+    for (position, symbol) in symbols.iter().enumerate() {
+        if positions
+            .insert(symbol.qualified_name.as_str(), position)
+            .is_some()
+        {
+            return errors::syntax::facts_name_invalid().fail();
+        }
+    }
+    validate_left_out_symbols(source, limits, &names, parts)?;
+    validate_symbol_parents(&symbols, limits, &positions)
+}
+
+fn retained_name(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
+    text(value, limits)?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return errors::syntax::facts_name_invalid().fail();
+    }
+    Ok(())
+}
+
+fn validate_left_out_symbols(
+    source: &str,
+    limits: SyntaxLimits,
+    names: &SyntaxNames,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    for symbol in &parts.left_out_symbols {
+        if rift_core::is_portable_name(&symbol.name)
+            && rift_core::is_portable_name(&symbol.qualified_name)
+        {
+            return errors::syntax::facts_name_invalid().fail();
+        }
+        retained_name(&symbol.name, limits)?;
+        retained_name(&symbol.qualified_name, limits)?;
+        validate_symbol(source, limits, names, &parts.language, symbol)?;
+    }
+    Ok(())
 }
 
 fn text(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
@@ -511,7 +556,7 @@ fn validate_module_path(
 }
 
 fn validate_symbol_parents(
-    symbols: &[SyntaxSymbol],
+    symbols: &[&SyntaxSymbol],
     limits: SyntaxLimits,
     positions: &BTreeMap<&str, usize>,
 ) -> Result<(), RiftError> {
@@ -520,9 +565,7 @@ fn validate_symbol_parents(
         let depth = match symbol.container.as_deref() {
             None => 1,
             Some(container) => {
-                if !rift_core::is_portable_name(container) {
-                    return Err(errors::syntax::facts_name_invalid().error());
-                }
+                retained_name(container, limits)?;
                 // Duplicate suffixing changes qualified names but retains authored containers.
                 match positions.get(container).copied() {
                     None => 1,
@@ -750,6 +793,7 @@ fn validate_export_bindings(
     let containers = parts
         .symbols
         .iter()
+        .chain(&parts.left_out_symbols)
         .map(|symbol| (symbol.qualified_name.as_str(), symbol.range))
         .collect::<BTreeMap<_, _>>();
     let mut previous = None;
@@ -770,13 +814,14 @@ fn validate_export_bindings(
                 return Err(errors::syntax::facts_range_invalid().error());
             }
         }
-        if let Some(container) = &binding.container
-            && (!rift_core::is_portable_name(container)
-                || !containers
-                    .get(container.as_str())
-                    .is_some_and(|range| contains(*range, binding.range)))
-        {
-            return Err(errors::syntax::facts_reference_invalid().error());
+        if let Some(container) = &binding.container {
+            retained_name(container, limits)?;
+            if !containers
+                .get(container.as_str())
+                .is_some_and(|range| contains(*range, binding.range))
+            {
+                return errors::syntax::facts_reference_invalid().fail();
+            }
         }
         let form_valid = match binding.kind {
             crate::SyntaxExportKind::Named => binding.local.is_some() && binding.exported.is_some(),

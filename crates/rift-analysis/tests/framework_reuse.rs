@@ -166,6 +166,7 @@ fn checked_facts(text: &str, limits: SyntaxLimits, facts: &SyntaxFacts) -> Synta
             origin: facts.origin(),
             language: facts.language().clone(),
             symbols: facts.symbols().to_vec(),
+            left_out_symbols: facts.left_out_symbols().to_vec(),
             has_errors: facts.has_errors(),
             left_out_declarations: facts.left_out_declaration_count(),
             markdown_facts: facts.markdown_facts().cloned(),

@@ -144,26 +144,37 @@ impl AssembledSymbol {
                     .or_insert_with(|| value.clone());
             }
         }
+        let mut symbol = Self::wire_facts(facts, &self.origin);
+        symbol.id = self
+            .identity
+            .as_ref()
+            .map(|identity| WireSymbolId(identity.as_str().to_owned()));
+        symbol.container = self
+            .container
+            .as_ref()
+            .map(|container| WireSymbolId(container.as_str().to_owned()));
+        symbol.extensions = Extensions(extension_values);
+        symbol
+    }
+
+    /// Converts retained facts without assigning a logical identity or container.
+    /// Portable Contribution admission remains separate from this factual projection.
+    #[must_use]
+    pub fn wire_facts(facts: &PortableSymbolFacts, origin: &ContributionOrigin) -> Symbol {
         Symbol {
-            id: self
-                .identity
-                .as_ref()
-                .map(|identity| WireSymbolId(identity.as_str().to_owned())),
+            id: None,
             language: facts.language().clone(),
             name: facts.name().to_owned(),
             kind: facts.kind().clone(),
             facets: facts.symbol_facets().to_vec(),
-            origin: wire_symbol_origin(&self.origin),
-            container: self
-                .container
-                .as_ref()
-                .map(|container| WireSymbolId(container.as_str().to_owned())),
+            origin: wire_symbol_origin(origin),
+            container: None,
             modifiers: facts.modifier_words().to_vec(),
             visibility: facts.visibility_spelling().map(str::to_owned),
             types: facts.type_bindings().to_vec(),
             signatures: facts.signatures_slice().to_vec(),
             documentation: facts.documentation_blocks().to_vec(),
-            extensions: Extensions(extension_values),
+            extensions: Extensions::default(),
             document_local: facts.is_document_local(),
         }
     }
@@ -577,6 +588,67 @@ mod tests {
             None,
         )
         .expect("graph")
+    }
+
+    #[test]
+    fn source_less_raw_facts_keep_full_names_signatures_and_documentation() {
+        let origin = ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin");
+        for characters in [3000, 4097] {
+            let name = "𐐀".repeat(characters);
+            let signature = serde_json::from_value(serde_json::json!({
+                "display": format!("fn {name}()"), "language":"rust",
+            }))
+            .expect("signature");
+            let facts = PortableSymbolFacts::new(
+                Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                },
+                &name,
+                &name,
+                ExactKind("function".to_owned()),
+            )
+            .signatures(vec![signature])
+            .documentation(vec![Documentation {
+                format: DocumentationFormat::Markdown,
+                text: "Original source-less documentation.".to_owned(),
+            }]);
+            assert!(!rift_core::is_portable_name(&name));
+            let refused = Contribution::builder(
+                ContributionKey::new(
+                    provider("syntax"),
+                    ProviderRevision::new(1).expect("revision"),
+                    ProviderSymbolId::new("raw").expect("provider symbol"),
+                ),
+                SourceApplicability::Independent,
+                facts.clone(),
+                origin.clone(),
+            )
+            .build();
+            assert!(
+                refused.is_err(),
+                "raw facts cannot bypass portable admission"
+            );
+            let symbol = super::AssembledSymbol::wire_facts(&facts, &origin);
+            assert_eq!(symbol.id, None);
+            assert_eq!(symbol.container, None);
+            assert_eq!(symbol.name, name);
+            assert_eq!(symbol.name_is_public(), characters <= 4096);
+            assert!(symbol.name_is_retained(name.len()));
+            assert!(!symbol.name_is_retained(name.len() - 1));
+            assert_eq!(symbol.signatures.len(), 1);
+            assert_eq!(
+                symbol.documentation[0].text,
+                "Original source-less documentation."
+            );
+            assert_eq!(symbol.origin.source_kind, SourceKind::Synthetic);
+            let wire = serde_json::to_value(&symbol).expect("retained symbol serializes");
+            assert_eq!(
+                serde_json::from_value::<rift_protocol::read::Symbol>(wire)
+                    .expect("retained symbol roundtrip"),
+                symbol
+            );
+        }
     }
 
     #[test]

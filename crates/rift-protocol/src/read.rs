@@ -2176,8 +2176,8 @@ impl Symbol {
     /// Whether the name fits the public character bound.
     ///
     /// This checks the name's length independently of the declaration's export visibility.
-    /// Package artifacts retain names outside this bound when the provider's byte bound permits
-    /// them; public directories omit those objects.
+    /// Package artifacts retain original names under their record byte bounds; public
+    /// directories omit objects outside the public character bound.
     #[must_use]
     pub fn name_is_public(&self) -> bool {
         self.name
@@ -2185,6 +2185,18 @@ impl Symbol {
             .take(SYMBOL_NAME_CHARACTERS_MAX + 1)
             .count()
             <= SYMBOL_NAME_CHARACTERS_MAX
+    }
+
+    /// Whether the original name fits an admitted artifact record's byte bound.
+    ///
+    /// Artifact callers check the aggregate input bound before parsing and the complete
+    /// record bound before restoration. This predicate preserves full names independently
+    /// of public character bounds and portable identity admission.
+    #[must_use]
+    pub fn name_is_retained(&self, bytes_max: usize) -> bool {
+        !self.name.is_empty()
+            && self.name.len() <= bytes_max
+            && !self.name.chars().any(char::is_control)
     }
 }
 
