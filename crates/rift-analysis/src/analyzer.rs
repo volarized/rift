@@ -35,13 +35,14 @@ use rift_protocol::documentation::{
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
     DocumentationWarningKind, NotebookCellKind,
 };
+use rift_protocol::identity::SymbolOwner;
 use rift_protocol::index::{
     PACKAGE_PUBLICATION_FORMAT_REVISION, PACKAGE_SOURCE_BYTES_MAX, PackageAnalysisWarning,
     PackageDocument, PackageDocumentKind, PackagePublication, PackageSourceUnit, PackageSymbol,
 };
 use rift_protocol::read::{
-    Digest, ExactKind, Language, PackageIdentity, ProjectPath, SourceLocationKind, SourceUnitId,
-    SymbolFacet, SymbolId, SymbolOrigin, TextRange,
+    Digest, ExactKind, Language, ProjectPath, SourceLocationKind, SourceUnitId, SymbolFacet,
+    SymbolId, SymbolOrigin, TextRange,
 };
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
@@ -62,8 +63,18 @@ mod retained_tests;
 use join::ModuleRole;
 pub use join::StubForm;
 
-pub(super) fn package_label(package: &PackageIdentity) -> String {
-    format!("{}/{}@{}", package.manager, package.name, package.version)
+pub(super) fn package_label(owner: &SymbolOwner) -> String {
+    match owner {
+        SymbolOwner::Package {
+            manager,
+            name,
+            version,
+            ..
+        } => format!("{manager}/{name}@{version}"),
+        SymbolOwner::Runtime { runtime, version } => format!("stdlib/{runtime}@{version}"),
+        SymbolOwner::Local => "local".to_owned(),
+        SymbolOwner::NamedLocal { name } => format!("local@{name}"),
+    }
 }
 
 /// One package file as the analyzer holds it: the parsed document, where it is filed, the
@@ -178,7 +189,7 @@ fn analyzed_file(
 ) -> Result<AnalyzedFile, RiftError> {
     let source = crate::PackageSyntaxSource::new(
         file,
-        input.package(),
+        input.owner(),
         input.language(),
         input.limits().syntax(),
     );
@@ -218,7 +229,7 @@ fn analyzed_file(
         false,
         facts,
     );
-    let placement = placement_of(input.package(), input.origin(), file.path())?;
+    let placement = placement_of(input.owner(), input.origin(), file.path())?;
     let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
     Ok(AnalyzedFile {
         file: parsed,
@@ -231,9 +242,8 @@ fn analyzed_file(
 impl PackageAnalyzer {
     /// Analyzes one exact package's selected files.
     ///
-    /// Each file is placed under `rift://source/<manager>/<name>@<version>/<path>` with
-    /// the identity path `<manager>/<name>@<version>/<path>`, and its origin is the
-    /// input origin: a dependency carrying the package identity, or the standard library.
+    /// Each file retains its original path under the exact package or runtime source
+    /// owner. Its origin is the input origin with the same complete owner.
     /// A stub and the module it declares (`mod.pyi` and `mod.py`, `index.d.ts` and
     /// `index.js`) join: each name both declare answers once, at the module, with the
     /// stub's signatures and types. Records are emitted in unit, symbol, and document
@@ -276,7 +286,7 @@ impl PackageAnalyzer {
         revision: u64,
         mut supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
     ) -> Result<PackageAnalysis, RiftError> {
-        let package = input.package();
+        let package = input.owner();
         let sources = input
             .files()
             .iter()
@@ -360,7 +370,7 @@ impl PackageAnalyzer {
 /// identity afterwards, so the publication's order is the identities' order and not the
 /// order the files arrived in.
 fn publish(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     source_origin: &ContributionOrigin,
     package_language: &Language,
     analyzed: &[AnalyzedFile],
@@ -412,7 +422,7 @@ fn publish(
         PackagePublication {
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
             analyzer_revision: analyzer_revision(),
-            package: package.clone(),
+            owner: package.clone(),
             source_digest,
             units: records.units,
             symbols: records.symbols,
@@ -425,7 +435,7 @@ fn publish(
 }
 
 fn package_documentation(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     origin: &SymbolOrigin,
     analyzed: &[AnalyzedFile],
@@ -524,7 +534,7 @@ impl PackageDocumentationInputs<'_> {
 }
 
 fn append_notebook_inputs<'source>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     origin: &SymbolOrigin,
     analyzed: &[AnalyzedFile],
@@ -552,7 +562,7 @@ fn append_notebook_inputs<'source>(
 }
 
 fn append_notebook_cell<'source>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     origin: &SymbolOrigin,
     held: &AnalyzedFile,
@@ -657,7 +667,7 @@ fn append_notebook_cell<'source>(
 }
 
 fn add_notebook_document(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     held: &AnalyzedFile,
     cell: &crate::documentation::notebook::NotebookCellContent,
@@ -684,7 +694,7 @@ fn add_notebook_document(
         kind: PackageDocumentKind::File,
         unit: unit.clone(),
         language,
-        package: package.clone(),
+        owner: package.clone(),
         content_digest: text_digest(&retained.text),
         identifier_terms: identifier_terms_with_limit(
             &[&name],
@@ -701,7 +711,7 @@ fn add_notebook_document(
 }
 
 fn append_regular_inputs<'source>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     origin: &SymbolOrigin,
     analyzed: &'source [AnalyzedFile],
     inputs: &mut PackageDocumentationInputs<'source>,
@@ -848,7 +858,7 @@ fn decode_package_notebooks(
 fn append_attached_comment_inputs<'source>(
     analyzed: &'source [AnalyzedFile],
     origin: &SymbolOrigin,
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     inputs: &mut PackageDocumentationInputs<'source>,
 ) -> Result<(), RiftError> {
     for held in analyzed {
@@ -875,7 +885,7 @@ fn append_attached_comment_inputs<'source>(
 fn append_attached_comment<'source>(
     held: &'source AnalyzedFile,
     origin: &SymbolOrigin,
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     inputs: &mut PackageDocumentationInputs<'source>,
 ) -> Result<(), RiftError> {
     let source_text = held.file.source();
@@ -950,7 +960,7 @@ fn append_attached_comment<'source>(
 }
 
 fn package_declarations<'declaration>(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     analyzed: &'declaration [AnalyzedFile],
     records: &'declaration Records,
 ) -> Result<Vec<DocumentationDeclaration<'declaration>>, RiftError> {
@@ -1104,7 +1114,7 @@ impl Records {
     /// Emits one file's unit record, its declarations, and the documents they rank under.
     fn file(
         &mut self,
-        package: &PackageIdentity,
+        package: &SymbolOwner,
         origin: &SymbolOrigin,
         semantics: &WorkspaceSemantics,
         held: &AnalyzedFile,
@@ -1154,7 +1164,7 @@ impl Records {
     /// Emits one file's own search document, ranked by its content.
     fn file_document(
         &mut self,
-        package: &PackageIdentity,
+        package: &SymbolOwner,
         language: &Language,
         unit: &SourceUnitId,
         path: &ProjectPath,
@@ -1167,7 +1177,7 @@ impl Records {
             kind: PackageDocumentKind::File,
             unit: unit.clone(),
             language: language.clone(),
-            package: package.clone(),
+            owner: package.clone(),
             content_digest,
             identifier_terms: identifier_terms_with_limit(
                 &[&name],
@@ -1190,7 +1200,7 @@ impl Records {
     #[allow(clippy::too_many_lines)]
     fn declaration(
         &mut self,
-        package: &PackageIdentity,
+        package: &SymbolOwner,
         origin: &SymbolOrigin,
         semantics: &WorkspaceSemantics,
         held: &AnalyzedFile,
@@ -1274,7 +1284,7 @@ impl Records {
                 kind: PackageDocumentKind::Symbol,
                 unit: unit.clone(),
                 language: language.clone(),
-                package: package.clone(),
+                owner: package.clone(),
                 content_digest,
                 identifier_terms: identifier_terms_with_limit(
                     &[&record.name, &record.qualified_name],
@@ -1308,7 +1318,7 @@ impl Records {
             self.warn_document_full();
             return Ok(());
         }
-        document.digest = digest_of(&document, &document.package.clone())?;
+        document.digest = digest_of(&document, &document.owner.clone())?;
         self.documents.push(document);
         Ok(())
     }
@@ -1452,11 +1462,13 @@ fn identifier_terms_with_limit(names: &[&str], maximum: u32) -> Vec<String> {
 
 /// The origin every declaration of one analyzed package carries.
 fn symbol_origin(
-    package: &PackageIdentity,
+    owner: &SymbolOwner,
     origin: &ContributionOrigin,
 ) -> Result<SymbolOrigin, RiftError> {
     let result = match origin.location() {
-        Some(rift_core::SourceLocation::Dependency { package: owner }) if owner == package => {
+        Some(rift_core::SourceLocation::Dependency { package })
+            if package.owner().ok().as_ref() == Some(owner) =>
+        {
             SymbolOrigin {
                 location: Some(SourceLocationKind::Dependency),
                 package: Some(package.clone()),
@@ -1464,15 +1476,17 @@ fn symbol_origin(
                 source_kind: SourceKind::Authored,
             }
         }
-        Some(rift_core::SourceLocation::Stdlib { runtime }) => SymbolOrigin {
+        Some(rift_core::SourceLocation::Stdlib {
+            runtime: Some(runtime),
+        }) if runtime.owner().ok().as_ref() == Some(owner) => SymbolOrigin {
             location: Some(SourceLocationKind::Stdlib),
             package: None,
-            runtime: runtime.clone(),
+            runtime: Some(runtime.clone()),
             source_kind: SourceKind::Authored,
         },
         _ => {
             return errors::analysis::package_identity_invalid()
-                .package(package_label(package))
+                .package(package_label(owner))
                 .fail();
         }
     };
@@ -1492,7 +1506,7 @@ fn truncation(collection: &str, bound: u64) -> PackageAnalysisWarning {
 ///
 /// The member is dropped rather than left empty so a record's digest covers what the
 /// record says and nothing about the digest field itself.
-fn digest_of<T: Serialize>(record: &T, package: &PackageIdentity) -> Result<Digest, RiftError> {
+fn digest_of<T: Serialize>(record: &T, package: &SymbolOwner) -> Result<Digest, RiftError> {
     let mut value = serde_json::to_value(record).map_err(|error| {
         errors::analysis::package_provider_failed()
             .package(package_label(package))
@@ -1537,7 +1551,7 @@ fn wire_path(path: &CoreProjectPath) -> ProjectPath {
 #[cfg(test)]
 fn parsed_file(
     file: crate::input::PackageSource<'_>,
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     package_language: &Language,
     syntax_limits: rift_syntax::SyntaxLimits,
 ) -> Result<IndexedFile, RiftError> {
@@ -1575,18 +1589,27 @@ pub(super) fn source_language(extension: &str, package_language: &Language) -> L
 
 /// The placement of one package file: its unit, identity path, and origin.
 fn placement_of(
-    package: &PackageIdentity,
+    package: &SymbolOwner,
     origin: &ContributionOrigin,
     path: &CoreProjectPath,
 ) -> Result<DocumentPlacement, RiftError> {
-    let unit = CoreSourceUnitId::for_package(package, path).map_err(|error| {
+    let unit = CoreSourceUnitId::for_owner(package.clone(), path.as_str()).map_err(|error| {
         errors::analysis::package_identity_invalid()
             .package(package_label(package))
             .path(Path::new(path.as_str()))
             .cause(error)
             .error()
     })?;
-    let identity_path = format!("{}/{path}", package_segment(package));
+    let address = unit.to_string();
+    let identity_path = address
+        .strip_prefix("rift://source/")
+        .ok_or_else(|| {
+            errors::analysis::package_identity_invalid()
+                .package(package_label(package))
+                .path(Path::new(path.as_str()))
+                .error()
+        })?
+        .to_owned();
     Ok(DocumentPlacement::new(origin.clone(), unit, identity_path))
 }
 
@@ -1802,13 +1825,6 @@ pub fn public_qualified_names(language: &Language, facts: &SyntaxFacts) -> BTree
         .collect()
 }
 
-fn package_segment(identity: &PackageIdentity) -> String {
-    format!(
-        "{}/{}@{}",
-        identity.manager, identity.name, identity.version
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
@@ -1835,6 +1851,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_publication_preserves_exact_owner_and_document_origin() {
+        let runtime = rift_protocol::read::RuntimeIdentity {
+            runtime: "cpython".to_owned(),
+            version: "3.14.3".to_owned(),
+        };
+        let owner = runtime.owner().expect("runtime owner");
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            }),
+            SourceKind::Authored,
+        )
+        .expect("exact runtime origin");
+        let source_language = language(ShippedLanguage::Python);
+        let path = ProjectPath::new("sys/__init__.pyi").expect("runtime unit");
+        let readme_path = ProjectPath::new("README.md").expect("runtime documentation");
+        let source = "def exit(status: int) -> None: ...\n";
+        let readme = "# Runtime\n\nExact selected runtime documentation.\n";
+        let files = [
+            PackageSource::new(&path, source),
+            PackageSource::new(&readme_path, readme),
+        ];
+        let input = ExactPackageInput::new(
+            &owner,
+            &source_language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(
+                2,
+                u64::try_from(source.len() + readme.len()).expect("source bytes"),
+            ),
+        )
+        .expect("runtime input");
+        let analysis = PackageAnalyzer::analyze(input, 1).expect("runtime publication");
+        let publication = analysis.publication();
+        assert_eq!(publication.owner, owner);
+        assert_eq!(publication.units.len(), 2);
+        assert!(publication.units.iter().any(|unit| {
+            unit.unit.as_str() == "rift://source/stdlib/cpython@3.14.3/sys/__init__.pyi"
+        }));
+        assert!(!publication.symbols.is_empty());
+        assert!(publication.symbols.iter().all(|binding| {
+            binding.origin.package.is_none() && binding.origin.runtime.as_ref() == Some(&runtime)
+        }));
+        assert!(!publication.documents.is_empty());
+        assert!(
+            publication
+                .documents
+                .iter()
+                .all(|document| document.owner == owner)
+        );
+        assert!(publication.documentation.sources.iter().any(|source| {
+            source.origin.package.is_none()
+                && source.origin.runtime.as_ref() == Some(&runtime)
+                && matches!(&source.identity.source,
+                    DocumentationSourceIdentity::Package { unit }
+                    if unit.as_str() == "rift://source/stdlib/cpython@3.14.3/README.md")
+        }));
+    }
+
+    #[test]
     fn package_failures_keep_registered_identity_and_ambient_context() {
         let package = identity();
         let child = RiftError::new(
@@ -1844,7 +1921,7 @@ mod tests {
             vec![],
         );
         let provider = errors::analysis::package_provider_failed()
-            .package(package_label(&package))
+            .package(package_label(&package.owner().expect("fixture owner")))
             .cause(child)
             .error();
         assert_eq!(
@@ -1874,7 +1951,9 @@ mod tests {
         let wrapped = syntax
             .with(rift_error::ErrorContext::new(
                 "package",
-                rift_error::ErrorValue::formatted(package_label(&package)),
+                rift_error::ErrorValue::formatted(package_label(
+                    &package.owner().expect("fixture owner"),
+                )),
             ))
             .with(rift_error::ErrorContext::new(
                 "path",
@@ -1889,7 +1968,7 @@ mod tests {
 
         let unsupported = super::parsed_file(
             PackageSource::new(&ProjectPath::new("guide.unknown").expect("path"), "source"),
-            &package,
+            &package.owner().expect("fixture owner"),
             &language(ShippedLanguage::Rust),
             SyntaxLimits::default(),
         )
@@ -2002,12 +2081,12 @@ mod tests {
         assert_eq!(public, ["spawn"], "the export rule keeps `pub` alone");
         assert_eq!(
             document_identities(&publication, PackageDocumentKind::Symbol),
-            ["rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/spawn"],
+            ["rift://symbol/rust/cargo/crates.io/beacon@1.0.0/src/lib.rs/spawn"],
             "a document stands for every public declaration and no other"
         );
         assert_eq!(
             document_identities(&publication, PackageDocumentKind::File),
-            ["rift://source/cargo/beacon@1.0.0/src/lib.rs"]
+            ["rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs"]
         );
     }
 
@@ -2080,11 +2159,11 @@ mod tests {
         );
         assert_eq!(
             block.symbol.as_ref().map(|symbol| symbol.0.as_str()),
-            Some("rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/spawn_task")
+            Some("rift://symbol/rust/cargo/crates.io/beacon@1.0.0/src/lib.rs/spawn_task")
         );
         assert_eq!(
             block.chunks[0].identity,
-            "rift://source/cargo/beacon@1.0.0/src/lib.rs"
+            "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs"
         );
     }
 
@@ -2377,8 +2456,8 @@ mod tests {
         assert_eq!(
             changed_documents,
             [
-                "rift://symbol/rust/cargo/beacon@1.0.0/src/a.rs/alpha",
-                "rift://source/cargo/beacon@1.0.0/src/a.rs",
+                "rift://symbol/rust/cargo/crates.io/beacon@1.0.0/src/a.rs/alpha",
+                "rift://source/cargo/crates.io/beacon@1.0.0/src/a.rs",
             ],
             "the changed declaration's own document and its file's document move"
         );
@@ -2419,7 +2498,7 @@ mod tests {
             .collect();
         assert_eq!(
             added,
-            ["rift://symbol/rust/cargo/beacon@1.0.0/src/b.rs/beta"]
+            ["rift://symbol/rust/cargo/crates.io/beacon@1.0.0/src/b.rs/beta"]
         );
         let unchanged: Vec<&str> = arrived
             .iter()
@@ -2428,7 +2507,7 @@ mod tests {
             .collect();
         assert_eq!(
             unchanged,
-            ["rift://symbol/rust/cargo/beacon@1.0.0/src/a.rs/alpha"],
+            ["rift://symbol/rust/cargo/crates.io/beacon@1.0.0/src/a.rs/alpha"],
             "an untouched declaration keeps its digest"
         );
     }
@@ -2520,7 +2599,7 @@ mod tests {
             block.source.source
                 == DocumentationSourceIdentity::Package {
                     unit: rift_protocol::read::SourceUnitId(
-                        "rift://source/cargo/beacon@1.0.0/README.md".to_owned(),
+                        "rift://source/cargo/crates.io/beacon@1.0.0/README.md".to_owned(),
                     ),
                 }
         }));
@@ -2545,7 +2624,9 @@ mod tests {
     #[test]
     fn long_package_identity_omits_notebook_cell_and_keeps_readme() {
         let mut package = identity();
-        package.name = "~".repeat(3_000);
+        package.name = "p".repeat(4_040);
+        package.registry = format!("r.example/{}", "a".repeat(4_086));
+        let owner = package.owner().expect("bounded canonical owner");
         let language = language(ShippedLanguage::Rust);
         let origin = ContributionOrigin::new(
             Some(SourceLocation::Dependency {
@@ -2567,13 +2648,14 @@ mod tests {
         assert_eq!(
             unit.to_string(),
             format!(
-                "rift://source/cargo/{}@1.0.0/notebooks/guide.ipynb",
+                "rift://source/cargo/r.example%2F{}/{}@1.0.0/notebooks/guide.ipynb",
+                "a".repeat(4_086),
                 package.name
             )
         );
         let byte_limit = u64::try_from(readme.len() + notebook.len()).expect("byte count");
         let input = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &files,
@@ -2680,9 +2762,9 @@ mod tests {
             ],
         );
         let documentation = &publication.documentation;
-        let markdown_unit = format!("rift://source/cargo/beacon@1.0.0/{markdown_path}");
-        let rst_unit = format!("rift://source/cargo/beacon@1.0.0/{rst_path}");
-        let attached_unit = format!("rift://source/cargo/beacon@1.0.0/{attached_path}");
+        let markdown_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{markdown_path}");
+        let rst_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{rst_path}");
+        let attached_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{attached_path}");
 
         assert_eq!(documentation.coverage.selected, 3);
         assert_eq!(documentation.coverage.parsed, 3);

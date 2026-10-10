@@ -82,7 +82,10 @@ const COMPONENT_ESCAPE_SET: &AsciiSet = &NON_ALPHANUMERIC
 const SOURCE_UNIT_ESCAPE_SET: &AsciiSet = &COMPONENT_ESCAPE_SET.remove(b'/').remove(b'~');
 
 /// Defining owner of a logical symbol.
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    Clone, Debug, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash, schemars::JsonSchema, Serialize,
+)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SymbolOwner {
     /// The project served by the current workspace.
     Local,

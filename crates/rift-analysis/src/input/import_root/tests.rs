@@ -26,6 +26,7 @@ fn roots_preserve_original_paths_and_selected_artifact() {
         name: "click".to_owned(),
         version: "8.3.3".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let language = Language::from_identity_segment("python").expect("language");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
@@ -44,7 +45,7 @@ fn roots_preserve_original_paths_and_selected_artifact() {
     )
     .expect("source artifact");
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &files,

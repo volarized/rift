@@ -150,6 +150,7 @@ fn test_package_publication_limits_validate_supported_capacity_and_ordering() {
 #[test]
 fn test_relationship_configuration_preserves_declaration_only_package_analysis() {
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Rust);
     let origin = origin(&package);
     let path = ProjectPath::new("src/lib.rs").expect("source path");
@@ -163,7 +164,7 @@ fn test_relationship_configuration_preserves_declaration_only_package_analysis()
         let limits =
             ExactPackageLimits::from_configuration(&configuration).expect("relationship bounds");
         assert_eq!(limits.relationships_max() as u64, relationships);
-        let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
             .expect("package input");
         PackageAnalyzer::analyze(input, 1).expect("package analysis")
     };
@@ -188,6 +189,7 @@ fn analyze(
     second: &str,
 ) -> Result<PackageAnalysis, RiftError> {
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Python);
     let origin = origin(&package);
     let first_path = ProjectPath::new("pkg/a.py").expect("path");
@@ -196,7 +198,7 @@ fn analyze(
         PackageSource::new(&first_path, first),
         PackageSource::new(&second_path, second),
     ];
-    let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?;
     PackageAnalyzer::analyze(input, 1)
 }
 
@@ -372,12 +374,13 @@ fn test_retained_total_counts_only_published_document_copies() {
 fn test_notebook_document_bound_keeps_cells_and_counts_only_published_source() {
     let notebook = r#"{"cells":[{"cell_type":"markdown","id":"first","source":"First."},{"cell_type":"markdown","id":"second","source":"Second."}],"metadata":{}}"#;
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Python);
     let origin = origin(&package);
     let path = ProjectPath::new("notebooks/guide.ipynb").expect("notebook path");
     let files = [PackageSource::new(&path, notebook)];
     let analyze_notebook = |limits| {
-        let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?;
         PackageAnalyzer::analyze(input, 1)
     };
     let default = analyze_notebook(ExactPackageLimits::new(1, notebook.len() as u64))

@@ -334,8 +334,8 @@ fn test_a_joined_declaration_records_its_stub_forms_and_ranges() {
     assert_eq!(
         identities,
         [
-            "rift://symbol/python/cargo/beacon@1.0.0/mod.pyi/f~1",
-            "rift://symbol/python/cargo/beacon@1.0.0/mod.pyi/f~2",
+            "rift://symbol/python/cargo/crates.io/beacon@1.0.0/mod.pyi/f~1",
+            "rift://symbol/python/cargo/crates.io/beacon@1.0.0/mod.pyi/f~2",
         ]
     );
     assert!(forms.iter().all(|form| form.path().0 == "mod.pyi"));
@@ -504,6 +504,7 @@ fn test_a_package_archive_is_selected_and_analyzed_as_global_ingestion_does() {
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -513,7 +514,7 @@ fn test_a_package_archive_is_selected_and_analyzed_as_global_ingestion_does() {
     .expect("origin");
     let language = ShippedLanguage::Python.language();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,

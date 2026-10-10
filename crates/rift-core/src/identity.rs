@@ -1,4 +1,5 @@
 use std::fmt;
+use std::fmt::Write as _;
 use std::num::NonZeroU64;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -203,6 +204,33 @@ define_id!(WorkspaceId, "Canonical workspace identity.");
 define_id!(SymbolId, "Language-qualified symbol identity.");
 define_id!(ProviderId, "Provider component identity.");
 define_id!(ProviderSymbolId, "Provider-local symbol identity.");
+
+impl ProviderSymbolId {
+    /// Uses a syntax symbol address as its bounded provider-local identity.
+    ///
+    /// Addresses within the provider bound keep their spelling. A longer address uses
+    /// its complete SHA-256 digest. This key identifies the provider Contribution,
+    /// independently of its logical symbol identity and physical source binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the address is not a symbol address or contains control text.
+    pub fn for_symbol(address: &str) -> Result<Self, RiftError> {
+        if !address.starts_with(SYMBOL_URI_PREFIX) || address.chars().any(char::is_control) {
+            return errors::core::identity_invalid().fail();
+        }
+        if address.len() <= crate::PROVIDER_SYMBOL_ID_BYTES_MAX {
+            return Self::new(address);
+        }
+        let digest = crate::FileDigest::of(address.as_bytes());
+        let mut bounded = String::with_capacity(71);
+        bounded.push_str("sha256:");
+        for byte in digest.as_bytes() {
+            write!(&mut bounded, "{byte:02x}").expect("String accepts formatted bytes");
+        }
+        Self::new(bounded)
+    }
+}
 define_id!(CompositionId, "Provider composition identity.");
 define_id!(ModelId, "Resolved embedding model identity.");
 
@@ -345,7 +373,12 @@ impl SourceUnitId {
         self.owner.as_ref()
     }
 
-    fn for_owner(
+    /// The source unit established by an exact released owner and relative path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity error for a local owner or an invalid released owner or path.
+    pub fn for_owner(
         owner: rift_protocol::identity::SymbolOwner,
         path: &str,
     ) -> Result<Self, RiftError> {
@@ -686,6 +719,40 @@ mod tests {
                 .to_string(),
             "rust:item"
         );
+    }
+
+    #[test]
+    fn syntax_provider_identity_keeps_the_bound_and_complete_overflow_digest() {
+        let prefix = "rift://symbol/";
+        let address = format!(
+            "{prefix}{}",
+            "a".repeat(crate::PROVIDER_SYMBOL_ID_BYTES_MAX - prefix.len())
+        );
+        assert_eq!(
+            ProviderSymbolId::for_symbol(&address)
+                .expect("exact provider bound")
+                .as_str(),
+            address
+        );
+        let longer = format!("{address}a");
+        let key = ProviderSymbolId::for_symbol(&longer).expect("bounded complete digest");
+        assert_eq!(
+            key.as_str(),
+            "sha256:afca4347c349131eb81815478c51fe2fbb86a598f99fff2ae3aa45c041645319"
+        );
+        assert_eq!(key.as_str().len(), 71);
+        assert!(key.as_str().starts_with("sha256:"));
+        assert_eq!(
+            key,
+            ProviderSymbolId::for_symbol(&longer).expect("same address same key")
+        );
+        assert_ne!(
+            key,
+            ProviderSymbolId::for_symbol(&format!("{address}b"))
+                .expect("different owner or path keeps distinct key")
+        );
+        assert!(ProviderSymbolId::for_symbol("sha256:unbound").is_err());
+        assert!(ProviderSymbolId::for_symbol(&format!("{longer}\n")).is_err());
     }
 
     #[test]

@@ -107,7 +107,15 @@ pub(super) fn declaration_path(source: &DocumentationContentIdentity) -> Result<
                     .field("source.unit")
                     .error()
             })?;
-            Ok(format!("{}/{path}", parsed.resolver()))
+            parsed
+                .to_string()
+                .strip_prefix("rift://source/")
+                .map(str::to_owned)
+                .ok_or_else(|| {
+                    errors::analysis::documentation_identity_invalid()
+                        .field("source.unit")
+                        .error()
+                })
         }
     }
 }
@@ -374,6 +382,58 @@ mod tests {
             language: None,
             reason: DocumentationUnresolvedReason::Missing,
         }
+    }
+
+    #[test]
+    fn test_released_declaration_path_keeps_registry_and_runtime_owners() {
+        use rift_protocol::identity::SymbolOwner;
+
+        let owners = [
+            SymbolOwner::Package {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "beacon".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            SymbolOwner::Package {
+                manager: "cargo".to_owned(),
+                registry: "registry.example:8443/cargo".to_owned(),
+                name: "beacon".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            SymbolOwner::Runtime {
+                runtime: "rustc".to_owned(),
+                version: "1.91.0".to_owned(),
+            },
+        ];
+        let mut identities = std::collections::BTreeSet::new();
+        for owner in owners {
+            let unit = rift_core::SourceUnitId::for_owner(owner, "src/lib.rs")
+                .expect("released source unit");
+            let address = unit.to_string();
+            let identity_path = address
+                .strip_prefix("rift://source/")
+                .expect("source prefix");
+            let source = DocumentationContentIdentity {
+                source: DocumentationSourceIdentity::Package {
+                    unit: rift_protocol::read::SourceUnitId::parse(&address)
+                        .expect("canonical source"),
+                },
+                cell: None,
+            };
+            let identity = SymbolId(rift_core::symbol_identity("rust", identity_path, "open"));
+            DocumentationDeclaration::new(
+                &identity,
+                &language(),
+                "open",
+                "open",
+                &source,
+                TextRange { start: 0, end: 20 },
+            )
+            .expect("declaration retains complete source owner");
+            assert!(identities.insert(identity));
+        }
+        assert_eq!(identities.len(), 3);
     }
 
     #[test]

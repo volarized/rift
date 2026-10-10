@@ -185,7 +185,7 @@ impl SyntaxPublicationBuilder {
                 &symbol.qualified_name,
             );
             let identity = SymbolId::new(identity)?;
-            let provider_symbol = ProviderSymbolId::new(identity.as_str())?;
+            let provider_symbol = ProviderSymbolId::for_symbol(identity.as_str())?;
             let mut facts = PortableSymbolFacts::new(
                 syntax.language().clone(),
                 symbol.name.clone(),
@@ -203,7 +203,7 @@ impl SyntaxPublicationBuilder {
                     symbol_identity(&language_segment, placement.identity_path(), container);
                 facts = facts.container(ContributionReference::new(
                     self.provider.clone(),
-                    ProviderSymbolId::new(container_identity)?,
+                    ProviderSymbolId::for_symbol(&container_identity)?,
                 ));
             }
             let source = rift_core::DeclarationBinding::new(

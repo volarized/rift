@@ -189,6 +189,7 @@ fn analyze(
     limits: ExactPackageLimits,
 ) -> Result<rift_protocol::index::PackagePublication, rift_error::RiftError> {
     let package = super::fixture::identity();
+    let owner = package.owner().expect("fixture owner");
     let language = Language {
         name: "rust".to_owned(),
         dialect: None,
@@ -201,6 +202,6 @@ fn analyze(
     )?;
     let path = ProjectPath::new("src/lib.rs")?;
     let files = [PackageSource::new(&path, source)];
-    let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?;
     Ok(PackageAnalyzer::analyze(input, 1)?.into_parts().0)
 }

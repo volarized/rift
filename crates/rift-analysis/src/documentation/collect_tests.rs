@@ -344,7 +344,9 @@ fn package_input_at<'a>(
 ) -> DocumentationInput<'a> {
     let mut record = source(path, text);
     record.identity.source = DocumentationSourceIdentity::Package {
-        unit: rift_protocol::read::SourceUnitId(format!("rift://source/cargo/beacon@1.0.0/{path}")),
+        unit: rift_protocol::read::SourceUnitId(format!(
+            "rift://source/cargo/crates.io/beacon@1.0.0/{path}"
+        )),
     };
     record.origin = SymbolOrigin {
         location: Some(SourceLocationKind::Dependency),
@@ -454,7 +456,7 @@ fn package_sibling_link_resolves_with_exact_source_unit() {
         } if matches!(
             &source.source,
             DocumentationSourceIdentity::Package { unit }
-                if unit.0 == "rift://source/cargo/beacon@1.0.0/src/lib.md"
+                if unit.0 == "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.md"
         )
     ));
 }

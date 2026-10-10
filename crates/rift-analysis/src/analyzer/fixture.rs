@@ -25,7 +25,7 @@ fn parsed_file_preserves_source_path_digest_and_declarations() {
     let text = "/// Opens a file.\npub fn café() {}\n";
     let file = super::parsed_file(
         PackageSource::new(&path, text),
-        &identity(),
+        &identity().owner().expect("fixture owner"),
         &language(ShippedLanguage::Rust),
         SyntaxLimits::default(),
     )
@@ -68,6 +68,7 @@ pub(super) fn package_result(
     syntax: Option<SyntaxLimits>,
 ) -> Result<PackageAnalysis, RiftError> {
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(shipped);
     let origin = origin(&package);
     let files: Vec<(ProjectPath, &str)> = files
@@ -84,7 +85,7 @@ pub(super) fn package_result(
         .map(|(_, text)| u64::try_from(text.len()).expect("test byte count"))
         .sum();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,

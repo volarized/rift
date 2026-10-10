@@ -309,7 +309,7 @@ impl WorkspaceSemantics {
     pub fn assembled(&self, provider_symbol: &str) -> Option<AssembledSymbol> {
         let reference = ContributionReference::new(
             self.syntax_provider.clone(),
-            ProviderSymbolId::new(provider_symbol).ok()?,
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
         );
         let record = self.graph.record_for(&reference)?;
         SymbolAssembler::assemble(

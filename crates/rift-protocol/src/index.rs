@@ -21,9 +21,10 @@ pub use artifact::{
 };
 
 use crate::documentation::DocumentationIndex;
+use crate::identity::SymbolOwner;
 use crate::read::{
-    Digest, Documentation, ExactKind, Language, PackageIdentity, ProjectPath, Signature,
-    SourceUnitId, Symbol, SymbolId, SymbolOrigin, TextRange,
+    Digest, Documentation, ExactKind, Language, ProjectPath, Signature, SourceUnitId, Symbol,
+    SymbolId, SymbolOrigin, TextRange,
 };
 
 /// The publication shape this revision of the analyzer emits.
@@ -62,7 +63,7 @@ pub const PACKAGE_WARNINGS_CEILING: u32 = 65_536;
 /// Supported identifier-term capacity; the default remains [`PACKAGE_IDENTIFIER_TERMS_MAX`].
 pub const PACKAGE_IDENTIFIER_TERMS_CEILING: u32 = 65_536;
 
-/// One package's analyzed source, as the analyzer publishes it.
+/// One package or runtime owner's analyzed source, as the analyzer publishes it.
 ///
 /// `Eq` is not derived: [`PackageSymbol`] is not `Eq`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -76,8 +77,8 @@ pub struct PackagePublication {
     /// source the run depended on. Two publications with equal package bytes and equal
     /// `analyzer_revision` are equal.
     pub analyzer_revision: Digest,
-    /// The package as its manager identifies it.
-    pub package: PackageIdentity,
+    /// Exact defining package, runtime, or compiler owner.
+    pub owner: SymbolOwner,
     /// The digest of the package source this publication was produced from, over every
     /// unit's path and content in unit order.
     pub source_digest: Digest,
@@ -194,8 +195,8 @@ pub struct PackageDocument {
     pub unit: SourceUnitId,
     /// The language whose provider parsed the unit.
     pub language: Language,
-    /// The package the document belongs to.
-    pub package: PackageIdentity,
+    /// Exact logical owner of the document.
+    pub owner: SymbolOwner,
     /// The digest of the content this document was built from.
     pub content_digest: Digest,
     /// The declaration name, or the file name including its extension.

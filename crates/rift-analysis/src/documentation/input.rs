@@ -587,24 +587,10 @@ pub(super) fn source_path(identity: &DocumentationContentIdentity) -> Result<Str
 
 pub(super) fn source_file_path(source: &DocumentationSource) -> Result<ProjectPath, RiftError> {
     let full_path = source_path(&source.identity)?;
-    let path = match &source.identity.source {
-        DocumentationSourceIdentity::Project { .. } => full_path.as_str(),
-        DocumentationSourceIdentity::Package { .. } => {
-            let package = source.origin.package.as_ref().ok_or_else(|| {
-                errors::analysis::documentation_origin_invalid()
-                    .field("origin.package")
-                    .error()
-            })?;
-            full_path
-                .strip_prefix(&format!("{}@{}/", package.name, package.version))
-                .ok_or_else(|| {
-                    errors::analysis::documentation_origin_invalid()
-                        .field("origin.package")
-                        .error()
-                })?
-        }
-    };
-    ProjectPath::new(path).map_err(|_| {
+    if let DocumentationSourceIdentity::Package { unit } = &source.identity.source {
+        validate_package_origin(unit, source)?;
+    }
+    ProjectPath::new(&full_path).map_err(|_| {
         errors::analysis::documentation_identity_invalid()
             .field("source")
             .error()

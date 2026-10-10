@@ -26,6 +26,7 @@ fn analyze(
         name: "beacon".to_owned(),
         version: version.to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let language = shipped.language();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
@@ -47,7 +48,7 @@ fn analyze(
         .map(|(_, text)| u64::try_from(text.len()).expect("fixture bytes"))
         .sum();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,

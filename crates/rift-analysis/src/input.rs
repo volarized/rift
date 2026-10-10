@@ -6,9 +6,10 @@ use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation, Sou
 use rift_error::{RiftError, errors};
 #[cfg(feature = "collector")]
 use rift_protocol::configuration::WorkspaceConfiguration;
+use rift_protocol::identity::SymbolOwner;
 use rift_protocol::index::PACKAGE_SOURCE_BYTES_CEILING;
 use rift_protocol::index::PackageArtifact;
-use rift_protocol::read::{Language, PackageIdentity};
+use rift_protocol::read::Language;
 #[cfg(feature = "collector")]
 use rift_provider::{
     CONTRIBUTIONS_PER_PROVIDER_MAX_DEFAULT, PROVIDERS_MAX_DEFAULT, PublicationLimits,
@@ -298,10 +299,10 @@ impl<'source> PackageSource<'source> {
     }
 }
 
-/// One exact package and the selected source bytes it carries.
+/// One exact package or runtime owner and its selected source bytes.
 #[derive(Debug, Clone, Copy)]
 pub struct ExactPackageInput<'input> {
-    package: &'input PackageIdentity,
+    owner: &'input SymbolOwner,
     language: &'input Language,
     origin: &'input ContributionOrigin,
     files: &'input [PackageSource<'input>],
@@ -313,24 +314,24 @@ pub struct ExactPackageInput<'input> {
 }
 
 impl<'input> ExactPackageInput<'input> {
-    /// Validates one package identity, origin, and bounded source set.
+    /// Validates one exact package or runtime owner, origin, and bounded source set.
     ///
     /// Paths must be unique. The source count and aggregate bytes must fit input limits,
-    /// and every path must form a source unit under the package identity.
+    /// and every path must form a source unit under that owner.
     ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when identity, origin, paths, source count, or source
     /// bytes violate these rules.
     pub fn new(
-        package: &'input PackageIdentity,
+        owner: &'input SymbolOwner,
         language: &'input Language,
         origin: &'input ContributionOrigin,
         files: &'input [PackageSource<'input>],
         limits: ExactPackageLimits,
     ) -> Result<Self, RiftError> {
-        validate_origin(package, origin)?;
-        validate_package_identity(package)?;
+        validate_owner(owner)?;
+        validate_origin(owner, origin)?;
         let files_bound = limits.files_max.min(limits.publication().units);
         let observed_files = u32::try_from(files.len()).unwrap_or(u32::MAX);
         if observed_files > files_bound {
@@ -348,7 +349,7 @@ impl<'input> ExactPackageInput<'input> {
                     .path(file.path.as_str())
                     .fail();
             }
-            SourceUnitId::for_package(package, file.path).map_err(|error| {
+            SourceUnitId::for_owner(owner.clone(), file.path.as_str()).map_err(|error| {
                 errors::analysis::package_input_identity_invalid()
                     .path(file.path.as_str())
                     .cause(error)
@@ -371,7 +372,7 @@ impl<'input> ExactPackageInput<'input> {
             }
         }
         Ok(Self {
-            package,
+            owner,
             language,
             origin,
             files,
@@ -383,10 +384,10 @@ impl<'input> ExactPackageInput<'input> {
         })
     }
 
-    /// Exact package identity.
+    /// Exact defining package, runtime, or compiler owner.
     #[must_use]
-    pub const fn package(self) -> &'input PackageIdentity {
-        self.package
+    pub const fn owner(self) -> &'input SymbolOwner {
+        self.owner
     }
 
     /// Adds established import roots without rewriting original source paths.
@@ -469,7 +470,7 @@ impl<'input> ExactPackageInput<'input> {
             .copied()
             .collect::<Vec<_>>();
         ExactPackageInput::new(
-            self.package,
+            self.owner,
             self.language,
             self.origin,
             &combined,
@@ -501,10 +502,22 @@ impl<'input> ExactPackageInput<'input> {
     }
 }
 
-fn validate_package_identity(package: &PackageIdentity) -> Result<(), RiftError> {
-    let path = ProjectPath::new("package")
-        .map_err(|_| errors::analysis::package_input_identity_invalid().error())?;
-    SourceUnitId::for_package(package, &path)
+fn validate_origin(owner: &SymbolOwner, origin: &ContributionOrigin) -> Result<(), RiftError> {
+    let observed = match origin.location() {
+        Some(SourceLocation::Dependency { package }) => package.owner().ok(),
+        Some(SourceLocation::Stdlib {
+            runtime: Some(runtime),
+        }) => runtime.owner().ok(),
+        _ => None,
+    };
+    if observed.as_ref() == Some(owner) && origin.source_kind() == SourceKind::Authored {
+        return Ok(());
+    }
+    errors::analysis::package_input_origin_invalid().fail()
+}
+
+fn validate_owner(owner: &SymbolOwner) -> Result<(), RiftError> {
+    SourceUnitId::for_owner(owner.clone(), "package")
         .map(|_| ())
         .map_err(|source| {
             errors::analysis::package_input_identity_invalid()
@@ -513,27 +526,123 @@ fn validate_package_identity(package: &PackageIdentity) -> Result<(), RiftError>
         })
 }
 
-fn validate_origin(
-    package: &PackageIdentity,
-    origin: &ContributionOrigin,
-) -> Result<(), RiftError> {
-    let location_matches = match origin.location() {
-        Some(SourceLocation::Dependency { package: owner }) => owner == package,
-        Some(SourceLocation::Stdlib { .. }) => true,
-        Some(SourceLocation::Project { .. } | SourceLocation::External {}) | None => false,
-    };
-    if location_matches && origin.source_kind() == SourceKind::Authored {
-        return Ok(());
-    }
-    errors::analysis::package_input_origin_invalid().fail()
-}
-
 #[cfg(test)]
 mod tests {
     use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
     use rift_protocol::read::{Language, PackageIdentity};
 
     use super::{ExactPackageInput, ExactPackageLimits, PackageSource};
+    use rift_protocol::identity::SymbolOwner;
+    use rift_protocol::read::RuntimeIdentity;
+
+    #[test]
+    fn exact_runtime_input_preserves_owner_without_a_package() {
+        let runtime = RuntimeIdentity {
+            runtime: "cpython".to_owned(),
+            version: "3.14.3".to_owned(),
+        };
+        let owner = runtime.owner().expect("runtime owner");
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            }),
+            SourceKind::Authored,
+        )
+        .expect("runtime origin");
+        let language = Language::from_identity_segment("python").expect("Python language");
+        let path = ProjectPath::new("sys/__init__.pyi").expect("source path");
+        let files = [PackageSource::new(&path, "def exit() -> None: ...")];
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect("exact runtime input");
+        assert_eq!(input.owner(), &owner);
+        assert_eq!(input.files()[0].path(), &path);
+        let wrong_owner = SymbolOwner::Runtime {
+            runtime: "cpython".to_owned(),
+            version: "3.13.3".to_owned(),
+        };
+        let error = ExactPackageInput::new(
+            &wrong_owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect_err("different runtime version");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.package_input_origin_invalid"
+        );
+    }
+
+    #[test]
+    fn exact_input_refuses_foreign_registry_local_and_unversioned_runtime_owners() {
+        let package = identity();
+        let origin = origin(&package);
+        let language = language();
+        let path = ProjectPath::new("src/lib.rs").expect("source path");
+        let files = [PackageSource::new(&path, "pub fn open() {}")];
+        let mut foreign = package.clone();
+        foreign.registry = "registry.example/index".to_owned();
+        let foreign = foreign.owner().expect("foreign registry owner");
+        let error = ExactPackageInput::new(
+            &foreign,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect_err("same name and version do not establish registry equality");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.package_input_origin_invalid"
+        );
+        for local in [
+            SymbolOwner::Local,
+            SymbolOwner::NamedLocal {
+                name: "cloud".to_owned(),
+            },
+        ] {
+            let error = ExactPackageInput::new(
+                &local,
+                &language,
+                &origin,
+                &files,
+                ExactPackageLimits::new(1, 64),
+            )
+            .expect_err("released input refuses local owner");
+            assert_eq!(
+                error.slug().as_str(),
+                "rift.analysis.package_input_identity_invalid"
+            );
+        }
+        let runtime = rift_protocol::read::RuntimeIdentity {
+            runtime: "rustc".to_owned(),
+            version: "1.98.0".to_owned(),
+        }
+        .owner()
+        .expect("runtime owner");
+        let unknown = ContributionOrigin::new(
+            Some(SourceLocation::Stdlib { runtime: None }),
+            SourceKind::Authored,
+        )
+        .expect("unresolved runtime origin");
+        assert!(
+            ExactPackageInput::new(
+                &runtime,
+                &language,
+                &unknown,
+                &files,
+                ExactPackageLimits::new(1, 64),
+            )
+            .is_err()
+        );
+    }
 
     fn identity() -> PackageIdentity {
         PackageIdentity {
@@ -561,13 +670,14 @@ mod tests {
     #[test]
     fn source_count_bound_is_validated_before_analysis() {
         let package = identity();
+        let owner = package.owner().expect("package owner");
         let language = language();
         let origin = origin(&package);
         let path = ProjectPath::new("src/lib.rs").expect("path");
         let sources = [PackageSource::new(&path, "fn open() {}")];
 
         let error = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &sources,
@@ -587,13 +697,14 @@ mod tests {
     #[test]
     fn aggregate_source_bytes_bound_is_validated_before_analysis() {
         let package = identity();
+        let owner = package.owner().expect("package owner");
         let language = language();
         let origin = origin(&package);
         let path = ProjectPath::new("src/lib.rs").expect("path");
         let sources = [PackageSource::new(&path, "fn open() {}")];
 
         let error = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &sources,
@@ -613,6 +724,7 @@ mod tests {
     #[test]
     fn duplicate_package_paths_are_rejected() {
         let package = identity();
+        let owner = package.owner().expect("package owner");
         let language = language();
         let origin = origin(&package);
         let path = ProjectPath::new("src/lib.rs").expect("path");
@@ -622,7 +734,7 @@ mod tests {
         ];
 
         let error = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &sources,
@@ -644,6 +756,7 @@ mod tests {
     #[test]
     fn non_authored_package_origin_is_rejected() {
         let package = identity();
+        let owner = package.owner().expect("package owner");
         let language = language();
         let origin = ContributionOrigin::new(
             Some(SourceLocation::Dependency {
@@ -656,7 +769,7 @@ mod tests {
         let sources = [PackageSource::new(&path, "fn open() {}")];
 
         let error = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &sources,
@@ -673,6 +786,7 @@ mod tests {
     #[test]
     fn package_input_refuses_location_mismatch_and_source_unit_overflow() {
         let package = identity();
+        let owner = package.owner().expect("package owner");
         let language = language();
         let path = ProjectPath::new("src/lib.rs").expect("path");
         let files = [PackageSource::new(&path, "source")];
@@ -683,7 +797,7 @@ mod tests {
         )
         .expect("project origin");
         let error = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &invalid_origin,
             &files,
@@ -697,15 +811,16 @@ mod tests {
 
         let long_package = PackageIdentity {
             manager: "cargo".to_owned(),
-            registry: "crates.io".to_owned(),
+            registry: format!("r.example/{}", "a".repeat(4_086)),
             name: "p".repeat(3_500),
             version: "1.0.0".to_owned(),
         };
         let long_path = ProjectPath::new("x".repeat(1_000)).expect("bounded project path");
         let long_files = [PackageSource::new(&long_path, "source")];
         let long_origin = origin(&long_package);
+        let long_owner = long_package.owner().expect("bounded package owner");
         let error = ExactPackageInput::new(
-            &long_package,
+            &long_owner,
             &language,
             &long_origin,
             &long_files,

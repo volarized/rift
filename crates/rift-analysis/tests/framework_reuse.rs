@@ -20,6 +20,7 @@ fn supplied_enriched_facts_are_refused_after_framework_context_is_removed() {
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -55,7 +56,7 @@ fn supplied_enriched_facts_are_refused_after_framework_context_is_removed() {
     );
     let language = ShippedLanguage::TypeScript.language();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,
@@ -89,6 +90,7 @@ fn supplied_angular_template_facts_are_refused_when_current_context_is_unresolve
         registry: "npmjs.org".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -127,7 +129,7 @@ fn supplied_angular_template_facts_are_refused_when_current_context_is_unresolve
         });
     let language = ShippedLanguage::TypeScript.language();
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &sources,
@@ -181,6 +183,7 @@ fn raw_embedded_provider_facts_remain_reusable_after_checked_restoration() {
         registry: "npmjs.org".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: package.clone(),
@@ -212,7 +215,7 @@ fn raw_embedded_provider_facts_remain_reusable_after_checked_restoration() {
         let sources = [PackageSource::new(&path, text)];
         let language = ShippedLanguage::TypeScript.language();
         let input = ExactPackageInput::new(
-            &package,
+            &owner,
             &language,
             &origin,
             &sources,
