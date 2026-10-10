@@ -34,6 +34,29 @@ fn explicit_retention_keeps_complete_source_and_current_declaration_ranges() {
         complete.units[0].content_digest,
         cut.units[0].content_digest
     );
+    assert_eq!(
+        complete.units[0].content_digest,
+        super::text_digest(&source)
+    );
+    let full_document = complete
+        .documents
+        .iter()
+        .find(|document| document.file_content.is_some())
+        .expect("complete file document");
+    let cut_document = cut
+        .documents
+        .iter()
+        .find(|document| document.file_content.is_some())
+        .expect("truncated file document");
+    assert_eq!(
+        full_document.content_digest,
+        complete.units[0].content_digest
+    );
+    assert_eq!(
+        cut_document.content_digest,
+        super::text_digest(cut_document.file_content.as_deref().expect("retained text"))
+    );
+    assert_ne!(full_document.content_digest, cut_document.content_digest);
     assert_eq!(complete.declarations.len(), 1);
     assert_eq!(complete.declarations[0].symbol, cut.declarations[0].symbol);
     assert_eq!(complete.declarations[0].range, cut.declarations[0].range);

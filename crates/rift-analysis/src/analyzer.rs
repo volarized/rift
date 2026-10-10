@@ -47,7 +47,6 @@ use rift_protocol::read::{
 };
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 use rift_ranking::split_identifier_words;
 
@@ -1308,7 +1307,7 @@ impl Records {
             != Some(DocumentationSourceFormat::Notebook);
         let publishes_document = needs_document && self.document_capacity();
         let mut retained = self.retained(source, &path, if publishes_document { 2 } else { 1 })?;
-        let content_digest = text_digest(source);
+        let content_digest = file_digest(held.file.digest());
         let mut record = PackageSourceUnit {
             unit: unit.clone(),
             path: path.clone(),
@@ -1325,7 +1324,11 @@ impl Records {
         record.digest = digest_of(&record, package)?;
         self.units.push(record);
         if publishes_document {
-            let document_digest = text_digest(&retained.text);
+            let document_digest = if retained.complete {
+                content_digest
+            } else {
+                text_digest(&retained.text)
+            };
             self.file_document(package, &language, &unit, &path, retained, document_digest)?;
         } else if needs_document {
             self.warn_document_full();
@@ -2069,8 +2072,18 @@ const fn bound(value: u32) -> usize {
 
 /// The wire digest of one text, in the eight-character form every wire digest takes.
 fn text_digest(text: &str) -> Digest {
-    let rendered = format!("{:x}", Sha256::digest(text.as_bytes()));
-    Digest(rendered[..DIGEST_WIRE_CHARS].to_owned())
+    file_digest(crate::FileDigest::of(text.as_bytes()))
+}
+
+fn file_digest(digest: crate::FileDigest) -> Digest {
+    use std::fmt::Write as _;
+
+    let mut rendered = String::with_capacity(DIGEST_WIRE_CHARS);
+    for byte in digest.as_bytes().iter().take(DIGEST_WIRE_CHARS.div_ceil(2)) {
+        write!(&mut rendered, "{byte:02x}").expect("String accepts formatted bytes");
+    }
+    rendered.truncate(DIGEST_WIRE_CHARS);
+    Digest(rendered)
 }
 
 fn wire_unit(unit: &CoreSourceUnitId) -> SourceUnitId {

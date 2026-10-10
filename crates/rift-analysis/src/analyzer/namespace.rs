@@ -23,6 +23,9 @@ pub(crate) struct SelectedFile<'source> {
 /// Original file paths and exact provider declaration names mapped to established IDs.
 pub(super) type Anchors = BTreeMap<String, BTreeMap<String, SymbolId>>;
 
+#[cfg(test)]
+mod digest_tests;
+
 /// One export binding whose defining declaration and logical owner are established.
 pub(crate) struct ExportBinding {
     pub(crate) path: String,
@@ -112,21 +115,27 @@ pub(crate) fn prepare_context(
         }
     }
     let roots_accepted = crate::input::validate_roots(&roots).is_ok();
+    let captured = input
+        .files()
+        .iter()
+        .map(|source| (source.path().as_str(), *source))
+        .collect::<BTreeMap<_, _>>();
     for file in selected {
         if file.syntax.language().name == "python" {
             prepared.anchors.insert(
                 file.path.as_str().to_owned(),
-                if roots_accepted {
-                    identity_anchors_with_roots(
-                        input,
-                        file.syntax,
-                        file.path.as_str(),
-                        file.source,
-                        &roots,
-                    )
-                } else {
-                    BTreeMap::new()
-                },
+                captured
+                    .get(file.path.as_str())
+                    .filter(|source| roots_accepted && source.text() == file.source)
+                    .map_or_else(BTreeMap::new, |source| {
+                        identity_anchors_with_roots(
+                            input,
+                            file.syntax,
+                            file.path.as_str(),
+                            *source,
+                            &roots,
+                        )
+                    }),
             );
         }
     }
@@ -137,20 +146,23 @@ fn identity_anchors_with_roots(
     input: &NamespaceInput<'_>,
     syntax: &SyntaxFacts,
     path: &str,
-    source: &str,
+    source: crate::PackageSource<'_>,
     roots: &[PackageImportRoot],
 ) -> BTreeMap<String, SymbolId> {
     if syntax.language().name != "python"
         || syntax.language().dialect.is_some()
         || syntax.has_errors()
-        || syntax.source_digest() != Some(&rift_core::FileDigest::of(source.as_bytes()))
     {
+        return BTreeMap::new();
+    }
+    let digest = source.source_digest();
+    if syntax.source_digest() != Some(&digest) {
         return BTreeMap::new();
     }
     let Some(module) = python_module(path, roots) else {
         return BTreeMap::new();
     };
-    let revision = crate::documentation::content_digest(source.as_bytes()).0;
+    let mut revision = None::<String>;
     let mut occurrences = BTreeMap::<String, usize>::new();
     let mut declarations = BTreeMap::<String, Vec<&rift_syntax::SyntaxSymbol>>::new();
     for symbol in syntax.symbols() {
@@ -214,6 +226,7 @@ fn identity_anchors_with_roots(
             continue;
         };
         if let Some(number) = occurrence {
+            let revision = revision.get_or_insert_with(|| occurrence_revision(digest));
             let Ok(occurrence) = SymbolOccurrence::new(number, revision.clone()) else {
                 continue;
             };
@@ -227,6 +240,16 @@ fn identity_anchors_with_roots(
         }
     }
     anchors
+}
+
+fn occurrence_revision(digest: rift_core::FileDigest) -> String {
+    use std::fmt::Write as _;
+
+    let mut revision = String::with_capacity(digest.as_bytes().len() * 2);
+    for byte in digest.as_bytes() {
+        write!(&mut revision, "{byte:02x}").expect("String accepts formatted bytes");
+    }
+    revision
 }
 
 fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String> {
