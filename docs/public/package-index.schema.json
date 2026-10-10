@@ -993,8 +993,160 @@
       ]
     },
     "PackageAnalysisWarning": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "identity_unresolved",
+                  "object_unavailable"
+                ]
+              }
+            }
+          },
+          "then": {
+            "oneOf": [
+              {
+                "required": [
+                  "unit",
+                  "range"
+                ]
+              },
+              {
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "unit"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "range"
+                      ]
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "identity_unresolved",
+                  "object_unavailable"
+                ]
+              },
+              "unit": {
+                "type": "null"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "range": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "code": {
+                "enum": [
+                  "identity_unresolved",
+                  "object_unavailable"
+                ]
+              },
+              "range": {
+                "type": "null"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "unit": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ],
       "description": "What an analyzer run could not do.",
       "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A retained object has no established identity, so its source binding cannot enter\nthe exact declaration directory.",
+          "properties": {
+            "code": {
+              "const": "identity_unresolved",
+              "type": "string"
+            },
+            "qualified_name": {
+              "description": "Qualified name captured by the provider.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange",
+              "description": "Original declaration range in that unit."
+            },
+            "unit": {
+              "$ref": "#/$defs/SourceUnitId",
+              "description": "Physical source unit carrying the retained facts."
+            }
+          },
+          "required": [
+            "code",
+            "qualified_name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One public object was left out because a field exceeds its enforced bound.\nOriginal source and provider facts remain retained.",
+          "properties": {
+            "bound": {
+              "description": "Enforced bound for that field, in the field's advertised units.",
+              "format": "uint64",
+              "minimum": 1,
+              "type": "integer"
+            },
+            "code": {
+              "const": "object_unavailable",
+              "type": "string"
+            },
+            "field": {
+              "description": "Public field that exceeds its enforced bound.",
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "qualified_name": {
+              "description": "Qualified name captured by the provider.",
+              "type": "string"
+            },
+            "range": {
+              "$ref": "#/$defs/TextRange",
+              "description": "Original declaration range in that unit."
+            },
+            "unit": {
+              "$ref": "#/$defs/SourceUnitId",
+              "description": "Physical source unit carrying the retained facts, when one exists."
+            }
+          },
+          "required": [
+            "code",
+            "qualified_name",
+            "field",
+            "bound"
+          ],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "description": "One selected file was left out: no shipped provider parses its extension, its\nbytes are not valid UTF-8, or its parse was refused.",
@@ -1074,6 +1226,71 @@
           "type": "object"
         }
       ]
+    },
+    "PackageArtifact": {
+      "additionalProperties": false,
+      "description": "The selected immutable package artifact and its observed compatibility tags.",
+      "properties": {
+        "content_digest": {
+          "$ref": "#/$defs/SourceDigest",
+          "description": "Complete digest of the selected archive bytes."
+        },
+        "filename": {
+          "$ref": "#/$defs/ProjectPath",
+          "description": "Original archive filename, retained as one basename."
+        },
+        "tags": {
+          "description": "Expanded tags accepted from the selected wheel's filename and metadata.",
+          "items": {
+            "$ref": "#/$defs/WheelTag"
+          },
+          "maxItems": 64,
+          "type": "array"
+        }
+      },
+      "required": [
+        "filename",
+        "content_digest",
+        "tags"
+      ],
+      "type": "object"
+    },
+    "PackageCoverage": {
+      "additionalProperties": false,
+      "description": "Independent coverage of one selected language and its relationship facets.",
+      "properties": {
+        "applicability_complete": {
+          "description": "Selected artifact and platform or export conditions establish this scope.",
+          "type": "boolean"
+        },
+        "identity_complete": {
+          "description": "Every retained object and binding has an established canonical identity.",
+          "type": "boolean"
+        },
+        "inventory_complete": {
+          "description": "Every source in the accepted inventory was retained and analyzed.",
+          "type": "boolean"
+        },
+        "language": {
+          "$ref": "#/$defs/Language",
+          "description": "Language this coverage describes."
+        },
+        "relationships": {
+          "description": "Coverage of each relationship facet, independent of identity lookup.",
+          "items": {
+            "$ref": "#/$defs/RelationshipCoverage"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "language",
+        "inventory_complete",
+        "identity_complete",
+        "applicability_complete",
+        "relationships"
+      ],
+      "type": "object"
     },
     "PackageDocument": {
       "additionalProperties": false,
@@ -1250,19 +1467,20 @@
     },
     "PackageSymbol": {
       "additionalProperties": false,
-      "description": "One declaration a package's source carries.\n\n`Eq` is not derived: [`Signature`] carries a confidence value, so it is not `Eq`.",
+      "description": "One declaration a package's source carries.\n\n`Eq` is not derived: [`Signature`](crate::read::Signature) carries a confidence value,\nso it is not `Eq`.",
       "properties": {
         "digest": {
           "$ref": "#/$defs/Digest",
           "description": "The digest of this record's canonical content."
         },
-        "documentation": {
-          "$ref": "#/$defs/Documentation",
-          "description": "The documentation attached to the declaration, when the grammar attaches any."
-        },
-        "kind": {
-          "$ref": "#/$defs/ExactKind",
-          "description": "What the declaration is in the provider's vocabulary, such as `function` or\n`class`. The language rides beside it in `presentation.language`."
+        "documentation_indices": {
+          "description": "Entries in the logical object's documentation array supplied by this binding.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
         },
         "line": {
           "description": "The one-based line the declaration starts on.",
@@ -1270,33 +1488,26 @@
           "minimum": 0,
           "type": "integer"
         },
-        "name": {
-          "description": "The declared short name, as the grammar spells it.",
-          "type": "string"
-        },
         "origin": {
           "$ref": "#/$defs/SymbolOrigin",
           "description": "Where the declaration came from: the package, and whether it was authored."
-        },
-        "presentation": {
-          "$ref": "#/$defs/Symbol",
-          "description": "Normalized read symbol assembled from provider Contributions."
         },
         "public": {
           "description": "Whether the declaration is public under its language's own rules. A consumer\nanswering a package read serves public declarations alone.",
           "type": "boolean"
         },
-        "qualified_name": {
-          "description": "The container-qualified name, unique within the unit's symbol space.",
-          "type": "string"
-        },
         "range": {
           "$ref": "#/$defs/TextRange",
           "description": "The declaration's byte range inside its unit."
         },
-        "signature": {
-          "$ref": "#/$defs/Signature",
-          "description": "The rendered signature, when the declaration has one."
+        "signature_indices": {
+          "description": "Entries in the logical object's signature array supplied by this binding.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
         },
         "source": {
           "description": "The declaration's own source, cut at the analyzer's retained-source bound.",
@@ -1311,6 +1522,15 @@
           "$ref": "#/$defs/SymbolId",
           "description": "The declaration's identity."
         },
+        "type_indices": {
+          "description": "Entries in the logical object's type array supplied by this binding.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
         "unit": {
           "$ref": "#/$defs/SourceUnitId",
           "description": "The unit the declaration was read from."
@@ -1318,14 +1538,13 @@
       },
       "required": [
         "symbol",
-        "presentation",
         "origin",
         "unit",
-        "name",
-        "qualified_name",
-        "kind",
         "range",
         "line",
+        "signature_indices",
+        "type_indices",
+        "documentation_indices",
         "source",
         "source_complete",
         "public",
@@ -1384,6 +1603,257 @@
       "maxLength": 1000,
       "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
       "type": "string"
+    },
+    "Relationship": {
+      "additionalProperties": false,
+      "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read.",
+      "properties": {
+        "confidence": {
+          "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
+          "format": "double",
+          "maximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "derivation": {
+          "$ref": "#/$defs/RelationshipDerivation",
+          "description": "How this edge was established."
+        },
+        "evidence": {
+          "default": [],
+          "description": "The nodes this edge was read from. Absent when empty.",
+          "items": {
+            "$ref": "#/$defs/NodeId"
+          },
+          "type": "array"
+        },
+        "extensions": {
+          "$ref": "#/$defs/Extensions",
+          "default": {},
+          "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty."
+        },
+        "facets": {
+          "description": "Portable classification, so a query for `imports` finds local kinds such as `import`\nand `use` alike.",
+          "items": {
+            "$ref": "#/$defs/RelationshipFacet"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "from": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the edge starts at."
+        },
+        "kind": {
+          "$ref": "#/$defs/ExactKind",
+          "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
+        },
+        "occurrence": {
+          "$ref": "#/$defs/SourceUnitSpan",
+          "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node."
+        },
+        "to": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
+        }
+      },
+      "required": [
+        "from",
+        "kind",
+        "facets",
+        "to",
+        "derivation"
+      ],
+      "type": "object"
+    },
+    "RelationshipCoverage": {
+      "additionalProperties": false,
+      "description": "Coverage of one relationship facet within a selected language.",
+      "properties": {
+        "complete": {
+          "description": "Whether every relationship in the accepted scope was captured.",
+          "type": "boolean"
+        },
+        "facet": {
+          "$ref": "#/$defs/RelationshipFacet",
+          "description": "Relationship facet this coverage describes."
+        }
+      },
+      "required": [
+        "facet",
+        "complete"
+      ],
+      "type": "object"
+    },
+    "RelationshipDerivation": {
+      "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
+      "oneOf": [
+        {
+          "const": "resolution",
+          "description": "The provider resolved the edge semantically, so a consumer may act on it directly.",
+          "type": "string"
+        },
+        {
+          "const": "syntax",
+          "description": "The edge was read from syntax alone, without semantic resolution.",
+          "type": "string"
+        },
+        {
+          "const": "heuristic",
+          "description": "The edge is a guess, qualified by `confidence`.",
+          "type": "string"
+        }
+      ]
+    },
+    "RelationshipFacet": {
+      "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+      "oneOf": [
+        {
+          "const": "contains",
+          "description": "The source contains the target within its scope.",
+          "type": "string"
+        },
+        {
+          "const": "declares",
+          "description": "The source declares the target.",
+          "type": "string"
+        },
+        {
+          "const": "augments",
+          "description": "The source adds to a declaration made elsewhere.",
+          "type": "string"
+        },
+        {
+          "const": "references",
+          "description": "The source mentions the target.",
+          "type": "string"
+        },
+        {
+          "const": "calls",
+          "description": "The source invokes the target.",
+          "type": "string"
+        },
+        {
+          "const": "constructs",
+          "description": "The source creates an instance of the target.",
+          "type": "string"
+        },
+        {
+          "const": "reads",
+          "description": "The source reads the target's value.",
+          "type": "string"
+        },
+        {
+          "const": "writes",
+          "description": "The source assigns to the target.",
+          "type": "string"
+        },
+        {
+          "const": "imports",
+          "description": "The source brings the target into scope.",
+          "type": "string"
+        },
+        {
+          "const": "exports",
+          "description": "The source exposes the target outside its unit.",
+          "type": "string"
+        },
+        {
+          "const": "extends",
+          "description": "The source inherits from the target.",
+          "type": "string"
+        },
+        {
+          "const": "implements",
+          "description": "The source fulfils the target's interface.",
+          "type": "string"
+        },
+        {
+          "const": "has_type",
+          "description": "The source is typed by the target.",
+          "type": "string"
+        },
+        {
+          "const": "overrides",
+          "description": "The source replaces the target inherited from a supertype.",
+          "type": "string"
+        },
+        {
+          "const": "aliases",
+          "description": "The source is another name for the target.",
+          "type": "string"
+        },
+        {
+          "const": "generates",
+          "description": "The source produces the target as generated code.",
+          "type": "string"
+        },
+        {
+          "const": "depends_on",
+          "description": "The source requires the target to build or run.",
+          "type": "string"
+        },
+        {
+          "const": "annotated_by",
+          "description": "The source carries the target as an annotation.",
+          "type": "string"
+        },
+        {
+          "const": "throws",
+          "description": "The source can raise the target.",
+          "type": "string"
+        },
+        {
+          "const": "catches",
+          "description": "The source handles the target when raised.",
+          "type": "string"
+        },
+        {
+          "const": "bounded_by",
+          "description": "The source's type parameter is constrained by the target.",
+          "type": "string"
+        },
+        {
+          "const": "instantiates",
+          "description": "The source applies concrete arguments to the generic target.",
+          "type": "string"
+        },
+        {
+          "const": "specializes",
+          "description": "The source is a specialization of the generic target.",
+          "type": "string"
+        },
+        {
+          "const": "overloads",
+          "description": "The source and target are separately dispatched forms of one name.",
+          "type": "string"
+        },
+        {
+          "const": "mixes_in",
+          "description": "The source incorporates the target as a mixin.",
+          "type": "string"
+        },
+        {
+          "const": "embeds",
+          "description": "The source embeds the target within its own definition.",
+          "type": "string"
+        },
+        {
+          "const": "tests",
+          "description": "The source exercises the target as a test.",
+          "type": "string"
+        },
+        {
+          "const": "configures",
+          "description": "The source supplies configuration for the target.",
+          "type": "string"
+        },
+        {
+          "const": "binds",
+          "description": "The source binds a name or value to the target.",
+          "type": "string"
+        }
+      ]
     },
     "RuntimeIdentity": {
       "additionalProperties": false,
@@ -1501,6 +1971,13 @@
       ],
       "type": "object"
     },
+    "SourceDigest": {
+      "description": "Complete lowercase SHA-256 digest of immutable source bytes.",
+      "maxLength": 64,
+      "minLength": 64,
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
     "SourceKind": {
       "description": "How source or a declaration came to exist.",
       "oneOf": [
@@ -1583,97 +2060,22 @@
       },
       "type": "string"
     },
-    "Symbol": {
-      "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
+    "SourceUnitSpan": {
+      "additionalProperties": false,
+      "description": "One byte range in a source-catalog unit.",
       "properties": {
-        "container": {
-          "$ref": "#/$defs/SymbolId",
-          "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "Half-open UTF-8 byte range in that unit."
         },
-        "document_local": {
-          "default": false,
-          "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
-          "type": "boolean"
-        },
-        "documentation": {
-          "default": [],
-          "description": "Doc comments attached to the declaration, with the markup format they were written\nin. Absent when empty.",
-          "items": {
-            "$ref": "#/$defs/Documentation"
-          },
-          "type": "array"
-        },
-        "extensions": {
-          "$ref": "#/$defs/Extensions",
-          "default": {},
-          "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
-        },
-        "facets": {
-          "default": [],
-          "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
-          "items": {
-            "$ref": "#/$defs/SymbolFacet"
-          },
-          "type": "array"
-        },
-        "id": {
-          "$ref": "#/$defs/SymbolId",
-          "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
-        },
-        "kind": {
-          "$ref": "#/$defs/ExactKind",
-          "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
-        },
-        "language": {
-          "$ref": "#/$defs/Language",
-          "description": "The language this symbol belongs to."
-        },
-        "modifiers": {
-          "default": [],
-          "description": "Language keywords qualifying the declaration: `export`, `async`, `const`. Absent\nwhen empty.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "name": {
-          "description": "The human-readable name, as written in the source: `parseConfig`. Rendered\nsignatures live in `signatures`.",
-          "maxLength": 4096,
-          "type": "string"
-        },
-        "origin": {
-          "$ref": "#/$defs/SymbolOrigin",
-          "default": {
-            "location": "project",
-            "source_kind": "authored"
-          },
-          "description": "Where the declaration belongs and how it was produced. Absent when it says a\nproject declaration, authored, with no package - the common case."
-        },
-        "signatures": {
-          "default": [],
-          "description": "One entry per callable form, absent when empty. Where the language dispatches\noverloads separately they are separate symbols joined by the `overloads` edge;\nseveral entries here are alternative forms of one dispatch target, as\n`typing.overload` writes them.",
-          "items": {
-            "$ref": "#/$defs/Signature"
-          },
-          "type": "array"
-        },
-        "types": {
-          "default": [],
-          "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound. Absent when empty.",
-          "items": {
-            "$ref": "#/$defs/TypeBinding"
-          },
-          "type": "array"
-        },
-        "visibility": {
-          "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
-          "type": "string"
+        "unit": {
+          "$ref": "#/$defs/SourceUnitId",
+          "description": "Source unit containing the bytes."
         }
       },
       "required": [
-        "language",
-        "name",
-        "kind"
+        "unit",
+        "range"
       ],
       "type": "object"
     },
@@ -2127,6 +2529,30 @@
         "source"
       ],
       "type": "object"
+    },
+    "WheelTag": {
+      "additionalProperties": false,
+      "description": "One expanded Python, ABI and platform compatibility tag.",
+      "properties": {
+        "abi": {
+          "description": "ABI required by the artifact.",
+          "type": "string"
+        },
+        "platform": {
+          "description": "Platform required by the artifact.",
+          "type": "string"
+        },
+        "python": {
+          "description": "Python implementation and version required by the artifact.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "python",
+        "abi",
+        "platform"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2136,6 +2562,25 @@
     "analyzer_revision": {
       "$ref": "#/$defs/Digest",
       "description": "The analyzer that produced it: the digest of the grammar versions and extraction\nsource the run depended on. Two publications with equal package bytes and equal\n`analyzer_revision` are equal."
+    },
+    "artifact": {
+      "$ref": "#/$defs/PackageArtifact",
+      "description": "Selected immutable artifact when the caller established its identity."
+    },
+    "coverage": {
+      "description": "Independent coverage of each selected language. Unknown applicability is not\ncomplete, even when every selected source was parsed.",
+      "items": {
+        "$ref": "#/$defs/PackageCoverage"
+      },
+      "type": "array"
+    },
+    "declarations": {
+      "description": "Established source bindings, in symbol, unit and range order.",
+      "items": {
+        "$ref": "#/$defs/PackageSymbol"
+      },
+      "maxItems": 50000000,
+      "type": "array"
     },
     "documentation": {
       "$ref": "#/$defs/DocumentationIndex",
@@ -2155,21 +2600,125 @@
       "minimum": 1,
       "type": "integer"
     },
+    "identity_format": {
+      "description": "Canonical symbol identity format supported by this publication.",
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "objects": {
+      "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Names follow the provider's byte\nbound; public directories apply the smaller public character bound separately.",
+      "items": {
+        "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
+        "properties": {
+          "container": {
+            "$ref": "#/$defs/SymbolId",
+            "description": "The symbol this one belongs to - the class that owns a method, the module that owns\na function. Ownership is not lexical: a Go method sits beside its type and a Rust\nmethod inside an `impl` block, both naming the type here; absent at the top level."
+          },
+          "document_local": {
+            "default": false,
+            "description": "Whether language semantics confine this symbol to the document that declares it. The\nprovider classifies locality from its language model; absent when `false`.",
+            "type": "boolean"
+          },
+          "documentation": {
+            "default": [],
+            "description": "Doc comments attached to the declaration, with the markup format they were written\nin. Absent when empty.",
+            "items": {
+              "$ref": "#/$defs/Documentation"
+            },
+            "type": "array"
+          },
+          "extensions": {
+            "$ref": "#/$defs/Extensions",
+            "default": {},
+            "description": "Language-specific facts with no portable equivalent, namespaced by the provider that\nemitted them. Absent when empty."
+          },
+          "facets": {
+            "default": [],
+            "description": "Portable classification for cross-language queries, absent when empty. The local\nkinds `trait` and `interface` can both carry the `type` facet.",
+            "items": {
+              "$ref": "#/$defs/SymbolFacet"
+            },
+            "type": "array"
+          },
+          "id": {
+            "$ref": "#/$defs/SymbolId",
+            "description": "Unique identifier of this Symbol across the whole workspace. Absent for an\nunestablished symbol: no accepted evidence, or more than one, established its\nidentity."
+          },
+          "kind": {
+            "$ref": "#/$defs/ExactKind",
+            "description": "What this symbol is in the provider's vocabulary, such as `trait`, `function`, or\n`table`."
+          },
+          "language": {
+            "$ref": "#/$defs/Language",
+            "description": "The language this symbol belongs to."
+          },
+          "modifiers": {
+            "default": [],
+            "description": "Language keywords qualifying the declaration: `export`, `async`, `const`. Absent\nwhen empty.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "The human-readable name, as written in the source: `parseConfig`. Rendered\nsignatures live in `signatures`.",
+            "maxLength": 8192,
+            "type": "string"
+          },
+          "origin": {
+            "$ref": "#/$defs/SymbolOrigin",
+            "default": {
+              "location": "project",
+              "source_kind": "authored"
+            },
+            "description": "Where the declaration belongs and how it was produced. Absent when it says a\nproject declaration, authored, with no package - the common case."
+          },
+          "signatures": {
+            "default": [],
+            "description": "One entry per callable form, absent when empty. Where the language dispatches\noverloads separately they are separate symbols joined by the `overloads` edge;\nseveral entries here are alternative forms of one dispatch target, as\n`typing.overload` writes them.",
+            "items": {
+              "$ref": "#/$defs/Signature"
+            },
+            "type": "array"
+          },
+          "types": {
+            "default": [],
+            "description": "The types this symbol carries, each tagged with the role it plays: a return type, a\nfield type, a bound. Absent when empty.",
+            "items": {
+              "$ref": "#/$defs/TypeBinding"
+            },
+            "type": "array"
+          },
+          "visibility": {
+            "description": "How widely the symbol is visible, in the language's own terms - `public`, `private`,\n`pub(crate)`. Absent where the language has no such concept.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "language",
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "maxItems": 50000000,
+      "type": "array"
+    },
     "owner": {
       "$ref": "#/$defs/SymbolOwner",
       "description": "Exact defining package, runtime, or compiler owner."
     },
+    "relationships": {
+      "description": "Normalized relationships, preserving their source occurrences and derivation.",
+      "items": {
+        "$ref": "#/$defs/Relationship"
+      },
+      "type": "array"
+    },
     "source_digest": {
       "$ref": "#/$defs/Digest",
       "description": "The digest of the package source this publication was produced from, over every\nunit's path and content in unit order."
-    },
-    "symbols": {
-      "description": "Every parsed declaration, in symbol identity order. Container declarations are\nkept whatever their visibility, so a consumer can assemble a read.",
-      "items": {
-        "$ref": "#/$defs/PackageSymbol"
-      },
-      "maxItems": 50000000,
-      "type": "array"
     },
     "units": {
       "description": "Every analyzed source unit, in unit identity order.",
@@ -2190,11 +2739,15 @@
   },
   "required": [
     "format_revision",
+    "identity_format",
     "analyzer_revision",
     "owner",
     "source_digest",
     "units",
-    "symbols",
+    "objects",
+    "declarations",
+    "relationships",
+    "coverage",
     "documents",
     "documentation"
   ],

@@ -8277,6 +8277,10 @@
                 "$ref": "#/$defs/ExactKind",
                 "description": "What the edge is in this provider's vocabulary, such as `import`, `use`, or\n`implements`."
               },
+              "occurrence": {
+                "$ref": "#/$defs/SourceUnitSpan",
+                "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node."
+              },
               "to": {
                 "$ref": "#/$defs/SymbolId",
                 "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
@@ -8898,6 +8902,25 @@
               "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "type": "string"
+          },
+          "SourceUnitSpan": {
+            "additionalProperties": false,
+            "description": "One byte range in a source-catalog unit.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Half-open UTF-8 byte range in that unit."
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Source unit containing the bytes."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
           },
           "Symbol": {
             "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
