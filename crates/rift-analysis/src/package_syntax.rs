@@ -114,7 +114,7 @@ impl<'source> PackageSyntaxSource<'source> {
             file,
             owner,
             identity: PackageSyntaxIdentity {
-                source_digest: FileDigest::of(file.text().as_bytes()),
+                source_digest: file.source_digest(),
                 language,
                 limits,
                 analyzer_digest: analyzer_digest(),

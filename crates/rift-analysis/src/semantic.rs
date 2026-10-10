@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+mod captured;
+
 use rift_core::{
     ContributionReference, IndexRevision, ProjectPath, ProviderId, ProviderRevision,
     ProviderSymbolId, SourceRevision, TreeRevision,
@@ -242,7 +244,13 @@ impl WorkspaceSemantics {
         let mut beyond_declaration_bound = Vec::new();
         let mut refused_contributions = Vec::new();
         for (offered, placed) in documents.iter().enumerate() {
-            if placed.facts.symbols().len() > builder.declarations_remaining() {
+            if placed
+                .facts
+                .symbols()
+                .len()
+                .saturating_add(placed.placement.aliases_count())
+                > builder.declarations_remaining()
+            {
                 beyond_declaration_bound = documents[offered..]
                     .iter()
                     .map(|left_out| left_out.path.clone())
@@ -304,6 +312,20 @@ impl WorkspaceSemantics {
         &self.relationships
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_graph(
+        graph: NormalizedGraph,
+        syntax_provider: ProviderId,
+        relationships_max: usize,
+    ) -> Self {
+        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
+        Self {
+            graph,
+            relationships,
+            syntax_provider,
+        }
+    }
+
     /// Assembles readable symbol for syntax provider-local identity.
     #[must_use]
     pub fn assembled(&self, provider_symbol: &str) -> Option<AssembledSymbol> {
@@ -312,6 +334,18 @@ impl WorkspaceSemantics {
             ProviderSymbolId::for_symbol(provider_symbol).ok()?,
         );
         let record = self.graph.record_for(&reference)?;
+        SymbolAssembler::assemble(
+            &self.graph,
+            record,
+            std::slice::from_ref(&self.syntax_provider),
+        )
+    }
+
+    /// Assembles one captured record, including records with no source declaration.
+    pub(crate) fn assembled_record(
+        &self,
+        record: &rift_core::SymbolRecord,
+    ) -> Option<AssembledSymbol> {
         SymbolAssembler::assemble(
             &self.graph,
             record,
