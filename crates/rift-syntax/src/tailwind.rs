@@ -646,7 +646,7 @@ pub fn append_framework_symbols(
     let mut combined = document.symbols().to_vec();
     combined.extend(symbols);
     combined.sort_by_key(|symbol| symbol.range.start);
-    let result = SyntaxDocument::new(
+    let mut result = SyntaxDocument::new(
         document.language().clone(),
         source.path.clone(),
         document.nodes().to_vec(),
@@ -657,6 +657,9 @@ pub fn append_framework_symbols(
     .with_syntax_limits(limits)
     .with_left_out_declarations(omitted)
     .with_framework_context();
+    if let Some(bindings) = document.facts().export_bindings() {
+        result = result.with_export_bindings(bindings.to_vec());
+    }
     let parts = SyntaxFactsParts {
         origin: result.facts().origin(),
         language: result.language().clone(),

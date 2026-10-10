@@ -30,6 +30,7 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         has_errors: facts.has_errors(),
         left_out_declarations: facts.left_out_declaration_count(),
         markdown_facts: facts.markdown_facts().cloned(),
+        export_bindings: facts.export_bindings().map(<[_]>::to_vec),
         source_digest: *facts.source_digest().expect("source witness"),
     }
 }
@@ -43,6 +44,141 @@ fn markdown_parts(facts: &MarkdownFacts) -> MarkdownFactsParts {
         error_ranges: facts.error_ranges().to_vec(),
         omitted_ranges: facts.omitted_ranges().to_vec(),
     }
+}
+
+#[test]
+fn rust_module_path_facts_restore_exact_source_and_keep_old_facts_unknown() {
+    let source = "#[path = \"client.rs\"]\n\nmod client;\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    assert!(matches!(
+        captured.symbols[0].module_path,
+        Some(rift_syntax::RustModulePath::Literal { .. })
+    ));
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("exact module path facts");
+    assert_eq!(&restored, document.facts());
+
+    let mut old = captured.clone();
+    old.symbols[0].module_path = None;
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), old)
+        .expect("older unrecorded module path");
+    assert!(restored.symbols()[0].module_path.is_none());
+
+    for mutation in 0..4 {
+        let mut invalid = captured.clone();
+        let symbol = &mut invalid.symbols[0];
+        let Some(rift_syntax::RustModulePath::Literal { path, range }) = &mut symbol.module_path
+        else {
+            panic!("literal module path");
+        };
+        match mutation {
+            0 => *path = ProjectPath::new("other.rs").expect("different path"),
+            1 => range.end += 1,
+            2 => *range = symbol.item_range,
+            _ => symbol.kind = "function",
+        }
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err());
+    }
+}
+
+#[test]
+fn python_overload_import_and_decorator_ranges_restore_without_inventing_old_facts() {
+    let source = "from typing import overload as ov\n@ov\ndef call(value: int): ...\n";
+    let document = parsed(ShippedLanguage::Python, source);
+    let captured = parts(document.facts());
+    assert!(matches!(
+        captured.symbols[0].python_overload,
+        Some(rift_syntax::PythonOverload::Overload { .. })
+    ));
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("exact original import and decorator");
+    assert_eq!(&restored, document.facts());
+    let mut old = captured.clone();
+    old.symbols[0].python_overload = None;
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), old)
+        .expect("unrecorded older overload state");
+    assert!(restored.symbols()[0].python_overload.is_none());
+    for mutation in 0..5 {
+        let mut invalid = captured.clone();
+        let symbol = &mut invalid.symbols[0];
+        let Some(rift_syntax::PythonOverload::Overload {
+            import_statement,
+            module,
+            imported,
+            binding,
+            decorator,
+        }) = &mut symbol.python_overload
+        else {
+            panic!("captured overload");
+        };
+        match mutation {
+            0 => *module = *binding,
+            1 => *imported = Some(*binding),
+            2 => *decorator = symbol.item_range,
+            3 => import_statement.end = symbol.item_range.end,
+            _ => symbol.kind = "class",
+        }
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err());
+    }
+}
+
+#[test]
+fn export_binding_restore_preserves_alias_source_and_refuses_invalid_facts() {
+    let source = "export { local as exposed } from 'client';\n";
+    let document = parsed(ShippedLanguage::JavaScript, source);
+    let token = |name: &str| {
+        let start = source.find(name).expect("source token");
+        ByteRange {
+            start: u64::try_from(start).expect("start"),
+            end: u64::try_from(start + name.len()).expect("end"),
+        }
+    };
+    let binding = rift_syntax::SyntaxExportBinding {
+        kind: rift_syntax::SyntaxExportKind::Named,
+        range: ByteRange {
+            start: 0,
+            end: u64::try_from(source.trim_end().len()).expect("statement"),
+        },
+        local: Some(token("local")),
+        exported: Some(token("exposed")),
+        source: Some(token("'client'")),
+        container: None,
+        type_only: false,
+    };
+    let mut captured = parts(document.facts());
+    captured.export_bindings = Some(vec![binding.clone()]);
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("captured alias binding");
+    assert_eq!(
+        restored.export_bindings(),
+        Some([binding.clone()].as_slice())
+    );
+    for mutation in 0..5 {
+        let mut invalid = captured.clone();
+        let facts = invalid.export_bindings.as_mut().expect("recorded bindings");
+        match mutation {
+            0 => facts[0].local = Some(ByteRange { start: 0, end: 0 }),
+            1 => facts[0].exported = None,
+            2 => facts[0].container = Some("absent".to_owned()),
+            3 => facts[0].range.end = 1,
+            _ => facts.push(binding.clone()),
+        }
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err());
+    }
+    let mut invalid = captured.clone();
+    invalid.language = ShippedLanguage::Rust.language();
+    assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err());
+    let mut overbound = captured;
+    overbound.export_bindings = Some(vec![binding; 2]);
+    let limits = SyntaxLimits::new(source.len(), 1, 1).expect("positive bounds");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, overbound)
+            .expect_err("export count bound")
+            .slug()
+            .as_str(),
+        "rift.syntax.facts_count_exceeded"
+    );
 }
 
 #[test]
@@ -660,11 +796,18 @@ fn restored_signatures_keep_syntax_shape() {
     let document = parsed(ShippedLanguage::Rust, text);
     let original = parts(document.facts());
     let limits = SyntaxLimits::new(text.len(), 100, 8).expect("source limits");
+    let identity = rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Local,
+        ShippedLanguage::Rust.language(),
+        vec!["fixture".to_owned(), "run".to_owned()],
+    )
+    .expect("canonical fixture identity")
+    .wire_identity();
     for (field, value) in [
         ("language", serde_json::json!("python")),
         (
             "links",
-            serde_json::json!([{"range":{"start":0,"end":1},"symbol":"rift://symbol/rust/lib.rs/run"}]),
+            serde_json::json!([{"range":{"start":0,"end":1},"symbol":identity}]),
         ),
         (
             "receiver",
@@ -678,10 +821,7 @@ fn restored_signatures_keep_syntax_shape() {
             "returns",
             serde_json::json!([{"role":"return","origin":"declared","type":{"language":"rust","source":"u8"}}]),
         ),
-        (
-            "type_parameters",
-            serde_json::json!(["rift://symbol/rust/lib.rs/run"]),
-        ),
+        ("type_parameters", serde_json::json!([identity])),
         (
             "throws",
             serde_json::json!([{"language":"rust","source":"u8"}]),

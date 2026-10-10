@@ -5,12 +5,45 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
-use rift_syntax::{ByteRange, SyntaxFacts, SyntaxFactsParts, SyntaxNames, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, RustModulePath, SyntaxFacts, SyntaxFactsParts, SyntaxNames, SyntaxSymbol,
+};
 use serde::{Deserialize, Serialize};
 
-use super::{PackageSyntax, ShippedLanguage, SyntaxLimits, analyze, canonical};
+use super::{PackageSyntax, ShippedLanguage, SyntaxLimits, analyze_with_library, canonical};
 
 const SOURCE: &str = "/// Opens a file.\npub mod client { pub fn open() {} pub fn open() {} }\n";
+
+#[derive(Serialize, Deserialize)]
+enum CapturedModulePath {
+    Absent,
+    Literal { path: String, range: [u64; 2] },
+    Unknown,
+}
+
+impl CapturedModulePath {
+    fn capture(value: &RustModulePath) -> Self {
+        match value {
+            RustModulePath::Absent => Self::Absent,
+            RustModulePath::Literal { path, range } => Self::Literal {
+                path: path.as_str().to_owned(),
+                range: captured_range(*range),
+            },
+            RustModulePath::Unknown => Self::Unknown,
+        }
+    }
+
+    fn restore(self) -> RustModulePath {
+        match self {
+            Self::Absent => RustModulePath::Absent,
+            Self::Literal { path, range } => RustModulePath::Literal {
+                path: rift_core::ProjectPath::new(path).expect("recorded module path"),
+                range: restored_range(range),
+            },
+            Self::Unknown => RustModulePath::Unknown,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct CapturedSymbol {
@@ -28,6 +61,7 @@ struct CapturedSymbol {
     signatures: Vec<Signature>,
     documentation: Vec<Documentation>,
     documentation_ranges: Vec<[u64; 2]>,
+    module_path: Option<CapturedModulePath>,
 }
 
 fn captured_range(range: ByteRange) -> [u64; 2] {
@@ -62,6 +96,7 @@ impl CapturedSymbol {
                 .copied()
                 .map(captured_range)
                 .collect(),
+            module_path: symbol.module_path.as_ref().map(CapturedModulePath::capture),
         }
     }
 
@@ -89,6 +124,8 @@ impl CapturedSymbol {
                 .into_iter()
                 .map(restored_range)
                 .collect(),
+            module_path: self.module_path.map(CapturedModulePath::restore),
+            python_overload: None,
         }
     }
 }
@@ -151,6 +188,7 @@ impl CapturedFacts {
                 left_out_declarations: usize::try_from(self.left_out_declarations)
                     .expect("bounded omissions"),
                 markdown_facts: None,
+                export_bindings: None,
                 source_digest: digest,
             },
         )
@@ -179,38 +217,48 @@ fn restored_facts_in_child() {
     assert!(captured.symbols.len() <= 16, "fixture declaration bound");
     let syntax = captured.restore();
     let files = [("src/moved.rs", SOURCE)];
-    let restored = analyze(
+    let restored = analyze_with_library(
         "2.0.0",
         ShippedLanguage::Rust,
         &files,
         SyntaxLimits::default(),
         |_| Some(syntax.clone()),
+        Some("src/moved.rs"),
     )
     .expect("restored package");
-    let fresh = analyze(
+    let fresh = analyze_with_library(
         "2.0.0",
         ShippedLanguage::Rust,
         &files,
         SyntaxLimits::default(),
         |_| None,
+        Some("src/moved.rs"),
     )
     .expect("fresh package");
     assert_eq!(canonical(&restored), canonical(&fresh));
     assert_eq!(restored.syntax_work().provider_calls, 0);
     assert_eq!(restored.syntax_work().reused_files, 1);
-    assert!(
-        restored
-            .publication()
-            .symbols
-            .iter()
-            .all(|symbol| symbol.symbol.0.contains("beacon@2.0.0/src/moved.rs"))
-    );
+    assert!(!restored.publication().declarations.is_empty());
+    for declaration in &restored.publication().declarations {
+        let identity = rift_protocol::identity::SymbolIdentity::parse(&declaration.symbol.0)
+            .expect("current canonical identity");
+        assert_eq!(
+            identity.owner(),
+            &rift_protocol::identity::SymbolOwner::Package {
+                manager: "cargo".into(),
+                registry: "crates.io".into(),
+                name: "beacon".into(),
+                version: "2.0.0".into(),
+            }
+        );
+        assert!(declaration.unit.0.ends_with("/src/moved.rs"));
+    }
 }
 
 #[test]
 fn facts_restore_in_another_process_with_current_placement() {
     let mut retained = None;
-    analyze(
+    analyze_with_library(
         "1.0.0",
         ShippedLanguage::Rust,
         &[("src/first.rs", SOURCE)],
@@ -220,6 +268,7 @@ fn facts_restore_in_another_process_with_current_placement() {
             retained = Some(parsed.clone());
             Some(parsed)
         },
+        Some("src/first.rs"),
     )
     .expect("original package");
     let captured = CapturedFacts::capture(&retained.expect("captured facts"));

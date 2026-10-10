@@ -144,6 +144,7 @@ fn native_declarations_keep_names_ranges_and_language_identity() {
                 has_errors: facts.has_errors(),
                 left_out_declarations: facts.left_out_declaration_count(),
                 markdown_facts: facts.markdown_facts().cloned(),
+                export_bindings: facts.export_bindings().map(<[_]>::to_vec),
                 source_digest: *document.source_digest().expect("captured source witness"),
             },
         )
@@ -241,6 +242,7 @@ fn embedded_signatures_restore_only_registered_host_languages() {
                 has_errors: original.has_errors(),
                 left_out_declarations: original.left_out_declaration_count(),
                 markdown_facts: None,
+                export_bindings: original.export_bindings().map(<[_]>::to_vec),
                 source_digest: *original.source_digest().expect("captured digest"),
             },
         );

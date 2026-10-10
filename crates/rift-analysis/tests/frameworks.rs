@@ -413,6 +413,7 @@ fn package_framework_publication_matches_fresh_supplied_and_restored_syntax() {
                     has_errors: facts.has_errors(),
                     left_out_declarations: facts.left_out_declaration_count(),
                     markdown_facts: facts.markdown_facts().cloned(),
+                    export_bindings: facts.export_bindings().map(<[_]>::to_vec),
                     source_digest: syntax.identity().source_digest,
                 },
             )
