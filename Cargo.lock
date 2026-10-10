@@ -4805,6 +4805,7 @@ dependencies = [
  "jsonschema",
  "pep440_rs",
  "percent-encoding",
+ "rift-error",
  "schemars 1.2.2",
  "semver",
  "serde",
