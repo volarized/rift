@@ -24,28 +24,38 @@ impl JsonSchema for CapturedViewId {
     fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
         schemars::json_schema!({
             "type": "string",
-            "minLength": 64,
-            "maxLength": 64,
-            "pattern": "^[0-9a-f]{64}$",
-            "description": "A service-issued full digest for one immutable view in one serving context."
+            "minLength": 3,
+            "maxLength": 4096,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "description": "A service-issued key for one immutable view in one serving context."
         })
     }
 }
 
 impl CapturedViewId {
-    /// Accepts a full immutable view digest.
+    /// Accepts a complete local digest or an opaque service-issued view key.
     ///
     /// # Errors
-    /// Returns an error for a truncated, uppercase or non-hexadecimal digest.
+    /// Returns an error for a malformed or oversized view key.
     pub fn parse(value: &str) -> Result<Self, String> {
-        if value.len() != 64
-            || !value
+        let bounded = value.len() <= 4096;
+        let digest = bounded
+            && value.len() == 64
+            && value
                 .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        let opaque = bounded
+            && value.split_once('.').is_some_and(|(claims, signature)| {
+                [claims, signature].iter().all(|component| {
+                    !component.is_empty()
+                        && component
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                })
+            });
+        if value.len() > 4096 || (!digest && !opaque) {
             return Err(
-                "invalid captured view; supply the full lowercase view digest returned by a read"
-                    .to_owned(),
+                "invalid captured view; supply the complete view key returned by a read".to_owned(),
             );
         }
         Ok(Self(value.to_owned()))
@@ -110,7 +120,7 @@ pub struct GetSymbolParams {
     pub declaration_cursor: Option<String>,
 }
 
-fn deserialize_symbol_id<'de, D>(deserializer: D) -> Result<SymbolId, D::Error>
+pub(crate) fn deserialize_symbol_id<'de, D>(deserializer: D) -> Result<SymbolId, D::Error>
 where
     D: serde::Deserializer<'de>,
 {

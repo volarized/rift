@@ -97,6 +97,37 @@ fn captured_view_requires_complete_key_and_unknown_fields_are_refused() {
 }
 
 #[test]
+fn captured_view_accepts_bounded_opaque_keys_without_claiming_authentication() {
+    for key in ["claims.signature", "a_B-9.z_Y-0"] {
+        let view = CapturedViewId::parse(key).expect("opaque view spelling");
+        assert_eq!(view.as_str(), key);
+        let encoded = serde_json::to_value(&view).expect("view encoding");
+        assert_eq!(
+            serde_json::from_value::<CapturedViewId>(encoded).expect("view decoding"),
+            view
+        );
+    }
+    let exact = format!("{}.s", "c".repeat(4094));
+    assert_eq!(exact.len(), 4096);
+    assert!(CapturedViewId::parse(&exact).is_ok());
+    for refused in [
+        format!("{exact}s"),
+        ".signature".to_owned(),
+        "claims.".to_owned(),
+        "claims.signature.extra".to_owned(),
+        "claims.signature=".to_owned(),
+        "claims.sig nature".to_owned(),
+        "claims.é".to_owned(),
+    ] {
+        assert!(CapturedViewId::parse(&refused).is_err());
+        assert!(serde_json::from_value::<CapturedViewId>(json!(refused)).is_err());
+    }
+    let schema = serde_json::to_value(schemars::schema_for!(CapturedViewId)).expect("view schema");
+    assert_eq!(schema["maxLength"], 4096);
+    assert_eq!(schema["minLength"], 3);
+}
+
+#[test]
 fn declaration_projection_references_one_object_and_keeps_source_association() {
     let mut value = symbol();
     value["signatures"]
