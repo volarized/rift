@@ -870,6 +870,27 @@ fn live_typescript_engine() -> String {
     )
 }
 
+#[cfg(unix)]
+fn install_captured_typescript_engine(root: &std::path::Path) {
+    typescript_install::install_typescript_engine(root);
+    let path = root.join("package.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("installed package metadata"))
+            .expect("captured package metadata");
+    metadata["version"] = json!("1.0.0");
+    metadata["exports"] = json!({
+        "./hub": "./hub.ts",
+        "./walk": "./walk.ts",
+        "./caller": "./caller.ts",
+        "./view": "./view.tsx"
+    });
+    std::fs::write(
+        path,
+        serde_json::to_vec(&metadata).expect("package metadata bytes"),
+    )
+    .expect("captured package entry points");
+}
+
 /// typescript-language-server answers both walk directions through `search`, each on its
 /// first walk, since the walk waits out the project load. The outgoing walk from `larger`
 /// reaches `beacon`, and addresses `Math.max` in the `typescript` package the workspace
@@ -887,7 +908,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
         &files,
         Some(live_typescript_engine()),
-        typescript_install::install_typescript_engine,
+        install_captured_typescript_engine,
     )
     .await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;

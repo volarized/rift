@@ -23,14 +23,38 @@ pub(super) fn prepare(
     let metadata = captured_metadata(input);
     let mut prepared = PreparedNamespace::default();
     if let Some(metadata) = &metadata {
+        let entries = ["typescript", "javascript"].map(|language| {
+            let (modules, unresolved) = entry_modules(metadata, language);
+            prepared.unresolved_exports |= unresolved;
+            (language, modules)
+        });
+        let inventory = selected
+            .iter()
+            .map(|file| (file.path, file.syntax.language().name.as_str()))
+            .collect::<BTreeSet<_>>();
+        for (language, modules) in &entries {
+            if selected
+                .iter()
+                .any(|file| file.syntax.language().name == *language)
+            {
+                prepared.unresolved_exports |= modules
+                    .keys()
+                    .any(|path| !inventory.contains(&(path, *language)));
+            }
+        }
         for file in selected {
-            let Some(path) = entry_path(metadata, &file.syntax.language().name) else {
+            let Some(module) = entries
+                .iter()
+                .find(|(language, _)| *language == file.syntax.language().name.as_str())
+                .and_then(|(_, modules)| modules.get(file.path))
+                .and_then(Option::as_deref)
+            else {
                 continue;
             };
-            if file.path != &path || !selected_source_is_valid(input, file) {
+            if !selected_source_is_valid(input, file) {
                 continue;
             }
-            prepare_file(input, file, &metadata.name, &mut prepared);
+            prepare_file(input, file, module, &mut prepared);
         }
         map_declared_types(input, metadata, selected, &mut prepared);
     }
@@ -251,6 +275,76 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
     accepted.then_some(metadata)
 }
 
+fn entry_modules(
+    metadata: &PackageMetadata,
+    language: &str,
+) -> (BTreeMap<ProjectPath, Option<String>>, bool) {
+    let Some(Exports::Subpaths(exports)) = &metadata.exports else {
+        return (
+            entry_path(metadata, language)
+                .map(|path| (path, Some(metadata.name.clone())))
+                .into_iter()
+                .collect(),
+            false,
+        );
+    };
+    let mut modules = BTreeMap::new();
+    let mut unresolved = false;
+    for (key, target) in &exports.0 {
+        let suffix = if key == "." {
+            ""
+        } else if let Some(suffix) = key.strip_prefix("./") {
+            if !export_subpath_is_valid(suffix) {
+                unresolved = true;
+                continue;
+            }
+            &key[1..]
+        } else {
+            unresolved = true;
+            continue;
+        };
+        let Some(target) = target.target(language) else {
+            unresolved = true;
+            continue;
+        };
+        let Some(relative) = target.strip_prefix("./") else {
+            unresolved = true;
+            continue;
+        };
+        if !export_subpath_is_valid(relative) {
+            unresolved = true;
+            continue;
+        }
+        let Ok(path) = ProjectPath::new(relative) else {
+            unresolved = true;
+            continue;
+        };
+        let module = format!("{}{suffix}", metadata.name);
+        match modules.entry(path) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(module));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&module) {
+                    entry.insert(None);
+                    unresolved = true;
+                }
+            }
+        }
+    }
+    (modules, unresolved)
+}
+
+fn export_subpath_is_valid(path: &str) -> bool {
+    !path.is_empty()
+        && !path.chars().any(|character| {
+            character.is_control() || matches!(character, '*' | '%' | '?' | '#' | '\\')
+        })
+        && path
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".." | "node_modules"))
+}
+
 fn entry_path(metadata: &PackageMetadata, language: &str) -> Option<ProjectPath> {
     let target = entry_target(metadata, language)?;
     let path = ProjectPath::new(target.strip_prefix("./").unwrap_or(target)).ok()?;
@@ -462,14 +556,19 @@ struct PackageMetadata {
 #[serde(untagged)]
 enum Exports {
     Direct(String),
-    Subpaths(ExportSubpaths),
+    Subpaths(OrderedConditions),
 }
 
 impl Exports {
     fn target(&self, language: &str) -> Option<&str> {
         match self {
             Self::Direct(path) => Some(path),
-            Self::Subpaths(paths) => paths.root.as_ref()?.target(language),
+            Self::Subpaths(paths) => paths
+                .0
+                .iter()
+                .find(|(key, _)| key == ".")?
+                .1
+                .target(language),
         }
     }
 
@@ -479,25 +578,26 @@ impl Exports {
         module: &str,
         conditions: &[&str],
     ) -> Option<(&str, &str)> {
-        if name != module {
-            return None;
-        }
+        let key = if name == module {
+            ".".to_owned()
+        } else {
+            let suffix = module.strip_prefix(name)?.strip_prefix('/')?;
+            if !export_subpath_is_valid(suffix) {
+                return None;
+            }
+            format!("./{suffix}")
+        };
         match self {
-            Self::Direct(path) => Some((path, path)),
+            Self::Direct(path) if name == module => Some((path, path)),
+            Self::Direct(_) => None,
             Self::Subpaths(paths) => {
-                let target = paths.root.as_ref()?;
+                let target = &paths.0.iter().find(|(subpath, _)| subpath == &key)?.1;
                 target
                     .selected_target(true, conditions)
                     .zip(target.selected_target(false, conditions))
             }
         }
     }
-}
-
-#[derive(Deserialize)]
-struct ExportSubpaths {
-    #[serde(rename = ".")]
-    root: Option<ExportTarget>,
 }
 
 #[derive(Deserialize)]

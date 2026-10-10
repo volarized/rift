@@ -619,3 +619,73 @@ fn local_owner_without_captured_entry_metadata_keeps_identity_unresolved() {
     assert!(result.exports.is_empty());
     assert!(result.mappings.is_empty());
 }
+
+#[test]
+fn explicit_export_subpaths_establish_independent_captured_modules() {
+    let found = prepared(
+        ShippedLanguage::TypeScript,
+        &[(
+            "package.json",
+            r#"{"name":"prettier","version":"3.8.5","exports":{".":"./index.ts","./hub":"./hub.ts","./walk":"./walk.ts"}}"#,
+        )],
+        &[
+            ("index.ts", "export function format() {}"),
+            ("hub.ts", "export function beacon() {}"),
+            (
+                "walk.ts",
+                "import { beacon } from './hub'; export function larger() { beacon(); }",
+            ),
+        ],
+    );
+    for (path, name, module) in [
+        ("index.ts", "format", "prettier"),
+        ("hub.ts", "beacon", "prettier/hub"),
+        ("walk.ts", "larger", "prettier/walk"),
+    ] {
+        let identity = SymbolIdentity::parse(found.anchors[path][name].as_str())
+            .expect("captured export identity");
+        assert_eq!(
+            identity.qualified_path(),
+            &[module.to_owned(), name.to_owned()]
+        );
+    }
+    assert!(!found.unresolved_exports);
+}
+
+#[test]
+fn missing_conditional_and_pattern_exports_leave_sources_unresolved() {
+    for target in [
+        r#"{"./hub":{"import":"./hub.ts"}}"#,
+        r#"{"./*":"./hub.ts"}"#,
+        r#"{"./hub":"./missing.ts"}"#,
+        r#"{"./hub":"../hub.ts"}"#,
+        r#"{"./hub":"./node_modules/hub.ts"}"#,
+    ] {
+        let metadata = format!(r#"{{"name":"prettier","version":"3.8.5","exports":{target}}}"#);
+        let found = prepared(
+            ShippedLanguage::TypeScript,
+            &[("package.json", metadata.as_str())],
+            &[("hub.ts", "export function beacon() {}")],
+        );
+        assert!(found.anchors.is_empty(), "{metadata}");
+        assert!(found.unresolved_exports, "{metadata}");
+    }
+}
+
+#[test]
+fn conflicting_export_subpaths_refuse_one_physical_module_assignment() {
+    let found = prepared(
+        ShippedLanguage::TypeScript,
+        &[(
+            "package.json",
+            r#"{"name":"prettier","version":"3.8.5","exports":{"./hub":"./hub.ts","./other":"./hub.ts"}}"#,
+        )],
+        &[("hub.ts", "export function beacon() {}")],
+    );
+    assert!(found.anchors.is_empty());
+    assert!(found.unresolved_exports);
+    let duplicate: Result<super::PackageMetadata, _> = serde_json::from_str(
+        r#"{"name":"prettier","version":"3.8.5","exports":{"./hub":"./hub.ts","./hub":"./other.ts"}}"#,
+    );
+    assert!(duplicate.is_err(), "duplicate captured export key refuses");
+}
