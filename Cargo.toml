@@ -95,6 +95,7 @@ opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = 
     "trace",
 ] }
 percent-encoding = "2.3.1"
+pep440_rs = { version = "0.7.3", default-features = false }
 # `traced!` opens the span of an awaited operation on its first poll through a
 # pinned state machine; tokio already locks this version.
 pin-project-lite = "0.2.17"
