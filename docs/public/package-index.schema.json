@@ -2607,7 +2607,7 @@
       "type": "integer"
     },
     "objects": {
-      "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Names follow the provider's byte\nbound; public directories apply the smaller public character bound separately.",
+      "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Artifact consumers enforce aggregate\nand complete-record byte bounds before parsing and restoration. Public directories\napply the public character bound separately.",
       "items": {
         "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
         "properties": {
@@ -2663,7 +2663,6 @@
           },
           "name": {
             "description": "The human-readable name, as written in the source: `parseConfig`. Rendered\nsignatures live in `signatures`.",
-            "maxLength": 8192,
             "type": "string"
           },
           "origin": {

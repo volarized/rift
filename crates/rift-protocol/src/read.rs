@@ -852,7 +852,7 @@ pub struct NodesParams {
             },
             {
                 "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-                "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "function_item",

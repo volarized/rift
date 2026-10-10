@@ -309,10 +309,10 @@ fn documentation_hit() -> DocumentationHit {
 /// A hop from `a.rs/A` to `b.rs/B` of the given direction, derivation, and confidence.
 fn hop(direction: &str, derivation: &str, confidence: Option<f64>) -> GraphHop {
     let mut relationship = json!({
-        "from": "rift://symbol/rust/a.rs/A",
+        "from": "rift://symbol/local/rust/app/a/A",
         "kind": "calls",
         "facets": ["calls"],
-        "to": "rift://symbol/rust/b.rs/B",
+        "to": "rift://symbol/local/rust/app/b/B",
         "derivation": derivation
     });
     if let Some(confidence) = confidence {
@@ -328,7 +328,7 @@ fn graph_hop() -> GraphHop {
 
 fn symbol_hit_with_source(source: Option<&str>) -> GetSymbolHit {
     GetSymbolHit {
-        symbol: symbol(Some("rift://symbol/rust/a.rs/A"), "A"),
+        symbol: symbol(Some("rift://symbol/local/rust/app/a/A"), "A"),
         path: Some(project_path("a.rs")),
         unit: None,
         range: range(0, 9),
@@ -370,7 +370,7 @@ fn error_data(code: ErrorCode, message: &str) -> ErrorData {
 
 // Owner examples.
 
-const A_ID: &str = "rift://symbol/rust/a.rs/A";
+const A_ID: &str = "rift://symbol/local/rust/app/a/A";
 
 /// The first authored search example with the source of its symbol hit cut to the declaration, as
 /// the owner's example shows it. The authored example keeps the doc comment line in that source.
@@ -402,7 +402,7 @@ fn the_owner_search_example_with_two_hits_on_the_first_of_three_pages() {
             "2 results · page 1/3",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\t\tsrc/config.rs:10 · name",
-            "\t\trift://symbol/rust/src/config.rs/load_config",
+            "\t\trift://symbol/local/rust/app/config/load_config",
             "\t\tLoads the workspace configuration from `rift.toml`.",
             "",
             "\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {",
@@ -441,7 +441,7 @@ fn the_authored_search_examples_render_as_the_layout_shows() {
             "2 results · page 1/3",
             "\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\t\tsrc/config.rs:10 · name",
-            "\t\trift://symbol/rust/src/config.rs/load_config",
+            "\t\trift://symbol/local/rust/app/config/load_config",
             "\t\tLoads the workspace configuration from `rift.toml`.",
             "",
             "\t\t/// Loads the workspace configuration from `rift.toml`.",
@@ -489,7 +489,7 @@ fn one_result_has_no_marker_and_an_indent_of_two_spaces() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1 · name",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tstruct A;",
         ],
@@ -502,14 +502,14 @@ fn several_results_on_one_page_have_markers_and_indent_and_no_page() {
         source: Some("struct A {\n\n    x: u8,\n}".to_owned()),
         ..placed_symbol_hit(symbol(Some(A_ID), "A"))
     };
-    let second = placed_symbol_hit(symbol(Some("rift://symbol/rust/a.rs/B"), "B"));
+    let second = placed_symbol_hit(symbol(Some("rift://symbol/local/rust/app/a/B"), "B"));
     golden(
         &only_page(vec![first, second]),
         &[
             "2 results",
             "\t[1] struct A",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tstruct A {",
             "",
@@ -517,7 +517,7 @@ fn several_results_on_one_page_have_markers_and_indent_and_no_page() {
             "\t\t}",
             "\t[2] struct B",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/B",
+            "\t\trift://symbol/local/rust/app/a/B",
         ],
     );
 }
@@ -528,7 +528,7 @@ fn the_page_follows_the_page_index() {
     let body = [
         "\tstruct A",
         "\ta.rs:1 · name",
-        "\trift://symbol/rust/a.rs/A",
+        "\trift://symbol/local/rust/app/a/A",
     ];
     let page =
         |index: u64, total: u64| search_result(vec![item()], pagination(index, total), Vec::new());
@@ -630,7 +630,7 @@ fn warnings_follow_one_item_in_their_own_section() {
         "1 result · page 1/2",
         "\tstruct A",
         "\ta.rs:1 · name",
-        "\trift://symbol/rust/a.rs/A",
+        "\trift://symbol/local/rust/app/a/A",
         "",
         "\tstruct A;",
     ];
@@ -644,7 +644,7 @@ fn warnings_follow_several_items_without_a_blank_line() {
         source: Some("struct A;".to_owned()),
         ..placed_symbol_hit(symbol(Some(A_ID), "A"))
     };
-    let second = placed_symbol_hit(symbol(Some("rift://symbol/rust/a.rs/B"), "B"));
+    let second = placed_symbol_hit(symbol(Some("rift://symbol/local/rust/app/a/B"), "B"));
     let answer = search_result(
         vec![first, second],
         pagination(0, 1),
@@ -659,12 +659,12 @@ fn warnings_follow_several_items_without_a_blank_line() {
             "2 results",
             "\t[1] struct A",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tstruct A;",
             "\t[2] struct B",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/B",
+            "\t\trift://symbol/local/rust/app/a/B",
             "2 warnings",
             "\tresults_truncated · results_max 2",
             "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
@@ -737,7 +737,7 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
     vec![
         (
             json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": [A_ID]}),
-            "symbol_not_found · name Beacpn · alternatives rift://symbol/rust/a.rs/A: no symbols available with this name",
+            "symbol_not_found · name Beacpn · alternatives rift://symbol/local/rust/app/a/A: no symbols available with this name",
         ),
         (
             json!({"code": "symbol_not_found", "name": "Beacpn", "alternatives": []}),
@@ -829,7 +829,7 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
         (
             json!({"code": "symbol_disagreement", "symbol": A_ID, "providers": ["history", "syntax"],
                 "detail": "providers disagree"}),
-            "symbol_disagreement · symbol rift://symbol/rust/a.rs/A · providers history, syntax: providers disagree",
+            "symbol_disagreement · symbol rift://symbol/local/rust/app/a/A · providers history, syntax: providers disagree",
         ),
         (
             json!({"code": "traversal_truncated", "visited": 500, "detail": "the walk stopped at its bound"}),
@@ -1176,7 +1176,7 @@ fn the_inline_writer_leaves_out_a_unit_struct_and_writes_a_newtype_struct_as_its
 #[test]
 fn a_symbol_hit_names_its_declaration_place_identity_and_summary() {
     let mut symbol = signed_symbol(
-        Some("rift://symbol/rust/src/config.rs/load_config"),
+        Some("rift://symbol/local/rust/app/config/load_config"),
         "load_config",
         "pub fn load_config(path: &Path)",
     );
@@ -1198,7 +1198,7 @@ fn a_symbol_hit_names_its_declaration_place_identity_and_summary() {
             "1 result",
             "\tpub fn load_config(path: &Path)",
             "\tsrc/config.rs:10 · name, signature",
-            "\trift://symbol/rust/src/config.rs/load_config",
+            "\trift://symbol/local/rust/app/config/load_config",
             "\tLoads the configuration.",
         ],
     );
@@ -1242,17 +1242,17 @@ fn the_visibility_is_written_once_before_a_declaration_that_lacks_it() {
 fn a_symbol_without_a_signature_is_visibility_kind_and_name() {
     let mut visible = symbol(Some(A_ID), "A");
     visible.visibility = Some("pub".to_owned());
-    let hidden = symbol(Some("rift://symbol/rust/a.rs/B"), "B");
+    let hidden = symbol(Some("rift://symbol/local/rust/app/a/B"), "B");
     golden(
         &only_page(vec![placed_symbol_hit(visible), placed_symbol_hit(hidden)]),
         &[
             "2 results",
             "\t[1] pub struct A",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct B",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/B",
+            "\t\trift://symbol/local/rust/app/a/B",
         ],
     );
 }
@@ -1292,7 +1292,11 @@ fn a_hit_without_a_place_or_matched_field_writes_no_facts_line() {
     let hit = search_hit(symbol_target(Some(A_ID), "A"));
     golden(
         &only_page(vec![hit]),
-        &["1 result", "\tstruct A", "\trift://symbol/rust/a.rs/A"],
+        &[
+            "1 result",
+            "\tstruct A",
+            "\trift://symbol/local/rust/app/a/A",
+        ],
     );
 }
 
@@ -1307,7 +1311,7 @@ fn a_dependency_hit_is_placed_by_its_unit() {
     };
     let without_line = SearchHit {
         unit: Some(source_unit(unit)),
-        ..search_hit(symbol_target(Some("rift://symbol/rust/a.rs/B"), "B"))
+        ..search_hit(symbol_target(Some("rift://symbol/local/rust/app/a/B"), "B"))
     };
     golden(
         &only_page(vec![with_line, without_line]),
@@ -1315,10 +1319,10 @@ fn a_dependency_hit_is_placed_by_its_unit() {
             "2 results",
             "\t[1] struct A",
             "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct B",
             "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs",
-            "\t\trift://symbol/rust/a.rs/B",
+            "\t\trift://symbol/local/rust/app/a/B",
         ],
     );
 }
@@ -1340,10 +1344,10 @@ fn the_score_follows_the_matched_fields_and_the_distance_is_not_written() {
             "2 results",
             "\t[1] struct A",
             "\t\ta.rs:1 · name · score 0.8125",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct A",
             "\t\ta.rs:1 · name · score 2",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
         ],
     );
 }
@@ -1411,7 +1415,7 @@ fn every_exceptional_fact_is_written_in_order() {
             "1 result",
             "\tstruct A",
             "\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · relationship · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
         ],
     );
 }
@@ -1426,7 +1430,7 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
     let project = Some(SourceLocationKind::Project);
     assert_eq!(
         facts(origin(project, None, SourceKind::Authored)),
-        "rift://symbol/rust/a.rs/A"
+        "rift://symbol/local/rust/app/a/A"
     );
     assert_eq!(
         facts(origin(
@@ -1502,7 +1506,10 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
 fn deprecated_test_and_document_local_are_written_only_when_they_hold() {
     let mut symbol = symbol(Some(A_ID), "A");
     symbol.facets = vec![SymbolFacet::Type, SymbolFacet::Public];
-    assert_eq!(facts_line(symbol.clone()), "rift://symbol/rust/a.rs/A");
+    assert_eq!(
+        facts_line(symbol.clone()),
+        "rift://symbol/local/rust/app/a/A"
+    );
     symbol.facets.push(SymbolFacet::Test);
     assert_eq!(facts_line(symbol.clone()), "test");
     symbol.facets.push(SymbolFacet::Deprecated);
@@ -1511,14 +1518,40 @@ fn deprecated_test_and_document_local_are_written_only_when_they_hold() {
     assert_eq!(facts_line(symbol), "deprecated · test · document local");
 }
 
+fn fixture_symbol_id(at: &str) -> String {
+    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+
+    let (owner, path) = match at {
+        LOAD_CONFIG => (SymbolOwner::Local, vec!["app", "config", "load_config"]),
+        RUN => (SymbolOwner::Local, vec!["app", "app", "run"]),
+        MAIN => (SymbolOwner::Local, vec!["app", "main", "main"]),
+        RELOAD_CONFIG => (SymbolOwner::Local, vec!["app", "watch", "reload_config"]),
+        "src/serve.rs/serve" => (SymbolOwner::Local, vec!["app", "serve", "serve"]),
+        "src/serve.rs/handle" => (SymbolOwner::Local, vec!["app", "serve", "handle"]),
+        "src/lib.rs/Config" => (
+            SymbolOwner::Package {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "serde".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+            vec!["serde", "Config"],
+        ),
+        _ => panic!("the fixture supplies no canonical identity for {at}"),
+    };
+    SymbolIdentity::new(owner, rust(), path.into_iter().map(str::to_owned).collect())
+        .expect("the fixture supplies a valid canonical identity")
+        .wire_identity()
+}
+
 /// A hop over the edge `from` to `to` with the given facets, followed in `direction`.
 fn edge(direction: &str, (from, to): (&str, &str), facets: &[&str], derivation: &str) -> GraphHop {
     serde_json::from_value(json!({
         "relationship": {
-            "from": format!("rift://symbol/rust/{from}"),
+            "from": fixture_symbol_id(from),
             "kind": "edge",
             "facets": facets,
-            "to": format!("rift://symbol/rust/{to}"),
+            "to": fixture_symbol_id(to),
             "derivation": derivation
         },
         "direction": direction
@@ -1541,11 +1574,7 @@ fn walked_hit(at: &str, display: &str, line: u64, hops: Vec<GraphHop>) -> Search
         path: Some(project_path(file)),
         traversal_path: Some(hops),
         ..search_hit(SearchHitTarget::Symbol {
-            symbol: Box::new(signed_symbol(
-                Some(&format!("rift://symbol/rust/{at}")),
-                name,
-                display,
-            )),
+            symbol: Box::new(signed_symbol(Some(&fixture_symbol_id(at)), name, display)),
         })
     }
 }
@@ -1596,7 +1625,7 @@ fn load_config_hit() -> SearchHit {
         path: Some(project_path("src/config.rs")),
         ..search_hit(SearchHitTarget::Symbol {
             symbol: Box::new(signed_symbol(
-                Some("rift://symbol/rust/src/config.rs/load_config"),
+                Some("rift://symbol/local/rust/app/config/load_config"),
                 "load_config",
                 "pub fn load_config()",
             )),
@@ -1624,12 +1653,12 @@ fn a_walk_hit_is_one_node_under_a_root_that_writes_its_identity() {
         &only_page(vec![run_hit()]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1640,22 +1669,22 @@ fn paths_that_share_a_prefix_share_its_nodes_and_children_follow_answer_order() 
         &only_page(vec![reload_hit(), main_hit(), run_hit()]),
         &[
             "3 results",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ called",
             "\t\t\tby fn reload_config()",
             "\t\t\tin src/watch.rs:41",
-            "\t\t\tat rift://symbol/rust/src/watch.rs/reload_config",
+            "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t↳ referenced",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
-            "\t\t\t\tat rift://symbol/rust/src/main.rs/main",
+            "\t\t\t\tat rift://symbol/local/rust/app/main/main",
         ],
     );
 }
@@ -1666,15 +1695,15 @@ fn a_middle_symbol_without_a_hit_writes_its_identity_alone() {
         &only_page(vec![main_hit()]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t↳ referenced",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
-            "\t\t\t\tat rift://symbol/rust/src/main.rs/main",
+            "\t\t\t\tat rift://symbol/local/rust/app/main/main",
         ],
     );
 }
@@ -1696,24 +1725,24 @@ fn walk_hits_from_two_starting_symbols_make_two_trees_with_a_blank_line_between(
         &only_page(vec![run_hit(), serve, reload_hit()]),
         &[
             "3 results",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t↳ called",
             "\t\t\tby fn reload_config()",
             "\t\t\tin src/watch.rs:41",
-            "\t\t\tat rift://symbol/rust/src/watch.rs/reload_config",
+            "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
             "",
-            "\tat rift://symbol/rust/src/serve.rs/serve",
+            "\tat rift://symbol/local/rust/app/serve/serve",
             "",
             "\t\t↳ calls",
             "\t\t\tfn handle()",
             "\t\t\tin src/serve.rs:5",
-            "\t\t\tat rift://symbol/rust/src/serve.rs/handle",
+            "\t\t\tat rift://symbol/local/rust/app/serve/handle",
         ],
     );
 }
@@ -1727,12 +1756,12 @@ fn one_hit_outside_the_walk_has_no_marker_and_a_blank_line_separates_it_from_the
             "\tREADME.md:3 · content",
             "\tReads configuration",
             "",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1748,19 +1777,19 @@ fn several_hits_outside_the_walk_have_markers_that_count_only_them() {
             "\t\tReads configuration",
             "\t[2] struct A",
             "\t\ta.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t↳ referenced",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
-            "\t\t\t\tat rift://symbol/rust/src/main.rs/main",
+            "\t\t\t\tat rift://symbol/local/rust/app/main/main",
         ],
     );
 }
@@ -1773,12 +1802,12 @@ fn a_hit_outside_the_walk_that_is_the_starting_symbol_becomes_the_root_and_is_no
             "2 results",
             "\tpub fn load_config()",
             "\tin src/config.rs:10 · name",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
     golden(
@@ -1790,12 +1819,12 @@ fn a_hit_outside_the_walk_that_is_the_starting_symbol_becomes_the_root_and_is_no
             "",
             "\tpub fn load_config()",
             "\tin src/config.rs:10 · name",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1809,16 +1838,16 @@ fn a_root_that_is_a_hit_carries_in_and_at_and_an_item_symbol_hit_carries_neither
             "3 results",
             "\tstruct A",
             "\ta.rs:1 · name",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tpub fn load_config()",
             "\tin src/config.rs:10 · name",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1836,12 +1865,12 @@ fn a_root_that_is_a_hit_without_a_location_writes_its_facts_without_in() {
             "2 results",
             "\tpub fn load_config()",
             "\tname",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1852,12 +1881,12 @@ fn a_root_that_is_no_hit_is_one_line_at_its_identity() {
         &only_page(vec![run_hit()]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1881,17 +1910,17 @@ fn two_walk_hits_that_reach_one_symbol_under_one_parent_each_get_a_node() {
         &only_page(vec![run_hit(), again]),
         &[
             "2 results",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:21",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1908,12 +1937,12 @@ fn an_outgoing_hop_writes_each_facet_as_its_wire_name_with_spaces() {
         &only_page(vec![walked_hit(RUN, "fn run()", 20, vec![hop])]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/main.rs/main",
+            "\tat rift://symbol/local/rust/app/main/main",
             "",
             "\t\t↳ calls, has type, depends on",
             "\t\t\tfn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1934,12 +1963,12 @@ fn an_incoming_hop_writes_each_facet_read_from_its_target_back_and_the_distance_
         &only_page(vec![hit]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ called by, referenced by, type of",
             "\t\t\tfn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -1958,24 +1987,24 @@ fn a_heuristic_hop_starts_with_probably_whatever_its_confidence_and_direction() 
         ]),
         &[
             "3 results",
-            "\tat rift://symbol/rust/src/main.rs/main",
+            "\tat rift://symbol/local/rust/app/main/main",
             "",
             "\t\t↳ probably implements",
             "\t\t\tfn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
-            "",
-            "\t\t↳ probably implemented",
-            "\t\t\tby fn run()",
-            "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ probably implemented",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
+            "",
+            "\t\t↳ probably implemented",
+            "\t\t\tby fn run()",
+            "\t\t\tin src/app.rs:20",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -2023,10 +2052,10 @@ fn the_by_word_moves_to_the_declaration_line_only_when_every_facet_phrase_ends_i
             vec![edge("incoming", (RUN, LOAD_CONFIG), facets, derivation)],
         )
     };
-    let root = "\tat rift://symbol/rust/src/config.rs/load_config";
+    let root = "\tat rift://symbol/local/rust/app/config/load_config";
     let tail = [
         "\t\t\tin src/app.rs:20",
-        "\t\t\tat rift://symbol/rust/src/app.rs/run",
+        "\t\t\tat rift://symbol/local/rust/app/app/run",
     ];
     let written = |head: &str, declaration: &str, hit: SearchHit| {
         let mut expected = vec!["1 result", root, "", head, declaration];
@@ -2067,11 +2096,11 @@ fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
     };
     let tail = [
         "\t\t\tin src/app.rs:20",
-        "\t\t\tat rift://symbol/rust/src/app.rs/run",
+        "\t\t\tat rift://symbol/local/rust/app/app/run",
     ];
     let mut calls = vec![
         "1 result",
-        "\tat rift://symbol/rust/src/main.rs/main",
+        "\tat rift://symbol/local/rust/app/main/main",
         "",
         "\t\t↳ calls",
         "\t\t\tfn run()",
@@ -2080,7 +2109,7 @@ fn an_outgoing_hop_moves_by_for_annotated_by_and_writes_calls_whole() {
     golden(&only_page(vec![walked("calls")]), &calls);
     let mut annotated = vec![
         "1 result",
-        "\tat rift://symbol/rust/src/main.rs/main",
+        "\tat rift://symbol/local/rust/app/main/main",
         "",
         "\t\t↳ annotated",
         "\t\t\tby fn run()",
@@ -2101,12 +2130,12 @@ fn a_node_without_a_location_writes_its_facts_without_in() {
         &only_page(vec![hit]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tname",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -2122,12 +2151,12 @@ fn copied_source_keeps_its_own_leading_spaces_and_empty_lines_after_the_indent()
         &only_page(vec![node]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t  two spaces",
             "",
@@ -2145,7 +2174,7 @@ fn copied_source_keeps_its_own_leading_spaces_and_empty_lines_after_the_indent()
             "1 result",
             "\tstruct A",
             "\ta.rs:1 · name",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\t  two spaces",
             "",
@@ -2202,12 +2231,12 @@ fn an_incoming_hop_reads_every_facet_as_the_table_says() {
             &only_page(vec![hit]),
             &[
                 "1 result",
-                "\tat rift://symbol/rust/src/config.rs/load_config",
+                "\tat rift://symbol/local/rust/app/config/load_config",
                 "",
                 &head,
                 declaration,
                 "\t\t\tin src/app.rs:20",
-                "\t\t\tat rift://symbol/rust/src/app.rs/run",
+                "\t\t\tat rift://symbol/local/rust/app/app/run",
             ],
         );
     }
@@ -2216,7 +2245,7 @@ fn an_incoming_hop_reads_every_facet_as_the_table_says() {
 #[test]
 fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
     let mut everything = signed_symbol(
-        Some("rift://symbol/rust/src/lib.rs/Config"),
+        Some("rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config"),
         "Config",
         "struct Config",
     );
@@ -2255,12 +2284,12 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
         &only_page(vec![hit]),
         &[
             "1 result",
-            "\tat rift://symbol/rust/src/app.rs/run",
+            "\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t↳ constructs",
             "\t\t\tstruct Config",
             "\t\t\tin rift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · name · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
-            "\t\t\tat rift://symbol/rust/src/lib.rs/Config",
+            "\t\t\tat rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config",
             "\t\t\tSettings of a run.",
             "\t\t\tmoved · old/lib.rs → new/lib.rs",
             "",
@@ -2291,21 +2320,21 @@ fn the_relationship_field_is_left_out_of_a_node_and_every_other_field_stays() {
         &only_page(vec![only, named, bare]),
         &[
             "3 results",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20 · score 2",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t↳ referenced",
             "\t\t\t\tby async fn main()",
-            "\t\t\t\tat rift://symbol/rust/src/main.rs/main",
+            "\t\t\t\tat rift://symbol/local/rust/app/main/main",
             "",
             "\t\t↳ called",
             "\t\t\tby fn reload_config()",
             "\t\t\tin src/watch.rs:41 · name",
-            "\t\t\tat rift://symbol/rust/src/watch.rs/reload_config",
+            "\t\t\tat rift://symbol/local/rust/app/watch/reload_config",
         ],
     );
 }
@@ -2322,7 +2351,7 @@ fn an_item_keeps_the_relationship_field_among_its_matched_fields() {
             "1 result",
             "\tfn run()",
             "\tsrc/app.rs:20 · relationship",
-            "\trift://symbol/rust/src/app.rs/run",
+            "\trift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -2340,12 +2369,12 @@ fn a_hit_of_another_target_with_a_traversal_path_stays_an_item() {
             "\tREADME.md:3 · content",
             "\tReads configuration",
             "",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
             "\t\t\tby fn run()",
             "\t\t\tin src/app.rs:20",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
         ],
     );
 }
@@ -2362,7 +2391,7 @@ fn a_traversal_without_hops_is_an_item() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1 · name",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
         ],
     );
 }
@@ -2381,15 +2410,15 @@ fn warnings_follow_the_last_node_without_a_blank_line() {
             "\tREADME.md:3 · content",
             "\tReads configuration",
             "",
-            "\tat rift://symbol/rust/src/config.rs/load_config",
+            "\tat rift://symbol/local/rust/app/config/load_config",
             "",
             "\t\t↳ referenced",
-            "\t\t\tat rift://symbol/rust/src/app.rs/run",
+            "\t\t\tat rift://symbol/local/rust/app/app/run",
             "",
             "\t\t\t↳ referenced",
             "\t\t\t\tby async fn main()",
             "\t\t\t\tin src/main.rs:9",
-            "\t\t\t\tat rift://symbol/rust/src/main.rs/main",
+            "\t\t\t\tat rift://symbol/local/rust/app/main/main",
             "1 warning",
             "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
         ],
@@ -2452,7 +2481,7 @@ fn source_follows_a_blank_line_after_the_last_fact_of_a_symbol_hit() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1 · name",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "\tmoved · old/a.rs → a.rs",
             "",
             "\tstruct A;",
@@ -2470,7 +2499,7 @@ fn an_empty_source_of_a_symbol_hit_is_one_empty_line_after_the_blank_line() {
     let with_empty = rendered(&only_page(vec![present]));
     let without = rendered(&only_page(vec![missing]));
     assert_eq!(with_empty, format!("{without}\n\n"));
-    assert!(with_empty.ends_with("rift://symbol/rust/a.rs/A\n\n\n"));
+    assert!(with_empty.ends_with("rift://symbol/local/rust/app/a/A\n\n\n"));
 }
 
 // File, node, and documentation hits.
@@ -2570,7 +2599,7 @@ fn a_documentation_hit_is_headed_by_its_heading_path() {
             "2 results",
             "\t[1] Guide > Install > Linux",
             "\t\tdocs/guide.md:12 · documentation · score 1.5",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t\tbody",
             "",
             "\t\tmore",
@@ -2803,8 +2832,8 @@ fn only_a_lowercase_hex_value_of_eight_characters_or_more_is_cut_to_eight() {
     assert_eq!(cut_hash("1F2080E49DA1"), "1F2080E49DA1");
     assert_eq!(cut_hash("1f2080e49dag"), "1f2080e49dag");
     assert_eq!(
-        cut_hash("rift://symbol/rust/a.rs/A"),
-        "rift://symbol/rust/a.rs/A"
+        cut_hash("rift://symbol/local/rust/app/a/A"),
+        "rift://symbol/local/rust/app/a/A"
     );
     assert_eq!(cut_hash(""), "");
 }
@@ -2851,7 +2880,7 @@ fn the_score_of_a_commit_hit_ends_its_first_line() {
 #[test]
 fn control_characters_in_single_line_facts_are_written_as_escapes() {
     let mut symbol = signed_symbol(
-        Some("rift://symbol/rust/a.rs/A"),
+        Some("rift://symbol/local/rust/app/a/A"),
         "A",
         "fn a(\n\tx: u8)\r\u{1b}\u{7f}",
     );
@@ -2897,7 +2926,7 @@ fn multi_line_source_keeps_its_bytes() {
         ..placed_symbol_hit(symbol(Some(A_ID), "A"))
     };
     let output = rendered(&only_page(vec![hit]));
-    let prefix = "1 result\n\tstruct A\n\ta.rs:1 · name\n\trift://symbol/rust/a.rs/A\n\n";
+    let prefix = "1 result\n\tstruct A\n\ta.rs:1 · name\n\trift://symbol/local/rust/app/a/A\n\n";
     let written = output
         .strip_prefix(prefix)
         .and_then(|rest| rest.strip_suffix('\n'))
@@ -3022,7 +3051,7 @@ fn the_owner_get_symbol_example_with_documentation_history_and_source() {
             "1 result",
             "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>",
             "\tsrc/config.rs:10",
-            "\trift://symbol/rust/src/config.rs/load_config",
+            "\trift://symbol/local/rust/app/config/load_config",
             "",
             "\tLoads the workspace configuration from `rift.toml`.",
             "",
@@ -3049,7 +3078,7 @@ fn a_hit_without_source_ends_after_its_last_section_and_an_empty_source_adds_an_
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
         ],
     );
     golden(
@@ -3058,7 +3087,7 @@ fn a_hit_without_source_ends_after_its_last_section_and_an_empty_source_adds_an_
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "",
         ],
@@ -3072,7 +3101,7 @@ fn a_hit_without_source_ends_after_its_last_section_and_an_empty_source_adds_an_
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tstruct A;",
         ],
@@ -3089,7 +3118,7 @@ fn page_and_warnings_of_a_get_symbol_answer_follow_the_shared_header() {
             "1 result · page 2/4",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "1 warning",
             "\tglobal_access_disabled",
         ],
@@ -3115,7 +3144,7 @@ fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() 
             "\t\t0..9",
             "\t[2] struct A",
             "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
         ],
     );
 }
@@ -3137,7 +3166,7 @@ fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distan
             "1 result",
             "\tpub struct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "\tdependency serde@1.0.0 · generated · deprecated · test · document local",
         ],
     );
@@ -3158,7 +3187,7 @@ fn every_documentation_text_follows_in_order_and_blank_texts_are_skipped() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tFirst line.",
             "\tSecond line.",
@@ -3212,7 +3241,7 @@ fn the_documentation_context_lists_each_reference_with_its_excerpt() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation:",
             "\t\tdocs/guide.md:12 · Guide > Install",
@@ -3239,12 +3268,12 @@ fn a_truncated_or_empty_documentation_context_keeps_its_label() {
             "2 results",
             "\t[1] struct A",
             "\t\ta.rs:1",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tdocumentation (truncated):",
             "\t[2] struct A",
             "\t\ta.rs:1",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tdocumentation:",
         ],
@@ -3273,7 +3302,7 @@ fn documentation_context_warnings_follow_the_references_as_documentation_warning
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation:",
             "\t\tdocs/guide.md:2 · Guide",
@@ -3308,7 +3337,7 @@ fn an_empty_documentation_context_with_a_warning_writes_the_label_and_the_warnin
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation (truncated):",
             "\t\tdocumentation · warning (source docs/a.md, stage source, kind source_unavailable, count 2)",
@@ -3335,7 +3364,7 @@ fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tdocumentation:",
             "\t\tdocs/guide.md:2 · \"Step 1: Install > a · b\"",
@@ -3373,11 +3402,11 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "3 results",
             "\t[1] struct A",
             "\t\t\"src/a · b.rs:1\" · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t\tmoved · \"old: a.rs\" → \"new · a.rs\"",
             "\t[2] struct A",
             "\t\tsrc/a:b·c.rs:1 · name",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t[3] 1f2080e4 · \"Ops: bot <ops@example.com>\" · \"day 1 · noon\"",
             "\t\tFix",
         ],
@@ -3487,7 +3516,7 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
             "2 results",
             "\t[1] struct A",
             "\t\ta.rs:1",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\thistory:",
             "\t\t\t2026-08-21 · 1f2080e4 · body changed · Alice <alice@example.com>",
@@ -3495,7 +3524,7 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
             "\t\t\t2026-08-21 · HEAD~2 · introduced · Alice <alice@example.com>",
             "\t[2] struct A",
             "\t\ta.rs:1",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\thistory (incomplete):",
         ],
@@ -3565,7 +3594,7 @@ fn sections_come_in_order_documentation_text_context_history_source() {
             "1 result",
             "\tstruct A",
             "\ta.rs:1",
-            "\trift://symbol/rust/a.rs/A",
+            "\trift://symbol/local/rust/app/a/A",
             "",
             "\tText.",
             "",
@@ -3586,7 +3615,7 @@ fn several_get_symbol_hits_have_markers_and_indent() {
     let mut first = symbol_hit_with_source(Some("struct A {\n\n    x: u8,\n}"));
     first.symbol.documentation = vec![documentation_text("Doc.")];
     let mut second = symbol_hit_with_source(Some("struct B;"));
-    second.symbol = signed_symbol(Some("rift://symbol/rust/b.rs/B"), "B", "struct B;");
+    second.symbol = signed_symbol(Some("rift://symbol/local/rust/app/b/B"), "B", "struct B;");
     second.path = Some(project_path("b.rs"));
     golden(
         &symbol_result(vec![first, second], pagination(0, 1)),
@@ -3594,7 +3623,7 @@ fn several_get_symbol_hits_have_markers_and_indent() {
             "2 results",
             "\t[1] struct A",
             "\t\ta.rs:1",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\tDoc.",
             "",
@@ -3604,7 +3633,7 @@ fn several_get_symbol_hits_have_markers_and_indent() {
             "\t\t}",
             "\t[2] struct B;",
             "\t\tb.rs:1",
-            "\t\trift://symbol/rust/b.rs/B",
+            "\t\trift://symbol/local/rust/app/b/B",
             "",
             "\t\tstruct B;",
         ],
@@ -3734,7 +3763,7 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
             "2 nodes",
             "\t[1] function_item · 3 lines · generated · test",
             "\t\trift://node/rust/lib.rs@0-20#aaaaaaaa",
-            "\t\trift://symbol/rust/a.rs/A",
+            "\t\trift://symbol/local/rust/app/a/A",
             "\t\tname 3..4 · body 8..20",
             "\t[2] block",
             "\t\trift://node/rust/lib.rs@9-10#bbbbbbbb",
@@ -4115,7 +4144,7 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
 
 #[test]
 fn identities_are_written_whole_and_hashes_are_cut() {
-    let symbol_id = "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService~2";
+    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService~2?rev=0000000000000000000000000000000000000000000000000000000000000000";
     let node_id = "rift://node/rust/src/config.rs@218-355#67ecfb36";
     let unit = "rift://source/project/packages/@scope/name/package.json";
     let file = "rift://file/src/dir%20name/lib.rs";
@@ -4157,7 +4186,7 @@ fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_sourc
             "\t\trift://node/rust/src/config.rs@0-356#dcbef6dd",
             "\t[2] function_item · 4 lines",
             "\t\trift://node/rust/src/config.rs@218-355#67ecfb36",
-            "\t\trift://symbol/rust/src/config.rs/load_config",
+            "\t\trift://symbol/local/rust/app/config/load_config",
             "\t\tname 225..236 · body 281..355",
             "\t[3] block · 4 lines",
             "\t\trift://node/rust/src/config.rs@281-355#4e554fa8",

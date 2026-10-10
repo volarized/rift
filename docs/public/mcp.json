@@ -5411,7 +5411,7 @@
                     "role": "body"
                   }
                 ],
-                "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs"
               },
               {

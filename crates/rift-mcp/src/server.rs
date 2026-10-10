@@ -2268,13 +2268,23 @@ impl RiftMcp {
     async fn get_symbol(
         &self,
         Parameters(params): Parameters<GetSymbolParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<Json<GetSymbolResult>, ToolFailure> {
-        if params.rev.is_none() && params.scope != SearchScope::Local {
-            return self.current_tree_get_symbol(params).await;
+        let result = async {
+            if params.rev.is_none() && params.scope != SearchScope::Local {
+                return self.current_tree_get_symbol(params).await;
+            }
+            let rev = params.rev.clone();
+            self.read_at(rev, move |reads| reads.get_symbol(&params))
+                .await
         }
-        let rev = params.rev.clone();
-        self.read_at(rev, move |reads| reads.get_symbol(&params))
-            .await
+        .await;
+        if let Err(ToolFailure::Registered(failure, _)) = &result
+            && let Some(operation) = extensions.get::<rift_tracing::Span>()
+        {
+            operation.record("error.type", failure.registered().slug().as_str());
+        }
+        result
     }
 
     /// Routes one current-tree lookup whose `scope` reaches packages: the project hits
@@ -4138,8 +4148,11 @@ impl ServerHandler for RiftMcp {
             tool = %request.name,
             mcp.method.name = TOOLS_CALL,
             gen_ai.tool.name = %request.name,
-            workspace = %self.root.display()
+            workspace = %self.root.display(),
+            error.type = rift_tracing::empty!()
         );
+        let operation = span.clone();
+        let _ = context.extensions.insert(operation.clone());
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("tools/call", {
             answered = span
@@ -4152,6 +4165,10 @@ impl ServerHandler for RiftMcp {
                                 || ToolFailure::from(error),
                                 |failure| ToolFailure::Registered(failure, wire::ErrorPhase::Read),
                             );
+                            if let ToolFailure::Registered(failure, _) = &failure {
+                                operation
+                                    .record("error.type", failure.registered().slug().as_str());
+                            }
                             failure.into_call_tool_result()
                         }
                         Ok(response) => Ok(response),
@@ -5884,7 +5901,7 @@ done
         let params = serde_json::from_value(json!({"name": name}))
             .expect("test symbol parameters must deserialize");
         server
-            .get_symbol(Parameters(params))
+            .get_symbol(Parameters(params), rmcp::model::Extensions::new())
             .await
             .map(|result| result.0)
             .map_err(rmcp::ErrorData::from)
@@ -8018,10 +8035,13 @@ done
         let params = serde_json::from_value(json!({
             "name": "beacon", "include": ["source", "history"]
         }))?;
-        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.get_symbol(Parameters(params)))
-            .await
-            .map_err(|_| "a history read waits on no fill")??
-            .0;
+        let answer = tokio::time::timeout(
+            UNWAITED_READ_MAX,
+            server.get_symbol(Parameters(params), rmcp::model::Extensions::new()),
+        )
+        .await
+        .map_err(|_| "a history read waits on no fill")??
+        .0;
         assert_eq!(answer.hits.len(), 1, "{answer:#?}");
         assert!(
             !answer
@@ -11526,6 +11546,103 @@ done
             stale_index_of(&answer.warnings).is_err(),
             "matching content must not warn stale: {:?}",
             answer.warnings
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn get_symbol_records_final_registered_failure_on_the_request_span() -> TestResult {
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("debug")
+            .install()?;
+        let (_directory, server) = Box::pin(fixture()).await?;
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let service = server.serve(server_transport).await?;
+            service.waiting().await?;
+            Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+        });
+        let client = ().serve(client_transport).await?;
+        let negotiated_version = client
+            .peer_info()
+            .ok_or("initialize must advertise server information")?
+            .protocol_version
+            .clone();
+        let response = client
+            .call_tool(
+                CallToolRequestParams::new("get_symbol")
+                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            )
+            .await?;
+        assert_ne!(response.is_error, Some(true));
+        for parameters in [
+            json!({"name": "beacon", "limit": 0}),
+            json!({"name": "beacon", "limit": false}),
+        ] {
+            let refused = client
+                .call_tool(
+                    CallToolRequestParams::new("get_symbol")
+                        .with_arguments(arguments(&parameters)?),
+                )
+                .await?;
+            assert_error_result(&refused, "invalid_request")?;
+        }
+        client.cancel().await?;
+        server_task.await?.map_err(std::io::Error::other)?;
+        let metrics = recorder.metrics();
+        drop(recorder);
+        let records = drain.queued_records();
+        let completed = records
+            .iter()
+            .filter(|record| record.message() == "tool request completed")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(completed.len(), 3, "{records:#?}");
+        let closed = completed
+            .iter()
+            .map(|fields| {
+                assert_eq!(fields["root_span"]["name"], "mcp.request");
+                &fields["root_span"]["fields"]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(closed.len(), 3, "{records:#?}");
+        for fields in &closed {
+            assert_eq!(fields["component"], "mcp");
+            assert_eq!(fields["operation"], "tools/call");
+            assert!(fields["request_id"].as_str().is_some());
+            assert_eq!(fields["gen_ai.tool.name"], "get_symbol");
+        }
+        for identity in ["rift.server.read_invalid", "rift.mcp.parameter_invalid"] {
+            assert_eq!(
+                closed
+                    .iter()
+                    .filter(|fields| fields["error.type"] == identity)
+                    .count(),
+                1,
+                "{closed:#?}"
+            );
+        }
+        assert_eq!(
+            closed
+                .iter()
+                .filter(|fields| fields["error.type"].is_null())
+                .count(),
+            1,
+            "the answered request carries no error identity: {closed:#?}"
+        );
+        assert_eq!(
+            crate::metrics::tests::recorded(
+                &metrics,
+                "mcp.server.operation.duration",
+                &[
+                    ("gen_ai.tool.name", "get_symbol"),
+                    ("error.type", "tool_error"),
+                    ("mcp.method.name", "tools/call"),
+                    ("mcp.protocol.version", negotiated_version.as_str()),
+                    ("network.transport", "tcp"),
+                ],
+            ),
+            2
         );
         Ok(())
     }
