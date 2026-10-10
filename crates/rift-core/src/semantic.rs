@@ -1054,6 +1054,29 @@ fn valid_namespace(value: &str) -> bool {
     prefix_valid && field_valid
 }
 
+/// Finds each supplied fact's position in the complete normalized array.
+///
+/// Repeated facts retain the first matching position and supplied order.
+///
+/// # Errors
+/// Returns the caller's registered failure when a supplied fact is absent.
+pub fn fact_indices<T: PartialEq>(
+    combined: &[T],
+    supplied: &[T],
+    missing: impl Fn() -> rift_error::RiftError,
+) -> Result<Vec<u64>, rift_error::RiftError> {
+    supplied
+        .iter()
+        .map(|fact| {
+            combined
+                .iter()
+                .position(|value| value == fact)
+                .and_then(|index| u64::try_from(index).ok())
+                .ok_or_else(&missing)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1726,5 +1749,39 @@ mod tests {
             empty.slug().as_str(),
             "rift.core.contribution_invalid_record"
         );
+    }
+}
+
+#[cfg(test)]
+mod fact_indices_tests {
+    use std::cell::Cell;
+
+    #[test]
+    fn fact_indices_preserve_full_array_positions_and_failure_factory() {
+        let calls = Cell::new(0);
+        let missing = || {
+            calls.set(calls.get() + 1);
+            rift_error::errors::analysis::package_provider_failed()
+                .package("captured fixture")
+                .error()
+        };
+        assert_eq!(
+            super::fact_indices(
+                &["implementation", "first", "second"],
+                &["second", "first", "second"],
+                missing
+            )
+            .expect("retained facts"),
+            [2, 1, 2]
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(super::fact_indices(&["first"], &["absent"], missing).is_err());
+        assert_eq!(calls.get(), 1);
+        assert!(
+            super::fact_indices::<&str>(&[], &[], missing)
+                .expect("source-less binding has no facts")
+                .is_empty()
+        );
+        assert_eq!(calls.get(), 1);
     }
 }

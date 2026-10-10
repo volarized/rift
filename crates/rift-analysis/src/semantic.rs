@@ -326,6 +326,18 @@ impl WorkspaceSemantics {
         }
     }
 
+    /// Returns the exact captured syntax Contribution for a provider-local identity.
+    #[must_use]
+    pub fn syntax_contribution(&self, provider_symbol: &str) -> Option<&rift_core::Contribution> {
+        let publication = self.graph.publications().provider(&self.syntax_provider)?;
+        let key = rift_core::ContributionKey::new(
+            self.syntax_provider.clone(),
+            publication.revision(),
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
+        );
+        self.graph.contribution(&key)
+    }
+
     /// Assembles readable symbol for syntax provider-local identity.
     #[must_use]
     pub fn assembled(&self, provider_symbol: &str) -> Option<AssembledSymbol> {

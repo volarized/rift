@@ -1930,20 +1930,11 @@ fn fact_indices<T: PartialEq>(
     combined: &[T],
     supplied: &[T],
 ) -> Result<Vec<u64>, RiftError> {
-    supplied
-        .iter()
-        .map(|fact| {
-            combined
-                .iter()
-                .position(|value| value == fact)
-                .and_then(|index| u64::try_from(index).ok())
-                .ok_or_else(|| {
-                    errors::analysis::package_provider_failed()
-                        .package(package_label(owner))
-                        .error()
-                })
-        })
-        .collect()
+    rift_core::fact_indices(combined, supplied, || {
+        errors::analysis::package_provider_failed()
+            .package(package_label(owner))
+            .error()
+    })
 }
 
 /// One record's retained source: the bytes it keeps, and whether they are the whole
