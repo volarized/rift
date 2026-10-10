@@ -391,31 +391,41 @@ impl PackageCallee {
 
     /// The symbol a walk's hit for this callee carries, once the global API named its
     /// `declaration`: the name is the engine's, and the kind the one package analysis
-    /// stored, as every other hit carries its provider's kind. The origin is the one
-    /// package analysis gives the package's declarations: `stdlib` for a standard library,
-    /// the Rust one included although its callees reach it through an install folder, and
-    /// `dependency` naming the package otherwise. `None` for an id naming no language.
+    /// stored, as every other hit carries its provider's kind. The logical origin comes
+    /// from the canonical identity. A mapped stub keeps its physical declaration origin
+    /// separately for source reads. `None` for an invalid or local identity.
     pub(crate) fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
         let CalleeDeclaration {
             id,
             kind,
-            origin: location,
+            origin: _,
         } = declaration;
         let parsed = rift_protocol::identity::SymbolIdentity::parse(id.as_str()).ok()?;
         let language = parsed.language().clone();
-        let origin = match location {
-            rift_core::SourceLocation::Dependency { package } => SymbolOrigin {
+        let origin = match parsed.owner() {
+            rift_protocol::identity::SymbolOwner::Package {
+                manager,
+                registry,
+                name,
+                version,
+            } => SymbolOrigin {
                 location: Some(SourceLocationKind::Dependency),
-                package: Some(package.clone()),
+                package: Some(PackageIdentity {
+                    manager: manager.clone(),
+                    registry: registry.clone(),
+                    name: name.clone(),
+                    version: version.clone(),
+                }),
                 runtime: None,
                 source_kind: SourceKind::Authored,
             },
-            rift_core::SourceLocation::Stdlib {
-                runtime: Some(runtime),
-            } => SymbolOrigin {
+            rift_protocol::identity::SymbolOwner::Runtime { runtime, version } => SymbolOrigin {
                 location: Some(SourceLocationKind::Stdlib),
                 package: None,
-                runtime: Some(runtime.clone()),
+                runtime: Some(rift_protocol::read::RuntimeIdentity {
+                    runtime: runtime.clone(),
+                    version: version.clone(),
+                }),
                 source_kind: SourceKind::Authored,
             },
             _ => return None,
@@ -990,6 +1000,64 @@ mod tests {
         assert!(
             held.symbol(&declaration("not an identity", "function", &greeting))
                 .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_stub_keeps_physical_unit_and_logical_owner_separate() -> TestResult {
+        let package = identity("pypi", "runtime-stubs", "1.0.0");
+        let held = callee(CalleePackage::Installed(package.clone()), "sys.pyi");
+        let physical = rift_core::SourceLocation::Dependency {
+            package: package.clone(),
+        };
+        let runtime_id = "rift://symbol/stdlib/python@3.14.3/python/sys/getsizeof";
+        let symbol = held
+            .symbol(&CalleeDeclaration {
+                id: SymbolId(runtime_id.to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: physical.clone(),
+            })
+            .ok_or("canonical runtime identity")?;
+        assert_eq!(symbol.id.as_ref().map(|id| id.0.as_str()), Some(runtime_id));
+        assert_eq!(symbol.language.name, "python");
+        assert_eq!(symbol.origin.package, None);
+        assert_eq!(
+            symbol.origin.runtime,
+            Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "python".to_owned(),
+                version: "3.14.3".to_owned(),
+            })
+        );
+        assert_eq!(
+            held.unit(&physical).map(|unit| unit.0),
+            Some("rift://source/pypi/pypi.org/runtime-stubs@1.0.0/sys.pyi".to_owned())
+        );
+
+        let runtime = rift_core::SourceLocation::Stdlib {
+            runtime: symbol.origin.runtime.clone(),
+        };
+        let package_id = "rift://symbol/pypi/pypi.org/runtime-stubs@1.0.0/python/helpers/size";
+        let inverse = held
+            .symbol(&CalleeDeclaration {
+                id: SymbolId(package_id.to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: runtime.clone(),
+            })
+            .ok_or("canonical package identity")?;
+        assert_eq!(inverse.origin.package, Some(package));
+        assert_eq!(inverse.origin.runtime, None);
+        assert_eq!(
+            held.unit(&runtime).map(|unit| unit.0),
+            Some("rift://source/stdlib/python@3.14.3/sys.pyi".to_owned())
+        );
+        assert!(
+            held.symbol(&CalleeDeclaration {
+                id: SymbolId("rift://symbol/local/python/helpers/size".to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: runtime,
+            })
+            .is_none()
         );
         Ok(())
     }
