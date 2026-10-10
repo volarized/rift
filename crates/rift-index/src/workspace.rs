@@ -9679,9 +9679,8 @@ mod tests {
         assert_eq!(repaired.digests().fingerprint(), *repaired.fingerprint());
     }
 
-    /// A declaration named exactly `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes: the document
-    /// keeps it, and the identity minted from it passes the bound, so the Contribution
-    /// contract refuses `provider_symbol`.
+    /// A declaration at the portable-name bound remains valid. Its overbound physical
+    /// address uses a bounded provider key and cannot establish a logical identity.
     fn wide_source() -> String {
         format!(
             "pub struct {};\n",
@@ -9690,7 +9689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_leaves_a_file_whose_declaration_the_contract_refuses_out_and_keeps_the_rest() {
+    fn test_build_keeps_exact_bound_names_with_unresolved_logical_identity() {
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory.path();
         fs::create_dir_all(root.join("src")).expect("fixture directory");
@@ -9698,18 +9697,30 @@ mod tests {
         fs::write(root.join("src/wide.rs"), wide_source()).expect("wide source");
         let index = indexed(root, &TextFileInclusion::default());
         let wide = ProjectPath::new("src/wide.rs").expect("path");
-        assert!(index.file(&wide).is_none(), "the wide file is not indexed");
+        let held = index
+            .file(&wide)
+            .expect("valid exact-bound source stays indexed");
+        assert_eq!(held.source(), wide_source());
         assert!(
-            index.text_file(&wide).is_none(),
-            "the wide file is absent from the text catalog too"
+            index.text_file(&wide).is_some(),
+            "the original source remains in the text catalog"
         );
         assert!(has_symbol(&index, "kept"), "the normal file still serves");
-        assert_eq!(index.file_count(), 1);
-        assert_eq!(index.left_out_file_count(), 1);
-        assert!(
-            matches!(index.warnings(), [WorkspaceIndexWarning::Contribution { path, error }]
-            if path == &wide && error.context().any(|(key, value)| key == "field" && value == "provider_symbol"))
-        );
+        assert_eq!(index.file_count(), 2);
+        assert_eq!(index.left_out_file_count(), 0);
+        assert!(index.warnings().is_empty());
+        let records = index.semantics.graph().records();
+        assert!(records.iter().any(|record| record.identity().is_none()
+            && record.contributions().iter().any(|key| {
+                index
+                    .semantics
+                    .graph()
+                    .contribution(key)
+                    .and_then(rift_core::Contribution::facts)
+                    .is_some_and(|facts| {
+                        facts.name().len() == rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX
+                    })
+            })));
         let capture = capture_digests(
             root,
             WorkspaceIndexLimits::default(),
@@ -9725,7 +9736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_leaves_a_file_turned_wide_out_and_holds_it_again_once_repaired() {
+    fn test_rebuild_keeps_exact_bound_source_and_restores_established_identity_when_repaired() {
         let directory = fixture();
         let root = directory.path();
         let index = indexed(root, &TextFileInclusion::default());
@@ -9735,13 +9746,20 @@ mod tests {
         let changes = resolved(&index, root, &["src/lib.rs"]);
         let wide = index
             .rebuilt(&changes)
-            .expect("one refused declaration must not fail rebuild");
-        assert!(wide.file(&lib_path).is_none());
-        assert!(wide.text_file(&lib_path).is_none());
-        assert_eq!(wide.left_out_file_count(), 1);
+            .expect("one unresolved identity must not fail rebuild");
+        assert_eq!(
+            wide.file(&lib_path).expect("source held").source(),
+            wide_source()
+        );
+        assert!(wide.text_file(&lib_path).is_some());
+        assert_eq!(wide.left_out_file_count(), 0);
+        assert!(wide.warnings().is_empty());
         assert!(
-            matches!(wide.warnings(), [WorkspaceIndexWarning::Contribution { path, error }]
-            if path == &lib_path && error.context().any(|(key, value)| key == "field" && value == "provider_symbol"))
+            wide.semantics
+                .graph()
+                .records()
+                .iter()
+                .any(|record| record.identity().is_none())
         );
         assert_eq!(wide.digests().fingerprint(), *wide.fingerprint());
 
@@ -9752,6 +9770,7 @@ mod tests {
             .expect("the repaired file must rebuild");
         assert!(repaired.file(&lib_path).is_some());
         assert_eq!(repaired.left_out_file_count(), 0);
+        assert!(has_symbol(&repaired, "Rift"));
     }
 
     /// A provider error leaves a file out only when one document's Contribution was
@@ -10836,7 +10855,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_python_contributions_leave_out_in_one_batch() {
+    fn exact_bound_python_names_keep_bounded_provider_keys_in_one_batch() {
         let root = tempfile::tempdir().expect("temporary workspace");
         let provider = registry::provider_for_extension("py").expect("the Python provider");
         let limits = SyntaxLimits::default();
@@ -10873,23 +10892,6 @@ mod tests {
                 .expect("provider parses exact-bound name");
         }
 
-        let mut expected = contents.clone();
-        for path in ["src/wide_a.py", "src/wide_b.py"] {
-            let path = ProjectPath::new(path).expect("path");
-            assert!(
-                expected.leave_out_held(
-                    &path,
-                    WorkspaceIndexWarning::Contribution {
-                        path: path.clone(),
-                        error: Arc::new(
-                            errors::core::contribution_invalid_name()
-                                .field("provider_symbol")
-                                .error()
-                        ),
-                    },
-                )
-            );
-        }
         let built = built_contents(
             root.path(),
             contents.sorted(),
@@ -10897,28 +10899,57 @@ mod tests {
             rift_analysis::RELATIONSHIP_EDGES_MAX,
             None,
         )
-        .expect("all refused declarations leave out together");
-        let expected = built_contents(
-            root.path(),
-            expected.sorted(),
-            10,
-            rift_analysis::RELATIONSHIP_EDGES_MAX,
-            None,
-        )
-        .expect("valid source alone builds");
-        assert_eq!(built.left_out.len(), 2);
-        assert!(matches!(built.warnings.as_slice(), [
-            WorkspaceIndexWarning::Contribution { path: first, error: first_error },
-            WorkspaceIndexWarning::Contribution { path: second, error: second_error },
-        ] if first.as_str() == "src/wide_a.py"
-            && second.as_str() == "src/wide_b.py"
-            && first_error.context().any(|(key, value)| key == "field" && value == "provider_symbol")
-            && second_error.context().any(|(key, value)| key == "field" && value == "provider_symbol")));
-        assert_eq!(
-            built.semantics.graph().records(),
-            expected.semantics.graph().records(),
-            "accepted graph matches build without refused files"
+        .expect("valid exact-bound names build together");
+        assert_eq!(built.left_out.len(), 0);
+        assert!(built.warnings.is_empty());
+        let graph = built.semantics.graph();
+        assert_eq!(graph.records().len(), 3);
+        let wide_records = graph
+            .records()
+            .iter()
+            .filter(|record| {
+                record.contributions().iter().any(|key| {
+                    graph
+                        .contribution(key)
+                        .and_then(|value| value.source())
+                        .is_some_and(|binding| {
+                            matches!(
+                                binding.unit().key().as_str(),
+                                "src/wide_a.py" | "src/wide_b.py"
+                            )
+                        })
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(wide_records.len(), 2);
+        assert!(
+            graph
+                .records()
+                .iter()
+                .any(|record| record.contributions().iter().any(|key| {
+                    graph.contribution(key).is_some_and(|value| {
+                        value
+                            .source()
+                            .is_some_and(|binding| binding.unit().key().as_str() == "src/valid.py")
+                            && value.facts().is_some_and(|facts| facts.name() == "beacon")
+                    })
+                }))
         );
+        for record in wide_records {
+            assert!(record.identity().is_none());
+            assert_eq!(record.contributions().len(), 1);
+            let key = &record.contributions()[0];
+            assert_eq!(key.reference().symbol().as_str().len(), 71);
+            assert!(key.reference().symbol().as_str().starts_with("sha256:"));
+            let contribution = graph.contribution(key).expect("retained contribution");
+            assert_eq!(contribution.facts().expect("retained facts").name(), name);
+            let binding = contribution.source().expect("original physical binding");
+            assert!(matches!(
+                binding.unit().key().as_str(),
+                "src/wide_a.py" | "src/wide_b.py"
+            ));
+            assert!(binding.range().end() > binding.range().start());
+        }
     }
 
     /// A semantics build the publication refuses fails the index build, naming the

@@ -167,6 +167,13 @@ impl AssembledSymbol {
             document_local: facts.is_document_local(),
         }
     }
+
+    /// Converts a captured Contribution origin using the same read representation as
+    /// logical objects and their physical declarations.
+    #[must_use]
+    pub fn wire_origin(origin: &ContributionOrigin) -> SymbolOrigin {
+        wire_symbol_origin(origin)
+    }
 }
 
 fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
@@ -519,7 +526,7 @@ mod tests {
             1,
             "syntax-beacon",
             "Beacon",
-            Some("symbol:beacon"),
+            Some("rift://symbol/local/rust/app/Beacon"),
             None,
         );
         let lsp = contribution(
@@ -584,7 +591,7 @@ mod tests {
             .expect("assembled symbol");
         assert_eq!(
             lsp_first.identity().map(SymbolId::as_str),
-            Some("symbol:beacon")
+            Some("rift://symbol/local/rust/app/Beacon")
         );
         assert_eq!(lsp_first.facts().expect("portable facts").name(), "beacon");
         assert_eq!(

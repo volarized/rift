@@ -32,9 +32,8 @@ fn check_request(directory: &tempfile::TempDir) -> TestResult<export::ExportRequ
     ])?)
 }
 
-/// Every `rift://` identity the served document advertises spells its path with the one shared
-/// character class. Four models carried that class by hand and one of them dropped `@`, so the
-/// server returned node identities its own schema refused; a fifth identity cannot repeat it.
+/// Node paths retain the shared character class. Canonical symbol and source paths
+/// accept encoded `@` and refuse ambiguous separators through their complete schemas.
 #[test]
 fn every_served_identity_pattern_spells_its_path_with_the_shared_class() -> TestResult {
     fn patterns(node: &Value, found: &mut Vec<String>) {
@@ -70,11 +69,54 @@ fn every_served_identity_pattern_spells_its_path_with_the_shared_class() -> Test
         "the served document advertises one pattern per identity: {identities:?}"
     );
     for pattern in identities {
+        if pattern.starts_with("^rift://symbol/") || pattern.starts_with("^rift://source/") {
+            continue;
+        }
         assert!(
             pattern.contains(rift_protocol::read::IDENTITY_PATH_CHARACTER),
             "an identity pattern spells its path with the shared class: {pattern}"
         );
     }
+    let package_schema: Value =
+        serde_json::from_str(&rift_protocol::schema::package_index_schema_document())?;
+    let source_schema = &package_schema["$defs"]["SourceUnitId"];
+    assert!(
+        source_schema.is_object(),
+        "the publication defines source units"
+    );
+    let source_validator = jsonschema::validator_for(source_schema)?;
+    for source in [
+        "rift://source/project/packages/@scope/core.ts",
+        "rift://source/npm/registry.npmjs.org/@scope/core@1.0.0/src/core.ts",
+        "rift://source/stdlib/python@3.14.3/sys/__init__.pyi",
+    ] {
+        assert!(
+            source_validator.is_valid(&serde_json::json!(source)),
+            "{source}"
+        );
+    }
+    for source in [
+        "rift://source/cargo/core@1.0.0/src/lib.rs",
+        "rift://source/project/src/../lib.rs",
+        "rift://source/project/src%2Flib.rs",
+    ] {
+        assert!(
+            !source_validator.is_valid(&serde_json::json!(source)),
+            "{source}"
+        );
+    }
+    let symbol_schema = &package_schema["$defs"]["SymbolId"];
+    assert!(
+        symbol_schema.is_object(),
+        "the publication defines symbol IDs"
+    );
+    let symbol_validator = jsonschema::validator_for(symbol_schema)?;
+    assert!(symbol_validator.is_valid(&serde_json::json!(
+        "rift://symbol/local/python/scope%40name/member"
+    )));
+    assert!(!symbol_validator.is_valid(&serde_json::json!(
+        "rift://symbol/local/python/scope//member"
+    )));
     Ok(())
 }
 

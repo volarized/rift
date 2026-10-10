@@ -437,7 +437,7 @@ fn default_get_symbol_params_page_index() -> u64 {
         "hits": [
             {
                 "symbol": {
-                    "id": "rift://symbol/rust/src/config.rs/load_config",
+                    "id": "rift://symbol/local/rust/app/config/load_config",
                     "language": "rust",
                     "name": "load_config",
                     "kind": "function",
@@ -466,7 +466,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                                         "start": 42,
                                         "end": 48
                                     },
-                                    "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                    "symbol": "rift://symbol/local/rust/app/config/Config"
                                 }
                             ],
                             "language": "rust",
@@ -515,7 +515,7 @@ fn default_get_symbol_params_page_index() -> u64 {
                 "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
                 "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
                 "history": {
-                    "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                    "symbol": "rift://symbol/local/rust/app/config/load_config",
                     "versions": [
                         {
                             "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
@@ -2262,28 +2262,38 @@ pub struct SymbolHistory {
     pub complete: bool,
 }
 
-/// Identity of one symbol: the language, the path of the declaring file, and the provider's
-/// stable qualified name for the declaration. No shipped provider puts the file path into a
-/// qualified name, so a declaration moved to another file keeps its qualified name while its
-/// identity names the new path. A `~N` suffix separates declarations the qualified name
-/// alone cannot, such as overloads that dispatch separately.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct SymbolId(
-    #[schemars(example = &"rift://symbol/rust/crates/rift-server/src/read.rs/ReadService")]
-    #[schemars(length(min = 17, max = 8192))]
-    #[schemars(regex(
-        pattern = concat!(
-            r"^rift://symbol/",
-            identity_language_segment!(),
-            r"/",
-            identity_path_character!(),
-            r"{1,1000}$"
-        )
-    ))]
-    pub String,
-);
+/// Canonical logical symbol identity with local, registered local, package or runtime ownership.
+/// The shared codec validates ownership, hierarchy and encoding at the read boundary.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SymbolId(pub String);
+
+impl JsonSchema for SymbolId {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SymbolId".into()
+    }
+
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        crate::identity::SymbolIdentity::json_schema(generator)
+    }
+}
+
+impl Serialize for SymbolId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let identity = crate::identity::SymbolIdentity::parse(self.as_str()).map_err(|violation| {
+            serde::ser::Error::custom(format!(
+                "invalid symbol identity: {violation:?}; supply a canonical rift://symbol/ address"
+            ))
+        })?;
+        identity.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SymbolId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::identity::SymbolIdentity::deserialize(deserializer)
+            .map(|identity| Self::from_identity(&identity))
+    }
+}
 
 impl SymbolId {
     /// Parses one canonical logical symbol identity without lookup or I/O.
@@ -2967,7 +2977,7 @@ mod tests {
             ),
             (
                 serde_json::to_value(schema_for!(SymbolId)).expect("symbol schema"),
-                "rift://symbol/json/packages/@scope/name/package.json/name",
+                "rift://symbol/local/json/packages/@scope/name/name",
             ),
         ];
         for (schema, identity) in cases {
@@ -3056,7 +3066,7 @@ mod tests {
             ),
             (
                 ReadWarning::SymbolDisagreement {
-                    symbol: SymbolId("rift://symbol/rust/src/lib.rs/Beacon".to_owned()),
+                    symbol: SymbolId("rift://symbol/local/rust/app/Beacon".to_owned()),
                     providers: vec!["history".to_owned(), "syntax".to_owned()],
                     detail: "normalization selected one presentation for this symbol; \
                              history, syntax disagree on at least one field"
@@ -3064,7 +3074,7 @@ mod tests {
                 },
                 json!({
                     "code": "symbol_disagreement",
-                    "symbol": "rift://symbol/rust/src/lib.rs/Beacon",
+                    "symbol": "rift://symbol/local/rust/app/Beacon",
                     "providers": ["history", "syntax"],
                     "detail": "normalization selected one presentation for this symbol; \
                                history, syntax disagree on at least one field",
@@ -3492,6 +3502,43 @@ mod tests {
                 json!("required_field_set"),
             ]
         );
+    }
+
+    #[test]
+    fn ordinary_symbol_id_serde_and_schema_use_the_canonical_codec() {
+        let schema = serde_json::to_value(schema_for!(SymbolId)).expect("symbol schema");
+        let validator = jsonschema::validator_for(&schema).expect("symbol validator");
+        for value in [
+            "rift://symbol/local/python/app/member",
+            "rift://symbol/cargo/crates.io/example@1.0.0/rust/example/member",
+            "rift://symbol/stdlib/python@3.14.3/python/sys/version",
+        ] {
+            let parsed: SymbolId = serde_json::from_value(json!(value)).expect("canonical ID");
+            assert_eq!(
+                serde_json::to_value(parsed).expect("symbol serialization"),
+                json!(value)
+            );
+            assert!(validator.is_valid(&json!(value)), "{value}");
+        }
+        for value in [
+            "rift://symbol/rust/src/lib.rs/member",
+            "rift://symbol/local/python/app//member",
+            "rift://symbol/local/python/app/../member",
+        ] {
+            assert!(
+                serde_json::from_value::<SymbolId>(json!(value)).is_err(),
+                "{value}"
+            );
+            assert!(
+                serde_json::to_value(SymbolId(value.to_owned())).is_err(),
+                "{value}"
+            );
+            assert!(!validator.is_valid(&json!(value)), "{value}");
+        }
+        let overbound = format!("rift://symbol/local/python/app/{}", "S".repeat(8192));
+        assert!(serde_json::from_value::<SymbolId>(json!(overbound)).is_err());
+        assert!(serde_json::to_value(SymbolId(overbound.clone())).is_err());
+        assert!(!validator.is_valid(&json!(overbound)));
     }
 
     #[test]

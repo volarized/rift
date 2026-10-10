@@ -3540,21 +3540,17 @@ impl Tower {
         Ok(())
     }
 
-    /// A force-included file holding a declaration the Contribution contract refuses is
-    /// left out of the on-demand index, and the answer names it in `source_unavailable`
-    /// instead of failing the request.
+    /// A force-included declaration at the portable name bound retains its original
+    /// source and bounded provider key, even when its logical identity is unresolved.
     #[test]
-    fn search_force_include_leaves_out_a_file_the_contract_refuses_and_warns() -> TestResult {
+    fn search_force_include_keeps_an_exact_bound_name_without_a_false_source_warning() -> TestResult
+    {
         let directory = tempfile::tempdir()?;
         fs::write(directory.path().join(".gitignore"), "wide.rs\n")?;
         fs::write(directory.path().join("lib.rs"), "pub fn kept() {}\n")?;
-        fs::write(
-            directory.path().join("wide.rs"),
-            format!(
-                "pub struct {};\n",
-                "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
-            ),
-        )?;
+        let name = "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX);
+        let source = format!("pub struct {name};\n");
+        fs::write(directory.path().join("wide.rs"), &source)?;
         let service = ReadService::build(
             directory.path(),
             WorkspaceIndexLimits::default(),
@@ -3586,16 +3582,25 @@ impl Tower {
                 .is_some_and(|results| results.iter().any(|hit| hit["path"] == "lib.rs")),
             "{value:#}"
         );
-        let names_wide = value["warnings"].as_array().is_some_and(|warnings| {
-            warnings.iter().any(|warning| {
-                warning["code"] == "source_unavailable"
-                    && warning["unit"] == "rift://file/wide.rs"
-                    && warning["detail"]
-                        .as_str()
-                        .is_some_and(|detail| detail.contains("provider_symbol"))
-            })
+        let no_false_source_warning = value["warnings"].as_array().is_none_or(|warnings| {
+            warnings
+                .iter()
+                .all(|warning| warning["code"] != "source_unavailable")
         });
-        assert!(names_wide, "{value:#}");
+        assert!(no_false_source_warning, "{value:#}");
+        let selected = service.selected_paths(params.paths.as_ref())?;
+        let included = selected.force_include.expect("force-included index");
+        let path = rift_core::ProjectPath::new("wide.rs")?;
+        let held = included.file(&path).expect("exact-bound source remains");
+        assert_eq!(held.source(), source);
+        assert_eq!(held.syntax().symbols()[0].name, name);
+        assert!(
+            included
+                .normalized_graph()
+                .records()
+                .iter()
+                .any(|record| record.identity().is_none())
+        );
         Ok(())
     }
 

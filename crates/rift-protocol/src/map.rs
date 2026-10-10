@@ -173,14 +173,12 @@ mod tests {
             }],
             hubs: vec![MapHub {
                 symbol: SymbolId(
-                    "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService".to_owned(),
+                    "rift://symbol/local/rust/rift_server/read/ReadService".to_owned(),
                 ),
                 kind: ExactKind("struct".to_owned()),
                 references: 87,
             }],
-            entry_points: vec![SymbolId(
-                "rift://symbol/rust/crates/rift/src/main.rs/main".to_owned(),
-            )],
+            entry_points: vec![SymbolId("rift://symbol/local/rust/rift/main".to_owned())],
             docs: vec![ProjectPath("README.md".to_owned())],
             module_relationships: vec![MapModuleRelationship {
                 from: ProjectPath("crates/rift-server".to_owned()),
@@ -223,12 +221,12 @@ mod tests {
         );
         assert_eq!(
             value["hubs"][0]["symbol"],
-            json!("rift://symbol/rust/crates/rift-server/src/read.rs/ReadService")
+            json!("rift://symbol/local/rust/rift_server/read/ReadService")
         );
         assert_eq!(value["hubs"][0]["kind"], json!("struct"));
         assert_eq!(
             value["entry_points"][0],
-            json!("rift://symbol/rust/crates/rift/src/main.rs/main")
+            json!("rift://symbol/local/rust/rift/main")
         );
         assert_eq!(value["docs"][0], json!("README.md"));
         assert_eq!(

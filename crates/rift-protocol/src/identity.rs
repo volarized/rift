@@ -225,6 +225,7 @@ impl schemars::JsonSchema for SymbolIdentity {
             "minLength": 1,
             "maxLength": SYMBOL_ID_BYTES_MAX,
             "pattern": SYMBOL_ID_PATTERN,
+            "not": {"pattern": "/\\.{1,2}(?:/|~|$)"},
             "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://symbol/local/rust/app/parser/parse",
