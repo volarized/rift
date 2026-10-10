@@ -38,6 +38,8 @@ pub use input::{
     PackageImportRoot, PackageImportRootOrigin, PackageSource,
 };
 #[cfg(feature = "collector")]
+pub use input::{NamespaceInput, NamespaceModule};
+#[cfg(feature = "collector")]
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
     ManifestError, analyzer_digest, analyzer_manifest_path, analyzer_revision,

@@ -22,8 +22,11 @@ impl McpConfiguration {
     ///
     /// # Errors
     /// Returns the first invalid entry or an aggregate input past the configuration bound.
-    pub fn validate(&self) -> Result<(), ConfigurationViolation> {
-        self.violation().map_or(Ok(()), Err)
+    pub fn validate(&self) -> Result<(), rift_error::RiftError> {
+        match self.violation() {
+            Some(violation) => Err(super::configuration_violation_error(&violation)),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn violation(&self) -> Option<ConfigurationViolation> {

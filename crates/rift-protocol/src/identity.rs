@@ -2,6 +2,8 @@
 
 use std::num::NonZeroU32;
 
+use rift_error::{RiftError, errors};
+
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -124,9 +126,9 @@ impl SourceDigest {
     ///
     /// # Errors
     /// Returns a revision violation for incomplete or noncanonical digests.
-    pub fn parse(value: &str) -> Result<Self, SymbolIdentityViolation> {
+    pub fn parse(value: &str) -> Result<Self, RiftError> {
         if !source_digest_is_valid(value) {
-            return Err(SymbolIdentityViolation::Revision);
+            return Err(SymbolIdentityViolation::Revision.into());
         }
         Ok(Self(value.to_owned()))
     }
@@ -183,10 +185,10 @@ impl SymbolOccurrence {
     ///
     /// # Errors
     /// Returns a violation for zero numbers or noncanonical revisions.
-    pub fn new(number: u32, revision: String) -> Result<Self, SymbolIdentityViolation> {
+    pub fn new(number: u32, revision: String) -> Result<Self, RiftError> {
         let number = NonZeroU32::new(number).ok_or(SymbolIdentityViolation::Occurrence)?;
         if !source_digest_is_valid(&revision) {
-            return Err(SymbolIdentityViolation::Revision);
+            return Err(SymbolIdentityViolation::Revision.into());
         }
         let revision = SourceDigest(revision);
         Ok(Self { number, revision })
@@ -240,7 +242,7 @@ impl schemars::JsonSchema for SymbolIdentity {
 /// A symbol identity outside its canonical wire form.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SymbolIdentityViolation {
+pub(crate) enum SymbolIdentityViolation {
     /// The encoded identity exceeds its byte limit.
     Length,
     /// The address has missing or misplaced components.
@@ -261,6 +263,25 @@ pub enum SymbolIdentityViolation {
     Revision,
 }
 
+impl From<SymbolIdentityViolation> for RiftError {
+    fn from(violation: SymbolIdentityViolation) -> Self {
+        let detail = match violation {
+            SymbolIdentityViolation::Length => "Length",
+            SymbolIdentityViolation::Structure => "Structure",
+            SymbolIdentityViolation::Owner => "Owner",
+            SymbolIdentityViolation::Language => "Language",
+            SymbolIdentityViolation::QualifiedPath => "QualifiedPath",
+            SymbolIdentityViolation::Encoding => "Encoding",
+            SymbolIdentityViolation::Noncanonical => "Noncanonical",
+            SymbolIdentityViolation::Occurrence => "Occurrence",
+            SymbolIdentityViolation::Revision => "Revision",
+        };
+        errors::core::symbol_identity_invalid()
+            .violation(detail)
+            .error()
+    }
+}
+
 impl SymbolIdentity {
     /// Constructs a canonical identity from accepted ownership and logical names.
     ///
@@ -270,7 +291,7 @@ impl SymbolIdentity {
         owner: SymbolOwner,
         language: Language,
         qualified_path: Vec<String>,
-    ) -> Result<Self, SymbolIdentityViolation> {
+    ) -> Result<Self, RiftError> {
         let identity = Self {
             owner,
             language,
@@ -285,10 +306,7 @@ impl SymbolIdentity {
     ///
     /// # Errors
     /// Returns a length violation if the complete encoded identity exceeds its limit.
-    pub fn with_occurrence(
-        mut self,
-        occurrence: SymbolOccurrence,
-    ) -> Result<Self, SymbolIdentityViolation> {
+    pub fn with_occurrence(mut self, occurrence: SymbolOccurrence) -> Result<Self, RiftError> {
         self.occurrence = Some(occurrence);
         self.validate_length()?;
         Ok(self)
@@ -300,9 +318,9 @@ impl SymbolIdentity {
     ///
     /// # Errors
     /// Returns a violation for malformed ownership, hierarchy, qualifiers or encoding.
-    pub fn parse(value: &str) -> Result<Self, SymbolIdentityViolation> {
+    pub fn parse(value: &str) -> Result<Self, RiftError> {
         if value.len() > SYMBOL_ID_BYTES_MAX {
-            return Err(SymbolIdentityViolation::Length);
+            return Err(SymbolIdentityViolation::Length.into());
         }
         let remainder = value
             .strip_prefix(SYMBOL_URI_PREFIX)
@@ -312,14 +330,14 @@ impl SymbolIdentity {
         let scope = next_segment(&mut segments)?;
         let owner = parse_owner(scope, &mut segments)?;
         let language = Language::from_identity_segment(next_segment(&mut segments)?)
-            .map_err(|_| SymbolIdentityViolation::Language)?;
+            .map_err(|_| RiftError::from(SymbolIdentityViolation::Language))?;
         let qualified_path = segments
             .map(decode_component)
             .collect::<Result<Vec<_>, _>>()?;
         let mut identity = Self::new(owner, language, qualified_path)?;
         identity.occurrence = occurrence;
         if identity.wire_identity() != value {
-            return Err(SymbolIdentityViolation::Noncanonical);
+            return Err(SymbolIdentityViolation::Noncanonical.into());
         }
         Ok(identity)
     }
@@ -369,23 +387,23 @@ impl SymbolIdentity {
         value
     }
 
-    fn validate(&self) -> Result<(), SymbolIdentityViolation> {
+    fn validate(&self) -> Result<(), RiftError> {
         self.validate_input_length()?;
         self.owner.validate()?;
         Language::from_identity_segment(&self.language.identity_segment())
-            .map_err(|_| SymbolIdentityViolation::Language)?;
+            .map_err(|_| RiftError::from(SymbolIdentityViolation::Language))?;
         if self.qualified_path.is_empty()
             || self
                 .qualified_path
                 .iter()
                 .any(|part| !valid_component(part))
         {
-            return Err(SymbolIdentityViolation::QualifiedPath);
+            return Err(SymbolIdentityViolation::QualifiedPath.into());
         }
         self.validate_length()
     }
 
-    fn validate_input_length(&self) -> Result<(), SymbolIdentityViolation> {
+    fn validate_input_length(&self) -> Result<(), RiftError> {
         let owner_bytes = self.owner.input_bytes();
         let path_bytes = self.qualified_path.iter().try_fold(0usize, |total, part| {
             total
@@ -402,14 +420,14 @@ impl SymbolIdentity {
             .and_then(|path| path.checked_add(owner_bytes))
             .and_then(|total| total.checked_add(language_bytes));
         if total.is_none_or(|total| total > SYMBOL_ID_BYTES_MAX) {
-            return Err(SymbolIdentityViolation::Length);
+            return Err(SymbolIdentityViolation::Length.into());
         }
         Ok(())
     }
 
-    fn validate_length(&self) -> Result<(), SymbolIdentityViolation> {
+    fn validate_length(&self) -> Result<(), RiftError> {
         if self.wire_identity().len() > SYMBOL_ID_BYTES_MAX {
-            return Err(SymbolIdentityViolation::Length);
+            return Err(SymbolIdentityViolation::Length.into());
         }
         Ok(())
     }
@@ -436,9 +454,9 @@ impl SymbolOwner {
     ///
     /// # Errors
     /// Returns the violated owner or length bound.
-    pub fn validate(&self) -> Result<(), SymbolIdentityViolation> {
+    pub fn validate(&self) -> Result<(), RiftError> {
         if self.input_bytes() > SYMBOL_ID_BYTES_MAX {
-            return Err(SymbolIdentityViolation::Length);
+            return Err(SymbolIdentityViolation::Length.into());
         }
         let accepted = match self {
             Self::Local => true,
@@ -466,9 +484,27 @@ impl SymbolOwner {
             }
         };
         if !accepted {
-            return Err(SymbolIdentityViolation::Owner);
+            return Err(SymbolIdentityViolation::Owner.into());
         }
         Ok(())
+    }
+
+    /// Renders the canonical local scope of a path-based operation.
+    ///
+    /// Physical source paths remain relative to the selected project.
+    ///
+    /// # Errors
+    /// Returns the existing owner or length refusal for an invalid local scope.
+    pub fn local_scope(&self) -> Result<String, RiftError> {
+        if !matches!(self, Self::Local | Self::NamedLocal { .. }) {
+            return Err(SymbolIdentityViolation::Owner.into());
+        }
+        self.validate()?;
+        let scope = self.wire_owner();
+        if scope.len() > SYMBOL_ID_BYTES_MAX {
+            return Err(SymbolIdentityViolation::Length.into());
+        }
+        Ok(scope)
     }
 
     fn wire_owner(&self) -> String {
@@ -508,17 +544,11 @@ impl Serialize for SymbolIdentity {
 impl<'de> Deserialize<'de> for SymbolIdentity {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        Self::parse(&value).map_err(|violation| {
-            serde::de::Error::custom(format!(
-                "invalid symbol identity: {violation:?}; supply a canonical rift://symbol/ address"
-            ))
-        })
+        Self::parse(&value).map_err(serde::de::Error::custom)
     }
 }
 
-fn parse_occurrence(
-    value: &str,
-) -> Result<(&str, Option<SymbolOccurrence>), SymbolIdentityViolation> {
+fn parse_occurrence(value: &str) -> Result<(&str, Option<SymbolOccurrence>), RiftError> {
     let Some((address, revision)) = value.split_once(REVISION_QUERY_PREFIX) else {
         return Ok((value, None));
     };
@@ -527,7 +557,7 @@ fn parse_occurrence(
         .ok_or(SymbolIdentityViolation::Occurrence)?;
     let number = number
         .parse::<u32>()
-        .map_err(|_| SymbolIdentityViolation::Occurrence)?;
+        .map_err(|_| RiftError::from(SymbolIdentityViolation::Occurrence))?;
     Ok((
         address,
         Some(SymbolOccurrence::new(number, revision.to_owned())?),
@@ -537,7 +567,7 @@ fn parse_occurrence(
 fn parse_owner<'a>(
     scope: &str,
     segments: &mut impl Iterator<Item = &'a str>,
-) -> Result<SymbolOwner, SymbolIdentityViolation> {
+) -> Result<SymbolOwner, RiftError> {
     match scope {
         "local" => Ok(SymbolOwner::Local),
         "stdlib" => {
@@ -554,7 +584,7 @@ fn parse_owner<'a>(
 fn parse_package_owner<'a>(
     manager: &str,
     segments: &mut impl Iterator<Item = &'a str>,
-) -> Result<SymbolOwner, SymbolIdentityViolation> {
+) -> Result<SymbolOwner, RiftError> {
     let registry = decode_component(next_segment(segments)?)?;
     let first = next_segment(segments)?;
     let (name, version) = match (manager, first.starts_with('@')) {
@@ -572,27 +602,26 @@ fn parse_package_owner<'a>(
     })
 }
 
-fn parse_release(value: &str) -> Result<(String, String), SymbolIdentityViolation> {
+fn parse_release(value: &str) -> Result<(String, String), RiftError> {
     let (name, version) = value
         .rsplit_once('@')
         .ok_or(SymbolIdentityViolation::Owner)?;
     Ok((decode_component(name)?, decode_component(version)?))
 }
 
-fn next_segment<'a>(
-    segments: &mut impl Iterator<Item = &'a str>,
-) -> Result<&'a str, SymbolIdentityViolation> {
+fn next_segment<'a>(segments: &mut impl Iterator<Item = &'a str>) -> Result<&'a str, RiftError> {
     segments
         .next()
         .filter(|value| !value.is_empty())
         .ok_or(SymbolIdentityViolation::Structure)
+        .map_err(Into::into)
 }
 
-fn decode_component(value: &str) -> Result<String, SymbolIdentityViolation> {
+fn decode_component(value: &str) -> Result<String, RiftError> {
     percent_decode_str(value)
         .decode_utf8()
         .map(std::borrow::Cow::into_owned)
-        .map_err(|_| SymbolIdentityViolation::Encoding)
+        .map_err(|_| RiftError::from(SymbolIdentityViolation::Encoding))
 }
 
 fn encode_component(value: &str) -> String {
@@ -628,17 +657,17 @@ pub fn valid_registration_name(value: &str) -> bool {
 ///
 /// # Errors
 /// Returns the existing owner or length refusal for an invalid local scope.
-pub fn parse_local_scope(value: &str) -> Result<SymbolOwner, SymbolIdentityViolation> {
+pub fn parse_local_scope(value: &str) -> Result<SymbolOwner, RiftError> {
     if value.len() > SYMBOL_ID_BYTES_MAX {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
     let owner = parse_owner(value, &mut std::iter::empty())?;
     if !matches!(&owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }) {
-        return Err(SymbolIdentityViolation::Owner);
+        return Err(SymbolIdentityViolation::Owner.into());
     }
     owner.validate()?;
     if owner.wire_owner() != value {
-        return Err(SymbolIdentityViolation::Noncanonical);
+        return Err(SymbolIdentityViolation::Noncanonical.into());
     }
     Ok(owner)
 }
@@ -680,11 +709,12 @@ fn valid_registry(value: &str) -> bool {
 ///
 /// # Errors
 /// Returns an owner violation for an invalid endpoint, or a length violation at the bound.
-pub fn canonical_registry_endpoint(value: &str) -> Result<String, SymbolIdentityViolation> {
+pub fn canonical_registry_endpoint(value: &str) -> Result<String, RiftError> {
     if value.is_empty() || value.len() > 4096 {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
-    let url = url::Url::parse(value).map_err(|_| SymbolIdentityViolation::Owner)?;
+    let url =
+        url::Url::parse(value).map_err(|_| RiftError::from(SymbolIdentityViolation::Owner))?;
     if url.scheme() != "https"
         || !url.username().is_empty()
         || url.password().is_some()
@@ -693,7 +723,7 @@ pub fn canonical_registry_endpoint(value: &str) -> Result<String, SymbolIdentity
         || url.host_str().is_none()
         || value.chars().any(char::is_control)
     {
-        return Err(SymbolIdentityViolation::Owner);
+        return Err(SymbolIdentityViolation::Owner.into());
     }
     let endpoint = url
         .as_str()
@@ -705,7 +735,7 @@ pub fn canonical_registry_endpoint(value: &str) -> Result<String, SymbolIdentity
         endpoint
     };
     if endpoint.len() > 4096 || !valid_registry(endpoint) {
-        return Err(SymbolIdentityViolation::Owner);
+        return Err(SymbolIdentityViolation::Owner.into());
     }
     Ok(endpoint.to_owned())
 }
@@ -753,30 +783,27 @@ fn canonical_semver(value: &str) -> bool {
 ///
 /// # Errors
 /// Returns a violation for an unresolved owner, invalid relative path or encoded length.
-pub fn released_source_identity(
-    owner: &SymbolOwner,
-    path: &str,
-) -> Result<String, SymbolIdentityViolation> {
+pub fn released_source_identity(owner: &SymbolOwner, path: &str) -> Result<String, RiftError> {
     if owner.input_bytes().saturating_add(path.len()) > SYMBOL_ID_BYTES_MAX {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
     owner.validate()?;
     if !matches!(
         owner,
         SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
     ) {
-        return Err(SymbolIdentityViolation::Owner);
+        return Err(SymbolIdentityViolation::Owner.into());
     }
     if matches!(owner, SymbolOwner::Package { manager, .. } if !released_source_resolver_is_valid(manager))
     {
-        return Err(SymbolIdentityViolation::Owner);
+        return Err(SymbolIdentityViolation::Owner.into());
     }
     if path.is_empty()
         || path
             .split('/')
             .any(|part| !valid_component(part) || part.contains('\\'))
     {
-        return Err(SymbolIdentityViolation::QualifiedPath);
+        return Err(SymbolIdentityViolation::QualifiedPath.into());
     }
     let path = path
         .split('/')
@@ -785,7 +812,7 @@ pub fn released_source_identity(
         .join("/");
     let value = format!("rift://source/{}/{path}", owner.wire_owner());
     if value.len() > SYMBOL_ID_BYTES_MAX {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
     Ok(value)
 }
@@ -794,11 +821,9 @@ pub fn released_source_identity(
 ///
 /// # Errors
 /// Returns a violation for malformed ownership, source path, encoding or spelling.
-pub fn parse_released_source_identity(
-    value: &str,
-) -> Result<(SymbolOwner, String), SymbolIdentityViolation> {
+pub fn parse_released_source_identity(value: &str) -> Result<(SymbolOwner, String), RiftError> {
     if value.len() > SYMBOL_ID_BYTES_MAX {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
     let mut parts = value
         .strip_prefix("rift://source/")
@@ -806,21 +831,21 @@ pub fn parse_released_source_identity(
         .split('/');
     let scope = next_segment(&mut parts)?;
     if !released_source_resolver_is_valid(scope) {
-        return Err(SymbolIdentityViolation::Owner);
+        return Err(SymbolIdentityViolation::Owner.into());
     }
     let owner = parse_owner(scope, &mut parts)?;
     let path = parts
         .map(|part| {
             let decoded = decode_component(part)?;
             if decoded.contains('/') {
-                return Err(SymbolIdentityViolation::QualifiedPath);
+                return Err(SymbolIdentityViolation::QualifiedPath.into());
             }
             Ok(decoded)
         })
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, RiftError>>()?
         .join("/");
     if released_source_identity(&owner, &path)? != value {
-        return Err(SymbolIdentityViolation::Noncanonical);
+        return Err(SymbolIdentityViolation::Noncanonical.into());
     }
     Ok((owner, path))
 }
@@ -852,9 +877,9 @@ pub fn encode_source_unit_key(value: &str) -> String {
 ///
 /// # Errors
 /// Returns a violation for oversized input, malformed escapes or invalid UTF-8.
-pub fn decode_source_unit_key(value: &str) -> Result<String, SymbolIdentityViolation> {
+pub fn decode_source_unit_key(value: &str) -> Result<String, RiftError> {
     if value.len() > SYMBOL_ID_BYTES_MAX {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -873,13 +898,13 @@ pub fn decode_source_unit_key(value: &str) -> Result<String, SymbolIdentityViola
             index += 3;
         } else {
             if !source_unit_key_byte_is_safe(bytes[index]) {
-                return Err(SymbolIdentityViolation::Encoding);
+                return Err(SymbolIdentityViolation::Encoding.into());
             }
             decoded.push(bytes[index]);
             index += 1;
         }
     }
-    String::from_utf8(decoded).map_err(|_| SymbolIdentityViolation::Encoding)
+    String::from_utf8(decoded).map_err(|_| RiftError::from(SymbolIdentityViolation::Encoding))
 }
 
 fn source_hex_value(byte: u8) -> Option<u8> {
@@ -913,9 +938,7 @@ pub fn source_unit_path_is_valid(value: &str) -> bool {
 ///
 /// # Errors
 /// Returns a violation for invalid ownership, paths, UTF-8 or canonical spelling.
-pub fn parse_source_unit_identity(
-    value: &str,
-) -> Result<(Option<SymbolOwner>, String), SymbolIdentityViolation> {
+pub fn parse_source_unit_identity(value: &str) -> Result<(Option<SymbolOwner>, String), RiftError> {
     let (_, owner, path) = parse_source_unit_components(value)?;
     Ok((owner, path))
 }
@@ -924,16 +947,16 @@ pub fn parse_source_unit_identity(
 ///
 /// # Errors
 /// Returns the same refusal as [`parse_source_unit_identity`] for an invalid identity.
-pub fn source_unit_is_project(value: &str) -> Result<bool, SymbolIdentityViolation> {
+pub fn source_unit_is_project(value: &str) -> Result<bool, RiftError> {
     let (resolver, _, _) = parse_source_unit_components(value)?;
     Ok(resolver == "project")
 }
 
 fn parse_source_unit_components(
     value: &str,
-) -> Result<(&str, Option<SymbolOwner>, String), SymbolIdentityViolation> {
+) -> Result<(&str, Option<SymbolOwner>, String), RiftError> {
     if value.len() > SYMBOL_ID_BYTES_MAX {
-        return Err(SymbolIdentityViolation::Length);
+        return Err(SymbolIdentityViolation::Length.into());
     }
     let address = value
         .strip_prefix("rift://source/")
@@ -944,20 +967,20 @@ fn parse_source_unit_components(
     if released_source_resolver_is_valid(resolver) {
         let (owner, path) = parse_released_source_identity(value)?;
         if !source_unit_path_is_valid(&path) {
-            return Err(SymbolIdentityViolation::QualifiedPath);
+            return Err(SymbolIdentityViolation::QualifiedPath.into());
         }
         return Ok((resolver, Some(owner), path));
     }
     if !source_resolver_is_valid(resolver) {
-        return Err(SymbolIdentityViolation::Structure);
+        return Err(SymbolIdentityViolation::Structure.into());
     }
     let path = decode_source_unit_key(encoded)?;
     if !source_unit_path_is_valid(&path) {
-        return Err(SymbolIdentityViolation::QualifiedPath);
+        return Err(SymbolIdentityViolation::QualifiedPath.into());
     }
     let canonical = encode_source_unit_key(&path);
     if canonical != encoded {
-        return Err(SymbolIdentityViolation::Noncanonical);
+        return Err(SymbolIdentityViolation::Noncanonical.into());
     }
     Ok((resolver, None, path))
 }

@@ -513,6 +513,8 @@ pub enum RelationshipKind {
     Implementation,
     /// Source is a type definition for target.
     TypeDefinition,
+    /// Source is another name for target.
+    Alias,
 }
 
 /// One relationship declared by a provider.
@@ -520,13 +522,49 @@ pub enum RelationshipKind {
 pub struct ContributionRelationship {
     kind: RelationshipKind,
     target: ContributionReference,
+    derivation: Option<rift_protocol::read::RelationshipDerivation>,
+    occurrence: Option<DeclarationBinding>,
 }
 
 impl ContributionRelationship {
     /// Creates one relationship.
     #[must_use]
     pub const fn new(kind: RelationshipKind, target: ContributionReference) -> Self {
-        Self { kind, target }
+        Self {
+            kind,
+            target,
+            derivation: None,
+            occurrence: None,
+        }
+    }
+
+    /// Retains the provider's supplied derivation without inferring it from the kind.
+    #[must_use]
+    pub const fn with_derivation(
+        mut self,
+        derivation: rift_protocol::read::RelationshipDerivation,
+    ) -> Self {
+        self.derivation = Some(derivation);
+        self
+    }
+
+    /// Retains the exact source occurrence, including an optional supplied node.
+    #[must_use]
+    pub fn with_occurrence(mut self, occurrence: DeclarationBinding) -> Self {
+        self.occurrence = Some(occurrence);
+        self
+    }
+
+    /// The supplied derivation. Absent means the provider did not establish it.
+    #[must_use]
+    pub const fn derivation(&self) -> Option<rift_protocol::read::RelationshipDerivation> {
+        self.derivation
+    }
+
+    /// The supplied physical occurrence. Source-less relationships have no occurrence.
+    #[must_use]
+    pub const fn occurrence(&self) -> Option<&DeclarationBinding> {
+        self.occurrence.as_ref()
     }
 
     /// Returns portable relationship kind.

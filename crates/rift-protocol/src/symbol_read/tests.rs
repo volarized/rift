@@ -88,7 +88,13 @@ fn captured_view_requires_complete_key_and_unknown_fields_are_refused() {
         "g".repeat(64),
         "0".repeat(65),
     ] {
-        assert!(CapturedViewId::parse(&refused).is_err());
+        let error = CapturedViewId::parse(&refused).expect_err("invalid view key");
+        assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(key, value)| key == "field" && value == "view")
+        );
         assert!(serde_json::from_value::<CapturedViewId>(json!(refused)).is_err());
     }
     assert!(

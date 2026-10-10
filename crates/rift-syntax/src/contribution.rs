@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rift_core::{
@@ -14,6 +15,30 @@ use crate::{SyntaxDocument, SyntaxFacts};
 /// Stable identity of built-in syntax Contribution provider.
 pub const SYNTAX_PROVIDER_ID: &str = "syntax";
 
+/// One established export alias and its defining provider identity.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedAlias {
+    /// Exported name.
+    pub name: String,
+    /// Provider-local qualified exported name.
+    pub qualified_name: String,
+    /// Established logical alias identity.
+    pub identity: SymbolId,
+    /// Physical identity of the defining declaration.
+    pub target_identity: String,
+    /// Original export statement range.
+    pub range: crate::ByteRange,
+}
+
+/// Logical identity and language supplied by an established declaration mapping.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogicalDeclaration {
+    /// Established target identity.
+    pub identity: SymbolId,
+    /// Language of that logical target.
+    pub language: rift_protocol::read::Language,
+}
+
 /// Where one document's declarations are filed: origin, source unit, and identity path.
 ///
 /// `unit` is the [`SourceUnitId`] every declaration's binding names, and
@@ -27,6 +52,9 @@ pub struct DocumentPlacement {
     origin: ContributionOrigin,
     unit: SourceUnitId,
     identity_path: String,
+    identity_anchors: Option<BTreeMap<String, SymbolId>>,
+    aliases: Vec<PlacedAlias>,
+    logical_declarations: BTreeMap<String, LogicalDeclaration>,
 }
 
 impl DocumentPlacement {
@@ -41,6 +69,9 @@ impl DocumentPlacement {
             origin,
             unit,
             identity_path: identity_path.into(),
+            identity_anchors: None,
+            aliases: Vec::new(),
+            logical_declarations: BTreeMap::new(),
         }
     }
 
@@ -85,6 +116,46 @@ impl DocumentPlacement {
     #[must_use]
     pub fn identity_path(&self) -> &str {
         &self.identity_path
+    }
+
+    /// Supplies established logical identities separately from physical provider keys.
+    /// An empty map retains all declarations as unresolved facts.
+    #[must_use]
+    pub fn with_identity_anchors(mut self, anchors: BTreeMap<String, SymbolId>) -> Self {
+        self.identity_anchors = Some(anchors);
+        self
+    }
+
+    /// Returns the current established identity for one physical declaration key.
+    #[must_use]
+    pub fn logical_identity(&self, qualified_name: &str) -> Option<&SymbolId> {
+        self.logical_declarations
+            .get(qualified_name)
+            .map(|declaration| &declaration.identity)
+            .or_else(|| self.identity_anchors.as_ref()?.get(qualified_name))
+    }
+
+    /// Supplies source-backed export aliases beside existing declarations.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: Vec<PlacedAlias>) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    /// Number of additional export alias declarations.
+    #[must_use]
+    pub fn aliases_count(&self) -> usize {
+        self.aliases.len()
+    }
+
+    /// Supplies established logical mappings while preserving physical source bindings.
+    #[must_use]
+    pub fn with_logical_declarations(
+        mut self,
+        declarations: BTreeMap<String, LogicalDeclaration>,
+    ) -> Self {
+        self.logical_declarations = declarations;
+        self
     }
 }
 
@@ -179,15 +250,26 @@ impl SyntaxPublicationBuilder {
         let language_segment = syntax.language().identity_segment();
         let mut additions = Vec::with_capacity(syntax.symbols().len());
         for symbol in syntax.symbols() {
+            let logical = placement.logical_declarations.get(&symbol.qualified_name);
             let identity = symbol_identity(
                 &language_segment,
                 placement.identity_path(),
                 &symbol.qualified_name,
             );
-            let identity = SymbolId::new(identity)?;
-            let provider_symbol = ProviderSymbolId::for_symbol(identity.as_str())?;
+            let provider_symbol = ProviderSymbolId::for_symbol(&identity)?;
+            let anchor = if let Some(logical) = logical {
+                Some(logical.identity.clone())
+            } else {
+                match &placement.identity_anchors {
+                    Some(anchors) => anchors.get(&symbol.qualified_name).cloned(),
+                    None => Some(SymbolId::new(identity)?),
+                }
+            };
             let mut facts = PortableSymbolFacts::new(
-                syntax.language().clone(),
+                logical.map_or_else(
+                    || syntax.language().clone(),
+                    |logical| logical.language.clone(),
+                ),
                 symbol.name.clone(),
                 symbol.qualified_name.clone(),
                 ExactKind(symbol.kind.to_owned()),
@@ -211,7 +293,7 @@ impl SyntaxPublicationBuilder {
                 SourceRange::new(symbol.item_range.start, symbol.item_range.end)?,
                 None,
             );
-            let contribution = Contribution::builder(
+            let mut contribution = Contribution::builder(
                 ContributionKey::new(self.provider.clone(), self.publication, provider_symbol),
                 SourceApplicability::Exact {
                     source_revision: self.source_revision,
@@ -220,12 +302,73 @@ impl SyntaxPublicationBuilder {
                 facts,
                 placement.origin().clone(),
             )
-            .source(source)
-            .identity_anchor(identity)
-            .build()?;
-            additions.push(contribution);
+            .source(source);
+            if let Some(anchor) = anchor {
+                contribution = contribution.identity_anchor(anchor);
+            }
+            additions.push(contribution.build()?);
         }
+        self.add_alias_contributions(syntax, placement, &mut additions)?;
         self.contributions.extend(additions);
+        Ok(())
+    }
+
+    fn add_alias_contributions(
+        &self,
+        syntax: &SyntaxFacts,
+        placement: &DocumentPlacement,
+        additions: &mut Vec<Contribution>,
+    ) -> Result<(), RiftError> {
+        let language_segment = syntax.language().identity_segment();
+        for alias in &placement.aliases {
+            let identity = symbol_identity(
+                &language_segment,
+                placement.identity_path(),
+                &alias.qualified_name,
+            );
+            let provider_symbol = ProviderSymbolId::for_symbol(&identity)?;
+            let target = ContributionReference::new(
+                self.provider.clone(),
+                ProviderSymbolId::for_symbol(&alias.target_identity)?,
+            );
+            let source = rift_core::DeclarationBinding::new(
+                placement.unit().clone(),
+                SourceRange::new(alias.range.start, alias.range.end)?,
+                None,
+            );
+            let facts = PortableSymbolFacts::new(
+                syntax.language().clone(),
+                alias.name.clone(),
+                alias.qualified_name.clone(),
+                ExactKind("export".to_owned()),
+            )
+            .facets(vec![
+                rift_protocol::read::SymbolFacet::Alias,
+                rift_protocol::read::SymbolFacet::Public,
+            ])
+            .visibility("public");
+            let relationship = rift_core::ContributionRelationship::new(
+                rift_core::RelationshipKind::Alias,
+                target,
+            )
+            .with_derivation(rift_protocol::read::RelationshipDerivation::Syntax)
+            .with_occurrence(source.clone());
+            additions.push(
+                Contribution::builder(
+                    ContributionKey::new(self.provider.clone(), self.publication, provider_symbol),
+                    SourceApplicability::Exact {
+                        source_revision: self.source_revision,
+                        tree_revision: self.tree_revision,
+                    },
+                    facts,
+                    placement.origin().clone(),
+                )
+                .source(source)
+                .identity_anchor(alias.identity.clone())
+                .relationships(vec![relationship])
+                .build()?,
+            );
+        }
         Ok(())
     }
 

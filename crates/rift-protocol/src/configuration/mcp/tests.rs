@@ -69,14 +69,20 @@ fn aggregate_registration_budget_counts_utf8_bytes_and_all_entries() {
     assert_eq!(value.extra["cloud"].len() + "cloud".len(), budget);
     value.validate().expect("exact aggregate boundary");
     value.extra.insert("app".to_owned(), ".".to_owned());
+    let error = value.validate().expect_err("aggregate boundary exceeded");
     assert_eq!(
-        value.validate(),
-        Err(ConfigurationViolation::LimitOutOfRange {
+        error.slug().as_str(),
+        "rift.core.configuration_limit_out_of_range"
+    );
+    assert_eq!(
+        error.context().collect::<Vec<_>>(),
+        ConfigurationViolation::LimitOutOfRange {
             field: "mcp.extra",
             value: CONFIGURATION_FILE_BYTES_MAX + 4,
             min: 0,
             max: CONFIGURATION_FILE_BYTES_MAX,
-        })
+        }
+        .evidence()
     );
 }
 
@@ -119,13 +125,13 @@ fn accepted_registration_names_fit_the_canonical_local_scope() {
         assert_eq!(validator.is_valid(&value), accepted);
         assert_eq!(configuration.validate().is_ok(), accepted);
         if !accepted {
-            assert!(matches!(
-                configuration.validate(),
-                Err(ConfigurationViolation::McpRegistrationInvalid {
-                    field: "mcp.extra",
-                    ..
-                })
-            ));
+            let error = configuration.validate().expect_err("invalid registration");
+            assert_eq!(error.slug().as_str(), "rift.core.configuration_invalid");
+            assert!(
+                error
+                    .context()
+                    .any(|(key, value)| key == "field" && value == "mcp.extra")
+            );
         }
     }
 }

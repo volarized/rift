@@ -46,9 +46,22 @@ pub struct NormalizedRelationship {
     source: ContributionKey,
     kind: RelationshipKind,
     target: NormalizedTarget,
+    derivation: Option<rift_protocol::read::RelationshipDerivation>,
+    occurrence: Option<DeclarationBinding>,
 }
 
 impl NormalizedRelationship {
+    /// Returns the provider's supplied derivation without inferring it from the kind.
+    #[must_use]
+    pub const fn derivation(&self) -> Option<rift_protocol::read::RelationshipDerivation> {
+        self.derivation
+    }
+
+    /// Returns the original physical occurrence, when supplied.
+    #[must_use]
+    pub const fn occurrence(&self) -> Option<&DeclarationBinding> {
+        self.occurrence.as_ref()
+    }
     /// Returns captured index revision.
     #[must_use]
     pub const fn index_revision(&self) -> IndexRevision {
@@ -693,6 +706,8 @@ fn normalize_edges(
                 source: contribution.key().clone(),
                 kind: relationship.kind(),
                 target: normalize_target(relationship.target()),
+                derivation: relationship.derivation(),
+                occurrence: relationship.occurrence().cloned(),
             }
         }));
     }

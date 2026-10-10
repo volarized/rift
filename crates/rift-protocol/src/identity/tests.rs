@@ -107,6 +107,15 @@ fn test_source_unit_boundary_keeps_resolvers_paths_and_released_owners_distinct(
     assert!(super::released_source_identity(&custom, "file.rs").is_err());
 }
 
+pub(super) fn error_violation(error: &rift_error::RiftError) -> String {
+    assert_eq!(error.slug().as_str(), "rift.core.symbol_identity_invalid");
+    error
+        .context()
+        .find(|(key, _)| *key == "violation")
+        .expect("registered violation evidence")
+        .1
+}
+
 #[test]
 fn test_source_unit_boundary_checks_decoded_and_encoded_limits() {
     use crate::read::SourceUnitId;
@@ -120,8 +129,9 @@ fn test_source_unit_boundary_checks_decoded_and_encoded_limits() {
     assert_eq!(exact_wire.len(), SYMBOL_ID_BYTES_MAX);
     assert!(SourceUnitId::parse(&exact_wire).is_ok());
     assert_eq!(
-        super::parse_source_unit_identity(&format!("{exact_wire}a")),
-        Err(SymbolIdentityViolation::Length)
+        super::parse_source_unit_identity(&format!("{exact_wire}a"))
+            .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
 }
 
@@ -440,14 +450,18 @@ fn test_component_escaping_preserves_data_and_rejects_alternate_spellings() {
     ] {
         let value = format!("rift://symbol/local/rust/app/{value}");
         assert_eq!(
-            SymbolIdentity::parse(&value).err(),
-            Some(SymbolIdentityViolation::Noncanonical),
+            SymbolIdentity::parse(&value)
+                .err()
+                .map(|error| error_violation(&error)),
+            Some("Noncanonical".to_owned()),
             "{value}"
         );
     }
     assert_eq!(
-        SymbolIdentity::parse("rift://symbol/local/rust/app/%FF").err(),
-        Some(SymbolIdentityViolation::Encoding)
+        SymbolIdentity::parse("rift://symbol/local/rust/app/%FF")
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Encoding".to_owned())
     );
 }
 
@@ -497,24 +511,32 @@ fn test_occurrences_require_complete_revisions_and_canonical_positive_numbers() 
         ("~2/Child?rev=1234", SymbolIdentityViolation::Occurrence),
     ] {
         assert_eq!(
-            SymbolIdentity::parse(&format!("rift://symbol/local/rust/app/anonymous{suffix}")).err(),
-            Some(violation)
+            SymbolIdentity::parse(&format!("rift://symbol/local/rust/app/anonymous{suffix}"))
+                .err()
+                .map(|error| error_violation(&error)),
+            Some(format!("{violation:?}"))
         );
     }
     let leading_zero = format!("rift://symbol/local/rust/app/anonymous~02?rev={REVISION}");
     assert_eq!(
-        SymbolIdentity::parse(&leading_zero).err(),
-        Some(SymbolIdentityViolation::Noncanonical)
+        SymbolIdentity::parse(&leading_zero)
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Noncanonical".to_owned())
     );
     let extra_query =
         format!("rift://symbol/local/rust/app/anonymous~2?rev={REVISION}&rev={REVISION}");
     assert_eq!(
-        SymbolIdentity::parse(&extra_query).err(),
-        Some(SymbolIdentityViolation::Revision)
+        SymbolIdentity::parse(&extra_query)
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Revision".to_owned())
     );
     assert_eq!(
-        SymbolOccurrence::new(2, REVISION.to_uppercase()).err(),
-        Some(SymbolIdentityViolation::Revision)
+        SymbolOccurrence::new(2, REVISION.to_uppercase())
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Revision".to_owned())
     );
 }
 
@@ -565,8 +587,10 @@ fn test_length_bound_applies_before_decode_and_after_encoding() {
     let exact = format!("{prefix}{}", "a".repeat(SYMBOL_ID_BYTES_MAX - prefix.len()));
     assert!(SymbolIdentity::parse(&exact).is_ok());
     assert_eq!(
-        SymbolIdentity::parse(&(exact.clone() + "a")).err(),
-        Some(SymbolIdentityViolation::Length)
+        SymbolIdentity::parse(&(exact.clone() + "a"))
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Length".to_owned())
     );
     assert_eq!(
         SymbolIdentity::new(
@@ -574,8 +598,9 @@ fn test_length_bound_applies_before_decode_and_after_encoding() {
             language(),
             vec!["é".repeat(SYMBOL_ID_BYTES_MAX / 3)]
         )
-        .err(),
-        Some(SymbolIdentityViolation::Length)
+        .err()
+        .map(|error| error_violation(&error)),
+        Some("Length".to_owned())
     );
     assert_eq!(
         SymbolIdentity::new(
@@ -583,15 +608,17 @@ fn test_length_bound_applies_before_decode_and_after_encoding() {
             language(),
             vec![String::new(); SYMBOL_ID_BYTES_MAX + 1]
         )
-        .err(),
-        Some(SymbolIdentityViolation::Length)
+        .err()
+        .map(|error| error_violation(&error)),
+        Some("Length".to_owned())
     );
     let identity = SymbolIdentity::parse(&exact).expect("exact bound");
     assert_eq!(
         identity
             .with_occurrence(SymbolOccurrence::new(1, REVISION.into()).expect("occurrence"))
-            .err(),
-        Some(SymbolIdentityViolation::Length)
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Length".to_owned())
     );
 }
 
@@ -618,15 +645,19 @@ fn test_construction_and_registration_use_same_acceptance() {
         "rift://symbol/local@service/rust/app"
     );
     assert_eq!(
-        SymbolIdentity::new(SymbolOwner::Local, language(), vec![]).err(),
-        Some(SymbolIdentityViolation::QualifiedPath)
+        SymbolIdentity::new(SymbolOwner::Local, language(), vec![])
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("QualifiedPath".to_owned())
     );
     let malformed_language = Language {
         name: "Rust".into(),
         dialect: None,
     };
     assert_eq!(
-        SymbolIdentity::new(SymbolOwner::Local, malformed_language, vec!["Name".into()]).err(),
-        Some(SymbolIdentityViolation::Language)
+        SymbolIdentity::new(SymbolOwner::Local, malformed_language, vec!["Name".into()])
+            .err()
+            .map(|error| error_violation(&error)),
+        Some("Language".to_owned())
     );
 }

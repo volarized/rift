@@ -797,3 +797,13 @@ __rift_error_definition!(
         identity: required(string),
     },
 );
+
+__rift_error_definition!(
+    symbol_identity_invalid,
+    slug = "rift.core.symbol_identity_invalid",
+    message = "symbol identity is not canonical: {violation}",
+    action = "supply a canonical rift://symbol/ address",
+    fields = {
+        violation: required(string),
+    },
+);

@@ -3063,6 +3063,9 @@ fn limit_evidence(
     ]
 }
 
+mod failure;
+pub use failure::configuration_violation_error;
+
 /// The first bound a configuration file breaks. Field paths name keys as
 /// the file spells them, so the refusal points at the line to fix.
 #[derive(Clone, Debug, PartialEq, Serialize)]

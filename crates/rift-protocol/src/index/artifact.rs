@@ -1,3 +1,4 @@
+use rift_error::{RiftError, errors};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -11,13 +12,27 @@ pub const PACKAGE_ARTIFACT_BYTES_MAX: usize = 65_536;
 
 /// A selected artifact field the analyzer cannot accept.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PackageArtifactViolation {
+pub(crate) enum PackageArtifactViolation {
     /// An input or expanded tag set exceeds its bound.
     Length,
     /// A compatibility tag has invalid components.
     Tag,
     /// The artifact filename is not one root-relative basename.
     Path,
+}
+
+impl From<PackageArtifactViolation> for RiftError {
+    fn from(violation: PackageArtifactViolation) -> Self {
+        let detail = match violation {
+            PackageArtifactViolation::Length => "Length",
+            PackageArtifactViolation::Tag => "Tag",
+            PackageArtifactViolation::Path => "Path",
+        };
+        errors::analysis::package_artifact_invalid()
+            .field("artifact")
+            .violation(detail)
+            .error()
+    }
 }
 
 /// One expanded Python, ABI and platform compatibility tag.
@@ -42,11 +57,10 @@ struct WheelTagInput {
 }
 
 impl TryFrom<WheelTagInput> for WheelTag {
-    type Error = String;
+    type Error = RiftError;
 
     fn try_from(value: WheelTagInput) -> Result<Self, Self::Error> {
         Self::new(&value.python, &value.abi, &value.platform)
-            .map_err(|violation| format!("invalid wheel tag: {violation:?}"))
     }
 }
 
@@ -55,7 +69,7 @@ impl WheelTag {
     ///
     /// # Errors
     /// Returns a violation for invalid components or an excessive byte count.
-    pub fn new(python: &str, abi: &str, platform: &str) -> Result<Self, PackageArtifactViolation> {
+    pub fn new(python: &str, abi: &str, platform: &str) -> Result<Self, RiftError> {
         if [python, abi, platform]
             .iter()
             .any(|value| value.len() > PACKAGE_ARTIFACT_BYTES_MAX)
@@ -65,13 +79,13 @@ impl WheelTag {
                 .sum::<usize>()
                 > PACKAGE_ARTIFACT_BYTES_MAX
         {
-            return Err(PackageArtifactViolation::Length);
+            return Err(PackageArtifactViolation::Length.into());
         }
         if !python_identifier_is_valid(python)
             || !tag_component_is_valid(abi)
             || !tag_component_is_valid(platform)
         {
-            return Err(PackageArtifactViolation::Tag);
+            return Err(PackageArtifactViolation::Tag.into());
         }
         Ok(Self {
             python: python.to_lowercase(),
@@ -84,9 +98,9 @@ impl WheelTag {
     ///
     /// # Errors
     /// Returns a violation before expansion for malformed or excessive input.
-    pub fn parse(value: &str) -> Result<Vec<Self>, PackageArtifactViolation> {
+    pub fn parse(value: &str) -> Result<Vec<Self>, RiftError> {
         if value.len() > PACKAGE_ARTIFACT_BYTES_MAX {
-            return Err(PackageArtifactViolation::Length);
+            return Err(PackageArtifactViolation::Length.into());
         }
         let mut fields = value.split('-');
         let python = fields.next().ok_or(PackageArtifactViolation::Tag)?;
@@ -97,7 +111,7 @@ impl WheelTag {
             || !abi.split('.').all(tag_component_is_valid)
             || !platform.split('.').all(tag_component_is_valid)
         {
-            return Err(PackageArtifactViolation::Tag);
+            return Err(PackageArtifactViolation::Tag.into());
         }
         let counts = [
             python.split('.').count(),
@@ -110,7 +124,7 @@ impl WheelTag {
                 .ok_or(PackageArtifactViolation::Length)
         })?;
         if count > PACKAGE_ARTIFACT_TAGS_MAX {
-            return Err(PackageArtifactViolation::Length);
+            return Err(PackageArtifactViolation::Length.into());
         }
         let bytes = [python, abi, platform]
             .iter()
@@ -120,7 +134,7 @@ impl WheelTag {
             })
             .sum::<usize>();
         if bytes > PACKAGE_ARTIFACT_BYTES_MAX {
-            return Err(PackageArtifactViolation::Length);
+            return Err(PackageArtifactViolation::Length.into());
         }
         let mut tags = Vec::with_capacity(count);
         for python in python.split('.') {
@@ -207,11 +221,10 @@ struct PackageArtifactInput {
 }
 
 impl TryFrom<PackageArtifactInput> for PackageArtifact {
-    type Error = String;
+    type Error = RiftError;
 
     fn try_from(value: PackageArtifactInput) -> Result<Self, Self::Error> {
         Self::new(&value.filename.0, value.content_digest, &value.tags)
-            .map_err(|violation| format!("invalid package artifact: {violation:?}"))
     }
 }
 
@@ -224,7 +237,7 @@ impl PackageArtifact {
         filename: &str,
         content_digest: SourceDigest,
         tags: &[WheelTag],
-    ) -> Result<Self, PackageArtifactViolation> {
+    ) -> Result<Self, RiftError> {
         if tags.len() > PACKAGE_ARTIFACT_TAGS_MAX
             || filename
                 .len()
@@ -232,20 +245,20 @@ impl PackageArtifact {
                 .saturating_add(tags.iter().map(WheelTag::bytes).sum::<usize>())
                 > PACKAGE_ARTIFACT_BYTES_MAX
         {
-            return Err(PackageArtifactViolation::Length);
+            return Err(PackageArtifactViolation::Length.into());
         }
         if !crate::identity::source_unit_path_is_valid(filename) || filename.contains('/') {
-            return Err(PackageArtifactViolation::Path);
+            return Err(PackageArtifactViolation::Path.into());
         }
         let mut tags = tags.to_vec();
         tags.sort_unstable();
         tags.dedup();
         if filename.strip_suffix(".whl").is_some() {
             if tags != wheel_filename_tags(filename)? {
-                return Err(PackageArtifactViolation::Tag);
+                return Err(PackageArtifactViolation::Tag.into());
             }
         } else if !tags.is_empty() {
-            return Err(PackageArtifactViolation::Tag);
+            return Err(PackageArtifactViolation::Tag.into());
         }
         Ok(Self {
             filename: ProjectPath(filename.to_owned()),
@@ -273,13 +286,13 @@ impl PackageArtifact {
     }
 }
 
-fn wheel_filename_tags(filename: &str) -> Result<Vec<WheelTag>, PackageArtifactViolation> {
+fn wheel_filename_tags(filename: &str) -> Result<Vec<WheelTag>, RiftError> {
     let stem = filename
         .strip_suffix(".whl")
         .ok_or(PackageArtifactViolation::Path)?;
     let dashes = stem.bytes().filter(|byte| *byte == b'-').count();
     if !matches!(dashes, 4 | 5) {
-        return Err(PackageArtifactViolation::Path);
+        return Err(PackageArtifactViolation::Path.into());
     }
     let mut parts = stem.splitn(dashes - 1, '-');
     let name = parts.next().ok_or(PackageArtifactViolation::Path)?;
@@ -291,12 +304,12 @@ fn wheel_filename_tags(filename: &str) -> Result<Vec<WheelTag>, PackageArtifactV
             .all(|character| character.is_alphanumeric() || matches!(character, '_' | '.'))
         || version.parse::<pep440_rs::Version>().is_err()
     {
-        return Err(PackageArtifactViolation::Path);
+        return Err(PackageArtifactViolation::Path.into());
     }
     if dashes == 5 {
         let build = parts.next().ok_or(PackageArtifactViolation::Path)?;
         if !build.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-            return Err(PackageArtifactViolation::Path);
+            return Err(PackageArtifactViolation::Path.into());
         }
     }
     WheelTag::parse(parts.next().ok_or(PackageArtifactViolation::Tag)?)

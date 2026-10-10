@@ -1,7 +1,4 @@
-use super::{
-    PACKAGE_ARTIFACT_BYTES_MAX, PackageArtifact, PackageArtifactViolation, WheelTag,
-    python_identifier_is_valid,
-};
+use super::{PACKAGE_ARTIFACT_BYTES_MAX, PackageArtifact, WheelTag, python_identifier_is_valid};
 use crate::identity::SourceDigest;
 
 #[test]
@@ -21,6 +18,23 @@ fn compressed_tags_expand_one_bounded_cartesian_set() {
     assert_eq!(tags.len(), 8);
     assert!(tags.windows(2).all(|pair| pair[0] < pair[1]));
     assert!(tags.iter().all(|tag| tag.python().starts_with("cp3")));
+}
+
+fn error_violation(error: &rift_error::RiftError) -> String {
+    assert_eq!(
+        error.slug().as_str(),
+        "rift.analysis.package_artifact_invalid"
+    );
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "field" && value == "artifact")
+    );
+    error
+        .context()
+        .find(|(key, _)| *key == "violation")
+        .expect("registered violation evidence")
+        .1
 }
 
 #[test]
@@ -47,8 +61,8 @@ fn tags_preserve_base64_abi_and_validate_python_identifiers() {
         "py3-none-any\n",
     ] {
         assert_eq!(
-            WheelTag::parse(value),
-            Err(PackageArtifactViolation::Tag),
+            WheelTag::parse(value).map_err(|error| error_violation(&error)),
+            Err("Tag".to_owned()),
             "{value}"
         );
     }
@@ -88,40 +102,44 @@ fn tag_limits_apply_before_cartesian_expansion_and_lowercase_copy() {
         64
     );
     assert_eq!(
-        WheelTag::parse(&format!("{python}.py64-none-any")),
-        Err(PackageArtifactViolation::Length)
+        WheelTag::parse(&format!("{python}.py64-none-any"))
+            .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     assert_eq!(
-        WheelTag::parse(&format!("{python}-none.abi3-any")),
-        Err(PackageArtifactViolation::Length)
+        WheelTag::parse(&format!("{python}-none.abi3-any"))
+            .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     let exact_abi = "a".repeat(PACKAGE_ARTIFACT_BYTES_MAX - "py3".len() - "any".len());
     assert!(WheelTag::new("py3", &exact_abi, "any").is_ok());
     assert_eq!(
-        WheelTag::new("py3", &format!("{exact_abi}a"), "any"),
-        Err(PackageArtifactViolation::Length)
+        WheelTag::new("py3", &format!("{exact_abi}a"), "any")
+            .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     assert_eq!(
         WheelTag::parse(&format!(
             "py3-{}-any",
             "a".repeat(PACKAGE_ARTIFACT_BYTES_MAX)
-        )),
-        Err(PackageArtifactViolation::Length)
+        ))
+        .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     let repeated = format!("py2.py3-{}-any", "a".repeat(PACKAGE_ARTIFACT_BYTES_MAX / 2));
     assert_eq!(
-        WheelTag::parse(&repeated),
-        Err(PackageArtifactViolation::Length)
+        WheelTag::parse(&repeated).map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     let expanding_lowercase = "İ".repeat(PACKAGE_ARTIFACT_BYTES_MAX / 2);
     assert_eq!(
-        WheelTag::new(&expanding_lowercase, "none", "any"),
-        Err(PackageArtifactViolation::Length)
+        WheelTag::new(&expanding_lowercase, "none", "any").map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
 }
 
 #[test]
-fn artifact_factories_preserve_filename_digest_and_refuse_unbounded_fields() {
+fn artifact_factories_preserve_filename_digest() {
     let digest = SourceDigest::parse(&"f".repeat(64)).expect("artifact digest");
     let tags = WheelTag::parse("py2.py3-none-any").expect("selected tags");
     let artifact = PackageArtifact::new("six-1.17.0-py2.py3-none-any.whl", digest.clone(), &tags)
@@ -137,25 +155,35 @@ fn artifact_factories_preserve_filename_digest_and_refuse_unbounded_fields() {
     let source =
         PackageArtifact::new("click-8.3.3.tar.gz", digest.clone(), &[]).expect("source archive");
     assert!(source.tags().is_empty());
+}
+
+#[test]
+fn artifact_factories_refuse_unbounded_fields() {
+    let digest = SourceDigest::parse(&"f".repeat(64)).expect("artifact digest");
+    let tags = WheelTag::parse("py2.py3-none-any").expect("selected tags");
     assert_eq!(
         PackageArtifact::new(
             "six-1.17.0-py2.py3-none-any.whl",
             digest.clone(),
             &tags[..1]
-        ),
-        Err(PackageArtifactViolation::Tag)
+        )
+        .map_err(|error| error_violation(&error)),
+        Err("Tag".to_owned())
     );
     assert_eq!(
-        PackageArtifact::new("six-1.17.0-py3-none-any.whl", digest.clone(), &tags),
-        Err(PackageArtifactViolation::Tag)
+        PackageArtifact::new("six-1.17.0-py3-none-any.whl", digest.clone(), &tags)
+            .map_err(|error| error_violation(&error)),
+        Err("Tag".to_owned())
     );
     assert_eq!(
-        PackageArtifact::new("click-8.3.3.tar.gz", digest.clone(), &tags),
-        Err(PackageArtifactViolation::Tag)
+        PackageArtifact::new("click-8.3.3.tar.gz", digest.clone(), &tags)
+            .map_err(|error| error_violation(&error)),
+        Err("Tag".to_owned())
     );
     assert_eq!(
-        PackageArtifact::new("six-1.17.0-py2.py3-none-any.WHL", digest.clone(), &tags),
-        Err(PackageArtifactViolation::Tag)
+        PackageArtifact::new("six-1.17.0-py2.py3-none-any.WHL", digest.clone(), &tags)
+            .map_err(|error| error_violation(&error)),
+        Err("Tag".to_owned())
     );
     assert!(
         PackageArtifact::new(
@@ -173,8 +201,9 @@ fn artifact_factories_preserve_filename_digest_and_refuse_unbounded_fields() {
         "six__other-1.17.0-py2.py3-none-any.whl",
     ] {
         assert_eq!(
-            PackageArtifact::new(filename, digest.clone(), &tags),
-            Err(PackageArtifactViolation::Path),
+            PackageArtifact::new(filename, digest.clone(), &tags)
+                .map_err(|error| error_violation(&error)),
+            Err("Path".to_owned()),
             "{filename}"
         );
     }
@@ -189,24 +218,28 @@ fn artifact_factories_preserve_filename_digest_and_refuse_unbounded_fields() {
         "six\n.whl",
     ] {
         assert_eq!(
-            PackageArtifact::new(filename, digest.clone(), &[]),
-            Err(PackageArtifactViolation::Path),
+            PackageArtifact::new(filename, digest.clone(), &[])
+                .map_err(|error| error_violation(&error)),
+            Err("Path".to_owned()),
             "{filename}"
         );
     }
     assert_eq!(
-        PackageArtifact::new(&"a".repeat(4097), digest.clone(), &[]),
-        Err(PackageArtifactViolation::Path)
+        PackageArtifact::new(&"a".repeat(4097), digest.clone(), &[])
+            .map_err(|error| error_violation(&error)),
+        Err("Path".to_owned())
     );
     assert_eq!(
-        PackageArtifact::new("six.whl", digest.clone(), &vec![tags[0].clone(); 65]),
-        Err(PackageArtifactViolation::Length)
+        PackageArtifact::new("six.whl", digest.clone(), &vec![tags[0].clone(); 65])
+            .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     let large_tag = WheelTag::new("py3", &"a".repeat(PACKAGE_ARTIFACT_BYTES_MAX - 6), "any")
         .expect("tag at bound");
     assert_eq!(
-        PackageArtifact::new("six.whl", digest, &[large_tag]),
-        Err(PackageArtifactViolation::Length)
+        PackageArtifact::new("six.whl", digest, &[large_tag])
+            .map_err(|error| error_violation(&error)),
+        Err("Length".to_owned())
     );
     assert!(
         serde_json::from_value::<PackageArtifact>(

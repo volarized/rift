@@ -6,7 +6,7 @@ use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation, Sou
 use rift_error::{RiftError, errors};
 #[cfg(feature = "collector")]
 use rift_protocol::configuration::WorkspaceConfiguration;
-use rift_protocol::identity::SymbolOwner;
+use rift_protocol::identity::{SourceDigest, SymbolOwner};
 use rift_protocol::index::PACKAGE_SOURCE_BYTES_CEILING;
 use rift_protocol::index::PackageArtifact;
 use rift_protocol::read::Language;
@@ -16,8 +16,14 @@ use rift_provider::{
 };
 #[cfg(feature = "collector")]
 use rift_syntax::SyntaxLimits;
+use sha2::{Digest as _, Sha256};
 
 mod import_root;
+#[cfg(feature = "collector")]
+mod namespace;
+
+#[cfg(feature = "collector")]
+pub use namespace::{NamespaceInput, NamespaceModule};
 
 pub use import_root::{
     PACKAGE_IMPORT_BYTES_MAX, PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot,
@@ -277,13 +283,87 @@ impl ExactPackageLimits {
 pub struct PackageSource<'source> {
     path: &'source ProjectPath,
     text: &'source str,
+    physical: Option<(&'source SourceUnitId, &'source ContributionOrigin)>,
+    source_digest: Option<rift_core::FileDigest>,
 }
 
 impl<'source> PackageSource<'source> {
     /// Names one package-relative UTF-8 source file.
     #[must_use]
     pub const fn new(path: &'source ProjectPath, text: &'source str) -> Self {
-        Self { path, text }
+        Self {
+            path,
+            text,
+            physical: None,
+            source_digest: None,
+        }
+    }
+
+    /// Retains a released physical source unit and its origin beside the analysis path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the unit has no released owner or its origin differs.
+    pub fn with_source_unit(
+        mut self,
+        unit: &'source SourceUnitId,
+        origin: &'source ContributionOrigin,
+    ) -> Result<Self, RiftError> {
+        let owner = unit
+            .source_owner()
+            .ok_or_else(|| errors::analysis::package_input_origin_invalid().error())?;
+        validate_owner(owner)?;
+        validate_physical_origin(owner, origin)?;
+        self.physical = Some((unit, origin));
+        Ok(self)
+    }
+
+    /// Retains a captured external source with its original path and complete digest.
+    ///
+    /// Acquisition and captured-view membership are validated by the caller.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] when the unit, origin, original path, or source digest differs.
+    pub fn with_captured_source_unit(
+        mut self,
+        unit: &'source SourceUnitId,
+        origin: &'source ContributionOrigin,
+        original_path: &rift_core::SourcePath,
+        digest: &SourceDigest,
+    ) -> Result<Self, RiftError> {
+        validate_captured_origin(unit, origin)?;
+        let actual = Sha256::digest(self.text.as_bytes());
+        if unit.key() != original_path || format!("{actual:x}") != digest.as_str() {
+            return errors::analysis::package_input_identity_invalid()
+                .path(self.path.as_str())
+                .fail();
+        }
+        self.physical = Some((unit, origin));
+        self.source_digest = Some(rift_core::FileDigest::from_bytes(actual.into()));
+        Ok(self)
+    }
+
+    pub(crate) fn source_digest(self) -> rift_core::FileDigest {
+        self.source_digest
+            .unwrap_or_else(|| rift_core::FileDigest::of(self.text.as_bytes()))
+    }
+
+    /// Explicit physical source unit, when supplied.
+    #[must_use]
+    pub const fn source_unit(self) -> Option<&'source SourceUnitId> {
+        match self.physical {
+            Some((unit, _)) => Some(unit),
+            None => None,
+        }
+    }
+
+    /// Origin of the explicit physical source unit, when supplied.
+    #[must_use]
+    pub const fn origin(self) -> Option<&'source ContributionOrigin> {
+        match self.physical {
+            Some((_, origin)) => Some(origin),
+            None => None,
+        }
     }
 
     /// Package-relative path.
@@ -310,6 +390,8 @@ pub struct ExactPackageInput<'input> {
     frameworks: &'input [rift_protocol::configuration::SyntaxFrameworkConfiguration],
     import_roots: &'input [PackageImportRoot],
     artifact: Option<&'input PackageArtifact>,
+    #[cfg(feature = "collector")]
+    modules: &'input [NamespaceModule<'input>],
     limits: ExactPackageLimits,
 }
 
@@ -332,45 +414,7 @@ impl<'input> ExactPackageInput<'input> {
     ) -> Result<Self, RiftError> {
         validate_owner(owner)?;
         validate_origin(owner, origin)?;
-        let files_bound = limits.files_max.min(limits.publication().units);
-        let observed_files = u32::try_from(files.len()).unwrap_or(u32::MAX);
-        if observed_files > files_bound {
-            return errors::analysis::package_input_too_many_files()
-                .field("package_files_max")
-                .bound(u64::from(files_bound))
-                .observed(u64::from(observed_files))
-                .fail();
-        }
-        let mut paths = BTreeSet::new();
-        let mut bytes = 0_u64;
-        for file in files {
-            if !paths.insert(file.path) {
-                return errors::analysis::package_input_duplicate_path()
-                    .path(file.path.as_str())
-                    .fail();
-            }
-            SourceUnitId::for_owner(owner.clone(), file.path.as_str()).map_err(|error| {
-                errors::analysis::package_input_identity_invalid()
-                    .path(file.path.as_str())
-                    .cause(error)
-                    .error()
-            })?;
-            let file_bytes = u64::try_from(file.text.len()).unwrap_or(u64::MAX);
-            bytes = bytes.checked_add(file_bytes).ok_or_else(|| {
-                errors::analysis::package_input_too_many_bytes()
-                    .field("package_bytes_max")
-                    .bound(limits.bytes_max)
-                    .observed(u64::MAX)
-                    .error()
-            })?;
-            if bytes > limits.bytes_max {
-                return errors::analysis::package_input_too_many_bytes()
-                    .field("package_bytes_max")
-                    .bound(limits.bytes_max)
-                    .observed(bytes)
-                    .fail();
-            }
-        }
+        validate_sources(files, limits, |file| released_source_unit(owner, file))?;
         Ok(Self {
             owner,
             language,
@@ -380,6 +424,8 @@ impl<'input> ExactPackageInput<'input> {
             frameworks: &[],
             import_roots: &[],
             artifact: None,
+            #[cfg(feature = "collector")]
+            modules: &[],
             limits,
         })
     }
@@ -388,6 +434,27 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub const fn owner(self) -> &'input SymbolOwner {
         self.owner
+    }
+
+    /// Borrows the admitted source and metadata context for namespace placement.
+    #[cfg(feature = "collector")]
+    #[must_use]
+    pub fn namespace_input(self) -> NamespaceInput<'input> {
+        NamespaceInput::from_package(&self)
+    }
+
+    /// Adds selected module observations validated against this source inventory.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for invalid witnesses or exceeded bounds.
+    #[cfg(feature = "collector")]
+    pub fn with_modules(
+        mut self,
+        modules: &'input [NamespaceModule<'input>],
+    ) -> Result<Self, RiftError> {
+        self.namespace_input().with_modules(modules)?;
+        self.modules = modules;
+        Ok(self)
     }
 
     /// Adds established import roots without rewriting original source paths.
@@ -503,6 +570,16 @@ impl<'input> ExactPackageInput<'input> {
 }
 
 fn validate_origin(owner: &SymbolOwner, origin: &ContributionOrigin) -> Result<(), RiftError> {
+    if origin.source_kind() != SourceKind::Authored {
+        return errors::analysis::package_input_origin_invalid().fail();
+    }
+    validate_physical_origin(owner, origin)
+}
+
+fn validate_physical_origin(
+    owner: &SymbolOwner,
+    origin: &ContributionOrigin,
+) -> Result<(), RiftError> {
     let observed = match origin.location() {
         Some(SourceLocation::Dependency { package }) => package.owner().ok(),
         Some(SourceLocation::Stdlib {
@@ -510,7 +587,108 @@ fn validate_origin(owner: &SymbolOwner, origin: &ContributionOrigin) -> Result<(
         }) => runtime.owner().ok(),
         _ => None,
     };
-    if observed.as_ref() == Some(owner) && origin.source_kind() == SourceKind::Authored {
+    if observed.as_ref() == Some(owner) && origin.source_kind() != SourceKind::Synthetic {
+        return Ok(());
+    }
+    errors::analysis::package_input_origin_invalid().fail()
+}
+
+fn validate_source_count(observed: usize, limits: ExactPackageLimits) -> Result<(), RiftError> {
+    validate_source_count_at_bound(
+        observed,
+        limits.files_max.min(limits.publication().units) as usize,
+    )
+}
+
+fn validate_source_count_at_bound(observed: usize, bound: usize) -> Result<(), RiftError> {
+    if observed > bound {
+        return errors::analysis::package_input_too_many_files()
+            .field("package_files_max")
+            .bound(u64::try_from(bound).unwrap_or(u64::MAX))
+            .observed(u64::try_from(observed).unwrap_or(u64::MAX))
+            .fail();
+    }
+    Ok(())
+}
+
+fn validate_sources(
+    files: &[PackageSource<'_>],
+    limits: ExactPackageLimits,
+    source_unit: impl Fn(&PackageSource<'_>) -> Result<SourceUnitId, RiftError>,
+) -> Result<(), RiftError> {
+    validate_source_count(files.len(), limits)?;
+    validate_source_bytes_and_units(files, limits.bytes_max(), source_unit)
+}
+
+fn validate_source_bytes_and_units(
+    files: &[PackageSource<'_>],
+    bytes_max: u64,
+    source_unit: impl Fn(&PackageSource<'_>) -> Result<SourceUnitId, RiftError>,
+) -> Result<(), RiftError> {
+    let mut paths = BTreeSet::new();
+    let mut units = BTreeSet::new();
+    let mut bytes = 0_u64;
+    for file in files {
+        if !paths.insert(file.path) {
+            return errors::analysis::package_input_duplicate_path()
+                .path(file.path.as_str())
+                .fail();
+        }
+        let unit = source_unit(file)?;
+        if !units.insert(unit) {
+            return errors::analysis::package_input_duplicate_path()
+                .path(file.path.as_str())
+                .fail();
+        }
+        let file_bytes = u64::try_from(file.text.len()).unwrap_or(u64::MAX);
+        bytes = bytes.checked_add(file_bytes).ok_or_else(|| {
+            errors::analysis::package_input_too_many_bytes()
+                .field("package_bytes_max")
+                .bound(bytes_max)
+                .observed(u64::MAX)
+                .error()
+        })?;
+        if bytes > bytes_max {
+            return errors::analysis::package_input_too_many_bytes()
+                .field("package_bytes_max")
+                .bound(bytes_max)
+                .observed(bytes)
+                .fail();
+        }
+    }
+    Ok(())
+}
+
+fn released_source_unit(
+    owner: &SymbolOwner,
+    file: &PackageSource<'_>,
+) -> Result<SourceUnitId, RiftError> {
+    Ok(match file.physical {
+        Some((unit, physical_origin)) => {
+            match unit.source_owner() {
+                Some(physical_owner) => validate_physical_origin(physical_owner, physical_origin)?,
+                None => validate_captured_origin(unit, physical_origin)?,
+            }
+            unit.clone()
+        }
+        None => SourceUnitId::for_owner(owner.clone(), file.path.as_str()).map_err(|error| {
+            errors::analysis::package_input_identity_invalid()
+                .path(file.path.as_str())
+                .cause(error)
+                .error()
+        })?,
+    })
+}
+
+fn validate_captured_origin(
+    unit: &SourceUnitId,
+    origin: &ContributionOrigin,
+) -> Result<(), RiftError> {
+    if unit.source_owner().is_none()
+        && unit.resolver().as_str() == "external"
+        && matches!(origin.location(), Some(SourceLocation::External {}))
+        && origin.source_kind() != SourceKind::Synthetic
+    {
         return Ok(());
     }
     errors::analysis::package_input_origin_invalid().fail()
@@ -528,12 +706,174 @@ fn validate_owner(owner: &SymbolOwner) -> Result<(), RiftError> {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation};
+    use rift_core::{ContributionOrigin, ProjectPath, SourceKind, SourceLocation, SourceUnitId};
     use rift_protocol::read::{Language, PackageIdentity};
 
     use super::{ExactPackageInput, ExactPackageLimits, PackageSource};
-    use rift_protocol::identity::SymbolOwner;
+    use rift_protocol::identity::{SourceDigest, SymbolOwner};
     use rift_protocol::read::RuntimeIdentity;
+    use sha2::{Digest as _, Sha256};
+
+    #[test]
+    fn captured_external_source_requires_original_path_digest_and_origin() {
+        let alias = ProjectPath::new("runtime/module.pyi").expect("analysis path");
+        let original =
+            rift_core::SourcePath::new("captured/stdlib/module.pyi").expect("original source path");
+        let unit = SourceUnitId::new(
+            rift_core::SourceResolverId::new("external").expect("external resolver"),
+            original.clone(),
+        )
+        .expect("captured unit");
+        let external =
+            ContributionOrigin::new(Some(SourceLocation::External {}), SourceKind::Authored)
+                .expect("physical origin");
+        let text = "def open() -> None: ...";
+        let digest = SourceDigest::parse(&format!("{:x}", Sha256::digest(text.as_bytes())))
+            .expect("complete source digest");
+        let source = PackageSource::new(&alias, text)
+            .with_captured_source_unit(&unit, &external, &original, &digest)
+            .expect("captured source proof");
+        assert_eq!(source.path(), &alias);
+        assert_eq!(source.source_unit(), Some(&unit));
+        assert_eq!(source.origin(), Some(&external));
+        assert_eq!(source.text(), text);
+        let checked = rift_core::FileDigest::of(text.as_bytes());
+        assert_eq!(source.source_digest, Some(checked));
+        assert_eq!(source.source_digest(), checked);
+        let copied = source;
+        assert_eq!(copied.source_digest, Some(checked));
+        let ordinary = PackageSource::new(&alias, text);
+        assert_eq!(ordinary.source_digest, None);
+        assert_eq!(ordinary.source_digest(), checked);
+        assert!(
+            PackageSource::new(&alias, text)
+                .with_source_unit(&unit, &external)
+                .is_err()
+        );
+        let wrong_path = rift_core::SourcePath::new("other/module.pyi").expect("other path");
+        assert!(
+            PackageSource::new(&alias, text)
+                .with_captured_source_unit(&unit, &external, &wrong_path, &digest)
+                .is_err()
+        );
+        assert!(
+            PackageSource::new(&alias, "changed source")
+                .with_captured_source_unit(&unit, &external, &original, &digest)
+                .is_err()
+        );
+        let package = identity();
+        let package_origin = origin(&package);
+        assert!(
+            PackageSource::new(&alias, text)
+                .with_captured_source_unit(&unit, &package_origin, &original, &digest)
+                .is_err()
+        );
+        let owner = package.owner().expect("logical package owner");
+        let language = language();
+        let syntax = crate::package_syntax::PackageSyntaxSource::new(
+            source,
+            &owner,
+            &language,
+            rift_syntax::SyntaxLimits::default(),
+        );
+        assert_eq!(syntax.identity().source_digest, checked);
+        let files = [source];
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &package_origin,
+            &files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect("independent logical owner");
+        assert_eq!(input.owner(), &owner);
+        let second_path = ProjectPath::new("runtime/second.pyi").expect("second analysis path");
+        let second = PackageSource::new(&second_path, text)
+            .with_captured_source_unit(&unit, &external, &original, &digest)
+            .expect("same physical source");
+        let files = [source, second];
+        assert!(
+            ExactPackageInput::new(
+                &owner,
+                &language,
+                &package_origin,
+                &files,
+                ExactPackageLimits::new(2, 128),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn physical_source_override_keeps_origin_separate_and_refuses_duplicate_units() {
+        let package = identity();
+        let physical_owner = package.owner().expect("physical package owner");
+        let physical_origin = origin(&package);
+        let unit = rift_core::SourceUnitId::for_owner(physical_owner, "src/lib.rs")
+            .expect("physical source unit");
+        let alias = ProjectPath::new("runtime/core.rs").expect("analysis path");
+        let source = PackageSource::new(&alias, "pub fn open() {}")
+            .with_source_unit(&unit, &physical_origin)
+            .expect("explicit physical association");
+        assert_eq!(source.path(), &alias);
+        assert_eq!(source.source_unit(), Some(&unit));
+        assert_eq!(source.origin(), Some(&physical_origin));
+        let runtime = RuntimeIdentity {
+            runtime: "rust".to_owned(),
+            version: "1.98.0".to_owned(),
+        };
+        let owner = runtime.owner().expect("logical runtime owner");
+        let logical_origin = ContributionOrigin::new(
+            Some(SourceLocation::Stdlib {
+                runtime: Some(runtime),
+            }),
+            SourceKind::Authored,
+        )
+        .expect("logical runtime origin");
+        let files = [source];
+        let language = language();
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &logical_origin,
+            &files,
+            ExactPackageLimits::new(1, 64),
+        )
+        .expect("distinct logical owner");
+        assert_eq!(input.owner(), &owner);
+        assert!(
+            PackageSource::new(&alias, "source")
+                .with_source_unit(&unit, &logical_origin)
+                .is_err()
+        );
+        let custom = rift_core::SourceUnitId::new(
+            rift_core::SourceResolverId::new("external").expect("resolver"),
+            rift_core::SourcePath::new("original.rs").expect("original path"),
+        )
+        .expect("custom source unit");
+        assert!(
+            PackageSource::new(&alias, "source")
+                .with_source_unit(&custom, &physical_origin)
+                .is_err()
+        );
+        let second_path = ProjectPath::new("runtime/other.rs").expect("second analysis path");
+        let second = PackageSource::new(&second_path, "source")
+            .with_source_unit(&unit, &physical_origin)
+            .expect("same physical unit");
+        let files = [source, second];
+        let error = ExactPackageInput::new(
+            &owner,
+            &language,
+            &logical_origin,
+            &files,
+            ExactPackageLimits::new(2, 64),
+        )
+        .expect_err("duplicate physical unit");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.package_input_duplicate_path"
+        );
+    }
 
     #[test]
     fn exact_runtime_input_preserves_owner_without_a_package() {

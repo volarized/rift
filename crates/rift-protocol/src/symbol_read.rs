@@ -37,7 +37,7 @@ impl CapturedViewId {
     ///
     /// # Errors
     /// Returns an error for a malformed or oversized view key.
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, rift_error::RiftError> {
         let bounded = value.len() <= 4096;
         let digest = bounded
             && value.len() == 64
@@ -54,9 +54,10 @@ impl CapturedViewId {
                 })
             });
         if value.len() > 4096 || (!digest && !opaque) {
-            return Err(
-                "invalid captured view; supply the complete view key returned by a read".to_owned(),
-            );
+            return rift_error::errors::server::read_invalid()
+                .field("view")
+                .violation("invalid captured view; supply the complete view key returned by a read")
+                .fail();
         }
         Ok(Self(value.to_owned()))
     }
@@ -69,7 +70,7 @@ impl CapturedViewId {
 }
 
 impl TryFrom<String> for CapturedViewId {
-    type Error = String;
+    type Error = rift_error::RiftError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         Self::parse(&value)
@@ -125,11 +126,7 @@ where
     D: serde::Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    SymbolId::parse(&value).map_err(|violation| {
-        serde::de::Error::custom(format!(
-            "invalid symbol identity: {violation:?}; supply a canonical rift://symbol/ address"
-        ))
-    })
+    SymbolId::parse(&value).map_err(serde::de::Error::custom)
 }
 
 fn default_include() -> Vec<GetSymbolInclude> {

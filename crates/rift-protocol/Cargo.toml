@@ -11,6 +11,7 @@ description = "Protocol models and exported schemas for Rift"
 workspace = true
 
 [dependencies]
+rift-error.workspace = true
 percent-encoding.workspace = true
 pep440_rs.workspace = true
 unicode-ident.workspace = true

@@ -11,7 +11,7 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Most characters a declaration lookup name carries.
+/// Most characters a public symbol name or declaration lookup name carries.
 pub const SYMBOL_NAME_CHARACTERS_MAX: usize = 4096;
 /// Most project declarations proposed when a lookup finds no match.
 pub const SYMBOL_ALTERNATIVES_MAX: usize = 3;
@@ -975,15 +975,13 @@ impl PackageIdentity {
     ///
     /// # Errors
     /// Returns the violated owner or length bound.
-    pub fn owner(
-        &self,
-    ) -> Result<crate::identity::SymbolOwner, crate::identity::SymbolIdentityViolation> {
+    pub fn owner(&self) -> Result<crate::identity::SymbolOwner, rift_error::RiftError> {
         if self.manager.len() > 128
             || self.registry.len() > 4096
             || self.name.len() > 4096
             || self.version.len() > 4096
         {
-            return Err(crate::identity::SymbolIdentityViolation::Length);
+            return Err(crate::identity::SymbolIdentityViolation::Length.into());
         }
         let owner = crate::identity::SymbolOwner::Package {
             manager: self.manager.clone(),
@@ -1025,11 +1023,9 @@ impl RuntimeIdentity {
     ///
     /// # Errors
     /// Returns the violated owner or length bound.
-    pub fn owner(
-        &self,
-    ) -> Result<crate::identity::SymbolOwner, crate::identity::SymbolIdentityViolation> {
+    pub fn owner(&self) -> Result<crate::identity::SymbolOwner, rift_error::RiftError> {
         if self.runtime.len() > 128 || self.version.len() > 4096 {
-            return Err(crate::identity::SymbolIdentityViolation::Length);
+            return Err(crate::identity::SymbolIdentityViolation::Length.into());
         }
         let owner = crate::identity::SymbolOwner::Runtime {
             runtime: self.runtime.clone(),
@@ -1660,6 +1656,10 @@ pub struct Relationship {
     /// The nodes this edge was read from. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<NodeId>,
+    /// Exact physical occurrence when this edge was read from source, independent of
+    /// whether the provider supplied a source node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<SourceUnitSpan>,
     /// How this edge was established.
     pub derivation: RelationshipDerivation,
     /// How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other
@@ -2069,7 +2069,7 @@ impl SourceUnitId {
     ///
     /// # Errors
     /// Returns a violation for malformed ownership, paths, UTF-8 or encoding.
-    pub fn parse(value: &str) -> Result<Self, crate::identity::SymbolIdentityViolation> {
+    pub fn parse(value: &str) -> Result<Self, rift_error::RiftError> {
         crate::identity::parse_source_unit_identity(value)?;
         Ok(Self(value.to_owned()))
     }
@@ -2090,9 +2090,7 @@ impl SourceUnitId {
 impl<'de> Deserialize<'de> for SourceUnitId {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        crate::identity::parse_source_unit_identity(&value).map_err(|violation| {
-            serde::de::Error::custom(format!("invalid source-unit identity: {violation:?}"))
-        })?;
+        crate::identity::parse_source_unit_identity(&value).map_err(serde::de::Error::custom)?;
         Ok(Self(value))
     }
 }
@@ -2172,6 +2170,22 @@ pub struct Symbol {
     /// provider classifies locality from its language model; absent when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub document_local: bool,
+}
+
+impl Symbol {
+    /// Whether the name fits the public character bound.
+    ///
+    /// This checks the name's length independently of the declaration's export visibility.
+    /// Package artifacts retain names outside this bound when the provider's byte bound permits
+    /// them; public directories omit those objects.
+    #[must_use]
+    pub fn name_is_public(&self) -> bool {
+        self.name
+            .chars()
+            .take(SYMBOL_NAME_CHARACTERS_MAX + 1)
+            .count()
+            <= SYMBOL_NAME_CHARACTERS_MAX
+    }
 }
 
 /// One portable category a symbol falls into. Kinds are language-specific; facets are
@@ -2279,11 +2293,8 @@ impl JsonSchema for SymbolId {
 
 impl Serialize for SymbolId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let identity = crate::identity::SymbolIdentity::parse(self.as_str()).map_err(|violation| {
-            serde::ser::Error::custom(format!(
-                "invalid symbol identity: {violation:?}; supply a canonical rift://symbol/ address"
-            ))
-        })?;
+        let identity = crate::identity::SymbolIdentity::parse(self.as_str())
+            .map_err(serde::ser::Error::custom)?;
         identity.serialize(serializer)
     }
 }
@@ -2300,7 +2311,7 @@ impl SymbolId {
     ///
     /// # Errors
     /// Returns the codec violation when ownership, hierarchy or encoding is invalid.
-    pub fn parse(value: &str) -> Result<Self, crate::identity::SymbolIdentityViolation> {
+    pub fn parse(value: &str) -> Result<Self, rift_error::RiftError> {
         crate::identity::SymbolIdentity::parse(value).map(|identity| Self(identity.wire_identity()))
     }
 

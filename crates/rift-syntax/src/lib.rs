@@ -27,12 +27,13 @@ mod yaml;
 
 pub use angular::{AngularComponent, AngularTemplate, angular_components};
 pub use contribution::{
-    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, source_unit,
-    source_unit_for_path,
+    DocumentPlacement, LogicalDeclaration, PlacedAlias, SYNTAX_PROVIDER_ID,
+    SyntaxPublicationBuilder, source_unit, source_unit_for_path,
 };
 pub use css::CssSyntaxProvider;
 pub use document::{
-    ByteRange, SyntaxDocument, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
+    ByteRange, PythonOverload, RustModulePath, SyntaxDocument, SyntaxExportBinding,
+    SyntaxExportKind, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
 };
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
