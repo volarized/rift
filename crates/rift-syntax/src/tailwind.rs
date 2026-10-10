@@ -586,6 +586,8 @@ fn symbol(name: &str, kind: &'static str, range: ByteRange) -> SyntaxSymbol {
         signatures: Arc::from([]),
         documentation: Arc::from([]),
         documentation_ranges: Vec::new(),
+        module_path: None,
+        python_overload: None,
     }
 }
 
@@ -662,6 +664,7 @@ pub fn append_framework_symbols(
         has_errors: result.has_errors(),
         left_out_declarations: result.left_out_declaration_count(),
         markdown_facts: None,
+        export_bindings: result.facts().export_bindings().map(<[_]>::to_vec),
         source_digest: FileDigest::of(source.text.as_bytes()),
     };
     SyntaxFacts::from_parts(source.text, limits, parts)?;
