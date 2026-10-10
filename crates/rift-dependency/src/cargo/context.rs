@@ -409,22 +409,27 @@ struct DetailedDependency {
 impl Dependency {
     /// The entry this value declares, absent when it states no version.
     fn entry(&self, key: &str) -> Option<PackageContextEntry> {
-        let (name, requirement, availability) = match self {
-            Self::Requirement(requirement) => {
-                (key, requirement.as_str(), PackageAvailability::Canonical)
-            }
-            Self::Detailed(detailed) => (
-                detailed.package.as_deref().unwrap_or(key),
-                detailed.version.as_deref()?,
-                detailed.availability(),
+        let (name, requirement, availability, registry) = match self {
+            Self::Requirement(requirement) => (
+                key,
+                requirement.as_str(),
+                PackageAvailability::RegistryUnresolved,
+                None,
             ),
+            Self::Detailed(detailed) => {
+                let (availability, registry) = detailed.origin();
+                (
+                    detailed.package.as_deref().unwrap_or(key),
+                    detailed.version.as_deref()?,
+                    availability,
+                    registry,
+                )
+            }
         };
-        Some(PackageContextEntry::new(
-            CARGO_MANAGER,
-            name,
-            selector(requirement),
-            availability,
-        ))
+        let mut entry =
+            PackageContextEntry::new(CARGO_MANAGER, name, selector(requirement), availability);
+        entry.registry = registry;
+        Some(entry)
     }
 }
 
@@ -440,18 +445,29 @@ impl Dependency {
 }
 
 impl DetailedDependency {
-    /// Whether a global package index can answer for this declaration. A `path` decides
-    /// first, since Cargo builds from it whatever else the table states; then `git`, then
-    /// a `registry` or `registry-index` other than crates.io.
-    fn availability(&self) -> PackageAvailability {
+    /// The accepted defining registry and availability. Path and Git sources take
+    /// precedence; a registry alias alone does not establish an endpoint.
+    fn origin(&self) -> (PackageAvailability, Option<String>) {
         if self.path.is_some() {
-            PackageAvailability::Path
+            (PackageAvailability::Path, None)
         } else if self.git.is_some() {
-            PackageAvailability::Git
-        } else if self.registry.is_some() || self.registry_index.is_some() {
-            PackageAvailability::PrivateRegistry
+            (PackageAvailability::Git, None)
+        } else if self.registry.is_some() {
+            (PackageAvailability::RegistryUnresolved, None)
         } else {
-            PackageAvailability::Canonical
+            let registry = self.registry_index.as_deref().and_then(|index| {
+                if index.len() > 4096 {
+                    return None;
+                }
+                source_registry(Some(index))
+                    .or_else(|| source_registry(Some(&format!("registry+{index}"))))
+            });
+            let availability = match registry.as_deref() {
+                Some("crates.io") => PackageAvailability::Canonical,
+                Some(_) => PackageAvailability::PrivateRegistry,
+                None => PackageAvailability::RegistryUnresolved,
+            };
+            (availability, registry)
         }
     }
 }
@@ -621,6 +637,62 @@ source = \"git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210\"
     }
 
     #[test]
+    fn manifest_registry_evidence_establishes_only_explicit_accepted_endpoints() {
+        let manifest = r#"
+[dependencies]
+unknown = "1"
+alias = { version = "1", registry = "internal" }
+conflict = { version = "1", registry = "internal", registry-index = "https://registry.example/index" }
+private = { version = "1", registry-index = "https://registry.example/team/api" }
+public = { version = "1", registry-index = "https://github.com/rust-lang/crates.io-index" }
+sparse = { version = "1", registry-index = "sparse+https://registry.example/index" }
+credentials = { version = "1", registry-index = "https://user:secret@registry.example/index" }
+insecure = { version = "1", registry-index = "http://registry.example/index" }
+path = { version = "1", path = "../outside", registry-index = "https://registry.example/index" }
+git = { version = "1", git = "https://git.example/source", registry-index = "https://registry.example/index" }
+"#;
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/Cargo.toml"), manifest);
+        let answer = context(&["Cargo.toml"], &mut inspector);
+        for (name, availability, registry) in [
+            ("unknown", PackageAvailability::RegistryUnresolved, None),
+            ("alias", PackageAvailability::RegistryUnresolved, None),
+            ("conflict", PackageAvailability::RegistryUnresolved, None),
+            (
+                "private",
+                PackageAvailability::PrivateRegistry,
+                Some("registry.example/team/api"),
+            ),
+            ("public", PackageAvailability::Canonical, Some("crates.io")),
+            (
+                "sparse",
+                PackageAvailability::PrivateRegistry,
+                Some("registry.example/index"),
+            ),
+            ("credentials", PackageAvailability::RegistryUnresolved, None),
+            ("insecure", PackageAvailability::RegistryUnresolved, None),
+            ("path", PackageAvailability::Path, None),
+            ("git", PackageAvailability::Git, None),
+        ] {
+            let entry = answer
+                .entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .expect("selector retained");
+            assert_eq!(entry.availability, availability, "{name}");
+            assert_eq!(entry.registry.as_deref(), registry, "{name}");
+            assert_eq!(entry.requirement.as_deref(), Some("1"));
+        }
+        assert!(answer.install_folders.is_empty());
+        assert!(
+            answer
+                .degradations
+                .iter()
+                .all(|reason| !reason.contains("secret"))
+        );
+    }
+
+    #[test]
     fn test_a_manifest_only_workspace_reports_requirements_and_no_versions() {
         let manifest = "\
 [package]
@@ -676,8 +748,14 @@ shared = \"3.1\"
             unserved,
             [
                 ("local", PackageAvailability::Path),
-                ("private", PackageAvailability::PrivateRegistry),
-                ("sourced", PackageAvailability::Git)
+                ("pinned", PackageAvailability::RegistryUnresolved),
+                ("private", PackageAvailability::RegistryUnresolved),
+                ("real-name", PackageAvailability::RegistryUnresolved),
+                ("serde", PackageAvailability::RegistryUnresolved),
+                ("sourced", PackageAvailability::Git),
+                ("criterion", PackageAvailability::RegistryUnresolved),
+                ("cc", PackageAvailability::RegistryUnresolved),
+                ("shared", PackageAvailability::RegistryUnresolved)
             ]
         );
         assert!(
