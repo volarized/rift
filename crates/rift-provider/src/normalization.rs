@@ -320,6 +320,8 @@ impl Normalizer {
     ///
     /// Previous graph supplies provider-local continuity. Only identity
     /// associated with same provider-local reference can cross revisions.
+    /// Current explicit identity anchors replace previous identities.
+    /// Released source units do not inherit previous anchors.
     ///
     /// # Errors
     ///
@@ -343,6 +345,7 @@ impl Normalizer {
         let edges = association_edges(&contributions, &references, &mut candidates);
         let mut groups = UnionFind::new(contributions.len());
 
+        union_established_anchors(&mut groups, &anchors);
         union_compatible_edges(&mut groups, &edges, &anchors);
         anchors = component_anchors(&mut groups, &anchors);
         let conflicting = attach_unanchored_components(
@@ -364,6 +367,22 @@ impl Normalizer {
             conflicting: &conflicting,
             candidates,
         })
+    }
+}
+
+fn union_established_anchors(groups: &mut UnionFind, anchors: &[BTreeSet<SymbolId>]) {
+    let mut identities = BTreeMap::new();
+    for (index, values) in anchors.iter().enumerate() {
+        if values.len() != 1 {
+            continue;
+        }
+        let identity = values.iter().next().expect("one identity");
+        if rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).is_err() {
+            continue;
+        }
+        if let Some(previous) = identities.insert(identity, index) {
+            groups.union(previous, index);
+        }
     }
 }
 
@@ -399,8 +418,12 @@ fn contribution_anchors(
     if let Some(identity) = contribution.identity_anchor() {
         anchors.insert(identity.clone());
     }
-    if let Some(identity) =
-        previous.and_then(|graph| graph.identity_for(contribution.key().reference()))
+    if contribution.identity_anchor().is_none()
+        && contribution
+            .source()
+            .is_none_or(|source| source.unit().source_owner().is_none())
+        && let Some(identity) =
+            previous.and_then(|graph| graph.identity_for(contribution.key().reference()))
     {
         anchors.insert(identity.clone());
     }
@@ -410,6 +433,7 @@ fn contribution_anchors(
             SourceApplicability::Exact { .. }
         )
         && let Some(source) = contribution.source()
+        && source.unit().source_owner().is_none()
         && let Some(facts) = contribution.facts()
     {
         let identity = symbol_identity(
@@ -1304,6 +1328,144 @@ mod tests {
         );
         assert_eq!(graph.candidates().len(), 1);
         assert_eq!(graph.candidates()[0].state(), AssociationState::Conflicting);
+    }
+
+    fn assert_explicit_anchor_replacement(previous_identity: &str, current_identity: &str) {
+        let anchored = |revision, identity| {
+            contribution(ContributionInput {
+                provider: "syntax",
+                publication: revision,
+                symbol: "Beacon",
+                applicability: SourceApplicability::Independent,
+                source: None,
+                identity: Some(identity),
+                equivalence: Vec::new(),
+            })
+        };
+        let first_set = publications(vec![publication(
+            "syntax",
+            1,
+            vec![anchored(1, previous_identity)],
+        )]);
+        let first = normalize(&first_set, 1, None);
+        let second_set = publications(vec![publication(
+            "syntax",
+            2,
+            vec![anchored(2, current_identity)],
+        )]);
+        let second = normalize(&second_set, 2, Some(&first));
+        let reference = reference("syntax", "Beacon");
+        let current = second.record_for(&reference).expect("current record");
+        assert_eq!(second.records().len(), 1);
+        assert_eq!(current.resolution(), SymbolResolution::Established);
+        assert_eq!(
+            current.identity().map(SymbolId::as_str),
+            Some(current_identity)
+        );
+        assert!(second.candidates().is_empty());
+        assert_eq!(first.records().len(), 1);
+        assert_eq!(
+            first
+                .record_for(&reference)
+                .expect("previous record")
+                .resolution(),
+            SymbolResolution::Established,
+        );
+        assert_eq!(
+            first.identity_for(&reference).map(SymbolId::as_str),
+            Some(previous_identity)
+        );
+    }
+
+    #[test]
+    fn explicit_owner_anchor_replaces_previous_provider_local_identity() {
+        assert_explicit_anchor_replacement(
+            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+            "rift://symbol/cargo/packages.example/tokio@1.50.0/rust/tokio/Beacon",
+        );
+    }
+
+    #[test]
+    fn explicit_namespace_anchor_replaces_previous_provider_local_identity() {
+        assert_explicit_anchor_replacement(
+            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/old_module/Beacon",
+            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/new_module/Beacon",
+        );
+    }
+
+    #[test]
+    fn competing_canonical_anchors_remain_distinct_despite_explicit_equivalence() {
+        let first_identity = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+        let other_identity = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Other";
+        let first = contribution(ContributionInput {
+            provider: "syntax",
+            publication: 1,
+            symbol: "Beacon",
+            applicability: SourceApplicability::Independent,
+            source: None,
+            identity: Some(first_identity),
+            equivalence: Vec::new(),
+        });
+        let other = contribution(ContributionInput {
+            provider: "native",
+            publication: 1,
+            symbol: "Other",
+            applicability: SourceApplicability::Independent,
+            source: None,
+            identity: Some(other_identity),
+            equivalence: vec![EquivalenceEvidence::Explicit(reference("syntax", "Beacon"))],
+        });
+        let set = publications(vec![
+            publication("syntax", 1, vec![first]),
+            publication("native", 1, vec![other]),
+        ]);
+        let graph = normalize(&set, 1, None);
+        assert_eq!(graph.records().len(), 2);
+        for (provider, symbol, identity) in [
+            ("syntax", "Beacon", first_identity),
+            ("native", "Other", other_identity),
+        ] {
+            let record = graph
+                .record_for(&reference(provider, symbol))
+                .expect("record");
+            assert_eq!(record.resolution(), SymbolResolution::Established);
+            assert_eq!(record.identity().map(SymbolId::as_str), Some(identity));
+        }
+        assert_eq!(graph.candidates().len(), 1);
+        assert_eq!(graph.candidates()[0].state(), AssociationState::Conflicting);
+    }
+
+    #[test]
+    fn equal_canonical_anchors_join_independent_provider_contributions() {
+        let identity = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+        let anchored = |provider| {
+            contribution(ContributionInput {
+                provider,
+                publication: 1,
+                symbol: "Beacon",
+                applicability: SourceApplicability::Independent,
+                source: None,
+                identity: Some(identity),
+                equivalence: Vec::new(),
+            })
+        };
+        let set = publications(vec![
+            publication("syntax", 1, vec![anchored("syntax")]),
+            publication("native", 1, vec![anchored("native")]),
+        ]);
+        let graph = normalize(&set, 1, None);
+        assert_eq!(graph.records().len(), 1);
+        let record = &graph.records()[0];
+        assert_eq!(record.resolution(), SymbolResolution::Established);
+        assert_eq!(record.identity().map(SymbolId::as_str), Some(identity));
+        assert_eq!(record.contributions().len(), 2);
+        for provider in ["syntax", "native"] {
+            assert_eq!(
+                graph.identity_for(&reference(provider, "Beacon")),
+                Some(record.identity().expect("identity"))
+            );
+        }
+        assert!(graph.candidates().is_empty());
     }
 
     #[test]
