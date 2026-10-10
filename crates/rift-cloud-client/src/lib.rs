@@ -4,6 +4,7 @@ mod cache;
 pub mod contract;
 mod pattern;
 mod response;
+pub mod search;
 mod source;
 mod symbol;
 
