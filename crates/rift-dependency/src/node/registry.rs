@@ -11,6 +11,37 @@ use crate::context::ContextAnswer;
 use crate::manifest::{file_beside, read_static_file};
 use crate::resolver::StaticInputs;
 
+/// One registry degradation per manifest; every dependency remains in the context.
+#[derive(Default)]
+pub(crate) struct RegistryDegradations {
+    unresolved: BTreeMap<String, (usize, String)>,
+}
+
+impl RegistryDegradations {
+    pub(crate) fn unresolved(&mut self, manifest: &ProjectPath, name: &str) {
+        let (count, _) = self
+            .unresolved
+            .entry(manifest.0.clone())
+            .or_insert_with(|| (0, name.to_owned()));
+        // Each observation comes from a bounded parsed manifest or lockfile.
+        *count += 1;
+    }
+
+    pub(crate) fn report(self, answer: &mut ContextAnswer) {
+        for (manifest, (count, name)) in self.unresolved {
+            let packages = if count == 1 {
+                name
+            } else {
+                format!("{count} packages; first package {name}")
+            };
+            answer.degradations.push(format!(
+                "{manifest}: registry unresolved for {packages}; no package owner reported; \
+                 user configuration, environment variables, and command-line flags were not read"
+            ));
+        }
+    }
+}
+
 const NPMRC: &str = ".npmrc";
 const BUNFIG: &str = "bunfig.toml";
 const PUBLIC_REGISTRY: &str = "npmjs.org";

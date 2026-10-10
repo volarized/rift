@@ -15,7 +15,7 @@ use crate::manifest::{StaticFileFailure, WorkspacePaths};
 use crate::resolver::StaticInputs;
 
 mod registry;
-pub(crate) use registry::{RegistryConfig, npm_registry};
+pub(crate) use registry::{RegistryConfig, RegistryDegradations, npm_registry};
 
 /// The package namespace every npm and Bun entry belongs to: both install from the npm
 /// registry, so one package has one identity whichever tool pinned it.

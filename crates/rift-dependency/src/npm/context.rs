@@ -56,6 +56,7 @@ pub(super) fn npm_context(
     let workspace = WorkspacePaths::new(request.root, inputs);
     let mut links = BTreeMap::new();
     let mut parsed = Vec::new();
+    let mut registry_degradations = crate::node::RegistryDegradations::default();
     for manifest in request.manifests {
         answer.inputs.push(manifest.clone());
         let directory = manifest_directory_path(request.root, manifest);
@@ -64,7 +65,7 @@ pub(super) fn npm_context(
             request.root,
             manifest,
             &workspace,
-            &registries,
+            (&registries, &mut registry_degradations),
             inputs,
             &mut links,
             &mut answer,
@@ -99,7 +100,7 @@ pub(super) fn npm_context(
             ) {
                 entry.registry = registries.registry(&entry.name).map(str::to_owned);
                 if entry.registry.is_none() {
-                    answer.degradations.push(format!("{}: registry unresolved for {}; user configuration, environment variables, and command-line flags were not read", manifest.0, entry.name));
+                    registry_degradations.unresolved(manifest, &entry.name);
                     entry.availability = PackageAvailability::RegistryUnresolved;
                 } else {
                     entry.availability = registry_availability(entry.registry.as_deref());
@@ -108,6 +109,7 @@ pub(super) fn npm_context(
             answer.entries.push(entry);
         }
     }
+    registry_degradations.report(&mut answer);
     answer
 }
 
@@ -157,7 +159,7 @@ fn pin_lockfile(
     root: &Path,
     manifest: &ProjectPath,
     workspace: &WorkspacePaths,
-    registries: &RegistryConfig,
+    (registries, registry_degradations): (&RegistryConfig, &mut crate::node::RegistryDegradations),
     inputs: &mut dyn StaticInputs,
     links: &mut BTreeMap<String, bool>,
     answer: &mut ContextAnswer,
@@ -215,10 +217,7 @@ fn pin_lockfile(
                 | PackageAvailability::RegistryUnresolved
         ) && registry.is_none()
         {
-            answer.degradations.push(format!(
-                "{}: registry unresolved for {}; no package owner reported",
-                manifest.0, installed.name
-            ));
+            registry_degradations.unresolved(manifest, installed.name);
         }
         if let Some(registry) = &registry {
             let package = PackageIdentity {
@@ -595,6 +594,33 @@ mod tests {
         );
         assert_eq!(answer.degradations.len(), 1);
         assert!(answer.degradations[0].contains("internal-tool"));
+    }
+
+    #[test]
+    fn registry_degradation_keeps_all_unresolved_npm_observations_with_one_count() {
+        let packages: BTreeMap<_, _> = (0..3000)
+            .map(|index| {
+                (
+                    format!("node_modules/package-{index}"),
+                    serde_json::json!({"version": "1.0.0"}),
+                )
+            })
+            .collect();
+        let lockfile = serde_json::to_vec(&serde_json::json!({"packages": packages}))
+            .expect("bounded lockfile fixture");
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/package-lock.json"), lockfile);
+        let answer = context(&["package.json"], &mut inspector);
+        assert_eq!(answer.entries.len(), 3000);
+        assert!(answer.entries.iter().all(|entry| {
+            entry.registry.is_none()
+                && entry.availability == PackageAvailability::RegistryUnresolved
+        }));
+        assert!(answer.install_folders.is_empty());
+        assert_eq!(answer.degradations.len(), 1);
+        assert!(answer.degradations[0].contains("3000 packages"));
+        assert!(answer.degradations[0].contains("environment variables"));
+        assert!(answer.degradations[0].len() < 1024);
     }
 
     #[test]

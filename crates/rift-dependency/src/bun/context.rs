@@ -9,7 +9,7 @@ use super::{BUN_LOCK_FILE_NAME, Pin, install_path_with_limit, parse_lockfile};
 use crate::context::ContextAnswer;
 use crate::manifest::{WorkspacePaths, file_beside, manifest_directory_path, read_static_file};
 use crate::node::{NPM_MANAGER, installed_folder, npm_selector, version_availability};
-use crate::node::{RegistryConfig, npm_registry};
+use crate::node::{RegistryConfig, RegistryDegradations, npm_registry};
 use crate::resolver::{ContextRequest, StaticInputs};
 use rift_protocol::read::PackageIdentity;
 
@@ -62,6 +62,7 @@ fn pin_lockfile(
             return;
         }
     };
+    let mut registry_degradations = RegistryDegradations::default();
     for (key, package) in &lockfile.packages {
         let Pin::Package { name, version } = package.pin() else {
             continue;
@@ -86,10 +87,7 @@ fn pin_lockfile(
             PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
         ) && registry.is_none()
         {
-            answer.degradations.push(format!(
-                "{}: registry unresolved for {name}; no package owner reported",
-                manifest.0
-            ));
+            registry_degradations.unresolved(manifest, name);
         }
         let nesting_depth_max =
             usize::try_from(inputs.collection().nesting_depth).unwrap_or(usize::MAX);
@@ -127,6 +125,7 @@ fn pin_lockfile(
         entry.registry = registry;
         answer.entries.push(entry);
     }
+    registry_degradations.report(answer);
 }
 
 /// Whether a global package index can answer for one pinned tuple: its version text
@@ -202,6 +201,32 @@ mod tests {
         );
         assert_eq!(answer.entries[0].registry, None);
         assert!(answer.degradations[0].contains("registry unresolved"));
+    }
+
+    #[test]
+    fn registry_degradation_keeps_all_unresolved_bun_observations_with_one_count() {
+        let packages: std::collections::BTreeMap<_, _> = (0..3000)
+            .map(|index| {
+                (
+                    format!("package-{index}"),
+                    serde_json::json!([format!("package-{index}@1.0.0"), ""]),
+                )
+            })
+            .collect();
+        let lockfile = serde_json::to_vec(&serde_json::json!({"packages": packages}))
+            .expect("bounded lockfile fixture");
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/bun.lock"), lockfile);
+        let answer = context(&["package.json"], &mut inspector);
+        assert_eq!(answer.entries.len(), 3000);
+        assert!(answer.entries.iter().all(|entry| {
+            entry.registry.is_none()
+                && entry.availability == PackageAvailability::RegistryUnresolved
+        }));
+        assert!(answer.install_folders.is_empty());
+        assert_eq!(answer.degradations.len(), 1);
+        assert!(answer.degradations[0].contains("3000 packages"));
+        assert!(answer.degradations[0].len() < 1024);
     }
 
     /// A lockfile pinning one registry package, one package from a private registry, one
