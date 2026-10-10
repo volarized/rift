@@ -1591,3 +1591,63 @@ fields = { record_bytes_max = { type = "unsigned" }, total_bytes_max = { type = 
 message = "retained source strings and their copies exceed their accepted byte limit"
 action = "raise the retained source total within the caller's memory bound or reduce retained source bytes"
 fields = { bound = { type = "unsigned" }, observed = { type = "unsigned" } }
+
+[error.mcp.start_unreachable]
+message = "no rift server answered for this workspace within {waited}; the workspace has no server this caller can reach"
+action = "starting a server is an operator action on this host"
+fields = { waited = { type = "duration", format = "human" } }
+
+[error.mcp.server_identity_mismatch]
+message = "workspace server identity differs from this rift process: server pid {pid}, version {server_version}, schema digest {server_schema_digest}; this process version {version}, schema digest {schema_digest}"
+action = "run rift server stop, then retry"
+fields = { pid = { type = "pid" }, server_version = { type = "string" }, server_schema_digest = { type = "string" }, version = { type = "string" }, schema_digest = { type = "string" } }
+
+[error.mcp.forward_failed]
+message = "the workspace's rift server failed the forwarded request: {source}"
+action = "check the server with `rift server start --foreground`"
+fields = { source = { type = "error", role = "source" } }
+
+[error.client.request_invalid]
+message = "global client request field {field} failed validation: {violation}"
+action = "correct the reported field and resend the request"
+fields = { operation = { type = "string" }, field = { type = "string" }, violation = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.body_limit]
+message = "global client {direction} body exceeds its accepted limit of {maximum} bytes; observed {bytes}"
+action = "narrow the request or adjust the accepted byte limit, then resend the request"
+fields = { operation = { type = "string" }, direction = { type = "string" }, bytes = { type = "unsigned" }, maximum = { type = "unsigned" } }
+
+[error.client.request_failed]
+message = "global client request failed during {operation}: {reason}"
+action = "resend the same request after a short delay"
+fields = { operation = { type = "string" }, reason = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.request_cancelled]
+message = "global client request was cancelled during {operation}"
+action = "resend the request if the result is still needed"
+fields = { operation = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.configuration_invalid]
+message = "global client configuration field {field} failed validation: {violation}"
+action = "correct the reported configuration field, then retry"
+fields = { field = { type = "string" }, violation = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.response_invalid]
+message = "global client response field {field} failed validation during {operation}: {violation}"
+action = "report this internal failure with its full context"
+fields = { operation = { type = "string" }, field = { type = "string" }, violation = { type = "string" }, status = { type = "unsigned", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.remote_permission_denied]
+message = "global client endpoint refused permission during {operation}: HTTP status {status}"
+action = "correct the credential configuration, then retry"
+fields = { operation = { type = "string" }, status = { type = "unsigned" }, metadata = { type = "string" }, problem = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.remote_unavailable]
+message = "global client endpoint cannot serve {operation} now: HTTP status {status}"
+action = "resend the same request after the reported retry delay"
+fields = { operation = { type = "string" }, status = { type = "unsigned" }, metadata = { type = "string" }, problem = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }
+
+[error.client.remote_failed]
+message = "global client endpoint returned a non-success response during {operation}: HTTP status {status}"
+action = "report this internal failure with its full context"
+fields = { operation = { type = "string" }, status = { type = "unsigned" }, metadata = { type = "string" }, problem = { type = "string", optional = true }, source = { type = "error", role = "source", optional = true } }

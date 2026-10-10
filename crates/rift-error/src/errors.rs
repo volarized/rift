@@ -71,6 +71,15 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.cli.update_rollback_failed",
     "rift.cli.update_staging_failed",
     "rift.cli.update_version_invalid",
+    "rift.client.body_limit",
+    "rift.client.configuration_invalid",
+    "rift.client.remote_failed",
+    "rift.client.remote_permission_denied",
+    "rift.client.remote_unavailable",
+    "rift.client.request_cancelled",
+    "rift.client.request_failed",
+    "rift.client.request_invalid",
+    "rift.client.response_invalid",
     "rift.core.configuration_command_argument_oversized",
     "rift.core.configuration_command_program_absolute",
     "rift.core.configuration_command_program_dot_segment",
@@ -226,6 +235,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.mcp.election_already_serving",
     "rift.mcp.election_document_invalid",
     "rift.mcp.election_storage_failed",
+    "rift.mcp.forward_failed",
     "rift.mcp.forward_unanswered",
     "rift.mcp.http_ports_exhausted",
     "rift.mcp.http_serve_failed",
@@ -239,9 +249,11 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.mcp.proxy_initialization_failed",
     "rift.mcp.proxy_task_failed",
     "rift.mcp.proxy_unexpected_quit",
+    "rift.mcp.server_identity_mismatch",
     "rift.mcp.spawn_failed",
     "rift.mcp.spawn_no_output",
     "rift.mcp.start_building",
+    "rift.mcp.start_unreachable",
     "rift.provider.cache_too_many_keys",
     "rift.provider.composition_dangling_input",
     "rift.provider.composition_duplicate_stage",
@@ -335,6 +347,9 @@ pub mod analysis;
 
 /// Registered errors under `rift.cli`.
 pub mod cli;
+
+/// Registered errors under `rift.client`.
+pub mod client;
 
 /// Registered errors under `rift.core`.
 pub mod core;
