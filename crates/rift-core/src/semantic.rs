@@ -680,7 +680,7 @@ impl ContributionBuilder {
         self
     }
 
-    /// Sets identity anchored by exact declaration binding.
+    /// Sets a semantic identity anchor, with or without a source declaration.
     #[must_use]
     pub fn identity_anchor(mut self, identity: SymbolId) -> Self {
         self.contribution.identity_anchor = Some(identity);
@@ -905,10 +905,20 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
 }
 
 fn validate_source_and_origin(contribution: &Contribution) -> Result<(), RiftError> {
-    if contribution.identity_anchor.is_some() && contribution.source.is_none() {
-        return errors::core::contribution_unbound_identity()
-            .field("identity_anchor")
-            .fail();
+    if contribution.source.is_none()
+        && let Some(anchor) = &contribution.identity_anchor
+    {
+        let identity = rift_protocol::identity::SymbolIdentity::parse(anchor.as_str())
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        if contribution
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.language() != identity.language())
+        {
+            return errors::core::contribution_invalid_language()
+                .field("identity_anchor")
+                .fail();
+        }
     }
     let synthetic = contribution.origin.source_kind == SourceKind::Synthetic;
     if contribution.source.is_some() && synthetic {
@@ -1215,11 +1225,8 @@ mod tests {
         )
         .identity_anchor(SymbolId::new("rust:Beacon").expect("symbol"))
         .build()
-        .expect_err("unbound identity");
-        assert_eq!(
-            error.slug().as_str(),
-            "rift.core.contribution_unbound_identity"
-        );
+        .expect_err("noncanonical identity anchor");
+        assert_eq!(error.slug().as_str(), "rift.core.identity_invalid");
 
         let source = super::DeclarationBinding::new(
             source_unit(),
@@ -1243,6 +1250,62 @@ mod tests {
             error.slug().as_str(),
             "rift.core.contribution_invalid_origin"
         );
+    }
+
+    #[test]
+    fn test_source_less_identity_anchors_keep_owner_and_language() {
+        for address in [
+            "rift://symbol/local/rust/Beacon",
+            "rift://symbol/stdlib/rust@1.98.0/rust/core/Beacon",
+            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+        ] {
+            let identity = SymbolId::new(address).expect("canonical identity");
+            let contribution = Contribution::builder(
+                ContributionKey::new(provider("lsp"), publication(1), provider_symbol("Beacon")),
+                SourceApplicability::Independent,
+                facts(),
+                ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+            )
+            .identity_anchor(identity.clone())
+            .build()
+            .expect("source-less canonical identity anchor");
+            assert!(contribution.source().is_none());
+            assert_eq!(contribution.identity_anchor(), Some(&identity));
+            assert_eq!(contribution.facts().expect("facts").language().name, "rust");
+        }
+    }
+
+    #[test]
+    fn test_source_less_identity_anchor_refuses_conflicting_language() {
+        let error = Contribution::builder(
+            ContributionKey::new(provider("lsp"), publication(1), provider_symbol("Beacon")),
+            SourceApplicability::Independent,
+            facts(),
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+        )
+        .identity_anchor(SymbolId::new("rift://symbol/local/python/Beacon").expect("identity"))
+        .build()
+        .expect_err("conflicting language");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.contribution_invalid_language"
+        );
+    }
+
+    #[test]
+    fn test_source_less_identity_anchor_without_presentation_remains_validated() {
+        let identity = SymbolId::new("rift://symbol/local/rust/Beacon").expect("identity");
+        let contribution = Contribution::fact_builder(
+            ContributionKey::new(provider("lsp"), publication(1), provider_symbol("Beacon")),
+            SourceApplicability::Independent,
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+        )
+        .identity_anchor(identity.clone())
+        .build()
+        .expect("identity without presentation");
+        assert!(contribution.facts().is_none());
+        assert!(contribution.source().is_none());
+        assert_eq!(contribution.identity_anchor(), Some(&identity));
     }
 
     #[test]

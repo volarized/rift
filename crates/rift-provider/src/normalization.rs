@@ -999,6 +999,68 @@ mod tests {
         .expect("normalized graph")
     }
 
+    #[test]
+    fn test_source_less_anchors_keep_distinct_owners_and_unresolved_facts() {
+        let package = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+        let runtime = "rift://symbol/stdlib/rust@1.98.0/rust/core/Beacon";
+        let anchored = |provider, identity| {
+            contribution(ContributionInput {
+                provider,
+                publication: 1,
+                symbol: "Beacon",
+                applicability: SourceApplicability::Independent,
+                source: None,
+                identity: Some(identity),
+                equivalence: Vec::new(),
+            })
+        };
+        let set = publications(vec![
+            publication("lsp", 1, vec![anchored("lsp", package)]),
+            publication("syntax", 1, vec![anchored("syntax", runtime)]),
+            publication(
+                "docs",
+                1,
+                vec![independent("docs", 1, "Beacon", Vec::new())],
+            ),
+        ]);
+        let graph = normalize(&set, 1, None);
+        assert_eq!(graph.records().len(), 3);
+        for (provider, identity) in [("lsp", package), ("syntax", runtime)] {
+            let record = graph
+                .record_for(&reference(provider, "Beacon"))
+                .expect("record");
+            assert_eq!(record.resolution(), SymbolResolution::Established);
+            assert_eq!(record.identity().map(SymbolId::as_str), Some(identity));
+            let assembled =
+                crate::SymbolAssembler::assemble(&graph, record, &[]).expect("assembly");
+            assert_eq!(assembled.identity().map(SymbolId::as_str), Some(identity));
+            assert_eq!(assembled.facts().expect("facts").name(), "Beacon");
+            assert_eq!(assembled.origin().source_kind(), SourceKind::Synthetic);
+            assert!(assembled.origin().location().is_none());
+            for key in assembled.contributions() {
+                assert!(
+                    graph
+                        .contribution(key)
+                        .expect("contribution")
+                        .source()
+                        .is_none()
+                );
+            }
+        }
+        let unresolved = graph
+            .record_for(&reference("docs", "Beacon"))
+            .expect("unresolved record");
+        assert_eq!(unresolved.resolution(), SymbolResolution::Unresolved);
+        assert!(unresolved.identity().is_none());
+        let next = normalize(&set, 2, Some(&graph));
+        for provider in ["lsp", "syntax"] {
+            assert_eq!(
+                next.identity_for(&reference(provider, "Beacon")),
+                graph.identity_for(&reference(provider, "Beacon"))
+            );
+        }
+    }
+
     /// Every published contribution resolves through the position index by
     /// its own exact key, and a key the set never published answers `None`
     /// instead of a neighbor at the same position.
