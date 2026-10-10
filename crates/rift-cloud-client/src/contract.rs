@@ -40,13 +40,14 @@ const ERROR_STATUSES: [StatusCode; 10] = [
     StatusCode::SERVICE_UNAVAILABLE,
 ];
 
-const ENDPOINTS: [Endpoint; 6] = [
+const ENDPOINTS: [Endpoint; 7] = [
     Endpoint::Capabilities,
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
     Endpoint::Patterns,
     Endpoint::Declarations,
+    Endpoint::Source,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -57,6 +58,7 @@ pub(crate) enum Endpoint {
     Symbols,
     Patterns,
     Declarations,
+    Source,
 }
 
 impl Endpoint {
@@ -68,6 +70,7 @@ impl Endpoint {
             Self::Symbols => "/v1/symbols",
             Self::Patterns => "/v1/patterns",
             Self::Declarations => "/v1/declarations",
+            Self::Source => "/v1/source",
         }
     }
 
@@ -78,7 +81,8 @@ impl Endpoint {
             | Self::Search
             | Self::Symbols
             | Self::Patterns
-            | Self::Declarations => Method::POST,
+            | Self::Declarations
+            | Self::Source => Method::POST,
         }
     }
 
@@ -90,6 +94,7 @@ impl Endpoint {
             Self::Symbols => "listPackageSymbols",
             Self::Patterns => "searchPackagePatterns",
             Self::Declarations => "findPackageDeclarations",
+            Self::Source => "getSource",
         }
     }
 
@@ -97,6 +102,9 @@ impl Endpoint {
         let mut statuses = ERROR_STATUSES.into_iter().collect::<BTreeSet<_>>();
         statuses.insert(StatusCode::OK);
         statuses.insert(StatusCode::GATEWAY_TIMEOUT);
+        if self == Self::Source {
+            statuses.insert(StatusCode::NOT_FOUND);
+        }
         if self == Self::Capabilities {
             statuses.remove(&StatusCode::PAYLOAD_TOO_LARGE);
             statuses.remove(&StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -328,7 +336,20 @@ fn validate_response_media(
             }
             continue;
         }
-        let expected = if *status == StatusCode::OK {
+        if endpoint == Endpoint::Source && *status == StatusCode::SERVICE_UNAVAILABLE {
+            if response.content.len() != 2
+                || !response.content.contains_key("application/json")
+                || !response.content.contains_key("application/problem+json")
+            {
+                return Err(format!(
+                    "{method} {path} {status} response must declare typed outcomes and problem details"
+                ));
+            }
+            continue;
+        }
+        let expected = if *status == StatusCode::OK
+            || (endpoint == Endpoint::Source && *status == StatusCode::NOT_FOUND)
+        {
             "application/json"
         } else {
             "application/problem+json"
@@ -705,6 +726,10 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<SymbolId>();
     let _ = generator.subschema_for::<DocumentationHit>();
     let _ = generator.subschema_for::<DocumentationContext>();
+    let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceParams>();
+    let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceResult>();
+    let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
+    let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
 
     // oas3 0.22 omits JSON Schema keywords used by shared models, including
     // patternProperties. Compare those schemas as JSON to retain their exact shape.

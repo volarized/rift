@@ -1,0 +1,141 @@
+use std::collections::HashSet;
+
+use rift_protocol::{
+    identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity},
+    source_read::{
+        DeclarationPositionResult, FindDeclarationsParams, FindDeclarationsResult, GetSourceParams,
+        GetSourceResult,
+    },
+};
+
+use crate::{
+    ClientError, GlobalClient, PACKAGES_MAX, active_response_body_bytes_max, contract, response,
+    serialize_body, smaller_bound, supports_feature, validate_body_for_capabilities,
+};
+
+impl GlobalClient {
+    /// Reads one physical source unit from its exact package or runtime release.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request or answer breaks the contract, or the endpoint
+    /// is unavailable.
+    pub async fn get_source(
+        &self,
+        request: &GetSourceParams,
+    ) -> Result<GetSourceResult, ClientError> {
+        if !self.inner.enabled {
+            return Err(ClientError::Disabled);
+        }
+        if !request.is_valid() || global_source_owner(request.unit.as_str()).is_none() {
+            return Err(ClientError::InvalidRequest { field: "unit" });
+        }
+        let capabilities = self.get_capabilities().await?;
+        let body = serialize_body(request, self.inner.config.max_request)?;
+        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
+        let raw = self
+            .request(
+                contract::Endpoint::Source,
+                Some(body),
+                None,
+                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
+            )
+            .await;
+        let raw = self.observed(raw).await?;
+        let parsed = self.observed(response::exact_source(raw)).await?;
+        let bounded_source = match &parsed.value {
+            GetSourceResult::Found { source, .. } => {
+                source.text.len()
+                    <= smaller_bound(
+                        capabilities.bounds.source_bytes_max,
+                        self.inner.config.max_source,
+                    )
+            }
+            _ => true,
+        };
+        if !bounded_source || !parsed.value.is_valid_for(request) {
+            return self
+                .observed(Err(ClientError::InvalidResponse {
+                    status: parsed.meta.status,
+                }))
+                .await;
+        }
+        Ok(parsed.value)
+    }
+
+    /// Names declarations holding source positions in one immutable selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the request or answer breaks the contract, declaration lookup
+    /// is unavailable, or the endpoint is unavailable.
+    pub async fn find_declarations(
+        &self,
+        request: &FindDeclarationsParams,
+    ) -> Result<FindDeclarationsResult, ClientError> {
+        if !self.inner.enabled {
+            return Err(ClientError::Disabled);
+        }
+        if !request.is_valid() {
+            return Err(ClientError::InvalidRequest { field: "positions" });
+        }
+        let owners = request
+            .positions
+            .iter()
+            .map(|position| {
+                global_source_owner(position.unit.as_str())
+                    .ok_or(ClientError::InvalidRequest { field: "unit" })
+            })
+            .collect::<Result<HashSet<_>, _>>()?;
+        let capabilities = self.get_capabilities().await?;
+        if !supports_feature(&capabilities, "declarations") {
+            return Err(ClientError::FeatureUnavailable {
+                feature: "declarations",
+            });
+        }
+        if owners.len() > smaller_bound(capabilities.bounds.packages_max, PACKAGES_MAX) {
+            return Err(ClientError::InvalidRequest { field: "positions" });
+        }
+        let body = serialize_body(request, self.inner.config.max_request)?;
+        validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
+        let raw = self
+            .request(
+                contract::Endpoint::Declarations,
+                Some(body),
+                None,
+                active_response_body_bytes_max(&capabilities, self.inner.config.max_response),
+            )
+            .await;
+        let raw = self.observed(raw).await?;
+        let parsed = self.observed(response::source_declarations(raw)).await?;
+        if !parsed.value.is_valid_for(request)
+            || !parsed.value.results.iter().all(|result| match result {
+                DeclarationPositionResult::Found { id, .. } => SymbolIdentity::parse(id.as_str())
+                    .is_ok_and(|identity| {
+                        matches!(
+                            identity.owner(),
+                            SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+                        )
+                    }),
+                _ => true,
+            })
+        {
+            return self
+                .observed(Err(ClientError::InvalidResponse {
+                    status: parsed.meta.status,
+                }))
+                .await;
+        }
+        Ok(parsed.value)
+    }
+}
+
+fn global_source_owner(unit: &str) -> Option<SymbolOwner> {
+    let (owner, _) = parse_source_unit_identity(unit).ok()?;
+    owner.filter(|owner| {
+        matches!(
+            owner,
+            SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+        )
+    })
+}

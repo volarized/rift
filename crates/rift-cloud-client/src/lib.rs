@@ -5,6 +5,7 @@ pub mod contract;
 mod declaration;
 mod pattern;
 mod response;
+mod source;
 mod symbol;
 
 use std::{
@@ -58,19 +59,20 @@ pub use generated::{
     GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
     ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
     NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDeclarationRequest,
-    PackageDeclarationRequestPositionEncoding, PackageDeclarationResponse,
-    PackageDeclarationResult, PackageDocumentationHit, PackageDocumentationHitContributingField,
-    PackageIdentity, PackagePatternDeclaration, PackagePatternHit, PackagePatternPage,
-    PackagePatternRequest, PackagePosition, PackageResolutionRequest, PackageResolutionResponse,
-    PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage,
-    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
-    PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
-    ProblemDetails, PublicationFormat, QueryTerm, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
-    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
-    SearchPackagesRequestQuery, SearchPackagesResponse, Signature, SignatureLink, SourceKind,
-    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange,
-    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, Warning, WarningCode,
+    PackageDeclarationResponse, PackageDeclarationResult, PackageDocumentationHit,
+    PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
+    PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackagePosition,
+    PackageResolutionRequest, PackageResolutionResponse, PackageSearchHit,
+    PackageSearchHitContributingField, PackageSearchItem, PackageSearchPage, PackageSearchRequest,
+    PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol, PackageSymbolPage,
+    PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
+    PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
+    PublicationFormat, QueryTerm, ResolvePackageContextRequest, ResolvePackageContextResponse,
+    ResolvedRequirement, SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery,
+    SearchPackagePatternsResponse, SearchPackagesRequest, SearchPackagesRequestQuery,
+    SearchPackagesResponse, Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId,
+    Symbol, SymbolFacet, SymbolId, SymbolOrigin, TextRange, TypeBinding, TypeBindingOrigin,
+    TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use declaration::{DECLARATION_POSITIONS_MAX, POSITION_COMPONENT_MAX};

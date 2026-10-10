@@ -1547,10 +1547,40 @@
       ]
     },
     "SourceUnitId": {
-      "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+      "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+      "else": {
+        "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+      },
+      "examples": [
+        "rift://source/project/src/lib.rs",
+        "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+        "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+      ],
+      "if": {
+        "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+      },
       "maxLength": 8192,
       "minLength": 17,
-      "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+      "not": {
+        "anyOf": [
+          {
+            "pattern": "/\\.{1,2}(?:/|$)"
+          },
+          {
+            "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+          },
+          {
+            "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+          },
+          {
+            "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+          }
+        ]
+      },
+      "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+      "then": {
+        "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+      },
       "type": "string"
     },
     "Symbol": {

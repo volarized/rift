@@ -4,7 +4,7 @@
   "info": {
     "title": "Rift Global Package API",
     "description": "REST contract for package capabilities, resolution, declaration search, and symbol reads.",
-    "version": "0.0.43"
+    "version": "0.0.67"
   },
   "security": [
     {},
@@ -1675,6 +1675,205 @@
         "x-rift-request-body-bytes-max": 4194304,
         "x-rift-response-body-bytes-max": 33554432
       }
+    },
+    "/v1/source": {
+      "post": {
+        "operationId": "getSource",
+        "summary": "Read one source unit.",
+        "description": "Reads one physical source unit in an exact release and immutable captured view.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "description": "Exact source unit and optional byte range.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GetSourceParams"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Source bytes and captured view.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetSourceResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Typed source unavailability or service failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetSourceResult"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Source unit absent from completely searched captured coverage.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetSourceResult"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-request-body-bytes-max": 4194304,
+        "x-rift-response-body-bytes-max": 33554432
+      }
     }
   },
   "components": {
@@ -1745,10 +1944,40 @@
         "type": "object"
       },
       "SourceUnitId": {
-        "description": "Stable identity of one source unit in the source catalog: a resolver identity, then that\nresolver's canonical unit key in canonical percent-encoding - for the project resolver, the\nproject-relative path, as `rift://source/project/src/lib.rs`. An identity derives from its\nresolver's canonical human-readable key; digests appear on the wire only as short witnesses\nwhere byte-identity is required.",
+        "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+        "else": {
+          "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+        },
+        "examples": [
+          "rift://source/project/src/lib.rs",
+          "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+          "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+        ],
+        "if": {
+          "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+        },
         "maxLength": 8192,
         "minLength": 17,
-        "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,8192}$",
+        "not": {
+          "anyOf": [
+            {
+              "pattern": "/\\.{1,2}(?:/|$)"
+            },
+            {
+              "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+            },
+            {
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+            },
+            {
+              "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+            }
+          ]
+        },
+        "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+        "then": {
+          "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+        },
         "type": "string"
       },
       "SymbolId": {
@@ -4108,6 +4337,1960 @@
           "version"
         ],
         "type": "object"
+      },
+      "CapturedView": {
+        "additionalProperties": false,
+        "description": "The immutable serving view and the expiry promised by its owner.",
+        "properties": {
+          "expires_at": {
+            "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/CapturedViewId",
+            "description": "Selects the same workspace, owner, applicability and accepted index revision."
+          }
+        },
+        "required": [
+          "id",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "CapturedViewId": {
+        "description": "A service-issued key for one immutable view in one serving context.",
+        "maxLength": 4096,
+        "minLength": 3,
+        "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+        "type": "string"
+      },
+      "CommitAuthor": {
+        "additionalProperties": false,
+        "description": "The author one revision records, as committed: no `.mailmap` rewrites the name or the\naddress.",
+        "properties": {
+          "email": {
+            "description": "The author's email address.",
+            "type": "string"
+          },
+          "name": {
+            "description": "The author's name.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "email"
+        ],
+        "type": "object"
+      },
+      "DeclarationPositionResult": {
+        "description": "One submitted source position and its exact declaration outcome.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "An established declaration holds this exact position.",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/SymbolIdentity",
+                "description": "Canonical logical object, including proved runtime or stub mappings."
+              },
+              "kind": {
+                "$ref": "#/components/schemas/ExactKind",
+                "description": "Declaration kind in the provider's vocabulary."
+              },
+              "outcome": {
+                "const": "found",
+                "type": "string"
+              },
+              "position": {
+                "$ref": "#/components/schemas/SourcePosition",
+                "description": "Submitted position, unchanged."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "Immutable selection supplying this declaration."
+              }
+            },
+            "required": [
+              "outcome",
+              "position",
+              "id",
+              "kind",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Complete captured coverage contains no declaration at this position.",
+            "properties": {
+              "outcome": {
+                "const": "missing",
+                "type": "string"
+              },
+              "position": {
+                "$ref": "#/components/schemas/SourcePosition",
+                "description": "Submitted position, unchanged."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "Complete immutable selection searched."
+              }
+            },
+            "required": [
+              "outcome",
+              "position",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Presence or absence cannot be established at this exact position.",
+            "properties": {
+              "outcome": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "position": {
+                "$ref": "#/components/schemas/SourcePosition",
+                "description": "Submitted position, unchanged."
+              },
+              "reason": {
+                "$ref": "#/components/schemas/SymbolUnavailableReason",
+                "description": "Typed cause of unavailability."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "Selected view, when one could be captured."
+              }
+            },
+            "required": [
+              "outcome",
+              "position",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Duration": {
+        "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
+        "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+        "type": "string"
+      },
+      "FileId": {
+        "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+        "examples": [
+          "rift://file/src/lib.rs"
+        ],
+        "maxLength": 8192,
+        "minLength": 13,
+        "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+        "type": "string"
+      },
+      "FindDeclarationsParams": {
+        "additionalProperties": false,
+        "description": "Finds declarations holding positions in one immutable selection.",
+        "properties": {
+          "position_encoding": {
+            "$ref": "#/components/schemas/PositionEncoding",
+            "description": "Character units negotiated by the engine that supplied the positions."
+          },
+          "positions": {
+            "description": "Positions to answer once, retaining request order.",
+            "items": {
+              "$ref": "#/components/schemas/SourcePosition"
+            },
+            "maxItems": 1000,
+            "minItems": 1,
+            "type": "array",
+            "uniqueItems": true
+          },
+          "rev": {
+            "$ref": "#/components/schemas/RevisionId",
+            "description": "A local Git revision. Refused for released sources and beside `view`."
+          },
+          "view": {
+            "$ref": "#/components/schemas/CapturedViewId",
+            "description": "A preceding immutable selection shared by the whole batch."
+          }
+        },
+        "required": [
+          "position_encoding",
+          "positions"
+        ],
+        "type": "object"
+      },
+      "FindDeclarationsResult": {
+        "additionalProperties": false,
+        "description": "One answer per submitted position, retaining one shared captured selection.",
+        "properties": {
+          "results": {
+            "description": "Exact outcomes in request order.",
+            "items": {
+              "$ref": "#/components/schemas/DeclarationPositionResult"
+            },
+            "maxItems": 1000,
+            "type": "array"
+          },
+          "warnings": {
+            "description": "Typed read warnings, including explicit partial coverage.",
+            "items": {
+              "$ref": "#/components/schemas/ReadWarning"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "type": "object"
+      },
+      "GetSourceParams": {
+        "additionalProperties": false,
+        "description": "Reads a source unit or a byte range without requiring a semantic symbol.",
+        "properties": {
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Requested half-open UTF-8 byte range. Omitted requests the whole unit."
+          },
+          "rev": {
+            "$ref": "#/components/schemas/RevisionId",
+            "description": "A local Git revision. Refused for released sources and beside `view`."
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "Canonical source unit, retaining its physical package or runtime owner."
+          },
+          "view": {
+            "$ref": "#/components/schemas/CapturedViewId",
+            "description": "A preceding immutable selection. Expiry never selects latest implicitly."
+          }
+        },
+        "required": [
+          "unit"
+        ],
+        "type": "object"
+      },
+      "GetSourceResult": {
+        "description": "Source bytes, definite absence, or explicit selection unavailability.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The selected unit exists, including when its requested range is empty.",
+            "properties": {
+              "outcome": {
+                "const": "found",
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/components/schemas/SourceExcerpt",
+                "description": "Returned bytes and their exact source unit and range."
+              },
+              "source_complete": {
+                "description": "Whether the complete requested range or unit was returned.",
+                "type": "boolean"
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "Immutable selection supplying these bytes."
+              },
+              "warnings": {
+                "description": "Projection cuts and other typed read warnings.",
+                "items": {
+                  "$ref": "#/components/schemas/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "source",
+              "source_complete",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The unit is absent from completely searched captured coverage.",
+            "properties": {
+              "outcome": {
+                "const": "missing",
+                "type": "string"
+              },
+              "unit": {
+                "$ref": "#/components/schemas/SourceUnitId",
+                "description": "Requested canonical source unit."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "Complete immutable selection searched."
+              },
+              "warnings": {
+                "description": "Other typed read warnings.",
+                "items": {
+                  "$ref": "#/components/schemas/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "unit",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The exact selection cannot establish presence or absence.",
+            "properties": {
+              "outcome": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/SymbolUnavailableReason",
+                "description": "Typed cause of unavailability."
+              },
+              "unit": {
+                "$ref": "#/components/schemas/SourceUnitId",
+                "description": "Requested canonical source unit."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "Selected view, when one could be captured."
+              },
+              "warnings": {
+                "description": "Details and partial-read warnings.",
+                "items": {
+                  "$ref": "#/components/schemas/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "unit",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GetSymbolInclude": {
+        "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
+        "type": "string",
+        "enum": [
+          "source",
+          "history",
+          "documentation"
+        ],
+        "x-enum-descriptions": [
+          "The hit's node identity and declaration source excerpt.",
+          "The hit's version-control timeline.",
+          "Bounded documentation referring to the exact declaration."
+        ]
+      },
+      "GetSymbolParams": {
+        "additionalProperties": false,
+        "description": "Reads one exact logical symbol obtained from discovery or another read.",
+        "properties": {
+          "declaration_cursor": {
+            "description": "Continuation bound to this exact symbol, projections and serving view.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "declaration_limit": {
+            "default": 5,
+            "description": "Most declarations returned in this read. Omitted uses the existing five-item bound.",
+            "format": "uint64",
+            "maximum": 10000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "id": {
+            "$ref": "#/components/schemas/SymbolIdentity",
+            "description": "Canonical identity. Ownership and language come from this address."
+          },
+          "include": {
+            "default": [
+              "source"
+            ],
+            "description": "Requested projections. Omitted defaults to source; an empty list requests none.",
+            "items": {
+              "$ref": "#/components/schemas/GetSymbolInclude"
+            },
+            "type": "array"
+          },
+          "rev": {
+            "$ref": "#/components/schemas/RevisionId",
+            "description": "A local Git revision. Refused for a package or runtime owner and beside `view`."
+          },
+          "view": {
+            "$ref": "#/components/schemas/CapturedViewId",
+            "description": "A view returned by a preceding read. Expiry never selects latest implicitly."
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "GetSymbolResult": {
+        "description": "Exactly one logical object, definite absence, or explicit selection unavailability.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The exact identity was established, even when it has no source declarations.",
+            "properties": {
+              "declaration_cursor": {
+                "description": "Continuation for remaining declarations in this exact view.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "declarations": {
+                "description": "Declaration bindings in deterministic source order.",
+                "items": {
+                  "$ref": "#/components/schemas/SymbolDeclaration"
+                },
+                "maxItems": 10000,
+                "type": "array"
+              },
+              "documentation": {
+                "$ref": "#/components/schemas/DocumentationContext",
+                "description": "Requested bounded documentation context."
+              },
+              "history": {
+                "$ref": "#/components/schemas/SymbolHistory",
+                "description": "Requested timeline for the logical symbol."
+              },
+              "outcome": {
+                "const": "found",
+                "type": "string"
+              },
+              "symbol": {
+                "$ref": "#/components/schemas/Symbol",
+                "description": "One logical symbol. Its established `id` is required by read validation."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "The immutable context used for this result and its continuations."
+              },
+              "warnings": {
+                "description": "Projection cuts and other typed read warnings.",
+                "items": {
+                  "$ref": "#/components/schemas/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "symbol",
+              "view",
+              "declarations"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The valid identity is absent from the completely searched exact selection.",
+            "properties": {
+              "outcome": {
+                "const": "missing",
+                "type": "string"
+              },
+              "symbol_not_found": {
+                "$ref": "#/components/schemas/SymbolNotFound",
+                "description": "Definite exact miss and its actual structural candidates."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "The exact immutable selection searched."
+              },
+              "warnings": {
+                "description": "Warnings, including incomplete candidate work.",
+                "items": {
+                  "$ref": "#/components/schemas/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "symbol_not_found",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The exact selection cannot establish presence or absence.",
+            "properties": {
+              "id": {
+                "$ref": "#/components/schemas/SymbolIdentity",
+                "description": "The requested exact canonical identity."
+              },
+              "outcome": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/components/schemas/SymbolUnavailableReason",
+                "description": "The typed cause of unavailability."
+              },
+              "view": {
+                "$ref": "#/components/schemas/CapturedView",
+                "description": "The selected view, when one could be captured."
+              },
+              "warnings": {
+                "description": "Details and available partial-read warnings.",
+                "items": {
+                  "$ref": "#/components/schemas/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "id",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "GlobalFailureClass": {
+        "description": "Bounded classes a global API failure can carry in a read warning.",
+        "type": "string",
+        "enum": [
+          "connection",
+          "timeout",
+          "retry_exhausted",
+          "authentication",
+          "credential_configuration",
+          "non_success_response",
+          "invalid_response",
+          "response_truncated",
+          "publication_format",
+          "corpus_revision",
+          "required_field_set"
+        ],
+        "x-enum-descriptions": [
+          "The endpoint could not accept a connection.",
+          "The operation exceeded its time bound.",
+          "Bounded retry attempts ended without a valid response.",
+          "The endpoint rejected credentials or access.",
+          "Credential configuration prevented a request.",
+          "The endpoint returned a non-success status.",
+          "The response did not satisfy its wire fields.",
+          "The response exceeded its byte or item bound.",
+          "The publication format was not supported.",
+          "The response named an unsupported corpus revision.",
+          "The response omitted a required field set."
+        ]
+      },
+      "GlobalPageWarningCode": {
+        "description": "Stable conditions a global package page can report while returning valid items.",
+        "type": "string",
+        "enum": [
+          "query_narrowed",
+          "source_truncated",
+          "publication_changed",
+          "capability_unavailable",
+          "result_truncated",
+          "unknown"
+        ],
+        "x-enum-descriptions": [
+          "The service narrowed a query before ranking.",
+          "The service omitted source content at its source bound.",
+          "The publication changed while pages were assembled.",
+          "A requested capability was unavailable.",
+          "The service stopped before its result bound.",
+          "The service returned a code this client does not know."
+        ]
+      },
+      "PositionEncoding": {
+        "description": "How a language engine counts characters within a source line.",
+        "type": "string",
+        "enum": [
+          "utf-8",
+          "utf-16"
+        ],
+        "x-enum-descriptions": [
+          "UTF-8 bytes.",
+          "UTF-16 code units."
+        ]
+      },
+      "ReadWarning": {
+        "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
+            "properties": {
+              "code": {
+                "const": "framework_context_unresolved",
+                "type": "string"
+              },
+              "detail": {
+                "description": "The missing package version, configuration, or template source.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "framework": {
+                "$ref": "#/components/schemas/SyntaxFramework",
+                "description": "The framework whose context could not be established."
+              },
+              "unit": {
+                "$ref": "#/components/schemas/FileId",
+                "description": "The source whose framework context is unresolved."
+              }
+            },
+            "required": [
+              "code",
+              "unit",
+              "framework",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
+            "properties": {
+              "alternatives": {
+                "description": "Project declaration identities the caller can use to select another name.",
+                "items": {
+                  "$ref": "#/components/schemas/SymbolId"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              "code": {
+                "const": "symbol_not_found",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why closest declarations could not be selected within the work bound.\nAbsent when every selected declaration was compared or scope is `global`.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "name": {
+                "description": "The declaration name the caller requested.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "name",
+              "alternatives"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Documentation collection or excerpt output omitted part of a selected source.",
+            "properties": {
+              "code": {
+                "const": "documentation",
+                "type": "string"
+              },
+              "warning": {
+                "$ref": "#/components/schemas/DocumentationWarning",
+                "description": "Bounded source identity, stage, failure label, and omitted count."
+              }
+            },
+            "required": [
+              "code",
+              "warning"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The documentation this read projects onto crossed a bound, so no documentation\nblock joins the answer: declarations and files answer as they would without it.\nThe condition holds until the documentation it names changes.",
+            "properties": {
+              "code": {
+                "const": "documentation_unavailable",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Which documentation was left out and the bound it crossed - prose for a\nreader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
+            "properties": {
+              "captured_tree_revision": {
+                "$ref": "#/components/schemas/Digest",
+                "description": "Tree revision the read captured."
+              },
+              "code": {
+                "const": "stale_index",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "index_tree_revision": {
+                "$ref": "#/components/schemas/Digest",
+                "description": "Tree revision the published index covers."
+              }
+            },
+            "required": [
+              "code",
+              "index_tree_revision",
+              "captured_tree_revision",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
+            "properties": {
+              "code": {
+                "const": "vector_index_preparing",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "prepared": {
+                "description": "Declarations of the captured tree that already carry a vector.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "ready_in": {
+                "$ref": "#/components/schemas/Duration",
+                "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+              },
+              "total": {
+                "description": "Declarations the set being embedded holds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "prepared",
+              "total",
+              "ready_in",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The local index is still preparing selected workspace files. The answer covers only\nfiles whose capture and analysis have finished; `total` is absent until discovery ends.",
+            "properties": {
+              "code": {
+                "const": "local_index_preparing",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the local index is preparing - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "prepared": {
+                "description": "Selected workspace files whose capture and analysis have finished.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "ready_in": {
+                "$ref": "#/components/schemas/Duration",
+                "description": "Estimated wait before local preparation finishes. No estimate is available yet."
+              },
+              "total": {
+                "description": "Selected workspace files, once discovery has finished.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "prepared",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
+            "properties": {
+              "code": {
+                "const": "vector_ranking_unavailable",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The full-text tier did not rank this answer, so it came from identifier matching\nalone: a query phrased as prose finds nothing. The tier is still committing the\ncaptured tree, missed a commit, holds no indexed tree, failed to load, got no\ndatabase connection within `[search] busy_timeout`, or still answers for a newer\npublication after the request's capture attempts; `detail` names which, and what\nclears it.",
+            "properties": {
+              "code": {
+                "const": "lexical_ranking_unavailable",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The query carried more terms and quoted phrases than `terms_max`, so the server\ndropped the shortest unquoted terms and ranked the answer by the rest. Every\nquoted phrase is kept. Shorten `query`, or quote the terms that must be matched.",
+            "properties": {
+              "code": {
+                "const": "query_narrowed",
+                "type": "string"
+              },
+              "terms_max": {
+                "description": "Terms and quoted phrases the query was cut to: the server's bound on one\nparsed query.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "terms_max"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+            "properties": {
+              "code": {
+                "const": "lexical_ranking_truncated",
+                "type": "string"
+              },
+              "matches_max": {
+                "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "matches_max"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `total_pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`.",
+            "properties": {
+              "code": {
+                "const": "results_truncated",
+                "type": "string"
+              },
+              "results_max": {
+                "description": "The bound the read stopped at: the server's limit on both the candidates one\nread ranks and the hits it returns.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "results_max"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A file held more matches of `pattern` than `matches_per_file`, so its later matches\nare missing from this answer while every other file answers in full. `files` names\nthe cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow\n`pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.",
+            "properties": {
+              "code": {
+                "const": "pattern_matches_truncated",
+                "type": "string"
+              },
+              "files": {
+                "description": "The files cut at the bound.",
+                "items": {
+                  "$ref": "#/components/schemas/FileId"
+                },
+                "maxItems": 8,
+                "type": "array"
+              },
+              "matches_per_file": {
+                "description": "Matches one file contributes at most: the server's bound on one file's matches.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "matches_per_file",
+              "files"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The trigram index `pattern` selects its files through lacks rows of stored file\ntext, and verifying those rows beside the selected ones would pass the `[search]`\nkey `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the\nrows the index holds and a match in the other rows is missing from it. The server\nindexes those rows in the background after each write; `prepared` and `total` state\nhow far it has got. Resend the request once the index has caught up.",
+            "properties": {
+              "code": {
+                "const": "pattern_index_preparing",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "prepared": {
+                "description": "Rows of stored file text the trigram index holds: one per file, or one per\nchunk of a file split under `[search.text]`.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "total": {
+                "description": "Rows of stored file text the store holds.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "prepared",
+              "total",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift server logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
+            "properties": {
+              "code": {
+                "const": "source_unavailable",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "unit": {
+                "$ref": "#/components/schemas/FileId",
+                "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
+              }
+            },
+            "required": [
+              "code",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Text files past `[search.text] max_chunk` are left out of the text index under the\nkey `large_files = \"skip\"`, so no hit answers from their text; `skipped` counts the\nones the request's `paths` reach. A declaration such a file holds still answers.\nSetting `large_files` to `split` indexes them in chunks.",
+            "properties": {
+              "code": {
+                "const": "large_file_skipped",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "skipped": {
+                "description": "The files past `max_chunk` the request's `paths` reach.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "skipped",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising\n`max_file` parses them.",
+            "properties": {
+              "code": {
+                "const": "large_file_unparsed",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "files": {
+                "description": "The files held as text alone.",
+                "items": {
+                  "$ref": "#/components/schemas/FileId"
+                },
+                "maxItems": 8,
+                "type": "array"
+              }
+            },
+            "required": [
+              "code",
+              "files",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A lockfile the request's `paths.include` selects is left out of search, so no hit\nanswers from it; `rift://map` still carries the versions it pins. Naming the file\nin `paths.force_include` searches it for one request, and removing its name from\nthe `[search.text]` key `excluded_lockfiles` indexes it. One warning names every\nsuch file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.",
+            "properties": {
+              "code": {
+                "const": "lockfile_excluded",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "files": {
+                "description": "The selected lockfiles search leaves out.",
+                "items": {
+                  "$ref": "#/components/schemas/FileId"
+                },
+                "maxItems": 8,
+                "type": "array"
+              }
+            },
+            "required": [
+              "code",
+              "files",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected.",
+            "properties": {
+              "code": {
+                "const": "symbol_disagreement",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "providers": {
+                "description": "Providers whose Contribution carries a differing value for at least one\npresentation field, sorted and deduplicated.",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              },
+              "symbol": {
+                "$ref": "#/components/schemas/SymbolId",
+                "description": "The symbol whose presentation facts disagree."
+              }
+            },
+            "required": [
+              "code",
+              "symbol",
+              "providers",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A traversal walk stopped at its node bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+            "properties": {
+              "code": {
+                "const": "traversal_truncated",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "visited": {
+                "description": "Symbols the walk visited before it stopped, equal to the bound it hit.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "visited",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "No lane populates part of the relationship coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+            "properties": {
+              "code": {
+                "const": "relationship_coverage_missing",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "facets": {
+                "description": "The requested facets no lane populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a lane.",
+                "items": {
+                  "$ref": "#/components/schemas/RelationshipFacet"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "code",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+            "properties": {
+              "code": {
+                "const": "engine_analysis_unavailable",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "language": {
+                "$ref": "#/components/schemas/Language",
+                "description": "The seed declaration's language, whose engine's answer was dropped."
+              }
+            },
+            "required": [
+              "code",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "An outgoing walk dropped its edges to callees it named no declaration for. The\nlanguage engine's call hierarchy named each in a file outside the project and every\ninstalled package the workspace's dependencies name, or in a package or standard\nlibrary file where the global index answered no declaration at the callee's\nposition. Every package callee drops when the global API is off or did not answer,\nand the answer then carries the global warning naming why. Every other edge stands.\nThe warning states that edges are missing from this answer; it never states that\nthe seed calls nothing more.",
+            "properties": {
+              "callees": {
+                "description": "Edges the walk dropped over every depth, one per call the engine named.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "code": {
+                "const": "callees_dropped",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "callees",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+            "properties": {
+              "code": {
+                "const": "engine_readiness_unconfirmed",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "processes": {
+                "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                "items": {
+                  "type": "string"
+                },
+                "minItems": 1,
+                "type": "array"
+              }
+            },
+            "required": [
+              "code",
+              "processes",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The history store the server fills in the background has not analyzed every commit\n`[providers.history]` selects, so a commit search answers from the `analyzed` ones\nalone and a commit the store has not reached answers nothing. The fill runs newest\nfirst and continues without a request; a later search answers the rest.",
+            "properties": {
+              "analyzed": {
+                "description": "Commits the history store holds of the ones its latest fill selects.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "code": {
+                "const": "history_store_filling",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "total": {
+                "description": "Commits the history store's latest fill selects.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "analyzed",
+              "total",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
+            "properties": {
+              "code": {
+                "const": "change_truncated",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "paths_max": {
+                "description": "Changed paths the comparison stopped at, equal to the bound it reached.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "code",
+              "paths_max",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "Global access is disabled under `[global] enabled = false`, so the answer carries no\npackage facts.",
+            "properties": {
+              "code": {
+                "const": "global_access_disabled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global API could not answer, so the answer carries no package facts.",
+            "properties": {
+              "code": {
+                "const": "global_api_unavailable",
+                "type": "string"
+              },
+              "failure_class": {
+                "$ref": "#/components/schemas/GlobalFailureClass",
+                "description": "Bounded class of the global API failure."
+              }
+            },
+            "required": [
+              "code",
+              "failure_class"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global API advertised a publication the client cannot read, so the answer\ncarries no package facts.",
+            "properties": {
+              "code": {
+                "const": "global_publication_incompatible",
+                "type": "string"
+              },
+              "failure_class": {
+                "$ref": "#/components/schemas/GlobalFailureClass",
+                "description": "Bounded class of the incompatible publication."
+              }
+            },
+            "required": [
+              "code",
+              "failure_class"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global API returned an invalid or truncated response, so the answer carries no\npackage facts.",
+            "properties": {
+              "code": {
+                "const": "global_response_invalid",
+                "type": "string"
+              },
+              "failure_class": {
+                "$ref": "#/components/schemas/GlobalFailureClass",
+                "description": "Bounded class of the invalid response."
+              }
+            },
+            "required": [
+              "code",
+              "failure_class"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.\n`capability_unavailable` also names a feature the global API's capabilities do not\nadvertise, such as `patterns` for a `pattern` search, and the answer then carries the\nproject hits alone.",
+            "properties": {
+              "code": {
+                "const": "global_page_warning",
+                "type": "string"
+              },
+              "detail": {
+                "description": "Optional bounded explanation returned by the global package service, or the\nfeature its capabilities do not advertise.",
+                "maxLength": 12431,
+                "type": "string"
+              },
+              "warning_code": {
+                "$ref": "#/components/schemas/GlobalPageWarningCode",
+                "description": "Stable condition code returned by the global package service, or\n`capability_unavailable` for a feature its capabilities do not advertise."
+              }
+            },
+            "required": [
+              "code",
+              "warning_code"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global publication holds no release of an exact package the dependency\ncontext names, so nothing answers for it. At most `DEPENDENCY_WARNINGS_MAX` package\nand dependency-context warnings ride one answer.",
+            "properties": {
+              "code": {
+                "const": "package_absent",
+                "type": "string"
+              },
+              "package": {
+                "$ref": "#/components/schemas/PackageIdentity",
+                "description": "The exact package absent from the global publication."
+              }
+            },
+            "required": [
+              "code",
+              "package"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global publication holds no release a declared requirement admits, so nothing\nanswers for it. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer.",
+            "properties": {
+              "code": {
+                "const": "package_requirement_absent",
+                "type": "string"
+              },
+              "entry": {
+                "$ref": "#/components/schemas/PackageContextEntry",
+                "description": "The declared requirement absent from the global publication."
+              }
+            },
+            "required": [
+              "code",
+              "entry"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+            "properties": {
+              "code": {
+                "const": "package_substituted",
+                "type": "string"
+              },
+              "entry": {
+                "$ref": "#/components/schemas/PackageContextEntry",
+                "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+              },
+              "package": {
+                "$ref": "#/components/schemas/PackageIdentity",
+                "description": "The collected release that answers for `entry`."
+              }
+            },
+            "required": [
+              "code",
+              "entry",
+              "package"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The dependency context names a package no public registry serves: a path outside\nthe workspace, a git repository, a private registry, or a URL. No global package\nindex answers for it, and `reason` names the capability Rift does not have yet. At\nmost `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer.",
+            "properties": {
+              "code": {
+                "const": "package_unavailable",
+                "type": "string"
+              },
+              "entry": {
+                "$ref": "#/components/schemas/PackageContextEntry",
+                "description": "The dependency context entry, as the workspace's manifests and lockfiles state\nit; its `availability` names the kind."
+              },
+              "reason": {
+                "description": "Why no global package index answers for the entry, for a reader.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "entry",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left:\nevery held entry before any the request's `packages` names. The dependency context\nmay then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
+            "properties": {
+              "code": {
+                "const": "package_context_degraded",
+                "type": "string"
+              },
+              "reason": {
+                "description": "What the resolver could not do - prose for a reader; nothing keys on it.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "resolver": {
+                "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose held or requested entries left past the entry bound, such\nas `pypi`.",
+                "maxLength": 128,
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "resolver",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RelationshipFacet": {
+        "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+        "type": "string",
+        "enum": [
+          "contains",
+          "declares",
+          "augments",
+          "references",
+          "calls",
+          "constructs",
+          "reads",
+          "writes",
+          "imports",
+          "exports",
+          "extends",
+          "implements",
+          "has_type",
+          "overrides",
+          "aliases",
+          "generates",
+          "depends_on",
+          "annotated_by",
+          "throws",
+          "catches",
+          "bounded_by",
+          "instantiates",
+          "specializes",
+          "overloads",
+          "mixes_in",
+          "embeds",
+          "tests",
+          "configures",
+          "binds"
+        ],
+        "x-enum-descriptions": [
+          "The source contains the target within its scope.",
+          "The source declares the target.",
+          "The source adds to a declaration made elsewhere.",
+          "The source mentions the target.",
+          "The source invokes the target.",
+          "The source creates an instance of the target.",
+          "The source reads the target's value.",
+          "The source assigns to the target.",
+          "The source brings the target into scope.",
+          "The source exposes the target outside its unit.",
+          "The source inherits from the target.",
+          "The source fulfils the target's interface.",
+          "The source is typed by the target.",
+          "The source replaces the target inherited from a supertype.",
+          "The source is another name for the target.",
+          "The source produces the target as generated code.",
+          "The source requires the target to build or run.",
+          "The source carries the target as an annotation.",
+          "The source can raise the target.",
+          "The source handles the target when raised.",
+          "The source's type parameter is constrained by the target.",
+          "The source applies concrete arguments to the generic target.",
+          "The source is a specialization of the generic target.",
+          "The source and target are separately dispatched forms of one name.",
+          "The source incorporates the target as a mixin.",
+          "The source embeds the target within its own definition.",
+          "The source exercises the target as a test.",
+          "The source supplies configuration for the target.",
+          "The source binds a name or value to the target."
+        ]
+      },
+      "RevisionId": {
+        "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
+        "examples": [
+          "main"
+        ],
+        "maxLength": 128,
+        "minLength": 1,
+        "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
+        "type": "string"
+      },
+      "SourceExcerpt": {
+        "additionalProperties": false,
+        "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
+        "properties": {
+          "span": {
+            "$ref": "#/components/schemas/SourceUnitSpan",
+            "description": "The source unit and byte range the text was taken from."
+          },
+          "text": {
+            "description": "The source bytes returned by the request.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "span",
+          "text"
+        ],
+        "type": "object"
+      },
+      "SourcePosition": {
+        "additionalProperties": false,
+        "description": "One exact position in a project, package or runtime source unit.",
+        "properties": {
+          "character": {
+            "description": "Zero-based offset counted using the request's position encoding.",
+            "format": "uint64",
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "line": {
+            "description": "Zero-based source line.",
+            "format": "uint64",
+            "maximum": 2147483647,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "Canonical physical source unit, independent of the logical symbol owner."
+          }
+        },
+        "required": [
+          "unit",
+          "line",
+          "character"
+        ],
+        "type": "object"
+      },
+      "SourceUnitSpan": {
+        "additionalProperties": false,
+        "description": "One byte range in a source-catalog unit.",
+        "properties": {
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "Half-open UTF-8 byte range in that unit."
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "Source unit containing the bytes."
+          }
+        },
+        "required": [
+          "unit",
+          "range"
+        ],
+        "type": "object"
+      },
+      "SymbolAlternative": {
+        "additionalProperties": false,
+        "description": "An actual object proposed after a valid exact miss.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/SymbolIdentity",
+            "description": "The candidate's actual canonical identity, including its exact owner and version."
+          },
+          "match_context": {
+            "description": "Structural comparisons that explain this candidate.",
+            "items": {
+              "$ref": "#/components/schemas/SymbolMatchContext"
+            },
+            "type": "array"
+          },
+          "name": {
+            "description": "The candidate's displayed name.",
+            "maxLength": 4096,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "match_context"
+        ],
+        "type": "object"
+      },
+      "SymbolDeclaration": {
+        "additionalProperties": false,
+        "description": "One source binding for a logical object. Source-less objects have no bindings.",
+        "properties": {
+          "documentation_indices": {
+            "description": "Entries in the result symbol's documentation array supplied by this declaration.",
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "line": {
+            "description": "One-based line where this declaration begins.",
+            "format": "uint64",
+            "minimum": 1,
+            "type": "integer"
+          },
+          "node": {
+            "$ref": "#/components/schemas/NodeId",
+            "description": "Source node when available and requested."
+          },
+          "origin": {
+            "$ref": "#/components/schemas/SymbolOrigin",
+            "description": "Contextual owner and source kind of this declaration's source."
+          },
+          "path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Repository-relative path. Exactly one of `path` and `unit` is present."
+          },
+          "range": {
+            "$ref": "#/components/schemas/TextRange",
+            "description": "The declaration's complete byte range in its source."
+          },
+          "signature_indices": {
+            "description": "Entries in the result symbol's signature array supplied by this declaration.",
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "Source excerpt when requested and available.",
+            "maxLength": 67108864,
+            "type": "string"
+          },
+          "source_complete": {
+            "description": "Whether the supplied excerpt contains this declaration's complete source.",
+            "type": "boolean"
+          },
+          "type_indices": {
+            "description": "Entries in the result symbol's type array supplied by this declaration.",
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "unit": {
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "Released source unit. Exactly one of `path` and `unit` is present."
+          }
+        },
+        "required": [
+          "origin",
+          "range",
+          "line",
+          "source_complete",
+          "signature_indices",
+          "type_indices",
+          "documentation_indices"
+        ],
+        "type": "object"
+      },
+      "SymbolHistory": {
+        "additionalProperties": false,
+        "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The timeline follows first parents from the served revision, or the selected\nreleases in version order, through the revisions the history store holds, and follows\nthe declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary.",
+        "properties": {
+          "complete": {
+            "description": "Whether the timeline reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so revisions older than the listed ones may have touched the symbol.",
+            "type": "boolean"
+          },
+          "symbol": {
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol the timeline is for."
+          },
+          "versions": {
+            "description": "Revisions that touched the symbol, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/SymbolVersion"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "symbol",
+          "versions",
+          "complete"
+        ],
+        "type": "object"
+      },
+      "SymbolIdentity": {
+        "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+        "examples": [
+          "rift://symbol/local/rust/app/parser/parse",
+          "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+          "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+          "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+        ],
+        "maxLength": 8192,
+        "minLength": 1,
+        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+        "type": "string"
+      },
+      "SymbolMatchContext": {
+        "description": "The structural parts compared when an alternative was selected.",
+        "type": "string",
+        "enum": [
+          "owner",
+          "language",
+          "module",
+          "container",
+          "form",
+          "name",
+          "version"
+        ],
+        "x-enum-descriptions": [
+          "Defining package, runtime or local scope.",
+          "Language and dialect.",
+          "Semantic module path.",
+          "Owning container path.",
+          "Callable dispatch form.",
+          "Terminal declared name.",
+          "Exact release of the same defining owner."
+        ]
+      },
+      "SymbolNotFound": {
+        "additionalProperties": false,
+        "description": "Definite absence after a complete exact selection, with bounded alternatives.",
+        "properties": {
+          "alternatives": {
+            "description": "Actual structural candidates, never substitutions for the requested object.",
+            "items": {
+              "$ref": "#/components/schemas/SymbolAlternative"
+            },
+            "maxItems": 3,
+            "type": "array"
+          },
+          "detail": {
+            "description": "Unfinished candidate work, when the complete nearest set could not be proved.",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/SymbolIdentity",
+            "description": "The valid exact identity requested by the caller."
+          }
+        },
+        "required": [
+          "id",
+          "alternatives"
+        ],
+        "type": "object"
+      },
+      "SymbolUnavailableReason": {
+        "description": "Why an exact selection cannot establish presence or definite absence.",
+        "type": "string",
+        "enum": [
+          "exact_release",
+          "index_preparing",
+          "read_failed",
+          "corrupt_publication",
+          "insufficient_coverage",
+          "view_expired",
+          "view_context"
+        ],
+        "x-enum-descriptions": [
+          "The encoded exact release has no accepted publication.",
+          "The selected index is preparing.",
+          "The serving read failed.",
+          "The publication failed validation.",
+          "Accepted facts do not cover this exact selection.",
+          "The requested captured view expired or was explicitly removed.",
+          "The captured view belongs to another workspace or scope mapping."
+        ]
+      },
+      "SymbolVersion": {
+        "additionalProperties": false,
+        "description": "One revision that touched a symbol. The history provider parses the declaration at each\nfirst-parent revision that changed its file and classifies adjacent states; a revision\nwhose source cannot be parsed contributes no version.",
+        "properties": {
+          "author": {
+            "$ref": "#/components/schemas/CommitAuthor",
+            "description": "Who authored the revision, as the version control records it."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/SymbolVersionKind",
+            "description": "How the revision changed the symbol."
+          },
+          "path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Where the declaration lived at that revision."
+          },
+          "revision": {
+            "$ref": "#/components/schemas/RevisionId",
+            "description": "The revision that touched the symbol."
+          },
+          "summary": {
+            "description": "The revision's own first summary line, where the version control records one.",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "timestamp": {
+            "description": "When the revision was committed, as RFC 3339 date-time carrying the recorded offset:\nthe committer time, not the author time.",
+            "maxLength": 64,
+            "type": "string"
+          }
+        },
+        "required": [
+          "revision",
+          "path",
+          "kind",
+          "timestamp",
+          "author"
+        ],
+        "type": "object"
+      },
+      "SymbolVersionKind": {
+        "description": "What the revision did to the symbol.",
+        "type": "string",
+        "enum": [
+          "introduced",
+          "body_changed",
+          "signature_changed",
+          "moved",
+          "removed",
+          "decorators_changed"
+        ],
+        "x-enum-descriptions": [
+          "The revision brought the symbol into existence.",
+          "The revision changed the implementation without touching the signature.",
+          "The revision changed the declared interface.",
+          "The revision relocated the declaration to another path.",
+          "The revision deleted the declaration.",
+          "The revision changed the annotations on the declaration."
+        ]
+      },
+      "SyntaxFramework": {
+        "description": "Frameworks whose syntax depends on package or component context.",
+        "type": "string",
+        "enum": [
+          "angular",
+          "tailwind"
+        ],
+        "x-enum-descriptions": [
+          "Angular templates owned by an imported `Component` decorator.",
+          "Tailwind directives and classes under a known major version."
+        ]
       }
     },
     "headers": {

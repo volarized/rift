@@ -38,6 +38,7 @@ rift-tracing = { path = "crates/rift-tracing" }
 rift-tracing-macros = { path = "crates/rift-tracing-macros" }
 
 anyhow = "1.0"
+chrono = { version = "=0.4.45", default-features = false, features = ["std", "serde"] }
 proc-macro2 = "1.0.107"
 prettyplease = "0.2.37"
 # `#[rift_tracing::timed]` finds the consuming crate's name for `rift-tracing`, renamed or

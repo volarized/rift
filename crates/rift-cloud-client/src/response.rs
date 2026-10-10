@@ -97,19 +97,48 @@ pub(crate) async fn search(
 pub(crate) fn exact_symbol(
     response: RawResponse,
 ) -> Result<Parsed<rift_protocol::symbol_read::GetSymbolResult>, ClientError> {
-    let RawResponse { status, body, meta } = response;
-    if matches!(status.as_u16(), 200 | 404 | 503) && crate::is_media(&meta, "application/json") {
-        use rift_protocol::symbol_read::GetSymbolResult;
-        let value: GetSymbolResult =
-            serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
-                status: status.as_u16(),
-            })?;
-        if !matches!(
-            (status.as_u16(), &value),
+    use rift_protocol::symbol_read::GetSymbolResult;
+    exact_response(response, &[200, 404, 503], |status, value| {
+        matches!(
+            (status, value),
             (200, GetSymbolResult::Found { .. })
                 | (404, GetSymbolResult::Missing { .. })
                 | (503, GetSymbolResult::Unavailable { .. })
-        ) {
+        )
+    })
+}
+
+pub(crate) fn exact_source(
+    response: RawResponse,
+) -> Result<Parsed<rift_protocol::source_read::GetSourceResult>, ClientError> {
+    use rift_protocol::source_read::GetSourceResult;
+    exact_response(response, &[200, 404, 503], |status, value| {
+        matches!(
+            (status, value),
+            (200, GetSourceResult::Found { .. })
+                | (404, GetSourceResult::Missing { .. })
+                | (503, GetSourceResult::Unavailable { .. })
+        )
+    })
+}
+
+pub(crate) fn source_declarations(
+    response: RawResponse,
+) -> Result<Parsed<rift_protocol::source_read::FindDeclarationsResult>, ClientError> {
+    exact_response(response, &[200], |_, _| true)
+}
+
+fn exact_response<T: serde::de::DeserializeOwned>(
+    response: RawResponse,
+    statuses: &[u16],
+    accepts: impl FnOnce(u16, &T) -> bool,
+) -> Result<Parsed<T>, ClientError> {
+    let RawResponse { status, body, meta } = response;
+    if statuses.contains(&status.as_u16()) && crate::is_media(&meta, "application/json") {
+        let value: T = serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
+            status: status.as_u16(),
+        })?;
+        if !accepts(status.as_u16(), &value) {
             return Err(ClientError::InvalidResponse {
                 status: status.as_u16(),
             });

@@ -41,6 +41,8 @@ enum FixtureMode {
 enum OperationFixture {
     Valid,
     ExactSymbol(serde_json::Value),
+    ExactSource(serde_json::Value, StatusCode),
+    SourceDeclarations(serde_json::Value, StatusCode),
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
@@ -357,7 +359,19 @@ fn operation_response(
         return operation_symbol_response(mode, query);
     }
     if path.ends_with("/declarations") {
+        if let OperationFixture::SourceDeclarations(value, status) = mode {
+            let mut response = json_response(value, None);
+            *response.status_mut() = *status;
+            return response;
+        }
         return json_response(&declaration::declaration_response_json(), None);
+    }
+    if path.ends_with("/source")
+        && let OperationFixture::ExactSource(value, status) = mode
+    {
+        let mut response = json_response(value, None);
+        *response.status_mut() = *status;
+        return response;
     }
     if path.ends_with("/patterns") {
         let mut page = pattern::pattern_page_json(query_cursor(query));
@@ -424,7 +438,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
         }
-        OperationFixture::Declarations => {
+        OperationFixture::Declarations | OperationFixture::SourceDeclarations(_, _) => {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "declarations"]);
         }
@@ -1528,6 +1542,15 @@ async fn operation_failure(
             .find_package_declarations(&declaration::declaration_request())
             .await
             .err(),
+        Endpoint::Source => client
+            .get_source(
+                &serde_json::from_value(serde_json::json!({
+                    "unit": "rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py"
+                }))
+                .expect("runtime source request"),
+            )
+            .await
+            .err(),
     }
 }
 
@@ -1936,6 +1959,247 @@ async fn operation_client(mode: OperationFixture) -> (FixtureServer, GlobalClien
     let client = GlobalClient::new(server.config())
         .unwrap_or_else(|error| panic!("fixture client: {error:?}"));
     (server, client)
+}
+
+#[tokio::test]
+async fn exact_source_preserves_runtime_owner_view_and_typed_http_outcomes() {
+    use rift_protocol::source_read::GetSourceParams;
+    let unit = "rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py";
+    let request: GetSourceParams =
+        serde_json::from_value(serde_json::json!({"unit":unit,"view":"a".repeat(64)}))
+            .expect("source request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    for (status, value) in [
+        (
+            StatusCode::OK,
+            serde_json::json!({"outcome":"found","source":{"span":{"unit":unit,"range":{"start":0,"end":2}},"text":"é"},"source_complete":true,"view":view,"warnings":[]}),
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"outcome":"missing","unit":unit,"view":view,"warnings":[]}),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"outcome":"unavailable","unit":unit,"view":view,"reason":"insufficient_coverage","warnings":[]}),
+        ),
+    ] {
+        let (server, client) =
+            operation_client(OperationFixture::ExactSource(value.clone(), status)).await;
+        let answer = client
+            .get_source(&request)
+            .await
+            .expect("typed source outcome");
+        assert_eq!(
+            answer,
+            serde_json::from_value(value).expect("source outcome")
+        );
+        let requests = server.state.request_log.lock().await;
+        let sent = requests
+            .iter()
+            .find(|sent| sent.path.ends_with("/source"))
+            .expect("source request");
+        assert_eq!(sent.path, "/rift/rest/v1/source");
+        assert_eq!(sent.method, reqwest::Method::POST);
+        assert_eq!(sent.query, None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&sent.body).expect("request JSON"),
+            serde_json::to_value(&request).expect("request")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|sent| sent.path.ends_with("/resolutions"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_source_refuses_wrong_http_outcomes_foreign_views_and_utf8_ranges() {
+    use rift_protocol::source_read::GetSourceParams;
+    let unit = "rift://source/npm/npmjs.org/demo@1.0.0/index.js";
+    let request: GetSourceParams = serde_json::from_value(
+        serde_json::json!({"unit":unit,"range":{"start":0,"end":2},"view":"a".repeat(64)}),
+    )
+    .expect("source request");
+    let found = serde_json::json!({"outcome":"found","source":{"span":{"unit":unit,"range":{"start":0,"end":2}},"text":"é"},"source_complete":true,"view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"},"warnings":[]});
+    let mut cases = vec![
+        (found.clone(), StatusCode::NOT_FOUND),
+        (found.clone(), StatusCode::SERVICE_UNAVAILABLE),
+    ];
+    let mut foreign_view = found.clone();
+    foreign_view["view"]["id"] = serde_json::json!("b".repeat(64));
+    cases.push((foreign_view, StatusCode::OK));
+    let mut foreign_unit = found.clone();
+    foreign_unit["source"]["span"]["unit"] =
+        serde_json::json!("rift://source/npm/registry.example/demo@1.0.0/index.js");
+    cases.push((foreign_unit, StatusCode::OK));
+    let mut wrong_bytes = found.clone();
+    wrong_bytes["source"]["span"]["range"]["end"] = serde_json::json!(1);
+    cases.push((wrong_bytes, StatusCode::OK));
+    let mut outside_range = found;
+    outside_range["source"]["span"]["range"]["start"] = serde_json::json!(1);
+    outside_range["source"]["span"]["range"]["end"] = serde_json::json!(3);
+    cases.push((outside_range, StatusCode::OK));
+    for (value, status) in cases {
+        let (_server, client) =
+            operation_client(OperationFixture::ExactSource(value, status)).await;
+        assert!(matches!(
+            client.get_source(&request).await,
+            Err(ClientError::InvalidResponse { .. })
+        ));
+    }
+}
+
+#[test]
+fn generated_source_range_preserves_exact_integer_bound() {
+    use validator::Validate;
+    let bound = 9_007_199_254_740_991;
+    assert!(
+        crate::generated::TextRange {
+            start: bound,
+            end: bound
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        crate::generated::TextRange {
+            start: 0,
+            end: bound + 1
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        crate::generated::TextRange {
+            start: bound + 1,
+            end: bound + 1
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn exact_source_refuses_legacy_and_noncanonical_units_after_http() {
+    use rift_protocol::source_read::GetSourceParams;
+    let request: GetSourceParams = serde_json::from_value(serde_json::json!({
+        "unit":"rift://source/npm/npmjs.org/demo@1.0.0/index.js"
+    }))
+    .expect("canonical source request");
+    for unit in [
+        "rift://source/npm/demo@1.0.0/index.js",
+        "rift://source/npm/npmjs.org/demo@1.0.0/../index.js",
+        "rift://source/npm/npmjs.org/demo@1.0.0/src%2Findex.js",
+        "rift://source/stdlib/cpython@3.12.9/C:/Lib/pathlib.py",
+    ] {
+        let value = serde_json::json!({"outcome":"found","source":{
+            "span":{"unit":unit,"range":{"start":0,"end":0}},"text":""
+        },"source_complete":true,"view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}});
+        let missing = serde_json::json!({"outcome":"missing","unit":unit,
+            "view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}});
+        for (value, status) in [(value, StatusCode::OK), (missing, StatusCode::NOT_FOUND)] {
+            let (_server, client) =
+                operation_client(OperationFixture::ExactSource(value, status)).await;
+            assert_eq!(
+                client.get_source(&request).await,
+                Err(ClientError::Decode {
+                    status: status.as_u16()
+                })
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_source_refuses_unproved_global_owners_before_http() {
+    use rift_protocol::source_read::GetSourceParams;
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    for unit in [
+        "rift://source/project/src/lib.rs",
+        "rift://source/custom/src/lib.rs",
+    ] {
+        let request: GetSourceParams =
+            serde_json::from_value(serde_json::json!({"unit":unit})).expect("valid local source");
+        assert!(matches!(
+            client.get_source(&request).await,
+            Err(ClientError::InvalidRequest { field: "unit" })
+        ));
+    }
+    assert!(server.state.request_log.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn source_declaration_batch_preserves_runtime_and_stub_owners_with_one_view() {
+    use rift_protocol::source_read::FindDeclarationsParams;
+    let positions = serde_json::json!([
+        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":0,"character":0},
+        {"unit":"rift://source/pypi/pypi.org/types-pathlib@0.1.0/pathlib.pyi","line":2,"character":3}
+    ]);
+    let request: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-16","positions":positions,"view":"a".repeat(64)})).expect("position request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let value = serde_json::json!({"results":[
+        {"outcome":"found","position":positions[0],"id":"rift://symbol/stdlib/cpython@3.12.9/python/pathlib/Path","kind":"class","view":view},
+        {"outcome":"unavailable","position":positions[1],"reason":"insufficient_coverage","view":view}
+    ],"warnings":[]});
+    let (server, client) = operation_client(OperationFixture::SourceDeclarations(
+        value.clone(),
+        StatusCode::OK,
+    ))
+    .await;
+    assert_eq!(
+        client
+            .find_declarations(&request)
+            .await
+            .expect("ordered outcomes"),
+        serde_json::from_value(value).expect("batch outcome")
+    );
+    let requests = server.state.request_log.lock().await;
+    let sent = requests
+        .iter()
+        .find(|sent| sent.path.ends_with("/declarations"))
+        .expect("position request");
+    assert_eq!(sent.query, None);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sent.body).expect("request JSON"),
+        serde_json::to_value(request).expect("request")
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|sent| sent.path.ends_with("/resolutions"))
+    );
+}
+
+#[tokio::test]
+async fn source_declaration_batch_refuses_reordering_foreign_views_and_whole_batch_missing() {
+    use rift_protocol::source_read::FindDeclarationsParams;
+    let positions = serde_json::json!([
+        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":0,"character":0},
+        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":1,"character":0}
+    ]);
+    let request: FindDeclarationsParams = serde_json::from_value(
+        serde_json::json!({"position_encoding":"utf-8","positions":positions}),
+    )
+    .expect("position request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let value = serde_json::json!({"results":[{"outcome":"missing","position":positions[0],"view":view},{"outcome":"missing","position":positions[1],"view":view}],"warnings":[]});
+    let mut reordered = value.clone();
+    reordered["results"]
+        .as_array_mut()
+        .expect("results")
+        .swap(0, 1);
+    let mut foreign_view = value.clone();
+    foreign_view["results"][1]["view"]["id"] = serde_json::json!("b".repeat(64));
+    for (value, status) in [
+        (reordered, StatusCode::OK),
+        (foreign_view, StatusCode::OK),
+        (value, StatusCode::NOT_FOUND),
+    ] {
+        let (_server, client) =
+            operation_client(OperationFixture::SourceDeclarations(value, status)).await;
+        assert!(client.find_declarations(&request).await.is_err());
+    }
 }
 
 #[tokio::test]
