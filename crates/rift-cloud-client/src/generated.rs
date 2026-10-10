@@ -3109,368 +3109,101 @@ impl<'de> serde::Deserialize<'de> for PositionEncoding {
 /// One warning attached to a read result. The answer stands; the warning carries evidence
 /// of a condition the caller weighs before relying on it.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(untagged)]
-pub enum ReadWarning {
-    /// Framework context could not be resolved for one source. Ordinary syntax stands;
-    /// framework-specific facts whose context is missing are left out.
-    #[default]
-    Object(ReadWarningObject),
-    /// The lookup found no declaration under its name, language, and scope.
-    /// `alternatives` names up to three project declarations, ordered by the smallest
-    /// case-insensitive Unicode Levenshtein distance to their short or qualified names.
-    /// Equal distances use qualified name, then project path order. Revision reads
-    /// use that revision's declarations. A `global` lookup carries no alternatives;
-    /// an `all` lookup proposes project declarations alone. If complete closest ranking
-    /// exceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`
-    /// carries the registered failure's message, recovery action, and observed work.
-    Object2(ReadWarningObject2),
-    /// Documentation collection or excerpt output omitted part of a selected source.
-    DocumentationWarning(ReadWarningDocumentationWarning),
-    /// The documentation this read projects onto crossed a bound, so no documentation
-    /// block joins the answer: declarations and files answer as they would without it.
-    /// The condition holds until the documentation it names changes.
-    Object3(ReadWarningObject3),
-    /// The answer was computed from an index that lags the tree the read captured. Facts
-    /// derived from the index may miss the newest writes; the digests state which two
-    /// trees disagree. When the two digests are equal, the tree moved in recorded files
-    /// outside the syntax-indexed ones or in the configuration file, and `detail` says
-    /// which.
-    Object4(ReadWarningObject4),
-    /// The vector ranking holds no vectors for the tree this read captured, so the answer
-    /// was ranked lexically alone. The pass over that tree is still running, or the tree
-    /// was published after the corpus the ranking holds was described. `prepared` and
-    /// `total` state how far the ranking has got for the captured tree, and `ready_in` is
-    /// derived from workspace size and embedding progress.
-    Duration(ReadWarningDuration),
-    /// The local index is still preparing selected workspace files. The answer covers only
-    /// files whose capture and analysis have finished; `total` is absent until discovery ends.
-    Duration2(ReadWarningDuration2),
-    /// The vector ranking will not answer for the life of this server, so every answer
-    /// is ranked lexically alone. No retry is coming: fix the `[search.vector]`
-    /// configuration and start the server again.
-    Object5(ReadWarningObject5),
-    /// The full-text tier did not rank this answer, so it came from identifier matching
-    /// alone: a query phrased as prose finds nothing. The tier is still committing the
-    /// captured tree, missed a commit, holds no indexed tree, failed to load, got no
-    /// database connection within `[search] busy_timeout`, or still answers for a newer
-    /// publication after the request's capture attempts; `detail` names which, and what
-    /// clears it.
-    Object6(ReadWarningObject6),
-    /// The query carried more terms and quoted phrases than `terms_max`, so the server
-    /// dropped the shortest unquoted terms and ranked the answer by the rest. Every
-    /// quoted phrase is kept. Shorten `query`, or quote the terms that must be matched.
-    Object7(ReadWarningObject7),
-    /// The lexical ranking stopped at `matches_max` units; hits past it never reached the
-    /// page, whatever `paths` selects. Narrow `query`.
-    Object8(ReadWarningObject8),
-    /// The server reached `results_max`, its result bound, before ordering and paging:
-    /// what the bound cut never reaches any page, and `total_pages` counts only what fit.
-    /// The bound cuts the ranked candidates and the hit set alike. The warning means the
-    /// bound was reached; a set of exactly `results_max` hits carries it too. Narrow
-    /// `query` or `paths`.
-    Object9(ReadWarningObject9),
-    /// A file held more matches of `pattern` than `matches_per_file`, so its later matches
-    /// are missing from this answer while every other file answers in full. `files` names
-    /// the cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow
-    /// `pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.
-    Object10(ReadWarningObject10),
-    /// The trigram index `pattern` selects its files through lacks rows of stored file
-    /// text, and verifying those rows beside the selected ones would pass the `[search]`
-    /// key `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the
-    /// rows the index holds and a match in the other rows is missing from it. The server
-    /// indexes those rows in the background after each write; `prepared` and `total` state
-    /// how far it has got. Resend the request once the index has caught up.
-    Object11(ReadWarningObject11),
-    /// A file answers nothing from its bytes. Either the index left the claimed file out -
-    /// its bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no
-    /// search or lookup, and addressing it directly still refuses `content_unavailable`;
-    /// or a comparison against the working tree read the changed file in no working form -
-    /// its attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it
-    /// answers changed with no declarations. Every other file in the workspace stays
-    /// available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
-    /// project-path order; when more files are named, one more carries no `unit` and
-    /// counts the rest. `rift server logs` names each file the index left out, and `paths`
-    /// narrows a comparison onto the others.
-    FileId(ReadWarningFileId),
-    /// Text files past `[search.text] max_chunk` are left out of the text index under the
-    /// key `large_files = "skip"`, so no hit answers from their text; `skipped` counts the
-    /// ones the request's `paths` reach. A declaration such a file holds still answers.
-    /// Setting `large_files` to `split` indexes them in chunks.
-    Object12(ReadWarningObject12),
-    /// Files past `[providers.syntax] max_file` are held as text the syntax provider does
-    /// not parse: their text answers `search`, and none of their declarations were
-    /// extracted, so no symbol hit and no `get_symbol` answer comes from them. `files`
-    /// names them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising
-    /// `max_file` parses them.
-    Object13(ReadWarningObject13),
-    /// A lockfile the request's `paths.include` selects is left out of search, so no hit
-    /// answers from it; `rift://map` still carries the versions it pins. Naming the file
-    /// in `paths.force_include` searches it for one request, and removing its name from
-    /// the `[search.text]` key `excluded_lockfiles` indexes it. One warning names every
-    /// such file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.
-    Object14(ReadWarningObject14),
-    /// Contributions selected for one symbol's presentation disagree on at least one
-    /// field. The answer carries what normalization selected.
-    SymbolId(ReadWarningSymbolId),
-    /// A traversal walk stopped at its node bound before exhausting the reachable graph,
-    /// so hits reachable beyond the bound are missing from this answer. Narrow the walk -
-    /// a tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it
-    /// under the bound.
-    Object15(ReadWarningObject15),
-    /// No lane populates part of the relationship coverage the traversal asked for, so the
-    /// walk had nothing to follow there whatever the graph holds. The warning states that a
-    /// lane is absent; it never states that the seed has no such neighbor. An empty answer
-    /// carrying it means the walk could not run; an empty answer without it means the walk
-    /// ran and the seed has no neighbor under the request.
-    Object16(ReadWarningObject16),
-    /// A language engine serves the seed's language, and this read carries none of its
-    /// edges: the engine answered about bytes the served revision does not carry, answered
-    /// more than the walk's node bound holds, or was still analyzing when
-    /// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
-    /// the engine resolves on top of them is missing. The warning states that an engine's
-    /// analysis is absent from this answer; it never states that the seed has no such
-    /// neighbor. An engine still analyzing keeps loading, and a later read, served from a
-    /// revision the engine has caught up with or sent once it reads ready, carries the
-    /// engine's edges again.
-    Language(ReadWarningLanguage),
-    /// An outgoing walk dropped its edges to callees it named no declaration for. The
-    /// language engine's call hierarchy named each in a file outside the project and every
-    /// installed package the workspace's dependencies name, or in a package or standard
-    /// library file where the global index answered no declaration at the callee's
-    /// position. Every package callee drops when the global API is off or did not answer,
-    /// and the answer then carries the global warning naming why. Every other edge stands.
-    /// The warning states that edges are missing from this answer; it never states that
-    /// the seed calls nothing more.
-    Object17(ReadWarningObject17),
-    /// The walk took a language engine's answer without progress evidence that the engine
-    /// had settled: it announced no work since it started or was last told of a changed
-    /// file, and stayed quiet past its `settle_delay`. The answer stands. An engine that
-    /// recomputes without announcing work may have answered before it read that change, and
-    /// a later read meets it settled.
-    Object18(ReadWarningObject18),
-    /// The history store the server fills in the background has not analyzed every commit
-    /// `[providers.history]` selects, so a commit search answers from the `analyzed` ones
-    /// alone and a commit the store has not reached answers nothing. The fill runs newest
-    /// first and continues without a request; a later search answers the rest.
-    Object19(ReadWarningObject19),
-    /// The comparison reached `paths_max` changed paths and stopped there, so declarations
-    /// in the changed paths past it are missing from this answer. Narrow the comparison
-    /// with `paths`, or name two sides that differ in fewer files.
-    Object20(ReadWarningObject20),
-    /// Global access is disabled under `[global] enabled = false`, so the answer carries no
-    /// package facts.
-    Code(ReadWarningCode),
-    /// The global API could not answer, so the answer carries no package facts.
-    GlobalFailureClass(ReadWarningGlobalFailureClass),
-    /// The global API advertised a publication the client cannot read, so the answer
-    /// carries no package facts.
-    GlobalFailureClass2(ReadWarningGlobalFailureClass2),
-    /// The global API returned an invalid or truncated response, so the answer carries no
-    /// package facts.
-    GlobalFailureClass3(ReadWarningGlobalFailureClass3),
-    /// The global package page carried a bounded condition while its items remained valid.
-    /// `warning_code` identifies the condition and `detail` carries its bounded explanation.
-    /// `capability_unavailable` also names a feature the global API's capabilities do not
-    /// advertise, such as `patterns` for a `pattern` search, and the answer then carries the
-    /// project hits alone.
-    GlobalPageWarningCode(ReadWarningGlobalPageWarningCode),
-    /// The global publication holds no release of an exact package the dependency
-    /// context names, so nothing answers for it. At most `DEPENDENCY_WARNINGS_MAX` package
-    /// and dependency-context warnings ride one answer.
-    PackageIdentity(ReadWarningPackageIdentity),
-    /// The global publication holds no release a declared requirement admits, so nothing
-    /// answers for it. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
-    /// warnings ride one answer.
-    PackageContextEntry(ReadWarningPackageContextEntry),
-    /// The global publication holds no release at the exact version the dependency context
-    /// names, or none inside the range a declared requirement states, so the collected
-    /// release nearest it answers in its place: the package facts for `entry` come from
-    /// `package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings
-    /// ride one answer.
-    Object21(ReadWarningObject21),
-    /// The dependency context names a package no public registry serves: a path outside
-    /// the workspace, a git repository, a private registry, or a URL. No global package
-    /// index answers for it, and `reason` names the capability Rift does not have yet. At
-    /// most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one
-    /// answer.
-    PackageContextEntry2(ReadWarningPackageContextEntry2),
-    /// One resolver or standard library probe read less than the workspace states, or the
-    /// context passed the bound on the entries one read carries, the smaller of the
-    /// server's own and the one the global API advertises, and its entries sorted last left:
-    /// every held entry before any the request's `packages` names. The dependency context
-    /// may then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`
-    /// reaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
-    /// warnings ride one answer, this one first, in resolver order.
-    Object22(ReadWarningObject22),
-}
-impl ReadWarning {
-    /// Documentation collection or excerpt output omitted part of a selected source.
-    pub fn documentation(warning: DocumentationWarning) -> Self {
-        Self::DocumentationWarning(ReadWarningDocumentationWarning {
-            warning,
-            ..Default::default()
-        })
-    }
-    /// The documentation this read projects onto crossed a bound, so no documentation
-    /// block joins the answer: declarations and files answer as they would without it.
-    /// The condition holds until the documentation it names changes.
-    pub fn object3(detail: String) -> Self {
-        Self::Object3(ReadWarningObject3 {
-            detail,
-            ..Default::default()
-        })
-    }
-    /// The vector ranking will not answer for the life of this server, so every answer
-    /// is ranked lexically alone. No retry is coming: fix the `[search.vector]`
-    /// configuration and start the server again.
-    pub fn object5(detail: String) -> Self {
-        Self::Object5(ReadWarningObject5 {
-            detail,
-            ..Default::default()
-        })
-    }
-    /// The full-text tier did not rank this answer, so it came from identifier matching
-    /// alone: a query phrased as prose finds nothing. The tier is still committing the
-    /// captured tree, missed a commit, holds no indexed tree, failed to load, got no
-    /// database connection within `[search] busy_timeout`, or still answers for a newer
-    /// publication after the request's capture attempts; `detail` names which, and what
-    /// clears it.
-    pub fn object6(detail: String) -> Self {
-        Self::Object6(ReadWarningObject6 {
-            detail,
-            ..Default::default()
-        })
-    }
-    /// The query carried more terms and quoted phrases than `terms_max`, so the server
-    /// dropped the shortest unquoted terms and ranked the answer by the rest. Every
-    /// quoted phrase is kept. Shorten `query`, or quote the terms that must be matched.
-    pub fn object7(terms_max: u64) -> Self {
-        Self::Object7(ReadWarningObject7 {
-            terms_max,
-            ..Default::default()
-        })
-    }
-    /// The lexical ranking stopped at `matches_max` units; hits past it never reached the
-    /// page, whatever `paths` selects. Narrow `query`.
-    pub fn object8(matches_max: u64) -> Self {
-        Self::Object8(ReadWarningObject8 {
-            matches_max,
-            ..Default::default()
-        })
-    }
-    /// The server reached `results_max`, its result bound, before ordering and paging:
-    /// what the bound cut never reaches any page, and `total_pages` counts only what fit.
-    /// The bound cuts the ranked candidates and the hit set alike. The warning means the
-    /// bound was reached; a set of exactly `results_max` hits carries it too. Narrow
-    /// `query` or `paths`.
-    pub fn object9(results_max: u64) -> Self {
-        Self::Object9(ReadWarningObject9 {
-            results_max,
-            ..Default::default()
-        })
-    }
-    /// A file answers nothing from its bytes. Either the index left the claimed file out -
-    /// its bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no
-    /// search or lookup, and addressing it directly still refuses `content_unavailable`;
-    /// or a comparison against the working tree read the changed file in no working form -
-    /// its attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it
-    /// answers changed with no declarations. Every other file in the workspace stays
-    /// available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
-    /// project-path order; when more files are named, one more carries no `unit` and
-    /// counts the rest. `rift server logs` names each file the index left out, and `paths`
-    /// narrows a comparison onto the others.
-    pub fn file_id(detail: String) -> Self {
-        Self::FileId(ReadWarningFileId {
-            detail,
-            ..Default::default()
-        })
-    }
-    /// No lane populates part of the relationship coverage the traversal asked for, so the
-    /// walk had nothing to follow there whatever the graph holds. The warning states that a
-    /// lane is absent; it never states that the seed has no such neighbor. An empty answer
-    /// carrying it means the walk could not run; an empty answer without it means the walk
-    /// ran and the seed has no neighbor under the request.
-    pub fn object16(detail: String) -> Self {
-        Self::Object16(ReadWarningObject16 {
-            detail,
-            ..Default::default()
-        })
-    }
-    /// A language engine serves the seed's language, and this read carries none of its
-    /// edges: the engine answered about bytes the served revision does not carry, answered
-    /// more than the walk's node bound holds, or was still analyzing when
-    /// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
-    /// the engine resolves on top of them is missing. The warning states that an engine's
-    /// analysis is absent from this answer; it never states that the seed has no such
-    /// neighbor. An engine still analyzing keeps loading, and a later read, served from a
-    /// revision the engine has caught up with or sent once it reads ready, carries the
-    /// engine's edges again.
-    pub fn language(detail: String) -> Self {
-        Self::Language(ReadWarningLanguage {
-            detail,
-            ..Default::default()
-        })
-    }
-    /// Global access is disabled under `[global] enabled = false`, so the answer carries no
-    /// package facts.
-    pub fn code(code: String) -> Self {
-        Self::Code(ReadWarningCode {
-            code,
-            ..Default::default()
-        })
-    }
-    /// The global API could not answer, so the answer carries no package facts.
-    pub fn global_failure_class(failure_class: GlobalFailureClass) -> Self {
-        Self::GlobalFailureClass(ReadWarningGlobalFailureClass {
-            failure_class,
-            ..Default::default()
-        })
-    }
-    /// The global API advertised a publication the client cannot read, so the answer
-    /// carries no package facts.
-    pub fn global_failure_class2(failure_class: GlobalFailureClass) -> Self {
-        Self::GlobalFailureClass2(ReadWarningGlobalFailureClass2 {
-            failure_class,
-            ..Default::default()
-        })
-    }
-    /// The global API returned an invalid or truncated response, so the answer carries no
-    /// package facts.
-    pub fn global_failure_class3(failure_class: GlobalFailureClass) -> Self {
-        Self::GlobalFailureClass3(ReadWarningGlobalFailureClass3 {
-            failure_class,
-            ..Default::default()
-        })
-    }
-    /// The global package page carried a bounded condition while its items remained valid.
-    /// `warning_code` identifies the condition and `detail` carries its bounded explanation.
-    /// `capability_unavailable` also names a feature the global API's capabilities do not
-    /// advertise, such as `patterns` for a `pattern` search, and the answer then carries the
-    /// project hits alone.
-    pub fn global_page_code(warning_code: GlobalPageWarningCode) -> Self {
-        Self::GlobalPageWarningCode(ReadWarningGlobalPageWarningCode {
-            warning_code,
-            ..Default::default()
-        })
-    }
-    /// The global publication holds no release of an exact package the dependency
-    /// context names, so nothing answers for it. At most `DEPENDENCY_WARNINGS_MAX` package
-    /// and dependency-context warnings ride one answer.
-    pub fn package_identity(package: PackageIdentity) -> Self {
-        Self::PackageIdentity(ReadWarningPackageIdentity {
-            package,
-            ..Default::default()
-        })
-    }
-    /// The global publication holds no release a declared requirement admits, so nothing
-    /// answers for it. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
-    /// warnings ride one answer.
-    pub fn package_context_entry(entry: PackageContextEntry) -> Self {
-        Self::PackageContextEntry(ReadWarningPackageContextEntry {
-            entry,
-            ..Default::default()
-        })
-    }
+#[serde(default)]
+pub struct ReadWarning {
+    /// Enforced public field bound.
+    pub bound: Option<u64>,
+    #[default(Some("object_unavailable".to_string()))]
+    pub code: Option<String>,
+    /// Public field whose bound the object crossed.
+    pub field: Option<String>,
+    /// Full original qualified name of the retained object.
+    pub qualified_name: Option<String>,
+    /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
+    /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
+    /// numbers arrive here on the same scale. No JSON Schema keyword can tie one field to
+    /// another, so that `end` is never below `start` is asserted by the surface
+    /// validation tests instead.
+    pub range: Option<TextRange>,
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    pub unit: Option<String>,
+    /// The missing package version, configuration, or template source.
+    pub detail: Option<String>,
+    /// Frameworks whose syntax depends on package or component context.
+    pub framework: Option<SyntaxFramework>,
+    /// Project declaration identities the caller can use to select another name.
+    pub alternatives: Option<Vec<String>>,
+    /// The declaration name the caller requested.
+    pub name: Option<String>,
+    /// One bounded warning with repeated conditions counted per source.
+    pub warning: Option<DocumentationWarning>,
+    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
+    /// uses. The full digest is computed and compared internally; only this short form ever
+    /// reaches the wire.
+    pub captured_tree_revision: Option<String>,
+    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
+    /// uses. The full digest is computed and compared internally; only this short form ever
+    /// reaches the wire.
+    pub index_tree_revision: Option<String>,
+    /// Declarations of the captured tree that already carry a vector.
+    pub prepared: Option<u64>,
+    /// A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.
+    pub ready_in: Option<String>,
+    /// Declarations the set being embedded holds.
+    pub total: Option<u64>,
+    /// Terms and quoted phrases the query was cut to: the server's bound on one
+    /// parsed query.
+    pub terms_max: Option<u64>,
+    /// Units the ranking stopped at: the server's bound on one lexical ranking.
+    pub matches_max: Option<u64>,
+    /// The bound the read stopped at: the server's limit on both the candidates one
+    /// read ranks and the hits it returns.
+    pub results_max: Option<u64>,
+    /// The files cut at the bound.
+    pub files: Option<Vec<String>>,
+    /// Matches one file contributes at most: the server's bound on one file's matches.
+    pub matches_per_file: Option<u64>,
+    /// The files past `max_chunk` the request's `paths` reach.
+    pub skipped: Option<u64>,
+    /// Providers whose Contribution carries a differing value for at least one
+    /// presentation field, sorted and deduplicated.
+    pub providers: Option<Vec<String>>,
+    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    pub symbol: Option<String>,
+    /// Symbols the walk visited before it stopped, equal to the bound it hit.
+    pub visited: Option<u64>,
+    /// The requested facets no lane populates, in the request's own order,
+    /// deduplicated. Absent when every requested facet has a lane.
+    pub facets: Option<Vec<RelationshipFacet>>,
+    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
+    pub language: Option<String>,
+    /// Edges the walk dropped over every depth, one per call the engine named.
+    pub callees: Option<u64>,
+    /// The engines the walk took unconfirmed, by accepted process key, sorted. Inline
+    /// processes use the exact language identity segment.
+    pub processes: Option<Vec<String>>,
+    /// Commits the history store holds of the ones its latest fill selects.
+    pub analyzed: Option<u64>,
+    /// Changed paths the comparison stopped at, equal to the bound it reached.
+    pub paths_max: Option<u64>,
+    /// Bounded classes a global API failure can carry in a read warning.
+    pub failure_class: Option<GlobalFailureClass>,
+    /// Stable conditions a global package page can report while returning valid items.
+    pub warning_code: Option<GlobalPageWarningCode>,
+    /// One package as its package manager identifies it.
+    pub package: Option<PackageIdentity>,
+    /// One package the workspace depends on, as its manifests and lockfiles state it.
+    ///
+    /// Entries order by manager, then name, then the selector they state: a declared
+    /// requirement before an exact version.
+    pub entry: Option<PackageContextEntry>,
+    /// Why no global package index answers for the entry, for a reader.
+    pub reason: Option<String>,
+    /// What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a
+    /// standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the
+    /// package manager whose held or requested entries left past the entry bound, such
+    /// as `pypi`.
+    pub resolver: Option<String>,
 }
 /// One portable category an edge falls into. The local kinds `import` and `use` can share
 /// the `imports` facet, which lets one query cross languages.
@@ -5477,542 +5210,5 @@ pub struct GetSourceResultObject3 {
     pub view: Option<CapturedView>,
     /// Details and partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-}
-/// Framework context could not be resolved for one source. Ordinary syntax stands;
-/// framework-specific facts whose context is missing are left out.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject {
-    #[default("framework_context_unresolved".to_string())]
-    pub code: String,
-    /// The missing package version, configuration, or template source.
-    pub detail: String,
-    /// Frameworks whose syntax depends on package or component context.
-    pub framework: SyntaxFramework,
-    /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
-    /// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
-    /// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
-    /// whatever schema its implementation generated from.
-    pub unit: String,
-}
-/// The lookup found no declaration under its name, language, and scope.
-/// `alternatives` names up to three project declarations, ordered by the smallest
-/// case-insensitive Unicode Levenshtein distance to their short or qualified names.
-/// Equal distances use qualified name, then project path order. Revision reads
-/// use that revision's declarations. A `global` lookup carries no alternatives;
-/// an `all` lookup proposes project declarations alone. If complete closest ranking
-/// exceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`
-/// carries the registered failure's message, recovery action, and observed work.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject2 {
-    /// Project declaration identities the caller can use to select another name.
-    pub alternatives: Vec<String>,
-    #[default("symbol_not_found".to_string())]
-    pub code: String,
-    /// Why closest declarations could not be selected within the work bound.
-    /// Absent when every selected declaration was compared or scope is `global`.
-    pub detail: Option<String>,
-    /// The declaration name the caller requested.
-    pub name: String,
-}
-/// Documentation collection or excerpt output omitted part of a selected source.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningDocumentationWarning {
-    #[default("documentation".to_string())]
-    pub code: String,
-    /// One bounded warning with repeated conditions counted per source.
-    pub warning: DocumentationWarning,
-}
-/// The documentation this read projects onto crossed a bound, so no documentation
-/// block joins the answer: declarations and files answer as they would without it.
-/// The condition holds until the documentation it names changes.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject3 {
-    #[default("documentation_unavailable".to_string())]
-    pub code: String,
-    /// Which documentation was left out and the bound it crossed - prose for a
-    /// reader; nothing keys on it.
-    pub detail: String,
-}
-/// The answer was computed from an index that lags the tree the read captured. Facts
-/// derived from the index may miss the newest writes; the digests state which two
-/// trees disagree. When the two digests are equal, the tree moved in recorded files
-/// outside the syntax-indexed ones or in the configuration file, and `detail` says
-/// which.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject4 {
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
-    pub captured_tree_revision: String,
-    #[default("stale_index".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
-    pub index_tree_revision: String,
-}
-/// The vector ranking holds no vectors for the tree this read captured, so the answer
-/// was ranked lexically alone. The pass over that tree is still running, or the tree
-/// was published after the corpus the ranking holds was described. `prepared` and
-/// `total` state how far the ranking has got for the captured tree, and `ready_in` is
-/// derived from workspace size and embedding progress.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningDuration {
-    #[default("vector_index_preparing".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Declarations of the captured tree that already carry a vector.
-    pub prepared: u64,
-    /// A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.
-    pub ready_in: String,
-    /// Declarations the set being embedded holds.
-    pub total: u64,
-}
-/// The local index is still preparing selected workspace files. The answer covers only
-/// files whose capture and analysis have finished; `total` is absent until discovery ends.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningDuration2 {
-    #[default("local_index_preparing".to_string())]
-    pub code: String,
-    /// Why the local index is preparing - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Selected workspace files whose capture and analysis have finished.
-    pub prepared: u64,
-    /// A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.
-    pub ready_in: Option<String>,
-    /// Selected workspace files, once discovery has finished.
-    pub total: Option<u64>,
-}
-/// The vector ranking will not answer for the life of this server, so every answer
-/// is ranked lexically alone. No retry is coming: fix the `[search.vector]`
-/// configuration and start the server again.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject5 {
-    #[default("vector_ranking_unavailable".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-}
-/// The full-text tier did not rank this answer, so it came from identifier matching
-/// alone: a query phrased as prose finds nothing. The tier is still committing the
-/// captured tree, missed a commit, holds no indexed tree, failed to load, got no
-/// database connection within `[search] busy_timeout`, or still answers for a newer
-/// publication after the request's capture attempts; `detail` names which, and what
-/// clears it.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject6 {
-    #[default("lexical_ranking_unavailable".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-}
-/// The query carried more terms and quoted phrases than `terms_max`, so the server
-/// dropped the shortest unquoted terms and ranked the answer by the rest. Every
-/// quoted phrase is kept. Shorten `query`, or quote the terms that must be matched.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject7 {
-    #[default("query_narrowed".to_string())]
-    pub code: String,
-    /// Terms and quoted phrases the query was cut to: the server's bound on one
-    /// parsed query.
-    pub terms_max: u64,
-}
-/// The lexical ranking stopped at `matches_max` units; hits past it never reached the
-/// page, whatever `paths` selects. Narrow `query`.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject8 {
-    #[default("lexical_ranking_truncated".to_string())]
-    pub code: String,
-    /// Units the ranking stopped at: the server's bound on one lexical ranking.
-    pub matches_max: u64,
-}
-/// The server reached `results_max`, its result bound, before ordering and paging:
-/// what the bound cut never reaches any page, and `total_pages` counts only what fit.
-/// The bound cuts the ranked candidates and the hit set alike. The warning means the
-/// bound was reached; a set of exactly `results_max` hits carries it too. Narrow
-/// `query` or `paths`.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject9 {
-    #[default("results_truncated".to_string())]
-    pub code: String,
-    /// The bound the read stopped at: the server's limit on both the candidates one
-    /// read ranks and the hits it returns.
-    pub results_max: u64,
-}
-/// A file held more matches of `pattern` than `matches_per_file`, so its later matches
-/// are missing from this answer while every other file answers in full. `files` names
-/// the cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow
-/// `pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject10 {
-    #[default("pattern_matches_truncated".to_string())]
-    pub code: String,
-    /// The files cut at the bound.
-    pub files: Vec<String>,
-    /// Matches one file contributes at most: the server's bound on one file's matches.
-    pub matches_per_file: u64,
-}
-/// The trigram index `pattern` selects its files through lacks rows of stored file
-/// text, and verifying those rows beside the selected ones would pass the `[search]`
-/// key `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the
-/// rows the index holds and a match in the other rows is missing from it. The server
-/// indexes those rows in the background after each write; `prepared` and `total` state
-/// how far it has got. Resend the request once the index has caught up.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject11 {
-    #[default("pattern_index_preparing".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Rows of stored file text the trigram index holds: one per file, or one per
-    /// chunk of a file split under `[search.text]`.
-    pub prepared: u64,
-    /// Rows of stored file text the store holds.
-    pub total: u64,
-}
-/// A file answers nothing from its bytes. Either the index left the claimed file out -
-/// its bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no
-/// search or lookup, and addressing it directly still refuses `content_unavailable`;
-/// or a comparison against the working tree read the changed file in no working form -
-/// its attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it
-/// answers changed with no declarations. Every other file in the workspace stays
-/// available. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in
-/// project-path order; when more files are named, one more carries no `unit` and
-/// counts the rest. `rift server logs` names each file the index left out, and `paths`
-/// narrows a comparison onto the others.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningFileId {
-    #[default("source_unavailable".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
-    /// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
-    /// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
-    /// whatever schema its implementation generated from.
-    pub unit: Option<String>,
-}
-/// Text files past `[search.text] max_chunk` are left out of the text index under the
-/// key `large_files = "skip"`, so no hit answers from their text; `skipped` counts the
-/// ones the request's `paths` reach. A declaration such a file holds still answers.
-/// Setting `large_files` to `split` indexes them in chunks.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject12 {
-    #[default("large_file_skipped".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// The files past `max_chunk` the request's `paths` reach.
-    pub skipped: u64,
-}
-/// Files past `[providers.syntax] max_file` are held as text the syntax provider does
-/// not parse: their text answers `search`, and none of their declarations were
-/// extracted, so no symbol hit and no `get_symbol` answer comes from them. `files`
-/// names them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising
-/// `max_file` parses them.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject13 {
-    #[default("large_file_unparsed".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// The files held as text alone.
-    pub files: Vec<String>,
-}
-/// A lockfile the request's `paths.include` selects is left out of search, so no hit
-/// answers from it; `rift://map` still carries the versions it pins. Naming the file
-/// in `paths.force_include` searches it for one request, and removing its name from
-/// the `[search.text]` key `excluded_lockfiles` indexes it. One warning names every
-/// such file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject14 {
-    #[default("lockfile_excluded".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// The selected lockfiles search leaves out.
-    pub files: Vec<String>,
-}
-/// Contributions selected for one symbol's presentation disagree on at least one
-/// field. The answer carries what normalization selected.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningSymbolId {
-    #[default("symbol_disagreement".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Providers whose Contribution carries a differing value for at least one
-    /// presentation field, sorted and deduplicated.
-    pub providers: Vec<String>,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
-    pub symbol: String,
-}
-/// A traversal walk stopped at its node bound before exhausting the reachable graph,
-/// so hits reachable beyond the bound are missing from this answer. Narrow the walk -
-/// a tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it
-/// under the bound.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject15 {
-    #[default("traversal_truncated".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Symbols the walk visited before it stopped, equal to the bound it hit.
-    pub visited: u64,
-}
-/// No lane populates part of the relationship coverage the traversal asked for, so the
-/// walk had nothing to follow there whatever the graph holds. The warning states that a
-/// lane is absent; it never states that the seed has no such neighbor. An empty answer
-/// carrying it means the walk could not run; an empty answer without it means the walk
-/// ran and the seed has no neighbor under the request.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject16 {
-    #[default("relationship_coverage_missing".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// The requested facets no lane populates, in the request's own order,
-    /// deduplicated. Absent when every requested facet has a lane.
-    pub facets: Option<Vec<RelationshipFacet>>,
-}
-/// A language engine serves the seed's language, and this read carries none of its
-/// edges: the engine answered about bytes the served revision does not carry, answered
-/// more than the walk's node bound holds, or was still analyzing when
-/// `[server] readiness_timeout` was spent. The indexed relationships stand; whatever
-/// the engine resolves on top of them is missing. The warning states that an engine's
-/// analysis is absent from this answer; it never states that the seed has no such
-/// neighbor. An engine still analyzing keeps loading, and a later read, served from a
-/// revision the engine has caught up with or sent once it reads ready, carries the
-/// engine's edges again.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningLanguage {
-    #[default("engine_analysis_unavailable".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
-    pub language: Option<String>,
-}
-/// An outgoing walk dropped its edges to callees it named no declaration for. The
-/// language engine's call hierarchy named each in a file outside the project and every
-/// installed package the workspace's dependencies name, or in a package or standard
-/// library file where the global index answered no declaration at the callee's
-/// position. Every package callee drops when the global API is off or did not answer,
-/// and the answer then carries the global warning naming why. Every other edge stands.
-/// The warning states that edges are missing from this answer; it never states that
-/// the seed calls nothing more.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject17 {
-    /// Edges the walk dropped over every depth, one per call the engine named.
-    pub callees: u64,
-    #[default("callees_dropped".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-}
-/// The walk took a language engine's answer without progress evidence that the engine
-/// had settled: it announced no work since it started or was last told of a changed
-/// file, and stayed quiet past its `settle_delay`. The answer stands. An engine that
-/// recomputes without announcing work may have answered before it read that change, and
-/// a later read meets it settled.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject18 {
-    #[default("engine_readiness_unconfirmed".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// The engines the walk took unconfirmed, by accepted process key, sorted. Inline
-    /// processes use the exact language identity segment.
-    pub processes: Vec<String>,
-}
-/// The history store the server fills in the background has not analyzed every commit
-/// `[providers.history]` selects, so a commit search answers from the `analyzed` ones
-/// alone and a commit the store has not reached answers nothing. The fill runs newest
-/// first and continues without a request; a later search answers the rest.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject19 {
-    /// Commits the history store holds of the ones its latest fill selects.
-    pub analyzed: u64,
-    #[default("history_store_filling".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Commits the history store's latest fill selects.
-    pub total: u64,
-}
-/// The comparison reached `paths_max` changed paths and stopped there, so declarations
-/// in the changed paths past it are missing from this answer. Narrow the comparison
-/// with `paths`, or name two sides that differ in fewer files.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject20 {
-    #[default("change_truncated".to_string())]
-    pub code: String,
-    /// Why the warning was raised - prose for a reader; nothing keys on it.
-    pub detail: String,
-    /// Changed paths the comparison stopped at, equal to the bound it reached.
-    pub paths_max: u64,
-}
-/// Global access is disabled under `[global] enabled = false`, so the answer carries no
-/// package facts.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningCode {
-    #[default("global_access_disabled".to_string())]
-    pub code: String,
-}
-/// The global API could not answer, so the answer carries no package facts.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningGlobalFailureClass {
-    #[default("global_api_unavailable".to_string())]
-    pub code: String,
-    /// Bounded classes a global API failure can carry in a read warning.
-    pub failure_class: GlobalFailureClass,
-}
-/// The global API advertised a publication the client cannot read, so the answer
-/// carries no package facts.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningGlobalFailureClass2 {
-    #[default("global_publication_incompatible".to_string())]
-    pub code: String,
-    /// Bounded classes a global API failure can carry in a read warning.
-    pub failure_class: GlobalFailureClass,
-}
-/// The global API returned an invalid or truncated response, so the answer carries no
-/// package facts.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningGlobalFailureClass3 {
-    #[default("global_response_invalid".to_string())]
-    pub code: String,
-    /// Bounded classes a global API failure can carry in a read warning.
-    pub failure_class: GlobalFailureClass,
-}
-/// The global package page carried a bounded condition while its items remained valid.
-/// `warning_code` identifies the condition and `detail` carries its bounded explanation.
-/// `capability_unavailable` also names a feature the global API's capabilities do not
-/// advertise, such as `patterns` for a `pattern` search, and the answer then carries the
-/// project hits alone.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningGlobalPageWarningCode {
-    #[default("global_page_warning".to_string())]
-    pub code: String,
-    /// Optional bounded explanation returned by the global package service, or the
-    /// feature its capabilities do not advertise.
-    pub detail: Option<String>,
-    /// Stable conditions a global package page can report while returning valid items.
-    pub warning_code: GlobalPageWarningCode,
-}
-/// The global publication holds no release of an exact package the dependency
-/// context names, so nothing answers for it. At most `DEPENDENCY_WARNINGS_MAX` package
-/// and dependency-context warnings ride one answer.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningPackageIdentity {
-    #[default("package_absent".to_string())]
-    pub code: String,
-    /// One package as its package manager identifies it.
-    pub package: PackageIdentity,
-}
-/// The global publication holds no release a declared requirement admits, so nothing
-/// answers for it. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
-/// warnings ride one answer.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningPackageContextEntry {
-    #[default("package_requirement_absent".to_string())]
-    pub code: String,
-    /// One package the workspace depends on, as its manifests and lockfiles state it.
-    ///
-    /// Entries order by manager, then name, then the selector they state: a declared
-    /// requirement before an exact version.
-    pub entry: PackageContextEntry,
-}
-/// The global publication holds no release at the exact version the dependency context
-/// names, or none inside the range a declared requirement states, so the collected
-/// release nearest it answers in its place: the package facts for `entry` come from
-/// `package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings
-/// ride one answer.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject21 {
-    #[default("package_substituted".to_string())]
-    pub code: String,
-    /// One package the workspace depends on, as its manifests and lockfiles state it.
-    ///
-    /// Entries order by manager, then name, then the selector they state: a declared
-    /// requirement before an exact version.
-    pub entry: PackageContextEntry,
-    /// One package as its package manager identifies it.
-    pub package: PackageIdentity,
-}
-/// The dependency context names a package no public registry serves: a path outside
-/// the workspace, a git repository, a private registry, or a URL. No global package
-/// index answers for it, and `reason` names the capability Rift does not have yet. At
-/// most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one
-/// answer.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningPackageContextEntry2 {
-    #[default("package_unavailable".to_string())]
-    pub code: String,
-    /// One package the workspace depends on, as its manifests and lockfiles state it.
-    ///
-    /// Entries order by manager, then name, then the selector they state: a declared
-    /// requirement before an exact version.
-    pub entry: PackageContextEntry,
-    /// Why no global package index answers for the entry, for a reader.
-    pub reason: String,
-}
-/// One resolver or standard library probe read less than the workspace states, or the
-/// context passed the bound on the entries one read carries, the smaller of the
-/// server's own and the one the global API advertises, and its entries sorted last left:
-/// every held entry before any the request's `packages` names. The dependency context
-/// may then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`
-/// reaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context
-/// warnings ride one answer, this one first, in resolver order.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields, default)]
-pub struct ReadWarningObject22 {
-    #[default("package_context_degraded".to_string())]
-    pub code: String,
-    /// What the resolver could not do - prose for a reader; nothing keys on it.
-    pub reason: String,
-    /// What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a
-    /// standard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the
-    /// package manager whose held or requested entries left past the entry bound, such
-    /// as `pypi`.
-    pub resolver: String,
 }
 

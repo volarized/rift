@@ -3117,3 +3117,51 @@ async fn test_fixture_enforces_active_server_bounds() {
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }
+
+#[test]
+fn generated_read_warning_preserves_bound_and_source_evidence() {
+    let unit = "rift://source/stdlib/node@22.14.0/lib/fs.js";
+    let value = serde_json::json!({
+        "code": "object_unavailable", "unit": unit,
+        "range": {"start": 4, "end": 12}, "qualified_name": "fs::wide",
+        "field": "name", "bound": 4096
+    });
+    let shared: rift_protocol::read::ReadWarning =
+        serde_json::from_value(value.clone()).expect("strict shared warning");
+    assert_eq!(serde_json::to_value(shared).expect("warning wire"), value);
+    let warning: crate::generated::ReadWarning =
+        serde_json::from_value(value).expect("generated warning");
+    assert_eq!(warning.code.as_deref(), Some("object_unavailable"));
+    assert_eq!(warning.unit.as_deref(), Some(unit));
+    assert_eq!(warning.range.expect("physical range").start, 4);
+    assert_eq!(warning.qualified_name.as_deref(), Some("fs::wide"));
+    assert_eq!(warning.field.as_deref(), Some("name"));
+    assert_eq!(warning.bound, Some(4096));
+}
+
+#[tokio::test]
+async fn exact_source_preserves_warning_bound_and_source_evidence() {
+    let unit = "rift://source/stdlib/node@22.14.0/lib/fs.js";
+    let request = serde_json::from_value(serde_json::json!({
+        "unit": unit, "view": "a".repeat(64)
+    }))
+    .expect("source request");
+    let value = serde_json::json!({
+        "outcome": "found", "source": {
+            "span": {"unit": unit, "range": {"start": 0, "end": 2}}, "text": "é"
+        }, "source_complete": true,
+        "view": {"id": "a".repeat(64), "expires_at": "2026-10-10T10:05:00Z"},
+        "warnings": [{
+            "code": "object_unavailable", "unit": unit,
+            "range": {"start": 4, "end": 12}, "qualified_name": "fs::wide",
+            "field": "name", "bound": 4096
+        }]
+    });
+    let (_server, client) =
+        operation_client(OperationFixture::ExactSource(value.clone(), StatusCode::OK)).await;
+    let answer = client
+        .get_source(&request)
+        .await
+        .expect("typed source outcome");
+    assert_eq!(serde_json::to_value(answer).expect("source wire"), value);
+}
