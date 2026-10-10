@@ -994,9 +994,9 @@ pub struct PackageSearchRequest {
     /// Optional fields to include.
     #[validate(length(max = 1u64))]
     pub include: Option<Vec<String>>,
-    /// Selected exact package versions.
+    /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
-    pub packages: Vec<PackageIdentity>,
+    pub packages: Option<Vec<PackageIdentity>>,
     /// Ranking phase to execute.
     pub phase: PackageSearchRequestPhase,
     /// Which package results may be returned. Omitted, symbol.
@@ -1188,9 +1188,9 @@ pub struct PackagePatternRequest {
     /// Regular expression in the syntax of the Rust `regex` crate. The server matches it line by line: `^` and `$` match at line boundaries, and no character class matches a line feed. The inline flag `(?i)` makes it case-insensitive.
     #[validate(length(min = 1u64, max = 1_024u64))]
     pub pattern: String,
-    /// Selected exact package versions.
+    /// Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.
     #[validate(length(max = 20_000u64), nested)]
-    pub packages: Vec<PackageIdentity>,
+    pub packages: Option<Vec<PackageIdentity>>,
     /// Optional fields to include.
     #[validate(length(max = 1u64))]
     pub include: Option<Vec<String>>,

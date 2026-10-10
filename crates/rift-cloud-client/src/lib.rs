@@ -1460,7 +1460,12 @@ fn validate_search_request_for_capabilities(
             field: "identifiers",
         });
     }
-    validate_read_bounds(request.packages.len(), limit, cursor, capabilities)
+    validate_read_bounds(
+        request.packages.as_ref().map_or(0, Vec::len),
+        limit,
+        cursor,
+        capabilities,
+    )
 }
 
 fn validate_symbol_request_for_capabilities(
@@ -1776,7 +1781,7 @@ fn validate_search_request(request: &PackageSearchRequest) -> Result<(), ClientE
     {
         return Err(ClientError::InvalidRequest { field: "include" });
     }
-    validate_packages(&request.packages)?;
+    validate_packages(request.packages.as_deref().unwrap_or_default())?;
     if matches!(request.phase, PackageSearchRequestPhase::Broad)
         && request.terms.iter().filter(|term| !term.phrase).count() < 2
     {
@@ -1875,7 +1880,14 @@ fn validate_search_page(
         warnings: &page.warnings,
     }
     .validate(capabilities, documentation_requested)?;
-    let packages: HashSet<_> = request.packages.iter().map(package_key).collect();
+    let packages: HashSet<_> = request
+        .packages
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(package_key)
+        .collect();
+    let selection = (!packages.is_empty()).then_some(&packages);
     let mut seen = HashSet::new();
     let mut documentation_bytes = 0_usize;
     for hit in &page.items {
@@ -1896,12 +1908,14 @@ fn validate_search_page(
                         line: hit.line,
                         source: hit.source.as_deref(),
                     },
-                    &packages,
+                    selection,
                     smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
                 )?;
                 validate_search_match_class(request, hit, &qualified_name)?;
             }
             PackageSearchItem::Documentation(hit) => {
+                validate_package_identity(&hit.package)
+                    .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
                 if hit.source.is_some() && !includes_source(request.include.as_deref()) {
                     return Err(ClientError::InvalidResponseField { field: "source" });
                 }
@@ -1913,7 +1927,8 @@ fn validate_search_page(
                 validate_documentation_bytes(documentation_bytes)?;
                 if !documentation_requested
                     || !supports_feature(capabilities, DOCUMENTATION_SEARCH_FEATURE)
-                    || !packages.contains(&package_key(&hit.package))
+                    || selection
+                        .is_some_and(|packages| !packages.contains(&package_key(&hit.package)))
                 {
                     return Err(ClientError::InvalidResponseField {
                         field: "documentation",
@@ -1990,7 +2005,7 @@ fn validate_symbol_page(
                 line: hit.line,
                 source: hit.source.as_deref(),
             },
-            &packages,
+            Some(&packages),
             smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
         )?;
         validate_symbol_match_class(request, hit, &qualified_name)?;
@@ -2120,10 +2135,12 @@ fn validate_hit_common(
     package: &PackageIdentity,
     symbol: &Symbol,
     location: HitLocation<'_>,
-    packages: &HashSet<(String, String, String)>,
+    packages: Option<&HashSet<(String, String, String)>>,
     source_bytes_max: usize,
 ) -> Result<String, ClientError> {
-    if !packages.contains(&package_key(package)) {
+    validate_package_identity(package)
+        .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
+    if packages.is_some_and(|packages| !packages.contains(&package_key(package))) {
         return Err(ClientError::InvalidResponseField { field: "package" });
     }
     if location.line < 1 || location.range.end < location.range.start {

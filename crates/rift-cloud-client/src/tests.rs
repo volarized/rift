@@ -1018,7 +1018,7 @@ fn test_request_relationships_are_validated_before_transport() {
         })
     );
     let mut search = search_request();
-    search.packages.push(search.packages[0].clone());
+    search.packages = Some(vec![package_request(), package_request()]);
     assert_eq!(
         validate_search_request(&search),
         Err(ClientError::InvalidRequest {
@@ -1900,7 +1900,7 @@ fn search_request() -> PackageSearchRequest {
         }],
         identifiers: vec!["demo".to_owned()],
         include: None,
-        packages: vec![package_request()],
+        packages: Some(vec![package_request()]),
         phase: PackageSearchRequestPhase::Precise,
         target: None,
     }
@@ -2008,6 +2008,33 @@ async fn test_fixture_search_and_symbol_pages() {
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
         Some("/rift/rest/v1/symbols")
+    );
+}
+
+#[tokio::test]
+async fn test_discovery_search_accepts_omitted_or_empty_package_selection() {
+    for packages in [None, Some(Vec::new())] {
+        let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
+        let mut request = search_request();
+        request.packages = packages;
+        let serialized = serde_json::to_value(&request).expect("search request");
+        if request.packages.is_none() {
+            assert!(serialized.get("packages").is_none());
+        }
+        let page = client
+            .search_packages(&request, 20, None)
+            .await
+            .expect("discovery page");
+        assert_eq!(page.items.len(), 1);
+        let PackageSearchItem::Search(hit) = &page.items[0] else {
+            panic!("symbol search hit")
+        };
+        assert_eq!(hit.package.name, "other");
+    }
+    let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
+    assert_eq!(
+        client.search_packages(&search_request(), 20, None).await,
+        Err(ClientError::InvalidResponseField { field: "package" })
     );
 }
 

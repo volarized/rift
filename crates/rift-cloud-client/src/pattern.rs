@@ -93,7 +93,7 @@ pub(crate) fn validate_pattern_request(request: &PackagePatternRequest) -> Resul
     {
         return Err(ClientError::InvalidRequest { field: "include" });
     }
-    validate_packages(&request.packages)
+    validate_packages(request.packages.as_deref().unwrap_or_default())
 }
 
 pub(crate) fn validate_pattern_request_for_capabilities(
@@ -107,7 +107,12 @@ pub(crate) fn validate_pattern_request_for_capabilities(
             feature: PATTERN_FEATURE,
         });
     }
-    validate_read_bounds(request.packages.len(), limit, cursor, capabilities)
+    validate_read_bounds(
+        request.packages.as_ref().map_or(0, Vec::len),
+        limit,
+        cursor,
+        capabilities,
+    )
 }
 
 /// What one pattern page is checked against: the request that asked for it, under the
@@ -135,7 +140,14 @@ impl PatternPageCheck<'_> {
         if !within_limit {
             return Err(ClientError::InvalidResponseField { field: "items" });
         }
-        let packages: HashSet<_> = self.request.packages.iter().map(package_key).collect();
+        let packages: HashSet<_> = self
+            .request
+            .packages
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(package_key)
+            .collect();
         let mut seen = HashSet::new();
         let mut files = HashSet::new();
         for hit in &page.items {
@@ -168,7 +180,9 @@ impl PatternPageCheck<'_> {
         hit: &PackagePatternHit,
         packages: &HashSet<(String, String, String)>,
     ) -> Result<(), ClientError> {
-        if !packages.contains(&package_key(&hit.package)) {
+        super::validate_package_identity(&hit.package)
+            .map_err(|_| ClientError::InvalidResponseField { field: "package" })?;
+        if !packages.is_empty() && !packages.contains(&package_key(&hit.package)) {
             return Err(ClientError::InvalidResponseField { field: "package" });
         }
         let inside_the_file = u64::try_from(hit.size).is_ok_and(|size| hit.range.end <= size);
@@ -204,7 +218,7 @@ impl PatternPageCheck<'_> {
             &hit.package,
             &declaration.symbol,
             location,
-            packages,
+            (!packages.is_empty()).then_some(packages),
             source_bytes_max,
         )?;
         let holds_the_match =

@@ -2211,11 +2211,11 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
             .map(|candidate| candidate.text().to_owned())
             .collect(),
         include: Some(vec!["source".to_owned()]),
-        packages: vec![rift_cloud_client::PackageIdentity {
+        packages: Some(vec![rift_cloud_client::PackageIdentity {
             manager: "cargo".to_owned(),
             name: "demo".to_owned(),
             version: "1.0.0".to_owned(),
-        }],
+        }]),
         phase: PackageSearchRequestPhase::Precise,
         target: None,
     })

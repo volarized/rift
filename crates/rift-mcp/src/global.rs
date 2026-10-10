@@ -650,7 +650,7 @@ pub(crate) async fn package_patterns(
     };
     let request = PackagePatternRequest {
         pattern,
-        packages: packages.to_vec(),
+        packages: Some(packages.to_vec()),
         include: includes_source(params).then(|| vec!["source".to_owned()]),
     };
     let page = client
@@ -744,7 +744,7 @@ fn search_request(
             .map(|candidate| candidate.text().to_owned())
             .collect(),
         include: includes_source(params).then(|| vec!["source".to_owned()]),
-        packages: packages.to_vec(),
+        packages: Some(packages.to_vec()),
         phase: match phase {
             QueryPhase::Precise => PackageSearchRequestPhase::Precise,
             QueryPhase::Broad => PackageSearchRequestPhase::Broad,

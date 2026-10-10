@@ -618,7 +618,7 @@ fn validate_location(
             line,
             source,
         },
-        &packages,
+        Some(&packages),
         source_bytes_max,
     )?;
     let source_unit =

@@ -2734,7 +2734,7 @@
             "maxItems": 1
           },
           "packages": {
-            "description": "Selected exact package versions.",
+            "description": "Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.",
             "items": {
               "$ref": "#/components/schemas/PackageIdentity"
             },
@@ -2763,7 +2763,6 @@
           "query",
           "terms",
           "identifiers",
-          "packages",
           "phase"
         ],
         "type": "object"
@@ -3049,7 +3048,7 @@
             "maxLength": 1024
           },
           "packages": {
-            "description": "Selected exact package versions.",
+            "description": "Selected exact package versions. Omitted or empty, use the newest collected stable version of each package, or its newest prerelease when no stable version is collected.",
             "items": {
               "$ref": "#/components/schemas/PackageIdentity"
             },
@@ -3069,8 +3068,7 @@
           }
         },
         "required": [
-          "pattern",
-          "packages"
+          "pattern"
         ],
         "type": "object"
       },
