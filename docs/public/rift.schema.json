@@ -1254,6 +1254,55 @@
       },
       "type": "object"
     },
+    "McpConfiguration": {
+      "additionalProperties": false,
+      "properties": {
+        "extra": {
+          "additionalProperties": {
+            "allOf": [
+              {
+                "not": {
+                  "pattern": "[\\u0000-\\u001f\\u007f-\\u009f]"
+                }
+              },
+              {
+                "anyOf": [
+                  {
+                    "const": "~"
+                  },
+                  {
+                    "pattern": "^~/"
+                  },
+                  {
+                    "not": {
+                      "pattern": "^~"
+                    }
+                  }
+                ]
+              }
+            ],
+            "maxLength": 262144,
+            "minLength": 1,
+            "type": "string"
+          },
+          "default": {},
+          "description": "Explicit named local projects. Aggregate UTF-8 name and path bytes must fit the configuration document byte budget before roots are resolved.",
+          "propertyNames": {
+            "maxLength": 8186,
+            "not": {
+              "enum": [
+                "local",
+                "global",
+                "all"
+              ]
+            },
+            "pattern": "^[a-z][a-z0-9_-]*$"
+          },
+          "type": "object"
+        }
+      },
+      "type": "object"
+    },
     "PackageConfiguration": {
       "additionalProperties": false,
       "description": "The `[package]` table: publication capacity for exact-package collection.\nInput files, bytes and declarations use `[source]`; parsing uses `[providers.syntax]`.",
@@ -2141,6 +2190,13 @@
         "pattern": "^[a-z][a-z0-9._-]*$"
       },
       "type": "object"
+    },
+    "mcp": {
+      "$ref": "#/$defs/McpConfiguration",
+      "default": {
+        "extra": {}
+      },
+      "description": "Named local projects registered by the primary project's MCP connection."
     },
     "package": {
       "$ref": "#/$defs/PackageConfiguration",

@@ -8,6 +8,9 @@
 //! reason it passes on [`is_absolute_program`], the classifier acceptance
 //! refuses a configured program with, to the engine launch in `rift-lsp`.
 
+#[cfg(test)]
+mod mcp_registration_tests;
+
 pub use rift_protocol::configuration::is_absolute_program;
 use rift_protocol::configuration::{
     EXCLUDED_LOCKFILES_DEFAULT, LanguageConfiguration, LargeFileStrategy, WorkspaceConfiguration,
@@ -314,6 +317,14 @@ pub(crate) fn unit_parse_error(error: &UnitParseError) -> RiftError {
         .error()
 }
 
+fn mcp_error(violation: &ConfigurationViolation) -> RiftError {
+    let mut builder = errors::core::configuration_invalid();
+    for (key, value) in violation.evidence() {
+        builder = builder.with(ErrorContext::new(key, value));
+    }
+    builder.error()
+}
+
 /// Converts one accepted configuration violation to its registered error.
 #[must_use]
 pub fn configuration_violation_error(violation: &ConfigurationViolation) -> RiftError {
@@ -327,6 +338,7 @@ pub fn configuration_violation_error(violation: &ConfigurationViolation) -> Rift
         }};
     }
     match violation {
+        ConfigurationViolation::McpRegistrationInvalid { .. } => mcp_error(violation),
         ConfigurationViolation::LimitOutOfRange { .. } => {
             build!(errors::core::configuration_limit_out_of_range())
         }

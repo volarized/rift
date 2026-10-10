@@ -20,9 +20,7 @@ use crate::constants::WORKSPACE_CONFIGURATION_FILE;
 use crate::line::lines_inclusive;
 use rift_error::{RiftError, errors};
 
-/// Bytes a configuration document may hold, at most. The document states
-/// bounded tables and entries; one this large is not configuration.
-pub const CONFIGURATION_FILE_BYTES_MAX: u64 = 256 << 10;
+pub use rift_protocol::configuration::CONFIGURATION_FILE_BYTES_MAX;
 
 /// The prefix of every variable naming a configuration key.
 pub const ENVIRONMENT_PREFIX: &str = "RIFT";
