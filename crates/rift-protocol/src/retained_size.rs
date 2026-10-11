@@ -475,6 +475,7 @@ pub fn retained_map_material<K: GetSize + Ord, V, T: GetSizeTracker>(
 /// Conservative material occupied by the nodes of a retained `BTreeMap` or `BTreeSet`.
 ///
 /// This bound uses the pinned Rust node layout and includes unused node slots.
+/// Every non-root node retains at least five entries; one root is counted separately.
 /// Overflow returns `usize::MAX`, so a finite admission budget refuses it.
 #[must_use]
 pub fn btree_material_bytes<K, V>(len: usize) -> usize {
@@ -495,7 +496,8 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
             .map(|padded| padded / alignment * alignment)
             .and_then(|padded| total.checked_add(padded))
     });
-    len.checked_add(1)
+    (len / 5)
+        .checked_add(1)
         .and_then(|nodes| node.and_then(|node| nodes.checked_mul(node)))
         .unwrap_or(usize::MAX)
 }
@@ -601,11 +603,41 @@ mod tests {
     fn tree_material_refuses_overflow_and_counts_empty_root() {
         let empty = btree_material_bytes::<String, String>(0);
         assert!(empty > 0);
-        assert_eq!(btree_material_bytes::<String, String>(1), empty * 2);
+        for len in [1, 4] {
+            assert_eq!(btree_material_bytes::<String, String>(len), empty);
+        }
+        for len in [5, 9] {
+            assert_eq!(btree_material_bytes::<String, String>(len), empty * 2);
+        }
+        for len in [10, 11, 12, 14] {
+            assert_eq!(btree_material_bytes::<String, String>(len), empty * 3);
+        }
+        assert_eq!(btree_material_bytes::<String, String>(15), empty * 4);
         assert_eq!(
             btree_material_bytes::<String, String>(usize::MAX),
             usize::MAX
         );
+    }
+
+    #[test]
+    fn retained_maps_count_distinct_nodes_and_shared_value_material_once() {
+        let value = std::sync::Arc::new(vec![0u8; 4096]);
+        let first: std::collections::BTreeMap<u32, _> = (0..12)
+            .map(|key| (key, std::sync::Arc::clone(&value)))
+            .collect();
+        let second = first.clone();
+        let measure = |value: &std::sync::Arc<Vec<u8>>, tracker| {
+            retained_arc_material(value, tracker, GetSize::get_heap_size_with_tracker)
+        };
+        let (first_bytes, tracker) =
+            retained_map_material(&first, get_size2::StandardTracker::new(), measure);
+        let (second_bytes, _) = retained_map_material(&second, tracker, measure);
+        let nodes = btree_material_bytes::<u32, std::sync::Arc<Vec<u8>>>(12);
+        let value_bytes =
+            std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>() + value.capacity();
+        assert_eq!(first_bytes, nodes + value_bytes);
+        assert_eq!(second_bytes, nodes);
+        assert_ne!(first_bytes, usize::MAX);
     }
 
     #[test]
