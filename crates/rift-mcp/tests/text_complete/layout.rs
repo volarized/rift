@@ -141,6 +141,27 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
         return Err("$: the text is empty".to_owned());
     };
     title_states(first.title, items.len(), tool, structured)?;
+    let rest = if let Some(view) = structured.get("view") {
+        let id = view
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("$.view.id: must be a string")?;
+        let expiry = view
+            .get("expires_at")
+            .and_then(Value::as_str)
+            .ok_or("$.view.expires_at: must be a string")?;
+        let (last, preceding) = rest
+            .split_last()
+            .ok_or("$.view: the text has no captured view")?;
+        if last.title != format!("view {id} · expires {expiry}") || !last.entries.is_empty() {
+            return Err(
+                "$.view: the text must state the original captured view and expiry".to_owned(),
+            );
+        }
+        preceding
+    } else {
+        rest
+    };
     warnings_states(rest, structured.get("warnings"))?;
     items_states(tool, &first.entries, items, structured)
 }
@@ -2336,5 +2357,45 @@ mod tests {
             "",
             "$.warnings[0].code",
         )
+    }
+}
+
+#[cfg(test)]
+mod captured_view_tests {
+    use super::{Tool, text_states};
+    use serde_json::json;
+
+    #[test]
+    fn nodes_text_requires_exact_captured_view_and_original_expiry() {
+        let result = json!({"nodes":[],"source":[],"view":{"id":"claims.nodes","expires_at":"2030-01-01T00:15:00Z"}});
+        assert!(
+            text_states(
+                Tool::Nodes,
+                "0 nodes\nview claims.nodes · expires 2030-01-01T00:15:00Z\n",
+                &result
+            )
+            .is_ok()
+        );
+        for text in [
+            "0 nodes\n",
+            "0 nodes\nview claims.other · expires 2030-01-01T00:15:00Z\n",
+            "0 nodes\nview claims.nodes · expires 2030-01-01T00:16:00Z\n",
+        ] {
+            assert!(text_states(Tool::Nodes, text, &result).is_err());
+        }
+    }
+
+    #[test]
+    fn captured_view_does_not_replace_required_warning_section() {
+        let result = json!({"nodes":[],"source":[],"warnings":[{"code":"stale_index","detail":"index lags"}],"view":{"id":"claims.nodes","expires_at":"2030-01-01T00:15:00Z"}});
+        assert!(
+            text_states(
+                Tool::Nodes,
+                "0 nodes\nview claims.nodes · expires 2030-01-01T00:15:00Z\n",
+                &result
+            )
+            .is_err()
+        );
+        assert!(text_states(Tool::Nodes, "0 nodes\n1 warning\n\tstale_index: index lags\nview claims.nodes · expires 2030-01-01T00:15:00Z\n", &result).is_ok());
     }
 }
