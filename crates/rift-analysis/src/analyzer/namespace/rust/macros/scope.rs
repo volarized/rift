@@ -121,7 +121,7 @@ impl<'a> Tokens<'a> {
         if !input.is_empty() {
             return None;
         }
-        self.charge(body.len())?;
+        self.charge(body.len().checked_mul(2)?)?;
         items(body, self.depth, |item| self.names_tokens(item))
     }
 
@@ -424,7 +424,7 @@ impl<'a> Tokens<'a> {
         if depth == 0 {
             return None;
         }
-        self.charge(input.len())?;
+        self.charge(input.len().checked_mul(2)?)?;
         items(input, depth, |item| {
             self.item_tokens(item, scope, library, depth - 1, validate)
         })
@@ -458,6 +458,7 @@ fn items(
         return None;
     }
     while !input.is_empty() {
+        let semicolon = constant(input)?;
         let mut groups = Vec::new();
         let mut end = None;
         for (index, token) in input.iter().enumerate() {
@@ -469,7 +470,11 @@ fn items(
                     if groups.pop() != Some(*token) {
                         return None;
                     }
-                    if groups.is_empty() && *token == "}" && input.get(index + 1) != Some(&";") {
+                    if !semicolon
+                        && groups.is_empty()
+                        && *token == "}"
+                        && input.get(index + 1) != Some(&";")
+                    {
                         end = Some(index + 1);
                         break;
                     }
@@ -489,6 +494,21 @@ fn items(
         input = &input[end..];
     }
     Some(())
+}
+
+fn constant(mut input: &[&str]) -> Option<bool> {
+    while consume(&mut input, &["#"]) {
+        let _ = consume(&mut input, &["!"]);
+        group(&mut input, "[", "]")?;
+    }
+    visibility(&mut input)?;
+    if !consume(&mut input, &["const"]) || input.first() == Some(&"fn") {
+        return Some(false);
+    }
+    if !consume(&mut input, &["_"]) {
+        identifier(&mut input)?;
+    }
+    Some(consume(&mut input, &[":"]))
 }
 
 fn visibility(input: &mut &[&str]) -> Option<()> {
@@ -910,6 +930,49 @@ mod tests {
         }
     }
 
+    #[test]
+    fn constant_items_keep_full_initializer_and_following_scope_effects() {
+        let original = "cfg_rt! { #[cfg(feature=\"rt\")] pub(crate) const BOX_FUTURE_THRESHOLD: usize = if true { 2048 } else { 16384 }; use other::Debug; pub mod runtime; }";
+        for source in [original.to_owned(), original.replace(' ', "\r\n")] {
+            with_tokens(&source, |tokens| {
+                assert!(tokens.complete);
+                assert!(tokens.bindings.contains("Debug"));
+                let mut scope = Scope::default();
+                scope.insert("cfg_rt".to_owned(), true);
+                assert!(tokens.item(whole(&source), &mut scope, true).is_some());
+                assert_eq!(scope.get("Debug"), Some(&false));
+                assert!(scope.complete);
+            });
+        }
+    }
+
+    #[test]
+    fn constant_items_preserve_function_boundaries_and_unnamed_constants() {
+        let source = "cfg_rt! { pub const fn threshold() -> usize { 2048 } const _: usize = { 16384 }; pub mod runtime; }";
+        with_tokens(source, |tokens| {
+            let mut scope = Scope::default();
+            scope.insert("cfg_rt".to_owned(), true);
+            assert!(tokens.item(whole(source), &mut scope, true).is_some());
+            assert!(scope.complete);
+        });
+    }
+
+    #[test]
+    fn constant_items_refuse_missing_semicolon_unknown_macros_and_work_overflow() {
+        let malformed = [
+            "const", "VALUE", ":", "usize", "=", "if", "true", "{", "1", "}", "else", "{", "2", "}",
+        ];
+        assert!(super::items(&malformed, 20, |_| Some(())).is_none());
+        let source =
+            "cfg_rt! { const VALUE: usize = if true { unknown!{} } else { 2 }; pub mod runtime; }";
+        with_tokens(source, |tokens| {
+            let mut scope = Scope::default();
+            scope.insert("cfg_rt".to_owned(), true);
+            assert!(tokens.item(whole(source), &mut scope, true).is_none());
+            tokens.work.set(tokens.work_max);
+            assert!(tokens.item(whole(source), &mut scope, true).is_none());
+        });
+    }
     #[test]
     fn original_macro_delimiters_keep_constructor_ranges_and_unknown_effects() {
         for source in ["crate_root!();", "crate_root![];", "crate_root!{}"] {
