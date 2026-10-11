@@ -69,7 +69,7 @@ async fn travelled_history(
         .filter(|row| {
             row["hit"]["symbol"]["name"] == "travelled"
                 && row["hit"]["symbol"]["language"] == "rust"
-                && row["hit"]["path"] == "after.rs"
+                && row["path"] == "after.rs"
         });
     let row = rows
         .next()
