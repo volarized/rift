@@ -5002,7 +5002,8 @@ done
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-    async fn starting_fixture() -> TestResult<(tempfile::TempDir, super::AssembledServer)> {
+    pub(super) async fn starting_fixture() -> TestResult<(tempfile::TempDir, super::AssembledServer)>
+    {
         let directory = tempfile::tempdir()?;
         fs::create_dir(directory.path().join("src"))?;
         fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;

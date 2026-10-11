@@ -41,6 +41,13 @@ pub(crate) struct SearchCandidateResponse {
     pub(crate) global: Option<crate::global::candidates::SearchCandidatePool>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+pub(crate) enum SearchCandidateResult {
+    Captured(Box<SearchCandidateResponse>),
+    Unavailable(rift_protocol::search_read::SearchUnavailable),
+}
+
 #[derive(Debug)]
 pub(super) struct CandidateResponses {
     bytes: Mutex<Vec<SavedCandidateBytes>>,
@@ -72,6 +79,26 @@ impl ReadAnswer for SearchCandidateInputs {
     fn warnings_mut(&mut self) -> &mut Vec<ReadWarning> {
         &mut self.warnings
     }
+}
+
+fn preparing_candidates(
+    resolved: &super::ResolvedWorkspace,
+    warnings: &[ReadWarning],
+) -> Option<rift_protocol::search_read::SearchUnavailable> {
+    let warning = resolved
+        .published
+        .preparation
+        .as_ref()
+        .and_then(crate::validation::LocalIndexPreparation::warning)?;
+    let mut answer_warnings = Vec::new();
+    answer_warnings.extend(warnings.iter().cloned());
+    answer_warnings.extend(resolved.stale.clone());
+    answer_warnings.push(warning);
+    Some(rift_protocol::search_read::SearchUnavailable::Unavailable {
+        reason: rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
+        view: None,
+        warnings: answer_warnings,
+    })
 }
 
 impl RiftMcp {
@@ -153,6 +180,14 @@ impl RiftMcp {
                 CallToolRequestParams::new("search_candidates").with_arguments(arguments),
             )
             .await?;
+        let captured = match captured {
+            SearchCandidateResult::Captured(answer) => *answer,
+            SearchCandidateResult::Unavailable(answer) => {
+                return Ok(Some(
+                    rift_protocol::search_read::SearchReadResult::Unavailable(answer),
+                ));
+            }
+        };
         let mut pools = vec![crate::global::candidates::SearchCandidatePool {
             backend: "local".to_owned(),
             root: captured.root,
@@ -263,7 +298,7 @@ impl RiftMcp {
     async fn search_candidates_request(
         &self,
         request: CallToolRequestParams,
-    ) -> Result<SearchCandidateResponse, ToolFailure> {
+    ) -> Result<SearchCandidateResult, ToolFailure> {
         let arguments = request.arguments.unwrap_or_default();
         crate::proxy::encode_bounded(&arguments, BYTES_MAX).map_err(transport_failure)?;
         let requested: SearchCandidateRequest =
@@ -292,10 +327,13 @@ impl RiftMcp {
             if &accepted != view {
                 return Err(unavailable("captured view context does not match"));
             }
-            return Ok(response);
+            return Ok(SearchCandidateResult::Captured(Box::new(response)));
         }
         let (resolved, answer, warnings, references, deadline) =
             self.current_search_inputs(&requested.params).await?;
+        if let Some(answer) = preparing_candidates(&resolved, &warnings) {
+            return Ok(SearchCandidateResult::Unavailable(answer));
+        }
         let ready = resolved.published.preparation.is_none();
         let params = requested.params.clone();
         let (mut inputs, material) = self
@@ -348,7 +386,9 @@ impl RiftMcp {
                 Ok(true)
             })
             .map_err(read_failure)?;
-        response.ok_or_else(|| unavailable("retained read material exceeds the byte or view bound"))
+        response
+            .map(|response| SearchCandidateResult::Captured(Box::new(response)))
+            .ok_or_else(|| unavailable("retained read material exceeds the byte or view bound"))
     }
 
     async fn package_candidate_pool(
@@ -566,7 +606,7 @@ mod captured_node_error_tests {
 
 #[cfg(test)]
 mod captured_search_startup_tests {
-    use super::{RiftMcp, SearchCandidateRequest, SearchParams};
+    use super::{RiftMcp, SearchCandidateRequest, SearchCandidateResult, SearchParams};
     use rmcp::model::CallToolRequestParams;
 
     #[tokio::test]
@@ -672,6 +712,9 @@ mod captured_search_startup_tests {
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?;
+        let SearchCandidateResult::Captured(captured) = captured else {
+            return Err("settled candidate read must capture results".into());
+        };
         assert!(
             captured
                 .inputs
@@ -742,6 +785,9 @@ mod captured_search_startup_tests {
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?;
+        let SearchCandidateResult::Captured(captured) = captured else {
+            return Err("settled candidate read must capture results".into());
+        };
         let original_root = first.canonicalize()?;
         assert_eq!(std::path::Path::new(&captured.root), original_root);
         std::fs::remove_file(&link)?;
@@ -760,6 +806,9 @@ mod captured_search_startup_tests {
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?;
+        let SearchCandidateResult::Captured(continued) = continued else {
+            return Err("settled candidate read must capture results".into());
+        };
         assert_eq!(continued.view, captured.view);
         assert_eq!(continued.root, captured.root);
         assert_eq!(continued.owner, captured.owner);
@@ -834,6 +883,240 @@ impl CandidateResponses {
             expires,
             bytes: encoded,
         });
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BYTES_MAX, CandidateResponses, RiftMcp, SLOTS_MAX, SearchCandidateResult};
+    use rmcp::model::CallToolRequestParams;
+    use std::time::{Duration, SystemTime};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn request() -> Result<CallToolRequestParams, serde_json::Error> {
+        Ok(
+            CallToolRequestParams::new("search_candidates").with_arguments(serde_json::from_value(
+                serde_json::json!({
+                    "params": {"query": "beacon", "scope": "local", "target": "symbol"}
+                }),
+            )?),
+        )
+    }
+
+    #[tokio::test]
+    async fn preparing_retries_allocate_no_candidates_then_capture_ready() -> TestResult {
+        let (_directory, assembled) = super::super::tests::starting_fixture().await?;
+        for attempt in 0..30 {
+            let answer = assembled
+                .server
+                .search_candidates_request(request()?)
+                .await?;
+            let value = serde_json::to_value(&answer)?;
+            assert_eq!(value["outcome"], "unavailable");
+            assert_eq!(value["reason"], "index_preparing");
+            assert!(value.get("view").is_none());
+            assert!(value.get("results").is_none());
+            let warnings = value["warnings"].as_array().ok_or("candidate warnings")?;
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning["code"] == "local_index_preparing")
+            );
+            assert!(
+                warnings
+                    .iter()
+                    .any(|warning| warning["code"] == "lexical_ranking_unavailable")
+            );
+            if attempt == 0 {
+                let params = serde_json::from_value(serde_json::json!({
+                    "query": "beacon", "scope": "local", "target": "symbol"
+                }))?;
+                let direct = assembled
+                    .server
+                    .search(super::super::Parameters(params))
+                    .await
+                    .map_err(|failure| format!("{failure:?}"))?
+                    .0;
+                assert_eq!(serde_json::to_value(direct)?, value);
+            }
+            assert!(
+                assembled
+                    .server
+                    .candidate_responses
+                    .bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty()
+            );
+        }
+        let initial = crate::validation::discover_initial_workspace(&assembled.context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
+        let answer = assembled
+            .server
+            .search_candidates_request(request()?)
+            .await?;
+        let SearchCandidateResult::Captured(answer) = answer else {
+            return Err("ready publication must capture candidates".into());
+        };
+        assert!(!answer.inputs.precise.is_empty());
+        assert_eq!(
+            assembled
+                .server
+                .candidate_responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        let views = assembled.server.local_views.get().ok_or("local views")?;
+        let foreign_root = tempfile::tempdir()?;
+        assert_eq!(
+            views.captured_view(answer.view.id.as_str(), foreign_root.path(), &answer.owner)?,
+            Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext)
+        );
+        let accepted = views.captured_view(
+            answer.view.id.as_str(),
+            std::path::Path::new(&answer.root),
+            &answer.owner,
+        )?;
+        assert_eq!(accepted, Ok(answer.view));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn held_candidates_survive_new_preparation() -> TestResult {
+        let (directory, assembled) = super::super::tests::starting_fixture().await?;
+        let initial = crate::validation::discover_initial_workspace(&assembled.context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
+        let answer = assembled
+            .server
+            .search_candidates_request(request()?)
+            .await?;
+        let SearchCandidateResult::Captured(original) = answer else {
+            return Err("ready publication must capture candidates".into());
+        };
+        let pending = RiftMcp::assemble(
+            super::super::absolute_root(directory.path())?,
+            rift_index::WorkspaceIndexLimits::default(),
+            None,
+            crate::identity::BuildCheckout::Unversioned,
+            crate::validation::unwatched,
+            crate::validation::LexicalLane::spawn,
+            None,
+        )
+        .await?;
+        let publication = std::sync::Arc::clone(&pending.server.published.read().await.current);
+        assert!(publication.preparation.is_some());
+        assembled.server.published.write().await.current = publication;
+        let params = serde_json::json!({
+            "params": {"query": "beacon", "scope": "local", "target": "symbol"},
+            "view": original.view
+        });
+        let request = CallToolRequestParams::new("search_candidates")
+            .with_arguments(serde_json::from_value(params)?);
+        let selected = assembled.server.search_candidates_request(request).await?;
+        let SearchCandidateResult::Captured(selected) = selected else {
+            return Err("held view must answer during preparation".into());
+        };
+        assert_eq!(
+            serde_json::to_value(selected)?,
+            serde_json::to_value(original)?
+        );
+        assert_eq!(
+            assembled
+                .server
+                .candidate_responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_capacity_refusal_preserves_original_candidate() -> TestResult {
+        let responses = CandidateResponses::default();
+        let id = String::from("first");
+        let table_bytes = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity()
+            * std::mem::size_of::<super::SavedCandidateBytes>();
+        let mut bytes = Vec::with_capacity(BYTES_MAX - table_bytes - id.capacity());
+        bytes.push(7);
+        let capacity = bytes.capacity();
+        let expires = SystemTime::now() + Duration::from_secs(60);
+        responses.save_bytes(id, expires, bytes)?;
+        assert!(
+            responses
+                .save_bytes(String::from("next"), expires, vec![8])
+                .is_err()
+        );
+        let saved = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, "first");
+        assert_eq!(saved[0].bytes, [7]);
+        assert_eq!(saved[0].bytes.capacity(), capacity);
+        assert_eq!(saved[0].expires, expires);
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_encoding_retains_message_bound() {
+        let exact = "x".repeat(BYTES_MAX - 2);
+        let accepted = crate::proxy::encode_bounded(&exact, BYTES_MAX);
+        assert!(accepted.is_ok());
+        if let Ok(encoded) = accepted {
+            assert_eq!(encoded.len(), BYTES_MAX);
+        }
+        let over = "x".repeat(BYTES_MAX - 1);
+        assert!(crate::proxy::encode_bounded(&over, BYTES_MAX).is_err());
+    }
+
+    #[test]
+    fn duplicate_slots_and_expiry_preserve_advertised_candidates() -> TestResult {
+        let responses = CandidateResponses::default();
+        let expires = SystemTime::now() + Duration::from_secs(60);
+        responses.save_bytes(String::from("expired"), SystemTime::UNIX_EPOCH, vec![0])?;
+        for serial in 0..SLOTS_MAX {
+            responses.save_bytes(format!("view-{serial}"), expires, vec![1])?;
+        }
+        assert!(
+            responses
+                .save_bytes(String::from("view-0"), expires, vec![2])
+                .is_err()
+        );
+        assert!(
+            responses
+                .save_bytes(String::from("overflow"), expires, vec![3])
+                .is_err()
+        );
+        let saved = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.len(), SLOTS_MAX);
+        assert_eq!(saved[0].id, "view-0");
+        assert_eq!(saved[0].bytes, [1]);
+        assert!(saved.iter().all(|row| row.expires == expires));
+        assert!(
+            saved
+                .iter()
+                .all(|row| row.id != "expired" && row.id != "overflow")
+        );
         Ok(())
     }
 }

@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use crate::global::candidates::{CANDIDATE_BYTES_MAX, SearchCandidatePool};
-use crate::server::candidates::{SearchCandidateRequest, SearchCandidateResponse};
+use crate::server::candidates::{
+    SearchCandidateRequest, SearchCandidateResponse, SearchCandidateResult,
+};
 
 use super::RiftProxy;
 
@@ -474,7 +476,13 @@ impl RiftProxy {
                 Ok(result) if result.is_error == Some(true) => {
                     return Ok(Ok(CandidateAnswer::Response(result)));
                 }
-                Ok(result) => decode_response(result)?,
+                Ok(result) => match decode_response(&result)? {
+                    SearchCandidateResult::Captured(response) => *response,
+                    SearchCandidateResult::Unavailable(answer) => {
+                        validate_preparing_response(&answer)?;
+                        return Ok(Ok(CandidateAnswer::Response(result)));
+                    }
+                },
             };
             validate_project_response(root, &response)?;
             for input in response
@@ -539,10 +547,10 @@ impl RiftProxy {
     }
 }
 
-fn decode_response(result: CallToolResult) -> Result<SearchCandidateResponse, RiftError> {
+fn decode_response(result: &CallToolResult) -> Result<SearchCandidateResult, RiftError> {
     super::encode_bounded(&result, CANDIDATE_BYTES_MAX)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    let value = result.structured_content.ok_or_else(|| {
+    let value = result.structured_content.clone().ok_or_else(|| {
         invalid(
             "structuredContent",
             "candidate response has no structured result",
@@ -550,6 +558,29 @@ fn decode_response(result: CallToolResult) -> Result<SearchCandidateResponse, Ri
     })?;
     serde_json::from_value(value)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
+}
+
+fn validate_preparing_response(
+    answer: &rift_protocol::search_read::SearchUnavailable,
+) -> Result<(), RiftError> {
+    let rift_protocol::search_read::SearchUnavailable::Unavailable {
+        reason,
+        view,
+        warnings,
+    } = answer;
+    if *reason != SymbolUnavailableReason::IndexPreparing
+        || view.is_some()
+        || !warnings.iter().any(|warning| {
+            matches!(
+                warning,
+                rift_protocol::read::ReadWarning::LocalIndexPreparing { prepared, total, .. }
+                    if total.is_none_or(|total| *prepared < total)
+            )
+        })
+    {
+        return Err(invalid("view", "captured search selector is unavailable"));
+    }
+    Ok(())
 }
 
 fn validate_project_response(
@@ -652,6 +683,54 @@ mod tests {
 
     fn params() -> SearchParams {
         serde_json::from_value(json!({"query":"beacon","scope":"all","limit":2})).expect("search")
+    }
+
+    #[test]
+    fn preparing_response_rejects_wrong_reason_view_warning_and_extra_fields() {
+        let valid = json!({
+            "outcome": "unavailable",
+            "reason": "index_preparing",
+            "warnings": [{
+                "code": "local_index_preparing", "prepared": 0,
+                "detail": "selected local files are still being prepared"
+            }]
+        });
+        let answer: rift_protocol::search_read::SearchUnavailable =
+            serde_json::from_value(valid.clone()).expect("existing preparing outcome");
+        validate_preparing_response(&answer).expect("warning matches preparing reason");
+        for field in ["results", "root", "unexpected"] {
+            let mut invalid = valid.clone();
+            invalid[field] = json!([]);
+            assert!(serde_json::from_value::<SearchCandidateResult>(invalid).is_err());
+        }
+        let mut wrong_reason = valid.clone();
+        wrong_reason["reason"] = json!("read_failed");
+        let wrong_reason =
+            serde_json::from_value(wrong_reason).expect("existing read-failed outcome");
+        assert!(validate_preparing_response(&wrong_reason).is_err());
+        let mut no_warning = valid.clone();
+        no_warning["warnings"] = json!([]);
+        let no_warning = serde_json::from_value(no_warning).expect("existing empty warnings");
+        assert!(validate_preparing_response(&no_warning).is_err());
+        let mut complete_warning = valid.clone();
+        complete_warning["warnings"][0]["total"] = json!(0);
+        let complete_warning =
+            serde_json::from_value(complete_warning).expect("existing complete progress fields");
+        assert!(validate_preparing_response(&complete_warning).is_err());
+        let mut other_warning = valid.clone();
+        other_warning["warnings"][0]["code"] = json!("lexical_ranking_unavailable");
+        other_warning["warnings"][0]
+            .as_object_mut()
+            .expect("existing warning object")
+            .remove("prepared");
+        let other_warning =
+            serde_json::from_value(other_warning).expect("existing lexical warning");
+        assert!(validate_preparing_response(&other_warning).is_err());
+        let mut with_view = valid;
+        with_view["view"] =
+            serde_json::to_value(captured().pools[0].view.clone()).expect("existing captured view");
+        let with_view = serde_json::from_value(with_view).expect("existing selected view");
+        assert!(validate_preparing_response(&with_view).is_err());
     }
 
     fn pool(backend: &str, root: &str, key: &str, expiry: &str) -> SearchCandidatePool {
