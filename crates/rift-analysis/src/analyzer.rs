@@ -465,7 +465,7 @@ fn publish(
         records.file(package, held)?;
     }
     records.graph(package, &origin, semantics, analyzed)?;
-    records.retained_syntax(analyzed);
+    let retained_syntax_complete = records.retained_syntax(analyzed);
     records.relationships(package, semantics, analyzed, limits.relationships_max())?;
     let (documentation, notebook_cells) = package_documentation(
         package,
@@ -508,7 +508,12 @@ fn publish(
         },
         package,
     )?;
-    let coverage = publication_coverage(analyzed, &records, unresolved_exports);
+    let coverage = publication_coverage(
+        analyzed,
+        &records,
+        unresolved_exports,
+        retained_syntax_complete,
+    );
     Ok((
         PackagePublication {
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
@@ -553,10 +558,33 @@ fn stub_document_signature<'graph>(
         .map(|(_, _, signature)| signature)
 }
 
+fn retained_declaration_ranges(source: &str, symbol: &rift_syntax::SyntaxSymbol) -> bool {
+    let valid = |range: rift_syntax::ByteRange| {
+        usize::try_from(range.start)
+            .ok()
+            .zip(usize::try_from(range.end).ok())
+            .is_some_and(|(start, end)| {
+                start <= end
+                    && end <= source.len()
+                    && source.is_char_boundary(start)
+                    && source.is_char_boundary(end)
+            })
+    };
+    valid(symbol.range)
+        && std::iter::once(symbol.item_range)
+            .chain(symbol.name_range)
+            .chain(symbol.body_range)
+            .chain(symbol.documentation_ranges.iter().copied())
+            .all(|range| {
+                valid(range) && symbol.range.start <= range.start && range.end <= symbol.range.end
+            })
+}
+
 fn publication_coverage(
     analyzed: &[AnalyzedFile],
     records: &Records,
     unresolved_exports: bool,
+    retained_syntax_complete: bool,
 ) -> Vec<PackageCoverage> {
     let languages = analyzed
         .iter()
@@ -580,7 +608,8 @@ fn publication_coverage(
             let mut syntax_complete = true;
             for held in selected {
                 inventory_complete &= units.get(&held.placement.unit().to_string()) == Some(&true);
-                inventory_complete &= held.file.syntax().left_out_declaration_count() == 0;
+                inventory_complete &= held.file.syntax().left_out_declaration_count() == 0
+                    || retained_syntax_complete;
                 syntax_complete &= !held.file.syntax().has_errors()
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
@@ -1648,7 +1677,8 @@ impl Records {
         Ok(())
     }
 
-    fn retained_syntax(&mut self, analyzed: &[AnalyzedFile]) {
+    fn retained_syntax(&mut self, analyzed: &[AnalyzedFile]) -> bool {
+        let mut complete = true;
         let admitted = self
             .units
             .iter()
@@ -1656,14 +1686,18 @@ impl Records {
             .collect::<BTreeSet<_>>();
         for held in analyzed {
             let unit = wire_unit(held.placement.unit());
+            complete &= held.file.syntax().left_out_declaration_count()
+                == held.file.syntax().left_out_symbols().len();
             if !admitted.contains(&unit.0) {
+                complete = false;
                 continue;
             }
             for symbol in held.file.syntax().left_out_symbols() {
+                complete &= retained_declaration_ranges(held.file.source(), symbol);
                 if self.objects.len() >= bound(self.publication.symbols) {
                     self.symbols_truncated = true;
                     self.warn(truncation("objects", u64::from(self.publication.symbols)));
-                    return;
+                    return false;
                 }
                 let facts = symbol.facts(held.file.syntax().language());
                 let object =
@@ -1691,6 +1725,7 @@ impl Records {
                 self.objects.push(object);
             }
         }
+        complete
     }
 
     fn object_identity(&mut self, owner: &SymbolOwner, origin: &SymbolOrigin, object: &mut Symbol) {
