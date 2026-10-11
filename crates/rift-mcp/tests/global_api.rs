@@ -192,6 +192,23 @@ impl Default for FixtureOptions {
 struct FixtureState {
     options: FixtureOptions,
     requests: Arc<Mutex<Vec<ObservedRequest>>>,
+    view: Value,
+}
+
+impl FixtureState {
+    fn response(&self, mut value: Value) -> Response {
+        if let Some(view) = value.get_mut("view") {
+            view.clone_from(&self.view);
+        }
+        if let Some(results) = value.get_mut("results").and_then(Value::as_array_mut) {
+            for result in results {
+                if let Some(view) = result.get_mut("view") {
+                    view.clone_from(&self.view);
+                }
+            }
+        }
+        json_response(&value)
+    }
 }
 
 impl FixtureState {
@@ -248,9 +265,17 @@ impl GlobalFixture {
     pub(crate) async fn start_with(options: FixtureOptions) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
+        let expires = std::time::SystemTime::now()
+            .checked_add(Duration::from_secs(15 * 60))
+            .expect("fixture view expiry fits the clock bound");
+        let view = rift_cloud_client::generated::CapturedView {
+            id: "a".repeat(64),
+            expires_at: expires.into(),
+        };
         let state = FixtureState {
             options,
             requests: Arc::new(Mutex::new(Vec::new())),
+            view: serde_json::to_value(view).expect("fixture captured view is serializable"),
         };
         let app = Router::new()
             .fallback(global_handler)
@@ -323,22 +348,22 @@ async fn global_handler(
     }
     if path.ends_with("/declarations") {
         state.hold_declarations().await;
-        return json_response(&declarations(&body));
+        return state.response(declarations(&body));
     }
     if path.ends_with("/search") {
         state.hold_read().await;
         let mut page = search_page(options.symbol, &body, options.stopped_at_body_bound);
         bound_case_page(&mut page, options.symbol, limit);
-        return json_response(&page);
+        return state.response(page);
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        return json_response(&symbols(options.symbol, &body));
+        return state.response(symbols(options.symbol, &body));
     }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
-            |page| json_response(&page),
+            |page| state.response(page),
         );
     }
     StatusCode::NOT_FOUND.into_response()
