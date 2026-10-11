@@ -51,6 +51,8 @@ use serde::Serialize;
 use rift_ranking::split_identifier_words;
 
 #[cfg(test)]
+mod coverage_tests;
+#[cfg(test)]
 mod fixture;
 mod join;
 #[cfg(test)]
@@ -60,6 +62,7 @@ mod limits_tests;
 pub(crate) mod namespace;
 #[cfg(test)]
 mod publication_tests;
+
 #[cfg(test)]
 mod retained_tests;
 
@@ -577,11 +580,12 @@ fn publication_coverage(
             let mut syntax_complete = true;
             for held in selected {
                 inventory_complete &= units.get(&held.placement.unit().to_string()) == Some(&true);
+                inventory_complete &= held.file.syntax().left_out_declaration_count() == 0;
                 syntax_complete &= !held.file.syntax().has_errors()
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
             PackageCoverage {
-                inventory_complete: inventory_complete && syntax_complete,
+                inventory_complete,
                 identity_complete: !records.symbols_truncated
                     && !records.identity_incomplete
                     && records

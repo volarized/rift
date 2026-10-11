@@ -174,13 +174,13 @@ fn malformed_and_omitted_declarations_cannot_prove_complete_coverage() {
         "def {}(): pass\n",
         "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1)
     );
-    for source in ["def echo(".to_owned(), omitted] {
+    for (source, inventory_complete) in [("def echo(".to_owned(), true), (omitted, false)] {
         let result = publication(&[("click/core.py", &source)], None, &["click"]);
         assert_eq!(result.units.len(), 1);
         assert_eq!(result.units[0].source, source);
         assert!(result.units[0].source_complete);
         let coverage = &result.coverage[0];
-        assert!(!coverage.inventory_complete);
+        assert_eq!(coverage.inventory_complete, inventory_complete);
         assert!(!coverage.identity_complete);
         assert!(!coverage.applicability_complete);
     }
