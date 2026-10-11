@@ -1766,3 +1766,117 @@ fn documented_module_prefix_refuses_unknown_path_and_macro_import_effects() {
         assert!(!found.contains_key("src/runtime.rs"), "{attribute}");
     }
 }
+
+fn cfg_expression_anchors(prefix: &str, suffix: &str, expression: &str) -> super::super::Anchors {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature=\"rt\")] $item )* } }";
+    let source = format!(
+        "{prefix}#[macro_use] mod macros; cfg_rt! {{ const BOX_FUTURE_THRESHOLD: usize = if {expression} {{ 2048 }} else {{ 16384 }}; pub mod runtime; }} {suffix}"
+    );
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual package owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("owner origin");
+    selected_anchors_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", &source),
+            ("src/macros.rs", definition),
+            ("src/runtime.rs", "pub struct Runtime;"),
+        ],
+        None,
+        false,
+        &owner,
+        &origin,
+        true,
+    )
+}
+
+#[test]
+fn cfg_expression_preserves_unknown_predicate_and_original_const_branches() {
+    for expression in [
+        "cfg!(debug_assertions)",
+        "cfg!(all(feature=\"rt\",not(test)))",
+    ] {
+        let found = cfg_expression_anchors("", "", expression);
+        assert!(found["src/runtime.rs"].contains_key("Runtime"));
+    }
+}
+
+#[test]
+fn cfg_expression_refuses_shadow_import_unknown_effect_and_prelude_changes() {
+    for (prefix, suffix) in [
+        ("#![no_std]", ""),
+        ("#![no_implicit_prelude]", ""),
+        ("#![cfg_attr(feature=\"bare\",no_std)]", ""),
+        ("use other::Macro as cfg;", ""),
+        ("use other::*;", ""),
+        ("macro_rules! cfg { ($($token:tt)*) => { false }; }", ""),
+        ("", "unknown!{}"),
+        ("", "use other::Macro as cfg;"),
+    ] {
+        let found = cfg_expression_anchors(prefix, suffix, "cfg!(debug_assertions)");
+        assert!(!found.contains_key("src/runtime.rs"), "{prefix} {suffix}");
+    }
+}
+
+#[test]
+fn cfg_expression_refuses_qualified_computed_and_unknown_macro_forms() {
+    for expression in [
+        "other::cfg!(debug_assertions)",
+        "cfg!(unknown!())",
+        "unknown!(debug_assertions)",
+        "cfg!{debug_assertions}",
+    ] {
+        let found = cfg_expression_anchors("", "", expression);
+        assert!(!found.contains_key("src/runtime.rs"), "{expression}");
+    }
+}
+
+#[test]
+fn transparent_item_macros_validate_original_modules_before_unknown_effects() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    for (body, admitted) in [
+        ("mod runtime; unknown! { mod hidden; }", true),
+        ("unknown! { mod hidden; } mod runtime;", false),
+        ("unknown! { mod runtime; } mod runtime;", false),
+    ] {
+        let source = format!("#[macro_use] mod macros; cfg_rt! {{ {body} }}");
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", source.as_str()),
+                ("src/macros.rs", definition),
+                ("src/runtime.rs", "pub struct Runtime;"),
+                ("src/hidden.rs", "pub fn hidden() {}"),
+            ],
+            None,
+            false,
+        );
+        assert_eq!(found.contains_key("src/runtime.rs"), admitted, "{source}");
+        assert!(!found.contains_key("src/hidden.rs"), "{source}");
+        if admitted {
+            let identity = SymbolIdentity::parse(found["src/runtime.rs"]["Runtime"].as_str())
+                .expect("original direct module identity");
+            assert_eq!(
+                identity.qualified_path(),
+                ["crate_root", "runtime", "Runtime"]
+            );
+        }
+    }
+}

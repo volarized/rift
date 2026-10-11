@@ -716,22 +716,26 @@ pub(super) fn children<'a>(
                     scope.clear();
                     continue;
                 }
-                for range in modules {
-                    let name = text_range(file.source, *range)
-                        .and_then(|item| item.strip_prefix("mod"))
-                        .and_then(|item| item.strip_suffix(';'))
-                        .map(str::trim)
-                        .filter(|name| super::crate_name_is_valid(name));
-                    if let Some(name) = name
-                        && let Some(path) = child_path(name, directory, inventory)
-                    {
-                        children.push((path, vec![name.to_owned()], scope.clone()));
-                    }
-                }
                 let complete = tokens
                     .as_ref()
                     .zip(direct.as_ref())
-                    .is_some_and(|(tokens, _)| tokens.item(*range, &mut scope, library).is_some());
+                    .is_some_and(|(tokens, _)| {
+                        tokens
+                            .item_modules(*range, &mut scope, library, modules, |range, scope| {
+                                let name = text_range(file.source, range)
+                                    .and_then(|item| item.strip_prefix("mod"))
+                                    .and_then(|item| item.strip_suffix(';'))
+                                    .map(str::trim)
+                                    .filter(|name| super::crate_name_is_valid(name));
+                                if let Some(name) = name
+                                    && let Some(path) = child_path(name, directory, inventory)
+                                {
+                                    children.push((path, vec![name.to_owned()], scope.clone()));
+                                }
+                                Some(())
+                            })
+                            .is_some()
+                    });
                 if !complete {
                     scope.clear();
                 }

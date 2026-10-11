@@ -7,6 +7,8 @@ use rift_syntax::ByteRange;
 
 use super::{Scope, SelectedFile, consume, group};
 
+type Modules<'callback> = Option<&'callback mut dyn FnMut(ByteRange, &Scope) -> Option<()>>;
+
 pub(super) struct Tokens<'a> {
     rows: Vec<(ByteRange, &'a str)>,
     bindings: BTreeSet<String>,
@@ -252,34 +254,97 @@ impl<'a> Tokens<'a> {
 
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
-        self.item_tokens(&tokens, scope, library, self.depth, true)
+        self.item_tokens(&tokens, scope, library, self.depth, true, &mut None)
+    }
+
+    pub(super) fn item_modules(
+        &self,
+        range: ByteRange,
+        scope: &mut Scope,
+        library: bool,
+        modules: &[ByteRange],
+        mut callback: impl FnMut(ByteRange, &Scope) -> Option<()>,
+    ) -> Option<()> {
+        let tokens = self.range(range)?;
+        let mut admitted = |range, scope: &Scope| {
+            self.charge(modules.len())?;
+            if modules.contains(&range) {
+                callback(range, scope)?;
+            }
+            Some(())
+        };
+        let mut callbacks: Modules<'_> = Some(&mut admitted);
+        self.item_tokens(&tokens, scope, library, self.depth, true, &mut callbacks)
+    }
+
+    fn module_range(&self, input: &[&str]) -> Option<ByteRange> {
+        self.charge(self.rows.len().checked_add(input.len())?)?;
+        let first = input.first()?;
+        let start = self
+            .rows
+            .iter()
+            .position(|(_, token)| std::ptr::eq(*token, *first))?;
+        let end = start.checked_add(input.len())?;
+        let rows = self.rows.get(start..end)?;
+        if !rows
+            .iter()
+            .zip(input)
+            .all(|((_, row), token)| std::ptr::eq(*row, *token))
+        {
+            return None;
+        }
+        Some(ByteRange {
+            start: rows.first()?.0.start,
+            end: rows.last()?.0.end,
+        })
     }
 
     pub(super) fn effects(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
-        self.item_tokens(&tokens, scope, library, self.depth, false)
+        self.item_tokens(&tokens, scope, library, self.depth, false, &mut None)
     }
 
     pub(super) fn compile_error(&self, range: ByteRange, scope: &Scope, library: bool) -> bool {
         let Some(tokens) = self.range(range) else {
             return false;
         };
-        if !compile_error_tokens(&tokens)
-            || !library
+        compile_error_tokens(&tokens) && self.implicit_prelude("compile_error", scope, library)
+    }
+
+    fn implicit_prelude(&self, name: &str, scope: &Scope, library: bool) -> bool {
+        if !library
             || !self.complete
             || !scope.complete
-            || self.bindings.contains("compile_error")
-            || scope.contains_key("compile_error")
+            || self.bindings.contains(name)
+            || scope.contains_key(name)
+            || self.charge(self.rows.len()).is_none()
         {
-            return false;
-        }
-        if self.charge(self.rows.len()).is_none() {
             return false;
         }
         !self
             .rows
             .iter()
             .any(|(_, token)| ["no_std", "no_implicit_prelude"].contains(token))
+    }
+
+    fn cfg(
+        &self,
+        input: &mut &[&str],
+        scope: &Scope,
+        library: bool,
+        depth: usize,
+        validate: bool,
+    ) -> Option<()> {
+        if !consume(input, &["cfg", "!"]) {
+            return None;
+        }
+        let predicate = group(input, "(", ")")?;
+        self.charge(predicate.len().checked_mul(depth)?)?;
+        super::cfg(predicate, library, depth)?;
+        if self.bindings.contains("cfg") || scope.contains_key("cfg") {
+            return None;
+        }
+        (!validate || self.implicit_prelude("cfg", scope, library)).then_some(())
     }
 
     fn item_tokens(
@@ -289,6 +354,7 @@ impl<'a> Tokens<'a> {
         library: bool,
         depth: usize,
         validate: bool,
+        modules: &mut Modules<'_>,
     ) -> Option<()> {
         if depth == 0 {
             return None;
@@ -332,9 +398,16 @@ impl<'a> Tokens<'a> {
             scope.insert(name, false);
             return Some(());
         }
+        let module = input;
         if consume(&mut input, &["mod"]) {
             identifier(&mut input)?;
-            return (consume(&mut input, &[";"]) && input.is_empty()).then_some(());
+            if !consume(&mut input, &[";"]) || !input.is_empty() {
+                return None;
+            }
+            if let Some(callback) = modules {
+                callback(self.module_range(module)?, scope)?;
+            }
+            return Some(());
         }
         if compile_error_tokens(input) {
             if self.bindings.contains("compile_error") || scope.contains_key("compile_error") {
@@ -343,15 +416,9 @@ impl<'a> Tokens<'a> {
             if !validate {
                 return Some(());
             }
-            self.charge(self.rows.len())?;
-            return (library
-                && self.complete
-                && scope.complete
-                && !self
-                    .rows
-                    .iter()
-                    .any(|(_, token)| ["no_std", "no_implicit_prelude"].contains(token)))
-            .then_some(());
+            return self
+                .implicit_prelude("compile_error", scope, library)
+                .then_some(());
         }
         let mut probe = input;
         if let Some(name) = identifier(&mut probe)
@@ -365,7 +432,7 @@ impl<'a> Tokens<'a> {
             if !probe.is_empty() {
                 return None;
             }
-            return self.body(body, scope, library, depth - 1, validate);
+            return self.body(body, scope, library, depth - 1, validate, modules);
         }
         if ![
             "mod", "fn", "impl", "struct", "enum", "union", "trait", "type", "const", "static",
@@ -387,6 +454,7 @@ impl<'a> Tokens<'a> {
         validate: bool,
     ) -> Option<()> {
         self.charge(input.len())?;
+        let mut previous = None;
         while !input.is_empty() {
             if consume(&mut input, &["#"]) {
                 let _ = consume(&mut input, &["!"]);
@@ -395,6 +463,14 @@ impl<'a> Tokens<'a> {
                     return None;
                 }
             } else {
+                if input.starts_with(&["cfg", "!", "("]) {
+                    if previous == Some(":") {
+                        return None;
+                    }
+                    self.cfg(&mut input, scope, library, depth, validate)?;
+                    previous = Some(")");
+                    continue;
+                }
                 if input[0] == "!"
                     && input
                         .get(1)
@@ -407,6 +483,7 @@ impl<'a> Tokens<'a> {
                 {
                     return None;
                 }
+                previous = Some(input[0]);
                 input = &input[1..];
             }
         }
@@ -420,13 +497,14 @@ impl<'a> Tokens<'a> {
         library: bool,
         depth: usize,
         validate: bool,
+        modules: &mut Modules<'_>,
     ) -> Option<()> {
         if depth == 0 {
             return None;
         }
         self.charge(input.len().checked_mul(2)?)?;
         items(input, depth, |item| {
-            self.item_tokens(item, scope, library, depth - 1, validate)
+            self.item_tokens(item, scope, library, depth - 1, validate, modules)
         })
     }
 }
@@ -1020,6 +1098,76 @@ mod tests {
                     ),
                     "{source}"
                 );
+            });
+        }
+    }
+
+    #[test]
+    fn cfg_expression_keeps_configuration_without_observed_values_unknown() {
+        assert!(matches!(
+            super::super::cfg(&["debug_assertions"], true, 20),
+            Some(super::super::Condition::Unknown),
+        ));
+        assert!(matches!(
+            super::super::cfg(&["feature", "=", "\"rt\""], true, 20),
+            Some(super::super::Condition::Unknown),
+        ));
+    }
+
+    #[test]
+    fn original_module_callbacks_require_captured_range_and_work_budget() {
+        let source = "cfg_rt! { mod runtime; unknown! { mod runtime; } }";
+        let start = u64::try_from(source.find("mod runtime;").expect("original direct module"))
+            .expect("module range");
+        let nested = u64::try_from(
+            source
+                .rfind("mod runtime;")
+                .expect("original nested module"),
+        )
+        .expect("module range");
+        let direct = ByteRange {
+            start,
+            end: start + 12,
+        };
+        for (range, expected) in [
+            (direct, vec![direct]),
+            (
+                ByteRange {
+                    start: nested,
+                    end: nested + 12,
+                },
+                Vec::new(),
+            ),
+            (
+                ByteRange {
+                    start,
+                    end: start + 11,
+                },
+                Vec::new(),
+            ),
+        ] {
+            with_tokens(source, |tokens| {
+                let mut scope = Scope::default();
+                scope.insert("cfg_rt".to_owned(), true);
+                let mut found = Vec::new();
+                let result =
+                    tokens.item_modules(whole(source), &mut scope, false, &[range], |range, _| {
+                        found.push(range);
+                        Some(())
+                    });
+                assert!(result.is_none());
+                assert_eq!(found, expected);
+                tokens.work.set(tokens.work_max);
+                found.clear();
+                assert!(
+                    tokens
+                        .item_modules(whole(source), &mut scope, false, &[range], |range, _| {
+                            found.push(range);
+                            Some(())
+                        })
+                        .is_none()
+                );
+                assert!(found.is_empty());
             });
         }
     }
