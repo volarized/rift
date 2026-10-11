@@ -689,3 +689,25 @@ fn conflicting_export_subpaths_refuse_one_physical_module_assignment() {
     );
     assert!(duplicate.is_err(), "duplicate captured export key refuses");
 }
+
+#[test]
+fn raw_anonymous_export_bindings_need_module_export_context_before_identity() {
+    let metadata = [(
+        "package.json",
+        r#"{"name":"prettier","version":"3.8.5","main":"./index.js"}"#,
+    )];
+    for source in [
+        "exports.open = function () {}; function kept() {}",
+        "function outer(exports) { exports.open = function () {}; } function kept() {}",
+        "(function (exports) { exports.open = function () {}; })(other); function kept() {}",
+    ] {
+        let prepared = prepared(
+            ShippedLanguage::JavaScript,
+            &metadata,
+            &[("index.js", source)],
+        );
+        let anchors = prepared.anchors.get("index.js").expect("captured module");
+        assert!(anchors.contains_key("kept"));
+        assert!(!anchors.contains_key("open"));
+    }
+}

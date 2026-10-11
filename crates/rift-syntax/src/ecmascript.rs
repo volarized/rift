@@ -21,9 +21,11 @@
 //! - Exports are read from the module's top-level statements: an assignment
 //!   nested in a block or a function marks nothing. A re-export
 //!   (`export { x } from './y'`, `export * from './y'`) names another
-//!   module's declarations, so it marks none here. A function or class
-//!   expression assigned to an export (`exports.run = function () {}`)
-//!   declares nothing, so nothing carries the facet for it.
+//!   module's declarations, so it marks none here. An anonymous function in a
+//!   literal property assignment (`exports.run = function () {}`) retains the
+//!   property binding and the original function source. The binding carries no
+//!   `Public` facet without supported module export context. Named function and
+//!   class expressions assigned to an export add no declaration.
 //! - `export` is not a visibility spelling: the `visibility` field carries
 //!   only an authored `accessibility_modifier` (`public`, `private`,
 //!   `protected`), and stays `None` everywhere else.
@@ -300,6 +302,7 @@ pub(crate) struct EcmaScriptKinds {
     equals_token: u16,
     expression_statement: u16,
     assignment_expression: u16,
+    function_expression: u16,
     member_expression: u16,
     object_literal: u16,
     shorthand_property_identifier: u16,
@@ -369,6 +372,7 @@ impl EcmaScriptKinds {
             equals_token: token_id(language, EQUALS_TOKEN),
             expression_statement: kind_id(language, EXPRESSION_STATEMENT_KIND),
             assignment_expression: kind_id(language, ASSIGNMENT_EXPRESSION_KIND),
+            function_expression: kind_id(language, "function_expression"),
             member_expression: kind_id(language, MEMBER_EXPRESSION_KIND),
             object_literal: kind_id(language, OBJECT_KIND),
             shorthand_property_identifier: kind_id(language, SHORTHAND_PROPERTY_IDENTIFIER_KIND),
@@ -561,6 +565,30 @@ impl EcmaScriptKinds {
             ExportTarget::Module => Some(value),
             ExportTarget::Property => (value.kind_id() == self.identifier).then_some(value),
         }
+    }
+
+    /// The original property token and anonymous function assigned to one literal export.
+    /// This records the physical binding; module and build evidence decide public export.
+    fn export_function<'tree>(
+        &self,
+        node: Node<'tree>,
+        text: &str,
+    ) -> Option<(Node<'tree>, Node<'tree>)> {
+        if node.kind_id() != self.assignment_expression {
+            return None;
+        }
+        let left = self.child(node, EcmaScriptGrammarField::Left)?;
+        if self.export_target(left, text) != Some(ExportTarget::Property) {
+            return None;
+        }
+        let function = self.child(node, EcmaScriptGrammarField::Right)?;
+        if function.kind_id() != self.function_expression
+            || self.child(function, EcmaScriptGrammarField::Name).is_some()
+        {
+            return None;
+        }
+        let property = self.child(left, EcmaScriptGrammarField::Property)?;
+        Some((property, function))
     }
 
     /// The export an assignment's left side addresses; `None` for any other
@@ -1074,9 +1102,15 @@ impl GrammarRules for EcmaScriptRules<'_> {
     }
 
     fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
-        node.child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
-            .map(extract::byte_range)
-            .transpose()
+        let name = node
+            .child_by_field_id(self.kinds.field(EcmaScriptGrammarField::Name).get())
+            .or_else(|| {
+                (node.kind_id() == self.kinds.assignment_expression)
+                    .then(|| self.kinds.child(node, EcmaScriptGrammarField::Left))
+                    .flatten()
+                    .and_then(|left| self.kinds.child(left, EcmaScriptGrammarField::Property))
+            });
+        name.map(extract::byte_range).transpose()
     }
 
     fn renders_signature(&self, visited: Visited<'_, '_>) -> bool {
@@ -1089,6 +1123,21 @@ impl GrammarRules for EcmaScriptRules<'_> {
         text: &str,
     ) -> Result<Option<Declaration>, RiftError> {
         let node = visited.node();
+        if let Some((property, function)) = self.kinds.export_function(node, text) {
+            let Some(name) = text.get(property.byte_range()) else {
+                return Ok(None);
+            };
+            let body = self.kinds.child(function, EcmaScriptGrammarField::Body);
+            return Ok(Some(Declaration {
+                name: name.to_owned(),
+                kind: EcmaScriptSymbolKind::Function.word(),
+                facets: EcmaScriptSymbolKind::Function.facets(),
+                visibility: None,
+                body_range: body.map(extract::byte_range).transpose()?,
+                documentation: Vec::new(),
+                documentation_ranges: Vec::new(),
+            }));
+        }
         let Some(kind) = self.kinds.symbol_kind(node) else {
             return Ok(None);
         };

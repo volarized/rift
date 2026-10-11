@@ -685,4 +685,143 @@ mod tests {
         assert_eq!(names, ["kept"]);
         assert_eq!(document.left_out_declaration_count(), 2);
     }
+
+    #[test]
+    fn anonymous_export_assignment_keeps_property_and_original_function_ranges() {
+        let source = "exports.useState = function (initialState) { return initialState; };\n";
+        let document = analyze(source);
+        let symbol = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "useState")
+            .expect("original property binding");
+        assert_eq!(symbol.kind, "function");
+        assert_eq!(symbol.node_kind, Some("assignment_expression"));
+        assert!(symbol.facets.contains(&SymbolFacet::Callable));
+        assert!(!symbol.facets.contains(&SymbolFacet::Public));
+        assert_eq!(
+            &source[usize::try_from(symbol.item_range.start).expect("item start")
+                ..usize::try_from(symbol.item_range.end).expect("item end")],
+            source.trim_end().trim_end_matches(';')
+        );
+        let name = symbol.name_range.expect("original property token");
+        assert_eq!(
+            &source[usize::try_from(name.start).expect("name start")
+                ..usize::try_from(name.end).expect("name end")],
+            "useState"
+        );
+        let body = symbol.body_range.expect("original anonymous body");
+        assert_eq!(
+            &source[usize::try_from(body.start).expect("body start")
+                ..usize::try_from(body.end).expect("body end")],
+            "{ return initialState; }"
+        );
+        assert_eq!(
+            symbol.signatures[0].display,
+            "exports.useState = function (initialState)"
+        );
+    }
+
+    #[test]
+    fn repeated_anonymous_export_assignments_keep_distinct_original_ranges() {
+        let source = "exports.open = function () { return 1; };\nexports.open = function () { return 2; };\n";
+        let document = analyze(source);
+        let symbols = document
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == "open")
+            .collect::<Vec<_>>();
+        assert_eq!(symbols.len(), 2);
+        assert_ne!(symbols[0].qualified_name, symbols[1].qualified_name);
+        assert!(symbols[0].range.end < symbols[1].range.start);
+        for symbol in symbols {
+            assert_eq!(symbol.node_kind, Some("assignment_expression"));
+            assert!(!symbol.facets.contains(&SymbolFacet::Public));
+        }
+        let changed = analyze(&source.replace("return 2", "return 3"));
+        assert_eq!(changed.symbols().len(), document.symbols().len());
+        assert_ne!(
+            changed.facts().source_digest(),
+            document.facts().source_digest()
+        );
+    }
+
+    #[test]
+    fn shadowed_and_dynamic_export_contexts_keep_raw_anonymous_binding() {
+        for source in [
+            "function outer(exports) { exports.open = function () {}; }",
+            "(function (exports) { exports.open = function () {}; })(other);",
+            "(function () { let exports = other; exports.open = function () {}; })();",
+            "run(function () { exports.open = function () {}; });",
+        ] {
+            let document = analyze(source);
+            let symbol = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == "open")
+                .expect("physical anonymous property binding");
+            assert!(!symbol.facets.contains(&SymbolFacet::Public), "{source}");
+            assert!(
+                document
+                    .facts()
+                    .export_bindings()
+                    .expect("recorded export facts")
+                    .is_empty()
+            );
+            let start = usize::try_from(symbol.item_range.start).expect("item start");
+            let end = usize::try_from(symbol.item_range.end).expect("item end");
+            assert_eq!(&source[start..end], "exports.open = function () {}");
+        }
+    }
+
+    #[test]
+    fn dynamic_property_and_named_function_assignments_remain_unassociated() {
+        for source in [
+            "exports[key] = function () {};",
+            "other.open = function () {};",
+            "exports.open = function inner() {};",
+            "exports.open = factory();",
+        ] {
+            let document = analyze(source);
+            assert!(
+                !document
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.name == "open"),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn original_react_anonymous_property_assignments_keep_full_source_ranges() {
+        for (source, original_start) in [
+            (
+                include_str!("../tests/fixtures/react/react.development.js"),
+                48_434_u64,
+            ),
+            (
+                include_str!("../tests/fixtures/react/react.production.js"),
+                17_608_u64,
+            ),
+        ] {
+            let document = analyze(source);
+            let symbol = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == "useState")
+                .expect("actual original anonymous export");
+            assert_eq!(symbol.range.start, original_start);
+            assert_eq!(symbol.node_kind, Some("assignment_expression"));
+            assert!(!symbol.facets.contains(&SymbolFacet::Public));
+            let start = usize::try_from(symbol.item_range.start).expect("item start");
+            let end = usize::try_from(symbol.item_range.end).expect("item end");
+            assert!(source[start..end].starts_with("exports.useState = function (initialState)"));
+            assert!(source[start..end].ends_with('}'));
+            assert_eq!(
+                symbol.signatures[0].display,
+                "exports.useState = function (initialState)"
+            );
+        }
+    }
 }

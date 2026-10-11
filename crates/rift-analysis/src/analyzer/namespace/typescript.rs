@@ -680,7 +680,10 @@ fn declaration_anchors(
     module: &str,
 ) -> BTreeMap<String, SymbolId> {
     let mut groups: BTreeMap<String, Vec<&SyntaxSymbol>> = BTreeMap::new();
-    for symbol in syntax.symbols() {
+    for symbol in syntax.symbols().iter().filter(|symbol| {
+        symbol.node_kind != Some("assignment_expression")
+            || symbol.facets.contains(&SymbolFacet::Public)
+    }) {
         groups
             .entry(defining_name(symbol))
             .or_default()
@@ -689,7 +692,10 @@ fn declaration_anchors(
     let revision = crate::documentation::content_digest(source.as_bytes()).0;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
-    for symbol in syntax.symbols() {
+    for symbol in syntax.symbols().iter().filter(|symbol| {
+        symbol.node_kind != Some("assignment_expression")
+            || symbol.facets.contains(&SymbolFacet::Public)
+    }) {
         let Some(mut path) = container_path(symbol, &paths, module) else {
             continue;
         };
