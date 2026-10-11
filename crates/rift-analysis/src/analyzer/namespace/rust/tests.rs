@@ -142,6 +142,7 @@ fn selected_anchors_for_owner(
                     left_out_declarations: 0,
                     markdown_facts: None,
                     export_bindings: None,
+                    macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
                     source_digest: rift_core::FileDigest::of(source.as_bytes()),
                 },
             )
@@ -843,4 +844,134 @@ fn runtime_explicit_target_and_inherited_package_version_keep_runtime_owner() {
         found["wrapper/lib.rs"]["Root"].as_str(),
         "rift://symbol/stdlib/rust@1.98.1/rust/actual_core/Root"
     );
+}
+
+#[test]
+fn transparent_item_macros_use_captured_ordered_imports_for_module_roots() {
+    let definition = "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] #[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))] $item )* } }";
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            (
+                "src/lib.rs",
+                "#[macro_use]\n#[doc(hidden)]\nmod macros;\ncfg_rt! { pub mod runtime; }\npub fn neighbor() {}",
+            ),
+            ("src/macros/mod.rs", "#[macro_use]\nmod cfg;"),
+            ("src/macros/cfg.rs", definition),
+            ("src/runtime/mod.rs", "mod builder; pub fn start() {}"),
+            ("src/runtime/builder.rs", "pub struct Builder;"),
+        ],
+        None,
+        false,
+    );
+    for (path, name, expected) in [
+        (
+            "src/runtime/mod.rs",
+            "start",
+            vec!["crate_root", "runtime", "start"],
+        ),
+        (
+            "src/runtime/builder.rs",
+            "Builder",
+            vec!["crate_root", "runtime", "builder", "Builder"],
+        ),
+    ] {
+        let identity =
+            SymbolIdentity::parse(found[path][name].as_str()).expect("captured module identity");
+        assert_eq!(identity.qualified_path(), expected);
+    }
+    assert!(found["src/lib.rs"].contains_key("neighbor"));
+}
+
+#[test]
+fn transparent_item_macros_refuse_shadowing_unknown_order_and_changed_items() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    for root in [
+        "cfg_rt! { pub mod runtime; }\n#[macro_use] mod macros;",
+        "mod macros; cfg_rt! { pub mod runtime; }",
+        "#[macro_use] mod macros; macro_rules! cfg_rt { () => {}; } cfg_rt! { pub mod runtime; }",
+        "#[macro_use] mod macros; cfg_rt! { #[path = \"renamed.rs\"] pub mod runtime; pub fn mixed() {} }",
+        "#[macro_use] mod macros; cfg_rt! { other! { pub mod runtime; } }",
+        "#[macro_use] mod macros; macros::cfg_rt! { pub mod runtime; }",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", root),
+                ("src/macros.rs", definition),
+                ("src/runtime.rs", "pub fn refused() {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/runtime.rs"), "{root}");
+    }
+    for changed in [
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* }; () => {}; }",
+        "macro_rules! cfg_rt { ($($item:item)*) => { pub mod runtime; } }",
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[path = \"runtime.rs\"] $item )* } }",
+        "#[cfg(feature = \"rt\")] macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                (
+                    "src/lib.rs",
+                    "#[macro_use] mod macros; cfg_rt! { pub mod runtime; }",
+                ),
+                ("src/macros.rs", changed),
+                ("src/runtime.rs", "pub fn refused() {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/runtime.rs"), "{changed}");
+    }
+}
+
+#[test]
+fn transparent_item_macros_keep_direct_modules_in_mixed_item_bodies() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            (
+                "src/lib.rs",
+                "#[macro_use] mod macros; cfg_rt! { pub mod runtime; } cfg_rt! { pub mod task; }",
+            ),
+            ("src/macros.rs", definition),
+            (
+                "src/runtime/mod.rs",
+                "cfg_rt! { pub use builder::Builder; mod builder; }",
+            ),
+            ("src/runtime/builder.rs", "pub struct Builder;"),
+            (
+                "src/task/mod.rs",
+                "cfg_rt! { pub use crate::runtime::{Builder}; mod spawn; pub use spawn::spawn; unknown! { mod hidden; } }",
+            ),
+            ("src/task/spawn.rs", "pub fn spawn() {}"),
+            ("src/task/hidden.rs", "pub fn refused() {}"),
+        ],
+        None,
+        false,
+    );
+    for (path, name, expected) in [
+        (
+            "src/runtime/builder.rs",
+            "Builder",
+            vec!["crate_root", "runtime", "builder", "Builder"],
+        ),
+        (
+            "src/task/spawn.rs",
+            "spawn",
+            vec!["crate_root", "task", "spawn", "spawn"],
+        ),
+    ] {
+        let identity = SymbolIdentity::parse(found[path][name].as_str())
+            .expect("captured direct module identity");
+        assert_eq!(identity.qualified_path(), expected);
+    }
+    assert!(!found.contains_key("src/task/hidden.rs"));
 }

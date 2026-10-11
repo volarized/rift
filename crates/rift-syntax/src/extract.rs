@@ -308,6 +308,7 @@ pub(crate) fn extract_with_export_bindings(
                 &qualification,
                 language,
                 rules,
+                grammar,
             )?);
         }
         let child_qualification = rules.container_name(node, text).map_or_else(
@@ -383,6 +384,7 @@ fn qualified_symbol(
     qualification: &str,
     language: &Language,
     rules: &dyn GrammarRules,
+    grammar: &'static tree_sitter::Language,
 ) -> Result<SyntaxSymbol, RiftError> {
     let visited_node = visited.node();
     let node = rules.declaration_node(visited);
@@ -404,7 +406,7 @@ fn qualified_symbol(
         container: (!qualification.is_empty()).then(|| qualification.to_owned()),
         name: declaration.name,
         kind: declaration.kind,
-        node_kind: None,
+        node_kind: grammar.node_kind_for_id(node.kind_id()),
         facets: declaration.facets,
         visibility: declaration.visibility,
         range: ByteRange {

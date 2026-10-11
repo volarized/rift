@@ -167,6 +167,7 @@ pub(super) fn module_path(
                 }
             }
             "cfg"
+            | "macro_use"
             | "doc"
             | "allow"
             | "warn"

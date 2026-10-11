@@ -13,6 +13,7 @@ use crate::markdown::MarkdownFacts;
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
 mod retained_size;
+pub(crate) mod rust_macros;
 
 /// Half-open UTF-8 byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -184,6 +185,7 @@ pub struct SyntaxFacts {
     symbols: Vec<SyntaxSymbol>,
     left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
+    macro_invocations: Option<Vec<(ByteRange, Vec<ByteRange>)>>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -308,8 +310,26 @@ impl SyntaxDocument {
         suffix_duplicate_qualified_names(&mut symbols);
         let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
         for symbol in &mut symbols {
-            symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            if symbol.node_kind.is_none() {
+                symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            }
         }
+        let macro_invocations =
+            (language.name == "rust" && language.dialect.is_none()).then(|| {
+                nodes
+                    .iter()
+                    .filter(|node| {
+                        node.kind == "macro_invocation"
+                            && node
+                                .parent
+                                .and_then(|parent| nodes.get(parent))
+                                .is_some_and(|parent| {
+                                    parent.kind == "source_file" && parent.parent.is_none()
+                                })
+                    })
+                    .map(|node| (node.range, Vec::new()))
+                    .collect()
+            });
         let left_out_symbols = leave_out_refused_names(&mut symbols);
         let left_out_declarations = left_out_symbols.len();
         Self {
@@ -320,6 +340,7 @@ impl SyntaxDocument {
                 symbols,
                 left_out_symbols,
                 export_bindings: None,
+                macro_invocations,
                 has_errors,
                 left_out_declarations,
                 markdown_facts: None,
@@ -382,7 +403,11 @@ impl SyntaxDocument {
     }
 
     pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
-        Arc::make_mut(&mut self.facts).source_digest = Some(FileDigest::of(source.as_bytes()));
+        let facts = Arc::make_mut(&mut self.facts);
+        facts.source_digest = Some(FileDigest::of(source.as_bytes()));
+        if let Some(invocations) = &mut facts.macro_invocations {
+            rust_macros::capture(source, &self.nodes, invocations);
+        }
         self
     }
 
@@ -446,6 +471,12 @@ impl SyntaxFacts {
     #[must_use]
     pub fn export_bindings(&self) -> Option<&[SyntaxExportBinding]> {
         self.export_bindings.as_deref()
+    }
+
+    /// Returns captured top-level Rust macro invocations, or `None` for unrecorded facts.
+    #[must_use]
+    pub fn macro_invocations(&self) -> Option<&[(ByteRange, Vec<ByteRange>)]> {
+        self.macro_invocations.as_deref()
     }
     /// Returns whether these facts came from a provider or framework context.
     #[must_use]
@@ -549,6 +580,7 @@ impl SyntaxFacts {
             symbols: parts.symbols,
             left_out_symbols: parts.left_out_symbols,
             export_bindings: parts.export_bindings,
+            macro_invocations: parts.macro_invocations,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,

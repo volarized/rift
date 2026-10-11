@@ -240,6 +240,7 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
             left_out_declarations: facts.left_out_declaration_count(),
             markdown_facts: facts.markdown_facts().cloned(),
             export_bindings: facts.export_bindings().map(<[_]>::to_vec),
+            macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
             source_digest: digest,
         },
     )

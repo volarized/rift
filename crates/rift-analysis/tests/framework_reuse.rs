@@ -171,6 +171,7 @@ fn checked_facts(text: &str, limits: SyntaxLimits, facts: &SyntaxFacts) -> Synta
             left_out_declarations: facts.left_out_declaration_count(),
             markdown_facts: facts.markdown_facts().cloned(),
             export_bindings: facts.export_bindings().map(<[_]>::to_vec),
+            macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
             source_digest: *facts.source_digest().expect("source witness"),
         },
     )

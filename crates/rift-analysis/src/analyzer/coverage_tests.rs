@@ -102,6 +102,7 @@ fn unretained_refused_heading_count_keeps_inventory_incomplete() {
         symbols: original.symbols().to_vec(),
         left_out_symbols: original.left_out_symbols().to_vec(),
         export_bindings: original.export_bindings().map(<[_]>::to_vec),
+        macro_invocations: None,
         has_errors: original.has_errors(),
         left_out_declarations: original.left_out_declaration_count() + 1,
         markdown_facts: original.markdown_facts().cloned(),

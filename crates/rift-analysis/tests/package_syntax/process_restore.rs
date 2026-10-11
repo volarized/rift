@@ -130,6 +130,8 @@ impl CapturedSymbol {
     }
 }
 
+type MacroInvocation = ([u64; 2], Vec<[u64; 2]>);
+
 #[derive(Serialize, Deserialize)]
 struct CapturedFacts {
     language: Language,
@@ -137,6 +139,7 @@ struct CapturedFacts {
     analyzer_digest: String,
     limits: [u64; 3],
     symbols: Vec<CapturedSymbol>,
+    macro_invocations: Option<Vec<MacroInvocation>>,
     has_errors: bool,
     left_out_declarations: u64,
 }
@@ -160,6 +163,20 @@ impl CapturedFacts {
                 .iter()
                 .map(CapturedSymbol::capture)
                 .collect(),
+            macro_invocations: syntax.facts().macro_invocations().map(|ranges| {
+                ranges
+                    .iter()
+                    .map(|(range, modules)| {
+                        (
+                            [range.start, range.end],
+                            modules
+                                .iter()
+                                .map(|range| [range.start, range.end])
+                                .collect(),
+                        )
+                    })
+                    .collect()
+            }),
             has_errors: syntax.facts().has_errors(),
             left_out_declarations: u64::try_from(syntax.facts().left_out_declaration_count())
                 .expect("omission width"),
@@ -190,6 +207,20 @@ impl CapturedFacts {
                     .expect("bounded omissions"),
                 markdown_facts: None,
                 export_bindings: None,
+                macro_invocations: self.macro_invocations.map(|ranges| {
+                    ranges
+                        .into_iter()
+                        .map(|([start, end], modules)| {
+                            (
+                                ByteRange { start, end },
+                                modules
+                                    .into_iter()
+                                    .map(|[start, end]| ByteRange { start, end })
+                                    .collect(),
+                            )
+                        })
+                        .collect()
+                }),
                 source_digest: digest,
             },
         )

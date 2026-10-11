@@ -29,6 +29,9 @@ pub struct SyntaxFactsParts {
     pub left_out_symbols: Vec<SyntaxSymbol>,
     /// Recorded export bindings. Missing facts remain unknown.
     pub export_bindings: Option<Vec<crate::SyntaxExportBinding>>,
+    /// Captured top-level Rust macro invocations and their direct module item ranges.
+    /// Missing facts remain unknown.
+    pub macro_invocations: Option<Vec<(ByteRange, Vec<ByteRange>)>>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
     /// Number of extracted declarations the provider omitted.
@@ -753,6 +756,7 @@ impl SyntaxFacts {
     ) -> Result<Self, RiftError> {
         validate_symbols(source, limits, &parts)?;
         validate_export_bindings(source, limits, &parts)?;
+        validate_macro_invocations(source, limits, &parts)?;
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {
                 return Err(errors::syntax::facts_structure_invalid().error());
@@ -848,4 +852,50 @@ fn validate_export_bindings(
 fn grammar_node_kind(grammar: &'static tree_sitter::Language, name: &str) -> Option<&'static str> {
     let id = grammar.id_for_node_kind(name, true);
     grammar.node_kind_for_id(id).filter(|kind| *kind == name)
+}
+
+fn validate_macro_invocations(
+    source: &str,
+    limits: SyntaxLimits,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    let Some(invocations) = &parts.macro_invocations else {
+        return Ok(());
+    };
+    if parts.language != ShippedLanguage::Rust.language() {
+        return errors::syntax::facts_structure_invalid().fail();
+    }
+    let retained_count = invocations
+        .iter()
+        .try_fold(invocations.len(), |total, (_, modules)| {
+            total.checked_add(modules.len())
+        })
+        .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
+    count(retained_count, limits)?;
+    ordered(invocations.iter().map(|(range, _)| *range))?;
+    let mut previous_end = 0;
+    for (invocation, modules) in invocations {
+        count(modules.len(), limits)?;
+        ordered(modules.iter().copied())?;
+        range(source, *invocation)?;
+        if invocation.start == invocation.end || invocation.start < previous_end {
+            return errors::syntax::facts_range_invalid().fail();
+        }
+        let mut context = crate::document::rust_macros::Context::new(source, *invocation)
+            .ok_or_else(|| errors::syntax::facts_range_invalid().error())?;
+        let mut module_end = invocation.start;
+        for module in modules {
+            range(source, *module)?;
+            if module.start < module_end
+                || module.end > invocation.end
+                || module.start == module.end
+                || !context.direct(*module)
+            {
+                return errors::syntax::facts_range_invalid().fail();
+            }
+            module_end = module.end;
+        }
+        previous_end = invocation.end;
+    }
+    Ok(())
 }

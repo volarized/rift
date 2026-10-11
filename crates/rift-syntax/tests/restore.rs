@@ -32,6 +32,7 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         left_out_declarations: facts.left_out_declaration_count(),
         markdown_facts: facts.markdown_facts().cloned(),
         export_bindings: facts.export_bindings().map(<[_]>::to_vec),
+        macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
         source_digest: *facts.source_digest().expect("source witness"),
     }
 }
@@ -1007,4 +1008,115 @@ fn retained_source_whitespace_roundtrips_without_portable_identity() {
             "rift.syntax.facts_name_invalid"
         );
     }
+}
+
+#[test]
+fn rust_macro_invocations_keep_original_top_level_ranges_and_unknown_state() {
+    let source = "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }\ncfg_rt! { pub mod runtime; }\nmod nested { cfg_rt! { pub mod hidden; } }\npub fn neighbor() {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured Rust invocations");
+    assert_eq!(invocations.len(), 1);
+    let invocation = invocations[0].0;
+    assert_eq!(
+        &source[usize::try_from(invocation.start).expect("start")
+            ..usize::try_from(invocation.end).expect("end")],
+        "cfg_rt! { pub mod runtime; }"
+    );
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("captured macro ranges restore");
+    assert_eq!(&restored, document.facts());
+    assert!(
+        restored
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == "neighbor")
+    );
+    let known_heap = get_size2::GetSize::get_heap_size(&restored);
+    let invocation_heap = get_size2::GetSize::get_heap_size(&captured.macro_invocations);
+    assert!(
+        invocation_heap > 0,
+        "captured invocation ranges own material"
+    );
+    let mut unknown = captured;
+    unknown.macro_invocations = None;
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+        .expect("old unrecorded ranges remain unknown");
+    assert_eq!(restored.macro_invocations(), None);
+    assert_eq!(
+        known_heap,
+        get_size2::GetSize::get_heap_size(&restored).saturating_add(invocation_heap),
+        "retained syntax charge includes every captured invocation allocation"
+    );
+    let plain = parsed(ShippedLanguage::Rust, "pub fn neighbor() {}\n");
+    assert_eq!(plain.facts().macro_invocations(), Some([].as_slice()));
+    let foreign = parsed(ShippedLanguage::Python, "def neighbor(): pass\n");
+    assert_eq!(foreign.facts().macro_invocations(), None);
+    for (source, state) in [
+        ("#[macro_use]\n#[doc(hidden)]\nmod macros;\n", 0),
+        ("#[macro_use]\n#[doc(hidden)]\nmod macros;", 0),
+        ("mod macros;", 0),
+        ("#[macro_use]\n#[path = \"actual.rs\"]\nmod macros;\n", 1),
+        ("#[macro_use]\n#[unknown]\nmod macros;\n", 2),
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        let symbol = &document.facts().symbols()[0];
+        assert_eq!(symbol.node_kind, Some("mod_item"));
+        assert_eq!(symbol.body_range, None);
+        assert_eq!(
+            &source[usize::try_from(symbol.item_range.start).expect("item start")
+                ..usize::try_from(symbol.item_range.end).expect("item end")],
+            "mod macros;",
+        );
+        let path = symbol.module_path.as_ref();
+        match state {
+            0 => assert_eq!(path, Some(&rift_syntax::RustModulePath::Absent)),
+            1 => assert!(matches!(
+                path,
+                Some(rift_syntax::RustModulePath::Literal { .. })
+            )),
+            _ => assert_eq!(path, Some(&rift_syntax::RustModulePath::Unknown)),
+        }
+        let restored =
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+                .expect("captured module attributes restore");
+        assert_eq!(&restored, document.facts());
+    }
+}
+
+#[test]
+fn rust_macro_invocation_restore_refuses_invalid_ranges_language_and_count() {
+    let source = "// 灯\ncfg_rt! { pub mod runtime; }\ncfg_rt! { pub mod fs; }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let ranges = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured invocations");
+    assert_eq!(ranges.len(), 2);
+    let first = ranges[0].clone();
+    for mutation in 0..6 {
+        let mut invalid = captured.clone();
+        let ranges = invalid.macro_invocations.as_mut().expect("captured ranges");
+        match mutation {
+            0 => ranges[0].0.end = ranges[0].0.start,
+            1 => ranges[1].0.start = ranges[0].0.end - 1,
+            2 => ranges.swap(0, 1),
+            3 => ranges[0].0.start = 4,
+            4 => ranges[1].0.end = u64::try_from(source.len() + 1).expect("source bound"),
+            _ => invalid.language = ShippedLanguage::Python.language(),
+        }
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err());
+    }
+    let mut overbound = captured;
+    overbound.macro_invocations = Some(vec![first; 2]);
+    let limits = SyntaxLimits::new(source.len(), 1, 100).expect("positive limits");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, overbound).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG)
+    );
 }

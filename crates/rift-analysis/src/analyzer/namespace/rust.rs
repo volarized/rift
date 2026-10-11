@@ -11,6 +11,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::NamespaceInput;
 
+mod macros;
+
 /// Establishes the selected library root from captured metadata once per inventory.
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
@@ -54,10 +56,10 @@ pub(super) fn prepare(
         if assigned.insert(root.clone(), namespace.clone()).is_some() {
             return BTreeMap::new();
         }
-        pending.push_back((root, namespace, directory));
+        pending.push_back((root, namespace, directory, macros::Scope::default()));
     }
     let mut anchors = BTreeMap::new();
-    while let Some((path, namespace, directory)) = pending.pop_front() {
+    while let Some((path, namespace, directory, scope)) = pending.pop_front() {
         let Some(file) = inventory.get(path.as_str()) else {
             continue;
         };
@@ -70,7 +72,14 @@ pub(super) fn prepare(
             path.clone(),
             file_anchors(input, file.syntax, &namespace, file.source),
         );
-        for (child, local) in module_children(file.syntax, &directory, &inventory) {
+        for (child, local, child_scope) in macros::children(
+            file,
+            &directory,
+            &inventory,
+            &originals,
+            scope,
+            input.syntax().syntax_depth_max(),
+        ) {
             let mut child_namespace = namespace.clone();
             child_namespace.extend(local);
             if SymbolIdentity::new(
@@ -94,7 +103,7 @@ pub(super) fn prepare(
                 .or_else(|| child.strip_suffix(".rs"))
                 .unwrap_or(&child)
                 .to_owned();
-            pending.push_back((child, child_namespace, child_directory));
+            pending.push_back((child, child_namespace, child_directory, child_scope));
         }
     }
     anchors
