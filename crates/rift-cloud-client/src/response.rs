@@ -3,10 +3,10 @@
 use rift_error::RiftError;
 
 use crate::{
-    Capabilities, GetCapabilitiesRequest, GetCapabilitiesResponse, ListPackageSymbolsRequest,
-    ListPackageSymbolsResponse, PackagePatternPage, PackageResolutionResponse, PackageSearchPage,
-    PackageSymbolPage, RawResponse, ResolvePackageContextRequest, ResolvePackageContextResponse,
-    ResponseMeta, SearchPackagePatternsRequest, SearchPackagePatternsResponse, contract, failure,
+    Capabilities, GetCapabilitiesRequest, GetCapabilitiesResponse, PackagePatternPage,
+    PackageResolutionResponse, PackageSearchPage, RawResponse, ResolvePackageContextRequest,
+    ResolvePackageContextResponse, ResponseMeta, SearchPackagePatternsRequest,
+    SearchPackagePatternsResponse, contract, failure,
 };
 
 pub(crate) struct Parsed<T> {
@@ -200,40 +200,6 @@ fn exact_response<T: serde::de::DeserializeOwned>(
         return Err(failure::remote(operation, &meta, Some(&problem)));
     }
     Err(failure::remote(operation, &meta, None))
-}
-
-pub(crate) async fn symbols(response: RawResponse) -> Result<Parsed<PackageSymbolPage>, RiftError> {
-    let operation = contract::Endpoint::Symbols.operation_id();
-    let (response, meta) = generated_response(response, operation)?;
-    let status = meta.status;
-    let response = ListPackageSymbolsRequest::parse_response(response)
-        .await
-        .map_err(|error| {
-            failure::response_source(
-                operation,
-                "body",
-                "global response decode failed",
-                Some(status),
-                error,
-            )
-        })?;
-    match response {
-        ListPackageSymbolsResponse::Ok(value) => Ok(Parsed { value, meta }),
-        ListPackageSymbolsResponse::BadRequest(problem)
-        | ListPackageSymbolsResponse::Unauthorized(problem)
-        | ListPackageSymbolsResponse::Forbidden(problem)
-        | ListPackageSymbolsResponse::NotAcceptable(problem)
-        | ListPackageSymbolsResponse::ContentTooLarge(problem)
-        | ListPackageSymbolsResponse::UnsupportedMediaType(problem)
-        | ListPackageSymbolsResponse::TooManyRequests(problem)
-        | ListPackageSymbolsResponse::InternalServerError(problem)
-        | ListPackageSymbolsResponse::BadGateway(problem)
-        | ListPackageSymbolsResponse::ServiceUnavailable(problem)
-        | ListPackageSymbolsResponse::GatewayTimeout(problem) => {
-            Err(failure::remote(operation, &meta, Some(&problem)))
-        }
-        ListPackageSymbolsResponse::Unknown => Err(failure::remote(operation, &meta, None)),
-    }
 }
 
 pub(crate) async fn patterns(

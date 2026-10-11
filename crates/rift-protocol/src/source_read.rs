@@ -16,6 +16,9 @@ pub const SOURCE_POSITION_MAX: u64 = 2_147_483_647;
 /// Reads a source unit or a byte range without requiring a semantic symbol.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {"unit": "rift://source/project/src/lib.rs"}
+]))]
 pub struct GetSourceParams {
     /// Canonical source unit, retaining its physical package or runtime owner.
     pub unit: SourceUnitId,

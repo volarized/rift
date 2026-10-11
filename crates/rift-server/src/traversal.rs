@@ -190,7 +190,7 @@ pub(crate) fn walkable(reads: &ReadService, identity: &CoreSymbolId) -> Result<b
 ///
 /// Answers `None` when every requested facet has a lane: an empty answer then means the
 /// walk ran and the seed has no neighbor under the request.
-fn relationship_coverage_missing(traversal: &SearchTraversal) -> Option<ReadWarning> {
+pub(crate) fn relationship_coverage_missing(traversal: &SearchTraversal) -> Option<ReadWarning> {
     relationship_coverage_warning(unproducible_facets(&traversal.facets, traversal.direction))
 }
 
@@ -457,7 +457,7 @@ fn graph_hop(edge: &RelationshipEdge, direction: HopDirection) -> GraphHop {
 /// distance-ascending order `SearchTraversal`'s doc comment promises; a hit also matched
 /// lexically keeps its lexical score instead - `absorb_traversal_match` never touches
 /// `score`.
-fn distance_score(distance: u64) -> f64 {
+pub(crate) fn distance_score(distance: u64) -> f64 {
     if distance == 1 { 1.0 } else { 0.5 }
 }
 
@@ -498,9 +498,13 @@ fn merge_traversal_hit(
 /// The hit for one package declaration an outgoing edge ends at: its symbol, addressed by
 /// the unit of the package file holding it. The local index holds none of its bytes, so
 /// the hit carries no range, line, or source.
-fn package_traversal_hit(declaration: &PackageDeclaration, path: Vec<GraphHop>) -> SearchHit {
+pub(crate) fn package_traversal_hit(
+    declaration: &PackageDeclaration,
+    path: Vec<GraphHop>,
+) -> SearchHit {
     let distance = u64::try_from(path.len()).unwrap_or(u64::MAX);
     SearchHit {
+        view: None,
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(declaration.symbol.clone()),
         },

@@ -337,6 +337,7 @@ impl<'a> FileMatches<'a> {
             None => text_file_hit_target(file),
         };
         SearchHit {
+            view: None,
             hit,
             score: None,
             matched_by: vec![MatchedField::Content],
@@ -397,7 +398,7 @@ impl ReadService {
         pattern: &Pattern,
         store: &StoreAnswer,
     ) -> Result<SearchResult, RiftError> {
-        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
+        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
         let bounds = store.pattern_bounds();
         let limit = super::search_page_limit(params)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
@@ -429,6 +430,7 @@ impl ReadService {
         let (mut results, pagination) = page(results, params.page_index, limit);
         populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
         Ok(SearchResult {
+            view: None,
             results,
             pagination,
             warnings,

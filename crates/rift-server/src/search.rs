@@ -10,6 +10,8 @@ mod commit;
 #[cfg(test)]
 mod commit_tests;
 mod documentation;
+
+pub(crate) use documentation::populate_sources_from;
 #[cfg(test)]
 mod documentation_tests;
 mod pattern;
@@ -17,6 +19,9 @@ mod pattern;
 mod pattern_tests;
 use body::BodyMatching;
 use documentation::SearchDocumentation;
+
+mod candidates;
+pub use candidates::{SearchCandidateInput, SearchCandidateInputs, SearchCandidateItem};
 pub use pattern::{PatternBounds, accepted_pattern};
 use rift_error::errors;
 
@@ -246,6 +251,7 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, RiftError> {
+        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
         if params.target == SearchParamsTarget::Commit {
             return self.search_commits(params);
         }
@@ -259,12 +265,82 @@ impl ReadService {
                 .capability("a revision comparison on a captured snapshot")
                 .fail();
         }
-        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
         if self.revision().is_some() && force_include_requested(params) {
             return errors::server::read_unsupported()
                 .capability("force_include at a revision")
                 .fail();
         }
+        let ((results, pagination), warnings) = self.ordered_search_hits(
+            params,
+            store,
+            references,
+            |results, selected, payloads, limit| {
+                let (mut results, pagination) = page(results, params.page_index, limit);
+                let warnings = self.populate_search_payloads(&mut results, selected, payloads)?;
+                Ok(((results, pagination), warnings))
+            },
+        )?;
+        Ok(SearchResult {
+            view: None,
+            results,
+            pagination,
+            warnings,
+        })
+    }
+
+    /// Returns the ordered traversal search results before applying a page window.
+    ///
+    /// # Errors
+    ///
+    /// Returns the search refusal, or refuses request-only source outside the captured index.
+    pub fn search_traversal_hits(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+    ) -> Result<(Vec<SearchHit>, Vec<ReadWarning>), RiftError> {
+        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        let pattern = self.validated_pattern(params, store, references)?;
+        if params.traversal.is_none()
+            || pattern.is_some()
+            || params.change.is_some()
+            || params.target == SearchParamsTarget::Commit
+            || force_include_requested(params)
+        {
+            return errors::server::read_unsupported()
+                .capability("traversal results on a captured snapshot")
+                .fail();
+        }
+        self.ordered_search_hits(
+            params,
+            store,
+            references,
+            |mut results, selected, payloads, _| {
+                let warnings = self.populate_search_payloads(
+                    &mut results,
+                    selected,
+                    HitPayloads {
+                        source: false,
+                        ..payloads
+                    },
+                )?;
+                Ok((results, warnings))
+            },
+        )
+    }
+
+    fn ordered_search_hits<Output>(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        finish: impl FnOnce(
+            Vec<SearchHit>,
+            &SelectedPaths,
+            HitPayloads,
+            usize,
+        ) -> Result<(Output, Vec<ReadWarning>), RiftError>,
+    ) -> Result<(Output, Vec<ReadWarning>), RiftError> {
         let query = accepted_query(params)?;
         let limit = search_page_limit(params)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
@@ -290,7 +366,7 @@ impl ReadService {
             };
             ranked_truncated_at = self.collect_query_hits(
                 criteria,
-                params.scope,
+                &params.scope,
                 &selected,
                 (&parsed, store),
                 (&mut results, &mut warnings),
@@ -319,13 +395,32 @@ impl ReadService {
         // Either bound reaching `results_max` costs the caller the same hits, so the two
         // carry one warning: the candidate pool cut before resolution, and the hit set
         // cut after it.
+        retain_public_symbol_hits(
+            &mut results,
+            &mut warnings,
+            &[Some(self.index()), selected.force_include.as_ref()],
+        )?;
         let results_max_reached =
             order_and_bound_hits(&mut results, params.order, fetch_limit).or(ranked_truncated_at);
-        let (mut results, pagination) = page(results, params.page_index, limit);
-        populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
+        let (output, payload_warnings) = finish(results, &selected, payloads, limit)?;
+        warnings.extend(payload_warnings);
+        Ok((
+            output,
+            Self::search_warnings(warnings, traversal_report, results_max_reached),
+        ))
+    }
+
+    fn populate_search_payloads(
+        &self,
+        results: &mut [SearchHit],
+        selected: &SelectedPaths,
+        payloads: HitPayloads,
+    ) -> Result<Vec<ReadWarning>, RiftError> {
+        let mut warnings = Vec::new();
+        populate_symbol_lines(results, self.index(), selected.force_include.as_ref())?;
         if payloads.source {
             warnings.extend(documentation::populate_sources(
-                &mut results,
+                results,
                 self.index(),
                 Resolution {
                     force_include: selected.force_include.as_ref(),
@@ -333,15 +428,11 @@ impl ReadService {
             ));
         }
         if !payloads.score {
-            for hit in &mut results {
+            for hit in results {
                 hit.score = None;
             }
         }
-        Ok(SearchResult {
-            results,
-            pagination,
-            warnings: Self::search_warnings(warnings, traversal_report, results_max_reached),
-        })
+        Ok(warnings)
     }
 
     /// Validates one search against this snapshot, and compiles the `pattern` it names,
@@ -398,7 +489,7 @@ impl ReadService {
 
     pub(crate) fn validate_engine_search(&self, params: &SearchParams) -> Result<(), RiftError> {
         validate_search(params)?;
-        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
+        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
         accepted_query(params)?;
         search_page_limit(params)?;
         path_matcher(self.index().root(), params.paths.as_ref())?;
@@ -479,7 +570,7 @@ impl ReadService {
     fn collect_query_hits(
         &self,
         criteria: SearchCriteria<'_>,
-        scope: SearchScope,
+        scope: &SearchScope,
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
         (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
@@ -490,8 +581,8 @@ impl ReadService {
             let matcher = selected.matcher.as_ref();
             let fetch_limit = index.results_max();
             let sources = IdentifierSources {
-                project: scope != SearchScope::Global,
-                force_include: (scope != SearchScope::Global)
+                project: scope != &SearchScope::Global,
+                force_include: (scope != &SearchScope::Global)
                     .then_some(selected.force_include.as_ref())
                     .flatten(),
             };
@@ -824,7 +915,7 @@ pub fn search_page_limit(params: &SearchParams) -> Result<usize, RiftError> {
 
 pub(crate) fn validate_search(params: &SearchParams) -> Result<(), RiftError> {
     validate_common(params.rev.is_some())?;
-    validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
+    validate_requested_packages(&params.scope, params.rev.is_some(), &params.packages)?;
     if let Some(selector) = params.paths.as_ref() {
         validate_path_selector(selector)?;
     }
@@ -910,7 +1001,10 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
             .violation("query and change select different result sets")
             .fail();
     }
-    if params.scope != SearchScope::Local {
+    if !matches!(
+        params.scope,
+        SearchScope::Local | SearchScope::NamedLocal { .. }
+    ) {
         return errors::server::read_invalid()
             .field("scope")
             .violation(CURRENT_TREE_ALONE)
@@ -1432,6 +1526,7 @@ fn assembled_symbol_hit(
     let line = (!payloads.defer_line)
         .then(|| line::line_number_at(matched.file.source(), matched.symbol.range.start));
     SearchHit {
+        view: None,
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(symbol),
         },
@@ -1497,6 +1592,7 @@ fn source_file_hit(
     payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
+        view: None,
         hit: SearchHitTarget::File {
             size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
             languages: vec![file.syntax().language().clone()],
@@ -1532,6 +1628,7 @@ fn text_file_hit(
     payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
+        view: None,
         hit: text_file_hit_target(file),
         score,
         matched_by,
@@ -1626,6 +1723,98 @@ pub(crate) fn hit_symbol_id(hit: &SearchHit) -> Option<&SymbolId> {
         | SearchHitTarget::Documentation { .. }
         | SearchHitTarget::Commit { .. } => None,
     }
+}
+
+fn retained_hit_qualified_name(
+    hit: &SearchHit,
+    symbol: &Symbol,
+    indices: &[Option<&WorkspaceIndex>],
+) -> Result<String, RiftError> {
+    let mut qualified = None;
+    if let (Some(path), Some(range)) = (&hit.path, hit.range.as_ref()) {
+        let path = rift_core::ProjectPath::new(path.0.clone())?;
+        for index in indices.iter().flatten() {
+            if let Some(file) = index.file(&path) {
+                for facts in file
+                    .syntax()
+                    .symbols()
+                    .iter()
+                    .chain(file.syntax().left_out_symbols())
+                {
+                    if facts.name == symbol.name
+                        && facts.range.start == range.start
+                        && facts.range.end == range.end
+                        && file.syntax().language() == &symbol.language
+                    {
+                        match &qualified {
+                            Some(previous) if previous != &facts.qualified_name => {
+                                return errors::server::read_unavailable()
+                                    .operation("search")
+                                    .detail("retained declaration qualification is ambiguous")
+                                    .fail();
+                            }
+                            _ => qualified = Some(facts.qualified_name.clone()),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(qualified) = qualified {
+        return Ok(qualified);
+    }
+    if let Some(id) = &symbol.id {
+        let id = rift_core::SymbolId::new(id.as_str())?;
+        for index in indices.iter().flatten() {
+            if let Some(readable) = index.object_by_identity(&id)? {
+                return Ok(readable.facts().qualified_name().to_owned());
+            }
+        }
+    }
+    errors::server::read_unavailable()
+        .operation("search")
+        .detail("retained declaration qualification is unavailable")
+        .fail()
+}
+
+pub(crate) fn retain_public_symbol_hits(
+    results: &mut Vec<SearchHit>,
+    warnings: &mut Vec<ReadWarning>,
+    indices: &[Option<&WorkspaceIndex>],
+) -> Result<(), RiftError> {
+    if results.iter().all(
+        |hit| !matches!(&hit.hit, SearchHitTarget::Symbol { symbol } if !symbol.name_is_public()),
+    ) {
+        return Ok(());
+    }
+    let mut retained = Vec::with_capacity(results.len());
+    for hit in std::mem::take(results) {
+        if let SearchHitTarget::Symbol { symbol } = &hit.hit
+            && !symbol.name_is_public()
+        {
+            let unit = match (&hit.unit, &hit.path) {
+                (Some(unit), _) => Some(unit.clone()),
+                (None, Some(path)) => Some(crate::read::source_unit_id(
+                    &rift_core::ProjectPath::new(path.0.clone())?,
+                )),
+                (None, None) => None,
+            };
+            let qualified_name = retained_hit_qualified_name(&hit, symbol, indices)?;
+            let (unit, range) = match (unit, hit.range) {
+                (Some(unit), Some(range)) => (Some(unit), Some(range)),
+                _ => (None, None),
+            };
+            warnings.push(crate::read::object_unavailable_at(
+                &qualified_name,
+                unit,
+                range,
+            ));
+        } else {
+            retained.push(hit);
+        }
+    }
+    *results = retained;
+    Ok(())
 }
 
 /// Orders the whole pool, then cuts it to `results_max`, answering that bound when the
@@ -4586,6 +4775,7 @@ impl Tower {
 
     fn file_hit_stub(path: &str, score: f64) -> SearchHit {
         SearchHit {
+            view: None,
             hit: SearchHitTarget::File {
                 size: 0,
                 languages: Vec::new(),
@@ -4673,6 +4863,7 @@ impl Tower {
 
     fn node_hit_stub_with_path(id: &str, path: Option<&str>, score: f64) -> SearchHit {
         SearchHit {
+            view: None,
             hit: SearchHitTarget::Node {
                 node: NodeId(id.to_owned()),
             },

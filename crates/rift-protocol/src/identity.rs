@@ -12,6 +12,9 @@ use crate::read::Language;
 /// Maximum encoded size of a symbol identity in bytes.
 pub const SYMBOL_ID_BYTES_MAX: usize = 8_192;
 
+/// Structural local scope pattern. The codec also refuses reserved registration names.
+pub const LOCAL_SCOPE_PATTERN: &str = r"^local(?:@[a-z][a-z0-9_-]*)?$";
+
 /// The canonical owner and logical path format this codec accepts.
 pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 1;
 

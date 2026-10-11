@@ -31,7 +31,7 @@ use crate::failure::{McpErrorExt as _, WireFailure as _};
 /// carried as `tools/call` arguments, matching the scale
 /// [`rift_protocol::configuration::TEXT_CHUNK_BYTES_MAX`] already uses for
 /// "a big but bounded blob" elsewhere in the protocol.
-const INBOUND_FRAME_BYTES_MAX: usize = 16 << 20;
+pub(crate) const INBOUND_FRAME_BYTES_MAX: usize = 16 << 20;
 
 /// Bytes relayed per read from the internal duplex feeding rmcp's own
 /// output back to the real writer.

@@ -121,6 +121,87 @@ fn captured_symbol_material_measures_existing_workspace() {
 }
 
 #[test]
+fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
+    let root = tempfile::tempdir().expect("workspace");
+    let text = "import {Component} from '@angular/core'; @Component({template:`<p>{{ title }}</p>`}) export class Beacon {}";
+    fs::write(root.path().join("package.json"), "{}").expect("package context");
+    fs::write(root.path().join("component.ts"), text).expect("component source");
+    let index = WorkspaceIndex::build(
+        root.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+    )
+    .expect("index");
+    let path = rift_core::ProjectPath::new("component.ts").expect("path");
+    let position = u64::try_from(text.find("title").expect("template bytes")).expect("position");
+    let original = index
+        .nodes(&path, position)
+        .expect("original nodes")
+        .expect("selected source");
+    assert!(original.iter().any(|node| node.kind == "interpolation"));
+    let view = index.symbol_view().expect("captured material");
+    assert_eq!(view.frameworks[&path].templates.len(), 1);
+    let charge = view.retained_material_bytes();
+    drop(index);
+    fs::write(root.path().join("component.ts"), "export class Changed {}").expect("new source");
+    fs::write(root.path().join("package.json"), "{\"name\":\"changed\"}")
+        .expect("new package context");
+    assert_eq!(
+        view.nodes(&path, position).expect("captured nodes"),
+        Some(original)
+    );
+    assert_eq!(view.file(&path).expect("captured source").source(), text);
+    assert_eq!(view.retained_material_bytes(), charge);
+    assert_eq!(
+        view.nodes(&path, u64::MAX).expect("outside source"),
+        Some(Vec::new())
+    );
+    assert!(
+        view.nodes(
+            &rift_core::ProjectPath::new("missing.ts").expect("missing path"),
+            0
+        )
+        .expect("missing captured source")
+        .is_none()
+    );
+}
+
+#[test]
+fn captured_framework_charge_counts_template_capacity_and_checked_source() {
+    let path = rift_core::ProjectPath::new("component.ts").expect("path");
+    let text = "import {Component} from '@angular/core'; @Component({template:`<p>{{ title }}</p>`}) class Beacon {}";
+    let sources = [rift_analysis::PackageSource::new(&path, text)];
+    let context = rift_analysis::FrameworkContext::resolve(
+        &sources,
+        &[],
+        rift_syntax::SyntaxLimits::default(),
+        &|| false,
+    )
+    .expect("framework context");
+    let digest = rift_core::FileDigest::of(text.as_bytes());
+    let retained = context.for_source(&path, &digest).expect("checked source");
+    assert_eq!(retained.templates.len(), 1);
+    let (heap, _) = retained.get_heap_size_with_tracker(StandardTracker::default());
+    assert_eq!(
+        heap,
+        retained.templates.capacity() * std::mem::size_of::<rift_syntax::ByteRange>()
+    );
+    assert!(
+        context
+            .for_source(&path, &rift_core::FileDigest::of(b"changed"))
+            .is_none()
+    );
+    let empty = rift_analysis::ResolvedFramework::default();
+    assert_eq!(
+        empty
+            .get_heap_size_with_tracker(StandardTracker::default())
+            .0,
+        0
+    );
+}
+
+#[test]
 fn captured_symbol_material_refuses_unmeasured_portable_facts_without_overflow() {
     let root = tempfile::tempdir().expect("workspace");
     fs::write(

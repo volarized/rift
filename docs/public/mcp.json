@@ -2,9 +2,2148 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Finds declarations and their source by exact symbol name. Each hit\ncarries the declaration and its source excerpt unless `include` omits\n`source`. `include: [\"history\"]` adds each hit's version-control timeline,\nwalked from the served revision. `rev` serves the lookup from a\nversion-control revision instead of the current tree. `scope` reaches\npast the project tree: `global` answers from the public declarations the\nglobal index holds for the workspace's dependencies alone, `all` from both,\nproject hits first. `packages` names package versions the lookup reads beside the\nworkspace's own, such as an upgrade target or a package the project does not use\nyet. A name with no match carries `symbol_not_found`, naming the lookup and\nup to three closest project declaration identities. A `global` lookup carries\nno alternatives; `all` proposes project declarations alone. A closest ranking\npast its fixed work bound leaves alternatives empty and explains why in `detail`.\nUse `search` when\nthe name is not exactly known.",
+      "description": "Reads a canonical source unit or a half-open UTF-8 byte range. A preceding `view`\nretains its immutable selection and original expiry; `rev` selects a local Git revision.\nThe result returns source bytes, definite absence or typed selection unavailability.",
       "input_schema": {
         "$defs": {
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
+          "RevisionId": {
+            "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
+            "examples": [
+              "main"
+            ],
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
+            "type": "string"
+          },
+          "SourceUnitId": {
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "else": {
+              "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "examples": [
+              "rift://source/project/src/lib.rs",
+              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ],
+            "if": {
+              "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+            },
+            "maxLength": 8192,
+            "minLength": 17,
+            "not": {
+              "anyOf": [
+                {
+                  "pattern": "/\\.{1,2}(?:/|$)"
+                },
+                {
+                  "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                }
+              ]
+            },
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+            "then": {
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "type": "string"
+          },
+          "TextRange": {
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+            "examples": [
+              {
+                "end": 0,
+                "start": 0
+              }
+            ],
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "examples": [
+          {
+            "unit": "rift://source/project/src/lib.rs"
+          }
+        ],
+        "properties": {
+          "range": {
+            "$ref": "#/$defs/TextRange",
+            "description": "Requested half-open UTF-8 byte range. Omitted requests the whole unit."
+          },
+          "rev": {
+            "$ref": "#/$defs/RevisionId",
+            "description": "A local Git revision. Refused for released sources and beside `view`."
+          },
+          "unit": {
+            "$ref": "#/$defs/SourceUnitId",
+            "description": "Canonical source unit, retaining its physical package or runtime owner."
+          },
+          "view": {
+            "$ref": "#/$defs/CapturedViewId",
+            "description": "A preceding immutable selection. Expiry never selects latest implicitly."
+          }
+        },
+        "required": [
+          "unit"
+        ],
+        "type": "object"
+      },
+      "name": "get_source",
+      "output_schema": {
+        "$defs": {
+          "CapturedView": {
+            "additionalProperties": false,
+            "description": "The immutable serving view and the expiry promised by its owner.",
+            "properties": {
+              "expires_at": {
+                "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
+                "format": "date-time",
+                "type": "string"
+              },
+              "id": {
+                "$ref": "#/$defs/CapturedViewId",
+                "description": "Selects the same workspace, owner, applicability and accepted index revision."
+              }
+            },
+            "required": [
+              "id",
+              "expires_at"
+            ],
+            "type": "object"
+          },
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
+          "Digest": {
+            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "examples": [
+              "3f9a1c2e"
+            ],
+            "pattern": "^[0-9a-f]{8}$",
+            "type": "string"
+          },
+          "DocumentationContentIdentity": {
+            "additionalProperties": false,
+            "description": "One content owner: a regular source or decoded notebook cell.",
+            "properties": {
+              "cell": {
+                "$ref": "#/$defs/NotebookCell",
+                "description": "Decoded cell when the parent source is a notebook."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationSourceIdentity",
+                "description": "Original workspace file or package source unit."
+              }
+            },
+            "required": [
+              "source"
+            ],
+            "type": "object"
+          },
+          "DocumentationSourceIdentity": {
+            "description": "The selected source's canonical address.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A visible workspace file.",
+                "properties": {
+                  "kind": {
+                    "const": "project",
+                    "type": "string"
+                  },
+                  "path": {
+                    "$ref": "#/$defs/ProjectPath",
+                    "description": "Path relative to the workspace root."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "path"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A source unit supplied by an exact package adapter.",
+                "properties": {
+                  "kind": {
+                    "const": "package",
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Canonical package source identity."
+                  }
+                },
+                "required": [
+                  "kind",
+                  "unit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "DocumentationStage": {
+            "description": "The collection step reporting incomplete documentation.",
+            "oneOf": [
+              {
+                "const": "source",
+                "description": "Source selection and byte validation.",
+                "type": "string"
+              },
+              {
+                "const": "extract",
+                "description": "Format parsing and block extraction.",
+                "type": "string"
+              },
+              {
+                "const": "resolve",
+                "description": "Authored link and declaration reference resolution.",
+                "type": "string"
+              },
+              {
+                "const": "index",
+                "description": "Mapping metadata to existing ranked documents.",
+                "type": "string"
+              }
+            ]
+          },
+          "DocumentationWarning": {
+            "additionalProperties": false,
+            "description": "One bounded warning with repeated conditions counted per source.",
+            "properties": {
+              "count": {
+                "description": "Number of items omitted or truncated for this condition.",
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "$ref": "#/$defs/DocumentationWarningKind",
+                "description": "Typed condition the caller can inspect."
+              },
+              "source": {
+                "$ref": "#/$defs/DocumentationContentIdentity",
+                "description": "Source whose documentation is incomplete."
+              },
+              "stage": {
+                "$ref": "#/$defs/DocumentationStage",
+                "description": "Collection step reporting the condition."
+              }
+            },
+            "required": [
+              "source",
+              "stage",
+              "kind",
+              "count"
+            ],
+            "type": "object"
+          },
+          "DocumentationWarningKind": {
+            "description": "Why one documentation source is incomplete.",
+            "oneOf": [
+              {
+                "const": "source_unavailable",
+                "description": "Source bytes or their format are unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "Retained source ends before an addressed range.",
+                "type": "string"
+              },
+              {
+                "const": "unsupported_format",
+                "description": "Format and extension do not select a supported parser.",
+                "type": "string"
+              },
+              {
+                "const": "malformed_source",
+                "description": "Parser refused malformed source.",
+                "type": "string"
+              },
+              {
+                "const": "omitted_range",
+                "description": "Recognized syntax was excluded from documentation metadata.",
+                "type": "string"
+              },
+              {
+                "const": "limit_exceeded",
+                "description": "A configured or format bound stopped output.",
+                "type": "string"
+              }
+            ]
+          },
+          "Duration": {
+            "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.",
+            "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
+            "type": "string"
+          },
+          "FileId": {
+            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
+            "examples": [
+              "rift://file/src/lib.rs"
+            ],
+            "maxLength": 8192,
+            "minLength": 13,
+            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
+            "type": "string"
+          },
+          "GlobalFailureClass": {
+            "description": "Bounded classes a global API failure can carry in a read warning.",
+            "oneOf": [
+              {
+                "const": "connection",
+                "description": "The endpoint could not accept a connection.",
+                "type": "string"
+              },
+              {
+                "const": "timeout",
+                "description": "The operation exceeded its time bound.",
+                "type": "string"
+              },
+              {
+                "const": "retry_exhausted",
+                "description": "Bounded retry attempts ended without a valid response.",
+                "type": "string"
+              },
+              {
+                "const": "authentication",
+                "description": "The endpoint rejected credentials or access.",
+                "type": "string"
+              },
+              {
+                "const": "credential_configuration",
+                "description": "Credential configuration prevented a request.",
+                "type": "string"
+              },
+              {
+                "const": "non_success_response",
+                "description": "The endpoint returned a non-success status.",
+                "type": "string"
+              },
+              {
+                "const": "invalid_response",
+                "description": "The response did not satisfy its wire fields.",
+                "type": "string"
+              },
+              {
+                "const": "response_truncated",
+                "description": "The response exceeded its byte or item bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_format",
+                "description": "The publication format was not supported.",
+                "type": "string"
+              },
+              {
+                "const": "corpus_revision",
+                "description": "The response named an unsupported corpus revision.",
+                "type": "string"
+              },
+              {
+                "const": "required_field_set",
+                "description": "The response omitted a required field set.",
+                "type": "string"
+              }
+            ]
+          },
+          "GlobalPageWarningCode": {
+            "description": "Stable conditions a global package page can report while returning valid items.",
+            "oneOf": [
+              {
+                "const": "query_narrowed",
+                "description": "The service narrowed a query before ranking.",
+                "type": "string"
+              },
+              {
+                "const": "source_truncated",
+                "description": "The service omitted source content at its source bound.",
+                "type": "string"
+              },
+              {
+                "const": "publication_changed",
+                "description": "The publication changed while pages were assembled.",
+                "type": "string"
+              },
+              {
+                "const": "capability_unavailable",
+                "description": "A requested capability was unavailable.",
+                "type": "string"
+              },
+              {
+                "const": "result_truncated",
+                "description": "The service stopped before its result bound.",
+                "type": "string"
+              },
+              {
+                "const": "unknown",
+                "description": "The service returned a code this client does not know.",
+                "type": "string"
+              }
+            ]
+          },
+          "Language": {
+            "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
+            "examples": [
+              "rust"
+            ],
+            "maxLength": 129,
+            "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
+            "type": "string"
+          },
+          "NotebookCell": {
+            "additionalProperties": false,
+            "description": "A selected cell addressed within its parent notebook.",
+            "properties": {
+              "identity": {
+                "$ref": "#/$defs/NotebookCellIdentity",
+                "description": "Authored identifier or original cell position."
+              },
+              "kind": {
+                "$ref": "#/$defs/NotebookCellKind",
+                "description": "Which content the cell carries."
+              }
+            },
+            "required": [
+              "identity",
+              "kind"
+            ],
+            "type": "object"
+          },
+          "NotebookCellIdentity": {
+            "description": "The authored cell identifier or its position when no identifier exists.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "A valid identifier stored in the notebook.",
+                "properties": {
+                  "id": {
+                    "description": "Identifier accepted by the notebook format.",
+                    "type": "string"
+                  },
+                  "kind": {
+                    "const": "authored",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "id"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The cell's zero-based position in its notebook.",
+                "properties": {
+                  "index": {
+                    "description": "Position among every cell, including unselected cells.",
+                    "format": "uint32",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "kind": {
+                    "const": "indexed",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "index"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "NotebookCellKind": {
+            "description": "The selected notebook cell's content kind.",
+            "oneOf": [
+              {
+                "const": "markdown",
+                "description": "Markdown source decoded from a markdown cell.",
+                "type": "string"
+              },
+              {
+                "const": "code",
+                "description": "Source decoded from a code cell, without execution.",
+                "type": "string"
+              }
+            ]
+          },
+          "PackageAvailability": {
+            "description": "Whether a global package index can answer for one package, and where the entry's\nsource comes from when none can.",
+            "oneOf": [
+              {
+                "const": "canonical",
+                "description": "The entry names a package a public registry serves, crates.io, npm, or the\nPython Package Index, or a standard library: `stdlib/rust`, `stdlib/node`, or\n`stdlib/python`.",
+                "type": "string"
+              },
+              {
+                "const": "path",
+                "description": "The entry names a path outside the workspace, or an archive at a path, that only\nthis machine can read.",
+                "type": "string"
+              },
+              {
+                "const": "git",
+                "description": "The entry names a git repository.",
+                "type": "string"
+              },
+              {
+                "const": "private_registry",
+                "description": "The entry names a registry other than the public one its package manager reads.",
+                "type": "string"
+              },
+              {
+                "const": "url",
+                "description": "The entry names a package fetched from a URL no registry serves, such as a uv\nwheel URL or an npm tarball URL.",
+                "type": "string"
+              },
+              {
+                "const": "registry_unresolved",
+                "description": "Accepted source evidence does not name the registry serving this entry.",
+                "type": "string"
+              }
+            ]
+          },
+          "PackageContextEntry": {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "oneOf": [
+                  {
+                    "required": [
+                      "version"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "requirement"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "description": "One package the workspace depends on, as its manifests and lockfiles state it.\n\nEntries order by manager, then name, then the selector they state: a declared\nrequirement before an exact version.",
+            "properties": {
+              "availability": {
+                "$ref": "#/$defs/PackageAvailability",
+                "description": "Whether a global package index can answer for this entry."
+              },
+              "manager": {
+                "description": "Package manager or ecosystem name.",
+                "maxLength": 128,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "registry": {
+                "description": "Accepted registry endpoint. Absent for a path, Git repository or direct URL source.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "requirement": {
+                "description": "The version requirement a manifest declares. Absent when a lockfile pins the\nversion.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "version": {
+                "description": "The exact version a lockfile pins. Absent when only a manifest names the package.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "manager",
+              "name",
+              "availability"
+            ],
+            "type": "object"
+          },
+          "PackageIdentity": {
+            "additionalProperties": false,
+            "description": "One package as its package manager identifies it.",
+            "properties": {
+              "manager": {
+                "description": "Package manager or ecosystem name.",
+                "maxLength": 128,
+                "type": "string"
+              },
+              "name": {
+                "description": "Package name in that ecosystem.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "registry": {
+                "description": "Canonical registry endpoint, including its path when that path identifies the registry.\nCredentials, query and fragment are never part of this owner.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "version": {
+                "description": "Resolved package version.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "manager",
+              "registry",
+              "name",
+              "version"
+            ],
+            "type": "object"
+          },
+          "ProjectPath": {
+            "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
+            "examples": [
+              "src/lib.rs"
+            ],
+            "maxLength": 1000,
+            "pattern": "^(?:(?:[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.\\.[^\\\\\\u0000-\\u001F\\u007F/]+|\\.[^\\\\\\u0000-\\u001F\\u007F/.r][^\\\\\\u0000-\\u001F\\u007F/]*|\\.r(?:[^\\\\\\u0000-\\u001F\\u007F/i][^\\\\\\u0000-\\u001F\\u007F/]*|i(?:[^\\\\\\u0000-\\u001F\\u007F/f][^\\\\\\u0000-\\u001F\\u007F/]*|f(?:[^\\\\\\u0000-\\u001F\\u007F/t][^\\\\\\u0000-\\u001F\\u007F/]*|t[^\\\\\\u0000-\\u001F\\u007F/]+)?)?)?)(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,}))*)?$",
+            "type": "string"
+          },
+          "ReadWarning": {
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    }
+                  }
+                },
+                "then": {
+                  "oneOf": [
+                    {
+                      "required": [
+                        "unit",
+                        "range"
+                      ]
+                    },
+                    {
+                      "not": {
+                        "anyOf": [
+                          {
+                            "required": [
+                              "unit"
+                            ]
+                          },
+                          {
+                            "required": [
+                              "range"
+                            ]
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "code": {
+                      "enum": [
+                        "identity_unresolved",
+                        "object_unavailable"
+                      ]
+                    },
+                    "range": {
+                      "type": "null"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "unit": {
+                      "type": "null"
+                    }
+                  }
+                }
+              }
+            ],
+            "description": "One warning attached to a read result. The answer stands; the warning carries evidence\nof a condition the caller weighs before relying on it.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "One object crossed a public field bound. Its original facts remain retained;\nevery other admitted object can answer.",
+                "properties": {
+                  "bound": {
+                    "description": "Enforced public field bound.",
+                    "format": "uint64",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "object_unavailable",
+                    "type": "string"
+                  },
+                  "field": {
+                    "description": "Public field whose bound the object crossed.",
+                    "maxLength": 128,
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "qualified_name": {
+                    "description": "Full original qualified name of the retained object.",
+                    "type": "string"
+                  },
+                  "range": {
+                    "$ref": "#/$defs/TextRange",
+                    "description": "Original declaration range, paired with `unit`."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/SourceUnitId",
+                    "description": "Physical source unit, paired with `range`, or absent for a source-less object."
+                  }
+                },
+                "required": [
+                  "code",
+                  "qualified_name",
+                  "field",
+                  "bound"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Framework context could not be resolved for one source. Ordinary syntax stands;\nframework-specific facts whose context is missing are left out.",
+                "properties": {
+                  "code": {
+                    "const": "framework_context_unresolved",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "The missing package version, configuration, or template source.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "framework": {
+                    "$ref": "#/$defs/SyntaxFramework",
+                    "description": "The framework whose context could not be established."
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The source whose framework context is unresolved."
+                  }
+                },
+                "required": [
+                  "code",
+                  "unit",
+                  "framework",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lookup found no declaration under its name, language, and scope.\n`alternatives` names up to three project declarations, ordered by the smallest\ncase-insensitive Unicode Levenshtein distance to their short or qualified names.\nEqual distances use qualified name, then project path order. Revision reads\nuse that revision's declarations. A `global` lookup carries no alternatives;\nan `all` lookup proposes project declarations alone. If complete closest ranking\nexceeds `search.symbol_alternatives_work`, alternatives are empty and `detail`\ncarries the registered failure's message, recovery action, and observed work.",
+                "properties": {
+                  "alternatives": {
+                    "description": "Project declaration identities the caller can use to select another name.",
+                    "items": {
+                      "$ref": "#/$defs/SymbolId"
+                    },
+                    "maxItems": 3,
+                    "type": "array"
+                  },
+                  "code": {
+                    "const": "symbol_not_found",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why closest declarations could not be selected within the work bound.\nAbsent when every selected declaration was compared or scope is `global`.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "name": {
+                    "description": "The declaration name the caller requested.",
+                    "maxLength": 4096,
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "name",
+                  "alternatives"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Documentation collection or excerpt output omitted part of a selected source.",
+                "properties": {
+                  "code": {
+                    "const": "documentation",
+                    "type": "string"
+                  },
+                  "warning": {
+                    "$ref": "#/$defs/DocumentationWarning",
+                    "description": "Bounded source identity, stage, failure label, and omitted count."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The documentation this read projects onto crossed a bound, so no documentation\nblock joins the answer: declarations and files answer as they would without it.\nThe condition holds until the documentation it names changes.",
+                "properties": {
+                  "code": {
+                    "const": "documentation_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Which documentation was left out and the bound it crossed - prose for a\nreader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The answer was computed from an index that lags the tree the read captured. Facts\nderived from the index may miss the newest writes; the digests state which two\ntrees disagree. When the two digests are equal, the tree moved in recorded files\noutside the syntax-indexed ones or in the configuration file, and `detail` says\nwhich.",
+                "properties": {
+                  "captured_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the read captured."
+                  },
+                  "code": {
+                    "const": "stale_index",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "index_tree_revision": {
+                    "$ref": "#/$defs/Digest",
+                    "description": "Tree revision the published index covers."
+                  }
+                },
+                "required": [
+                  "code",
+                  "index_tree_revision",
+                  "captured_tree_revision",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The vector ranking holds no vectors for the tree this read captured, so the answer\nwas ranked lexically alone. The pass over that tree is still running, or the tree\nwas published after the corpus the ranking holds was described. `prepared` and\n`total` state how far the ranking has got for the captured tree, and `ready_in` is\nderived from workspace size and embedding progress.",
+                "properties": {
+                  "code": {
+                    "const": "vector_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Declarations of the captured tree that already carry a vector.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before the vector ranking joins an answer, not a measurement\nof this machine. A caller may report it and must not schedule against it."
+                  },
+                  "total": {
+                    "description": "Declarations the set being embedded holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "ready_in",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The local index is still preparing selected workspace files. The answer covers only\nfiles whose capture and analysis have finished; `total` is absent until discovery ends.",
+                "properties": {
+                  "code": {
+                    "const": "local_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the local index is preparing - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Selected workspace files whose capture and analysis have finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "ready_in": {
+                    "$ref": "#/$defs/Duration",
+                    "description": "Estimated wait before local preparation finishes. No estimate is available yet."
+                  },
+                  "total": {
+                    "description": "Selected workspace files, once discovery has finished.",
+                    "format": "uint64",
+                    "maximum": 9007199254740991,
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The vector ranking will not answer for the life of this server, so every answer\nis ranked lexically alone. No retry is coming: fix the `[search.vector]`\nconfiguration and start the server again.",
+                "properties": {
+                  "code": {
+                    "const": "vector_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The full-text tier did not rank this answer, so it came from identifier matching\nalone: a query phrased as prose finds nothing. The tier is still committing the\ncaptured tree, missed a commit, holds no indexed tree, failed to load, got no\ndatabase connection within `[search] busy_timeout`, or still answers for a newer\npublication after the request's capture attempts; `detail` names which, and what\nclears it.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The query carried more terms and quoted phrases than `terms_max`, so the server\ndropped the shortest unquoted terms and ranked the answer by the rest. Every\nquoted phrase is kept. Shorten `query`, or quote the terms that must be matched.",
+                "properties": {
+                  "code": {
+                    "const": "query_narrowed",
+                    "type": "string"
+                  },
+                  "terms_max": {
+                    "description": "Terms and quoted phrases the query was cut to: the server's bound on one\nparsed query.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "terms_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The lexical ranking stopped at `matches_max` units; hits past it never reached the\npage, whatever `paths` selects. Narrow `query`.",
+                "properties": {
+                  "code": {
+                    "const": "lexical_ranking_truncated",
+                    "type": "string"
+                  },
+                  "matches_max": {
+                    "description": "Units the ranking stopped at: the server's bound on one lexical ranking.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The server reached `results_max`, its result bound, before ordering and paging:\nwhat the bound cut never reaches any page, and `total_pages` counts only what fit.\nThe bound cuts the ranked candidates and the hit set alike. The warning means the\nbound was reached; a set of exactly `results_max` hits carries it too. Narrow\n`query` or `paths`.",
+                "properties": {
+                  "code": {
+                    "const": "results_truncated",
+                    "type": "string"
+                  },
+                  "results_max": {
+                    "description": "The bound the read stopped at: the server's limit on both the candidates one\nread ranks and the hits it returns.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "results_max"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file held more matches of `pattern` than `matches_per_file`, so its later matches\nare missing from this answer while every other file answers in full. `files` names\nthe cut files in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Narrow\n`pattern` or `paths`, or raise the `[search]` key `pattern_matches_per_file`.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_matches_truncated",
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The files cut at the bound.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  },
+                  "matches_per_file": {
+                    "description": "Matches one file contributes at most: the server's bound on one file's matches.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "matches_per_file",
+                  "files"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The trigram index `pattern` selects its files through lacks rows of stored file\ntext, and verifying those rows beside the selected ones would pass the `[search]`\nkey `pattern_candidate_rows` or `pattern_verified_size`, so the answer covers the\nrows the index holds and a match in the other rows is missing from it. The server\nindexes those rows in the background after each write; `prepared` and `total` state\nhow far it has got. Resend the request once the index has caught up.",
+                "properties": {
+                  "code": {
+                    "const": "pattern_index_preparing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "prepared": {
+                    "description": "Rows of stored file text the trigram index holds: one per file, or one per\nchunk of a file split under `[search.text]`.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "total": {
+                    "description": "Rows of stored file text the store holds.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "prepared",
+                  "total",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A file answers nothing from its bytes. Either the index left the claimed file out -\nits bytes are not valid UTF-8, or it crosses a per-file bound - so it answers no\nsearch or lookup, and addressing it directly still refuses `content_unavailable`;\nor a comparison against the working tree read the changed file in no working form -\nits attributes name a `filter` driver or a UTF-16 `working-tree-encoding` - so it\nanswers changed with no declarations. Every other file in the workspace stays\navailable. At most `SOURCE_WARNINGS_MAX` of this warning name a file, in\nproject-path order; when more files are named, one more carries no `unit` and\ncounts the rest. `rift server logs` names each file the index left out, and `paths`\nnarrows a comparison onto the others.",
+                "properties": {
+                  "code": {
+                    "const": "source_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "unit": {
+                    "$ref": "#/$defs/FileId",
+                    "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Text files past `[search.text] max_chunk` are left out of the text index under the\nkey `large_files = \"skip\"`, so no hit answers from their text; `skipped` counts the\nones the request's `paths` reach. A declaration such a file holds still answers.\nSetting `large_files` to `split` indexes them in chunks.",
+                "properties": {
+                  "code": {
+                    "const": "large_file_skipped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "skipped": {
+                    "description": "The files past `max_chunk` the request's `paths` reach.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "skipped",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Files past `[providers.syntax] max_file` are held as text the syntax provider does\nnot parse: their text answers `search`, and none of their declarations were\nextracted, so no symbol hit and no `get_symbol` answer comes from them. `files`\nnames them in project-path order, at most `SOURCE_WARNINGS_MAX` of them. Raising\n`max_file` parses them.",
+                "properties": {
+                  "code": {
+                    "const": "large_file_unparsed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The files held as text alone.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "files",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A lockfile the request's `paths.include` selects is left out of search, so no hit\nanswers from it; `rift://map` still carries the versions it pins. Naming the file\nin `paths.force_include` searches it for one request, and removing its name from\nthe `[search.text]` key `excluded_lockfiles` indexes it. One warning names every\nsuch file, in project-path order, at most `SOURCE_WARNINGS_MAX` of them.",
+                "properties": {
+                  "code": {
+                    "const": "lockfile_excluded",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "files": {
+                    "description": "The selected lockfiles search leaves out.",
+                    "items": {
+                      "$ref": "#/$defs/FileId"
+                    },
+                    "maxItems": 8,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "files",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Contributions selected for one symbol's presentation disagree on at least one\nfield. The answer carries what normalization selected.",
+                "properties": {
+                  "code": {
+                    "const": "symbol_disagreement",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "providers": {
+                    "description": "Providers whose Contribution carries a differing value for at least one\npresentation field, sorted and deduplicated.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  "symbol": {
+                    "$ref": "#/$defs/SymbolId",
+                    "description": "The symbol whose presentation facts disagree."
+                  }
+                },
+                "required": [
+                  "code",
+                  "symbol",
+                  "providers",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A traversal walk stopped at its node bound before exhausting the reachable graph,\nso hits reachable beyond the bound are missing from this answer. Narrow the walk -\na tighter `facets` list, a smaller `depth`, or a less-connected seed - to fit it\nunder the bound.",
+                "properties": {
+                  "code": {
+                    "const": "traversal_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "visited": {
+                    "description": "Symbols the walk visited before it stopped, equal to the bound it hit.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "visited",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "No lane populates part of the relationship coverage the traversal asked for, so the\nwalk had nothing to follow there whatever the graph holds. The warning states that a\nlane is absent; it never states that the seed has no such neighbor. An empty answer\ncarrying it means the walk could not run; an empty answer without it means the walk\nran and the seed has no neighbor under the request.",
+                "properties": {
+                  "code": {
+                    "const": "relationship_coverage_missing",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "facets": {
+                    "description": "The requested facets no lane populates, in the request's own order,\ndeduplicated. Absent when every requested facet has a lane.",
+                    "items": {
+                      "$ref": "#/$defs/RelationshipFacet"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "A language engine serves the seed's language, and this read carries none of its\nedges: the engine answered about bytes the served revision does not carry, answered\nmore than the walk's node bound holds, or was still analyzing when\n`[server] readiness_timeout` was spent. The indexed relationships stand; whatever\nthe engine resolves on top of them is missing. The warning states that an engine's\nanalysis is absent from this answer; it never states that the seed has no such\nneighbor. An engine still analyzing keeps loading, and a later read, served from a\nrevision the engine has caught up with or sent once it reads ready, carries the\nengine's edges again.",
+                "properties": {
+                  "code": {
+                    "const": "engine_analysis_unavailable",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "language": {
+                    "$ref": "#/$defs/Language",
+                    "description": "The seed declaration's language, whose engine's answer was dropped."
+                  }
+                },
+                "required": [
+                  "code",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "An outgoing walk dropped its edges to callees it named no declaration for. The\nlanguage engine's call hierarchy named each in a file outside the project and every\ninstalled package the workspace's dependencies name, or in a package or standard\nlibrary file where the global index answered no declaration at the callee's\nposition. Every package callee drops when the global API is off or did not answer,\nand the answer then carries the global warning naming why. Every other edge stands.\nThe warning states that edges are missing from this answer; it never states that\nthe seed calls nothing more.",
+                "properties": {
+                  "callees": {
+                    "description": "Edges the walk dropped over every depth, one per call the engine named.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "callees_dropped",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "callees",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The walk took a language engine's answer without progress evidence that the engine\nhad settled: it announced no work since it started or was last told of a changed\nfile, and stayed quiet past its `settle_delay`. The answer stands. An engine that\nrecomputes without announcing work may have answered before it read that change, and\na later read meets it settled.",
+                "properties": {
+                  "code": {
+                    "const": "engine_readiness_unconfirmed",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "processes": {
+                    "description": "The engines the walk took unconfirmed, by accepted process key, sorted. Inline\nprocesses use the exact language identity segment.",
+                    "items": {
+                      "type": "string"
+                    },
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "code",
+                  "processes",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The history store the server fills in the background has not analyzed every commit\n`[providers.history]` selects, so a commit search answers from the `analyzed` ones\nalone and a commit the store has not reached answers nothing. The fill runs newest\nfirst and continues without a request; a later search answers the rest.",
+                "properties": {
+                  "analyzed": {
+                    "description": "Commits the history store holds of the ones its latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "code": {
+                    "const": "history_store_filling",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "total": {
+                    "description": "Commits the history store's latest fill selects.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "analyzed",
+                  "total",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The comparison reached `paths_max` changed paths and stopped there, so declarations\nin the changed paths past it are missing from this answer. Narrow the comparison\nwith `paths`, or name two sides that differ in fewer files.",
+                "properties": {
+                  "code": {
+                    "const": "change_truncated",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Why the warning was raised - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "paths_max": {
+                    "description": "Changed paths the comparison stopped at, equal to the bound it reached.",
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "code",
+                  "paths_max",
+                  "detail"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "Global access is disabled under `[global] enabled = false`, so the answer carries no\npackage facts.",
+                "properties": {
+                  "code": {
+                    "const": "global_access_disabled",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API could not answer, so the answer carries no package facts.",
+                "properties": {
+                  "code": {
+                    "const": "global_api_unavailable",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the global API failure."
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API advertised a publication the client cannot read, so the answer\ncarries no package facts.",
+                "properties": {
+                  "code": {
+                    "const": "global_publication_incompatible",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the incompatible publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global API returned an invalid or truncated response, so the answer carries no\npackage facts.",
+                "properties": {
+                  "code": {
+                    "const": "global_response_invalid",
+                    "type": "string"
+                  },
+                  "failure_class": {
+                    "$ref": "#/$defs/GlobalFailureClass",
+                    "description": "Bounded class of the invalid response."
+                  }
+                },
+                "required": [
+                  "code",
+                  "failure_class"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global package page carried a bounded condition while its items remained valid.\n`warning_code` identifies the condition and `detail` carries its bounded explanation.\n`capability_unavailable` also names a feature the global API's capabilities do not\nadvertise, such as `patterns` for a `pattern` search, and the answer then carries the\nproject hits alone.",
+                "properties": {
+                  "code": {
+                    "const": "global_page_warning",
+                    "type": "string"
+                  },
+                  "detail": {
+                    "description": "Optional bounded explanation returned by the global package service, or the\nfeature its capabilities do not advertise.",
+                    "maxLength": 12431,
+                    "type": "string"
+                  },
+                  "warning_code": {
+                    "$ref": "#/$defs/GlobalPageWarningCode",
+                    "description": "Stable condition code returned by the global package service, or\n`capability_unavailable` for a feature its capabilities do not advertise."
+                  }
+                },
+                "required": [
+                  "code",
+                  "warning_code"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global publication holds no release of an exact package the dependency\ncontext names, so nothing answers for it. At most `DEPENDENCY_WARNINGS_MAX` package\nand dependency-context warnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_absent",
+                    "type": "string"
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The exact package absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global publication holds no release a declared requirement admits, so nothing\nanswers for it. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_requirement_absent",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The declared requirement absent from the global publication."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The global publication holds no release at the exact version the dependency context\nnames, or none inside the range a declared requirement states, so the collected\nrelease nearest it answers in its place: the package facts for `entry` come from\n`package`. At most `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings\nride one answer.",
+                "properties": {
+                  "code": {
+                    "const": "package_substituted",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state it."
+                  },
+                  "package": {
+                    "$ref": "#/$defs/PackageIdentity",
+                    "description": "The collected release that answers for `entry`."
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "package"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "The dependency context names a package no public registry serves: a path outside\nthe workspace, a git repository, a private registry, or a URL. No global package\nindex answers for it, and `reason` names the capability Rift does not have yet. At\nmost `DEPENDENCY_WARNINGS_MAX` package and dependency-context warnings ride one\nanswer.",
+                "properties": {
+                  "code": {
+                    "const": "package_unavailable",
+                    "type": "string"
+                  },
+                  "entry": {
+                    "$ref": "#/$defs/PackageContextEntry",
+                    "description": "The dependency context entry, as the workspace's manifests and lockfiles state\nit; its `availability` names the kind."
+                  },
+                  "reason": {
+                    "description": "Why no global package index answers for the entry, for a reader.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "entry",
+                  "reason"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "description": "One resolver or standard library probe read less than the workspace states, or the\ncontext passed the bound on the entries one read carries, the smaller of the\nserver's own and the one the global API advertises, and its entries sorted last left:\nevery held entry before any the request's `packages` names. The dependency context\nmay then miss packages or name a standard library by its static reading. Rides only an answer whose `scope`\nreaches packages; at most `DEPENDENCY_WARNINGS_MAX` package and dependency-context\nwarnings ride one answer, this one first, in resolver order.",
+                "properties": {
+                  "code": {
+                    "const": "package_context_degraded",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "description": "What the resolver could not do - prose for a reader; nothing keys on it.",
+                    "maxLength": 4096,
+                    "type": "string"
+                  },
+                  "resolver": {
+                    "description": "What degraded: a resolver by its manager name, `cargo`, `uv`, `npm`, or `bun`, a\nstandard library entry, `stdlib/rust`, `stdlib/node`, or `stdlib/python`, or the\npackage manager whose held or requested entries left past the entry bound, such\nas `pypi`.",
+                    "maxLength": 128,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "code",
+                  "resolver",
+                  "reason"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "RelationshipFacet": {
+            "description": "One portable category an edge falls into. The local kinds `import` and `use` can share\nthe `imports` facet, which lets one query cross languages.",
+            "oneOf": [
+              {
+                "const": "contains",
+                "description": "The source contains the target within its scope.",
+                "type": "string"
+              },
+              {
+                "const": "declares",
+                "description": "The source declares the target.",
+                "type": "string"
+              },
+              {
+                "const": "augments",
+                "description": "The source adds to a declaration made elsewhere.",
+                "type": "string"
+              },
+              {
+                "const": "references",
+                "description": "The source mentions the target.",
+                "type": "string"
+              },
+              {
+                "const": "calls",
+                "description": "The source invokes the target.",
+                "type": "string"
+              },
+              {
+                "const": "constructs",
+                "description": "The source creates an instance of the target.",
+                "type": "string"
+              },
+              {
+                "const": "reads",
+                "description": "The source reads the target's value.",
+                "type": "string"
+              },
+              {
+                "const": "writes",
+                "description": "The source assigns to the target.",
+                "type": "string"
+              },
+              {
+                "const": "imports",
+                "description": "The source brings the target into scope.",
+                "type": "string"
+              },
+              {
+                "const": "exports",
+                "description": "The source exposes the target outside its unit.",
+                "type": "string"
+              },
+              {
+                "const": "extends",
+                "description": "The source inherits from the target.",
+                "type": "string"
+              },
+              {
+                "const": "implements",
+                "description": "The source fulfils the target's interface.",
+                "type": "string"
+              },
+              {
+                "const": "has_type",
+                "description": "The source is typed by the target.",
+                "type": "string"
+              },
+              {
+                "const": "overrides",
+                "description": "The source replaces the target inherited from a supertype.",
+                "type": "string"
+              },
+              {
+                "const": "aliases",
+                "description": "The source is another name for the target.",
+                "type": "string"
+              },
+              {
+                "const": "generates",
+                "description": "The source produces the target as generated code.",
+                "type": "string"
+              },
+              {
+                "const": "depends_on",
+                "description": "The source requires the target to build or run.",
+                "type": "string"
+              },
+              {
+                "const": "annotated_by",
+                "description": "The source carries the target as an annotation.",
+                "type": "string"
+              },
+              {
+                "const": "throws",
+                "description": "The source can raise the target.",
+                "type": "string"
+              },
+              {
+                "const": "catches",
+                "description": "The source handles the target when raised.",
+                "type": "string"
+              },
+              {
+                "const": "bounded_by",
+                "description": "The source's type parameter is constrained by the target.",
+                "type": "string"
+              },
+              {
+                "const": "instantiates",
+                "description": "The source applies concrete arguments to the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "specializes",
+                "description": "The source is a specialization of the generic target.",
+                "type": "string"
+              },
+              {
+                "const": "overloads",
+                "description": "The source and target are separately dispatched forms of one name.",
+                "type": "string"
+              },
+              {
+                "const": "mixes_in",
+                "description": "The source incorporates the target as a mixin.",
+                "type": "string"
+              },
+              {
+                "const": "embeds",
+                "description": "The source embeds the target within its own definition.",
+                "type": "string"
+              },
+              {
+                "const": "tests",
+                "description": "The source exercises the target as a test.",
+                "type": "string"
+              },
+              {
+                "const": "configures",
+                "description": "The source supplies configuration for the target.",
+                "type": "string"
+              },
+              {
+                "const": "binds",
+                "description": "The source binds a name or value to the target.",
+                "type": "string"
+              }
+            ]
+          },
+          "SourceExcerpt": {
+            "additionalProperties": false,
+            "description": "A copy of source from the catalog. The unit may belong to the project, a dependency, or\nthe standard library; the excerpt preserves bytes as they were when the answer was\nproduced.",
+            "properties": {
+              "span": {
+                "$ref": "#/$defs/SourceUnitSpan",
+                "description": "The source unit and byte range the text was taken from."
+              },
+              "text": {
+                "description": "The source bytes returned by the request.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "span",
+              "text"
+            ],
+            "type": "object"
+          },
+          "SourceUnitId": {
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "else": {
+              "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "examples": [
+              "rift://source/project/src/lib.rs",
+              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
+              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+            ],
+            "if": {
+              "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
+            },
+            "maxLength": 8192,
+            "minLength": 17,
+            "not": {
+              "anyOf": [
+                {
+                  "pattern": "/\\.{1,2}(?:/|$)"
+                },
+                {
+                  "pattern": "^rift://source/[^/]+/[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                },
+                {
+                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                }
+              ]
+            },
+            "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
+            "then": {
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+            },
+            "type": "string"
+          },
+          "SourceUnitSpan": {
+            "additionalProperties": false,
+            "description": "One byte range in a source-catalog unit.",
+            "properties": {
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "Half-open UTF-8 byte range in that unit."
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Source unit containing the bytes."
+              }
+            },
+            "required": [
+              "unit",
+              "range"
+            ],
+            "type": "object"
+          },
+          "SymbolId": {
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+            ],
+            "maxLength": 8192,
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "type": "string"
+          },
+          "SymbolUnavailableReason": {
+            "description": "Why an exact selection cannot establish presence or definite absence.",
+            "oneOf": [
+              {
+                "const": "exact_release",
+                "description": "The encoded exact release has no accepted publication.",
+                "type": "string"
+              },
+              {
+                "const": "index_preparing",
+                "description": "The selected index is preparing.",
+                "type": "string"
+              },
+              {
+                "const": "read_failed",
+                "description": "The serving read failed.",
+                "type": "string"
+              },
+              {
+                "const": "corrupt_publication",
+                "description": "The publication failed validation.",
+                "type": "string"
+              },
+              {
+                "const": "insufficient_coverage",
+                "description": "Accepted facts do not cover this exact selection.",
+                "type": "string"
+              },
+              {
+                "const": "view_expired",
+                "description": "The requested captured view expired or was explicitly removed.",
+                "type": "string"
+              },
+              {
+                "const": "view_context",
+                "description": "The captured view belongs to another workspace or scope mapping.",
+                "type": "string"
+              }
+            ]
+          },
+          "SyntaxFramework": {
+            "description": "Frameworks whose syntax depends on package or component context.",
+            "oneOf": [
+              {
+                "const": "angular",
+                "description": "Angular templates owned by an imported `Component` decorator.",
+                "type": "string"
+              },
+              {
+                "const": "tailwind",
+                "description": "Tailwind directives and classes under a known major version.",
+                "type": "string"
+              }
+            ]
+          },
+          "TextRange": {
+            "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+            "examples": [
+              {
+                "end": 0,
+                "start": 0
+              }
+            ],
+            "properties": {
+              "end": {
+                "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "start": {
+                "description": "First byte of the range, counted from the start of the file.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "start",
+              "end"
+            ],
+            "type": "object"
+          }
+        },
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "description": "The selected unit exists, including when its requested range is empty.",
+            "properties": {
+              "outcome": {
+                "const": "found",
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/$defs/SourceExcerpt",
+                "description": "Returned bytes and their exact source unit and range."
+              },
+              "source_complete": {
+                "description": "Whether the complete requested range or unit was returned.",
+                "type": "boolean"
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "Immutable selection supplying these bytes."
+              },
+              "warnings": {
+                "description": "Projection cuts and other typed read warnings.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "source",
+              "source_complete",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The unit is absent from completely searched captured coverage.",
+            "properties": {
+              "outcome": {
+                "const": "missing",
+                "type": "string"
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Requested canonical source unit."
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "Complete immutable selection searched."
+              },
+              "warnings": {
+                "description": "Other typed read warnings.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "unit",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The exact selection cannot establish presence or absence.",
+            "properties": {
+              "outcome": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/$defs/SymbolUnavailableReason",
+                "description": "Typed cause of unavailability."
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Requested canonical source unit."
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "Selected view, when one could be captured."
+              },
+              "warnings": {
+                "description": "Details and partial-read warnings.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "unit",
+              "reason"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    {
+      "description": "Reads one logical symbol by its canonical `id`. The caller may select a preceding\nimmutable `view`; continuations retain that selection and its original expiry.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. Use `search` for discovery.",
+      "input_schema": {
+        "$defs": {
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
           "GetSymbolInclude": {
             "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
             "oneOf": [
@@ -25,63 +2164,6 @@
               }
             ]
           },
-          "Language": {
-            "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
-            "examples": [
-              "rust"
-            ],
-            "maxLength": 129,
-            "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
-            "type": "string"
-          },
-          "RequestedPackage": {
-            "additionalProperties": false,
-            "description": "One package a `get_symbol` or `search` request names beside the dependency context.",
-            "examples": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "registry": "crates.io",
-                "version": "1.47.1"
-              },
-              {
-                "manager": "npm",
-                "name": "zod",
-                "registry": "npmjs.org"
-              }
-            ],
-            "properties": {
-              "manager": {
-                "description": "Package manager or ecosystem name, as `cargo`, `npm`, or `pypi`.",
-                "maxLength": 128,
-                "minLength": 1,
-                "type": "string"
-              },
-              "name": {
-                "description": "Package name in that ecosystem.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              },
-              "registry": {
-                "description": "Accepted defining registry endpoint. Absent when the registry is unresolved.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              },
-              "version": {
-                "description": "The exact version to read. Absent, the entry asks for the requirement `>=0`, which\nthe global index answers from its newest collected release.",
-                "maxLength": 4096,
-                "minLength": 1,
-                "type": "string"
-              }
-            },
-            "required": [
-              "manager",
-              "name"
-            ],
-            "type": "object"
-          },
           "RevisionId": {
             "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers.",
             "examples": [
@@ -92,126 +2174,106 @@
             "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
             "type": "string"
           },
-          "SearchScope": {
-            "description": "Which corpus a read searches. The names identify logical corpora, not storage\nlocations: `global` reaches dependency package facts wherever the server holds them.",
-            "oneOf": [
-              {
-                "const": "local",
-                "description": "The project tree the server serves.",
-                "type": "string"
-              },
-              {
-                "const": "global",
-                "description": "The dependency packages, answered from their public declarations alone.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "Both: hits merge by rank; at equal rank a project hit orders before a package hit.",
-                "type": "string"
-              }
-            ]
+          "SymbolIdentity": {
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+            ],
+            "maxLength": 8192,
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "type": "string"
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
         "examples": [
           {
+            "id": "rift://symbol/local/rust/app/parser/parse",
             "include": [
-              "source",
-              "history"
-            ],
-            "language": "rust",
-            "limit": 5,
-            "name": "ReadService",
-            "page_index": 0
-          },
-          {
-            "limit": 10,
-            "name": "Deserialize",
-            "page_index": 1
-          },
-          {
-            "limit": 5,
-            "name": "spawn",
-            "scope": "all"
-          },
-          {
-            "limit": 5,
-            "name": "spawn",
-            "packages": [
-              {
-                "manager": "cargo",
-                "name": "tokio",
-                "version": "1.47.1"
-              }
-            ],
-            "scope": "global"
+              "source"
+            ]
           }
         ],
         "properties": {
-          "include": {
-            "default": [
-              "source"
-            ],
-            "description": "Optional hit fields to attach: `source`, `history`. Omitted defaults to\n`[\"source\"]`; an explicit empty list carries neither.",
-            "items": {
-              "$ref": "#/$defs/GetSymbolInclude"
-            },
-            "type": "array"
+          "declaration_cursor": {
+            "description": "Continuation bound to this exact symbol, projections and serving view.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
           },
-          "language": {
-            "$ref": "#/$defs/Language",
-            "description": "Narrows the answer to one language. Omitted searches every served language."
-          },
-          "limit": {
+          "declaration_limit": {
             "default": 5,
-            "description": "Most hits to return in one page, at most 10,000; the server refuses a larger\n`limit` naming the field. The server's result bound caps the set itself, and an\nanswer whose set reached it warns `results_truncated`.",
+            "description": "Most declarations returned in this read. Omitted uses the existing five-item bound.",
             "format": "uint64",
             "maximum": 10000,
             "minimum": 1,
             "type": "integer"
           },
-          "name": {
-            "description": "The declaration name to look up - a name, not a full `SymbolId` or free-text\nquery; `search` takes free text. The server ranks exact original name or qualified-name\nspelling first, followed by case-insensitive exact, prefix, and qualified-name substring\nmatches. Every tier joins the result set, so a substring match still answers after\nthe exact and prefix matches.",
-            "maxLength": 4096,
-            "minLength": 1,
-            "type": "string"
+          "id": {
+            "$ref": "#/$defs/SymbolIdentity",
+            "description": "Canonical identity. Ownership and language come from this address."
           },
-          "packages": {
-            "description": "Packages this lookup reads beside the ones the workspace's manifests and\nlockfiles name, at most 64. An entry naming a package the workspace depends on\nreplaces that package's versions for this read, and an entry naming another\npackage adds it. The server refuses `packages` beside the `local` scope, since a\nproject read consults no package, and beside `rev`, since package facts are\nserved for the current tree alone.",
+          "include": {
+            "default": [
+              "source"
+            ],
+            "description": "Requested projections. Omitted defaults to source; an empty list requests none.",
             "items": {
-              "$ref": "#/$defs/RequestedPackage"
+              "$ref": "#/$defs/GetSymbolInclude"
             },
-            "maxItems": 64,
             "type": "array"
-          },
-          "page_index": {
-            "default": 0,
-            "description": "Zero-based page of the result set to serve, sized by `limit`. A `page_index` past\nthe last page returns an empty page whose `pagination` carries the requested\n`page_index` and the true `total_pages`.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
           },
           "rev": {
             "$ref": "#/$defs/RevisionId",
-            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
+            "description": "A local Git revision. Refused for a package or runtime owner and beside `view`."
           },
-          "scope": {
-            "$ref": "#/$defs/SearchScope",
-            "default": "local",
-            "description": "Which declarations the lookup searches: the project tree, the dependency\npackages, or both. Omitted, `local`. The server refuses a scope beyond `local`\ntogether with `rev`, since package facts are served for the current tree alone."
+          "view": {
+            "$ref": "#/$defs/CapturedViewId",
+            "description": "A view returned by a preceding read. Expiry never selects latest implicitly."
           }
         },
         "required": [
-          "name"
+          "id"
         ],
-        "rift:since": "v0.0.4",
         "type": "object"
       },
       "name": "get_symbol",
       "output_schema": {
         "$defs": {
+          "CapturedView": {
+            "additionalProperties": false,
+            "description": "The immutable serving view and the expiry promised by its owner.",
+            "properties": {
+              "expires_at": {
+                "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
+                "format": "date-time",
+                "type": "string"
+              },
+              "id": {
+                "$ref": "#/$defs/CapturedViewId",
+                "description": "Selects the same workspace, owner, applicability and accepted index revision."
+              }
+            },
+            "required": [
+              "id",
+              "expires_at"
+            ],
+            "type": "object"
+          },
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
           "CommitAuthor": {
             "additionalProperties": false,
             "description": "The author one revision records, as committed: no `.mailmap` rewrites the name or the\naddress.",
@@ -913,72 +2975,6 @@
             "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
             "type": "string"
           },
-          "GetSymbolHit": {
-            "additionalProperties": false,
-            "allOf": [
-              {
-                "oneOf": [
-                  {
-                    "required": [
-                      "path"
-                    ]
-                  },
-                  {
-                    "required": [
-                      "unit"
-                    ]
-                  }
-                ]
-              }
-            ],
-            "description": "One declaration a `get_symbol` lookup found.",
-            "properties": {
-              "documentation": {
-                "$ref": "#/$defs/DocumentationContext",
-                "description": "Exact documentation references, present only when `include` names `documentation`."
-              },
-              "history": {
-                "$ref": "#/$defs/SymbolHistory",
-                "description": "The symbol's timeline, present when `include` names `history`."
-              },
-              "line": {
-                "description": "The 1-based source line where the declaration begins.",
-                "format": "uint64",
-                "minimum": 1,
-                "type": "integer"
-              },
-              "node": {
-                "$ref": "#/$defs/NodeId",
-                "description": "The declaration node's identity, including its source range and witness.\nAbsent unless `include` names `source`, or when source is unavailable or outside\nthe project."
-              },
-              "path": {
-                "$ref": "#/$defs/ProjectPath",
-                "description": "Project-relative path, present for a declaration that belongs to the project.\nExactly one of `path` and `unit` is present."
-              },
-              "range": {
-                "$ref": "#/$defs/TextRange",
-                "description": "Byte range of the declaration within `path` or `unit`."
-              },
-              "source": {
-                "description": "The declaration source, present when `include` names `source` and the provider\ncan read it. Absent for a source-less declaration.",
-                "type": "string"
-              },
-              "symbol": {
-                "$ref": "#/$defs/Symbol",
-                "description": "The declaration that matched."
-              },
-              "unit": {
-                "$ref": "#/$defs/SourceUnitId",
-                "description": "Source-catalog unit, present for a declaration that belongs to a dependency or the\nstandard library. Exactly one of `path` and `unit` is present."
-              }
-            },
-            "required": [
-              "symbol",
-              "range",
-              "line"
-            ],
-            "type": "object"
-          },
           "GlobalFailureClass": {
             "description": "Bounded classes a global API failure can carry in a read warning.",
             "oneOf": [
@@ -1296,31 +3292,6 @@
               "registry",
               "name",
               "version"
-            ],
-            "type": "object"
-          },
-          "Pagination": {
-            "additionalProperties": false,
-            "description": "Where one page sits in the full result set the request's `limit` divides.",
-            "properties": {
-              "page_index": {
-                "description": "The zero-based page this answer serves.",
-                "format": "uint64",
-                "maximum": 9007199254740991,
-                "minimum": 0,
-                "type": "integer"
-              },
-              "total_pages": {
-                "description": "The page count of the full result set under the request's `limit`, computed within\nthe server's result bound. Zero when the result set is empty.",
-                "format": "uint64",
-                "maximum": 9007199254740991,
-                "minimum": 0,
-                "type": "integer"
-              }
-            },
-            "required": [
-              "page_index",
-              "total_pages"
             ],
             "type": "object"
           },
@@ -2883,6 +4854,112 @@
             ],
             "type": "object"
           },
+          "SymbolAlternative": {
+            "additionalProperties": false,
+            "description": "An actual object proposed after a valid exact miss.",
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/SymbolIdentity",
+                "description": "The candidate's actual canonical identity, including its exact owner and version."
+              },
+              "match_context": {
+                "description": "Structural comparisons that explain this candidate.",
+                "items": {
+                  "$ref": "#/$defs/SymbolMatchContext"
+                },
+                "type": "array"
+              },
+              "name": {
+                "description": "The candidate's displayed name.",
+                "maxLength": 4096,
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "match_context"
+            ],
+            "type": "object"
+          },
+          "SymbolDeclaration": {
+            "additionalProperties": false,
+            "description": "One source binding for a logical object. Source-less objects have no bindings.",
+            "properties": {
+              "documentation_indices": {
+                "description": "Entries in the result symbol's documentation array supplied by this declaration.",
+                "items": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "line": {
+                "description": "One-based line where this declaration begins.",
+                "format": "uint64",
+                "minimum": 1,
+                "type": "integer"
+              },
+              "node": {
+                "$ref": "#/$defs/NodeId",
+                "description": "Source node when available and requested."
+              },
+              "origin": {
+                "$ref": "#/$defs/SymbolOrigin",
+                "description": "Contextual owner and source kind of this declaration's source."
+              },
+              "path": {
+                "$ref": "#/$defs/ProjectPath",
+                "description": "Repository-relative path. Exactly one of `path` and `unit` is present."
+              },
+              "range": {
+                "$ref": "#/$defs/TextRange",
+                "description": "The declaration's complete byte range in its source."
+              },
+              "signature_indices": {
+                "description": "Entries in the result symbol's signature array supplied by this declaration.",
+                "items": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "source": {
+                "description": "Source excerpt when requested and available.",
+                "maxLength": 67108864,
+                "type": "string"
+              },
+              "source_complete": {
+                "description": "Whether the supplied excerpt contains this declaration's complete source.",
+                "type": "boolean"
+              },
+              "type_indices": {
+                "description": "Entries in the result symbol's type array supplied by this declaration.",
+                "items": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": "array"
+              },
+              "unit": {
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "Released source unit. Exactly one of `path` and `unit` is present."
+              }
+            },
+            "required": [
+              "origin",
+              "range",
+              "line",
+              "source_complete",
+              "signature_indices",
+              "type_indices",
+              "documentation_indices"
+            ],
+            "type": "object"
+          },
           "SymbolFacet": {
             "description": "One portable category a symbol falls into. Kinds are language-specific; facets are\nshared, so a filter written once applies to every served language.",
             "oneOf": [
@@ -3081,6 +5158,90 @@
             "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
+          "SymbolIdentity": {
+            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "examples": [
+              "rift://symbol/local/rust/app/parser/parse",
+              "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+            ],
+            "maxLength": 8192,
+            "minLength": 1,
+            "not": {
+              "pattern": "/\\.{1,2}(?:/|~|$)"
+            },
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "type": "string"
+          },
+          "SymbolMatchContext": {
+            "description": "The structural parts compared when an alternative was selected.",
+            "oneOf": [
+              {
+                "const": "owner",
+                "description": "Defining package, runtime or local scope.",
+                "type": "string"
+              },
+              {
+                "const": "language",
+                "description": "Language and dialect.",
+                "type": "string"
+              },
+              {
+                "const": "module",
+                "description": "Semantic module path.",
+                "type": "string"
+              },
+              {
+                "const": "container",
+                "description": "Owning container path.",
+                "type": "string"
+              },
+              {
+                "const": "form",
+                "description": "Callable dispatch form.",
+                "type": "string"
+              },
+              {
+                "const": "name",
+                "description": "Terminal declared name.",
+                "type": "string"
+              },
+              {
+                "const": "version",
+                "description": "Exact release of the same defining owner.",
+                "type": "string"
+              }
+            ]
+          },
+          "SymbolNotFound": {
+            "additionalProperties": false,
+            "description": "Definite absence after a complete exact selection, with bounded alternatives.",
+            "properties": {
+              "alternatives": {
+                "description": "Actual structural candidates, never substitutions for the requested object.",
+                "items": {
+                  "$ref": "#/$defs/SymbolAlternative"
+                },
+                "maxItems": 3,
+                "type": "array"
+              },
+              "detail": {
+                "description": "Unfinished candidate work, when the complete nearest set could not be proved.",
+                "maxLength": 4096,
+                "type": "string"
+              },
+              "id": {
+                "$ref": "#/$defs/SymbolIdentity",
+                "description": "The valid exact identity requested by the caller."
+              }
+            },
+            "required": [
+              "id",
+              "alternatives"
+            ],
+            "type": "object"
+          },
           "SymbolOrigin": {
             "description": "Where a symbol belongs and how its declaration came to exist. Source location and\ngeneration are separate: generated code can belong to the project or to a dependency.\nAbsent from `Symbol` entirely when it says a project declaration, authored, with no\npackage.",
             "properties": {
@@ -3105,6 +5266,46 @@
               "source_kind"
             ],
             "type": "object"
+          },
+          "SymbolUnavailableReason": {
+            "description": "Why an exact selection cannot establish presence or definite absence.",
+            "oneOf": [
+              {
+                "const": "exact_release",
+                "description": "The encoded exact release has no accepted publication.",
+                "type": "string"
+              },
+              {
+                "const": "index_preparing",
+                "description": "The selected index is preparing.",
+                "type": "string"
+              },
+              {
+                "const": "read_failed",
+                "description": "The serving read failed.",
+                "type": "string"
+              },
+              {
+                "const": "corrupt_publication",
+                "description": "The publication failed validation.",
+                "type": "string"
+              },
+              {
+                "const": "insufficient_coverage",
+                "description": "Accepted facts do not cover this exact selection.",
+                "type": "string"
+              },
+              {
+                "const": "view_expired",
+                "description": "The requested captured view expired or was explicitly removed.",
+                "type": "string"
+              },
+              {
+                "const": "view_context",
+                "description": "The captured view belongs to another workspace or scope mapping.",
+                "type": "string"
+              }
+            ]
           },
           "SymbolVersion": {
             "additionalProperties": false,
@@ -3198,6 +5399,12 @@
           },
           "TextRange": {
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+            "examples": [
+              {
+                "end": 0,
+                "start": 0
+              }
+            ],
             "properties": {
               "end": {
                 "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
@@ -3357,157 +5564,141 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "additionalProperties": false,
-        "examples": [
+        "oneOf": [
           {
-            "hits": [
-              {
-                "history": {
-                  "complete": true,
-                  "symbol": "rift://symbol/local/rust/app/config/load_config",
-                  "versions": [
-                    {
-                      "author": {
-                        "email": "alice@example.com",
-                        "name": "Alice"
-                      },
-                      "kind": "signature_changed",
-                      "path": "src/config.rs",
-                      "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
-                      "summary": "Return ConfigError from load_config",
-                      "timestamp": "2026-08-21T14:03:22+00:00"
-                    },
-                    {
-                      "author": {
-                        "email": "alice@example.com",
-                        "name": "Alice"
-                      },
-                      "kind": "introduced",
-                      "path": "src/config.rs",
-                      "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
-                      "summary": "Add workspace configuration loading",
-                      "timestamp": "2026-08-17T09:41:05+00:00"
-                    }
-                  ]
+            "additionalProperties": false,
+            "description": "The exact identity was established, even when it has no source declarations.",
+            "properties": {
+              "declaration_cursor": {
+                "description": "Continuation for remaining declarations in this exact view.",
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "declarations": {
+                "description": "Declaration bindings in deterministic source order.",
+                "items": {
+                  "$ref": "#/$defs/SymbolDeclaration"
                 },
-                "line": 10,
-                "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-                "path": "src/config.rs",
-                "range": {
-                  "end": 355,
-                  "start": 162
+                "maxItems": 10000,
+                "type": "array"
+              },
+              "documentation": {
+                "$ref": "#/$defs/DocumentationContext",
+                "description": "Requested bounded documentation context."
+              },
+              "history": {
+                "$ref": "#/$defs/SymbolHistory",
+                "description": "Requested timeline for the logical symbol."
+              },
+              "outcome": {
+                "const": "found",
+                "type": "string"
+              },
+              "symbol": {
+                "$ref": "#/$defs/Symbol",
+                "description": "One logical symbol. Its established `id` is required by read validation."
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "The immutable context used for this result and its continuations."
+              },
+              "warnings": {
+                "description": "Projection cuts and other typed read warnings.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
                 },
-                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-                "symbol": {
-                  "documentation": [
-                    {
-                      "format": "markdown",
-                      "text": "Loads the workspace configuration from `rift.toml`."
-                    }
-                  ],
-                  "facets": [
-                    "value",
-                    "callable",
-                    "public"
-                  ],
-                  "id": "rift://symbol/local/rust/app/config/load_config",
-                  "kind": "function",
-                  "language": "rust",
-                  "name": "load_config",
-                  "signatures": [
-                    {
-                      "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                      "language": "rust",
-                      "links": [
-                        {
-                          "range": {
-                            "end": 48,
-                            "start": 42
-                          },
-                          "symbol": "rift://symbol/local/rust/app/config/Config"
-                        }
-                      ],
-                      "parameters": [
-                        {
-                          "name": "path",
-                          "optional": false,
-                          "types": [
-                            {
-                              "origin": "declared",
-                              "role": "parameter",
-                              "type": {
-                                "language": "rust",
-                                "source": "&Path"
-                              }
-                            }
-                          ],
-                          "variadic": false
-                        }
-                      ],
-                      "returns": [
-                        {
-                          "origin": "declared",
-                          "role": "return",
-                          "type": {
-                            "language": "rust",
-                            "source": "Result<Config, ConfigError>"
-                          }
-                        }
-                      ]
-                    }
-                  ],
-                  "types": [
-                    {
-                      "origin": "declared",
-                      "role": "return",
-                      "type": {
-                        "language": "rust",
-                        "source": "Result<Config, ConfigError>"
-                      }
-                    }
-                  ],
-                  "visibility": "pub"
-                }
+                "type": "array"
               }
+            },
+            "required": [
+              "outcome",
+              "symbol",
+              "view",
+              "declarations"
             ],
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 1
-            }
-          }
-        ],
-        "properties": {
-          "hits": {
-            "description": "The declarations on this page, best match first.",
-            "items": {
-              "$ref": "#/$defs/GetSymbolHit"
-            },
-            "type": "array"
+            "type": "object"
           },
-          "pagination": {
-            "$ref": "#/$defs/Pagination",
-            "description": "Where this page sits in the full result set under the request's `limit`."
-          },
-          "warnings": {
-            "default": [],
-            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
-            "items": {
-              "$ref": "#/$defs/ReadWarning"
+          {
+            "additionalProperties": false,
+            "description": "The valid identity is absent from the completely searched exact selection.",
+            "properties": {
+              "outcome": {
+                "const": "missing",
+                "type": "string"
+              },
+              "symbol_not_found": {
+                "$ref": "#/$defs/SymbolNotFound",
+                "description": "Definite exact miss and its actual structural candidates."
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "The exact immutable selection searched."
+              },
+              "warnings": {
+                "description": "Warnings, including incomplete candidate work.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
+              }
             },
-            "type": "array"
+            "required": [
+              "outcome",
+              "symbol_not_found",
+              "view"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The exact selection cannot establish presence or absence.",
+            "properties": {
+              "id": {
+                "$ref": "#/$defs/SymbolIdentity",
+                "description": "The requested exact canonical identity."
+              },
+              "outcome": {
+                "const": "unavailable",
+                "type": "string"
+              },
+              "reason": {
+                "$ref": "#/$defs/SymbolUnavailableReason",
+                "description": "The typed cause of unavailability."
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "The selected view, when one could be captured."
+              },
+              "warnings": {
+                "description": "Details and available partial-read warnings.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "outcome",
+              "id",
+              "reason"
+            ],
+            "type": "object"
           }
-        },
-        "required": [
-          "hits",
-          "pagination"
-        ],
-        "type": "object"
+        ]
       }
     },
     {
       "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and `source` and\ncarries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.\nPer-file refusals keep their typed errors. A visible path no syntax\nprovider parses refuses `capability_unavailable`, naming the extension.",
       "input_schema": {
         "$defs": {
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
           "ProjectPath": {
             "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "examples": [
@@ -3551,6 +5742,10 @@
           "rev": {
             "$ref": "#/$defs/RevisionId",
             "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository."
+          },
+          "view": {
+            "$ref": "#/$defs/CapturedViewId",
+            "description": "Captured view selected by discovery. The server reads nodes from that view and\nrefuses an expired or foreign view. The caller MUST omit `rev` beside `view`."
           }
         },
         "required": [
@@ -3563,6 +5758,33 @@
       "name": "nodes",
       "output_schema": {
         "$defs": {
+          "CapturedView": {
+            "additionalProperties": false,
+            "description": "The immutable serving view and the expiry promised by its owner.",
+            "properties": {
+              "expires_at": {
+                "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
+                "format": "date-time",
+                "type": "string"
+              },
+              "id": {
+                "$ref": "#/$defs/CapturedViewId",
+                "description": "Selects the same workspace, owner, applicability and accepted index revision."
+              }
+            },
+            "required": [
+              "id",
+              "expires_at"
+            ],
+            "type": "object"
+          },
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
             "examples": [
@@ -5594,6 +7816,12 @@
           },
           "TextRange": {
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+            "examples": [
+              {
+                "end": 0,
+                "start": 0
+              }
+            ],
             "properties": {
               "end": {
                 "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
@@ -5725,6 +7953,10 @@
             },
             "type": "array"
           },
+          "view": {
+            "$ref": "#/$defs/CapturedView",
+            "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view."
+          },
           "warnings": {
             "default": [],
             "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
@@ -5745,6 +7977,13 @@
       "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. `pattern` matches a\nregex against the text of every indexed file, line by line as ripgrep reads it, and\nanswers each match and each declaration holding one, in place of `query` and\n`traversal`. `change` answers the declarations a committed revision and another\nrevision, or the working tree, hold differently, in place of `query` and `traversal`.\n`rev` searches a version-control revision instead of the current tree, and never\ncombines with `pattern`, `traversal`, or `change`. `scope` reaches past the project\ntree: `global` answers `query` from the public declarations the global index holds for\nthe workspace's dependencies alone and `pattern` from their source, `all` from both,\nordered together. `packages` names package versions `query` and `pattern` search beside\nthe workspace's own, such as an upgrade target or a package the project does not use\nyet. `target: \"commit\"` matches `query` alone against the messages of the commits the\nhistory store holds. Use `get_symbol` when the declaration name is known.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
           "ChangeHead": {
             "anyOf": [
               {
@@ -5782,7 +8021,7 @@
             "examples": [
               "src/**"
             ],
-            "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
+            "pattern": "^(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,})(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,})?)*$",
             "type": "string"
           },
           "PathSelector": {
@@ -6131,24 +8370,28 @@
             ]
           },
           "SearchScope": {
-            "description": "Which corpus a read searches. The names identify logical corpora, not storage\nlocations: `global` reaches dependency package facts wherever the server holds them.",
-            "oneOf": [
+            "anyOf": [
               {
-                "const": "local",
-                "description": "The project tree the server serves.",
-                "type": "string"
+                "enum": [
+                  "local",
+                  "global",
+                  "all"
+                ]
               },
               {
-                "const": "global",
-                "description": "The dependency packages, answered from their public declarations alone.",
-                "type": "string"
-              },
-              {
-                "const": "all",
-                "description": "Both: hits merge by rank; at equal rank a project hit orders before a package hit.",
-                "type": "string"
+                "not": {
+                  "enum": [
+                    "local@local",
+                    "local@global",
+                    "local@all"
+                  ]
+                },
+                "pattern": "^local(?:@[a-z][a-z0-9_-]*)?$"
               }
-            ]
+            ],
+            "description": "Which corpus a read searches. A named local scope requires an extra project accepted by the current connection.",
+            "maxLength": 8192,
+            "type": "string"
           },
           "SearchTraversal": {
             "additionalProperties": false,
@@ -6442,6 +8685,10 @@
           "traversal": {
             "$ref": "#/$defs/SearchTraversal",
             "description": "A bounded relationship walk from `seed`, standing alone or beside `query`. A symbol\nthe walk reaches becomes a hit tagged `relationship`; one also matched lexically\nkeeps its own score and payload and gains the walk's path. `target: \"file\"` never\ncarries a walked hit, since a traversal only reaches symbols. With no `query`,\n`relevance` orders hits by ascending `distance`, then identity. A configured\nlanguage engine resolves the references the walk follows, and an engine session\nserves the current tree, so the server refuses `traversal` beside `rev` and beside\n`change`."
+          },
+          "view": {
+            "$ref": "#/$defs/CapturedViewId",
+            "description": "The captured serving context returned by an earlier search. The server retains\nquery, filters, ranking policy, selected projects and releases under this view.\nAn expired or mismatched view is unavailable; the server never substitutes latest."
           }
         },
         "rift:since": "v0.0.6",
@@ -6450,6 +8697,33 @@
       "name": "search",
       "output_schema": {
         "$defs": {
+          "CapturedView": {
+            "additionalProperties": false,
+            "description": "The immutable serving view and the expiry promised by its owner.",
+            "properties": {
+              "expires_at": {
+                "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
+                "format": "date-time",
+                "type": "string"
+              },
+              "id": {
+                "$ref": "#/$defs/CapturedViewId",
+                "description": "Selects the same workspace, owner, applicability and accepted index revision."
+              }
+            },
+            "required": [
+              "id",
+              "expires_at"
+            ],
+            "type": "object"
+          },
+          "CapturedViewId": {
+            "description": "A service-issued key for one immutable view in one serving context.",
+            "maxLength": 4096,
+            "minLength": 3,
+            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
+            "type": "string"
+          },
           "CommitAuthor": {
             "additionalProperties": false,
             "description": "The author one revision records, as committed: no `.mailmap` rewrites the name or the\naddress.",
@@ -8985,6 +11259,10 @@
               "unit": {
                 "$ref": "#/$defs/SourceUnitId",
                 "description": "Source-catalog unit of a hit in a dependency or standard-library file: a\ndeclaration, or a `pattern` match. A hit in a file carries exactly one of `path` and\n`unit`; a commit hit carries neither."
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "The immutable view that supplied this hit. The caller passes its `id` to later\nexact, source, declaration, and relationship reads to retain the same context.\nAbsent when the caller selected latest facts without retained serving context."
               }
             },
             "required": [
@@ -9098,6 +11376,217 @@
                 "required": [
                   "target",
                   "commit"
+                ],
+                "type": "object"
+              }
+            ]
+          },
+          "SearchResult": {
+            "additionalProperties": false,
+            "description": "One page of search hits from one captured tree.",
+            "examples": [
+              {
+                "pagination": {
+                  "page_index": 0,
+                  "total_pages": 3
+                },
+                "results": [
+                  {
+                    "hit": {
+                      "symbol": {
+                        "documentation": [
+                          {
+                            "format": "markdown",
+                            "text": "Loads the workspace configuration from `rift.toml`."
+                          }
+                        ],
+                        "facets": [
+                          "value",
+                          "callable",
+                          "public"
+                        ],
+                        "id": "rift://symbol/local/rust/app/config/load_config",
+                        "kind": "function",
+                        "language": "rust",
+                        "name": "load_config",
+                        "signatures": [
+                          {
+                            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                            "language": "rust",
+                            "links": [
+                              {
+                                "range": {
+                                  "end": 48,
+                                  "start": 42
+                                },
+                                "symbol": "rift://symbol/local/rust/app/config/Config"
+                              }
+                            ],
+                            "parameters": [
+                              {
+                                "name": "path",
+                                "optional": false,
+                                "types": [
+                                  {
+                                    "origin": "declared",
+                                    "role": "parameter",
+                                    "type": {
+                                      "language": "rust",
+                                      "source": "&Path"
+                                    }
+                                  }
+                                ],
+                                "variadic": false
+                              }
+                            ],
+                            "returns": [
+                              {
+                                "origin": "declared",
+                                "role": "return",
+                                "type": {
+                                  "language": "rust",
+                                  "source": "Result<Config, ConfigError>"
+                                }
+                              }
+                            ]
+                          }
+                        ],
+                        "types": [
+                          {
+                            "origin": "declared",
+                            "role": "return",
+                            "type": {
+                              "language": "rust",
+                              "source": "Result<Config, ConfigError>"
+                            }
+                          }
+                        ],
+                        "visibility": "pub"
+                      },
+                      "target": "symbol"
+                    },
+                    "line": 10,
+                    "matched_by": [
+                      "name"
+                    ],
+                    "path": "src/config.rs",
+                    "range": {
+                      "end": 355,
+                      "start": 162
+                    },
+                    "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                  },
+                  {
+                    "hit": {
+                      "languages": [
+                        "rust"
+                      ],
+                      "size": 241,
+                      "target": "file"
+                    },
+                    "line": 7,
+                    "matched_by": [
+                      "content"
+                    ],
+                    "path": "src/lib.rs",
+                    "range": {
+                      "end": 168,
+                      "start": 121
+                    },
+                    "source": "    let config = load_config(&arguments.path)?;"
+                  }
+                ]
+              },
+              {
+                "pagination": {
+                  "page_index": 0,
+                  "total_pages": 1
+                },
+                "results": [
+                  {
+                    "hit": {
+                      "commit": {
+                        "author": {
+                          "email": "alice@example.com",
+                          "name": "Alice"
+                        },
+                        "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
+                        "message_truncated": false,
+                        "paths": [
+                          "crates/rift-protocol/src/search.rs",
+                          "crates/rift-server/src/change.rs"
+                        ],
+                        "paths_truncated": false,
+                        "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
+                        "timestamp": "2026-09-22T14:03:11+02:00"
+                      },
+                      "target": "commit"
+                    }
+                  }
+                ]
+              }
+            ],
+            "properties": {
+              "pagination": {
+                "$ref": "#/$defs/Pagination",
+                "description": "Where this page sits in the full result set under the request's `limit`."
+              },
+              "results": {
+                "description": "The hits on this page, in the order the request asked for.",
+                "items": {
+                  "$ref": "#/$defs/SearchHit"
+                },
+                "type": "array"
+              },
+              "view": {
+                "$ref": "#/$defs/CapturedView",
+                "description": "The captured serving context for this result, including an empty page. Each hit\ncarries the original view of its selected project or released owner.\nAbsent when the caller selected latest facts without retained serving context."
+              },
+              "warnings": {
+                "default": [],
+                "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
+                "items": {
+                  "$ref": "#/$defs/ReadWarning"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "results",
+              "pagination"
+            ],
+            "type": "object"
+          },
+          "SearchUnavailable": {
+            "description": "The captured selection cannot serve this search or pattern request.",
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "description": "Presence or absence cannot be established in the requested selection.",
+                "properties": {
+                  "outcome": {
+                    "const": "unavailable",
+                    "type": "string"
+                  },
+                  "reason": {
+                    "$ref": "#/$defs/SymbolUnavailableReason",
+                    "description": "The existing typed cause of selection unavailability."
+                  },
+                  "view": {
+                    "$ref": "#/$defs/CapturedView",
+                    "description": "Selected view, when one could be captured."
+                  },
+                  "warnings": {
+                    "description": "Details and partial-read warnings.",
+                    "items": {
+                      "$ref": "#/$defs/ReadWarning"
+                    },
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "outcome",
+                  "reason"
                 ],
                 "type": "object"
               }
@@ -9609,6 +12098,46 @@
             ],
             "type": "object"
           },
+          "SymbolUnavailableReason": {
+            "description": "Why an exact selection cannot establish presence or definite absence.",
+            "oneOf": [
+              {
+                "const": "exact_release",
+                "description": "The encoded exact release has no accepted publication.",
+                "type": "string"
+              },
+              {
+                "const": "index_preparing",
+                "description": "The selected index is preparing.",
+                "type": "string"
+              },
+              {
+                "const": "read_failed",
+                "description": "The serving read failed.",
+                "type": "string"
+              },
+              {
+                "const": "corrupt_publication",
+                "description": "The publication failed validation.",
+                "type": "string"
+              },
+              {
+                "const": "insufficient_coverage",
+                "description": "Accepted facts do not cover this exact selection.",
+                "type": "string"
+              },
+              {
+                "const": "view_expired",
+                "description": "The requested captured view expired or was explicitly removed.",
+                "type": "string"
+              },
+              {
+                "const": "view_context",
+                "description": "The captured view belongs to another workspace or scope mapping.",
+                "type": "string"
+              }
+            ]
+          },
           "SymbolVersionKind": {
             "description": "What the revision did to the symbol.",
             "oneOf": [
@@ -9661,6 +12190,12 @@
           },
           "TextRange": {
             "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+            "examples": [
+              {
+                "end": 0,
+                "start": 0
+              }
+            ],
             "properties": {
               "end": {
                 "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
@@ -9820,175 +12355,16 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "additionalProperties": false,
-        "examples": [
+        "anyOf": [
           {
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 3
-            },
-            "results": [
-              {
-                "hit": {
-                  "symbol": {
-                    "documentation": [
-                      {
-                        "format": "markdown",
-                        "text": "Loads the workspace configuration from `rift.toml`."
-                      }
-                    ],
-                    "facets": [
-                      "value",
-                      "callable",
-                      "public"
-                    ],
-                    "id": "rift://symbol/local/rust/app/config/load_config",
-                    "kind": "function",
-                    "language": "rust",
-                    "name": "load_config",
-                    "signatures": [
-                      {
-                        "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                        "language": "rust",
-                        "links": [
-                          {
-                            "range": {
-                              "end": 48,
-                              "start": 42
-                            },
-                            "symbol": "rift://symbol/local/rust/app/config/Config"
-                          }
-                        ],
-                        "parameters": [
-                          {
-                            "name": "path",
-                            "optional": false,
-                            "types": [
-                              {
-                                "origin": "declared",
-                                "role": "parameter",
-                                "type": {
-                                  "language": "rust",
-                                  "source": "&Path"
-                                }
-                              }
-                            ],
-                            "variadic": false
-                          }
-                        ],
-                        "returns": [
-                          {
-                            "origin": "declared",
-                            "role": "return",
-                            "type": {
-                              "language": "rust",
-                              "source": "Result<Config, ConfigError>"
-                            }
-                          }
-                        ]
-                      }
-                    ],
-                    "types": [
-                      {
-                        "origin": "declared",
-                        "role": "return",
-                        "type": {
-                          "language": "rust",
-                          "source": "Result<Config, ConfigError>"
-                        }
-                      }
-                    ],
-                    "visibility": "pub"
-                  },
-                  "target": "symbol"
-                },
-                "line": 10,
-                "matched_by": [
-                  "name"
-                ],
-                "path": "src/config.rs",
-                "range": {
-                  "end": 355,
-                  "start": 162
-                },
-                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
-              },
-              {
-                "hit": {
-                  "languages": [
-                    "rust"
-                  ],
-                  "size": 241,
-                  "target": "file"
-                },
-                "line": 7,
-                "matched_by": [
-                  "content"
-                ],
-                "path": "src/lib.rs",
-                "range": {
-                  "end": 168,
-                  "start": 121
-                },
-                "source": "    let config = load_config(&arguments.path)?;"
-              }
-            ]
+            "$ref": "#/$defs/SearchResult",
+            "description": "Search hits and the captured serving context, including an empty page."
           },
           {
-            "pagination": {
-              "page_index": 0,
-              "total_pages": 1
-            },
-            "results": [
-              {
-                "hit": {
-                  "commit": {
-                    "author": {
-                      "email": "alice@example.com",
-                      "name": "Alice"
-                    },
-                    "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
-                    "message_truncated": false,
-                    "paths": [
-                      "crates/rift-protocol/src/search.rs",
-                      "crates/rift-server/src/change.rs"
-                    ],
-                    "paths_truncated": false,
-                    "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
-                    "timestamp": "2026-09-22T14:03:11+02:00"
-                  },
-                  "target": "commit"
-                }
-              }
-            ]
+            "$ref": "#/$defs/SearchUnavailable",
+            "description": "The captured selection cannot serve this request."
           }
-        ],
-        "properties": {
-          "pagination": {
-            "$ref": "#/$defs/Pagination",
-            "description": "Where this page sits in the full result set under the request's `limit`."
-          },
-          "results": {
-            "description": "The hits on this page, in the order the request asked for.",
-            "items": {
-              "$ref": "#/$defs/SearchHit"
-            },
-            "type": "array"
-          },
-          "warnings": {
-            "default": [],
-            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
-            "items": {
-              "$ref": "#/$defs/ReadWarning"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "results",
-          "pagination"
-        ],
-        "type": "object"
+        ]
       }
     }
   ]

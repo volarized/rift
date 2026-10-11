@@ -27,11 +27,61 @@ pub struct LocalSymbolViewInput {
     retained_bytes: usize,
 }
 
+impl LocalSymbolViewInput {
+    /// Returns the warnings retained by this immutable input.
+    ///
+    /// # Errors
+    /// Returns the original captured metadata read failure.
+    pub fn warnings(&self) -> Result<Vec<rift_protocol::read::ReadWarning>, RiftError> {
+        let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
+            .map_err(|error| material_error("decode captured metadata", &error))?;
+        Ok(metadata.warnings)
+    }
+
+    /// Adds caller-owned warnings before the immutable material is admitted.
+    ///
+    /// # Errors
+    /// Returns the original captured metadata read or encoding failure.
+    pub fn with_warnings(
+        self,
+        warnings: Vec<rift_protocol::read::ReadWarning>,
+    ) -> Result<Self, RiftError> {
+        if warnings.is_empty() {
+            return Ok(self);
+        }
+        let mut metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
+            .map_err(|error| material_error("decode captured metadata", &error))?;
+        metadata.warnings.extend(warnings);
+        let metadata = serde_json::to_vec(&metadata)
+            .map_err(|error| material_error("capture read metadata", &error))?;
+        Ok(local_view_input(
+            Arc::clone(&self.material.index),
+            metadata,
+            self.material.history.clone(),
+            self.material.traversal.clone(),
+            self.ready,
+        ))
+    }
+
+    /// Root of the immutable publication admitted by this input.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        self.material.index.root()
+    }
+
+    /// Fixed owner of the immutable publication admitted by this input.
+    #[must_use]
+    pub fn owner(&self) -> &SymbolOwner {
+        self.material.index.owner()
+    }
+}
+
 #[derive(Debug)]
 struct LocalSymbolMaterial {
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Arc<[u8]>,
     history: Option<(String, Arc<[u8]>)>,
+    traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -283,6 +333,17 @@ impl LocalSymbolViews {
         owner: &SymbolOwner,
         now: SystemTime,
     ) -> Result<CapturedView, SymbolUnavailableReason> {
+        self.held_view_at(id, root, owner, now)
+            .map(|held| held.view)
+    }
+
+    fn held_view_at(
+        &self,
+        id: &CapturedViewId,
+        root: &Path,
+        owner: &SymbolOwner,
+        now: SystemTime,
+    ) -> Result<HeldView, SymbolUnavailableReason> {
         let mut state = self
             .state
             .lock()
@@ -301,7 +362,7 @@ impl LocalSymbolViews {
         if !held.ready {
             return Err(SymbolUnavailableReason::IndexPreparing);
         }
-        Ok(held.view.clone())
+        Ok(held.clone())
     }
 
     /// Reads only an issued view or continuation belonging to the expected root and owner.
@@ -453,7 +514,33 @@ impl ReadService {
     /// Returns the original captured index or read failure.
     pub fn local_search_view_input(&self, ready: bool) -> Result<LocalSymbolViewInput, RiftError> {
         let (index, metadata) = self.local_view_material()?;
-        Ok(local_view_input(index, metadata, None, ready))
+        Ok(local_view_input(index, metadata, None, None, ready))
+    }
+
+    /// Captures one traversal's engine rows from the same source and index revision.
+    ///
+    /// # Errors
+    /// Returns the original index or read failure, or refuses rows from another revision.
+    pub fn local_traversal_view_input(
+        &self,
+        traversal: &rift_protocol::search::SearchTraversal,
+        references: crate::EngineReferences,
+        ready: bool,
+    ) -> Result<LocalSymbolViewInput, RiftError> {
+        crate::traversal::validate_traversal(traversal)?;
+        if traversal.seed.is_none() {
+            return Err(invalid("seed", "a traversal starts at seed"));
+        }
+        references.validate_revision(self)?;
+        let (index, metadata) = self.local_view_material()?;
+        let traversal = if ready && references.captured_for(self) {
+            let request = serde_json::to_vec(traversal)
+                .map_err(|error| material_error("capture traversal", &error))?;
+            Some((Arc::from(request), Arc::new(references)))
+        } else {
+            None
+        };
+        Ok(local_view_input(index, metadata, None, traversal, ready))
     }
 
     fn local_view_material(
@@ -504,11 +591,11 @@ impl ReadService {
         } else {
             None
         };
-        Ok(local_view_input(index, metadata, history, ready))
+        Ok(local_view_input(index, metadata, history, None, ready))
     }
 }
 
-fn material_error(operation: &str, error: &serde_json::Error) -> RiftError {
+fn material_error(operation: &str, error: &impl std::fmt::Display) -> RiftError {
     errors::server::read_unavailable()
         .operation(operation)
         .detail(error.to_string())
@@ -551,12 +638,13 @@ impl LocalSymbolMaterial {
                     None,
                 ));
             }
+            let (alternatives, detail) = self.symbol_alternatives(&identity)?;
             return Ok((
                 GetSymbolResult::Missing {
                     symbol_not_found: SymbolNotFound {
                         id: request.id.clone(),
-                        alternatives: Vec::new(),
-                        detail: None,
+                        alternatives,
+                        detail,
                     },
                     view: view.clone(),
                     warnings: metadata.warnings,
@@ -611,6 +699,50 @@ impl LocalSymbolMaterial {
             },
             (next < total).then_some(next),
         ))
+    }
+
+    fn symbol_alternatives(
+        &self,
+        identity: &SymbolIdentity,
+    ) -> Result<
+        (
+            Vec<rift_protocol::symbol_read::SymbolAlternative>,
+            Option<String>,
+        ),
+        RiftError,
+    > {
+        use rift_protocol::symbol_read::{SymbolAlternative, SymbolMatchContext};
+        let proposed = crate::alternatives::captured_symbols(&self.index, identity);
+        let keys = match proposed {
+            Ok(keys) => keys,
+            Err(error)
+                if error.slug() == errors::server::read_symbol_alternatives_unavailable::SLUG =>
+            {
+                return Ok((Vec::new(), Some(error.to_string())));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut alternatives = Vec::with_capacity(keys.len());
+        for key in keys {
+            let key_value = rift_core::SymbolId::new(key.as_str())?;
+            let Some(symbol) = self.index.object_by_identity(&key_value)? else {
+                continue;
+            };
+            let name = symbol.facts().qualified_name();
+            if !rift_protocol::read::symbol_name_is_public(name) {
+                continue;
+            }
+            alternatives.push(SymbolAlternative {
+                id: key,
+                name: name.to_owned(),
+                match_context: vec![
+                    SymbolMatchContext::Owner,
+                    SymbolMatchContext::Language,
+                    SymbolMatchContext::Name,
+                ],
+            });
+        }
+        Ok((alternatives, None))
     }
 
     fn refused_public_symbol(
@@ -676,12 +808,14 @@ fn local_view_input(
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Vec<u8>,
     history: Option<(String, Arc<[u8]>)>,
+    traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
     ready: bool,
 ) -> LocalSymbolViewInput {
     let material = Arc::new(LocalSymbolMaterial {
         index,
         metadata: Arc::from(metadata),
         history,
+        traversal,
     });
     let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
         .saturating_add(4 * std::mem::size_of::<usize>())
@@ -690,13 +824,28 @@ fn local_view_input(
             id.capacity()
                 .saturating_add(bytes.len())
                 .saturating_add(2 * std::mem::size_of::<usize>())
-        }));
+        }))
+        .saturating_add(
+            material
+                .traversal
+                .as_ref()
+                .map_or(0, |(request, references)| {
+                    request
+                        .len()
+                        .saturating_add(4 * std::mem::size_of::<usize>())
+                        .saturating_add(references.retained_material_bytes())
+                }),
+        );
     LocalSymbolViewInput {
         material,
         ready,
         retained_bytes,
     }
 }
+
+mod nodes;
+mod source;
+mod traversal;
 
 #[cfg(test)]
 mod tests;

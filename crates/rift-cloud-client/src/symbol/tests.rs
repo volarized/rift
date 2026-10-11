@@ -37,7 +37,11 @@ fn view() -> Value {
 fn found(declarations: Vec<Value>) -> GetSymbolResult {
     serde_json::from_value(json!({
         "outcome": "found",
-        "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"},
+        "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct", "origin": {
+            "location": "dependency", "source_kind": "authored", "package": {
+                "manager": "cargo", "registry": "crates.io", "name": "tokio", "version": "1.50.0"
+            }
+        }},
         "view": view(),
         "declarations": Value::Array(declarations),
     }))
@@ -64,6 +68,11 @@ fn declaration(source: &str) -> Value {
 fn source_less_found_and_typed_absence_remain_distinct() {
     let request = request();
     assert!(valid_result(&request, &found(Vec::new()), 100));
+    let mut intrinsic = serde_json::to_value(found(Vec::new())).expect("source-less symbol");
+    intrinsic["symbol"]["origin"] = json!({"source_kind": "synthetic"});
+    let intrinsic: GetSymbolResult =
+        serde_json::from_value(intrinsic).expect("synthetic source-less symbol");
+    assert!(valid_result(&request, &intrinsic, 100));
     let missing = serde_json::from_value(json!({
         "outcome": "missing", "view": view(),
         "symbol_not_found": {"id": ID, "alternatives": [{
@@ -237,4 +246,144 @@ fn exact_response_keeps_service_problem_separate_from_unavailable() {
             assert_eq!(problem["detail"], "fixture problem");
         }
     }
+}
+
+fn documented_result() -> Value {
+    let content = json!({"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/tokio@1.50.0/README.md"}});
+    let mut result =
+        serde_json::to_value(found(vec![declaration("pub struct Beacon;")])).expect("found");
+    result["documentation"] = json!({
+        "documentation_revision": "0123abcd", "truncated": false,
+        "references": [{
+            "reference": {"identity": "5".repeat(64), "block": "1".repeat(64),
+                "target": ID, "range": {"start": 1, "end": 7},
+                "authored": "Beacon", "evidence": "unique_name"},
+            "documentation": {
+                "documentation_revision": "0123abcd",
+                "block": {"identity": "1".repeat(64), "source": content,
+                    "content_digest": "2".repeat(64), "range": {"start": 0, "end": 40},
+                    "line": 1, "kind": "prose"},
+                "source": {"identity": content, "revision": "3".repeat(64), "content_digest": "4".repeat(64),
+                    "origin": {"location": "dependency", "source_kind": "authored", "package": {
+                        "manager": "cargo", "registry": "crates.io", "name": "tokio", "version": "1.50.0"}},
+                    "format": "markdown", "media_type": "text/markdown", "selection": "package_archive", "byte_length": 40}
+            }, "excerpt": "guide"
+        }]
+    });
+    result
+}
+
+#[test]
+fn canonical_documentation_keeps_original_associations_and_refuses_tampered_facts() {
+    let mut request = request();
+    request.include.push(GetSymbolInclude::Documentation);
+    let original = documented_result();
+    let result: GetSymbolResult =
+        serde_json::from_value(original.clone()).expect("documented result");
+    assert!(valid_result(&request, &result, 100));
+    let mut source_less = original.clone();
+    source_less["declarations"] = json!([]);
+    let source_less = serde_json::from_value(source_less).expect("source-less documented symbol");
+    assert!(valid_result(&request, &source_less, 5));
+    assert!(!valid_result(&request, &source_less, 4));
+    for (pointer, changed) in [
+        (
+            "/documentation/references/0/reference/target",
+            json!(OTHER_ID),
+        ),
+        (
+            "/documentation/references/0/reference/block",
+            json!("6".repeat(64)),
+        ),
+        ("/documentation/references/0/reference/range/end", json!(41)),
+        (
+            "/documentation/references/0/documentation/documentation_revision",
+            json!("abcdef01"),
+        ),
+        (
+            "/documentation/references/0/documentation/source/origin/package/version",
+            json!("1.49.0"),
+        ),
+        (
+            "/documentation/references/0/documentation/source/identity/source/unit",
+            json!("rift://source/cargo/crates.io/tokio@1.49.0/README.md"),
+        ),
+        (
+            "/documentation/references/0/documentation/source/revision",
+            json!("invalid"),
+        ),
+        (
+            "/documentation/references/0/documentation/source/byte_length",
+            json!(39),
+        ),
+        ("/documentation/references/0/excerpt", json!("x".repeat(41))),
+        ("/declarations/0/origin/package/version", json!("1.49.0")),
+        (
+            "/declarations/0/unit",
+            json!("rift://source/cargo/crates.io/tokio@1.49.0/src/lib.rs"),
+        ),
+    ] {
+        let mut changed_result = original.clone();
+        *changed_result.pointer_mut(pointer).expect("fixture field") = changed;
+        let result = serde_json::from_value(changed_result).expect("typed tampered result");
+        assert!(!valid_result(&request, &result, 100), "refuse {pointer}");
+    }
+    let mut duplicate = original.clone();
+    let reference = duplicate["documentation"]["references"][0].clone();
+    duplicate["documentation"]["references"]
+        .as_array_mut()
+        .expect("references")
+        .push(reference);
+    assert!(!valid_result(
+        &request,
+        &serde_json::from_value(duplicate).expect("duplicate"),
+        100
+    ));
+    let mut warning = original;
+    warning["documentation"]["warnings"] = json!([{
+        "source": {"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/tokio@1.49.0/README.md"}},
+        "stage": "source", "kind": "source_unavailable", "count": 1
+    }]);
+    assert!(!valid_result(
+        &request,
+        &serde_json::from_value(warning).expect("warning"),
+        100
+    ));
+    request
+        .include
+        .retain(|include| *include != GetSymbolInclude::Documentation);
+    assert!(!valid_result(&request, &result, 100));
+}
+
+#[test]
+fn canonical_runtime_documentation_preserves_exact_runtime_source_owner() {
+    let id = "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFileSync";
+    let unit = "rift://source/stdlib/node@26.11.1/doc/api/fs.md";
+    let mut value = documented_result();
+    value["symbol"]["id"] = json!(id);
+    value["symbol"]["language"] = json!("javascript");
+    value["symbol"]["name"] = json!("readFileSync");
+    value["symbol"]["origin"] = json!({"location": "stdlib", "source_kind": "authored", "runtime": {
+        "runtime": "node", "version": "26.11.1"
+    }});
+    value["declarations"] = json!([]);
+    value["documentation"]["references"][0]["reference"]["target"] = json!(id);
+    for pointer in [
+        "/documentation/references/0/documentation/source/identity/source/unit",
+        "/documentation/references/0/documentation/block/source/source/unit",
+    ] {
+        *value.pointer_mut(pointer).expect("unit") = json!(unit);
+    }
+    value["documentation"]["references"][0]["documentation"]["source"]["origin"] = json!({
+        "location": "stdlib", "source_kind": "authored", "runtime": {"runtime": "node", "version": "26.11.1"}
+    });
+    let mut request = request();
+    request.id = rift_protocol::read::SymbolId::parse(id).expect("runtime identity");
+    request.include.push(GetSymbolInclude::Documentation);
+    let result = serde_json::from_value(value.clone()).expect("runtime result");
+    assert!(valid_result(&request, &result, 100));
+    value["documentation"]["references"][0]["documentation"]["source"]["origin"]["runtime"]["version"] =
+        json!("26.11.0");
+    let result = serde_json::from_value(value).expect("foreign runtime result");
+    assert!(!valid_result(&request, &result, 100));
 }

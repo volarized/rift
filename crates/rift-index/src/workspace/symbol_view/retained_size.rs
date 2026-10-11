@@ -123,6 +123,10 @@ impl GetSize for WorkspaceSymbolView {
         bytes = bytes.saturating_add(part);
         let (part, tracker) = map(&self.files, tracker);
         bytes = bytes.saturating_add(part);
+        let (part, tracker) = map(&self.frameworks, tracker);
+        bytes = bytes.saturating_add(part);
+        let (part, tracker) = map(&self.identities, tracker);
+        bytes = bytes.saturating_add(part);
         let (part, tracker) = map(&self.text_files, tracker);
         bytes = bytes.saturating_add(part);
         let (part, tracker) = map(&self.notebooks, tracker);

@@ -1,4 +1,9 @@
 use super::*;
+use rift_protocol::{
+    read::GetSymbolInclude,
+    symbol_read::{GetSymbolParams, GetSymbolResult},
+};
+use serde_json::json;
 
 fn assert_registered_field(error: &rift_error::RiftError, slug: &str, field: &str) {
     assert_eq!(error.slug().as_str(), slug, "{error}");
@@ -85,6 +90,11 @@ enum OperationFixture {
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
+    },
+    DocumentationBounds {
+        search: serde_json::Value,
+        symbols: serde_json::Value,
+        source_bytes_max: usize,
     },
     EchoResolution,
     InvalidResolutionAccounting,
@@ -429,7 +439,7 @@ const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
-        OperationFixture::Documentation { .. } => {
+        OperationFixture::Documentation { .. } | OperationFixture::DocumentationBounds { .. } => {
             value["supported_features"] = serde_json::json!([
                 "resolutions",
                 "search",
@@ -438,6 +448,12 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
                 "symbol_documentation"
             ]);
             value["documentation_revision"] = serde_json::json!("0123abcd");
+            if let OperationFixture::DocumentationBounds {
+                source_bytes_max, ..
+            } = mode
+            {
+                value["bounds"]["source_bytes_max"] = serde_json::json!(source_bytes_max);
+            }
         }
         OperationFixture::InvalidPublication => {
             value["publication_format"] = serde_json::json!("other");
@@ -566,7 +582,8 @@ fn operation_search_response(
     }
     let cursor = query_cursor(query);
     let body = match mode {
-        OperationFixture::Documentation { search, .. } => search.clone(),
+        OperationFixture::Documentation { search, .. }
+        | OperationFixture::DocumentationBounds { search, .. } => search.clone(),
         OperationFixture::UnrequestedPackage => {
             search_page_json("other", None, "analyzer-v1", "first")
         }
@@ -630,47 +647,18 @@ fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde
     }
 }
 
-fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Response {
-    let cursor = query_cursor(query);
-    let followed = cursor.is_some();
-    let body = match mode {
-        OperationFixture::Documentation { symbols, .. } => symbols.clone(),
-        OperationFixture::CollectionBounds { source_bytes, .. } => {
-            let mut page = symbol_page_json("demo", None, "analyzer-v1", "first");
-            page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
-            page
-        }
-        OperationFixture::BodyBoundStop => pages::body_bound_page(
-            symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
-            symbol_page_json("demo", None, "analyzer-v2", "second"),
-            cursor,
-        ),
-        OperationFixture::PageRevisionChange => symbol_page_json(
-            "demo",
-            Some("next"),
-            if followed {
-                "analyzer-v2"
-            } else {
-                "analyzer-v1"
-            },
-            if followed { "second" } else { "first" },
-        ),
-        OperationFixture::MismatchedCursor => symbol_page_json(
-            "demo",
-            (!followed).then_some("next"),
-            "analyzer-v2",
-            "first",
-        ),
-        OperationFixture::RepeatedCursor => symbol_page_json(
-            "demo",
-            Some("next"),
-            "analyzer-v2",
-            if followed { "second" } else { "first" },
-        ),
-        _ if followed => symbol_page_json("demo", None, "analyzer-v2", "second"),
-        _ => symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
+fn operation_symbol_response(mode: &OperationFixture, _query: Option<&str>) -> Response {
+    let mut value = match mode {
+        OperationFixture::Documentation { symbols, .. }
+        | OperationFixture::DocumentationBounds { symbols, .. } => symbols.clone(),
+        _ => symbol_result_json("demo", "first"),
     };
-    json_response(&body, None)
+    if let OperationFixture::CollectionBounds { source_bytes, .. } = mode {
+        value["declarations"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
+        value["declarations"][0]["range"]["end"] = serde_json::json!(*source_bytes);
+        value["declarations"][0]["source_complete"] = serde_json::json!(true);
+    }
+    json_response(&value, None)
 }
 
 fn query_cursor(query: Option<&str>) -> Option<&str> {
@@ -793,19 +781,6 @@ fn invalid_search_page(mode: &OperationFixture) -> serde_json::Value {
         page["items"][0]["match_class"] = serde_json::json!("substring");
     }
     page
-}
-
-fn symbol_page_json(
-    package: &str,
-    next: Option<&str>,
-    analyzer: &str,
-    suffix: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "items":[{"package":package_json(package),"symbol":symbol_json(package, suffix),"unit":format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"),"range":{"start":0,"end":4},"line":1,"match_class":"qualified_exact"}],
-        "next_cursor":next, "warnings":[], "publication_format":"rift-package-index-v2",
-        "analyzer_revision":analyzer, "corpus_revision":"corpus-v1"
-    })
 }
 
 fn capabilities_response() -> Response {
@@ -1191,8 +1166,8 @@ fn test_generated_requests_serialize_only_declared_fields() {
     assert!(value.get("unknown").is_none());
 }
 
-#[test]
-fn test_documentation_request_requires_advertised_capability() {
+#[tokio::test]
+async fn test_documentation_request_requires_advertised_capability() {
     let mut capabilities: Capabilities =
         serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
     let mut request = search_request();
@@ -1210,15 +1185,33 @@ fn test_documentation_request_requires_advertised_capability() {
     assert!(validate_search_request_for_capabilities(&request, 20, None, &capabilities).is_ok());
 
     let mut symbol = symbol_request();
-    symbol.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
-    let error = validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities)
+    symbol.include = vec![GetSymbolInclude::Documentation];
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let error = client
+        .get_symbol(&symbol)
+        .await
         .expect_err("documentation capability");
     assert_registered_field(&error, "rift.client.configuration_invalid", "feature");
     assert!(error_text_field(&error, "violation").contains("symbol_documentation"));
-    capabilities
-        .supported_features
-        .push("symbol_documentation".to_owned());
-    assert!(validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities).is_ok());
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
+    assert!(
+        server
+            .state
+            .request_log
+            .lock()
+            .await
+            .iter()
+            .all(|sent| sent.method != Method::POST)
+    );
+    assert!(
+        canonical_symbol_response(
+            symbol_result_json("demo", "first"),
+            &symbol,
+            SOURCE_BYTES_MAX
+        )
+        .await
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1648,10 +1641,7 @@ async fn operation_failure(
             .search_packages(&search_request(), OPERATION_PAGE_LIMIT, None)
             .await
             .err(),
-        Endpoint::Symbols => client
-            .list_package_symbols(&symbol_request(), OPERATION_PAGE_LIMIT, None)
-            .await
-            .err(),
+        Endpoint::Symbols => client.get_symbol(&symbol_request()).await.err(),
         Endpoint::Patterns => client
             .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
             .await
@@ -2076,14 +2066,14 @@ fn test_query_term_and_name_bounds_count_characters() {
         "term",
     );
 
-    let mut symbol = symbol_request();
-    symbol.name = at_bound(QUERY_BYTES_MAX);
-    assert!((validate_symbol_request(&symbol)).is_ok());
-    symbol.name = past_bound(QUERY_BYTES_MAX);
+    let mut search = search_request();
+    search.identifiers = Some(vec!["x".repeat(IDENTIFIER_BYTES_MAX)]);
+    assert!(validate_search_request(&search).is_ok());
+    search.identifiers = Some(vec!["x".repeat(IDENTIFIER_BYTES_MAX + 1)]);
     assert_registered_field(
-        &(validate_symbol_request(&symbol)).expect_err("registered refusal"),
+        &validate_search_request(&search).expect_err("identifier bound"),
         "rift.client.request_invalid",
-        "name",
+        "identifiers",
     );
 }
 
@@ -2195,13 +2185,54 @@ fn search_request() -> PackageSearchRequest {
     }
 }
 
-fn symbol_request() -> PackageSymbolRequest {
-    PackageSymbolRequest {
-        name: "demo".to_owned(),
-        language: Some("rust".to_owned()),
-        include: None,
-        packages: vec![package_request()],
-    }
+fn symbol_request() -> GetSymbolParams {
+    serde_json::from_value(serde_json::json!({
+        "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo"
+    }))
+    .expect("canonical symbol request")
+}
+
+fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "found", "symbol": {
+            "id": format!("rift://symbol/cargo/crates.io/{package}@1.0.0/rust/{package}"),
+            "language": "rust", "name": package, "kind": "function",
+            "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"}
+        },
+        "view": {"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"},
+        "declarations": [{
+            "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"},
+            "unit": format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"),
+            "range": {"start": 0, "end": 4}, "line": 1, "source_complete": false,
+            "signature_indices": [], "type_indices": [], "documentation_indices": []
+        }]
+    })
+}
+
+async fn canonical_symbol_response(
+    value: serde_json::Value,
+    request: &GetSymbolParams,
+    source_bytes_max: usize,
+) -> Result<GetSymbolResult, RiftError> {
+    canonical_symbol_response_with_bounds(value, request, source_bytes_max, SOURCE_BYTES_MAX).await
+}
+
+async fn canonical_symbol_response_with_bounds(
+    value: serde_json::Value,
+    request: &GetSymbolParams,
+    configured_source_bytes_max: usize,
+    advertised_source_bytes_max: usize,
+) -> Result<GetSymbolResult, RiftError> {
+    let (server, _) = operation_client(OperationFixture::DocumentationBounds {
+        search: documentation::page(),
+        symbols: value,
+        source_bytes_max: advertised_source_bytes_max,
+    })
+    .await;
+    let mut config = server.config();
+    config.max_source = configured_source_bytes_max;
+    let client = GlobalClient::new(config).expect("canonical client");
+    client.get_symbol(request).await
 }
 
 async fn operation_client(mode: OperationFixture) -> (FixtureServer, GlobalClient) {
@@ -2558,7 +2589,7 @@ async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() 
         serde_json::from_value(serde_json::json!({"id":id})).expect("request");
     let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
     for answer in [
-        serde_json::json!({"outcome":"found","symbol":{"id":id,"language":"rust","name":"Thing","kind":"struct"},"view":view,"declarations":[],"warnings":[]}),
+        serde_json::json!({"outcome":"found","symbol":{"id":id,"language":"rust","name":"Thing","kind":"struct","origin":{"source_kind":"synthetic"}},"view":view,"declarations":[],"warnings":[]}),
         serde_json::json!({"outcome":"missing","symbol_not_found":{"id":id,"alternatives":[]},"view":view,"warnings":[]}),
         serde_json::json!({"outcome":"unavailable","id":id,"reason":"exact_release","warnings":[]}),
     ] {
@@ -2685,12 +2716,7 @@ async fn test_fixture_search_and_symbol_pages() {
             .await
             .is_ok()
     );
-    assert!(
-        client
-            .list_package_symbols(&symbol_request(), 20, None)
-            .await
-            .is_ok()
-    );
+    assert!(client.get_symbol(&symbol_request()).await.is_ok());
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
         Some("/rift/rest/v1/symbols")
@@ -2734,12 +2760,19 @@ async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
     assert_eq!(pages.ok().map(|value| value.items.len()), Some(2));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 3);
 
-    let (_server, client) = operation_client(OperationFixture::SearchPages).await;
-    let pages = client
-        .list_package_symbols_pages(&symbol_request(), 20)
-        .await;
-    assert!(pages.is_ok());
-    assert_eq!(pages.ok().map(|value| value.items.len()), Some(2));
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let result = client
+        .get_symbol(&symbol_request())
+        .await
+        .expect("canonical result");
+    assert!(
+        matches!(result, GetSymbolResult::Found { ref declarations, .. } if declarations.len() == 1)
+    );
+    assert_eq!(
+        server.state.requests.load(Ordering::SeqCst),
+        2,
+        "exact reads issue no implicit continuation"
+    );
 
     let (_server, client) = operation_client(OperationFixture::PageRevisionChange).await;
     assert_registered_field(
@@ -2905,46 +2938,47 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
     );
 }
 
-/// A padded name keeps its original spelling when the admitted request validates a page.
-#[test]
-fn test_symbol_lookup_accepts_padded_original_names() {
-    let capabilities: Capabilities =
-        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+/// Exact identity selection preserves the declaration's original displayed spelling.
+#[tokio::test]
+async fn test_symbol_lookup_keeps_original_names() {
     for name in ["SearchHit", "searchHit"] {
-        let mut request = symbol_request();
-        request.name = format!(" \t{name}\n ");
-        assert!((validate_symbol_request(&request)).is_ok());
-        let mut value = symbol_page_json("demo", None, "analyzer-v1", "first");
-        value["items"][0]["symbol"]["name"] = serde_json::json!(name);
-        let qualified_name = format!("Module::{name}");
-        value["items"][0]["symbol"]["id"] = serde_json::json!(rift_core::symbol_identity(
-            "rust",
-            "cargo/demo@1.0.0/src/first.rs",
-            &qualified_name,
-        ));
-        value["items"][0]["match_class"] = serde_json::json!("name_exact");
-        let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol page fixture");
-        assert!(
-            (validate_symbol_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX)).is_ok()
+        let mut value = symbol_result_json("demo", "first");
+        value["symbol"]["name"] = serde_json::json!(name);
+        let result = canonical_symbol_response(value, &symbol_request(), SOURCE_BYTES_MAX)
+            .await
+            .expect("canonical symbol");
+        let GetSymbolResult::Found {
+            symbol,
+            declarations,
+            ..
+        } = result
+        else {
+            panic!("found symbol")
+        };
+        assert_eq!(symbol.name, name);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(
+            declarations[0].unit.as_ref().map(|unit| unit.0.as_str()),
+            Some("rift://source/cargo/crates.io/demo@1.0.0/src/first.rs")
         );
-        assert_eq!(page.items[0].symbol.name, name);
     }
+    let mut request = symbol_request();
+    request.id.0 = format!(" \t{}\n ", request.id.0);
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    assert!(client.get_symbol(&request).await.is_err());
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn test_symbol_lookup_refuses_unknown_match_class() {
-    let hit: PackageSymbol = serde_json::from_value(serde_json::json!({
-        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
-        "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
-        "line": 1, "match_class": "unknown"
-    }))
-    .expect("symbol hit fixture");
-    let mut request = symbol_request();
-    request.name = "absent".to_owned();
+#[tokio::test]
+async fn test_symbol_lookup_refuses_discovery_match_class() {
+    let mut value = symbol_result_json("demo", "first");
+    value["match_class"] = serde_json::json!("unknown");
     assert_registered_field(
-        &(validate_symbol_match_class(&request, &hit, "demo")).expect_err("registered refusal"),
+        &canonical_symbol_response(value, &symbol_request(), SOURCE_BYTES_MAX)
+            .await
+            .expect_err("unknown exact-result field"),
         "rift.client.response_invalid",
-        "match_class",
+        "body",
     );
 }
 
@@ -2952,8 +2986,8 @@ fn test_symbol_lookup_refuses_unknown_match_class() {
 /// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
 /// `rift://source/cargo/crates.io/demo@1.0.0/src/first.rs`. The package-relative spelling names a
 /// project file, and no producer mints it for a package declaration, so it is refused.
-#[test]
-fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
+#[tokio::test]
+async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     let hit = |id: &str| {
         let mut value = search_hit_json("demo", "first");
         value["symbol"]["id"] = serde_json::json!(id);
@@ -2974,18 +3008,40 @@ fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
         assert_registered_field(&error, "rift.client.response_invalid", "symbol_identity");
     }
 
-    let symbol: PackageSymbol = serde_json::from_value(serde_json::json!({
-        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
-        "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
-        "line": 1, "match_class": "qualified_exact"
-    }))
-    .expect("symbol hit fixture");
-    let candidate = PackageSymbolCandidate::try_from(&symbol)
-        .unwrap_or_else(|error| panic!("package symbol identity: {error:?}"));
+    let result = canonical_symbol_response(
+        symbol_result_json("demo", "first"),
+        &symbol_request(),
+        SOURCE_BYTES_MAX,
+    )
+    .await
+    .expect("canonical owner and source unit");
+    let GetSymbolResult::Found {
+        symbol,
+        declarations,
+        ..
+    } = result
+    else {
+        panic!("found symbol")
+    };
+    assert_eq!(symbol.id.as_ref(), Some(&symbol_request().id));
     assert_eq!(
-        candidate.symbol_identity.0,
-        "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo"
+        declarations[0].unit.as_ref().map(|unit| unit.0.as_str()),
+        Some("rift://source/cargo/crates.io/demo@1.0.0/src/first.rs")
     );
+    for unit in [
+        "rift://source/cargo/crates.io/demo@2.0.0/src/first.rs",
+        "rift://source/npm/npmjs.org/demo@1.0.0/src/first.rs",
+    ] {
+        let mut value = symbol_result_json("demo", "first");
+        value["declarations"][0]["unit"] = serde_json::json!(unit);
+        assert_registered_field(
+            &canonical_symbol_response(value, &symbol_request(), SOURCE_BYTES_MAX)
+                .await
+                .expect_err("foreign source owner"),
+            "rift.client.response_invalid",
+            "body",
+        );
+    }
 }
 
 #[test]
@@ -3078,7 +3134,7 @@ async fn test_fixture_enforces_active_server_bounds() {
     // Each page read meets the advertised response body bound on its own request, refusing
     // the page by its declared length, and records the failure a later request answers.
     let search_page = search_page_json("demo", None, "analyzer-v2", "first").to_string();
-    let symbol_page = symbol_page_json("demo", Some("next"), "analyzer-v2", "first").to_string();
+    let symbol_page = symbol_result_json("demo", "first").to_string();
     for (endpoint, page) in [
         (crate::contract::Endpoint::Search, search_page),
         (crate::contract::Endpoint::Symbols, symbol_page),
@@ -3164,4 +3220,100 @@ async fn exact_source_preserves_warning_bound_and_source_evidence() {
         .await
         .expect("typed source outcome");
     assert_eq!(serde_json::to_value(answer).expect("source wire"), value);
+}
+
+#[test]
+fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
+    use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+    const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+    let request: GetSymbolParams = serde_json::from_value(json!({
+        "id": ID, "include": ["source", "documentation"], "declaration_limit": 5,
+        "view": "a".repeat(64),
+    }))
+    .expect("shared request");
+    let wire = serde_json::to_value(&request).expect("shared request encoding");
+    let generated = crate::generated::GetSymbolParams {
+        id: request.id.as_str().to_owned(),
+        include: Some(vec![
+            crate::generated::GetSymbolInclude::Source,
+            crate::generated::GetSymbolInclude::Documentation,
+        ]),
+        declaration_limit: Some(request.declaration_limit),
+        declaration_cursor: request.declaration_cursor.clone(),
+        rev: request.rev.as_ref().map(|revision| revision.0.clone()),
+        view: request.view.as_ref().map(|view| view.as_str().to_owned()),
+    };
+    assert_eq!(
+        serde_json::to_value(&generated).expect("generated request wire"),
+        wire
+    );
+    assert_eq!(generated.id, request.id.as_str());
+    assert_eq!(generated.declaration_limit, Some(5));
+    assert_eq!(
+        generated.view.as_deref(),
+        request
+            .view
+            .as_ref()
+            .map(rift_protocol::symbol_read::CapturedViewId::as_str)
+    );
+    assert_eq!(generated.include.expect("requested includes").len(), 2);
+    let view = json!({"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"});
+    for value in [
+        json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "view": view, "declarations": []}),
+        json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "view": view}),
+        json!({"outcome": "unavailable", "id": ID, "reason": "exact_release"}),
+    ] {
+        let shared: GetSymbolResult =
+            serde_json::from_value(value.clone()).expect("shared outcome");
+        assert!(shared.is_valid_for(&request.id));
+        let generated: crate::generated::GetSymbolResult =
+            serde_json::from_value(value).expect("generated outcome shape");
+        match (shared, generated) {
+            (
+                GetSymbolResult::Found { symbol, view, .. },
+                crate::generated::GetSymbolResult::Object(result),
+            ) => {
+                assert_eq!(result.outcome, "found");
+                assert_eq!(
+                    result.symbol.id.as_deref(),
+                    symbol
+                        .id
+                        .as_ref()
+                        .map(rift_protocol::read::SymbolId::as_str)
+                );
+                assert_eq!(result.view.id, view.id.as_str());
+                assert!(result.declarations.is_empty());
+            }
+            (
+                GetSymbolResult::Missing {
+                    symbol_not_found,
+                    view,
+                    ..
+                },
+                crate::generated::GetSymbolResult::Object2(result),
+            ) => {
+                assert_eq!(result.outcome, "missing");
+                assert_eq!(result.symbol_not_found.id, symbol_not_found.id.as_str());
+                assert_eq!(result.view.id, view.id.as_str());
+            }
+            (
+                GetSymbolResult::Unavailable { id, .. },
+                crate::generated::GetSymbolResult::Object3(result),
+            ) => {
+                assert_eq!(result.outcome, "unavailable");
+                assert_eq!(result.id, id.as_str());
+                assert!(result.view.is_none());
+            }
+            _ => panic!("generated outcome must keep the shared branch"),
+        }
+    }
+    assert!(
+        serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "name": "Beacon"})).is_err()
+    );
+    assert!(
+        serde_json::from_value::<GetSymbolResult>(
+            json!({"outcome": "unavailable", "reason": "exact_release"})
+        )
+        .is_err()
+    );
 }

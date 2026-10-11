@@ -112,6 +112,9 @@ pub struct CapturedView {
 /// Reads one exact logical symbol obtained from discovery or another read.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    {"id": "rift://symbol/local/rust/app/parser/parse", "include": ["source"]}
+]))]
 pub struct GetSymbolParams {
     /// Canonical identity. Ownership and language come from this address.
     #[serde(deserialize_with = "deserialize_symbol_id")]

@@ -2,34 +2,34 @@
 
 Generated from the served tool surface.
 
-## get_symbol
+## get_source
 
-Finds declarations and their source by exact symbol name. Each hit
-carries the declaration and its source excerpt unless `include` omits
-`source`. `include: ["history"]` adds each hit's version-control timeline,
-walked from the served revision. `rev` serves the lookup from a
-version-control revision instead of the current tree. `scope` reaches
-past the project tree: `global` answers from the public declarations the
-global index holds for the workspace's dependencies alone, `all` from both,
-project hits first. `packages` names package versions the lookup reads beside the
-workspace's own, such as an upgrade target or a package the project does not use
-yet. A name with no match carries `symbol_not_found`, naming the lookup and
-up to three closest project declaration identities. A `global` lookup carries
-no alternatives; `all` proposes project declarations alone. A closest ranking
-past its fixed work bound leaves alternatives empty and explains why in `detail`.
-Use `search` when
-the name is not exactly known.
+Reads a canonical source unit or a half-open UTF-8 byte range. A preceding `view`
+retains its immutable selection and original expiry; `rev` selects a local Git revision.
+The result returns source bytes, definite absence or typed selection unavailability.
 
 Parameters:
 
-- `name` (required) - The declaration name to look up - a name, not a full `SymbolId` or free-text query; `search` takes free text.
-- `language` - Narrows the answer to one language.
-- `scope` - Which declarations the lookup searches: the project tree, the dependency packages, or both.
-- `packages` - Packages this lookup reads beside the ones the workspace's manifests and lockfiles name, at most 64.
-- `include` - Optional hit fields to attach: `source`, `history`.
-- `limit` - Most hits to return in one page, at most 10,000; the server refuses a larger `limit` naming the field.
-- `page_index` - Zero-based page of the result set to serve, sized by `limit`.
-- `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
+- `unit` (required) - Canonical source unit, retaining its physical package or runtime owner.
+- `range` - Requested half-open UTF-8 byte range.
+- `view` - A preceding immutable selection.
+- `rev` - A local Git revision.
+
+## get_symbol
+
+Reads one logical symbol by its canonical `id`. The caller may select a preceding
+immutable `view`; continuations retain that selection and its original expiry.
+A complete exact miss returns `symbol_not_found` and up to three alternatives.
+An unavailable selection returns its typed cause. Use `search` for discovery.
+
+Parameters:
+
+- `id` (required) - Canonical identity.
+- `include` - Requested projections.
+- `rev` - A local Git revision.
+- `view` - A view returned by a preceding read.
+- `declaration_limit` - Most declarations returned in this read.
+- `declaration_cursor` - Continuation bound to this exact symbol, projections and serving view.
 
 ## nodes
 
@@ -49,6 +49,7 @@ Parameters:
 
 - `path` (required) - Project-relative file to inspect.
 - `position` (required) - UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes themselves carry the spans.
+- `view` - Captured view selected by discovery.
 - `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
 
 ## search
@@ -77,6 +78,7 @@ results computed from another.
 
 Parameters:
 
+- `view` - The captured serving context returned by an earlier search.
 - `target` - Which entity kinds may be returned - a kind selector, never the text to search for; that is `query`.
 - `order` - Which total order the page comes back in.
 - `query` - Text to match against declaration names, qualified names, signatures, attached documentation, and file contents.

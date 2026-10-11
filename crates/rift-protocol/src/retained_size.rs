@@ -500,9 +500,68 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+heap_fields!(crate::read::SourceUnitSpan, unit);
+heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, evidence => vector, occurrence, extensions);
+heap_fields!(crate::search::GraphHop, relationship);
+
+impl GetSize for crate::read::RelationshipFacet {
+    fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        (0, tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_relationship_material_counts_capacity_and_refuses_unmeasured_facts() {
+        let mut kind = String::with_capacity(256);
+        kind.push_str("calls");
+        let mut facets = Vec::with_capacity(32);
+        facets.push(crate::read::RelationshipFacet::Calls);
+        let edge = crate::read::Relationship {
+            from: SymbolId("rift://symbol/local/rust/app/caller".to_owned()),
+            kind: ExactKind(kind),
+            facets,
+            to: SymbolId("rift://symbol/local/rust/app/callee".to_owned()),
+            evidence: vec![NodeId("rift://node/rust/lib.rs@0-12#12345678".to_owned())],
+            occurrence: Some(crate::read::SourceUnitSpan {
+                unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
+                range: crate::read::TextRange { start: 0, end: 12 },
+            }),
+            derivation: crate::read::RelationshipDerivation::Resolution,
+            confidence: None,
+            extensions: Extensions::default(),
+        };
+        let minimum = edge.kind.0.capacity()
+            + edge.facets.capacity() * std::mem::size_of::<crate::read::RelationshipFacet>()
+            + edge.from.0.capacity()
+            + edge.to.0.capacity();
+        let hop = crate::search::GraphHop {
+            relationship: edge,
+            direction: crate::search::HopDirection::Outgoing,
+        };
+        let measured = hop
+            .get_size_with_tracker(get_size2::StandardTracker::new())
+            .0;
+        assert!(measured >= std::mem::size_of_val(&hop) + minimum);
+        assert_ne!(measured, usize::MAX);
+        let mut unmeasured = hop;
+        unmeasured.relationship.extensions = Extensions(std::collections::BTreeMap::from([(
+            ExtensionKey("example.org.fact".to_owned()),
+            crate::read::ExtensionValue {
+                version: 1,
+                data: serde_json::json!({"held": true}),
+            },
+        )]));
+        assert_eq!(unmeasured.get_size(), usize::MAX);
+        let values = vec![unmeasured];
+        assert_eq!(
+            retained_vector_material(&values, get_size2::StandardTracker::new()).0,
+            usize::MAX
+        );
+    }
 
     #[test]
     fn retained_fact_material_counts_capacity_and_shared_arcs_once() {

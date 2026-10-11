@@ -91,7 +91,7 @@ impl Endpoint {
             Self::Capabilities => "getCapabilities",
             Self::Resolutions => "resolvePackageContext",
             Self::Search => "searchPackages",
-            Self::Symbols => "listPackageSymbols",
+            Self::Symbols => "get_symbol",
             Self::Patterns => "searchPackagePatterns",
             Self::Declarations => "findDeclarations",
             Self::Source => "getSource",
@@ -102,7 +102,7 @@ impl Endpoint {
         let mut statuses = ERROR_STATUSES.into_iter().collect::<BTreeSet<_>>();
         statuses.insert(StatusCode::OK);
         statuses.insert(StatusCode::GATEWAY_TIMEOUT);
-        if self == Self::Source {
+        if matches!(self, Self::Source | Self::Symbols) {
             statuses.insert(StatusCode::NOT_FOUND);
         }
         if self == Self::Capabilities {
@@ -213,6 +213,7 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     }
     validate_security(&spec).map_err(&invalid)?;
     validate_operations(&spec).map_err(&invalid)?;
+    validate_symbol_contract(&document).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
     validate_optional_properties_omit_null(&document).map_err(&invalid)?;
     validate_patterns(&document).map_err(&invalid)?;
@@ -336,7 +337,9 @@ fn validate_response_media(
             }
             continue;
         }
-        if endpoint == Endpoint::Source && *status == StatusCode::SERVICE_UNAVAILABLE {
+        if matches!(endpoint, Endpoint::Source | Endpoint::Symbols)
+            && *status == StatusCode::SERVICE_UNAVAILABLE
+        {
             if response.content.len() != 2
                 || !response.content.contains_key("application/json")
                 || !response.content.contains_key("application/problem+json")
@@ -348,7 +351,8 @@ fn validate_response_media(
             continue;
         }
         let expected = if *status == StatusCode::OK
-            || (endpoint == Endpoint::Source && *status == StatusCode::NOT_FOUND)
+            || (matches!(endpoint, Endpoint::Source | Endpoint::Symbols)
+                && *status == StatusCode::NOT_FOUND)
         {
             "application/json"
         } else {
@@ -387,6 +391,58 @@ fn validate_request(spec: &Spec, endpoint: Endpoint, operation: &Operation) -> R
     Ok(())
 }
 
+fn validate_symbol_contract(document: &Value) -> Result<(), String> {
+    let operation = &document["paths"]["/v1/symbols"]["post"];
+    if operation.get("parameters").is_some_and(|parameters| {
+        parameters
+            .as_array()
+            .is_none_or(|values| !values.is_empty())
+    }) {
+        return Err("POST /v1/symbols must not declare query selectors".to_owned());
+    }
+    let request = &operation["requestBody"]["content"]["application/json"]["schema"];
+    if request != &json!({"$ref": "#/components/schemas/GetSymbolParams"}) {
+        return Err("POST /v1/symbols request must use GetSymbolParams".to_owned());
+    }
+    for status in ["200", "404", "503"] {
+        let response = &operation["responses"][status]["content"]["application/json"]["schema"];
+        if response != &json!({"$ref": "#/components/schemas/GetSymbolResult"}) {
+            return Err(format!(
+                "POST /v1/symbols {status} response must use GetSymbolResult"
+            ));
+        }
+    }
+    let schemas = &document["components"]["schemas"];
+    let declaration_limit_max = rift_protocol::read::PAGE_LIMIT_MAX;
+    for (path, actual, expected) in [
+        (
+            "GetSymbolResult/found/declarations/maxItems",
+            schemas["GetSymbolResult"]["oneOf"][0]["properties"]["declarations"]["maxItems"]
+                .as_u64(),
+            declaration_limit_max,
+        ),
+        (
+            "GetSymbolParams/declaration_limit/maximum",
+            schemas["GetSymbolParams"]["properties"]["declaration_limit"]["maximum"].as_u64(),
+            declaration_limit_max,
+        ),
+        (
+            "GetSymbolParams/declaration_cursor/maxLength",
+            schemas["GetSymbolParams"]["properties"]["declaration_cursor"]["maxLength"].as_u64(),
+            4096,
+        ),
+        (
+            "GetSymbolResult/found/declaration_cursor/maxLength",
+            schemas["GetSymbolResult"]["oneOf"][0]["properties"]["declaration_cursor"]["maxLength"]
+                .as_u64(),
+            4096,
+        ),
+    ] {
+        expect_bound(path, actual, expected)?;
+    }
+    Ok(())
+}
+
 fn validate_bounds(spec: &Spec) -> Result<(), String> {
     // Before the pins below, so a package field raised past the detail bound names the
     // detail it no longer fits.
@@ -405,7 +461,6 @@ fn validate_bounds(spec: &Spec) -> Result<(), String> {
             crate::DEPENDENCY_ENTRIES_MAX,
         ),
         ("PackageSearchPage", "items", page_items_max),
-        ("PackageSymbolPage", "items", page_items_max),
         ("PackagePatternPage", "items", page_items_max),
         (
             "FindDeclarationsParams",
@@ -489,7 +544,7 @@ fn validate_max_lengths(spec: &Spec) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let expected_max_lengths = [
         ("PackageSearchHit", "source", source_max),
-        ("PackageSymbol", "source", source_max),
+        ("SymbolDeclaration", "source", source_max),
         ("PackagePatternDeclaration", "source", source_max),
         ("PackagePatternHit", "source", source_max),
         (
@@ -728,6 +783,8 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<DocumentationContext>();
     let _ = generator.subschema_for::<rift_protocol::read::SearchHit>();
     let _ = generator.subschema_for::<rift_protocol::read::SearchTraversal>();
+    let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolParams>();
+    let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();

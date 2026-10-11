@@ -1,5 +1,7 @@
 //! Global package routing for current-tree reads.
 
+pub(crate) mod candidates;
+
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -14,7 +16,6 @@ use rift_cloud_client::{
     PackageDeclarationRequestPositionEncoding, PackageIdentity as WirePackageIdentity,
     PackagePatternMatch, PackagePatternRequest, PackageResolutionRequest, PackageSearchCandidate,
     PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget,
-    PackageSymbolCandidate, PackageSymbolRequest, PackageSymbolRequestInclude,
     PreparedPackageResolutionRequest, QueryTerm, Warning, WarningCode,
 };
 use rift_dependency::DependencyContext;
@@ -22,10 +23,9 @@ use rift_error::{RiftError, errors};
 use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
-    DEPENDENCY_WARNINGS_MAX, ExactKind, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
-    GlobalFailureClass, GlobalPageWarningCode, PackageIdentity, Pagination, ReadWarning,
-    ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
-    SearchParamsTarget, SearchResult, SearchScope, SymbolId,
+    DEPENDENCY_WARNINGS_MAX, ExactKind, GlobalFailureClass, GlobalPageWarningCode, PackageIdentity,
+    Pagination, ReadWarning, ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude,
+    SearchParams, SearchParamsTarget, SearchResult, SearchScope, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
@@ -108,7 +108,7 @@ impl<'a> ReadContext<'a> {
     /// the argument.
     pub(crate) fn accepted(
         reads: &'a ReadService,
-        scope: SearchScope,
+        scope: &SearchScope,
         rev: Option<&RevisionId>,
         requested: &'a [RequestedPackage],
     ) -> Result<Self, RiftError> {
@@ -403,6 +403,14 @@ impl GlobalState {
         Ok((context, prepared))
     }
 
+    pub(crate) async fn exact_symbol(
+        &self,
+        configuration: &GlobalConfiguration,
+        params: &rift_protocol::symbol_read::GetSymbolParams,
+    ) -> Result<rift_protocol::symbol_read::GetSymbolResult, RiftError> {
+        self.client(configuration).await?.get_symbol(params).await
+    }
+
     async fn client(&self, configuration: &GlobalConfiguration) -> Result<GlobalClient, RiftError> {
         let config = Config::try_from(configuration)?;
         let credential = std::env::var_os(&config.token_env);
@@ -420,70 +428,6 @@ impl GlobalState {
             client: client.clone(),
         });
         Ok(client)
-    }
-}
-
-/// Reads package declarations for one accepted symbol request.
-pub(crate) async fn package_symbols(
-    client: &GlobalClient,
-    params: &GetSymbolParams,
-    packages: &[WirePackageIdentity],
-) -> Result<GlobalSymbolCandidates, RiftError> {
-    let request = PackageSymbolRequest {
-        name: params.name.clone(),
-        language: params
-            .language
-            .as_ref()
-            .map(rift_core::Language::identity_segment),
-        include: symbol_include(params),
-        packages: packages.to_vec(),
-    };
-    let page = client
-        .list_package_symbols_pages(
-            &request,
-            i64::try_from(params.limit.min(rift_cloud_client::PAGE_LIMIT_MAX as u64))
-                .unwrap_or(rift_cloud_client::PAGE_LIMIT_MAX),
-        )
-        .await?;
-    let warnings = page_warnings(page.warnings);
-    let items = page
-        .items
-        .into_iter()
-        .map(PackageSymbolCandidate::try_from)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(GlobalSymbolCandidates { items, warnings })
-}
-
-/// The declarations the global API named at one walk's package callee positions.
-#[derive(Debug, Default)]
-pub(crate) struct CalleeDeclarations {
-    /// The declaration answered at each position asked, with its kind, by the position's
-    /// encoding and key.
-    named:
-        HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), (SymbolId, ExactKind)>,
-}
-
-/// One package position as a request carries it and its answer names it.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CalleePosition {
-    unit: String,
-    line: u64,
-    character: u64,
-}
-
-impl CalleeDeclarations {
-    /// The declaration the global API named at `callee`'s position, with its kind and the
-    /// exact package holding it; `None` for a position it answered no declaration at, or
-    /// one left unasked.
-    pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
-        let origin = callee_origin(callee)?;
-        let key = (wire_encoding(callee), callee_position(callee, &origin)?);
-        let (id, kind) = self.named.get(&key)?;
-        Some(CalleeDeclaration {
-            id: id.clone(),
-            kind: kind.clone(),
-            origin,
-        })
     }
 }
 
@@ -666,13 +610,6 @@ fn callee_position(
     })
 }
 
-/// Package symbol candidates and page warnings returned by one remote read.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct GlobalSymbolCandidates {
-    pub(crate) items: Vec<PackageSymbolCandidate>,
-    pub(crate) warnings: Vec<ReadWarning>,
-}
-
 /// Reads precise and broad package search phases in order.
 pub(crate) async fn package_search(
     client: &GlobalClient,
@@ -680,8 +617,27 @@ pub(crate) async fn package_search(
     query: &ParsedQuery,
     packages: &[WirePackageIdentity],
 ) -> Result<GlobalSearchCandidates, RiftError> {
+    captured_package_search(client, params, query, packages)
+        .await
+        .map(|captured| captured.candidates)
+}
+
+/// Package candidate phases retained under their original captured view.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CapturedGlobalSearchCandidates {
+    pub(crate) view: Option<rift_protocol::symbol_read::CapturedView>,
+    pub(crate) candidates: GlobalSearchCandidates,
+}
+
+/// Reads both package candidate phases under one captured selection.
+pub(crate) async fn captured_package_search(
+    client: &GlobalClient,
+    params: &SearchParams,
+    query: &ParsedQuery,
+    packages: &[WirePackageIdentity],
+) -> Result<CapturedGlobalSearchCandidates, RiftError> {
     if params.target == rift_protocol::read::SearchParamsTarget::File {
-        return Ok(GlobalSearchCandidates::default());
+        return Ok(CapturedGlobalSearchCandidates::default());
     }
     let page_limit = rift_cloud_client::PAGE_LIMIT_MAX;
     let precise_page = client
@@ -690,6 +646,7 @@ pub(crate) async fn package_search(
             page_limit,
         )
         .await?;
+    let view = precise_page.view.clone();
     let mut warnings = page_warnings(precise_page.warnings);
     let precise = precise_page
         .items
@@ -698,12 +655,9 @@ pub(crate) async fn package_search(
         .collect::<Result<Vec<_>, _>>()?;
     let broad = if query.has_broad_phase() && precise.len() < rift_cloud_client::CANDIDATE_POOL_MAX
     {
-        let broad_page = client
-            .search_packages_pages(
-                &search_request(params, query, packages, QueryPhase::Broad),
-                page_limit,
-            )
-            .await?;
+        let mut request = search_request(params, query, packages, QueryPhase::Broad);
+        request.view = Some(view.id.as_str().to_owned());
+        let broad_page = client.search_packages_pages(&request, page_limit).await?;
         extend_page_warnings(&mut warnings, broad_page.warnings);
         broad_page
             .items
@@ -713,10 +667,13 @@ pub(crate) async fn package_search(
     } else {
         Vec::new()
     };
-    Ok(GlobalSearchCandidates {
-        precise,
-        broad,
-        warnings,
+    Ok(CapturedGlobalSearchCandidates {
+        view: Some(view),
+        candidates: GlobalSearchCandidates {
+            precise,
+            broad,
+            warnings,
+        },
     })
 }
 
@@ -803,17 +760,6 @@ fn extend_page_warnings(target: &mut Vec<ReadWarning>, warnings: Vec<Warning>) {
     }
 }
 
-fn symbol_include(params: &GetSymbolParams) -> Option<Vec<PackageSymbolRequestInclude>> {
-    let mut fields = Vec::new();
-    if params.include.contains(&GetSymbolInclude::Source) {
-        fields.push(PackageSymbolRequestInclude::Source);
-    }
-    if params.include.contains(&GetSymbolInclude::Documentation) {
-        fields.push(PackageSymbolRequestInclude::Documentation);
-    }
-    (!fields.is_empty()).then_some(fields)
-}
-
 fn search_request(
     params: &SearchParams,
     query: &ParsedQuery,
@@ -867,89 +813,37 @@ fn search_request(
 /// reciprocal-rank fusion paper uses.
 const MERGE_WEIGHTS: RankingWeights = RankingWeights::fixed(0.5, 0.5, 0.0, 60);
 
-/// Merges local and remote symbol hits, then pages them at `limit`, the request's accepted
-/// page size.
-///
-/// # Errors
-///
-/// Returns a registered error naming a project hit that carries no identity, whose
-/// identity does not decode to a qualified name, or that the requested name does not
-/// match. The project read answers none of these, so each is a broken invariant in that
-/// read.
-pub(crate) fn merge_symbols(
-    params: &GetSymbolParams,
-    limit: usize,
-    mut local: GetSymbolResult,
-    remote: Vec<PackageSymbolCandidate>,
-) -> Result<GetSymbolResult, RiftError> {
-    let mut entries = Vec::with_capacity(local.hits.len() + remote.len());
-    for hit in local.hits.drain(..) {
-        let symbol_id = hit.symbol.id.clone().ok_or_else(|| {
-            errors::mcp::project_hit_identity_missing()
-                .hit(&hit.symbol.name)
-                .error()
-        })?;
-        let package = hit.symbol.origin.package.clone();
-        let class = local_match_class(&params.name, &hit, &symbol_id)?;
-        entries.push(SymbolEntry {
-            hit,
-            symbol_id,
-            package,
-            class,
-            remote: false,
-        });
-    }
-    for candidate in remote {
-        let class = local_match_class(&params.name, &candidate.hit, &candidate.symbol_identity)?;
-        entries.push(SymbolEntry {
-            symbol_id: candidate.symbol_identity,
-            package: Some(candidate.package),
-            class,
-            hit: candidate.hit,
-            remote: true,
-        });
-    }
-    entries.sort_by(|left, right| symbol_order(left, right, params.scope));
-    entries.dedup_by(|left, right| left.symbol_id == right.symbol_id);
-    let hits = entries
-        .into_iter()
-        .map(|entry| entry.hit)
-        .collect::<Vec<_>>();
-    if !hits.is_empty() {
-        local
-            .warnings
-            .retain(|warning| !matches!(warning, ReadWarning::SymbolNotFound { .. }));
-    }
-    let (hits, pagination) = page_window(hits, params.page_index, limit);
-    Ok(GetSymbolResult {
-        hits,
-        pagination,
-        warnings: local.warnings,
-    })
+/// The declarations the global API named at one walk's package callee positions.
+#[derive(Debug, Default)]
+pub(crate) struct CalleeDeclarations {
+    /// The declaration answered at each position asked, with its kind, by the position's
+    /// encoding and key.
+    named:
+        HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), (SymbolId, ExactKind)>,
 }
 
-#[derive(Debug)]
-struct SymbolEntry {
-    hit: rift_protocol::read::GetSymbolHit,
-    symbol_id: rift_protocol::read::SymbolId,
-    package: Option<PackageIdentity>,
-    class: rift_ranking::IdentifierMatch,
-    remote: bool,
+/// One package position as a request carries it and its answer names it.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CalleePosition {
+    unit: String,
+    line: u64,
+    character: u64,
 }
 
-/// How `query` matches one project hit, read from the hit's name and the qualified name
-/// its identity encodes.
-fn local_match_class(
-    query: &str,
-    hit: &rift_protocol::read::GetSymbolHit,
-    identity: &SymbolId,
-) -> Result<rift_ranking::IdentifierMatch, RiftError> {
-    let qualified_name = encoded_qualified_name(identity)?;
-    rift_ranking::identifier_match(query, &hit.symbol.name, &qualified_name).ok_or_else(|| {
-        errors::mcp::project_hit_name_unmatched()
-            .hit(&identity.0)
-            .error()
-    })
+impl CalleeDeclarations {
+    /// The declaration the global API named at `callee`'s position, with its kind and the
+    /// exact package holding it; `None` for a position it answered no declaration at, or
+    /// one left unasked.
+    pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
+        let origin = callee_origin(callee)?;
+        let key = (wire_encoding(callee), callee_position(callee, &origin)?);
+        let (id, kind) = self.named.get(&key)?;
+        Some(CalleeDeclaration {
+            id: id.clone(),
+            kind: kind.clone(),
+            origin,
+        })
+    }
 }
 
 /// The qualified name a symbol address carries, percent-encoded, in its final segment.
@@ -963,33 +857,6 @@ fn encoded_qualified_name(identity: &SymbolId) -> Result<Cow<'_, str>, RiftError
             .hit(&identity.0)
             .error()
     })
-}
-
-fn symbol_order(left: &SymbolEntry, right: &SymbolEntry, scope: SearchScope) -> std::cmp::Ordering {
-    left.class
-        .cmp(&right.class)
-        .then_with(|| {
-            if scope == SearchScope::All {
-                left.package.is_some().cmp(&right.package.is_some())
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        })
-        .then_with(|| package_key(left.package.as_ref()).cmp(&package_key(right.package.as_ref())))
-        .then_with(|| left.remote.cmp(&right.remote))
-        .then_with(|| left.symbol_id.0.cmp(&right.symbol_id.0))
-}
-
-fn package_key(package: Option<&PackageIdentity>) -> (String, String, String) {
-    package
-        .map(|package| {
-            (
-                package.manager.clone(),
-                package.name.clone(),
-                package.version.clone(),
-            )
-        })
-        .unwrap_or_default()
 }
 
 /// Merges package candidates into local search hits while retaining traversal-only hits,
@@ -1078,6 +945,7 @@ pub(crate) fn merge_search(
     order_search_hits(&mut ordered, params.order);
     let (results, pagination) = page_window(ordered, params.page_index, limit);
     Ok(SearchResult {
+        view: None,
         results,
         pagination,
         warnings: local.warnings,
@@ -1143,6 +1011,7 @@ pub(crate) fn merge_patterns(
     let mut warnings = local.warnings;
     warnings.extend(remote.warnings);
     SearchResult {
+        view: None,
         results,
         pagination,
         warnings,
@@ -1254,7 +1123,7 @@ fn unit_identity(
     })
 }
 
-fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
+pub(crate) fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
     match order {
         ResultOrder::Relevance => {}
         ResultOrder::Path => hits.sort_by(|left, right| {
@@ -1284,7 +1153,7 @@ fn search_hit_key(hit: &SearchHit) -> &str {
     }
 }
 
-fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+pub(crate) fn page_window<T>(items: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
     let total_pages = u64::try_from(items.len().div_ceil(limit)).unwrap_or(u64::MAX);
     let start = usize::try_from(page_index)
         .ok()
@@ -1690,6 +1559,16 @@ fn failure_state(error: &RiftError) -> RouteState {
     RouteState::Unavailable { kind, class }
 }
 
+impl GlobalState {
+    pub(crate) async fn exact_source(
+        &self,
+        configuration: &GlobalConfiguration,
+        params: &rift_protocol::source_read::GetSourceParams,
+    ) -> Result<rift_protocol::source_read::GetSourceResult, RiftError> {
+        self.client(configuration).await?.get_source(params).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
@@ -1796,7 +1675,7 @@ mod tests {
 
     #[test]
     fn documentation_requests_preserve_targets_and_symbol_includes() {
-        use rift_cloud_client::{PackageSearchRequestTarget, PackageSymbolRequestInclude};
+        use rift_cloud_client::PackageSearchRequestTarget;
 
         let query = ParsedQuery::parse("compass").expect("query");
         for (target, expected) in [
@@ -1817,16 +1696,17 @@ mod tests {
                 expected
             );
         }
-        let params = serde_json::from_value(serde_json::json!({
-            "name": "Compass", "include": ["documentation", "source"]
-        }))
-        .expect("symbol request");
+        let mut params: rift_protocol::symbol_read::GetSymbolParams = authored_example();
+        params.include = vec![
+            rift_protocol::read::GetSymbolInclude::Source,
+            rift_protocol::read::GetSymbolInclude::Documentation,
+        ];
+        let encoded = serde_json::to_value(&params).expect("canonical symbol request");
+        assert_eq!(encoded["id"], params.id.as_str());
+        assert!(encoded.get("name").is_none());
         assert_eq!(
-            super::symbol_include(&params),
-            Some(vec![
-                PackageSymbolRequestInclude::Source,
-                PackageSymbolRequestInclude::Documentation
-            ])
+            encoded["include"],
+            serde_json::json!(["source", "documentation"])
         );
     }
 
@@ -1936,71 +1816,6 @@ mod tests {
         hit
     }
 
-    /// A project hit the lookup ranked merges beside no package hit into one page of its own.
-    #[test]
-    fn merge_symbols_pages_the_project_hits_it_can_place() {
-        use rift_protocol::read::{GetSymbolParams, GetSymbolResult};
-
-        let example: GetSymbolResult = authored_example();
-        let request = serde_json::json!({"name": "load_config"});
-        let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
-        let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
-
-        let merged = super::merge_symbols(&params, limit, example.clone(), Vec::new())
-            .expect("the project hit carries its identity and matches the name");
-
-        assert_eq!(merged.hits, example.hits);
-        assert_eq!(merged.pagination.total_pages, 1);
-    }
-
-    /// A project hit the merge cannot key or order refuses the lookup as the server's own
-    /// internal error, naming the hit and the rule it broke.
-    #[test]
-    fn merge_symbols_refuses_a_project_hit_it_cannot_place() {
-        use rift_protocol::read::{GetSymbolParams, GetSymbolResult, SymbolId};
-
-        let example: GetSymbolResult = authored_example();
-        let placed = "rift://symbol/rust/src/config.rs/load_config";
-        let undecodable = "rift://symbol/rust/src/config.rs/%FF";
-        let cases = [
-            (
-                "load_config",
-                None,
-                "load_config",
-                errors::mcp::project_hit_identity_missing::SLUG,
-            ),
-            (
-                "load_config",
-                Some(undecodable),
-                undecodable,
-                errors::mcp::project_hit_identity_undecodable::SLUG,
-            ),
-            (
-                "parse_manifest",
-                Some(placed),
-                placed,
-                errors::mcp::project_hit_name_unmatched::SLUG,
-            ),
-        ];
-        for (name, identity, hit, slug) in cases {
-            let request = serde_json::json!({"name": name});
-            let params: GetSymbolParams = serde_json::from_value(request).expect("a lookup");
-            let limit = rift_server::accepted_limit(params.limit).expect("an accepted limit");
-            let mut local = example.clone();
-            local.hits[0].symbol.id = identity.map(|identity| SymbolId(identity.to_owned()));
-
-            let error = super::merge_symbols(&params, limit, local, Vec::new())
-                .expect_err("the merge cannot place the project hit");
-
-            assert_eq!(error.slug(), slug);
-            assert!(
-                error
-                    .context()
-                    .any(|(key, value)| key == "hit" && value == hit)
-            );
-        }
-    }
-
     /// Each kind of project hit ranks under the identity the fusion keys it by, and a merge
     /// beside no package candidate answers every one of them.
     #[test]
@@ -2070,6 +1885,7 @@ mod tests {
         let params: SearchParams = serde_json::from_value(request).expect("a search");
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         let local = SearchResult {
+            view: None,
             results: hits.to_vec(),
             pagination: example.pagination.clone(),
             warnings: Vec::new(),
@@ -2161,6 +1977,7 @@ mod tests {
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         for (hit, label, slug) in cases {
             let local = SearchResult {
+                view: None,
                 results: vec![hit],
                 pagination: example.pagination.clone(),
                 warnings: Vec::new(),
@@ -3030,6 +2847,7 @@ mod tests {
         let merged = |request: serde_json::Value| {
             let params: SearchParams = serde_json::from_value(request).expect("search request");
             let local = SearchResult {
+                view: None,
                 results: vec![project.clone()],
                 pagination: Pagination {
                     page_index: 0,

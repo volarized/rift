@@ -32,6 +32,82 @@ pub struct FrameworkContext {
     provider_calls: u64,
 }
 
+impl ResolvedFramework {
+    /// Applies the retained interpretation to a captured source under its syntax bounds.
+    ///
+    /// The caller retains the source whose digest admitted this context. Ordinary syntax
+    /// and every original range remain unchanged when interpretation is unavailable.
+    ///
+    /// # Errors
+    /// Returns source witness, range, parser, or aggregate syntax-bound failures.
+    pub fn apply(
+        &self,
+        source: SyntaxSource<'_>,
+        limits: SyntaxLimits,
+        mut document: SyntaxDocument,
+    ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
+        let mut calls = 0;
+        if self.angular
+            && document.language() != &rift_syntax::ShippedLanguage::HtmlAngular.language()
+        {
+            document = rift_syntax::ShippedLanguage::HtmlAngular
+                .definition()
+                .syntax_provider()
+                .analyze(source, limits)?;
+            calls += 1;
+        }
+        if !self.templates.is_empty() {
+            document =
+                rift_syntax::append_angular_templates(source, limits, &document, &self.templates)?;
+            calls += u64::try_from(
+                self.templates
+                    .iter()
+                    .filter(|range| range.start < range.end)
+                    .count(),
+            )
+            .unwrap_or(u64::MAX);
+        }
+        let mut warnings = Vec::new();
+        if let Some(version) = self.tailwind {
+            let major = match version {
+                TailwindVersion::V3 => 3,
+                TailwindVersion::V4 => 4,
+            };
+            let facts = rift_syntax::tailwind_symbols(source, &document, major, limits)?;
+            if !facts.unresolved.is_empty() {
+                warnings.push(warning(
+                    source.path,
+                    SyntaxFramework::Tailwind,
+                    "Dynamic class expressions are retained without Tailwind interpretation.",
+                ));
+            }
+            document =
+                rift_syntax::append_framework_symbols(source, limits, &document, facts.symbols)?;
+        }
+        Ok((document, warnings, calls))
+    }
+}
+
+impl get_size2::GetSize for ResolvedFramework {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        (
+            self.templates
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ByteRange>()),
+            tracker,
+        )
+    }
+}
+
 impl FrameworkContext {
     /// Resolves nearest package context, imported Angular component ownership, and
     /// Tailwind version plus configuration or stylesheet evidence.
@@ -247,6 +323,18 @@ impl FrameworkContext {
         self.files.get(path)
     }
 
+    /// Context admitted for these exact captured source bytes.
+    #[must_use]
+    pub fn for_source(
+        &self,
+        path: &ProjectPath,
+        digest: &rift_core::FileDigest,
+    ) -> Option<&ResolvedFramework> {
+        (self.digests.get(path) == Some(digest))
+            .then(|| self.for_path(path))
+            .flatten()
+    }
+
     /// Typed conditions that left framework context unresolved.
     #[must_use]
     pub fn warnings(&self) -> &[ReadWarning] {
@@ -268,7 +356,7 @@ impl FrameworkContext {
         &self,
         source: SyntaxSource<'_>,
         limits: SyntaxLimits,
-        mut document: SyntaxDocument,
+        document: SyntaxDocument,
     ) -> Result<(SyntaxDocument, Vec<ReadWarning>, u64), RiftError> {
         let Some(context) = self.for_path(source.path) else {
             return Ok((document, Vec::new(), 0));
@@ -289,50 +377,7 @@ impl FrameworkContext {
                 0,
             ));
         }
-        let mut calls = 0;
-        if context.angular
-            && document.language() != &rift_syntax::ShippedLanguage::HtmlAngular.language()
-        {
-            document = rift_syntax::ShippedLanguage::HtmlAngular
-                .definition()
-                .syntax_provider()
-                .analyze(source, limits)?;
-            calls += 1;
-        }
-        if !context.templates.is_empty() {
-            document = rift_syntax::append_angular_templates(
-                source,
-                limits,
-                &document,
-                &context.templates,
-            )?;
-            calls += u64::try_from(
-                context
-                    .templates
-                    .iter()
-                    .filter(|range| range.start < range.end)
-                    .count(),
-            )
-            .unwrap_or(u64::MAX);
-        }
-        let mut warnings = Vec::new();
-        if let Some(version) = context.tailwind {
-            let major = match version {
-                TailwindVersion::V3 => 3,
-                TailwindVersion::V4 => 4,
-            };
-            let facts = rift_syntax::tailwind_symbols(source, &document, major, limits)?;
-            if !facts.unresolved.is_empty() {
-                warnings.push(warning(
-                    source.path,
-                    SyntaxFramework::Tailwind,
-                    "Dynamic class expressions are retained without Tailwind interpretation.",
-                ));
-            }
-            document =
-                rift_syntax::append_framework_symbols(source, limits, &document, facts.symbols)?;
-        }
-        Ok((document, warnings, calls))
+        context.apply(source, limits, document)
     }
 
     fn warn(&mut self, path: &ProjectPath, framework: SyntaxFramework, detail: &str) {

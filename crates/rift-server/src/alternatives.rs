@@ -2,7 +2,7 @@
 
 use rapidfuzz::distance::levenshtein::{Args, BatchComparator};
 use rift_error::{RiftError, errors};
-use rift_index::{IndexedFile, WorkspaceIndex, WorkspaceIndexLimits};
+use rift_index::{IndexedFile, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSymbolView};
 use rift_protocol::read::{SYMBOL_ALTERNATIVES_MAX, SymbolId};
 use rift_syntax::SyntaxSymbol;
 
@@ -114,9 +114,74 @@ pub(crate) fn symbols<'source>(
     )
 }
 
+/// Returns captured alternatives under the publication's original work policy.
+pub(crate) fn captured_symbols(
+    view: &WorkspaceSymbolView,
+    identity: &rift_protocol::identity::SymbolIdentity,
+) -> Result<Vec<SymbolId>, RiftError> {
+    let limits = view.limits();
+    rank_from(
+        RankingSource::Captured(view, identity),
+        view.files(),
+        identity.qualified_path().last().map_or("", String::as_str),
+        Some(identity.language()),
+        Work::new(
+            limits.symbol_alternatives_work_max(),
+            limits.symbol_alternatives_lowercase_work(),
+        ),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RankingSource<'index> {
+    Current(&'index WorkspaceIndex),
+    Captured(
+        &'index WorkspaceSymbolView,
+        &'index rift_protocol::identity::SymbolIdentity,
+    ),
+}
+
+impl RankingSource<'_> {
+    fn identity(
+        self,
+        file: &IndexedFile,
+        symbol: &SyntaxSymbol,
+        position: usize,
+    ) -> Result<Option<SymbolId>, RiftError> {
+        match self {
+            Self::Current(index) => Ok(index
+                .assembled_symbol(crate::search::declared(file, symbol))?
+                .identity()
+                .map(|identity| SymbolId(identity.as_str().to_owned()))),
+            Self::Captured(view, requested) => {
+                if !rift_protocol::read::symbol_name_is_public(&symbol.qualified_name) {
+                    return Ok(None);
+                }
+                let Some(key) = view.symbol_identity_at(file.path(), position) else {
+                    return Ok(None);
+                };
+                let identity = rift_protocol::identity::SymbolIdentity::parse(key.as_str())?;
+                Ok((identity.owner() == requested.owner()
+                    && identity.language() == requested.language())
+                .then(|| SymbolId(key.as_str().to_owned())))
+            }
+        }
+    }
+}
+
 /// Compares the complete selected set under the accepted work policy.
 fn rank<'source>(
     index: &WorkspaceIndex,
+    files: impl IntoIterator<Item = &'source IndexedFile>,
+    name: &str,
+    language: Option<&rift_protocol::read::Language>,
+    work: Work,
+) -> Result<Vec<SymbolId>, RiftError> {
+    rank_from(RankingSource::Current(index), files, name, language, work)
+}
+
+fn rank_from<'source>(
+    source: RankingSource<'_>,
     files: impl IntoIterator<Item = &'source IndexedFile>,
     name: &str,
     language: Option<&rift_protocol::read::Language>,
@@ -129,7 +194,7 @@ fn rank<'source>(
     let mut nearest: Vec<Alternative<'_>> = Vec::with_capacity(SYMBOL_ALTERNATIVES_MAX + 1);
     for file in files {
         select_file(
-            index,
+            source,
             file,
             language,
             &mut work,
@@ -146,7 +211,7 @@ fn rank<'source>(
 
 /// Charges one file and its declarations before selecting its language and names.
 fn select_file<'source>(
-    index: &WorkspaceIndex,
+    source: RankingSource<'_>,
     file: &'source IndexedFile,
     language: Option<&rift_protocol::read::Language>,
     work: &mut Work,
@@ -157,13 +222,12 @@ fn select_file<'source>(
     work.claim(1)?;
     let selected = language
         .is_none_or(|language| crate::read::language_selects(language, file.syntax().language()));
-    for symbol in file.syntax().symbols() {
+    for (position, symbol) in file.syntax().symbols().iter().enumerate() {
         work.claim(1)?;
         if !selected {
             continue;
         }
-        let assembled = index.assembled_symbol(crate::search::declared(file, symbol))?;
-        let Some(identity) = assembled.identity() else {
+        let Some(identity) = source.identity(file, symbol, position)? else {
             continue;
         };
         let cutoff = nearest
@@ -176,13 +240,25 @@ fn select_file<'source>(
         let candidate = Alternative {
             file,
             symbol,
-            identity: SymbolId(identity.as_str().to_owned()),
+            identity,
             distance,
         };
         let ordering =
             (symbol.qualified_name.len() as u128 + file.path().as_str().len() as u128 + 1)
                 * SYMBOL_ALTERNATIVES_MAX as u128;
         work.claim(ordering)?;
+        if matches!(source, RankingSource::Captured(..)) {
+            work.claim(candidate.identity.as_str().len() as u128 * nearest.len() as u128)?;
+            if let Some(position) = nearest
+                .iter()
+                .position(|other| other.identity == candidate.identity)
+            {
+                if nearest[position].order() <= candidate.order() {
+                    continue;
+                }
+                nearest.remove(position);
+            }
+        }
         let position = nearest
             .iter()
             .position(|other| candidate.order() < other.order())
@@ -219,7 +295,7 @@ mod tests {
     use std::error::Error;
 
     use rift_core::{SourceVisibility, TextFileInclusion};
-    use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
+    use rift_index::{WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSymbolView};
 
     use super::Work;
 

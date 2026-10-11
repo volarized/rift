@@ -2,7 +2,10 @@ use rift_error::RiftError;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner},
-    read::{GetSymbolInclude, PAGE_LIMIT_MAX},
+    read::{
+        GetSymbolInclude, PAGE_LIMIT_MAX, PackageIdentity, SourceKind, SourceLocationKind,
+        SymbolOrigin,
+    },
     symbol_read::{GetSymbolParams, GetSymbolResult},
 };
 
@@ -135,8 +138,13 @@ fn valid_result(
     if !result.is_valid_for(&request.id) {
         return false;
     }
+    let Ok(identity) = SymbolIdentity::parse(request.id.as_str()) else {
+        return false;
+    };
+    let owner = identity.owner();
     match result {
         GetSymbolResult::Found {
+            symbol,
             view,
             declarations,
             history,
@@ -146,15 +154,27 @@ fn valid_result(
             request.view.as_ref().is_none_or(|id| id == &view.id)
                 && u64::try_from(declarations.len())
                     .is_ok_and(|length| length <= request.declaration_limit)
+                && (valid_origin(&symbol.origin, owner)
+                    || (declarations.is_empty()
+                        && symbol.origin.source_kind == SourceKind::Synthetic
+                        && symbol.origin.location.is_none()
+                        && symbol.origin.package.is_none()
+                        && symbol.origin.runtime.is_none()))
                 && declarations.iter().all(|declaration| {
-                    declaration.source.as_ref().is_none_or(|source| {
-                        request.include.contains(&GetSymbolInclude::Source)
-                            && source.len() <= source_bytes_max
-                    })
+                    declaration.unit.as_ref().is_some_and(|unit| {
+                        rift_core::SourceUnitId::parse(&unit.0)
+                            .is_ok_and(|unit| unit.source_owner() == Some(owner))
+                    }) && valid_origin(&declaration.origin, owner)
+                        && declaration.source.as_ref().is_none_or(|source| {
+                            request.include.contains(&GetSymbolInclude::Source)
+                                && source.len() <= source_bytes_max
+                        })
                 })
                 && (history.is_none() || request.include.contains(&GetSymbolInclude::History))
-                && (documentation.is_none()
-                    || request.include.contains(&GetSymbolInclude::Documentation))
+                && documentation.as_ref().is_none_or(|context| {
+                    request.include.contains(&GetSymbolInclude::Documentation)
+                        && valid_documentation(context, &request.id, owner, source_bytes_max)
+                })
         }
         GetSymbolResult::Missing { view, .. } => {
             request.view.as_ref().is_none_or(|id| id == &view.id)
@@ -162,6 +182,93 @@ fn valid_result(
         GetSymbolResult::Unavailable { view, .. } => view
             .as_ref()
             .is_none_or(|view| request.view.as_ref().is_none_or(|id| id == &view.id)),
+    }
+}
+
+fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner) -> bool {
+    if origin.source_kind == SourceKind::Synthetic {
+        return false;
+    }
+    match owner {
+        SymbolOwner::Package { .. } => {
+            origin.location == Some(SourceLocationKind::Dependency)
+                && origin.runtime.is_none()
+                && origin
+                    .package
+                    .as_ref()
+                    .is_some_and(|package| package.owner().is_ok_and(|actual| &actual == owner))
+        }
+        SymbolOwner::Runtime { .. } => {
+            origin.location == Some(SourceLocationKind::Stdlib)
+                && origin.package.is_none()
+                && origin
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.owner().is_ok_and(|actual| &actual == owner))
+        }
+        _ => false,
+    }
+}
+
+fn valid_documentation(
+    context: &rift_protocol::documentation::DocumentationContext,
+    target: &rift_protocol::read::SymbolId,
+    owner: &SymbolOwner,
+    source_bytes_max: usize,
+) -> bool {
+    if context
+        .references
+        .iter()
+        .try_fold(0_usize, |bytes, reference| {
+            bytes
+                .checked_add(reference.excerpt.as_ref().map_or(0, String::len))
+                .filter(|total| *total <= source_bytes_max)
+        })
+        .is_none()
+    {
+        return false;
+    }
+    match owner {
+        SymbolOwner::Package {
+            manager,
+            registry,
+            name,
+            version,
+        } => {
+            let package = PackageIdentity {
+                manager: manager.clone(),
+                registry: registry.clone(),
+                name: name.clone(),
+                version: version.clone(),
+            };
+            crate::domain::validate_documentation_context(context, target, &package).is_ok()
+        }
+        SymbolOwner::Runtime { .. } => {
+            if rift_analysis::documentation::validate_documentation_context(context, target)
+                .is_err()
+            {
+                return false;
+            }
+            let valid_identity =
+                |identity: &rift_protocol::documentation::DocumentationContentIdentity| {
+                    let rift_protocol::documentation::DocumentationSourceIdentity::Package { unit } =
+                        &identity.source
+                    else {
+                        return false;
+                    };
+                    rift_core::SourceUnitId::parse(&unit.0)
+                        .is_ok_and(|unit| unit.source_owner() == Some(owner))
+                };
+            context
+                .references
+                .iter()
+                .all(|reference| valid_identity(&reference.documentation.source.identity))
+                && context
+                    .warnings
+                    .iter()
+                    .all(|warning| valid_identity(&warning.source))
+        }
+        _ => false,
     }
 }
 

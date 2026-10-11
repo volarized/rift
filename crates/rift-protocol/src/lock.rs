@@ -8,8 +8,12 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::configuration::ServerConfiguration;
+use crate::identity::SymbolOwner;
+
+mod context;
 
 /// The lowest port of the default serving range, used when `rift.toml`
 /// selects no port.
@@ -56,8 +60,9 @@ pub struct ProductIdentity {
 ///
 /// A reader that validates the file holds everything needed to issue a
 /// request: port, bearer token, process id, and exact product identity.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields, try_from = "context::LockInput")]
+#[schemars(!try_from, transform = context::pair_workspace_context)]
 pub struct ServerLock {
     /// Loopback TCP port the server listens on, 1024 or above.
     #[schemars(range(min = 1_024))]
@@ -74,9 +79,31 @@ pub struct ServerLock {
     /// Accepted `[server]` values held by the serving process, absent in older lock files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<ServerConfiguration>,
+    /// Canonical workspace root held by the serving process.
+    /// Servers **MUST** record `root` and `owner` together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<PathBuf>,
+    /// Fixed local owner held by the serving process.
+    /// A named local server **MUST** record its accepted registration owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<SymbolOwner>,
 }
 
 impl ServerLock {
+    /// Checks that the optional workspace root and local owner form a valid pair.
+    #[must_use]
+    pub fn workspace_context_is_valid(&self) -> bool {
+        match (&self.root, &self.owner) {
+            (None, None) => true,
+            (Some(root), Some(owner)) => {
+                root.is_absolute()
+                    && matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. })
+                    && owner.validate().is_ok()
+            }
+            _ => false,
+        }
+    }
+
     /// Checks every bound the schema advertises.
     ///
     /// # Errors
@@ -220,6 +247,8 @@ mod tests {
             pid: 4_242,
             identity: valid_identity(),
             server: None,
+            root: None,
+            owner: None,
         }
     }
 

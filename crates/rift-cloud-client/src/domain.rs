@@ -10,8 +10,8 @@ use serde_json::Value;
 use crate::{
     HitLocation, PackageDocumentationHit, PackageIdentity, PackagePatternDeclaration,
     PackagePatternHit, PackageSearchHit, PackageSearchHitContributingField, PackageSearchItem,
-    PackageSymbol, SourceKind, SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange,
-    TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression, failure,
+    SourceKind, SourceLocationKind, Symbol, SymbolFacet, SymbolOrigin, TextRange, TypeBinding,
+    TypeBindingOrigin, TypeBindingRole, TypeExpression, failure,
 };
 
 /// One package declaration returned by global search in the local read model.
@@ -26,19 +26,6 @@ pub struct PackageSearchCandidate {
     /// Identifier match class established by global index. Absent for a documentation
     /// block, and for a declaration matching none of the requested identifiers.
     pub match_class: Option<rift_ranking::IdentifierMatchClass>,
-}
-
-/// One package declaration returned by global symbol lookup in the local read model.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PackageSymbolCandidate {
-    /// Package that owns declaration.
-    pub package: rift_protocol::read::PackageIdentity,
-    /// Stable identity of declaration symbol.
-    pub symbol_identity: rift_protocol::read::SymbolId,
-    /// Symbol hit carrying declaration.
-    pub hit: rift_protocol::read::GetSymbolHit,
-    /// Identifier match class established by global index.
-    pub match_class: rift_ranking::IdentifierMatchClass,
 }
 
 /// One package pattern match in the local read model: the file hit for the match, and the
@@ -66,6 +53,7 @@ impl TryFrom<&PackagePatternHit> for PackagePatternMatch {
             return Err(invalid("location"));
         }
         let file = rift_protocol::read::SearchHit {
+            view: None,
             hit: rift_protocol::read::SearchHitTarget::File {
                 size,
                 languages: Vec::new(),
@@ -110,6 +98,7 @@ fn declaration_hit(
         declaration.source.as_deref(),
     )?;
     Ok(rift_protocol::read::SearchHit {
+        view: None,
         hit: rift_protocol::read::SearchHitTarget::Symbol {
             symbol: Box::new(convert_symbol(&declaration.symbol)?),
         },
@@ -164,6 +153,7 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
             .map_err(|source| invalid_source("symbol_identity", source))?;
         let match_class = crate::search_match_class(&value.match_class)?;
         let hit = rift_protocol::read::SearchHit {
+            view: None,
             hit: rift_protocol::read::SearchHitTarget::Symbol {
                 symbol: Box::new(symbol),
             },
@@ -236,6 +226,7 @@ fn documentation_candidate(
         })
         .collect();
     let hit = rift_protocol::read::SearchHit {
+        view: None,
         hit: rift_protocol::read::SearchHitTarget::Documentation {
             documentation: Box::new(documentation.clone()),
         },
@@ -435,6 +426,25 @@ fn protocol_documentation_source(
     })
 }
 
+fn protocol_documentation_license(
+    value: crate::DocumentationLicense,
+) -> Result<rift_protocol::documentation::DocumentationLicense, RiftError> {
+    Ok(rift_protocol::documentation::DocumentationLicense {
+        expression: value.expression,
+        files: value
+            .files
+            .unwrap_or_default()
+            .into_iter()
+            .map(|file| {
+                Ok(rift_protocol::documentation::DocumentationLicenseFile {
+                    path: protocol_project_path(file.path, "documentation.license.path")?,
+                    digest: rift_protocol::documentation::DocumentationDigest(file.digest),
+                })
+            })
+            .collect::<Result<_, RiftError>>()?,
+    })
+}
+
 fn protocol_content_identity(
     value: crate::DocumentationContentIdentity,
 ) -> Result<rift_protocol::documentation::DocumentationContentIdentity, RiftError> {
@@ -470,162 +480,6 @@ fn protocol_content_identity(
         },
     });
     Ok(protocol::DocumentationContentIdentity { source, cell })
-}
-
-pub(crate) fn protocol_documentation_context(
-    value: crate::DocumentationContext,
-) -> Result<rift_protocol::documentation::DocumentationContext, RiftError> {
-    use rift_protocol::documentation as protocol;
-    Ok(protocol::DocumentationContext {
-        documentation_revision: rift_protocol::read::Digest(value.documentation_revision),
-        references: value
-            .references
-            .into_iter()
-            .map(|hit| {
-                Ok(protocol::DocumentationReferenceHit {
-                    reference: protocol::DocumentationReference {
-                        identity: rift_protocol::documentation::DocumentationDigest(
-                            hit.reference.identity,
-                        ),
-                        block: rift_protocol::documentation::DocumentationDigest(
-                            hit.reference.block,
-                        ),
-                        target: rift_protocol::read::SymbolId(hit.reference.target),
-                        range: text_range(&hit.reference.range),
-                        authored: hit.reference.authored,
-                        evidence: match hit.reference.evidence {
-                            crate::DocumentationReferenceEvidence::Provider => {
-                                protocol::DocumentationReferenceEvidence::Provider
-                            }
-                            crate::DocumentationReferenceEvidence::AuthoredLink => {
-                                protocol::DocumentationReferenceEvidence::AuthoredLink
-                            }
-                            crate::DocumentationReferenceEvidence::QualifiedName => {
-                                protocol::DocumentationReferenceEvidence::QualifiedName
-                            }
-                            crate::DocumentationReferenceEvidence::UniqueName => {
-                                protocol::DocumentationReferenceEvidence::UniqueName
-                            }
-                        },
-                    },
-                    documentation: protocol_documentation_hit(hit.documentation)?,
-                    excerpt: hit.excerpt,
-                })
-            })
-            .collect::<Result<_, RiftError>>()?,
-        truncated: value.truncated,
-        warnings: value
-            .warnings
-            .unwrap_or_default()
-            .into_iter()
-            .map(|warning| {
-                Ok(protocol::DocumentationWarning {
-                    source: protocol_content_identity(warning.source)?,
-                    stage: match warning.stage {
-                        crate::DocumentationStage::Source => protocol::DocumentationStage::Source,
-                        crate::DocumentationStage::Extract => protocol::DocumentationStage::Extract,
-                        crate::DocumentationStage::Resolve => protocol::DocumentationStage::Resolve,
-                        crate::DocumentationStage::Index => protocol::DocumentationStage::Index,
-                    },
-                    kind: match warning.kind {
-                        crate::DocumentationWarningKind::SourceUnavailable => {
-                            protocol::DocumentationWarningKind::SourceUnavailable
-                        }
-                        crate::DocumentationWarningKind::SourceTruncated => {
-                            protocol::DocumentationWarningKind::SourceTruncated
-                        }
-                        crate::DocumentationWarningKind::UnsupportedFormat => {
-                            protocol::DocumentationWarningKind::UnsupportedFormat
-                        }
-                        crate::DocumentationWarningKind::MalformedSource => {
-                            protocol::DocumentationWarningKind::MalformedSource
-                        }
-                        crate::DocumentationWarningKind::OmittedRange => {
-                            protocol::DocumentationWarningKind::OmittedRange
-                        }
-                        crate::DocumentationWarningKind::LimitExceeded => {
-                            protocol::DocumentationWarningKind::LimitExceeded
-                        }
-                    },
-                    count: warning.count,
-                })
-            })
-            .collect::<Result<_, RiftError>>()?,
-    })
-}
-
-fn protocol_documentation_license(
-    value: crate::DocumentationLicense,
-) -> Result<rift_protocol::documentation::DocumentationLicense, RiftError> {
-    Ok(rift_protocol::documentation::DocumentationLicense {
-        expression: value.expression,
-        files: value
-            .files
-            .unwrap_or_default()
-            .into_iter()
-            .map(|file| {
-                Ok(rift_protocol::documentation::DocumentationLicenseFile {
-                    path: protocol_project_path(file.path, "documentation.license.path")?,
-                    digest: rift_protocol::documentation::DocumentationDigest(file.digest),
-                })
-            })
-            .collect::<Result<_, RiftError>>()?,
-    })
-}
-
-impl TryFrom<PackageSymbol> for PackageSymbolCandidate {
-    type Error = RiftError;
-
-    fn try_from(value: PackageSymbol) -> Result<Self, Self::Error> {
-        Self::try_from(&value)
-    }
-}
-
-impl TryFrom<&PackageSymbol> for PackageSymbolCandidate {
-    type Error = RiftError;
-
-    fn try_from(value: &PackageSymbol) -> Result<Self, Self::Error> {
-        let (_, _, line) = validate_location(
-            &value.package,
-            &value.symbol,
-            &value.unit,
-            &value.range,
-            value.line,
-            value.source.as_deref(),
-        )?;
-        let package = package_identity(&value.package);
-        let symbol = convert_symbol(&value.symbol)?;
-        let symbol_identity = symbol
-            .id
-            .clone()
-            .ok_or_else(|| invalid("symbol_identity"))?;
-        let match_class = crate::ranking_match_class(&value.match_class)?;
-        let documentation = value
-            .documentation
-            .clone()
-            .map(protocol_documentation_context)
-            .transpose()?;
-        if let Some(context) = &documentation {
-            validate_documentation_context(context, &symbol_identity, &package)?;
-        }
-        let hit = rift_protocol::read::GetSymbolHit {
-            symbol,
-            path: None,
-            unit: Some(protocol_unit(&value.unit)),
-            range: text_range(&value.range),
-            line,
-            node: None,
-            source: value.source.clone(),
-            history: None,
-            documentation,
-        };
-        Ok(Self {
-            package,
-            symbol_identity,
-            hit,
-            match_class,
-        })
-    }
 }
 
 pub(crate) fn validate_documentation_context(
@@ -1391,7 +1245,7 @@ mod tests {
             }]),
             ..Default::default()
         }]);
-        let hit = PackageSymbol {
+        let hit = PackageSearchHit {
             package,
             symbol,
             unit: unit(),
@@ -1399,26 +1253,27 @@ mod tests {
             line: 3,
             match_class: crate::generated::IdentifierMatchClass::QualifiedExact,
             source: None,
-            documentation: None,
+            contributing_fields: vec![PackageSearchHitContributingField::QualifiedName],
             additional_properties: HashMap::new(),
         };
-        let candidate = PackageSymbolCandidate::try_from(hit).expect("valid package symbol");
+        let candidate = PackageSearchCandidate::try_from(hit).expect("valid package symbol");
         assert_eq!(
             candidate.match_class,
-            rift_ranking::IdentifierMatchClass::QualifiedExact
+            Some(rift_ranking::IdentifierMatchClass::QualifiedExact)
         );
+        let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &candidate.hit.hit else {
+            panic!("symbol candidate");
+        };
         assert_eq!(
-            candidate.symbol_identity.0,
-            candidate.hit.symbol.id.as_ref().expect("id").0
+            symbol.id.as_ref().expect("id").0,
+            rift_core::symbol_identity("rust", "cargo/helper@1.0.0/src/lib.rs", "helper_beacon")
         );
-        assert_eq!(candidate.hit.symbol.documentation[0].text, "Beacon docs");
+        assert_eq!(symbol.documentation[0].text, "Beacon docs");
         assert_eq!(
-            candidate.hit.symbol.signatures[0].parameters[0]
-                .name
-                .as_deref(),
+            symbol.signatures[0].parameters[0].name.as_deref(),
             Some("value")
         );
-        assert_eq!(candidate.hit.symbol.extensions.0.len(), 1);
+        assert_eq!(symbol.extensions.0.len(), 1);
     }
 
     #[test]
@@ -1426,7 +1281,7 @@ mod tests {
         let package = package();
         let mut symbol = symbol(&package);
         symbol.kind = "9struct".to_owned();
-        let hit = PackageSymbol {
+        let hit = PackageSearchHit {
             package,
             symbol,
             unit: unit(),
@@ -1434,11 +1289,11 @@ mod tests {
             line: 3,
             match_class: crate::generated::IdentifierMatchClass::NameExact,
             source: None,
-            documentation: None,
+            contributing_fields: vec![PackageSearchHitContributingField::QualifiedName],
             additional_properties: HashMap::new(),
         };
         assert_response_field(
-            &PackageSymbolCandidate::try_from(hit).expect_err("registered refusal"),
+            &PackageSearchCandidate::try_from(hit).expect_err("registered refusal"),
             "kind",
         );
     }
@@ -1446,7 +1301,7 @@ mod tests {
     #[test]
     fn candidate_rejects_invalid_source_identity() {
         let package = package();
-        let mut hit = PackageSymbol {
+        let mut hit = PackageSearchHit {
             package: package.clone(),
             symbol: symbol(&package),
             unit: unit(),
@@ -1454,12 +1309,12 @@ mod tests {
             line: 3,
             match_class: crate::generated::IdentifierMatchClass::NameExact,
             source: None,
-            documentation: None,
+            contributing_fields: vec![PackageSearchHitContributingField::QualifiedName],
             additional_properties: HashMap::new(),
         };
         hit.unit = "rift://source/cargo/crates.io/other@1.0.0/src/lib.rs".to_owned();
         assert_response_field(
-            &(PackageSymbolCandidate::try_from(hit)).expect_err("registered refusal"),
+            &(PackageSearchCandidate::try_from(hit)).expect_err("registered refusal"),
             "source_identity",
         );
     }

@@ -19,6 +19,8 @@ pub struct WorkspaceSymbolView {
     root: PathBuf,
     owner: SymbolOwner,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
+    frameworks: BTreeMap<ProjectPath, rift_analysis::ResolvedFramework>,
+    identities: BTreeMap<(ProjectPath, usize), SymbolId>,
     text_files: BTreeMap<ProjectPath, Arc<TextSourceFile>>,
     notebooks: NotebookFiles,
     semantics: Arc<WorkspaceSemantics>,
@@ -53,6 +55,24 @@ impl WorkspaceIndex {
             root: self.root.clone(),
             owner: self.owner.clone(),
             files: self.files.clone(),
+            frameworks: self
+                .files
+                .iter()
+                .filter_map(|(path, file)| {
+                    self.frameworks
+                        .for_source(path, &file.digest())
+                        .map(|context| (path.clone(), context.clone()))
+                })
+                .collect(),
+            identities: declarations
+                .canonical
+                .iter()
+                .flat_map(|(identity, bindings)| {
+                    bindings
+                        .iter()
+                        .map(move |binding| (binding.clone(), identity.clone()))
+                })
+                .collect(),
             text_files: self.text_files.clone(),
             notebooks: self.notebooks.clone(),
             semantics: Arc::clone(&self.semantics),
@@ -110,10 +130,99 @@ impl WorkspaceSymbolView {
         self.limits.results_max()
     }
 
+    /// Iterates captured source files in their original path order.
+    pub fn files(&self) -> impl Iterator<Item = &IndexedFile> {
+        self.files.values().map(Arc::as_ref)
+    }
+
+    /// Returns the established identity at one captured declaration position.
+    #[must_use]
+    pub fn symbol_identity_at(&self, path: &ProjectPath, position: usize) -> Option<&SymbolId> {
+        self.identities.get(&(path.clone(), position))
+    }
+
     /// Captured source file, without any filesystem read or path selection.
     #[must_use]
     pub fn file(&self, path: &ProjectPath) -> Option<&IndexedFile> {
         self.files.get(path).map(Arc::as_ref)
+    }
+
+    /// Returns the established object for one captured declaration or item range.
+    /// Raw syntax without an established identity remains unaddressed.
+    #[must_use]
+    pub fn symbol_identity(
+        &self,
+        path: &ProjectPath,
+        range: rift_syntax::ByteRange,
+    ) -> Option<&SymbolId> {
+        let position = self
+            .file(path)?
+            .syntax()
+            .symbols()
+            .iter()
+            .position(|symbol| symbol.range == range || symbol.item_range == range)?;
+        self.identities.get(&(path.clone(), position))
+    }
+
+    /// Returns accepted source bytes from the captured syntax or text catalog.
+    #[must_use]
+    pub fn source(&self, path: &ProjectPath) -> Option<&str> {
+        self.files
+            .get(path)
+            .map(|file| file.source())
+            .or_else(|| self.text_files.get(path).map(|file| file.content()))
+    }
+
+    /// Parses captured bytes with their admitted language, framework context and bounds.
+    ///
+    /// No path matcher or filesystem read selects the provider. Temporary node material
+    /// remains bounded by the captured syntax limits and is not stored after the read.
+    ///
+    /// # Errors
+    /// Returns the captured source or syntax refusal when node reconstruction fails.
+    pub fn nodes(
+        &self,
+        path: &ProjectPath,
+        position: u64,
+    ) -> Result<Option<Vec<rift_syntax::SyntaxNode>>, RiftError> {
+        let Some(file) = self.file(path) else {
+            return Ok(None);
+        };
+        let absolute = self.root.join(path.as_str());
+        let provider = rift_syntax::registry::provider_for_language(file.syntax().language())
+            .ok_or_else(|| {
+                rift_error::errors::index::workspace_syntax()
+                    .path(&absolute)
+                    .error()
+            })?;
+        let mut syntax = super::analyze_source(
+            path,
+            file.source(),
+            &absolute,
+            provider,
+            self.limits.syntax(),
+        )?;
+        if let Some(context) = self.frameworks.get(path) {
+            let (interpreted, _, _) = context
+                .apply(
+                    rift_syntax::SyntaxSource {
+                        path,
+                        text: file.source(),
+                    },
+                    self.limits.syntax(),
+                    syntax,
+                )
+                .map_err(|error| {
+                    rift_error::errors::index::workspace_syntax()
+                        .path(&absolute)
+                        .cause(error)
+                        .error()
+                })?;
+            syntax = interpreted;
+        }
+        Ok(Some(
+            syntax.nodes_at(position).into_iter().cloned().collect(),
+        ))
     }
 
     /// Captured normalized graph, shared with the original publication.

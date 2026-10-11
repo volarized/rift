@@ -146,6 +146,7 @@ fn documentation_text(text: &str) -> Documentation {
 
 fn search_hit(target: SearchHitTarget) -> SearchHit {
     SearchHit {
+        view: None,
         hit: target,
         score: None,
         matched_by: Vec::new(),
@@ -196,6 +197,7 @@ fn search_result(
     warnings: Vec<ReadWarning>,
 ) -> SearchResult {
     SearchResult {
+        view: None,
         results,
         pagination,
         warnings,
@@ -350,6 +352,7 @@ fn symbol_result(hits: Vec<GetSymbolHit>, page: Pagination) -> GetSymbolResult {
 
 fn nodes_result(nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
     NodesResult {
+        view: None,
         nodes,
         source: source.into_iter().map(str::to_owned).collect(),
         warnings: Vec::new(),
@@ -757,6 +760,10 @@ fn warning_cases() -> Vec<(serde_json::Value, &'static str)> {
         (
             json!({"code": "documentation_unavailable", "detail": "documentation crossed a bound"}),
             "documentation_unavailable: documentation crossed a bound",
+        ),
+        (
+            json!({"code": "object_unavailable", "qualified_name": "app/a/A", "field": "name", "bound": 4096}),
+            "object_unavailable · qualified_name app/a/A · field name · bound 4096",
         ),
         (
             json!({"code": "stale_index", "index_tree_revision": "3f9a1c2e",
@@ -4394,4 +4401,140 @@ fn output_allocation_cost() {
     measure_allocations::<SearchResult>("search");
     measure_allocations::<GetSymbolResult>("get_symbol");
     measure_allocations::<NodesResult>("nodes");
+}
+
+#[test]
+fn nodes_captured_view_renders_original_key_and_expiry() {
+    let mut answer = nodes_result(Vec::new(), Vec::new());
+    answer.view = Some(rift_protocol::symbol_read::CapturedView {
+        id: rift_protocol::symbol_read::CapturedViewId::parse("claims.nodes")
+            .expect("issued fixture key"),
+        expires_at: "2030-01-01T00:15:00Z".to_owned(),
+    });
+    let text = rendered(&answer);
+    assert!(
+        text.contains("view claims.nodes · expires 2030-01-01T00:15:00Z"),
+        "{text}"
+    );
+    answer.view = None;
+    assert!(!rendered(&answer).contains("view "));
+}
+
+#[test]
+fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() {
+    use rift_protocol::symbol_read::{CapturedView, CapturedViewId, GetSymbolResult};
+    let id = SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity");
+    let answer = GetSymbolResult::Found {
+        symbol: Box::new(symbol(Some(id.as_str()), "A")),
+        view: CapturedView {
+            id: CapturedViewId::parse("claims.signature").expect("view"),
+            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
+        },
+        declarations: Vec::new(),
+        declaration_cursor: None,
+        history: None,
+        documentation: None,
+        warnings: Vec::new(),
+    };
+    let text = rendered(&answer);
+    assert!(text.contains(id.as_str()));
+    assert!(text.contains("view claims.signature"));
+    assert!(!text.contains("declarations:"));
+    assert!(!text.contains("a.rs:1"));
+}
+
+#[test]
+fn canonical_symbol_render_keeps_binding_bytes_and_declaration_continuation() {
+    use rift_protocol::symbol_read::{
+        CapturedView, CapturedViewId, GetSymbolResult, SymbolDeclaration,
+    };
+    let logical = symbol(Some("rift://symbol/local/rust/app/a/A"), "A");
+    let source = "// original\nstruct A;\n";
+    let answer = GetSymbolResult::Found {
+        declarations: vec![SymbolDeclaration {
+            origin: logical.origin.clone(),
+            path: Some(project_path("a.rs")),
+            unit: None,
+            range: range(0, source.len() as u64),
+            line: 1,
+            node: None,
+            source: Some(source.to_owned()),
+            source_complete: true,
+            signature_indices: Vec::new(),
+            type_indices: Vec::new(),
+            documentation_indices: Vec::new(),
+        }],
+        symbol: Box::new(logical),
+        view: CapturedView {
+            id: CapturedViewId::parse("claims.signature").expect("view"),
+            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
+        },
+        declaration_cursor: Some("opaque-continuation".to_owned()),
+        history: None,
+        documentation: None,
+        warnings: Vec::new(),
+    };
+    let text = rendered(&answer);
+    assert!(text.contains("a.rs:1"));
+    assert!(text.contains("// original\n\t\tstruct A;\n"));
+    assert!(text.contains("declaration_cursor opaque-continuation"));
+}
+
+#[test]
+fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
+    use rift_protocol::symbol_read::{
+        CapturedView, CapturedViewId, GetSymbolResult, SymbolNotFound, SymbolUnavailableReason,
+    };
+    let id = SymbolId::parse("rift://symbol/local/rust/app/a/A").expect("modeled local identity");
+    let view = CapturedView {
+        id: CapturedViewId::parse("claims.signature").expect("view"),
+        expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
+    };
+    let missing = GetSymbolResult::Missing {
+        symbol_not_found: SymbolNotFound {
+            id: id.clone(),
+            alternatives: Vec::new(),
+            detail: None,
+        },
+        view: view.clone(),
+        warnings: Vec::new(),
+    };
+    let unavailable = GetSymbolResult::Unavailable {
+        id,
+        view: Some(view),
+        reason: SymbolUnavailableReason::ViewExpired,
+        warnings: Vec::new(),
+    };
+    assert!(rendered(&missing).contains("symbol_not_found"));
+    let text = rendered(&unavailable);
+    assert!(text.contains("unavailable · ViewExpired"));
+    assert!(!text.contains("symbol_not_found"));
+}
+
+#[test]
+fn canonical_source_render_keeps_utf8_bytes_and_original_view() {
+    use rift_protocol::source_read::GetSourceResult;
+    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
+    let unit = SourceUnitId::parse("rift://source/project/src/lib.rs").expect("modeled source");
+    let text = "// café\nstruct A;\n";
+    let answer = GetSourceResult::Found {
+        source: rift_protocol::read::SourceExcerpt {
+            span: rift_protocol::read::SourceUnitSpan {
+                unit: unit.clone(),
+                range: range(0, text.len() as u64),
+            },
+            text: text.to_owned(),
+        },
+        source_complete: true,
+        view: CapturedView {
+            id: CapturedViewId::parse("claims.signature").expect("view"),
+            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
+        },
+        warnings: Vec::new(),
+    };
+    let output = rendered(&answer);
+    assert!(output.contains(unit.as_str()));
+    assert!(output.contains("// café\n\tstruct A;\n"));
+    assert!(output.contains(&format!("0..{}", text.len())));
+    assert!(output.contains("view claims.signature · expires 2030-01-01T00:10:00+00:00"));
 }

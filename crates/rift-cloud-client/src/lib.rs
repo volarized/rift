@@ -56,14 +56,12 @@ pub use generated::{
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
     DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, IdentifierMatchClass, Language, ListPackageSymbolsRequest,
-    ListPackageSymbolsRequestQuery, ListPackageSymbolsResponse, NodeId, NotebookCellIdentity,
+    GetCapabilitiesResponse, IdentifierMatchClass, Language, NodeId, NotebookCellIdentity,
     NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
     PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
     PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,
     PackageResolutionResponse, PackageSearchHit, PackageSearchHitContributingField,
-    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, PackageSymbol,
-    PackageSymbolPage, PackageSymbolRequest, PackageSymbolRequestInclude, Parameter,
+    PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
     PublicationFormat, QueryTerm, RelationshipFacet, ResolvePackageContextRequest,
     ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
@@ -74,7 +72,7 @@ pub use generated::{
     Warning, WarningCode,
 };
 pub mod domain;
-pub use domain::{PackagePatternMatch, PackageSearchCandidate, PackageSymbolCandidate};
+pub use domain::{PackagePatternMatch, PackageSearchCandidate};
 pub use pattern::PATTERN_PAGE_FILES_MAX;
 pub use search::{PackageSearchItem, PackageSearchPage};
 
@@ -390,24 +388,6 @@ pub struct PackageSearchPages {
     pub view: rift_protocol::symbol_read::CapturedView,
     /// Cursor of the last page when the server stopped it at the response body bound. The
     /// assembly does not follow it; a caller **MAY** pass it to `search_packages`.
-    pub next_cursor: Option<String>,
-}
-
-/// Symbol pages assembled under one capability and candidate bound.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PackageSymbolPages {
-    /// Ordered, duplicate-free declarations.
-    pub items: Vec<PackageSymbol>,
-    /// First distinct warnings in page order.
-    pub warnings: Vec<Warning>,
-    /// Analyzer revision shared by every page.
-    pub analyzer_revision: String,
-    /// Corpus revision shared by every page.
-    pub corpus_revision: String,
-    /// Documentation revision shared by every page that returns documentation.
-    pub documentation_revision: Option<String>,
-    /// Cursor of the last page when the server stopped it at the response body bound. The
-    /// assembly does not follow it; a caller **MAY** pass it to `list_package_symbols`.
     pub next_cursor: Option<String>,
 }
 
@@ -765,80 +745,6 @@ impl GlobalClient {
         .await
     }
 
-    /// Reads one package symbol page.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RiftError`] when the request or answer breaks the contract, or the endpoint is
-    /// unavailable.
-    pub async fn list_package_symbols(
-        &self,
-        request: &PackageSymbolRequest,
-        limit: i64,
-        cursor: Option<&str>,
-    ) -> Result<PackageSymbolPage, RiftError> {
-        rift_tracing::traced!(
-            component = "global",
-            operation = "list_package_symbols",
-            async {
-                if !self.inner.enabled {
-                    return Err(failure::configuration_invalid(
-                        "enabled",
-                        "global client disabled",
-                    ));
-                }
-                validate_symbol_request(request)?;
-                validate_page(limit, cursor)?;
-                let capabilities = self.get_capabilities().await?;
-                validate_symbol_request_for_capabilities(request, limit, cursor, &capabilities)?;
-                let body = serialize_body(request, self.inner.config.max_request)?;
-                validate_body_for_capabilities(
-                    &body,
-                    &capabilities,
-                    self.inner.config.max_request,
-                )?;
-                let query = ListPackageSymbolsRequestQuery {
-                    limit: Some(limit),
-                    cursor: cursor.map(str::to_owned),
-                };
-                let raw = match self
-                    .request_with_query(
-                        contract::Endpoint::Symbols,
-                        body,
-                        &query,
-                        active_response_body_bytes_max(
-                            &capabilities,
-                            self.inner.config.max_response,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(raw) => raw,
-                    Err(error) => {
-                        return self.observed(Err(error)).await;
-                    }
-                };
-                let response::Parsed { value: page, .. } = match response::symbols(raw).await {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        return self.observed(Err(error)).await;
-                    }
-                };
-                if let Err(error) = validate_symbol_page(
-                    request,
-                    &capabilities,
-                    &page,
-                    cursor,
-                    self.inner.config.max_source,
-                ) {
-                    return self.observed(Err(error)).await;
-                }
-                Ok(page)
-            }
-        )
-        .await
-    }
-
     /// Reads package search pages through the active candidate bound, asking each page for the
     /// smaller of `limit` and the advertised `page_limit_max`.
     ///
@@ -928,93 +834,6 @@ impl GlobalClient {
                         return self
                             .observed(Err(failure::response_invalid(
                                 "search_packages_pages",
-                                "cursor_progress",
-                                "field failed validation",
-                                None,
-                            )))
-                            .await;
-                    }
-                    cursor = Some(next);
-                }
-            }
-        )
-        .await
-    }
-
-    /// Reads package symbol pages through the active candidate bound, asking each page for the
-    /// smaller of `limit` and the advertised `page_limit_max`.
-    ///
-    /// A page the server stopped at the response body bound ends the assembly, and its cursor
-    /// lands in [`PackageSymbolPages::next_cursor`] unfollowed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RiftError`] when any page is unavailable, changes revision, repeats an identity,
-    /// or repeats a cursor.
-    pub async fn list_package_symbols_pages(
-        &self,
-        request: &PackageSymbolRequest,
-        limit: i64,
-    ) -> Result<PackageSymbolPages, RiftError> {
-        rift_tracing::traced!(
-            component = "global",
-            operation = "list_package_symbols_pages",
-            async {
-                validate_symbol_request(request)?;
-                validate_page(limit, None)?;
-                let capabilities = self.get_capabilities().await?;
-                let limit = advertised_page_limit(limit, &capabilities);
-                validate_symbol_request_for_capabilities(request, limit, None, &capabilities)?;
-                let candidate_max = bounded_candidate_pool(&capabilities);
-                let mut cursor = None;
-                let mut hits = Vec::new();
-                let mut warnings = Vec::new();
-                let mut revisions = None;
-                let mut seen_cursors = HashSet::new();
-                loop {
-                    let page = self
-                        .list_package_symbols(request, limit, cursor.as_deref())
-                        .await?;
-                    if let Err(error) = validate_assembled_revision(
-                        &mut revisions,
-                        &page.analyzer_revision,
-                        &page.corpus_revision,
-                        page.documentation_revision.as_deref(),
-                    ) {
-                        return self.observed(Err(error)).await;
-                    }
-                    let stopped = stopped_at_body_bound(&page.warnings, page.items.len(), limit);
-                    extend_warnings(&mut warnings, page.warnings);
-                    for hit in page.items {
-                        let identity = symbol_hit_identity(&hit);
-                        if hits
-                            .iter()
-                            .any(|item: &PackageSymbol| symbol_hit_identity(item) == identity)
-                        {
-                            return self
-                                .observed(Err(failure::response_invalid(
-                                    "list_package_symbols_pages",
-                                    "duplicate_item",
-                                    "field failed validation",
-                                    None,
-                                )))
-                                .await;
-                        }
-                        hits.push(hit);
-                        if hits.len() >= candidate_max {
-                            return Ok(symbol_pages(hits, warnings, revisions, None));
-                        }
-                    }
-                    let Some(next) = page.next_cursor else {
-                        return Ok(symbol_pages(hits, warnings, revisions, None));
-                    };
-                    if stopped {
-                        return Ok(symbol_pages(hits, warnings, revisions, Some(next)));
-                    }
-                    if !seen_cursors.insert(next.clone()) {
-                        return self
-                            .observed(Err(failure::response_invalid(
-                                "list_package_symbols_pages",
                                 "cursor_progress",
                                 "field failed validation",
                                 None,
@@ -1529,33 +1348,6 @@ fn validate_search_request_for_capabilities(
     )
 }
 
-fn validate_symbol_request_for_capabilities(
-    request: &PackageSymbolRequest,
-    limit: i64,
-    cursor: Option<&str>,
-    capabilities: &Capabilities,
-) -> Result<(), RiftError> {
-    if request
-        .include
-        .as_ref()
-        .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation))
-        && !supports_feature(capabilities, SYMBOL_DOCUMENTATION_FEATURE)
-    {
-        return Err(failure::configuration_invalid(
-            "feature",
-            &format!("global API does not advertise feature: {SYMBOL_DOCUMENTATION_FEATURE}"),
-        ));
-    }
-    if request.name.len() > smaller_bound(capabilities.bounds.query_bytes_max, QUERY_BYTES_MAX) {
-        return Err(failure::request_invalid(
-            "validate_symbol_request_for_capabilities",
-            "name",
-            "field failed validation",
-        ));
-    }
-    validate_read_bounds(request.packages.len(), limit, cursor, capabilities)
-}
-
 fn validate_read_bounds(
     packages: usize,
     limit: i64,
@@ -2048,22 +1840,6 @@ fn validate_search_traversal_request(request: &PackageSearchRequest) -> Result<(
     Ok(())
 }
 
-fn validate_symbol_request(request: &PackageSymbolRequest) -> Result<(), RiftError> {
-    bounded_nonempty_characters(&request.name, QUERY_BYTES_MAX, "name")?;
-    if request
-        .include
-        .as_ref()
-        .is_some_and(|values| values.len() > 2)
-    {
-        return Err(failure::request_invalid(
-            "validate_symbol_request",
-            "include",
-            "field failed validation",
-        ));
-    }
-    validate_packages(&request.packages)
-}
-
 /// Checks contract character bounds and the validated exact defining registry owner.
 fn validate_package_identity(package: &PackageIdentity) -> Result<(), RiftError> {
     bounded_nonempty_characters(
@@ -2427,114 +2203,6 @@ fn validate_canonical_search_hit(
     Ok(())
 }
 
-fn validate_symbol_page(
-    request: &PackageSymbolRequest,
-    capabilities: &Capabilities,
-    page: &PackageSymbolPage,
-    cursor: Option<&str>,
-    source_bytes_max: usize,
-) -> Result<(), RiftError> {
-    let documentation_requested = request
-        .include
-        .as_ref()
-        .is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Documentation));
-    PageMetadata {
-        publication_format: &page.publication_format,
-        analyzer_revision: &page.analyzer_revision,
-        corpus_revision: &page.corpus_revision,
-        documentation_revision: page.documentation_revision.as_deref(),
-        next_cursor: page.next_cursor.as_deref(),
-        warnings: &page.warnings,
-    }
-    .validate(capabilities, documentation_requested)?;
-    let packages: HashSet<_> = request.packages.iter().map(package_key).collect();
-    let mut seen = HashSet::new();
-    let mut documentation_bytes = 0_usize;
-    for hit in &page.items {
-        if documentation_requested != hit.documentation.is_some() {
-            return Err(failure::response_invalid(
-                "validate_symbol_page",
-                "documentation",
-                "field failed validation",
-                None,
-            ));
-        }
-        if hit.source.is_some() && !includes_symbol_source(request.include.as_deref()) {
-            return Err(failure::response_invalid(
-                "validate_symbol_page",
-                "source",
-                "field failed validation",
-                None,
-            ));
-        }
-        if request
-            .language
-            .as_ref()
-            .is_some_and(|language| language != &hit.symbol.language)
-        {
-            return Err(failure::response_invalid(
-                "validate_symbol_page",
-                "language",
-                "field failed validation",
-                None,
-            ));
-        }
-        let qualified_name = validate_hit_common(
-            &hit.package,
-            &hit.symbol,
-            HitLocation {
-                unit: &hit.unit,
-                range: &hit.range,
-                line: hit.line,
-                source: hit.source.as_deref(),
-            },
-            Some(&packages),
-            smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
-        )?;
-        validate_symbol_match_class(request, hit, &qualified_name)?;
-        if let Some(context) = &hit.documentation {
-            for reference in &context.references {
-                documentation_bytes += reference.excerpt.as_ref().map_or(0, String::len);
-                validate_documentation_source_bytes(
-                    reference.excerpt.as_ref().map_or(0, String::len),
-                    smaller_bound(capabilities.bounds.source_bytes_max, source_bytes_max),
-                )?;
-                validate_documentation_bytes(documentation_bytes)?;
-            }
-            let symbol_id = hit.symbol.id.as_deref().ok_or(failure::response_invalid(
-                "validate_symbol_page",
-                "symbol_identity",
-                "field failed validation",
-                None,
-            ))?;
-            let symbol_id = rift_protocol::read::SymbolId(symbol_id.to_owned());
-            let protocol_context = crate::domain::protocol_documentation_context(context.clone())?;
-            crate::domain::validate_documentation_context(
-                &protocol_context,
-                &symbol_id,
-                &domain::package_identity(&hit.package),
-            )?;
-        }
-        if !seen.insert(symbol_hit_identity(hit)) {
-            return Err(failure::response_invalid(
-                "validate_symbol_page",
-                "duplicate_item",
-                "field failed validation",
-                None,
-            ));
-        }
-    }
-    if cursor.is_some() && page.items.is_empty() && page.next_cursor.as_deref() == cursor {
-        return Err(failure::response_invalid(
-            "validate_symbol_page",
-            "cursor_progress",
-            "field failed validation",
-            None,
-        ));
-    }
-    Ok(())
-}
-
 fn validate_documentation_source_bytes(bytes: usize, maximum: usize) -> Result<(), RiftError> {
     if bytes > maximum {
         return Err(failure::response_invalid(
@@ -2636,10 +2304,6 @@ impl PageMetadata<'_> {
 
 fn includes_source(include: Option<&[String]>) -> bool {
     include.is_some_and(|fields| fields.iter().any(|field| field == "source"))
-}
-
-fn includes_symbol_source(include: Option<&[PackageSymbolRequestInclude]>) -> bool {
-    include.is_some_and(|fields| fields.contains(&PackageSymbolRequestInclude::Source))
 }
 
 #[derive(Clone, Copy)]
@@ -2864,26 +2528,6 @@ fn validate_search_match_class(
     Ok(())
 }
 
-fn validate_symbol_match_class(
-    request: &PackageSymbolRequest,
-    hit: &PackageSymbol,
-    qualified_name: &str,
-) -> Result<(), RiftError> {
-    let actual = ranking_match_class(&hit.match_class)?;
-    let expected =
-        rift_ranking::identifier_match(request.name.trim(), &hit.symbol.name, qualified_name)
-            .map(rift_ranking::IdentifierMatch::class);
-    if expected != Some(actual) {
-        return Err(failure::response_invalid(
-            "validate_symbol_match_class",
-            "match_class",
-            "field failed validation",
-            None,
-        ));
-    }
-    Ok(())
-}
-
 /// The identifier match class one search hit claims: `None` for `unknown`, which a hit
 /// matching none of the requested identifiers reports, such as a declaration matched by
 /// its body alone.
@@ -3058,24 +2702,6 @@ fn search_pages(
     })
 }
 
-fn symbol_pages(
-    items: Vec<PackageSymbol>,
-    warnings: Vec<Warning>,
-    revisions: Option<(String, String, Option<String>)>,
-    next_cursor: Option<String>,
-) -> PackageSymbolPages {
-    let (analyzer_revision, corpus_revision, documentation_revision) =
-        assembled_revisions(revisions);
-    PackageSymbolPages {
-        items,
-        warnings,
-        analyzer_revision,
-        corpus_revision,
-        documentation_revision,
-        next_cursor,
-    }
-}
-
 fn search_hit_identity(hit: &PackageSearchItem) -> Result<String, RiftError> {
     match hit {
         PackageSearchItem::Search(hit) => {
@@ -3124,19 +2750,6 @@ fn search_hit_identity(hit: &PackageSearchItem) -> Result<String, RiftError> {
             Ok(candidate.identity.as_str().to_owned())
         }
     }
-}
-
-fn symbol_hit_identity(hit: &PackageSymbol) -> (String, String, String, String) {
-    let symbol_id = match &hit.symbol.id {
-        Some(value) => value.clone(),
-        None => hit.symbol.name.clone(),
-    };
-    (
-        hit.package.manager.clone(),
-        hit.package.name.clone(),
-        hit.package.version.clone(),
-        format!("{}:{symbol_id}", hit.unit),
-    )
 }
 
 fn validate_config(config: &Config) -> Result<(), RiftError> {

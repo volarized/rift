@@ -495,3 +495,686 @@ fn captured_view_refuses_unknown_keys_and_preparing_indices() {
         Err(SymbolUnavailableReason::IndexPreparing),
     );
 }
+
+#[test]
+fn captured_source_and_nodes_keep_canonical_binding_after_live_source_changes() {
+    let (directory, reads, id) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [13; 32]);
+    let view = store
+        .capture(captured_input(&reads))
+        .expect("admission")
+        .expect("view");
+    let source_request = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/index.js")
+            .expect("source identity"),
+        range: None,
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    let node_request = rift_protocol::read::NodesParams {
+        path: rift_protocol::read::ProjectPath("index.js".to_owned()),
+        position: 40,
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    let source = store
+        .get_source(&source_request, reads.index.root(), reads.index.owner())
+        .expect("source read");
+    let rift_protocol::source_read::GetSourceResult::Found {
+        source: excerpt,
+        view: answered,
+        source_complete,
+        ..
+    } = &source
+    else {
+        panic!("captured source must remain available");
+    };
+    assert!(source_complete);
+    assert_eq!(answered, &view);
+    assert_eq!(
+        excerpt.text,
+        reads
+            .index
+            .file(&rift_core::ProjectPath::new("index.js").expect("path"))
+            .expect("source")
+            .source()
+    );
+    let nodes = store
+        .nodes(
+            &node_request,
+            &view.id,
+            reads.index.root(),
+            reads.index.owner(),
+        )
+        .expect("node read")
+        .expect("captured nodes");
+    assert_eq!(nodes.1, view);
+    assert_eq!(nodes.0.view.as_ref(), Some(&view));
+    assert!(
+        nodes
+            .0
+            .nodes
+            .iter()
+            .any(|node| node.symbol.as_ref() == Some(&id))
+    );
+    std::fs::write(
+        directory.path().join("index.js"),
+        "export function changed() {}\n",
+    )
+    .expect("current source change");
+    assert_eq!(
+        store
+            .get_source(&source_request, reads.index.root(), reads.index.owner())
+            .expect("retained source"),
+        source
+    );
+    assert_eq!(
+        store
+            .nodes(
+                &node_request,
+                &view.id,
+                reads.index.root(),
+                reads.index.owner()
+            )
+            .expect("retained nodes")
+            .expect("view"),
+        nodes
+    );
+}
+
+#[test]
+fn captured_source_and_nodes_refuse_foreign_selection_and_invalid_byte_ranges() {
+    let (_directory, reads, _) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [14; 32]);
+    let view = store
+        .capture(captured_input(&reads))
+        .expect("admission")
+        .expect("view");
+    let mut request = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/index.js")
+            .expect("source identity"),
+        range: Some(rift_protocol::read::TextRange {
+            start: 0,
+            end: u64::MAX,
+        }),
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    assert!(
+        store
+            .get_source(&request, reads.index.root(), reads.index.owner())
+            .is_err()
+    );
+    request.range = None;
+    request.unit = rift_protocol::read::SourceUnitId::parse(
+        "rift://source/npm/npmjs.org/beacon@1.0.0/index.js",
+    )
+    .expect("released source identity");
+    assert!(matches!(
+        store
+            .get_source(&request, reads.index.root(), reads.index.owner())
+            .expect("owner refusal"),
+        rift_protocol::source_read::GetSourceResult::Unavailable {
+            reason: SymbolUnavailableReason::ViewContext,
+            ..
+        }
+    ));
+    request.unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/missing.rs")
+        .expect("missing source identity");
+    assert!(matches!(
+        store
+            .get_source(&request, reads.index.root(), reads.index.owner())
+            .expect("source absence"),
+        rift_protocol::source_read::GetSourceResult::Missing { .. }
+    ));
+    let nodes = rift_protocol::read::NodesParams {
+        path: rift_protocol::read::ProjectPath("index.js".to_owned()),
+        position: u64::MAX,
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    assert!(
+        store
+            .nodes(&nodes, &view.id, reads.index.root(), reads.index.owner())
+            .is_err()
+    );
+    let other_view = store
+        .capture(captured_input(&reads))
+        .expect("second admission")
+        .expect("second view");
+    let mut other_nodes = nodes.clone();
+    other_nodes.view = Some(other_view.id);
+    assert!(matches!(
+        store
+            .nodes(
+                &other_nodes,
+                &view.id,
+                reads.index.root(),
+                reads.index.owner()
+            )
+            .expect("request view context refusal"),
+        Err(SymbolUnavailableReason::ViewContext)
+    ));
+    assert!(matches!(
+        store
+            .nodes(&nodes, &view.id, Path::new("/foreign"), reads.index.owner())
+            .expect("context refusal"),
+        Err(SymbolUnavailableReason::ViewContext)
+    ));
+}
+#[test]
+fn captured_input_getters_keep_exact_root_owner_and_material_charge() {
+    let (_directory, reads, id) = fixture(true);
+    let input = reads
+        .local_search_view_input(true)
+        .expect("immutable input");
+    let charge = input.retained_bytes;
+    assert_eq!(input.root(), reads.index.root());
+    assert_eq!(input.owner(), reads.index.owner());
+    assert_eq!(input.owner(), &SymbolOwner::Local);
+    let root = input.root().to_owned();
+    let owner = input.owner().clone();
+    for _ in 0..256 {
+        assert_eq!(input.root(), root);
+        assert_eq!(input.owner(), &owner);
+        assert_eq!(input.retained_bytes, charge);
+    }
+    let store = LocalSymbolViews::new(1 << 20, [18; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let view = store
+        .capture_at(input, now)
+        .expect("capture")
+        .expect("admitted");
+    assert!(matches!(
+        store
+            .resolve_at(&request(id, view.id), &root, &owner, now)
+            .expect("same captured authority"),
+        GetSymbolResult::Found { .. }
+    ));
+}
+
+#[test]
+fn captured_nodes_keep_inline_framework_after_current_source_changes() {
+    let directory = tempfile::tempdir().expect("workspace");
+    let original = "import {Component} from '@angular/core'; @Component({template:`<p>{{ title }}</p>`}) export class Beacon {}";
+    std::fs::write(directory.path().join("component.ts"), original).expect("captured source");
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"beacon","version":"1.0.0","main":"component.ts"}"#,
+    )
+    .expect("captured metadata");
+    let reads = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        HistoryConfiguration::default(),
+    )
+    .expect("captured index");
+    let input = reads
+        .local_search_view_input(true)
+        .expect("immutable input");
+    let store = LocalSymbolViews::new(1 << 20, [19; 32]);
+    let view = store.capture(input).expect("capture").expect("admission");
+    let request = rift_protocol::read::NodesParams {
+        path: rift_protocol::read::ProjectPath("component.ts".to_owned()),
+        position: u64::try_from(original.find("title").expect("template position"))
+            .expect("position"),
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    let captured = store
+        .nodes(&request, &view.id, reads.index.root(), reads.index.owner())
+        .expect("captured node read")
+        .expect("captured context");
+    assert!(
+        captured
+            .0
+            .nodes
+            .iter()
+            .any(|node| node.kind.0 == "interpolation")
+    );
+    assert_eq!(captured.0.view.as_ref(), Some(&view));
+    assert!(
+        captured
+            .0
+            .source
+            .iter()
+            .any(|source| source.contains("title"))
+    );
+    std::fs::write(
+        directory.path().join("component.ts"),
+        "export class Changed {}",
+    )
+    .expect("current source change");
+    std::fs::write(directory.path().join("package.json"), "{}").expect("current metadata change");
+    assert_eq!(
+        store
+            .nodes(&request, &view.id, reads.index.root(), reads.index.owner())
+            .expect("retained node read")
+            .expect("retained context"),
+        captured
+    );
+}
+
+#[test]
+fn captured_traversal_refuses_missing_seed_before_admission() {
+    let (_directory, reads, _) = fixture(true);
+    let traversal = serde_json::from_value(serde_json::json!({"direction":"incoming"}))
+        .expect("missing seed request");
+    let error = reads
+        .local_traversal_view_input(&traversal, crate::EngineReferences::default(), true)
+        .expect_err("missing seed refuses before capture");
+    assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+    let store = LocalSymbolViews::new(1 << 20, [20; 32]);
+    let view = store
+        .capture(captured_input(&reads))
+        .expect("capture")
+        .expect("view");
+    let error = store
+        .traversal(
+            &traversal,
+            &view.id,
+            reads.index.root(),
+            reads.index.owner(),
+        )
+        .expect_err("missing seed cannot read retained graph");
+    assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+}
+
+#[test]
+fn captured_traversal_keeps_missing_engine_rows_unavailable() {
+    let (_directory, reads, id) = fixture(true);
+    let traversal = serde_json::from_value(serde_json::json!({"seed":id,"direction":"incoming"}))
+        .expect("canonical traversal");
+    let input = reads
+        .local_traversal_view_input(&traversal, crate::EngineReferences::default(), true)
+        .expect("captured syntax without engine authority");
+    let store = LocalSymbolViews::new(1 << 20, [21; 32]);
+    let view = store.capture(input).expect("capture").expect("view");
+    assert!(matches!(
+        store
+            .traversal(
+                &traversal,
+                &view.id,
+                reads.index.root(),
+                reads.index.owner()
+            )
+            .expect("truthful engine coverage"),
+        Err(SymbolUnavailableReason::InsufficientCoverage)
+    ));
+    assert!(matches!(
+        store
+            .traversal(
+                &traversal,
+                &view.id,
+                Path::new("/foreign"),
+                reads.index.owner()
+            )
+            .expect("context refusal"),
+        Err(SymbolUnavailableReason::ViewContext)
+    ));
+}
+
+#[test]
+fn captured_input_warnings_remain_measured_after_current_source_changes() {
+    let (directory, reads, id) = fixture(true);
+    let warning = rift_protocol::read::ReadWarning::StaleIndex {
+        index_tree_revision: rift_protocol::read::Digest("12345678".into()),
+        captured_tree_revision: rift_protocol::read::Digest("87654321".into()),
+        detail: "captured tree changed after publication".into(),
+    };
+    let input = reads
+        .local_search_view_input(true)
+        .expect("immutable input");
+    let charge = input.retained_bytes;
+    let input = input
+        .with_warnings(vec![warning.clone()])
+        .expect("measured warning");
+    assert!(input.retained_bytes > charge);
+    let metadata: CapturedMetadata =
+        serde_json::from_slice(&input.material.metadata).expect("captured metadata");
+    assert_eq!(metadata.warnings.last(), Some(&warning));
+    assert_eq!(
+        input.warnings().expect("captured warnings"),
+        metadata.warnings
+    );
+    let root = input.root().to_owned();
+    let owner = input.owner().clone();
+    let store = LocalSymbolViews::new(1 << 20, [24; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let view = store
+        .capture_at(input, now)
+        .expect("capture")
+        .expect("admitted");
+    let selected = request(id, view.id.clone());
+    let initial = store
+        .resolve_at(&selected, &root, &owner, now)
+        .expect("initial read");
+    std::fs::write(
+        directory.path().join("index.js"),
+        "export function changed() {}\n",
+    )
+    .expect("later source");
+    let later = store
+        .resolve_at(&selected, &root, &owner, now)
+        .expect("held read");
+    let GetSymbolResult::Found {
+        warnings: initial_warnings,
+        view: initial_view,
+        ..
+    } = initial
+    else {
+        panic!("initial object")
+    };
+    let GetSymbolResult::Found {
+        warnings: later_warnings,
+        view: later_view,
+        ..
+    } = later
+    else {
+        panic!("held object")
+    };
+    assert_eq!(initial_warnings, later_warnings);
+    assert_eq!(initial_warnings.len(), metadata.warnings.len() + 1);
+    assert_eq!(
+        &initial_warnings[..metadata.warnings.len()],
+        metadata.warnings.as_slice()
+    );
+    assert!(initial_warnings.contains(&warning));
+    assert!(matches!(
+        initial_warnings.last(),
+        Some(rift_protocol::read::ReadWarning::SymbolDisagreement {
+            symbol,
+            providers,
+            detail,
+        }) if symbol == &selected.id && providers == &["syntax"] && !detail.is_empty()
+    ));
+    assert_eq!(initial_view, later_view);
+    assert_eq!(later_view, view);
+}
+
+#[test]
+fn captured_input_warning_extension_preserves_preparing_refusal() {
+    let (_directory, reads, id) = fixture(true);
+    let input = reads
+        .local_search_view_input(false)
+        .expect("preparing input")
+        .with_warnings(vec![rift_protocol::read::ReadWarning::GlobalAccessDisabled])
+        .expect("warning");
+    assert!(!input.ready);
+    let root = input.root().to_owned();
+    let owner = input.owner().clone();
+    let store = LocalSymbolViews::new(1 << 20, [25; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let view = store
+        .capture_at(input, now)
+        .expect("capture")
+        .expect("admitted");
+    assert!(matches!(
+        store
+            .resolve_at(&request(id, view.id), &root, &owner, now)
+            .expect("preparing refusal"),
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::IndexPreparing,
+            ..
+        }
+    ));
+}
+
+fn captured_documentation_hits(
+    reads: &ReadService,
+    view: &CapturedView,
+) -> Vec<rift_protocol::read::SearchHit> {
+    use rift_protocol::documentation::{DOCUMENTATION_EXCERPT_BYTES_MAX, DocumentationHit};
+    use rift_protocol::read::{SearchHit, SearchHitTarget};
+    let collection = reads.index.documentation();
+    collection
+        .index()
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.range.end - block.range.start > u64::from(DOCUMENTATION_EXCERPT_BYTES_MAX)
+        })
+        .map(|block| SearchHit {
+            view: Some(view.clone()),
+            hit: SearchHitTarget::Documentation {
+                documentation: Box::new(DocumentationHit {
+                    block: block.clone(),
+                    source: collection
+                        .source(&block.source)
+                        .expect("captured content owner")
+                        .clone(),
+                    documentation_revision: collection.index().documentation_revision.clone(),
+                }),
+            },
+            score: None,
+            matched_by: Vec::new(),
+            source: None,
+            range: Some(block.range.clone()),
+            line: Some(block.line),
+            path: match &block.source.source {
+                rift_protocol::documentation::DocumentationSourceIdentity::Project { path } => {
+                    Some(path.clone())
+                }
+                rift_protocol::documentation::DocumentationSourceIdentity::Package { .. } => None,
+            },
+            unit: match &block.source.source {
+                rift_protocol::documentation::DocumentationSourceIdentity::Package { unit } => {
+                    Some(unit.clone())
+                }
+                rift_protocol::documentation::DocumentationSourceIdentity::Project { .. } => None,
+            },
+            traversal_path: None,
+            distance: None,
+            change: None,
+        })
+        .collect()
+}
+
+#[test]
+fn captured_documentation_pages_reset_excerpt_budget_and_keep_original_utf8_sources() {
+    use rift_protocol::documentation::{DOCUMENTATION_EXCERPT_BYTES_MAX, DocumentationWarningKind};
+    let directory = tempfile::tempdir().expect("workspace");
+    let budget = DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
+    let original = format!("beacon {}\n", "é".repeat(budget));
+    for name in ["first.md", "second.md"] {
+        std::fs::write(directory.path().join(name), &original).expect("captured documentation");
+    }
+    let reads = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        HistoryConfiguration::default(),
+    )
+    .expect("captured index");
+    let store = LocalSymbolViews::new(64 << 20, [37; 32]);
+    let view = store
+        .capture(
+            reads
+                .local_search_view_input(true)
+                .expect("captured material"),
+        )
+        .expect("material admission")
+        .expect("captured view");
+    let hits = captured_documentation_hits(&reads, &view);
+    assert_eq!(hits.len(), 2);
+    for name in ["first.md", "second.md"] {
+        std::fs::write(directory.path().join(name), "changed current bytes\n")
+            .expect("source change");
+    }
+    let mut combined = hits.clone();
+    let warnings = store
+        .populate_sources(
+            &mut combined,
+            &view.id,
+            reads.index.root(),
+            reads.index.owner(),
+        )
+        .expect("held page")
+        .expect("original context");
+    assert_eq!(
+        combined[0].source.as_ref().expect("first excerpt").len(),
+        budget - 1
+    );
+    assert!(
+        combined[1]
+            .source
+            .as_ref()
+            .is_none_or(|source| source.len() <= 1)
+    );
+    assert!(!warnings.is_empty());
+    for hit in hits {
+        let mut page = vec![hit];
+        let warnings = store
+            .populate_sources(&mut page, &view.id, reads.index.root(), reads.index.owner())
+            .expect("held next page")
+            .expect("original context");
+        let source = page[0]
+            .source
+            .as_ref()
+            .expect("each page receives its own excerpt budget");
+        assert_eq!(source.as_bytes(), &original.as_bytes()[..budget - 1]);
+        assert_eq!(page[0].view.as_ref(), Some(&view));
+        assert!(warnings.iter().any(|warning| matches!(warning,
+            rift_protocol::read::ReadWarning::Documentation { warning }
+            if warning.kind == DocumentationWarningKind::LimitExceeded && warning.count == 1)));
+    }
+}
+
+#[test]
+#[ignore = "manual retained material measurement"]
+fn captured_local_view_material_measures_existing_workspace() {
+    let root = std::env::var_os("RIFT_RETAINED_MATERIAL_ROOT").expect("measurement root");
+    let root = std::path::PathBuf::from(root);
+    let reads = ReadService::build(
+        &root,
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        HistoryConfiguration::default(),
+    )
+    .expect("captured workspace");
+    let first_input = reads
+        .local_search_view_input(true)
+        .expect("immutable measured input");
+    let immutable = Arc::clone(&first_input.material.index);
+    let immutable_bytes = immutable.retained_material_bytes();
+    let factory_bytes = first_input.retained_bytes;
+    assert_ne!(immutable_bytes, usize::MAX);
+    assert_ne!(factory_bytes, usize::MAX);
+    let budget = usize::try_from(8_u64 << 30).expect("measurement budget");
+    let store = LocalSymbolViews::new(budget, [23; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let first = store
+        .capture_at(first_input, now)
+        .expect("first capture")
+        .expect("ordinary workspace admission");
+    let first_state = store.state.lock().expect("store").material_bytes();
+    let second_input = reads
+        .local_search_view_input(true)
+        .expect("same publication input");
+    assert!(Arc::ptr_eq(&immutable, &second_input.material.index));
+    let second = store
+        .capture_at(second_input, now)
+        .expect("second capture")
+        .expect("shared generation admission");
+    let second_state = {
+        let state = store.state.lock().expect("store");
+        assert_eq!(state.views.len(), 2);
+        assert!(state.views.contains_key(first.id.as_str()));
+        assert!(state.views.contains_key(second.id.as_str()));
+        state.material_bytes()
+    };
+    assert!(second_state <= budget);
+    assert!(second_state - first_state < immutable_bytes);
+    for record in immutable.normalized_graph().records() {
+        let Some(identity) = record.identity() else {
+            continue;
+        };
+        let (_, count) = immutable
+            .declarations_by_identity_page(identity, 0, 1)
+            .expect("captured binding page");
+        if count < 2 {
+            continue;
+        }
+        let params = request(
+            SymbolId::parse(identity.as_str()).expect("captured identity"),
+            first.id.clone(),
+        );
+        if matches!(
+            store
+                .resolve_at(&params, reads.index.root(), reads.index.owner(), now)
+                .expect("captured declaration page"),
+            GetSymbolResult::Found {
+                declaration_cursor: Some(_),
+                ..
+            }
+        ) {
+            break;
+        }
+    }
+    let state = store.state.lock().expect("store");
+    let cursor_state = state.material_bytes();
+    assert!(cursor_state <= budget);
+    println!(
+        "retained_material_bytes={immutable_bytes} factory_bytes={factory_bytes} first_state_bytes={first_state} second_state_bytes={second_state} cursor_state_bytes={cursor_state} cursor_count={} budget_bytes={budget} root={}",
+        state.cursors.len(),
+        root.display(),
+    );
+}
+
+#[test]
+fn local_view_continuation_charges_owned_context_and_refuses_byte_overflow() {
+    let (_directory, reads, id) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [27; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let view = capture(&store, &reads, now);
+    let before = store.state.lock().expect("state").material_bytes();
+    let params = request(id.clone(), view.id.clone());
+    let result = store
+        .resolve_at(&params, reads.index.root(), reads.index.owner(), now)
+        .expect("real declaration continuation");
+    let GetSymbolResult::Found {
+        declaration_cursor: Some(key),
+        view: answered,
+        ..
+    } = result
+    else {
+        panic!("three original declarations require a continuation");
+    };
+    assert_eq!(answered, view);
+    {
+        let state = store.state.lock().expect("state");
+        assert_eq!(state.cursors.len(), 1);
+        let cursor = state.cursors.get(&key).expect("retained continuation");
+        assert_eq!(cursor.id, id);
+        assert_eq!(cursor.view, view.id);
+        assert_eq!(cursor.include, params.include);
+        assert!(state.material_bytes() > before);
+        assert!(state.material_bytes() - before >= cursor.retained_bytes());
+        assert!(state.material_bytes() <= store.material_bytes_max);
+    }
+    let limited = LocalSymbolViews::new(before, [28; 32]);
+    let limited_view = capture(&limited, &reads, now);
+    let limited_params = request(id, limited_view.id.clone());
+    assert!(matches!(
+        limited
+            .resolve_at(
+                &limited_params,
+                reads.index.root(),
+                reads.index.owner(),
+                now
+            )
+            .expect("charged continuation refusal"),
+        GetSymbolResult::Unavailable {
+            reason: SymbolUnavailableReason::InsufficientCoverage,
+            ..
+        }
+    ));
+    let state = limited.state.lock().expect("state");
+    assert!(state.cursors.is_empty());
+    assert!(state.views.contains_key(limited_view.id.as_str()));
+    assert!(state.material_bytes() <= before);
+}

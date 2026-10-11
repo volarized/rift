@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn original_react_anonymous_property_assignments_keep_full_source_ranges() {
-        for (source, original_start) in [
+        for (original, original_start) in [
             (
                 include_str!("../tests/fixtures/react/react.development.js"),
                 48_434_u64,
@@ -805,23 +805,36 @@ mod tests {
                 17_608_u64,
             ),
         ] {
-            let document = analyze(source);
-            let symbol = document
-                .symbols()
-                .iter()
-                .find(|symbol| symbol.name == "useState")
-                .expect("actual original anonymous export");
-            assert_eq!(symbol.range.start, original_start);
-            assert_eq!(symbol.node_kind, Some("assignment_expression"));
-            assert!(!symbol.facets.contains(&SymbolFacet::Public));
-            let start = usize::try_from(symbol.item_range.start).expect("item start");
-            let end = usize::try_from(symbol.item_range.end).expect("item end");
-            assert!(source[start..end].starts_with("exports.useState = function (initialState)"));
-            assert!(source[start..end].ends_with('}'));
-            assert_eq!(
-                symbol.signatures[0].display,
-                "exports.useState = function (initialState)"
-            );
+            let lf = original.replace("\r\n", "\n");
+            let crlf = lf.replace('\n', "\r\n");
+            for source in [original, lf.as_str(), crlf.as_str()] {
+                let prefix = "exports.useState = function (initialState)";
+                let starts = source.match_indices(prefix).collect::<Vec<_>>();
+                assert_eq!(starts.len(), 1, "one original property assignment");
+                let expected_start = starts[0].0;
+                assert_eq!(
+                    u64::try_from(source[..expected_start].replace("\r\n", "\n").len())
+                        .expect("original LF offset"),
+                    original_start,
+                );
+                let document = analyze(source);
+                let symbol = document
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == "useState")
+                    .expect("actual original anonymous export");
+                assert_eq!(
+                    symbol.range.start,
+                    u64::try_from(expected_start).expect("supplied source offset")
+                );
+                assert_eq!(symbol.node_kind, Some("assignment_expression"));
+                assert!(!symbol.facets.contains(&SymbolFacet::Public));
+                let start = usize::try_from(symbol.item_range.start).expect("item start");
+                let end = usize::try_from(symbol.item_range.end).expect("item end");
+                assert!(source[start..end].starts_with(prefix));
+                assert!(source[start..end].ends_with('}'));
+                assert_eq!(symbol.signatures[0].display, prefix);
+            }
         }
     }
 }
