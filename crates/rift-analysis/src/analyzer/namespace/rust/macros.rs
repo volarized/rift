@@ -666,7 +666,7 @@ pub(super) fn children<'a>(
         depth_max,
         library,
     };
-    let ordinary = super::module_children(file.syntax, directory, inventory);
+    let ordinary = super::module_children(file, directory, inventory);
     let direct = ordinary
         .iter()
         .filter(|(_, local)| local.len() == 1)

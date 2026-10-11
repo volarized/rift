@@ -150,10 +150,11 @@ fn module_has_default_path(symbol: &rift_syntax::SyntaxSymbol) -> bool {
 }
 
 fn module_children(
-    syntax: &SyntaxFacts,
+    file: &super::SelectedFile<'_>,
     directory: &str,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
 ) -> Vec<(String, Vec<String>)> {
+    let syntax = file.syntax;
     let symbols = syntax
         .symbols()
         .iter()
@@ -161,7 +162,15 @@ fn module_children(
         .collect::<BTreeMap<_, _>>();
     let mut children = Vec::new();
     for symbol in syntax.symbols() {
-        if !module_has_default_path(symbol)
+        if symbol.kind != "module"
+            || !matches!(symbol.node_kind, None | Some("mod_item"))
+            || !matches!(
+                symbol.module_path,
+                Some(
+                    rift_syntax::RustModulePath::Absent
+                        | rift_syntax::RustModulePath::Literal { .. }
+                )
+            )
             || symbol.body_range.is_some()
             || !source_identifier(&symbol.name).is_some_and(|name| crate_name_is_valid(&name))
         {
@@ -197,13 +206,36 @@ fn module_children(
         else {
             continue;
         };
-        let relative = local.join("/");
-        let stem = if directory.is_empty() {
-            relative
-        } else {
-            format!("{directory}/{relative}")
-        };
-        let candidates = [format!("{stem}.rs"), format!("{stem}/mod.rs")];
+        let candidates =
+            if let Some(rift_syntax::RustModulePath::Literal { path, .. }) = &symbol.module_path {
+                let parent = if local.len() == 1 {
+                    file.path
+                        .as_str()
+                        .rsplit_once('/')
+                        .map_or("", |(parent, _)| parent)
+                        .to_owned()
+                } else {
+                    let inline = local[..local.len() - 1].join("/");
+                    if directory.is_empty() {
+                        inline
+                    } else {
+                        format!("{directory}/{inline}")
+                    }
+                };
+                vec![if parent.is_empty() {
+                    path.as_str().to_owned()
+                } else {
+                    format!("{parent}/{}", path.as_str())
+                }]
+            } else {
+                let relative = local.join("/");
+                let stem = if directory.is_empty() {
+                    relative
+                } else {
+                    format!("{directory}/{relative}")
+                };
+                vec![format!("{stem}.rs"), format!("{stem}/mod.rs")]
+            };
         let admitted = candidates
             .iter()
             .filter(|path| {

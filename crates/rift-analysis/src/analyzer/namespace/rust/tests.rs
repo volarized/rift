@@ -615,8 +615,22 @@ fn uncaptured_and_unlinked_module_files_do_not_supply_namespaces() {
 
 #[test]
 fn path_attributes_and_unknown_inline_attributes_refuse_default_file_mapping() {
+    let supported = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "#[path = \"a.rs\"] mod a;"),
+            ("src/a.rs", "pub struct Sender;"),
+            ("src/outer/a.rs", "pub struct Sender;"),
+        ],
+        None,
+        false,
+    );
+    let identity = SymbolIdentity::parse(supported["src/a.rs"]["Sender"].as_str())
+        .expect("original explicitly selected module");
+    assert_eq!(identity.qualified_path(), vec!["crate_root", "a", "Sender"]);
+    assert!(!supported.contains_key("src/outer/a.rs"));
     for root in [
-        "#[path = \"a.rs\"] mod a;",
+        "#[path = \"missing.rs\"] mod a;",
         "#[cfg_attr(feature = \"other\", path = \"a.rs\")] mod a;",
         "#[custom] mod outer { mod a; }",
         "mod outer { #![path = \"custom\"] mod a; }",
@@ -1879,4 +1893,99 @@ fn transparent_item_macros_validate_original_modules_before_unknown_effects() {
             );
         }
     }
+}
+
+#[test]
+fn literal_module_paths_keep_original_sources_and_logical_names() {
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            (
+                "src/lib.rs",
+                "#[path = \"to.rs\"] pub mod kept; mod ordinary; mod inline { #[path = \"other.rs\"] mod child; }",
+            ),
+            ("src/to.rs", "pub fn travelled() {}"),
+            (
+                "src/ordinary.rs",
+                "#[path = \"same.rs\"] mod kept; mod inline { #[path = \"nested.rs\"] mod child; }",
+            ),
+            ("src/same.rs", "pub fn sibling() {}"),
+            ("src/inline/other.rs", "pub fn from_root() {}"),
+            ("src/ordinary/inline/nested.rs", "pub fn from_inline() {}"),
+        ],
+        None,
+        false,
+    );
+    for (path, name, expected) in [
+        (
+            "src/to.rs",
+            "travelled",
+            vec!["crate_root", "kept", "travelled"],
+        ),
+        (
+            "src/same.rs",
+            "sibling",
+            vec!["crate_root", "ordinary", "kept", "sibling"],
+        ),
+        (
+            "src/inline/other.rs",
+            "from_root",
+            vec!["crate_root", "inline", "child", "from_root"],
+        ),
+        (
+            "src/ordinary/inline/nested.rs",
+            "from_inline",
+            vec!["crate_root", "ordinary", "inline", "child", "from_inline"],
+        ),
+    ] {
+        let identity = SymbolIdentity::parse(found[path][name].as_str())
+            .expect("original literal module identity");
+        assert_eq!(identity.qualified_path(), expected);
+    }
+}
+
+#[test]
+fn literal_module_paths_refuse_missing_unknown_and_conflicting_sources() {
+    for root in [
+        "#[path = \"missing.rs\"] mod kept;",
+        "#[cfg_attr(docsrs, path = \"to.rs\")] mod kept;",
+        "#[path = \"../to.rs\"] mod kept;",
+        "#[path = \"directory\"] mod inline { #[path = \"to.rs\"] mod kept; }",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[("src/lib.rs", root), ("src/to.rs", "pub fn refused() {}")],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/to.rs"), "{root}");
+    }
+    let conflict = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            (
+                "src/lib.rs",
+                "#[path = \"to.rs\"] mod first; #[path = \"to.rs\"] mod second;",
+            ),
+            ("src/to.rs", "pub fn refused() {}"),
+        ],
+        None,
+        false,
+    );
+    assert!(
+        conflict.is_empty(),
+        "one physical source cannot acquire two module identities"
+    );
+    let ambiguous = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "mod kept;"),
+            ("src/kept.rs", "pub fn first() {}"),
+            ("src/kept/mod.rs", "pub fn second() {}"),
+        ],
+        None,
+        false,
+    );
+    assert!(!ambiguous.contains_key("src/kept.rs"));
+    assert!(!ambiguous.contains_key("src/kept/mod.rs"));
 }
