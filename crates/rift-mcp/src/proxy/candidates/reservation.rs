@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 // + offset 6 = 38 bytes. Oversized foreign metadata is refused before exposure.
 const VIEW_KEY_BYTES_MAX: usize = 4096;
 const VIEW_EXPIRY_BYTES_MAX: usize = 38;
+const VIEW_LIFETIME: Duration = Duration::from_mins(15);
 
 pub(super) struct CandidateReservation<'a> {
     store: &'a CandidateViews,
@@ -25,7 +26,7 @@ impl CandidateViews {
         now: SystemTime,
     ) -> Result<CandidateReservation<'_>, RiftError> {
         let expires = now
-            .checked_add(Duration::from_mins(15))
+            .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
         let template = SavedCandidateBackend {
             owner: Some(owner.clone()),
@@ -105,7 +106,10 @@ impl CandidateReservation<'_> {
             .iter()
             .position(|row| row.reservation == Some(self.serial))
             .ok_or_else(|| invalid("view", "captured view reservation is unavailable"))?;
-        if expires <= now || expires > rows[position].expires {
+        let latest_expiry = now
+            .checked_add(VIEW_LIFETIME)
+            .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
+        if rows[position].expires <= now || expires <= now || expires > latest_expiry {
             return Err(invalid(
                 "view",
                 "captured view expiry does not match the reservation",
@@ -195,6 +199,93 @@ mod tests {
             root: "/fixture/main".to_owned(),
             view: view(key),
         }
+    }
+
+    #[test]
+    fn symbol_reservation_accepts_delayed_issue_and_retains_exact_backend_view() {
+        let store = CandidateViews::default();
+        let mut pending = store
+            .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
+            .expect("reserve");
+        let mut response = selected("claims.delayed");
+        response.view.expires_at = "2030-01-01T00:15:01+00:00".to_owned();
+        let finalized = clock() + Duration::from_secs(2);
+        assert!(captured_expiry(&response.view).expect("expiry") > clock() + VIEW_LIFETIME);
+        pending
+            .finalize(&response, finalized)
+            .expect("delayed issue");
+        let retained = store
+            .backend(&response.view.id, finalized)
+            .expect("decode")
+            .expect("authority")
+            .expect("backend");
+        assert_eq!(retained.backend, response.backend);
+        assert_eq!(retained.root, response.root);
+        assert_eq!(retained.owner, response.owner);
+        assert_eq!(retained.view, response.view);
+        assert_eq!(
+            store.rows.lock().expect("rows")[0].expires,
+            captured_expiry(&response.view).expect("expiry")
+        );
+        assert_eq!(
+            store
+                .backend(
+                    &response.view.id,
+                    captured_expiry(&response.view).expect("expiry")
+                )
+                .expect("expired"),
+            Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired)
+        );
+    }
+
+    #[test]
+    fn symbol_reservation_refuses_returned_expiry_past_finalization_lifetime() {
+        let store = CandidateViews::default();
+        let mut pending = store
+            .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
+            .expect("reserve");
+        let mut response = selected("claims.future");
+        response.view.expires_at = "2030-01-01T00:15:02.000000001+00:00".to_owned();
+        assert!(
+            pending
+                .finalize(&response, clock() + Duration::from_secs(2))
+                .is_err()
+        );
+        drop(pending);
+        assert!(store.rows.lock().expect("rows").is_empty());
+    }
+
+    #[test]
+    fn symbol_reservation_refuses_expired_pending_row_after_delayed_issue() {
+        let store = CandidateViews::default();
+        let mut pending = store
+            .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
+            .expect("reserve");
+        let mut response = selected("claims.pending_expired");
+        response.view.expires_at = "2030-01-01T00:29:59+00:00".to_owned();
+        assert!(
+            pending
+                .finalize(&response, clock() + VIEW_LIFETIME)
+                .is_err()
+        );
+        drop(pending);
+        assert!(store.rows.lock().expect("rows").is_empty());
+    }
+
+    #[test]
+    fn symbol_reservation_refuses_already_expired_returned_view() {
+        let store = CandidateViews::default();
+        let mut pending = store
+            .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
+            .expect("reserve");
+        let response = selected("claims.expired");
+        assert!(
+            pending
+                .finalize(&response, captured_expiry(&response.view).expect("expiry"))
+                .is_err()
+        );
+        drop(pending);
+        assert!(store.rows.lock().expect("rows").is_empty());
     }
 
     #[test]
