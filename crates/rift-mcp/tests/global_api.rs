@@ -268,14 +268,16 @@ impl GlobalFixture {
         let expires = std::time::SystemTime::now()
             .checked_add(Duration::from_secs(15 * 60))
             .expect("fixture view expiry fits the clock bound");
-        let view = rift_cloud_client::generated::CapturedView {
-            id: "a".repeat(64),
-            expires_at: expires.into(),
-        };
+        let view = json!({
+            "id": "a".repeat(64),
+            "expires_at": jiff::Timestamp::try_from(expires)
+                .expect("fixture view expiry fits the timestamp bound")
+                .to_string(),
+        });
         let state = FixtureState {
             options,
             requests: Arc::new(Mutex::new(Vec::new())),
-            view: serde_json::to_value(view).expect("fixture captured view is serializable"),
+            view,
         };
         let app = Router::new()
             .fallback(global_handler)
