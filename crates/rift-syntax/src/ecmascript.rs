@@ -1398,10 +1398,10 @@ mod tests {
         assert!(javascript.accessibility_modifier.is_none());
 
         for grammar in [
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT,
-            tree_sitter_typescript::LANGUAGE_TSX,
+            tree_sitter_typescript::language_typescript(),
+            tree_sitter_typescript::language_tsx(),
         ] {
-            let typescript = EcmaScriptKinds::resolve_typescript(&grammar.into());
+            let typescript = EcmaScriptKinds::resolve_typescript(&grammar);
             assert_eq!(typescript.declarations.len(), 13);
             assert_eq!(typescript.member_signatures.len(), 2);
             assert!(typescript.accessibility_modifier.is_some());

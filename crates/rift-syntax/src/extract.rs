@@ -617,12 +617,12 @@ mod tests {
                 "# Beacon\n\nText.\n\nLoose\n---\n\n- item\n- item\n",
             ),
             (
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                tree_sitter_typescript::language_typescript(),
                 ShippedLanguage::TypeScript,
                 "export interface Beacon { beam<T>(value: T): T; }\nconst light = { beam: 1 };\n",
             ),
             (
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                tree_sitter_typescript::language_tsx(),
                 ShippedLanguage::TypeScriptTsx,
                 "export const Beacon = () => <section light={1}><span>beam</span></section>;\n",
             ),

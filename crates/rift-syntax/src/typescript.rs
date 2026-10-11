@@ -44,8 +44,8 @@ impl TypeScriptDialect {
 
     pub(crate) fn grammar(self) -> tree_sitter::Language {
         match self {
-            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::TypeScript => tree_sitter_typescript::language_typescript(),
+            Self::Tsx => tree_sitter_typescript::language_tsx(),
         }
     }
 

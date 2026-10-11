@@ -37,7 +37,7 @@ const GRAMMAR_PREFIX: &str = "tree-sitter";
 ///
 /// Naming single files here was not enough. A grammar rule set in `rift-syntax` changes
 /// what a publication holds while `extract.rs` and `analyzer.rs` stay byte-identical.
-const ANALYZED_SOURCES: [&str; 47] = [
+const ANALYZED_SOURCES: [&str; 27] = [
     "crates/rift-core/src",
     "crates/rift-analysis/src",
     "crates/rift-dependency/src",
@@ -51,26 +51,6 @@ const ANALYZED_SOURCES: [&str; 47] = [
     "crates/rift-ranking/src",
     "crates/rift-server/src/read.rs",
     "crates/rift-syntax/src",
-    "vendor/tree-sitter-typescript/Cargo.toml",
-    "vendor/tree-sitter-typescript/bindings/rust",
-    "vendor/tree-sitter-typescript/common/define-grammar.js",
-    "vendor/tree-sitter-typescript/common/scanner.h",
-    "vendor/tree-sitter-typescript/typescript/grammar.js",
-    "vendor/tree-sitter-typescript/tsx/grammar.js",
-    "vendor/tree-sitter-typescript/typescript/src/grammar.json",
-    "vendor/tree-sitter-typescript/typescript/src/node-types.json",
-    "vendor/tree-sitter-typescript/typescript/src/parser.c",
-    "vendor/tree-sitter-typescript/typescript/src/scanner.c",
-    "vendor/tree-sitter-typescript/typescript/src/tree_sitter/alloc.h",
-    "vendor/tree-sitter-typescript/typescript/src/tree_sitter/array.h",
-    "vendor/tree-sitter-typescript/typescript/src/tree_sitter/parser.h",
-    "vendor/tree-sitter-typescript/tsx/src/grammar.json",
-    "vendor/tree-sitter-typescript/tsx/src/node-types.json",
-    "vendor/tree-sitter-typescript/tsx/src/parser.c",
-    "vendor/tree-sitter-typescript/tsx/src/scanner.c",
-    "vendor/tree-sitter-typescript/tsx/src/tree_sitter/alloc.h",
-    "vendor/tree-sitter-typescript/tsx/src/tree_sitter/array.h",
-    "vendor/tree-sitter-typescript/tsx/src/tree_sitter/parser.h",
     "vendor/tree-sitter-angular/Cargo.toml",
     "vendor/tree-sitter-angular/bindings/rust",
     "vendor/tree-sitter-angular/grammar.js",

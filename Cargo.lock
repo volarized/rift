@@ -6744,10 +6744,11 @@ dependencies = [
 
 [[package]]
 name = "tree-sitter-typescript"
-version = "0.23.2"
+version = "0.21.1"
+source = "git+https://github.com/tree-sitter/tree-sitter-typescript?rev=35a3762218ca481cd85f14f4db11b563bc805c83#35a3762218ca481cd85f14f4db11b563bc805c83"
 dependencies = [
  "cc",
- "tree-sitter-language",
+ "tree-sitter",
 ]
 
 [[package]]
