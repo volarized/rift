@@ -259,8 +259,21 @@ impl LocalSymbolViews {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.expire(now);
         if input.retained_bytes == 0 || state.views.len() == VIEW_SLOTS {
+            rift_tracing::warn!(
+                component = "server",
+                rows = state.views.len(),
+                views_max = VIEW_SLOTS,
+                incoming_bytes = input.retained_bytes,
+                index_bytes = input.material.index.retained_material_bytes(),
+                ready = input.ready,
+                bytes_max = self.material_bytes_max,
+                "retained read material exceeds the byte or view bound"
+            );
             return Ok(None);
         }
+        let retained_bytes = input.retained_bytes;
+        let index_bytes = input.material.index.retained_material_bytes();
+        let ready = input.ready;
         let id = self.next_key(&mut state)?;
         let expires = now
             .checked_add(VIEW_LIFETIME)
@@ -281,6 +294,18 @@ impl LocalSymbolViews {
         );
         let material_bytes = state.material_bytes();
         if material_bytes == usize::MAX || material_bytes > self.material_bytes_max {
+            rift_tracing::warn!(
+                component = "server",
+                rows = state.views.len(),
+                cursors = state.cursors.len(),
+                views_max = VIEW_SLOTS,
+                material_bytes,
+                incoming_bytes = retained_bytes,
+                index_bytes,
+                ready,
+                bytes_max = self.material_bytes_max,
+                "retained read material exceeds the byte or view bound"
+            );
             state.views.remove(&id);
             return Ok(None);
         }
