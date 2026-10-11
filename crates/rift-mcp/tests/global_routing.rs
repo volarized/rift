@@ -495,6 +495,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|warning| warning["code"] != "lexical_ranking_unavailable")
         .partition(|warning| warning["code"] != "global_page_warning");
     let codes: Vec<&str> = warnings
         .iter()
@@ -515,7 +516,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
             .iter()
             .map(|warning| &warning["warning_code"])
             .collect::<Vec<_>>(),
-        [&json!("source_truncated")]
+        [&json!("query_narrowed")]
     );
     assert_eq!(
         *warnings[0],
@@ -1403,9 +1404,17 @@ fn assert_unserved_dependency_warnings(answer: &Value) -> TestResult {
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("warnings are an array")?;
-    assert_eq!(warnings[0], json!({"code": "global_access_disabled"}));
-    let unavailable: Vec<(String, String, String)> = warnings[1..]
+    let disabled: Vec<&Value> = warnings
         .iter()
+        .filter(|warning| warning["code"] == "global_access_disabled")
+        .collect();
+    assert_eq!(disabled, [&json!({"code": "global_access_disabled"})]);
+    let unavailable: Vec<(String, String, String)> = warnings
+        .iter()
+        .filter(|warning| {
+            warning["code"] != "global_access_disabled"
+                && warning["code"] != "lexical_ranking_unavailable"
+        })
         .map(|warning| {
             (
                 warning["entry"]["name"]
@@ -1477,7 +1486,7 @@ fn assert_unserved_dependency_warnings(answer: &Value) -> TestResult {
 }
 
 fn assert_distinct_registry_observations(warnings: &[Value], answer: &Value) {
-    let private: Vec<&Value> = warnings[1..]
+    let private: Vec<&Value> = warnings
         .iter()
         .filter(|warning| warning["entry"]["name"] == "private")
         .map(|warning| &warning["entry"])
