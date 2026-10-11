@@ -30,7 +30,7 @@ pub enum ArchiveMemberKind {
 }
 
 mod import_root;
-pub(crate) use import_root::validate_roots;
+pub(crate) use import_root::{validate_roots, validate_runtime_roots};
 #[cfg(feature = "collector")]
 mod namespace;
 
@@ -512,6 +512,7 @@ impl<'input> ExactPackageInput<'input> {
         roots: &'input [PackageImportRoot],
     ) -> Result<Self, RiftError> {
         import_root::validate_roots(roots)?;
+        import_root::validate_runtime_roots(self.owner, self.language, self.files, roots)?;
         self.import_roots = roots;
         Ok(self)
     }

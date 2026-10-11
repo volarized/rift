@@ -118,7 +118,16 @@ pub(crate) fn prepare_context(
             roots.push(root);
         }
     }
-    let roots_accepted = crate::input::validate_roots(&roots).is_ok();
+    let roots_accepted = crate::input::validate_roots(&roots)
+        .and_then(|()| {
+            crate::input::validate_runtime_roots(
+                input.owner(),
+                input.language(),
+                input.files(),
+                &roots,
+            )
+        })
+        .is_ok();
     let captured = input
         .files()
         .iter()
@@ -298,13 +307,15 @@ fn python_module(path: &str, roots: &[PackageImportRoot]) -> Option<Vec<String>>
             continue;
         }
         let spelling = parts.join(".");
-        if !root.modules().iter().any(|module| {
-            spelling == *module
-                || (root.origin() != PackageImportRootOrigin::PyModules
-                    && spelling
-                        .strip_prefix(module.as_str())
-                        .is_some_and(|tail| tail.starts_with('.')))
-        }) {
+        if root.origin() != PackageImportRootOrigin::Runtime
+            && !root.modules().iter().any(|module| {
+                spelling == *module
+                    || (root.origin() != PackageImportRootOrigin::PyModules
+                        && spelling
+                            .strip_prefix(module.as_str())
+                            .is_some_and(|tail| tail.starts_with('.')))
+            })
+        {
             continue;
         }
         modules.insert(parts.into_iter().map(str::to_owned).collect::<Vec<_>>());
@@ -448,3 +459,6 @@ mod tests {
         assert_eq!(python_module("six-1.17.0.data/data/six.py", &roots), None);
     }
 }
+
+#[cfg(test)]
+mod runtime_tests;

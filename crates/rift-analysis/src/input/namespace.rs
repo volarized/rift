@@ -118,6 +118,7 @@ impl<'input> NamespaceInput<'input> {
             None => rift_syntax::source_unit_for_path(file.path),
         })?;
         super::import_root::validate_roots(import_roots)?;
+        super::import_root::validate_runtime_roots(owner, language, files, import_roots)?;
         Ok(Self {
             owner,
             language,

@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 
 use rift_core::ProjectPath;
 use rift_error::{RiftError, errors};
-use rift_protocol::index::python_identifier_is_valid;
+use rift_protocol::{identity::SymbolOwner, index::python_identifier_is_valid, read::Language};
+
+use super::PackageSource;
 
 /// Maximum retained import roots and module entries for one selected artifact.
 pub const PACKAGE_IMPORT_ENTRIES_MAX: usize = 64;
@@ -20,6 +22,8 @@ pub enum PackageImportRootOrigin {
     Flit,
     /// A statically captured PDM package layout and build-path observations.
     Pdm,
+    /// A selected Python standard library with an exact runtime owner.
+    Runtime,
 }
 
 /// Original source prefix and established Python modules under that prefix.
@@ -30,6 +34,7 @@ pub struct PackageImportRoot {
     prefix: Option<ProjectPath>,
     modules: Vec<String>,
     origin: PackageImportRootOrigin,
+    runtime: Option<SymbolOwner>,
 }
 
 impl PackageImportRoot {
@@ -44,7 +49,8 @@ impl PackageImportRoot {
         modules: Vec<String>,
         origin: PackageImportRootOrigin,
     ) -> Result<Self, RiftError> {
-        if modules.is_empty()
+        if origin == PackageImportRootOrigin::Runtime
+            || modules.is_empty()
             || modules.len() > PACKAGE_IMPORT_ENTRIES_MAX
             || prefix.as_ref().is_some_and(|path| path.as_str().is_empty())
         {
@@ -69,7 +75,40 @@ impl PackageImportRoot {
             prefix,
             modules,
             origin,
+            runtime: None,
         })
+    }
+
+    /// Selects the original Python library layout under one exact runtime owner.
+    ///
+    /// The caller supplies the prefix admitted from the verified runtime archive.
+    /// `None` names the selected library root after acquisition removed its archive prefix.
+    /// Input validation requires the same owner and an admitted Python source under this root.
+    ///
+    /// # Errors
+    /// Returns the existing identity refusal for a different runtime, invalid version,
+    /// empty explicit prefix, or exceeded byte bound.
+    pub fn runtime(owner: SymbolOwner, prefix: Option<ProjectPath>) -> Result<Self, RiftError> {
+        owner.validate().map_err(|source| {
+            errors::analysis::package_input_identity_invalid()
+                .cause(source)
+                .error()
+        })?;
+        if !matches!(&owner, SymbolOwner::Runtime { runtime, .. } if runtime == "python")
+            || prefix.as_ref().is_some_and(|path| path.as_str().is_empty())
+        {
+            return invalid();
+        }
+        let root = Self {
+            prefix,
+            modules: Vec::new(),
+            origin: PackageImportRootOrigin::Runtime,
+            runtime: Some(owner),
+        };
+        if root.bytes() > PACKAGE_IMPORT_BYTES_MAX {
+            return invalid();
+        }
+        Ok(root)
     }
 
     /// Original artifact-relative prefix, or the artifact root.
@@ -93,6 +132,10 @@ impl PackageImportRoot {
     pub(super) fn bytes(&self) -> usize {
         self.prefix.as_ref().map_or(0, |path| path.as_str().len())
             + self.modules.iter().map(String::len).sum::<usize>()
+            + self.runtime.as_ref().map_or(0, |owner| match owner {
+                SymbolOwner::Runtime { runtime, version } => runtime.len() + version.len(),
+                _ => 0,
+            })
     }
 }
 
@@ -128,3 +171,37 @@ fn invalid<T>() -> Result<T, RiftError> {
 
 #[cfg(test)]
 mod tests;
+
+/// Checks runtime layout authority against the exact selected input.
+pub(crate) fn validate_runtime_roots(
+    owner: &SymbolOwner,
+    language: &Language,
+    files: &[PackageSource<'_>],
+    roots: &[PackageImportRoot],
+) -> Result<(), RiftError> {
+    for root in roots {
+        if root.origin != PackageImportRootOrigin::Runtime {
+            continue;
+        }
+        if root.runtime.as_ref() != Some(owner)
+            || language.name != "python"
+            || language.dialect.is_some()
+            || !files.iter().any(|source| {
+                let path = source.path().as_str();
+                let relative = match root.prefix.as_ref() {
+                    Some(prefix) => path
+                        .strip_prefix(prefix.as_str())
+                        .and_then(|tail| tail.strip_prefix('/')),
+                    None => Some(path),
+                };
+                relative.is_some_and(|path| {
+                    path.rsplit_once('.')
+                        .is_some_and(|(_, extension)| matches!(extension, "py" | "pyi"))
+                })
+            })
+        {
+            return invalid();
+        }
+    }
+    Ok(())
+}
