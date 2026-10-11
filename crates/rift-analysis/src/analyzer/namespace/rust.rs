@@ -17,39 +17,25 @@ mod macros;
 pub(super) fn prepare(
     input: &NamespaceInput<'_>,
     selected: &[super::SelectedFile<'_>],
-) -> super::Anchors {
+) -> super::PreparedNamespace {
     let inventory = selected
         .iter()
         .map(|file| (file.path.as_str(), file))
         .collect::<BTreeMap<_, _>>();
     if inventory.len() != selected.len() {
-        return BTreeMap::new();
+        return super::PreparedNamespace::default();
     }
     let originals = original_sources(input);
     let libraries = selected_libraries(input, &inventory);
     let mut assigned = BTreeMap::new();
     let mut pending = VecDeque::new();
     for (root, name) in libraries {
-        let namespace = vec![name];
-        if SymbolIdentity::new(
-            input.owner().clone(),
-            input.language().clone(),
-            namespace.clone(),
-        )
-        .is_err()
-        {
+        let Some((namespace, directory, library)) = library_root(input, &root, name) else {
             continue;
-        }
-        let directory = root
-            .rsplit_once('/')
-            .map_or("", |(parent, _)| parent)
-            .to_owned();
+        };
         if assigned.insert(root.clone(), namespace.clone()).is_some() {
-            return BTreeMap::new();
+            return super::PreparedNamespace::default();
         }
-        let library = input
-            .library()
-            .is_some_and(|(_, selected)| selected.path().as_str() == root);
         pending.push_back((
             root,
             namespace,
@@ -59,6 +45,7 @@ pub(super) fn prepare(
         ));
     }
     let mut anchors = BTreeMap::new();
+    let mut requested = Vec::new();
     while let Some((path, namespace, directory, scope, library)) = pending.pop_front() {
         let Some(file) = inventory.get(path.as_str()) else {
             continue;
@@ -69,14 +56,20 @@ pub(super) fn prepare(
             continue;
         }
         let mut admitted = std::collections::BTreeSet::new();
+        let mut exports = Vec::new();
         let children = macros::children(
             file,
             &directory,
             &inventory,
             &originals,
-            (scope, &mut admitted),
+            (scope, &mut admitted, &mut exports),
             input.syntax().syntax_depth_max(),
             library,
+        );
+        requested.extend(
+            exports
+                .into_iter()
+                .map(|export| (namespace.clone(), export)),
         );
         anchors.insert(
             path.clone(),
@@ -96,7 +89,7 @@ pub(super) fn prepare(
             }
             if let Some(previous) = assigned.get(&child) {
                 if previous != &child_namespace {
-                    return BTreeMap::new();
+                    return super::PreparedNamespace::default();
                 }
                 continue;
             }
@@ -115,7 +108,37 @@ pub(super) fn prepare(
             ));
         }
     }
-    anchors
+    let mut prepared = super::PreparedNamespace {
+        anchors,
+        ..Default::default()
+    };
+    local_exports(input, selected, &requested, &mut prepared);
+    prepared
+}
+
+fn library_root(
+    input: &NamespaceInput<'_>,
+    root: &str,
+    name: String,
+) -> Option<(Vec<String>, String, bool)> {
+    let namespace = vec![name];
+    if SymbolIdentity::new(
+        input.owner().clone(),
+        input.language().clone(),
+        namespace.clone(),
+    )
+    .is_err()
+    {
+        return None;
+    }
+    let directory = root
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent)
+        .to_owned();
+    let library = input
+        .library()
+        .is_some_and(|(_, selected)| selected.path().as_str() == root);
+    Some((namespace, directory, library))
 }
 
 fn original_sources<'a>(input: &NamespaceInput<'a>) -> BTreeMap<&'a str, &'a str> {
@@ -513,6 +536,146 @@ struct CargoPackage {
 struct CargoLibrary {
     name: Option<String>,
     path: Option<String>,
+}
+
+// Resolves only original public bindings against this inventory's admitted declarations.
+fn local_exports(
+    input: &NamespaceInput<'_>,
+    selected: &[super::SelectedFile<'_>],
+    requested: &[(Vec<String>, macros::Export)],
+    prepared: &mut super::PreparedNamespace,
+) {
+    let Some(work_max) = input
+        .syntax()
+        .syntax_nodes_max()
+        .checked_mul(input.syntax().syntax_depth_max())
+    else {
+        prepared.unresolved_exports = !requested.is_empty();
+        return;
+    };
+    let mut work = 0usize;
+    for (namespace, (path, range, name, target)) in requested {
+        // Captured conditional declarations do not establish export completeness.
+        prepared.unresolved_exports = true;
+        let Some(target_path) = requested_path(namespace, target) else {
+            continue;
+        };
+        let Some((file, symbol, target)) = local_target(
+            input,
+            selected,
+            &prepared.anchors,
+            &target_path,
+            &mut work,
+            work_max,
+        ) else {
+            continue;
+        };
+        let mut alias_path = namespace.clone();
+        alias_path.push(name.clone());
+        let Some(identity) =
+            SymbolIdentity::new(input.owner().clone(), input.language().clone(), alias_path)
+                .ok()
+                .and_then(|identity| SymbolId::new(identity.wire_identity()).ok())
+        else {
+            continue;
+        };
+        if identity == *target {
+            continue;
+        }
+        if prepared
+            .anchors
+            .values()
+            .any(|anchors| anchors.values().any(|anchor| *anchor == identity))
+        {
+            continue;
+        }
+        prepared.exports.push(super::ExportBinding {
+            path: path.as_str().to_owned(),
+            binding: rift_syntax::SyntaxExportBinding {
+                kind: rift_syntax::SyntaxExportKind::Named,
+                range: *range,
+                local: None,
+                exported: None,
+                source: None,
+                container: None,
+                type_only: false,
+            },
+            identity,
+            target: target.clone(),
+            target_path: file.path.as_str().to_owned(),
+            target_qualified_name: symbol.qualified_name.clone(),
+            name: name.clone(),
+            qualified_name: name.clone(),
+        });
+    }
+    let conflicts = super::typescript::conflicting_export_identities(&prepared.exports);
+    prepared
+        .exports
+        .retain(|export| !conflicts.contains(export.identity.as_str()));
+}
+
+fn requested_path(namespace: &[String], target: &[String]) -> Option<Vec<String>> {
+    let (head, tail) = target.split_first()?;
+    let mut path = match head.as_str() {
+        "crate" => vec![namespace.first()?.clone()],
+        "self" => namespace.to_vec(),
+        "super" if namespace.len() > 1 => namespace[..namespace.len() - 1].to_vec(),
+        _ => return None,
+    };
+    path.extend(tail.iter().cloned());
+    Some(path)
+}
+
+fn local_target<'input>(
+    input: &NamespaceInput<'_>,
+    selected: &'input [super::SelectedFile<'input>],
+    anchors: &'input super::Anchors,
+    path: &[String],
+    work: &mut usize,
+    work_max: usize,
+) -> Option<(
+    &'input super::SelectedFile<'input>,
+    &'input rift_syntax::SyntaxSymbol,
+    &'input SymbolId,
+)> {
+    let requested = SymbolIdentity::new(
+        input.owner().clone(),
+        input.language().clone(),
+        path.to_vec(),
+    )
+    .ok()?
+    .wire_identity();
+    let mut found = None;
+    for file in selected {
+        let Some(anchors) = anchors.get(file.path.as_str()) else {
+            continue;
+        };
+        for symbol in file.syntax.symbols() {
+            *work = work.checked_add(1)?;
+            if *work > work_max {
+                return None;
+            }
+            let Some(identity) = anchors
+                .get(&symbol.qualified_name)
+                .filter(|identity| identity.as_str() == requested)
+            else {
+                continue;
+            };
+            if symbol.visibility.as_deref() != Some("pub")
+                || file
+                    .source
+                    .get(
+                        usize::try_from(symbol.range.start).ok()?
+                            ..usize::try_from(symbol.range.end).ok()?,
+                    )
+                    .is_none()
+                || found.replace((file, symbol, identity)).is_some()
+            {
+                return None;
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]

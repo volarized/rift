@@ -776,9 +776,10 @@ impl Context<'_> {
         invocation: ByteRange,
         name: &str,
         directory: &str,
-        scope: &Scope,
+        scope: (&Scope, &mut Vec<Export>),
         tokens: &scope::Tokens<'_>,
     ) -> Option<Vec<Child>> {
+        let (scope, exports) = scope;
         if !tokens.empty_invocation(invocation, name) {
             return None;
         }
@@ -790,7 +791,6 @@ impl Context<'_> {
                 symbol.name == name
                     && symbol.kind == "macro"
                     && symbol.node_kind == Some("macro_definition")
-                    && symbol.range.start == range.start
                     && symbol.item_range == *range
             })
             || path.as_str().rsplit_once('/').map(|(parent, _)| parent)
@@ -803,41 +803,64 @@ impl Context<'_> {
             return None;
         }
         let definition = scope::Tokens::new(defining)?;
+        let mut symbols = defining
+            .syntax
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.name == name && symbol.kind == "macro");
+        let symbol = symbols.next()?;
+        if symbols.next().is_some() {
+            return None;
+        }
+        definition.definition_prefix(ByteRange {
+            start: symbol.range.start,
+            end: symbol.item_range.start,
+        })?;
+        let mut requested = Vec::new();
         let mut children = Vec::new();
         let mut incomplete = scope.clone();
         incomplete.clear();
-        definition.definition_modules(*range, name, |module, name, default_path, paths| {
-            if module.start < range.start || module.end > range.end {
-                return None;
-            }
-            let mut candidates = Vec::new();
-            if default_path && let Some(path) = child_path(name, directory, self.inventory) {
-                candidates.push(path);
-            }
-            let parent = file
-                .path
-                .as_str()
-                .rsplit_once('/')
-                .map_or("", |(parent, _)| parent);
-            for path in paths {
-                let candidate = if parent.is_empty() {
-                    path.as_str().to_owned()
-                } else {
-                    format!("{parent}/{}", path.as_str())
-                };
-                if rift_core::ProjectPath::new(candidate.as_str()).is_ok()
-                    && self.inventory.contains_key(candidate.as_str())
-                {
-                    candidates.push(candidate);
+        definition.definition_items(
+            *range,
+            name,
+            &mut |module, name, default_path, paths| {
+                if module.start < range.start || module.end > range.end {
+                    return None;
                 }
-            }
-            candidates.sort();
-            candidates.dedup();
-            if let [path] = candidates.as_slice() {
-                children.push((path.clone(), vec![name.to_owned()], incomplete.clone()));
-            }
-            Some(())
-        })?;
+                let mut candidates = Vec::new();
+                if default_path && let Some(path) = child_path(name, directory, self.inventory) {
+                    candidates.push(path);
+                }
+                let parent = file
+                    .path
+                    .as_str()
+                    .rsplit_once('/')
+                    .map_or("", |(parent, _)| parent);
+                for path in paths {
+                    let candidate = if parent.is_empty() {
+                        path.as_str().to_owned()
+                    } else {
+                        format!("{parent}/{}", path.as_str())
+                    };
+                    if rift_core::ProjectPath::new(candidate.as_str()).is_ok()
+                        && self.inventory.contains_key(candidate.as_str())
+                    {
+                        candidates.push(candidate);
+                    }
+                }
+                candidates.sort();
+                candidates.dedup();
+                if let [path] = candidates.as_slice() {
+                    children.push((path.clone(), vec![name.to_owned()], incomplete.clone()));
+                }
+                Some(())
+            },
+            &mut |range, name, target| {
+                requested.push((path.clone(), range, name, target));
+                Some(())
+            },
+        )?;
+        exports.extend(requested);
         Some(children)
     }
 
@@ -896,16 +919,22 @@ fn invocation_name(source: &str, range: ByteRange) -> Option<&str> {
         .filter(|name| super::crate_name_is_valid(name))
 }
 
+pub(super) type Export = (rift_core::ProjectPath, ByteRange, String, Vec<String>);
+
 pub(super) fn children<'a>(
     file: &'a SelectedFile<'a>,
     directory: &str,
     inventory: &'a Inventory<'a>,
     originals: &'a BTreeMap<&'a str, &'a str>,
-    scope: (Scope, &mut std::collections::BTreeSet<ByteRange>),
+    scope: (
+        Scope,
+        &mut std::collections::BTreeSet<ByteRange>,
+        &mut Vec<Export>,
+    ),
     depth_max: usize,
     library: bool,
 ) -> Vec<Child> {
-    let (mut scope, admitted) = scope;
+    let (mut scope, admitted, exports) = scope;
     let context = Context {
         inventory,
         originals,
@@ -955,8 +984,14 @@ pub(super) fn children<'a>(
                     if let Some(name) = name
                         && direct.is_some()
                         && let Some(literal) = tokens.as_ref().and_then(|tokens| {
-                            context
-                                .definition_children(file, *range, name, directory, &scope, tokens)
+                            context.definition_children(
+                                file,
+                                *range,
+                                name,
+                                directory,
+                                (&scope, exports),
+                                tokens,
+                            )
                         })
                     {
                         children.extend(literal);
@@ -990,16 +1025,40 @@ pub(super) fn children<'a>(
                     scope.clear();
                 }
             }
-            Event::Item(range) => {
-                if tokens
-                    .as_ref()
-                    .and_then(|tokens| tokens.item(range, &mut scope, library))
-                    .is_none()
-                {
-                    scope.clear();
-                }
-            }
+            Event::Item(range) => context.item(file, range, tokens.as_ref(), &mut scope, exports),
         }
     }
     children
+}
+
+impl Context<'_> {
+    fn item(
+        &self,
+        file: &SelectedFile<'_>,
+        range: ByteRange,
+        tokens: Option<&scope::Tokens<'_>>,
+        scope: &mut Scope,
+        exports: &mut Vec<Export>,
+    ) {
+        if let Some(tokens) = tokens.filter(|tokens| tokens.complete && scope.complete)
+            && let Some(item) = tokens.range(range)
+        {
+            let mut requested = Vec::new();
+            if tokens
+                .public_imports(&item, &mut |range, name, target| {
+                    requested.push((file.path.clone(), range, name, target));
+                    Some(())
+                })
+                .is_some()
+            {
+                exports.extend(requested);
+            }
+        }
+        if tokens
+            .and_then(|tokens| tokens.item(range, scope, self.library))
+            .is_none()
+        {
+            scope.clear();
+        }
+    }
 }

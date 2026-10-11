@@ -285,14 +285,36 @@ impl<'a> Tokens<'a> {
         body.is_empty() && input.is_empty()
     }
 
+    #[cfg(test)]
     pub(super) fn definition_modules(
         &self,
         range: ByteRange,
         name: &str,
         mut callback: impl FnMut(ByteRange, &str, bool, &[rift_core::ProjectPath]) -> Option<()>,
     ) -> Option<()> {
+        self.definition_items(range, name, &mut callback, &mut |_, _, _| Some(()))
+    }
+
+    pub(super) fn definition_items(
+        &self,
+        range: ByteRange,
+        name: &str,
+        callback: &mut impl FnMut(ByteRange, &str, bool, &[rift_core::ProjectPath]) -> Option<()>,
+        export: &mut dyn FnMut(ByteRange, String, Vec<String>) -> Option<()>,
+    ) -> Option<()> {
         let tokens = self.range(range)?;
         let mut input = tokens.as_slice();
+        while consume(&mut input, &["#"]) {
+            if consume(&mut input, &["!"]) {
+                return None;
+            }
+            let value = group(&mut input, "[", "]")?;
+            if !matches!(value.first(), Some(&"cfg" | &"doc"))
+                || !self.attribute(value, &Scope::default(), false, self.depth, false)
+            {
+                return None;
+            }
+        }
         if !consume(&mut input, &["macro_rules", "!", name, "{"]) {
             return None;
         }
@@ -306,8 +328,13 @@ impl<'a> Tokens<'a> {
         }
         self.charge(body.len().checked_mul(2)?)?;
         let mut modules = Vec::new();
+        let mut exports = Vec::new();
         let mut names = BTreeSet::new();
         items(body, self.depth, |item| {
+            self.public_imports(item, &mut |range, name, path| {
+                exports.push((range, name, path));
+                Some(())
+            })?;
             if let Some((range, name, default_path, paths)) = self.definition_module(item) {
                 if !names.insert(name.clone()) {
                     return None;
@@ -316,11 +343,81 @@ impl<'a> Tokens<'a> {
             }
             Some(())
         })?;
+        for (binding, name, path) in exports {
+            if binding.start < range.start || binding.end > range.end {
+                return None;
+            }
+            export(binding, name, path)?;
+        }
         for (module, name, default_path, paths) in modules {
             if module.start < range.start || module.end > range.end {
                 return None;
             }
             callback(module, &name, default_path, &paths)?;
+        }
+        Some(())
+    }
+
+    pub(super) fn definition_prefix(&self, range: ByteRange) -> Option<()> {
+        if range.start == range.end {
+            return Some(());
+        }
+        let tokens = self.range(range)?;
+        let mut input = tokens.as_slice();
+        while consume(&mut input, &["#"]) {
+            if consume(&mut input, &["!"]) {
+                return None;
+            }
+            let value = group(&mut input, "[", "]")?;
+            if !matches!(value.first(), Some(&"cfg" | &"doc"))
+                || !self.attribute(value, &Scope::default(), false, self.depth, false)
+            {
+                return None;
+            }
+        }
+        input.is_empty().then_some(())
+    }
+
+    pub(super) fn public_imports(
+        &self,
+        item: &[&str],
+        callback: &mut dyn FnMut(ByteRange, String, Vec<String>) -> Option<()>,
+    ) -> Option<()> {
+        let mut input = item;
+        while consume(&mut input, &["#"]) {
+            if consume(&mut input, &["!"]) {
+                return Some(());
+            }
+            let value = group(&mut input, "[", "]")?;
+            if !self.attribute(value, &Scope::default(), false, self.depth, false) {
+                return Some(());
+            }
+        }
+        if !consume(&mut input, &["pub", "use"]) {
+            return Some(());
+        }
+        let range = self.module_range(item)?;
+        let mut names = BTreeSet::new();
+        let mut exports = Vec::new();
+        imports_path(
+            &mut input,
+            &[],
+            &mut names,
+            self.depth,
+            &mut |name, path| {
+                let bytes = path
+                    .iter()
+                    .try_fold(name.len(), |bytes, value| bytes.checked_add(value.len()))?;
+                self.charge(bytes)?;
+                exports.push((name, path));
+                Some(())
+            },
+        )?;
+        if !consume(&mut input, &[";"]) || !input.is_empty() {
+            return None;
+        }
+        for (name, path) in exports {
+            callback(range, name, path)?;
         }
         Some(())
     }
@@ -879,11 +976,26 @@ fn imports(
     names: &mut BTreeSet<String>,
     depth: usize,
 ) -> Option<()> {
+    let path = parent.map(|name| vec![name.to_owned()]).unwrap_or_default();
+    imports_path(input, &path, names, depth, &mut |_, _| Some(()))
+}
+
+fn imports_path(
+    input: &mut &[&str],
+    parent: &[String],
+    names: &mut BTreeSet<String>,
+    depth: usize,
+    callback: &mut dyn FnMut(String, Vec<String>) -> Option<()>,
+) -> Option<()> {
     if depth == 0 {
         return None;
     }
-    let _ = consume(input, &[":", ":"]);
-    let mut last = parent.map(str::to_owned);
+    let absolute = consume(input, &[":", ":"]);
+    let mut path = if absolute {
+        Vec::new()
+    } else {
+        parent.to_vec()
+    };
     loop {
         if consume(input, &["*"]) {
             return None;
@@ -891,7 +1003,7 @@ fn imports(
         if input.first() == Some(&"{") {
             let mut body = group(input, "{", "}")?;
             while !body.is_empty() {
-                imports(&mut body, last.as_deref(), names, depth - 1)?;
+                imports_path(&mut body, &path, names, depth - 1, callback)?;
                 if !body.is_empty() && !consume(&mut body, &[","]) {
                     return None;
                 }
@@ -899,23 +1011,24 @@ fn imports(
             return Some(());
         }
         let name = identifier(input)?;
-        last = Some(if name == "self" && !input.starts_with(&[":", ":"]) {
-            last?
+        if name == "self" && !input.starts_with(&[":", ":"]) {
+            path.last()?;
         } else {
-            name
-        });
+            path.push(name);
+        }
         if !consume(input, &[":", ":"]) {
             break;
         }
     }
+    let mut name = path.last()?.clone();
     if consume(input, &["as"]) {
         if consume(input, &["_"]) {
             return Some(());
         }
-        last = Some(identifier(input)?);
+        name = identifier(input)?;
     }
-    names.insert(last?);
-    Some(())
+    names.insert(name.clone());
+    callback(name, path)
 }
 
 #[cfg(test)]
@@ -1163,9 +1276,18 @@ mod tests {
 
     #[test]
     fn exported_macro_attribute_refuses_unknown_misattached_and_inner_macro_forms() {
+        let source = "#[macro_export(local_inner_macros)] macro_rules! api { () => {}; }";
+        with_tokens(source, |tokens| {
+            assert!(tokens.complete);
+            assert_eq!(tokens.bindings, BTreeSet::from(["api".to_owned()]));
+            assert!(
+                tokens
+                    .item(whole(source), &mut Scope::default(), true)
+                    .is_none()
+            );
+        });
         for source in [
             "#[macro_export] struct Item;",
-            "#[macro_export(local_inner_macros)] macro_rules! api { () => {}; }",
             "#[proc_macro] macro_rules! api { () => {}; }",
             "#[custom] #[macro_export] macro_rules! api { () => {}; }",
         ] {

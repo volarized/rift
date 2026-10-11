@@ -189,7 +189,7 @@ fn export_bindings(
     (exports, unresolved)
 }
 
-fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
+pub(super) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
     let mut targets = BTreeMap::<&str, Option<&SymbolId>>::new();
     for export in exports {
         match targets.entry(export.identity.as_str()) {

@@ -189,7 +189,7 @@ fn selected_anchors_for_context(
         .iter()
         .map(|path| physical_unit(owner, path))
         .collect::<Vec<_>>();
-    let result = super::prepare(&input, &admitted);
+    let result = super::prepare(&input, &admitted).anchors;
     assert_original_sources(&input, selected, &units);
     result
 }
@@ -2398,5 +2398,253 @@ fn literal_empty_matcher_modules_refuse_unknown_and_misattached_export_attribute
             false,
         );
         assert!(!found.contains_key("src/de.rs"), "{macros}");
+    }
+}
+
+fn local_alias_analysis(selected: &[(&str, &str)], manifest: &str) -> crate::PackageAnalysis {
+    let package = PackageIdentity {
+        manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
+        name: "serde_core".to_owned(),
+        version: "1.0.228".to_owned(),
+    };
+    let owner = package.owner().expect("captured package owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("captured origin");
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let paths = selected
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("original path"))
+        .collect::<Vec<_>>();
+    let files = paths
+        .iter()
+        .zip(selected)
+        .map(|(path, (_, text))| PackageSource::new(path, text))
+        .collect::<Vec<_>>();
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = PackageSource::new(&manifest_path, manifest);
+    let context = [metadata];
+    let root = files
+        .iter()
+        .find(|file| file.path().as_str() == "src/lib.rs")
+        .copied()
+        .expect("original root");
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &files,
+        ExactPackageLimits::new(21, 16 * 1024 * 1024),
+    )
+    .expect("bounded package")
+    .with_framework_context(&context, &[])
+    .expect("original manifest")
+    .with_library(&owner, metadata, root)
+    .expect("selected non-test library");
+    crate::PackageAnalyzer::analyze(input, 1).expect("checked original publication")
+}
+
+const LOCAL_ALIAS_MANIFEST: &str =
+    "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n";
+const LOCAL_ALIAS_ROOT: &str = "#[macro_use]\nmod crate_root;\ncrate_root!();\n";
+const LOCAL_ALIAS_DEFINITION: &str = "macro_rules! crate_root { () => { pub mod de; pub mod ser; #[doc(inline)] pub use crate::de::{Deserialize, Deserializer}; #[doc(inline)] pub use crate::ser::{Serialize, Serializer}; include!(concat!(env!(\"OUT_DIR\"), \"/private.rs\")); }; }\n";
+
+fn local_alias_sources(definition: &str) -> Vec<(&str, &str)> {
+    vec![
+        ("src/lib.rs", LOCAL_ALIAS_ROOT),
+        ("src/crate_root.rs", definition),
+        (
+            "src/de/mod.rs",
+            "pub trait Deserialize {}\npub trait Deserializer {}\n",
+        ),
+        (
+            "src/ser/mod.rs",
+            "pub trait Serialize {}\npub trait Serializer {}\n",
+        ),
+    ]
+}
+
+fn assert_local_alias(
+    publication: &rift_protocol::index::PackagePublication,
+    name: &str,
+    module: &str,
+) {
+    let alias = format!("rift://symbol/cargo/crates.io/serde_core@1.0.228/rust/serde_core/{name}");
+    let target =
+        format!("rift://symbol/cargo/crates.io/serde_core@1.0.228/rust/serde_core/{module}/{name}");
+    let object = publication
+        .objects
+        .iter()
+        .find(|object| object.id.as_ref().is_some_and(|id| id.as_str() == alias))
+        .expect("source-backed public alias");
+    assert!(
+        object
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Alias)
+    );
+    let binding = publication
+        .declarations
+        .iter()
+        .find(|declaration| Some(&declaration.symbol) == object.id.as_ref())
+        .expect("original public binding");
+    assert!(binding.public && binding.source_complete);
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.unit == binding.unit)
+        .expect("original defining unit");
+    assert_eq!(unit.path.0, "src/crate_root.rs");
+    assert_eq!(
+        unit.source.get(
+            usize::try_from(binding.range.start).expect("start")
+                ..usize::try_from(binding.range.end).expect("end")
+        ),
+        Some(binding.source.as_str())
+    );
+    assert!(binding.source.contains("pub use crate::"));
+    let identity = SymbolIdentity::parse(object.id.as_ref().expect("canonical alias").as_str())
+        .expect("owner-preserving identity");
+    assert_eq!(identity.owner(), &publication.owner);
+    let edge = publication
+        .relationships
+        .iter()
+        .find(|edge| {
+            Some(&edge.from) == object.id.as_ref()
+                && edge.kind.0 == rift_protocol::read::RelationshipFacet::Aliases.as_ref()
+        })
+        .expect("explicit alias target");
+    assert_eq!(edge.to.as_str(), target);
+    assert_eq!(
+        edge.occurrence
+            .as_ref()
+            .expect("original statement occurrence")
+            .unit,
+        binding.unit
+    );
+    assert_eq!(
+        edge.occurrence
+            .as_ref()
+            .expect("original statement occurrence")
+            .range,
+        binding.range
+    );
+    assert!(publication.objects.iter().any(|object| {
+        object.id.as_ref().is_some_and(|id| id.as_str() == target)
+            && object
+                .facets
+                .contains(&rift_protocol::read::SymbolFacet::Type)
+    }));
+}
+
+#[test]
+fn literal_root_public_reexports_keep_original_defining_traits() {
+    let sources = local_alias_sources(LOCAL_ALIAS_DEFINITION);
+    let analysis = local_alias_analysis(&sources, LOCAL_ALIAS_MANIFEST);
+    for (name, module) in [
+        ("Deserialize", "de"),
+        ("Deserializer", "de"),
+        ("Serialize", "ser"),
+        ("Serializer", "ser"),
+    ] {
+        assert_local_alias(analysis.publication(), name, module);
+    }
+    for (path, source) in sources {
+        let unit = analysis
+            .publication()
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("original unit");
+        assert_eq!(unit.source, source);
+        assert!(unit.source_complete);
+    }
+}
+
+#[test]
+fn literal_root_public_reexports_refuse_missing_and_conflicting_targets() {
+    let mut sources = local_alias_sources(LOCAL_ALIAS_DEFINITION);
+    sources.retain(|(path, _)| *path != "src/de/mod.rs");
+    let analysis = local_alias_analysis(&sources, LOCAL_ALIAS_MANIFEST);
+    assert!(!analysis.publication().objects.iter().any(|object| {
+        object
+            .id
+            .as_ref()
+            .is_some_and(|id| id.as_str().ends_with("/serde_core/Deserialize"))
+    }));
+    assert_local_alias(analysis.publication(), "Serialize", "ser");
+    let conflicting = "macro_rules! crate_root { () => { pub mod de; pub mod ser; pub use crate::de::Deserialize as Shared; pub use crate::ser::Serialize as Shared; }; }\n";
+    let sources = local_alias_sources(conflicting);
+    let analysis = local_alias_analysis(&sources, LOCAL_ALIAS_MANIFEST);
+    assert!(!analysis.publication().objects.iter().any(|object| {
+        object
+            .id
+            .as_ref()
+            .is_some_and(|id| id.as_str().ends_with("/serde_core/Shared"))
+    }));
+    assert!(analysis.publication().objects.iter().any(|object| {
+        object
+            .id
+            .as_ref()
+            .is_some_and(|id| id.as_str().ends_with("/serde_core/ser/Serialize"))
+    }));
+}
+
+#[test]
+fn literal_root_public_reexports_refuse_opaque_and_unknown_attributes() {
+    for definition in [
+        "macro_rules! crate_root { ($item:item) => { pub mod ser; pub use crate::ser::Serialize; }; }\n",
+        "macro_rules! crate_root { () => { pub mod ser; #[unknown] pub use crate::ser::Serialize; }; }\n",
+        "macro_rules! crate_root { () => { pub mod ser; pub(crate) use crate::ser::Serialize; }; }\n",
+    ] {
+        let sources = local_alias_sources(definition);
+        let analysis = local_alias_analysis(&sources, LOCAL_ALIAS_MANIFEST);
+        assert!(
+            !analysis.publication().objects.iter().any(|object| object
+                .id
+                .as_ref()
+                .is_some_and(|id| id.as_str().ends_with("/serde_core/Serialize"))),
+            "opaque or unattested binding: {definition}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires immutable original serde_core source artifact and verified manifest"]
+fn cold_serde_core_original_public_reexports_keep_defining_traits() {
+    let artifact_path = std::env::var("RIFT_COLD_SERDE_CORE_ARTIFACT").expect("original artifact");
+    let manifest_path = std::env::var("RIFT_COLD_SERDE_CORE_MANIFEST").expect("verified manifest");
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifact_path).expect("immutable original bytes"))
+            .expect("original artifact");
+    let manifest = std::fs::read_to_string(manifest_path).expect("verified original manifest");
+    let selected = artifact["units"]
+        .as_array()
+        .expect("original units")
+        .iter()
+        .filter(|unit| unit["language"].as_str() == Some("rust"))
+        .map(|unit| {
+            assert_eq!(unit["source_complete"].as_bool(), Some(true));
+            (
+                unit["path"].as_str().expect("original path"),
+                unit["source"].as_str().expect("original source"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 20);
+    let analysis = local_alias_analysis(&selected, &manifest);
+    assert_eq!(
+        serde_json::to_value(&analysis.publication().owner).expect("owner"),
+        artifact["owner"]
+    );
+    for (name, module) in [
+        ("Deserialize", "de"),
+        ("Deserializer", "de"),
+        ("Serialize", "ser"),
+        ("Serializer", "ser"),
+    ] {
+        assert_local_alias(analysis.publication(), name, module);
     }
 }

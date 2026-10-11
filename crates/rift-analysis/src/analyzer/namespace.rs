@@ -110,7 +110,10 @@ pub(crate) fn prepare_context(
     selected: &[SelectedFile<'_>],
 ) -> PreparedNamespace {
     let mut prepared = typescript::prepare(input, selected);
-    prepared.anchors.extend(rust::prepare(input, selected));
+    let rust = rust::prepare(input, selected);
+    prepared.anchors.extend(rust.anchors);
+    prepared.exports.extend(rust.exports);
+    prepared.unresolved_exports |= rust.unresolved_exports;
     let mut roots = input.import_roots().to_vec();
     for root in python::import_roots(input) {
         if !roots.iter().any(|accepted| {
