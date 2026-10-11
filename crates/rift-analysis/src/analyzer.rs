@@ -1833,7 +1833,13 @@ impl Records {
         })?;
         let unit = wire_unit(binding.unit());
         let path = wire_path(held.file.path());
-        let public = held.is_public(facts.qualified_name());
+        let public = held.is_public(facts.qualified_name())
+            || (facts
+                .symbol_facets()
+                .contains(&rift_protocol::read::SymbolFacet::Alias)
+                && facts
+                    .symbol_facets()
+                    .contains(&rift_protocol::read::SymbolFacet::Public));
         let publishes_document = public
             && object.name_is_public()
             && self.document_capacity()

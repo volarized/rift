@@ -213,3 +213,85 @@ fn alias_collision_retains_definitions_without_arbitrary_target() {
             .all(|coverage| !coverage.identity_complete)
     );
 }
+
+#[test]
+fn public_alias_keeps_original_export_binding_and_incoming_target() {
+    let analysis = analysis(JAVASCRIPT, true);
+    let publication = analysis.publication();
+    let definition = identity(&publication.owner, &["prettier", "format2"]);
+    let alias = identity(&publication.owner, &["prettier", "format"]);
+    let edge = publication
+        .relationships
+        .iter()
+        .find(|edge| {
+            edge.from == alias
+                && edge.to == definition
+                && edge
+                    .facets
+                    .contains(&rift_protocol::read::RelationshipFacet::Aliases)
+        })
+        .expect("explicit alias relationship");
+    assert_eq!(
+        edge.derivation,
+        rift_protocol::read::RelationshipDerivation::Syntax
+    );
+    assert!(edge.confidence.is_none());
+    assert!(edge.evidence.is_empty());
+    let occurrence = edge
+        .occurrence
+        .as_ref()
+        .expect("original export occurrence");
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.unit == occurrence.unit)
+        .expect("admitted physical implementation unit");
+    assert_eq!(unit.path.0, "index.mjs");
+    let start = usize::try_from(occurrence.range.start).expect("source start");
+    let end = usize::try_from(occurrence.range.end).expect("source end");
+    assert_eq!(&unit.source[start..end], "export { format2 as format };");
+    let binding = publication
+        .declarations
+        .iter()
+        .find(|binding| {
+            binding.symbol == alias
+                && binding.unit == occurrence.unit
+                && binding.range == occurrence.range
+        })
+        .expect("original alias declaration binding");
+    assert!(
+        binding.public,
+        "checked public alias retains its public binding"
+    );
+    assert!(binding.source_complete);
+    assert_eq!(binding.source, "export { format2 as format };");
+    assert_eq!(&unit.source[start..end], binding.source);
+    assert_eq!(
+        publication
+            .relationships
+            .iter()
+            .filter(|incoming| incoming.to == definition
+                && incoming.from == binding.symbol
+                && incoming.occurrence.as_ref().is_some_and(
+                    |source| source.unit == binding.unit && source.range == binding.range
+                ))
+            .count(),
+        1,
+        "original public alias has one incoming target and occurrence"
+    );
+    let alias_object = publication
+        .objects
+        .iter()
+        .find(|object| object.id.as_ref() == Some(&alias))
+        .expect("established alias object");
+    assert!(
+        alias_object
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Alias)
+    );
+    assert!(
+        alias_object
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Public)
+    );
+}
