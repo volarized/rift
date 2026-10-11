@@ -36,6 +36,10 @@ mod namespace;
 
 #[cfg(feature = "collector")]
 pub use namespace::{NamespaceInput, NamespaceModule};
+#[cfg(feature = "collector")]
+mod dependency;
+#[cfg(feature = "collector")]
+pub use dependency::PackageDependency;
 
 pub use import_root::{
     PACKAGE_IMPORT_BYTES_MAX, PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot,
@@ -405,6 +409,8 @@ pub struct ExactPackageInput<'input> {
     #[cfg(feature = "collector")]
     modules: &'input [NamespaceModule<'input>],
     #[cfg(feature = "collector")]
+    dependencies: &'input [PackageDependency<'input>],
+    #[cfg(feature = "collector")]
     build_paths: Option<
         &'input std::collections::BTreeMap<
             rift_protocol::read::ProjectPath,
@@ -448,6 +454,8 @@ impl<'input> ExactPackageInput<'input> {
             #[cfg(feature = "collector")]
             modules: &[],
             #[cfg(feature = "collector")]
+            dependencies: &[],
+            #[cfg(feature = "collector")]
             build_paths: None,
             #[cfg(feature = "collector")]
             library: None,
@@ -466,6 +474,20 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub fn namespace_input(self) -> NamespaceInput<'input> {
         NamespaceInput::from_package(&self)
+    }
+
+    /// Adds admitted dependency publications and their original selected sources.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for a missing manifest selector or exceeded bounds.
+    #[cfg(feature = "collector")]
+    pub fn with_dependencies(
+        mut self,
+        dependencies: &'input [PackageDependency<'input>],
+    ) -> Result<Self, RiftError> {
+        self.namespace_input().with_dependencies(dependencies)?;
+        self.dependencies = dependencies;
+        Ok(self)
     }
 
     /// Adds selected module observations validated against this source inventory.
@@ -612,6 +634,9 @@ impl<'input> ExactPackageInput<'input> {
         )?;
         self.context_sources = sources;
         self.frameworks = frameworks;
+        #[cfg(feature = "collector")]
+        self.namespace_input()
+            .with_dependencies(self.dependencies)?;
         #[cfg(feature = "collector")]
         if let Some((manifest, root)) = self.library {
             self.namespace_input()

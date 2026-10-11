@@ -62,9 +62,6 @@ pub(crate) fn placed_aliases(
     let mut aliases = BTreeMap::<String, Vec<rift_syntax::PlacedAlias>>::new();
     for export in &prepared.exports {
         let source = *positions.get(export.path.as_str()).ok_or_else(&invalid)?;
-        let target = *positions
-            .get(export.target_path.as_str())
-            .ok_or_else(&invalid)?;
         let range = export.binding.range;
         let bytes = usize::try_from(range.start)
             .ok()
@@ -74,7 +71,23 @@ pub(crate) fn placed_aliases(
         if bytes.is_none() {
             return Err(invalid());
         }
-        let placement = placements.get(target).ok_or_else(&invalid)?;
+        let owner = rift_protocol::identity::SymbolIdentity::parse(export.identity.as_str())
+            .map_err(|_| invalid())?;
+        let target_owner = rift_protocol::identity::SymbolIdentity::parse(export.target.as_str())
+            .map_err(|_| invalid())?;
+        let target_identity = if owner.owner() == target_owner.owner() {
+            let target = *positions
+                .get(export.target_path.as_str())
+                .ok_or_else(&invalid)?;
+            let placement = placements.get(target).ok_or_else(&invalid)?;
+            rift_core::symbol_identity(
+                &selected[target].syntax.language().identity_segment(),
+                placement.identity_path(),
+                &export.target_qualified_name,
+            )
+        } else {
+            export.target.as_str().to_owned()
+        };
         aliases
             .entry(export.path.clone())
             .or_default()
@@ -82,11 +95,7 @@ pub(crate) fn placed_aliases(
                 name: export.name.clone(),
                 qualified_name: export.qualified_name.clone(),
                 identity: export.identity.clone(),
-                target_identity: rift_core::symbol_identity(
-                    &selected[target].syntax.language().identity_segment(),
-                    placement.identity_path(),
-                    &export.target_qualified_name,
-                ),
+                target_identity,
                 range,
             });
     }

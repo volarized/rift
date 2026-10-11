@@ -557,17 +557,26 @@ fn local_exports(
     for (namespace, (path, range, name, target)) in requested {
         // Captured conditional declarations do not establish export completeness.
         prepared.unresolved_exports = true;
-        let Some(target_path) = requested_path(namespace, target) else {
-            continue;
+        let target = if let Some(target_path) = requested_path(namespace, target) {
+            local_target(
+                input,
+                selected,
+                &prepared.anchors,
+                &target_path,
+                &mut work,
+                work_max,
+            )
+            .map(|(file, symbol, target)| {
+                (
+                    target.clone(),
+                    file.path.as_str().to_owned(),
+                    symbol.qualified_name.clone(),
+                )
+            })
+        } else {
+            external_target(input, target, &mut work, work_max)
         };
-        let Some((file, symbol, target)) = local_target(
-            input,
-            selected,
-            &prepared.anchors,
-            &target_path,
-            &mut work,
-            work_max,
-        ) else {
+        let Some((target, target_path, target_qualified_name)) = target else {
             continue;
         };
         let mut alias_path = namespace.clone();
@@ -579,7 +588,7 @@ fn local_exports(
         else {
             continue;
         };
-        if identity == *target {
+        if identity == target {
             continue;
         }
         if prepared
@@ -601,9 +610,9 @@ fn local_exports(
                 type_only: false,
             },
             identity,
-            target: target.clone(),
-            target_path: file.path.as_str().to_owned(),
-            target_qualified_name: symbol.qualified_name.clone(),
+            target,
+            target_path,
+            target_qualified_name,
             name: name.clone(),
             qualified_name: name.clone(),
         });
@@ -612,6 +621,39 @@ fn local_exports(
     prepared
         .exports
         .retain(|export| !conflicts.contains(export.identity.as_str()));
+}
+
+fn external_target(
+    input: &NamespaceInput<'_>,
+    path: &[String],
+    work: &mut usize,
+    work_max: usize,
+) -> Option<(SymbolId, String, String)> {
+    let mut found = None;
+    for dependency in input.dependencies() {
+        *work = work.checked_add(1)?;
+        if *work > work_max {
+            return None;
+        }
+        if dependency.name() != path.first()?.as_str() {
+            continue;
+        }
+        let (identity, declaration, unit) =
+            dependency.target(path, input.language(), work, work_max)?;
+        let name = SymbolIdentity::parse(identity.as_str())
+            .ok()?
+            .qualified_path()
+            .last()?
+            .clone();
+        if found
+            .replace((identity, unit.path.0.clone(), name))
+            .is_some()
+            || declaration.unit != unit.unit
+        {
+            return None;
+        }
+    }
+    found
 }
 
 fn requested_path(namespace: &[String], target: &[String]) -> Option<Vec<String>> {

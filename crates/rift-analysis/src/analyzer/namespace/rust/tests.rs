@@ -2648,3 +2648,313 @@ fn cold_serde_core_original_public_reexports_keep_defining_traits() {
         assert_local_alias(analysis.publication(), name, module);
     }
 }
+
+fn external_alias_analysis(
+    target: &rift_protocol::index::PackagePublication,
+    selected: &[(&str, &str)],
+    manifest: &str,
+    include_target: bool,
+) -> crate::PackageAnalysis {
+    let package = PackageIdentity {
+        manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
+        name: "serde".to_owned(),
+        version: "1.0.228".to_owned(),
+    };
+    let owner = package.owner().expect("source owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency { package }),
+        SourceKind::Authored,
+    )
+    .expect("source origin");
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let paths = selected
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("original path"))
+        .collect::<Vec<_>>();
+    let files = paths
+        .iter()
+        .zip(selected)
+        .map(|(path, (_, text))| PackageSource::new(path, text))
+        .collect::<Vec<_>>();
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let metadata = PackageSource::new(&manifest_path, manifest);
+    let context = [metadata];
+    let root = files
+        .iter()
+        .find(|file| file.path().as_str() == "src/lib.rs")
+        .copied()
+        .expect("root");
+    let rift_protocol::identity::SymbolOwner::Package {
+        manager,
+        registry,
+        name,
+        version,
+    } = &target.owner
+    else {
+        panic!("released package target");
+    };
+    let target_origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: manager.clone(),
+                registry: registry.clone(),
+                name: name.clone(),
+                version: version.clone(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("target origin");
+    let target_paths = target
+        .units
+        .iter()
+        .map(|unit| ProjectPath::new(unit.path.0.as_str()).expect("admitted target path"))
+        .collect::<Vec<_>>();
+    let target_units = target
+        .units
+        .iter()
+        .map(|unit| {
+            rift_core::SourceUnitId::parse(unit.unit.as_str()).expect("admitted target unit")
+        })
+        .collect::<Vec<_>>();
+    let target_sources = target
+        .units
+        .iter()
+        .zip(&target_units)
+        .zip(&target_paths)
+        .map(|((unit, source_unit), path)| {
+            PackageSource::new(path, &unit.source)
+                .with_source_unit(source_unit, &target_origin)
+                .expect("original target source")
+        })
+        .collect::<Vec<_>>();
+    let dependencies = [crate::PackageDependency::new(
+        "serde_core",
+        metadata,
+        target,
+        &target_sources,
+    )];
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &files,
+        ExactPackageLimits::new(128, 32 * 1024 * 1024),
+    )
+    .expect("bounded source")
+    .with_framework_context(&context, &[])
+    .expect("source manifest")
+    .with_library(&owner, metadata, root)
+    .expect("source library");
+    let input = if include_target {
+        input
+            .with_dependencies(&dependencies)
+            .expect("admitted dependency")
+    } else {
+        input
+    };
+    crate::PackageAnalyzer::analyze(input, 1).expect("checked external binding")
+}
+
+fn assert_external_alias(publication: &rift_protocol::index::PackagePublication, name: &str) {
+    let alias = format!("rift://symbol/cargo/crates.io/serde@1.0.228/rust/serde/{name}");
+    let target = format!("rift://symbol/cargo/crates.io/serde_core@1.0.228/rust/serde_core/{name}");
+    let object = publication
+        .objects
+        .iter()
+        .find(|object| object.id.as_ref().is_some_and(|id| id.as_str() == alias))
+        .expect("original public reexport");
+    assert!(
+        object
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Alias)
+    );
+    assert_eq!(
+        SymbolIdentity::parse(object.id.as_ref().expect("alias identity").as_str())
+            .expect("source owner")
+            .owner(),
+        &publication.owner
+    );
+    let binding = publication
+        .declarations
+        .iter()
+        .find(|row| Some(&row.symbol) == object.id.as_ref())
+        .expect("source binding");
+    assert!(binding.public && binding.source_complete);
+    let unit = publication
+        .units
+        .iter()
+        .find(|unit| unit.unit == binding.unit)
+        .expect("source unit");
+    assert_eq!(
+        unit.source.get(
+            usize::try_from(binding.range.start).expect("start")
+                ..usize::try_from(binding.range.end).expect("end")
+        ),
+        Some(binding.source.as_str())
+    );
+    assert!(binding.source.contains("pub use serde_core"));
+    let edge = publication
+        .relationships
+        .iter()
+        .find(|edge| {
+            Some(&edge.from) == object.id.as_ref()
+                && edge.kind.0 == rift_protocol::read::RelationshipFacet::Aliases.as_ref()
+        })
+        .expect("explicit target binding");
+    assert_eq!(edge.to.as_str(), target);
+    assert_eq!(
+        edge.occurrence.as_ref().expect("original occurrence").unit,
+        binding.unit
+    );
+    assert_eq!(
+        edge.occurrence.as_ref().expect("original occurrence").range,
+        binding.range
+    );
+    assert!(
+        !publication
+            .objects
+            .iter()
+            .any(|object| object.id.as_ref().is_some_and(|id| id.as_str() == target))
+    );
+    assert!(
+        !publication
+            .units
+            .iter()
+            .any(|unit| unit.unit.as_str().contains("serde_core@"))
+    );
+}
+
+#[test]
+fn external_public_reexports_keep_original_alias_chain_and_defining_owner() {
+    let target = local_alias_analysis(
+        &[
+            (
+                "src/lib.rs",
+                "pub mod ser;\npub use crate::ser::Serialize;\n",
+            ),
+            ("src/ser.rs", "pub trait Serialize {}\n"),
+        ],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    let source = external_alias_analysis(
+        target.publication(),
+        &[("src/lib.rs", "pub use serde_core::Serialize;\n")],
+        "[package]\nname='serde'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_core='=1.0.228'\n",
+        true,
+    );
+    assert_external_alias(source.publication(), "Serialize");
+    assert!(
+        target.publication().relationships.iter().any(|edge| edge
+            .from
+            .as_str()
+            .ends_with("/serde_core/Serialize")
+            && edge.to.as_str().ends_with("/serde_core/ser/Serialize"))
+    );
+}
+
+#[test]
+fn external_public_reexports_without_admitted_target_remain_unresolved() {
+    let target = local_alias_analysis(
+        &[("src/lib.rs", "pub trait Serialize {}\n")],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    let source = external_alias_analysis(
+        target.publication(),
+        &[("src/lib.rs", "pub use serde_core::Serialize;\n")],
+        "[package]\nname='serde'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_core='=1.0.228'\n",
+        false,
+    );
+    assert!(!source.publication().objects.iter().any(|object| {
+        object
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Alias)
+    }));
+}
+
+#[test]
+fn external_public_reexports_refuse_missing_target_and_opaque_source() {
+    let target = local_alias_analysis(
+        &[("src/lib.rs", "pub trait Other {}\n")],
+        "[package]\nname='serde_core'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n",
+    );
+    for text in [
+        "pub use serde_core::Serialize;\n",
+        "unknown! { pub use serde_core::Other; }\n",
+    ] {
+        let source = external_alias_analysis(
+            target.publication(),
+            &[("src/lib.rs", text)],
+            "[package]\nname='serde'\nversion='1.0.228'\n[lib]\npath='src/lib.rs'\n[dependencies]\nserde_core='=1.0.228'\n",
+            true,
+        );
+        assert!(!source.publication().objects.iter().any(|object| {
+            object
+                .facets
+                .contains(&rift_protocol::read::SymbolFacet::Alias)
+        }));
+    }
+}
+
+#[test]
+#[ignore = "requires immutable original Serde and serde_core artifacts and verified manifests"]
+fn cold_serde_original_public_reexports_keep_serde_core_owner() {
+    let core_artifact: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("RIFT_COLD_SERDE_CORE_ARTIFACT").expect("target artifact"))
+            .expect("original target bytes"),
+    )
+    .expect("target artifact");
+    let core_manifest = std::fs::read_to_string(
+        std::env::var("RIFT_COLD_SERDE_CORE_MANIFEST").expect("target manifest"),
+    )
+    .expect("original target manifest");
+    let target_files = core_artifact["units"]
+        .as_array()
+        .expect("target units")
+        .iter()
+        .filter(|unit| unit["language"].as_str() == Some("rust"))
+        .map(|unit| {
+            assert_eq!(unit["source_complete"].as_bool(), Some(true));
+            (
+                unit["path"].as_str().expect("target path"),
+                unit["source"].as_str().expect("target source"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(target_files.len(), 20);
+    let target = local_alias_analysis(&target_files, &core_manifest);
+    for (name, module) in [("Deserialize", "de"), ("Serialize", "ser")] {
+        assert_local_alias(target.publication(), name, module);
+    }
+    let artifact: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(std::env::var("RIFT_COLD_SERDE_ARTIFACT").expect("source artifact"))
+            .expect("original source bytes"),
+    )
+    .expect("source artifact");
+    let manifest = std::fs::read_to_string(
+        std::env::var("RIFT_COLD_SERDE_MANIFEST").expect("source manifest"),
+    )
+    .expect("original source manifest");
+    let selected = artifact["units"]
+        .as_array()
+        .expect("source units")
+        .iter()
+        .filter(|unit| unit["language"].as_str() == Some("rust"))
+        .map(|unit| {
+            assert_eq!(unit["source_complete"].as_bool(), Some(true));
+            (
+                unit["path"].as_str().expect("source path"),
+                unit["source"].as_str().expect("source bytes"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source = external_alias_analysis(target.publication(), &selected, &manifest, true);
+    assert_eq!(
+        serde_json::to_value(&source.publication().owner).expect("source owner"),
+        artifact["owner"]
+    );
+    for name in ["Deserialize", "Serialize"] {
+        assert_external_alias(source.publication(), name);
+    }
+}

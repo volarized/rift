@@ -246,6 +246,18 @@ fn analyzed_file(
     })
 }
 
+fn external_work_limits(input: &ExactPackageInput<'_>) -> (std::cell::Cell<usize>, usize) {
+    (
+        std::cell::Cell::new(0),
+        input
+            .limits()
+            .syntax()
+            .syntax_nodes_max()
+            .checked_mul(input.limits().syntax().syntax_depth_max())
+            .unwrap_or(0),
+    )
+}
+
 impl PackageAnalyzer {
     /// Analyzes one exact package's selected files.
     ///
@@ -323,7 +335,7 @@ impl PackageAnalyzer {
             )?);
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
-        let unresolved_exports = place_namespace(&input, &mut analyzed)?;
+        let namespace = place_namespace(&input, &mut analyzed)?;
         join::join_modules(&mut analyzed);
         let placed = analyzed
             .iter()
@@ -333,12 +345,36 @@ impl PackageAnalyzer {
                 placement: held.placement.clone(),
             })
             .collect::<Vec<_>>();
-        let built = WorkspaceSemantics::build_facts_placed_with_relationships(
+        let (external_work, external_work_max) = external_work_limits(&input);
+        let built = WorkspaceSemantics::build_facts_placed_with_external(
             &placed,
             input.limits().declarations_max(),
             input.limits().relationships_max(),
             revision,
-            None,
+            &|reference| {
+                if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
+                    return None;
+                }
+                namespace.exports.iter().find_map(|export| {
+                    let work = external_work
+                        .get()
+                        .checked_add(1)?
+                        .checked_add(export.target.as_str().len())?;
+                    external_work.set(work);
+                    if work > external_work_max {
+                        return None;
+                    }
+                    let parsed =
+                        rift_protocol::identity::SymbolIdentity::parse(export.target.as_str())
+                            .ok()?;
+                    if parsed.owner() == input.owner() {
+                        return None;
+                    }
+                    let target =
+                        rift_core::ProviderSymbolId::for_symbol(export.target.as_str()).ok()?;
+                    (reference.symbol() == &target).then(|| export.target.clone())
+                })
+            },
         )
         .map_err(|error| {
             errors::analysis::package_provider_failed()
@@ -352,8 +388,12 @@ impl PackageAnalyzer {
                 .path(path.as_str())
                 .fail();
         }
-        let (publication, notebook_cells) =
-            publish(&input, &analyzed, &built.semantics, unresolved_exports)?;
+        let (publication, notebook_cells) = publish(
+            &input,
+            &analyzed,
+            &built.semantics,
+            namespace.unresolved_exports,
+        )?;
         Ok(PackageAnalysis {
             publication,
             files: analyzed,
@@ -384,7 +424,7 @@ fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read:
 fn place_namespace(
     input: &ExactPackageInput<'_>,
     analyzed: &mut [AnalyzedFile],
-) -> Result<bool, RiftError> {
+) -> Result<namespace::PreparedNamespace, RiftError> {
     let package = input.owner();
     let selected = analyzed
         .iter()
@@ -432,7 +472,7 @@ fn place_namespace(
             );
     }
 
-    Ok(namespace.unresolved_exports)
+    Ok(namespace)
 }
 
 /// Renders the canonical publication over the analyzed files.

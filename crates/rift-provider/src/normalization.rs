@@ -345,6 +345,29 @@ impl Normalizer {
         publications: &Arc<PublicationSet>,
         _previous: Option<&NormalizedGraph>,
     ) -> Result<NormalizedGraph, RiftError> {
+        Self::normalize_with(
+            index_revision,
+            source_revision,
+            tree_revision,
+            publications,
+            &|_| None,
+        )
+    }
+
+    /// Normalizes edges with explicitly supplied, source-checked external targets.
+    ///
+    /// Existing local contributions take precedence, including unresolved local
+    /// contributions. The callback cannot add records, anchors, or associations.
+    ///
+    /// # Errors
+    /// Returns the same record validation errors as `normalize`.
+    pub fn normalize_with(
+        index_revision: IndexRevision,
+        source_revision: SourceRevision,
+        tree_revision: TreeRevision,
+        publications: &Arc<PublicationSet>,
+        external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
+    ) -> Result<NormalizedGraph, RiftError> {
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
         let references = reference_index(&contributions);
@@ -377,6 +400,7 @@ impl Normalizer {
             groups,
             conflicting: &conflicting,
             candidates,
+            external,
         })
     }
 }
@@ -624,6 +648,7 @@ struct GraphBuild<'a> {
     groups: UnionFind,
     conflicting: &'a BTreeSet<usize>,
     candidates: Vec<AssociationCandidate>,
+    external: &'a dyn Fn(&ContributionReference) -> Option<SymbolId>,
 }
 
 fn build_records(
@@ -673,17 +698,21 @@ fn normalize_edges(
     contributions: &[&Contribution],
     records: &[SymbolRecord],
     records_by_contribution: &BTreeMap<ContributionReference, usize>,
+    external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
 ) -> (Vec<NormalizedReference>, Vec<NormalizedRelationship>) {
     let normalize_target = |target: &ContributionReference| {
-        records_by_contribution
-            .get(target)
-            .and_then(|index| records.get(*index))
-            .and_then(SymbolRecord::identity)
-            .cloned()
-            .map_or_else(
-                || NormalizedTarget::Contribution(target.clone()),
-                NormalizedTarget::Symbol,
-            )
+        let identity = if let Some(index) = records_by_contribution.get(target) {
+            records
+                .get(*index)
+                .and_then(SymbolRecord::identity)
+                .cloned()
+        } else {
+            external(target)
+        };
+        identity.map_or_else(
+            || NormalizedTarget::Contribution(target.clone()),
+            NormalizedTarget::Symbol,
+        )
     };
     let mut references = Vec::new();
     let mut relationships = Vec::new();
@@ -725,6 +754,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         mut groups,
         conflicting,
         mut candidates,
+        external,
     } = input;
     let (records, records_by_contribution) = build_records(
         index_revision,
@@ -752,6 +782,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         contributions,
         &records,
         &records_by_contribution,
+        external,
     );
 
     let contribution_positions = contribution_positions(&publications);

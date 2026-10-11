@@ -41,7 +41,7 @@ pub use input::{
     PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot, PackageImportRootOrigin, PackageSource,
 };
 #[cfg(feature = "collector")]
-pub use input::{NamespaceInput, NamespaceModule};
+pub use input::{NamespaceInput, NamespaceModule, PackageDependency};
 #[cfg(feature = "collector")]
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{

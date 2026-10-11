@@ -24,6 +24,7 @@ pub struct NamespaceInput<'input> {
     syntax: SyntaxLimits,
     library: Option<(PackageSource<'input>, PackageSource<'input>)>,
     modules: &'input [NamespaceModule<'input>],
+    dependencies: &'input [super::PackageDependency<'input>],
     build_paths:
         Option<&'input BTreeMap<rift_protocol::read::ProjectPath, Option<ArchiveMemberKind>>>,
 }
@@ -44,6 +45,7 @@ impl<'input> NamespaceInput<'input> {
             syntax: input.limits.syntax(),
             library: input.library,
             modules: input.modules,
+            dependencies: input.dependencies,
             build_paths: input.build_paths,
         }
     }
@@ -130,8 +132,58 @@ impl<'input> NamespaceInput<'input> {
             syntax,
             library: None,
             modules: &[],
+            dependencies: &[],
             build_paths: None,
         })
+    }
+
+    /// Adds dependency witnesses without copying their foreign objects.
+    ///
+    /// Each selector must occur in an original admitted Cargo manifest. Missing or
+    /// conflicting target declarations remain unresolved during requested lookup.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for invalid witnesses or exceeded bounds.
+    pub fn with_dependencies(
+        mut self,
+        dependencies: &'input [super::PackageDependency<'input>],
+    ) -> Result<Self, RiftError> {
+        self.validate_count(dependencies.len())?;
+        let mut names = BTreeSet::new();
+        let mut sources = self
+            .files
+            .len()
+            .checked_add(self.context_sources.len())
+            .ok_or_else(invalid)?;
+        let mut bytes = self
+            .files
+            .iter()
+            .chain(self.context_sources)
+            .try_fold(0_u64, |bytes, source| {
+                counted_bytes(bytes, source.text.len(), self.bytes_max)
+            })?;
+        for dependency in dependencies {
+            bytes = counted_bytes(bytes, dependency.name().len(), self.bytes_max)?;
+            if !names.insert(dependency.name()) {
+                return Err(invalid());
+            }
+            sources = sources
+                .checked_add(dependency.sources().len())
+                .ok_or_else(invalid)?;
+            self.validate_count(sources)?;
+            for source in dependency.sources() {
+                bytes = counted_bytes(bytes, source.text().len(), self.bytes_max)?;
+            }
+            dependency.validate(&self)?;
+        }
+        self.dependencies = dependencies;
+        Ok(self)
+    }
+
+    /// Borrowed admitted dependency publications, in caller order.
+    #[must_use]
+    pub const fn dependencies(self) -> &'input [super::PackageDependency<'input>] {
+        self.dependencies
     }
 
     /// Adds selected module observations without combining their export conditions.

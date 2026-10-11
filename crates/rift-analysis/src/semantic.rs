@@ -69,6 +69,9 @@ pub struct BuiltSemantics {
     pub refused_contributions: Vec<(ProjectPath, RiftError)>,
 }
 
+type ExternalTarget<'input> =
+    dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
+
 impl WorkspaceSemantics {
     /// Builds one syntax publication and one normalized graph over one file set.
     ///
@@ -178,6 +181,7 @@ impl WorkspaceSemantics {
             revision,
             previous,
             true,
+            None,
         )
     }
 
@@ -219,6 +223,25 @@ impl WorkspaceSemantics {
             revision,
             previous,
             false,
+            None,
+        )
+    }
+
+    pub(crate) fn build_facts_placed_with_external(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        relationships_max: usize,
+        revision: u64,
+        external: &dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        Self::build_facts_placed_inner(
+            documents,
+            declarations_max,
+            relationships_max,
+            revision,
+            None,
+            false,
+            Some(external),
         )
     }
 
@@ -229,6 +252,7 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
         collect_refused_contributions: bool,
+        external: Option<&ExternalTarget<'_>>,
     ) -> Result<BuiltSemantics, RiftError> {
         let index_revision = IndexRevision::new(revision)?;
         let source_revision = SourceRevision::new(revision)?;
@@ -281,13 +305,22 @@ impl WorkspaceSemantics {
         }
         let publication = builder.build()?;
         let publications = Arc::new(PublicationSet::empty(limits).replaced(publication)?);
-        let graph = Normalizer::normalize(
-            index_revision,
-            source_revision,
-            tree_revision,
-            &publications,
-            previous,
-        )?;
+        let graph = match external {
+            Some(external) => Normalizer::normalize_with(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &publications,
+                external,
+            )?,
+            None => Normalizer::normalize(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &publications,
+                previous,
+            )?,
+        };
         let relationships = RelationshipStore::build_capped(&graph, relationships_max);
         Ok(BuiltSemantics {
             semantics: Self {
