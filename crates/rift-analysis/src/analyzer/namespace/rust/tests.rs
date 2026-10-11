@@ -2036,3 +2036,160 @@ fn literal_macro_function_anchors_refuse_opaque_shadowed_and_unknown_effects() {
         assert!(found["src/lib.rs"].contains_key("plain"), "{source}");
     }
 }
+
+fn function_body_anchors(
+    prefix: &str,
+    body: &str,
+    suffix: &str,
+    library: bool,
+) -> super::super::Anchors {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let source = format!(
+        "{prefix}{definition} cfg_rt! {{ pub fn spawn<F>(future: F) -> JoinHandle<F::Output> where F: Future + Send + 'static, F::Output: Send + 'static, {{ {body} }} }} {suffix} pub fn plain() {{}}"
+    );
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual package owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("owner origin");
+    selected_anchors_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &[("src/lib.rs", &source)],
+        None,
+        false,
+        &owner,
+        &origin,
+        library,
+    )
+}
+
+#[test]
+fn literal_function_bodies_keep_local_imports_and_checked_panic() {
+    for body in [
+        "use crate::runtime::{context, task}; let future = task::spawn(future); match context::with_current(future) { Ok(value) => value, Err(e) => panic!(\"{}\", e), }",
+        "use crate::runtime::context as local_context; { use crate::runtime::task; } panic!(\"{}\", local_context)",
+    ] {
+        let found = function_body_anchors("", body, "", true);
+        let identity = SymbolIdentity::parse(found["src/lib.rs"]["spawn"].as_str())
+            .expect("original function identity");
+        assert_eq!(identity.qualified_path(), &["crate_root", "spawn"]);
+        assert!(found["src/lib.rs"].contains_key("plain"));
+    }
+    let found = function_body_anchors(
+        "pub fn borrowed(value: &Value) -> &Value { value }",
+        "future",
+        "#[track_caller] pub(super) fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>) -> JoinHandle<T::Output> where T: Future + Send + 'static, T::Output: Send + 'static, { use crate::runtime::{context, task}; panic!(\"{}\", context); }",
+        true,
+    );
+    assert!(found["src/lib.rs"].contains_key("spawn"));
+    let found = function_body_anchors("", "use crate::runtime::{context, task}; future", "", false);
+    assert!(found["src/lib.rs"].contains_key("spawn"));
+}
+
+#[test]
+fn literal_function_bodies_keep_local_imports_out_of_outer_scope() {
+    for body in [
+        "use crate::other::Copy; future",
+        "use crate::other::Macro as Copy; future",
+    ] {
+        let found =
+            function_body_anchors("", body, "#[derive(Copy, Clone)] pub struct Marker;", true);
+        assert!(found["src/lib.rs"].contains_key("spawn"), "{body}");
+        assert!(found["src/lib.rs"].contains_key("Marker"), "{body}");
+    }
+}
+
+#[test]
+fn literal_function_bodies_refuse_panic_shadow_and_missing_prelude() {
+    for (prefix, body, suffix, library) in [
+        (
+            "",
+            "use crate::other::Macro as panic; panic!(\"message\");",
+            "",
+            true,
+        ),
+        (
+            "",
+            "panic!(\"message\"); use crate::other::Macro as panic;",
+            "",
+            true,
+        ),
+        ("", "use crate::other::*; panic!(\"message\");", "", true),
+        (
+            "use crate::other::Macro as panic;",
+            "panic!(\"message\");",
+            "",
+            true,
+        ),
+        (
+            "",
+            "panic!(\"message\");",
+            "use crate::other::Macro as panic;",
+            true,
+        ),
+        ("#![no_std]", "panic!(\"message\");", "", true),
+        ("#![no_implicit_prelude]", "panic!(\"message\");", "", true),
+        (
+            "#![cfg_attr(feature=\"bare\",no_std)]",
+            "panic!(\"message\");",
+            "",
+            true,
+        ),
+        ("", "panic!(\"message\");", "", false),
+        ("", "other::panic!(\"message\");", "", true),
+    ] {
+        let found = function_body_anchors(prefix, body, suffix, library);
+        assert!(
+            !found["src/lib.rs"].contains_key("spawn"),
+            "{prefix} {body} {suffix}"
+        );
+        assert!(found["src/lib.rs"].contains_key("plain"));
+    }
+}
+
+#[test]
+fn literal_function_bodies_refuse_unknown_and_exported_macro_effects() {
+    for (body, suffix) in [
+        ("use crate::runtime::context; unknown! {}; future", ""),
+        ("panic!(unknown!());", ""),
+        ("macro_rules! panic { () => {} } panic!();", ""),
+        (
+            "#[macro_export] macro_rules! emitted { () => {} } future",
+            "",
+        ),
+        ("#[unknown] let value = future; value", ""),
+        ("extern crate other; future", ""),
+        ("mod emitted; future", ""),
+        ("panic!(\"message\");", "unknown! {};"),
+    ] {
+        let found = function_body_anchors("", body, suffix, true);
+        assert!(
+            !found["src/lib.rs"].contains_key("spawn"),
+            "{body} {suffix}"
+        );
+        assert!(found["src/lib.rs"].contains_key("plain"));
+    }
+    let source = "opaque! { pub fn spawn() { use crate::runtime::context; panic!(\"message\"); } } pub fn plain() {}";
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[("src/lib.rs", source)],
+        None,
+        false,
+    );
+    assert!(!found["src/lib.rs"].contains_key("spawn"));
+    assert!(found["src/lib.rs"].contains_key("plain"));
+}

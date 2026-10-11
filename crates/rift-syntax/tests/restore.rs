@@ -1971,3 +1971,63 @@ fn literal_macro_functions_obey_original_source_and_node_bounds() {
         );
     }
 }
+
+fn literal_function_header_tokens(source: &str) -> Vec<&str> {
+    let mut rows = Vec::new();
+    assert!(rift_syntax::tokens(
+        source,
+        rift_syntax::ByteRange {
+            start: 0,
+            end: u64::try_from(source.len()).expect("original header length"),
+        },
+        SyntaxLimits::default(),
+        |range| {
+            let start = usize::try_from(range.start).expect("token start");
+            let end = usize::try_from(range.end).expect("token end");
+            rows.push(&source[start..end]);
+            true
+        },
+    ));
+    rows
+}
+
+#[test]
+fn literal_function_headers_keep_original_lifetime_arguments_and_where_bounds() {
+    for source in [
+        "fn spawn<F>(future: F) -> JoinHandle<F::Output> where F: Future + Send + 'static, F::Output: Send + 'static,",
+        "fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>) -> JoinHandle<T::Output> where T: Future + Send + 'static, T::Output: Send + 'static,",
+    ] {
+        let tokens = literal_function_header_tokens(source);
+        assert!(SyntaxDocument::function_header(
+            &tokens,
+            (tokens.len(), source.len())
+        ));
+        assert!(tokens.iter().all(|token| source.contains(token)));
+        assert_eq!(tokens[0], "fn");
+    }
+}
+
+#[test]
+fn literal_function_headers_refuse_bounds_malformed_and_truncated_tokens() {
+    let source = "fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>) -> JoinHandle<T::Output> where T: Future + Send + 'static,";
+    let tokens = literal_function_header_tokens(source);
+    assert!(!SyntaxDocument::function_header(
+        &tokens,
+        (tokens.len() - 1, source.len())
+    ));
+    assert!(!SyntaxDocument::function_header(&tokens, (tokens.len(), 0)));
+    for source in [
+        "fn spawn_inner<T>(future: T, meta: SpawnMeta<>)",
+        "fn spawn_inner<T>(future: T) ->",
+        "fn spawn_inner<T>(future: T) where T:",
+        "fn spawn_inner<T>(future: T) where T: Future +",
+        "fn spawn_inner<T>(future: T) extra",
+        "fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>, extra)",
+    ] {
+        let tokens = literal_function_header_tokens(source);
+        assert!(
+            !SyntaxDocument::function_header(&tokens, (tokens.len(), source.len())),
+            "{source}"
+        );
+    }
+}

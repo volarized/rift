@@ -442,7 +442,91 @@ impl<'a> Tokens<'a> {
         {
             return None;
         }
-        self.ordinary(input, scope, library, depth, validate)
+        if input.first() == Some(&"fn")
+            && self
+                .function(input, scope, library, depth, validate)
+                .is_some()
+        {
+            return Some(());
+        }
+        self.ordinary(input, scope, library, depth, validate, false)
+    }
+
+    fn function(
+        &self,
+        input: &[&str],
+        scope: &Scope,
+        library: bool,
+        depth: usize,
+        validate: bool,
+    ) -> Option<()> {
+        self.charge(input.len())?;
+        let range = self.module_range(input)?;
+        let start = input.iter().position(|token| *token == "{")?;
+        let width = usize::try_from(range.end.checked_sub(range.start)?).ok()?;
+        if !rift_syntax::SyntaxDocument::function_header(&input[..start], (self.rows.len(), width))
+        {
+            return None;
+        }
+        let mut tail = &input[start..];
+        let body = group(&mut tail, "{", "}")?;
+        if !tail.is_empty() {
+            return None;
+        }
+        let mut local = scope.clone();
+        self.local_imports(body, &mut local, depth)?;
+        self.ordinary(body, &local, library, depth.checked_sub(1)?, validate, true)
+    }
+
+    fn local_imports(&self, mut input: &[&str], scope: &mut Scope, depth: usize) -> Option<()> {
+        self.charge(input.len())?;
+        while !input.is_empty() {
+            if consume(&mut input, &["use"]) {
+                let mut bindings = BTreeSet::new();
+                imports(&mut input, None, &mut bindings, depth)?;
+                if !consume(&mut input, &[";"]) {
+                    return None;
+                }
+                for name in bindings {
+                    scope.insert(name, false);
+                }
+            } else {
+                input = &input[1..];
+            }
+        }
+        Some(())
+    }
+
+    fn panic(
+        &self,
+        input: &mut &[&str],
+        scope: &Scope,
+        library: bool,
+        depth: usize,
+        validate: bool,
+    ) -> Option<()> {
+        if !consume(input, &["panic", "!"])
+            || self.bindings.contains("panic")
+            || scope.contains_key("panic")
+            || (validate && !self.implicit_prelude("panic", scope, library))
+        {
+            return None;
+        }
+        let (open, close) = match input.first().copied()? {
+            "(" => ("(", ")"),
+            "[" => ("[", "]"),
+            "{" => ("{", "}"),
+            _ => return None,
+        };
+        let arguments = group(input, open, close)?;
+        self.ordinary(
+            arguments,
+            scope,
+            library,
+            depth.checked_sub(1)?,
+            validate,
+            true,
+        )
     }
 
     fn ordinary(
@@ -452,6 +536,7 @@ impl<'a> Tokens<'a> {
         library: bool,
         depth: usize,
         validate: bool,
+        local: bool,
     ) -> Option<()> {
         self.charge(input.len())?;
         let mut previous = None;
@@ -463,6 +548,23 @@ impl<'a> Tokens<'a> {
                     return None;
                 }
             } else {
+                if local && consume(&mut input, &["use"]) {
+                    let mut bindings = BTreeSet::new();
+                    imports(&mut input, None, &mut bindings, depth)?;
+                    if !consume(&mut input, &[";"]) {
+                        return None;
+                    }
+                    previous = None;
+                    continue;
+                }
+                if local && input.starts_with(&["panic", "!"]) {
+                    if previous == Some(":") {
+                        return None;
+                    }
+                    self.panic(&mut input, scope, library, depth, validate)?;
+                    previous = Some(")");
+                    continue;
+                }
                 if input.starts_with(&["cfg", "!", "("]) {
                     if previous == Some(":") {
                         return None;

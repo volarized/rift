@@ -317,6 +317,20 @@ impl SyntaxDocument {
         Self::assemble(language, path, nodes, symbols, has_errors, None)
     }
 
+    /// Checks literal Rust function header tokens within the token and source byte bounds.
+    ///
+    /// The tokens must come from the caller's checked original source range.
+    #[must_use]
+    pub fn function_header(input: &[&str], bounds: (usize, usize)) -> bool {
+        let (tokens_max, source_bytes_max) = bounds;
+        input.len() <= tokens_max
+            && input
+                .iter()
+                .try_fold(0_usize, |bytes, token| bytes.checked_add(token.len()))
+                .is_some_and(|bytes| bytes <= source_bytes_max)
+            && rust_macros::function_header_tokens(input)
+    }
+
     pub(crate) fn new_rust(
         language: Language,
         source: crate::SyntaxSource<'_>,

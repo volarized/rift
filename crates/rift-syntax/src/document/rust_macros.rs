@@ -941,18 +941,24 @@ fn function_header(
     }) {
         return false;
     }
-    let mut offset = usize::from(rows.first().is_some_and(|(_, value)| *value == "pub"));
+    let offset = usize::from(rows.first().is_some_and(|(_, value)| *value == "pub"));
     if rows.get(offset).map(|(_, value)| *value) != Some("fn")
         || rows.get(offset + 1).map(|(range, _)| *range) != Some(name)
     {
         return false;
     }
-    offset += 2;
     let values = rows[offset..]
         .iter()
         .map(|(_, value)| *value)
         .collect::<Vec<_>>();
-    let mut input = values.as_slice();
+    function_header_tokens(&values)
+}
+
+pub(super) fn function_header_tokens(input: &[&str]) -> bool {
+    if input.first() != Some(&"fn") || input.get(1).is_none_or(|value| !identifier(value)) {
+        return false;
+    }
+    let mut input = &input[2..];
     if consume(&mut input, "<") {
         loop {
             let Some(value) = input.first() else {
@@ -1052,7 +1058,12 @@ fn type_path(input: &mut &[&str]) -> bool {
     }
     if consume(input, "<") {
         loop {
-            if !literal_path(input) {
+            if input
+                .first()
+                .is_some_and(|value| value.strip_prefix('\'').is_some_and(identifier))
+            {
+                *input = &input[1..];
+            } else if !literal_path(input) {
                 return false;
             }
             if consume(input, ">") {
