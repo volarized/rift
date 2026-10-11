@@ -110,6 +110,16 @@ impl CandidateReservation<'_> {
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
         if rows[position].expires <= now || expires <= now || expires > latest_expiry {
+            rift_tracing::warn!(
+                component = "mcp",
+                pending_expired = rows[position].expires <= now,
+                returned_expired = expires <= now,
+                expiry_over_bound = expires > latest_expiry,
+                pending_remaining = ?rows[position].expires.duration_since(now),
+                returned_remaining = ?expires.duration_since(now),
+                expiry_overflow = ?expires.duration_since(latest_expiry),
+                "captured view expiry does not match the reservation"
+            );
             return Err(invalid(
                 "view",
                 "captured view expiry does not match the reservation",
