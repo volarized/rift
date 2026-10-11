@@ -207,7 +207,7 @@ mod tests {
         let text = "\t    pub fn beacon() {}\n";
         assert_eq!(source_lines(text, &source, "\t"), Ok(()));
         assert!(source_lines(&text.replace("beacon", "changed"), &source, "\t").is_err());
-        assert!(source_lines(&text.replacen("\t", "\t\t", 1), &source, "\t").is_err());
+        assert!(source_lines(&text.replacen('\t', "\t\t", 1), &source, "\t").is_err());
     }
 
     #[test]
