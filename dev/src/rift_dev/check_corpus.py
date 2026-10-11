@@ -1152,7 +1152,24 @@ class Corpus:
                 hits = objects(found, "hits")
                 require(bool(hits), "shallow checkout has no FastAPI declaration")
                 for hit in hits:
-                    history = object_value(hit.get("history"), "symbol history")
+                    symbol = hit.get("symbol")
+                    evidence = {
+                        "name": symbol.get("name")
+                        if isinstance(symbol, dict)
+                        else hit.get("name"),
+                        "id": symbol.get("id")
+                        if isinstance(symbol, dict)
+                        else hit.get("id"),
+                        "path": hit.get("path"),
+                        "history": hit.get("history"),
+                        "view": found.get("view"),
+                        "revision": found.get("revision"),
+                        "root": str(root),
+                    }
+                    history = object_value(
+                        hit.get("history"),
+                        "symbol history " + json.dumps(evidence, sort_keys=True)[:4096],
+                    )
                     require(
                         history.get("complete") is False,
                         "shallow history must report complete=false",
