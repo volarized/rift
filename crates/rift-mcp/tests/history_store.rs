@@ -16,7 +16,9 @@ use std::time::Duration;
 
 use rift_history::fixture::{commit_all, git, init};
 use serde_json::{Value, json};
-use workspace_client::{TestResult, call_retrying_acceptance, served_root, tool_request};
+use workspace_client::{
+    TestResult, call_retrying_acceptance, search_after_population, served_root, tool_request,
+};
 
 /// How long a test waits for the background fill of a few fixture commits.
 const FILL_WAIT_MAX: Duration = Duration::from_secs(30);
@@ -51,19 +53,56 @@ fn moved_workspace(root: &Path) -> TestResult {
     Ok(())
 }
 
-/// The history of `travelled`'s one hit.
+/// The history of the observed `travelled` identity.
 async fn travelled_history(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult<Value> {
+    let search = search_after_population(
+        client,
+        &json!({"query": "travelled", "target": "symbol", "include": ["source"]}),
+    )
+    .await?;
+    let mut rows = search["results"]
+        .as_array()
+        .ok_or("search results are an array")?
+        .iter()
+        .filter(|row| {
+            row["hit"]["symbol"]["name"] == "travelled"
+                && row["hit"]["symbol"]["language"] == "rust"
+                && row["hit"]["path"] == "after.rs"
+        });
+    let row = rows
+        .next()
+        .ok_or("the original travelled declaration is present")?;
+    assert!(rows.next().is_none(), "travelled is unique: {search}");
+    assert_eq!(row["hit"]["symbol"]["kind"], "function");
+    let id = row["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("travelled has an established identity")?;
+    let identity = rift_protocol::identity::SymbolIdentity::parse(id)?;
+    assert!(matches!(
+        identity.owner(),
+        rift_protocol::identity::SymbolOwner::Local
+    ));
+    assert_eq!(identity.wire_identity(), id);
+    let view = search
+        .get("view")
+        .ok_or("search carries its captured view")?;
     let structured = call_retrying_acceptance(
         client,
         tool_request(
             "get_symbol",
-            &json!({"name": "travelled", "include": ["history"]}),
+            &json!({"id": id, "include": ["history"], "view": view}),
         ),
     )
     .await?;
-    Ok(structured["hits"][0]["history"].clone())
+    assert_eq!(structured["outcome"], "found", "{structured}");
+    assert_eq!(structured["symbol"]["id"], id);
+    assert_eq!(structured["view"], *view);
+    structured
+        .get("history")
+        .cloned()
+        .ok_or_else(|| "the requested history is present".into())
 }
 
 /// Asks until the history answers complete, as a caller does while the store lags.
