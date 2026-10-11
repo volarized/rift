@@ -81,6 +81,21 @@ impl ReadAnswer for SearchCandidateInputs {
     }
 }
 
+fn validate_candidate_query(params: &SearchParams) -> Result<(), ToolFailure> {
+    let Some(query) = params.query.as_deref() else {
+        return Ok(());
+    };
+    rift_ranking::ParsedQuery::parse(query).map_err(|error| {
+        read_failure(
+            errors::server::read_invalid()
+                .field("query")
+                .violation(error.detail())
+                .error(),
+        )
+    })?;
+    Ok(())
+}
+
 fn preparing_candidates(
     resolved: &super::ResolvedWorkspace,
     warnings: &[ReadWarning],
@@ -329,6 +344,7 @@ impl RiftMcp {
             }
             return Ok(SearchCandidateResult::Captured(Box::new(response)));
         }
+        validate_candidate_query(&requested.params)?;
         let (resolved, answer, warnings, references, deadline) =
             self.current_search_inputs(&requested.params).await?;
         if let Some(answer) = preparing_candidates(&resolved, &warnings) {
@@ -903,6 +919,41 @@ mod tests {
                 }),
             )?),
         )
+    }
+
+    #[tokio::test]
+    async fn preparing_query_refuses_unterminated_quote_without_retaining_candidates() -> TestResult
+    {
+        let (_directory, assembled) = super::super::tests::starting_fixture().await?;
+        let params = serde_json::from_value(serde_json::json!({
+            "query": "\"beacon", "scope": "local", "target": "symbol"
+        }))?;
+        let failure = assembled
+            .server
+            .search(super::super::Parameters(params))
+            .await
+            .err()
+            .expect("preparing publication must refuse the malformed query");
+        let super::ToolFailure::Registered(failure, phase) = failure else {
+            return Err("query refusal must remain registered".into());
+        };
+        assert_eq!(phase, super::wire::ErrorPhase::Read);
+        assert!(
+            failure
+                .registered()
+                .context()
+                .any(|(key, value)| key == "field" && value == "query")
+        );
+        assert!(
+            assembled
+                .server
+                .candidate_responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[tokio::test]
