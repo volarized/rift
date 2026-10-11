@@ -2130,7 +2130,8 @@
             ],
             "type": "object"
           }
-        ]
+        ],
+        "type": "object"
       }
     },
     {
@@ -5685,7 +5686,8 @@
             ],
             "type": "object"
           }
-        ]
+        ],
+        "type": "object"
       }
     },
     {
@@ -12364,7 +12366,8 @@
             "$ref": "#/$defs/SearchUnavailable",
             "description": "The captured selection cannot serve this request."
           }
-        ]
+        ],
+        "type": "object"
       }
     }
   ]

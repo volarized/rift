@@ -417,3 +417,28 @@ async fn foreign_host_and_origin_are_refused_at_the_boundary() -> TestResult {
     shutdown.cancel();
     stopped_within_deadline(server).await
 }
+
+#[tokio::test]
+async fn http_tools_list_preserves_object_output_unions() -> TestResult {
+    let directory = workspace_with(None)?;
+    let (shutdown, server) = served(directory.path()).await?;
+    let client = connected_client(&server).await?;
+    let listing = client.list_tools(None).await?;
+    let exported = schema::tool_listing();
+    assert_eq!(listing.tools.len(), 4);
+    for tool in &listing.tools {
+        let output = tool
+            .output_schema
+            .as_deref()
+            .ok_or("output schema missing")?;
+        assert_eq!(output.get("type"), Some(&json!("object")), "{}", tool.name);
+        let expected = exported
+            .iter()
+            .find(|entry| entry.name == tool.name)
+            .ok_or("exported tool missing")?;
+        assert_eq!(tool.output_schema, expected.output_schema);
+    }
+    client.cancel().await?;
+    shutdown.cancel();
+    stopped_within_deadline(server).await
+}
