@@ -299,7 +299,13 @@ async fn served_fixture_with_setup(
     tokio::task::JoinHandle<()>,
 )> {
     let fixture = if complete_selection {
-        surface_corpus::SurfaceFixture::start_canonical().await?
+        let fixture = surface_corpus::SurfaceFixture::start().await?;
+        let path = fixture.root().join("lib.rs");
+        let original = std::fs::read_to_string(&path)?;
+        assert!(fixture.root().join("change_witness.rs").is_file());
+        std::fs::write(path, format!("{original}pub mod change_witness;\n"))?;
+        rift_history::fixture::commit_all(fixture.root(), "declare the original change module");
+        fixture
     } else {
         surface_corpus::SurfaceFixture::start().await?
     };

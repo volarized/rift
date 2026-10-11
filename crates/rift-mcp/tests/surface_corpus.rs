@@ -584,17 +584,6 @@ impl SurfaceFixture {
         })
     }
 
-    /// Admits the original Rust change file through its actual Cargo library root.
-    pub(crate) async fn start_canonical() -> Result<Self, Box<dyn std::error::Error>> {
-        let fixture = Self::start().await?;
-        let path = fixture.root().join("lib.rs");
-        let original = fs::read_to_string(&path)?;
-        assert!(fixture.root().join("change_witness.rs").is_file());
-        fs::write(path, format!("{original}pub mod change_witness;\n"))?;
-        rift_history::fixture::commit_all(fixture.root(), "declare the original change module");
-        Ok(fixture)
-    }
-
     /// Returns workspace root used by direct and proxy clients.
     pub(crate) fn root(&self) -> &Path {
         self.workspace.path()

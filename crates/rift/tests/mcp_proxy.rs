@@ -530,19 +530,14 @@ fn windows_indigo_first_index_xfail_matches_only_the_recorded_refusal() {
     }
 }
 
-/// All internal root routes share one elected process and retain separate workspace facts.
-#[tokio::test]
-async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
--> TestResult {
-    let names = ["amber", "cedar", "indigo", "quartz"];
-    let main = laid_out_workspace(
-        &[("lib.rs", "pub fn amber() {}\n")],
-        &harness::assigned_port_key()?,
-    )?;
-    fixture_git(main.path(), &["init", "-q"])?;
-    fixture_git(main.path(), &["add", "lib.rs", "rift.toml"])?;
+fn repository_linked_workspaces(
+    main: &Path,
+    names: &[&str],
+) -> TestResult<(tempfile::TempDir, Vec<PathBuf>)> {
+    fixture_git(main, &["init", "-q"])?;
+    fixture_git(main, &["add", "lib.rs", "rift.toml"])?;
     fixture_git(
-        main.path(),
+        main,
         &[
             "-c",
             "commit.gpgsign=false",
@@ -552,11 +547,11 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         ],
     )?;
     let linked_parent = tempfile::tempdir()?;
-    let mut roots = vec![main.path().to_path_buf()];
+    let mut roots = vec![main.to_path_buf()];
     for name in names.iter().skip(1) {
         let root = linked_parent.path().join(format!("worktree-é-{name}"));
         fixture_git(
-            main.path(),
+            main,
             &[
                 "worktree",
                 "add",
@@ -569,6 +564,19 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         fs::write(root.join("lib.rs"), format!("pub fn {name}() {{}}\n"))?;
         roots.push(root);
     }
+    Ok((linked_parent, roots))
+}
+
+/// All internal root routes share one elected process and retain separate workspace facts.
+#[tokio::test]
+async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
+-> TestResult {
+    let names = ["amber", "cedar", "indigo", "quartz"];
+    let main = laid_out_workspace(
+        &[("lib.rs", "pub fn amber() {}\n")],
+        &harness::assigned_port_key()?,
+    )?;
+    let (_linked_parent, roots) = repository_linked_workspaces(main.path(), &names)?;
     let common = rift_mcp::repository::discover_common_directory(main.path())
         .ok_or("fixture repository has a common Git directory")?;
     let state_directory =
