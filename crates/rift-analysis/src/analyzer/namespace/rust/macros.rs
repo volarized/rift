@@ -1,5 +1,7 @@
 //! Checks captured item-repetition macros without expanding source.
 
+mod scope;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -7,7 +9,36 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use super::super::SelectedFile;
 
-pub(super) type Scope = Arc<BTreeMap<String, bool>>;
+#[derive(Clone)]
+pub(super) struct Scope {
+    symbols: Arc<BTreeMap<String, bool>>,
+    complete: bool,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            symbols: Arc::default(),
+            complete: true,
+        }
+    }
+}
+
+impl Scope {
+    fn get(&self, name: &str) -> Option<&bool> {
+        self.symbols.get(name)
+    }
+    fn contains_key(&self, name: &str) -> bool {
+        self.symbols.contains_key(name)
+    }
+    fn insert(&mut self, name: String, transparent: bool) {
+        Arc::make_mut(&mut self.symbols).insert(name, transparent);
+    }
+    fn clear(&mut self) {
+        Arc::make_mut(&mut self.symbols).clear();
+        self.complete = false;
+    }
+}
 
 type Inventory<'a> = BTreeMap<&'a str, &'a SelectedFile<'a>>;
 type Child = (String, Vec<String>, Scope);
@@ -113,10 +144,14 @@ fn cfg_attribute(input: &[&str]) -> bool {
     {
         return false;
     }
-    *name == "cfg"
-        || (*name == "cfg_attr"
-            && body.starts_with(&["docsrs", ",", "doc", "("])
-            && body.last() == Some(&")"))
+    if *name == "cfg" {
+        return true;
+    }
+    if *name != "cfg_attr" || !body.starts_with(&["docsrs", ",", "doc", "("]) {
+        return false;
+    }
+    let mut documentation = &body[3..];
+    group(&mut documentation, "(", ")").is_some() && documentation.is_empty()
 }
 
 fn transparent_definition(source: &str, symbol: &SyntaxSymbol, scope: &Scope) -> bool {
@@ -203,57 +238,197 @@ fn transparent_definition(source: &str, symbol: &SyntaxSymbol, scope: &Scope) ->
     consume(&mut input, &["}"]) && input.is_empty()
 }
 
-fn macro_use(source: &str, symbol: &SyntaxSymbol) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Condition {
+    Known(bool),
+    Unknown,
+}
+
+fn cfg(input: &[&str], library: bool, depth: usize) -> Option<Condition> {
+    if depth == 0 {
+        return None;
+    }
+    match input {
+        ["test"] => Some(if library {
+            Condition::Known(false)
+        } else {
+            Condition::Unknown
+        }),
+        ["true"] => Some(Condition::Known(true)),
+        ["false"] => Some(Condition::Known(false)),
+        [name] if super::crate_name_is_valid(name) => Some(Condition::Unknown),
+        [name, "=", value]
+            if super::crate_name_is_valid(name)
+                && value.starts_with('"')
+                && value.ends_with('"') =>
+        {
+            Some(Condition::Unknown)
+        }
+        ["not", "(", rest @ .., ")"] => cfg(rest, library, depth - 1).map(|value| match value {
+            Condition::Known(value) => Condition::Known(!value),
+            Condition::Unknown => Condition::Unknown,
+        }),
+        [operation @ ("all" | "any"), "(", rest @ .., ")"] => {
+            let mut rest = rest;
+            let mut result = Condition::Known(*operation == "all");
+            while !rest.is_empty() {
+                let mut split = 0;
+                let mut nested = 0_usize;
+                while split < rest.len() {
+                    match rest[split] {
+                        "(" => nested = nested.checked_add(1)?,
+                        ")" => nested = nested.checked_sub(1)?,
+                        "," if nested == 0 => break,
+                        _ => {}
+                    }
+                    if nested > depth {
+                        return None;
+                    }
+                    split += 1;
+                }
+                if nested != 0 || split == 0 {
+                    return None;
+                }
+                let value = cfg(&rest[..split], library, depth - 1)?;
+                result = if *operation == "all" {
+                    match (result, value) {
+                        (Condition::Known(false), _) | (_, Condition::Known(false)) => {
+                            Condition::Known(false)
+                        }
+                        (Condition::Known(true), Condition::Known(true)) => Condition::Known(true),
+                        _ => Condition::Unknown,
+                    }
+                } else {
+                    match (result, value) {
+                        (Condition::Known(true), _) | (_, Condition::Known(true)) => {
+                            Condition::Known(true)
+                        }
+                        (Condition::Known(false), Condition::Known(false)) => {
+                            Condition::Known(false)
+                        }
+                        _ => Condition::Unknown,
+                    }
+                };
+                rest = rest.get(split.saturating_add(1)..).unwrap_or_default();
+            }
+            Some(result)
+        }
+        _ => None,
+    }
+}
+
+fn macro_use(
+    tokens: &scope::Tokens<'_>,
+    symbol: &SyntaxSymbol,
+    library: bool,
+    depth_max: usize,
+) -> Option<bool> {
     let prefix = ByteRange {
         start: symbol.range.start,
         end: symbol.item_range.start,
     };
-    let Some(tokens) = text_range(source, prefix).and_then(tokens) else {
-        return false;
-    };
-    let mut input = tokens.as_slice();
+    let prefix = tokens.range(prefix)?;
+    let mut input = prefix.as_slice();
     let mut imported = false;
+    let mut condition = Condition::Known(true);
     while !input.is_empty() {
-        let Some(value) = attribute(&mut input) else {
-            return false;
-        };
+        let value = attribute(&mut input)?;
         if value == ["macro_use"] {
             if imported {
-                return false;
-            }
-            imported = true;
-        } else if !value.starts_with(&["doc", "("]) || value.last() != Some(&")") {
-            return false;
-        }
-    }
-    imported
-}
-
-fn invocation_modules(source: &str) -> Option<(&str, Vec<String>)> {
-    let tokens = tokens(source)?;
-    let mut input = tokens.as_slice();
-    let name = *input.first()?;
-    if !super::crate_name_is_valid(name) || !consume(&mut input, &[name, "!", "{"]) {
-        return None;
-    }
-    let mut modules = Vec::new();
-    while input.first() != Some(&"}") {
-        if consume(&mut input, &["pub"]) && input.first() == Some(&"(") {
-            let visibility = group(&mut input, "(", ")")?;
-            if ![&["crate"][..], &["self"][..], &["super"][..]].contains(&visibility) {
                 return None;
             }
-        }
-        if !consume(&mut input, &["mod"]) {
+            imported = true;
+        } else if let ["cfg", "(", predicate @ .., ")"] = value {
+            condition = match (condition, cfg(predicate, library, depth_max)?) {
+                (Condition::Known(false), _) | (_, Condition::Known(false)) => {
+                    Condition::Known(false)
+                }
+                (Condition::Known(true), Condition::Known(true)) => Condition::Known(true),
+                _ => Condition::Unknown,
+            };
+        } else if !cfg_attribute(value)
+            && (!value.starts_with(&["doc", "("]) || value.last() != Some(&")"))
+        {
             return None;
         }
-        let module = *input.first()?;
-        if !super::crate_name_is_valid(module) || !consume(&mut input, &[module, ";"]) {
-            return None;
-        }
-        modules.push(module.to_owned());
     }
-    (consume(&mut input, &["}"]) && input.is_empty()).then_some((name, modules))
+    match condition {
+        Condition::Known(false) => Some(false),
+        Condition::Known(true) => Some(imported),
+        Condition::Unknown if !imported => Some(false),
+        Condition::Unknown => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Condition, cfg};
+
+    #[test]
+    fn selected_library_test_predicate_keeps_other_configuration_unknown() {
+        assert_eq!(cfg(&["test"], false, 20), Some(Condition::Unknown));
+        assert_eq!(cfg(&["test"], true, 20), Some(Condition::Known(false)));
+        assert_eq!(
+            cfg(&["not", "(", "test", ")"], true, 20),
+            Some(Condition::Known(true))
+        );
+        assert_eq!(
+            cfg(&["feature", "=", "\"rt\""], true, 20),
+            Some(Condition::Unknown)
+        );
+        assert_eq!(
+            cfg(&["target_family", "=", "\"wasm\""], true, 20),
+            Some(Condition::Unknown)
+        );
+        assert_eq!(
+            cfg(
+                &[
+                    "all",
+                    "(",
+                    "test",
+                    ",",
+                    "target_family",
+                    "=",
+                    "\"wasm\"",
+                    ")"
+                ],
+                true,
+                20
+            ),
+            Some(Condition::Known(false))
+        );
+        assert_eq!(
+            cfg(
+                &[
+                    "any",
+                    "(",
+                    "test",
+                    ",",
+                    "target_family",
+                    "=",
+                    "\"wasm\"",
+                    ")"
+                ],
+                true,
+                20
+            ),
+            Some(Condition::Unknown)
+        );
+        assert_eq!(
+            cfg(&["all", "(", ")"], true, 20),
+            Some(Condition::Known(true))
+        );
+        assert_eq!(
+            cfg(&["any", "(", ")"], true, 20),
+            Some(Condition::Known(false))
+        );
+        assert_eq!(cfg(&["not", "(", "test", ")"], true, 1), None);
+        assert_eq!(
+            cfg(&["all", "(", "test", ",", ",", "false", ")"], true, 20),
+            None
+        );
+        assert_eq!(cfg(&["unknown", "!", "(", ")"], true, 20), None);
+    }
 }
 
 fn child_path(name: &str, directory: &str, inventory: &Inventory<'_>) -> Option<String> {
@@ -280,6 +455,7 @@ fn child_directory(path: &str) -> &str {
 enum Event<'a> {
     Symbol(&'a SyntaxSymbol),
     Invocation(&'a rift_syntax::MacroInvocation),
+    Item(ByteRange),
 }
 
 impl Event<'_> {
@@ -287,8 +463,20 @@ impl Event<'_> {
         match self {
             Self::Symbol(symbol) => symbol.item_range.start,
             Self::Invocation((range, _, _)) => range.start,
+            Self::Item(range) => range.start,
         }
     }
+}
+
+fn macro_export_attribute(file: &SelectedFile<'_>, range: ByteRange) -> bool {
+    text_range(file.source, range).is_some_and(|source| source.trim() == "#[macro_export]")
+        && file.syntax.symbols().iter().any(|symbol| {
+            symbol.kind == "macro"
+                && symbol.node_kind == Some("macro_definition")
+                && symbol.visibility.as_deref() == Some("pub")
+                && symbol.range.start <= range.start
+                && range.end <= symbol.item_range.start
+        })
 }
 
 fn events<'a>(file: &'a SelectedFile<'a>) -> Vec<Event<'a>> {
@@ -306,6 +494,21 @@ fn events<'a>(file: &'a SelectedFile<'a>) -> Vec<Event<'a>> {
             .flatten()
             .map(Event::Invocation),
     );
+    if let Some((_, Some(children))) = file.syntax.scope().and_then(|rows| rows.first()) {
+        for range in children {
+            if macro_export_attribute(file, *range) {
+                continue;
+            }
+            if events.iter().any(|event| match event {
+                Event::Symbol(symbol) => symbol.item_range == *range,
+                Event::Invocation((invocation, _, _)) => *invocation == *range,
+                Event::Item(_) => false,
+            }) {
+                continue;
+            }
+            events.push(Event::Item(*range));
+        }
+    }
     events.sort_by_key(|event| event.start());
     events
 }
@@ -314,6 +517,7 @@ struct Context<'a> {
     inventory: &'a Inventory<'a>,
     originals: &'a BTreeMap<&'a str, &'a str>,
     depth_max: usize,
+    library: bool,
 }
 
 impl Context<'_> {
@@ -327,9 +531,76 @@ impl Context<'_> {
         if visiting.len() >= self.depth_max || !visiting.insert(path.to_owned()) {
             return None;
         }
-        let result = self.file_exports(path, directory, &mut scope, visiting);
+        let result = (|| {
+            let file = self.inventory.get(path)?;
+            if self.originals.get(path).copied() != Some(file.source)
+                || !super::source_is_valid(file.syntax, file.source)
+                || file.syntax.macro_invocations().is_none()
+            {
+                return None;
+            }
+            let mut tokens = scope::Tokens::new(file)?;
+            let mut proof = scope.clone();
+            self.file_exports(path, directory, &mut proof, visiting, &tokens, false)?;
+            tokens.complete &= proof.complete;
+            self.file_exports(path, directory, &mut scope, visiting, &tokens, true)
+        })();
         visiting.remove(path);
         result.map(|()| scope)
+    }
+
+    fn tokens<'a>(
+        &self,
+        file: &'a SelectedFile<'a>,
+        directory: &str,
+        scope: &Scope,
+    ) -> Option<scope::Tokens<'a>> {
+        let mut tokens = scope::Tokens::new(file);
+        if let Some(tokens) = tokens.as_mut() {
+            let mut proof = scope.clone();
+            let mut visiting = BTreeSet::new();
+            visiting.insert(file.path.as_str().to_owned());
+            let complete = self
+                .file_exports(
+                    file.path.as_str(),
+                    directory,
+                    &mut proof,
+                    &mut visiting,
+                    tokens,
+                    false,
+                )
+                .is_some()
+                && proof.complete;
+            tokens.complete &= complete;
+        }
+        tokens
+    }
+
+    fn import_module(
+        &self,
+        symbol: &SyntaxSymbol,
+        child: Option<&str>,
+        tokens: Option<&scope::Tokens<'_>>,
+        scope: &mut Scope,
+    ) {
+        let imported =
+            tokens.and_then(|tokens| macro_use(tokens, symbol, self.library, self.depth_max));
+        if imported == Some(true) {
+            if let Some(imported) = child.and_then(|path| {
+                self.exports(
+                    path,
+                    child_directory(path),
+                    scope.clone(),
+                    &mut BTreeSet::new(),
+                )
+            }) {
+                *scope = imported;
+            } else {
+                scope.clear();
+            }
+        } else if imported.is_none() {
+            scope.clear();
+        }
     }
 
     fn file_exports(
@@ -338,32 +609,39 @@ impl Context<'_> {
         directory: &str,
         scope: &mut Scope,
         visiting: &mut BTreeSet<String>,
+        tokens: &scope::Tokens<'_>,
+        validate: bool,
     ) -> Option<()> {
         let file = self.inventory.get(path)?;
-        if self.originals.get(path).copied() != Some(file.source)
-            || !super::source_is_valid(file.syntax, file.source)
-            || file.syntax.macro_invocations().is_none()
-        {
-            return None;
-        }
         for event in events(file) {
             match event {
                 Event::Symbol(symbol) if symbol.kind == "macro" => {
                     let transparent = transparent_definition(file.source, symbol, scope);
-                    Arc::make_mut(scope).insert(symbol.name.clone(), transparent);
+                    scope.insert(symbol.name.clone(), transparent);
                 }
-                Event::Symbol(symbol) if macro_use(file.source, symbol) => {
+                Event::Symbol(symbol)
+                    if macro_use(tokens, symbol, self.library, self.depth_max)? =>
+                {
                     if !super::module_has_default_path(symbol) || symbol.body_range.is_some() {
                         return None;
                     }
                     let path = child_path(&symbol.name, directory, self.inventory)?;
                     *scope =
-                        self.exports(&path, child_directory(&path), Arc::clone(scope), visiting)?;
+                        self.exports(&path, child_directory(&path), scope.clone(), visiting)?;
                 }
-                Event::Invocation((range, _, _)) => {
-                    let (name, _) = invocation_modules(text_range(file.source, *range)?)?;
-                    if scope.get(name) != Some(&true) {
-                        return None;
+                Event::Invocation((range, _, children)) => {
+                    children.as_ref()?;
+                    if validate {
+                        tokens.item(*range, scope, self.library)?;
+                    } else {
+                        tokens.effects(*range, scope, self.library)?;
+                    }
+                }
+                Event::Item(range) => {
+                    if validate {
+                        tokens.item(range, scope, self.library)?;
+                    } else {
+                        tokens.effects(range, scope, self.library)?;
                     }
                 }
                 Event::Symbol(_) => {}
@@ -380,11 +658,13 @@ pub(super) fn children<'a>(
     originals: &'a BTreeMap<&'a str, &'a str>,
     mut scope: Scope,
     depth_max: usize,
+    library: bool,
 ) -> Vec<Child> {
     let context = Context {
         inventory,
         originals,
         depth_max,
+        library,
     };
     let ordinary = super::module_children(file.syntax, directory, inventory);
     let direct = ordinary
@@ -397,42 +677,43 @@ pub(super) fn children<'a>(
         .filter(|(_, local)| local.len() > 1)
         .map(|(path, local)| (path.clone(), local.clone(), Scope::default()))
         .collect::<Vec<_>>();
-    if file.syntax.macro_invocations().is_none() {
-        Arc::make_mut(&mut scope).clear();
+    let tokens = context.tokens(file, directory, &scope);
+    if file.syntax.macro_invocations().is_none() || tokens.is_none() {
+        scope.clear();
     }
     for event in events(file) {
         match event {
             Event::Symbol(symbol) if symbol.kind == "macro" => {
                 let transparent = transparent_definition(file.source, symbol, &scope);
-                Arc::make_mut(&mut scope).insert(symbol.name.clone(), transparent);
+                scope.insert(symbol.name.clone(), transparent);
             }
             Event::Symbol(symbol) => {
                 let name = super::source_identifier(&symbol.name);
                 let child = name.as_deref().and_then(|name| direct.get(name)).copied();
                 if let Some((path, local)) = child {
-                    children.push((path.clone(), local.clone(), Arc::clone(&scope)));
+                    children.push((path.clone(), local.clone(), scope.clone()));
                 }
-                if macro_use(file.source, symbol) {
-                    scope = child
-                        .and_then(|(path, _)| {
-                            context.exports(
-                                path,
-                                child_directory(path),
-                                Arc::clone(&scope),
-                                &mut BTreeSet::new(),
-                            )
-                        })
-                        .unwrap_or_default();
-                }
+                context.import_module(
+                    symbol,
+                    child.map(|(path, _)| path.as_str()),
+                    tokens.as_ref(),
+                    &mut scope,
+                );
             }
-            Event::Invocation((range, modules, _)) => {
+            Event::Invocation((range, modules, direct)) => {
+                if tokens
+                    .as_ref()
+                    .is_some_and(|tokens| tokens.compile_error(*range, &scope, library))
+                {
+                    continue;
+                }
                 let source = text_range(file.source, *range);
                 let name = source
                     .and_then(|source| source.split_once('!'))
                     .map(|(name, _)| name.trim())
                     .filter(|name| super::crate_name_is_valid(name));
                 if name.is_none_or(|name| scope.get(name) != Some(&true)) {
-                    Arc::make_mut(&mut scope).clear();
+                    scope.clear();
                     continue;
                 }
                 for range in modules {
@@ -444,12 +725,24 @@ pub(super) fn children<'a>(
                     if let Some(name) = name
                         && let Some(path) = child_path(name, directory, inventory)
                     {
-                        children.push((path, vec![name.to_owned()], Arc::clone(&scope)));
+                        children.push((path, vec![name.to_owned()], scope.clone()));
                     }
                 }
-                // Mixed items preserve witnessed modules. Their other effects remain unknown.
-                if source.and_then(invocation_modules).is_none() {
-                    Arc::make_mut(&mut scope).clear();
+                let complete = tokens
+                    .as_ref()
+                    .zip(direct.as_ref())
+                    .is_some_and(|(tokens, _)| tokens.item(*range, &mut scope, library).is_some());
+                if !complete {
+                    scope.clear();
+                }
+            }
+            Event::Item(range) => {
+                if tokens
+                    .as_ref()
+                    .and_then(|tokens| tokens.item(range, &mut scope, library))
+                    .is_none()
+                {
+                    scope.clear();
                 }
             }
         }

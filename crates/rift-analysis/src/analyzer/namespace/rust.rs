@@ -25,17 +25,8 @@ pub(super) fn prepare(
     if inventory.len() != selected.len() {
         return BTreeMap::new();
     }
-    let originals = input
-        .files()
-        .iter()
-        .map(|file| (file.path().as_str(), file.text()))
-        .collect::<BTreeMap<_, _>>();
-    let libraries = match input.owner() {
-        SymbolOwner::Package { .. } => library(input).into_iter().collect(),
-        SymbolOwner::Runtime { runtime, .. } if runtime == "rust" => libraries(input, &inventory),
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } => libraries(input, &inventory),
-        SymbolOwner::Runtime { .. } => Vec::new(),
-    };
+    let originals = original_sources(input);
+    let libraries = selected_libraries(input, &inventory);
     let mut assigned = BTreeMap::new();
     let mut pending = VecDeque::new();
     for (root, name) in libraries {
@@ -56,10 +47,19 @@ pub(super) fn prepare(
         if assigned.insert(root.clone(), namespace.clone()).is_some() {
             return BTreeMap::new();
         }
-        pending.push_back((root, namespace, directory, macros::Scope::default()));
+        let library = input
+            .library()
+            .is_some_and(|(_, selected)| selected.path().as_str() == root);
+        pending.push_back((
+            root,
+            namespace,
+            directory,
+            macros::Scope::default(),
+            library,
+        ));
     }
     let mut anchors = BTreeMap::new();
-    while let Some((path, namespace, directory, scope)) = pending.pop_front() {
+    while let Some((path, namespace, directory, scope, library)) = pending.pop_front() {
         let Some(file) = inventory.get(path.as_str()) else {
             continue;
         };
@@ -79,6 +79,7 @@ pub(super) fn prepare(
             &originals,
             scope,
             input.syntax().syntax_depth_max(),
+            library,
         ) {
             let mut child_namespace = namespace.clone();
             child_namespace.extend(local);
@@ -103,10 +104,36 @@ pub(super) fn prepare(
                 .or_else(|| child.strip_suffix(".rs"))
                 .unwrap_or(&child)
                 .to_owned();
-            pending.push_back((child, child_namespace, child_directory, child_scope));
+            pending.push_back((
+                child,
+                child_namespace,
+                child_directory,
+                child_scope,
+                library,
+            ));
         }
     }
     anchors
+}
+
+fn original_sources<'a>(input: &NamespaceInput<'a>) -> BTreeMap<&'a str, &'a str> {
+    input
+        .files()
+        .iter()
+        .map(|file| (file.path().as_str(), file.text()))
+        .collect()
+}
+
+fn selected_libraries(
+    input: &NamespaceInput<'_>,
+    inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
+) -> Vec<(String, String)> {
+    match input.owner() {
+        SymbolOwner::Package { .. } => library(input).into_iter().collect(),
+        SymbolOwner::Runtime { runtime, .. } if runtime == "rust" => libraries(input, inventory),
+        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } => libraries(input, inventory),
+        SymbolOwner::Runtime { .. } => Vec::new(),
+    }
 }
 
 fn source_is_valid(syntax: &SyntaxFacts, source: &str) -> bool {

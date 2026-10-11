@@ -72,6 +72,26 @@ fn selected_anchors_for_owner(
     owner: &rift_protocol::identity::SymbolOwner,
     origin: &ContributionOrigin,
 ) -> super::super::Anchors {
+    selected_anchors_for_context(
+        metadata,
+        selected,
+        qualified_name,
+        restored_paths,
+        owner,
+        origin,
+        false,
+    )
+}
+
+fn selected_anchors_for_context(
+    metadata: &[(&str, &str)],
+    selected: &[(&str, &str)],
+    qualified_name: Option<&str>,
+    restored_paths: bool,
+    owner: &rift_protocol::identity::SymbolOwner,
+    origin: &ContributionOrigin,
+    library: bool,
+) -> super::super::Anchors {
     let language = rift_syntax::ShippedLanguage::Rust.language();
     let paths = selected
         .iter()
@@ -91,18 +111,24 @@ fn selected_anchors_for_owner(
         .zip(metadata)
         .map(|(path, (_, text))| PackageSource::new(path, text))
         .collect::<Vec<_>>();
-    let limits = ExactPackageLimits::new(20, 16 * 1024 * 1024);
+    let limits = ExactPackageLimits::new(21, 16 * 1024 * 1024);
     let input = match owner {
-        rift_protocol::identity::SymbolOwner::Local
-        | rift_protocol::identity::SymbolOwner::NamedLocal { .. } => {
+        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } => {
             NamespaceInput::project(owner, &language, &files, &context, &[], limits)
                 .expect("bounded project context")
         }
-        _ => ExactPackageInput::new(owner, &language, origin, &files, limits)
-            .expect("bounded input")
-            .with_framework_context(&context, &[])
-            .expect("captured Cargo metadata")
-            .namespace_input(),
+        _ => {
+            let input = ExactPackageInput::new(owner, &language, origin, &files, limits)
+                .expect("bounded input")
+                .with_framework_context(&context, &[])
+                .expect("captured Cargo metadata");
+            let input = if library {
+                selected_library(&input, owner, &context, &files)
+            } else {
+                input
+            };
+            input.namespace_input()
+        }
     };
     let facts = files
         .iter()
@@ -166,6 +192,25 @@ fn selected_anchors_for_owner(
     let result = super::prepare(&input, &admitted);
     assert_original_sources(&input, selected, &units);
     result
+}
+
+fn selected_library<'input>(
+    input: &ExactPackageInput<'input>,
+    owner: &SymbolOwner,
+    context: &[PackageSource<'input>],
+    files: &[PackageSource<'input>],
+) -> ExactPackageInput<'input> {
+    let manifest = *context
+        .iter()
+        .find(|file| file.path().as_str() == "Cargo.toml")
+        .expect("original selected manifest");
+    let root = *files
+        .iter()
+        .find(|file| file.path().as_str() == "src/lib.rs")
+        .expect("original selected library root");
+    (*input)
+        .with_library(owner, manifest, root)
+        .expect("explicit selected library acquisition")
 }
 
 fn assert_original_sources(
@@ -1179,5 +1224,545 @@ fn selected_library_context_refuses_admitted_manifest_with_wrong_release_or_targ
             "manifest {text}"
         );
         assert!(input.namespace_input().library().is_none());
+    }
+}
+
+#[test]
+fn complete_mixed_scope_keeps_selected_library_modules_after_literal_items() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let source = "#[macro_use] mod macros; #[cfg(test)] #[macro_use] mod tests; compile_error!(\"unsupported target\"); cfg_rt! { use other::{Debug as Compass, Copy as Pointer}; #[derive(Debug, Copy, Clone, PartialEq)] enum Timer { Ready } impl Timer { fn poll<'a>(&self) { let _ = r#\"unknown! {}\"#; let _ = '\\''; } } } cfg_rt! { pub mod runtime; }";
+    let selected = [
+        ("src/lib.rs", source),
+        ("src/macros.rs", definition),
+        ("src/runtime.rs", "pub struct Runtime;"),
+    ];
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual package owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("owner origin");
+    let found = selected_anchors_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &selected,
+        None,
+        false,
+        &owner,
+        &origin,
+        true,
+    );
+    assert!(found["src/runtime.rs"].contains_key("Runtime"));
+    let unknown = selected_anchors_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &selected,
+        None,
+        false,
+        &owner,
+        &origin,
+        false,
+    );
+    assert!(!unknown.contains_key("src/runtime.rs"));
+}
+
+#[test]
+fn complete_mixed_scope_refuses_later_alias_glob_nested_and_unknown_import_effects() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual origin");
+    for (before, body, later) in [
+        (
+            "",
+            "#[derive(Debug)] struct Timer;",
+            "use other::Macro as Debug;",
+        ),
+        ("", "#[derive(Debug)] struct Timer;", "use other::*;"),
+        ("", "#[derive(Debug)] struct Timer;", "unknown! {};"),
+        (
+            "#[macro_use] mod unknown; macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }",
+            "#[derive(Debug)] struct Timer;",
+            "",
+        ),
+        ("", "impl Timer { fn poll(&self) { unknown! {}; } }", ""),
+        (
+            "",
+            "impl Timer { fn poll(&self) { #[macro_export] macro_rules! cfg_rt { () => {}; } } }",
+            "",
+        ),
+        ("", "use other::Macro as cfg_rt;", ""),
+    ] {
+        let root = format!(
+            "#[macro_use] mod macros; {before} cfg_rt! {{ {body} }} cfg_rt! {{ pub mod runtime; }} {later}"
+        );
+        let selected = [
+            ("src/lib.rs", root.as_str()),
+            ("src/macros.rs", definition),
+            ("src/runtime.rs", "pub struct Runtime;"),
+        ];
+        let found = selected_anchors_for_context(
+            &[("Cargo.toml", MANIFEST)],
+            &selected,
+            None,
+            false,
+            &owner,
+            &origin,
+            true,
+        );
+        assert!(!found.contains_key("src/runtime.rs"), "{root}");
+    }
+}
+
+#[test]
+#[ignore = "requires the immutable cold-run source artifact and verified Cargo manifest"]
+fn cold_tokio_original_sources_keep_required_library_anchors() {
+    let artifact_path = std::env::var("RIFT_COLD_TOKIO_ARTIFACT").expect("original artifact");
+    let manifest_path = std::env::var("RIFT_COLD_TOKIO_MANIFEST").expect("verified manifest");
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifact_path).expect("retained original artifact"))
+            .expect("artifact data");
+    let manifest =
+        std::fs::read_to_string(manifest_path).expect("verified original Cargo metadata");
+    let units = artifact["units"].as_array().expect("retained units");
+    let selected = units
+        .iter()
+        .filter_map(|unit| {
+            let path = unit["path"].as_str()?;
+            (path.starts_with("src/macros/")
+                || [
+                    "src/lib.rs",
+                    "src/runtime/mod.rs",
+                    "src/runtime/runtime.rs",
+                    "src/runtime/builder.rs",
+                    "src/task/mod.rs",
+                    "src/task/spawn.rs",
+                ]
+                .contains(&path))
+            .then(|| {
+                (
+                    path,
+                    unit["source"].as_str().expect("original complete source"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert!(selected.len() < 20, "existing fixture input bound");
+    let owner = serde_json::from_value(artifact["owner"].clone()).expect("actual captured owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "tokio".to_owned(),
+                version: "1.53.2".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual captured origin");
+    let found = selected_anchors_for_context(
+        &[("Cargo.toml", manifest.as_str())],
+        &selected,
+        None,
+        false,
+        &owner,
+        &origin,
+        true,
+    );
+    eprintln!(
+        "actual retained input paths: {:?}",
+        selected.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "admitted namespace paths: {:?}",
+        found.keys().collect::<Vec<_>>()
+    );
+    for (path, name) in [
+        ("src/runtime/runtime.rs", "Runtime"),
+        ("src/runtime/builder.rs", "Builder"),
+        ("src/task/spawn.rs", "spawn"),
+    ] {
+        assert!(
+            found
+                .get(path)
+                .is_some_and(|symbols| symbols.contains_key(name)),
+            "required original anchor missing: {path}::{name}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the immutable cold-run source artifact and verified Cargo manifest"]
+fn cold_serde_original_sources_keep_required_library_anchors() {
+    let artifact_path = std::env::var("RIFT_COLD_SERDE_ARTIFACT").expect("original artifact");
+    let manifest_path = std::env::var("RIFT_COLD_SERDE_MANIFEST").expect("verified manifest");
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifact_path).expect("retained original artifact"))
+            .expect("artifact data");
+    let manifest =
+        std::fs::read_to_string(manifest_path).expect("verified original Cargo metadata");
+    let units = artifact["units"].as_array().expect("retained units");
+    let selected = units
+        .iter()
+        .filter_map(|unit| {
+            let path = unit["path"].as_str()?;
+            [
+                "src/lib.rs",
+                "src/core/lib.rs",
+                "src/core/crate_root.rs",
+                "src/core/macros.rs",
+                "src/core/de/mod.rs",
+                "src/core/de/ignored_any.rs",
+                "src/core/de/impls.rs",
+                "src/core/de/value.rs",
+                "src/core/ser/mod.rs",
+                "src/core/ser/fmt.rs",
+                "src/core/ser/impls.rs",
+                "src/core/ser/impossible.rs",
+                "src/core/format.rs",
+                "src/core/std_error.rs",
+                "src/core/private/mod.rs",
+                "src/core/private/doc.rs",
+                "src/core/private/seed.rs",
+                "src/private/mod.rs",
+                "src/integer128.rs",
+            ]
+            .contains(&path)
+            .then(|| {
+                (
+                    path,
+                    unit["source"].as_str().expect("original complete source"),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 19, "original selected source count");
+    let owner = serde_json::from_value(artifact["owner"].clone()).expect("actual captured owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "serde".to_owned(),
+                version: "1.0.228".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual captured origin");
+    let found = selected_anchors_for_context(
+        &[("Cargo.toml", manifest.as_str())],
+        &selected,
+        None,
+        false,
+        &owner,
+        &origin,
+        true,
+    );
+    eprintln!(
+        "actual retained input paths: {:?}",
+        selected.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "admitted namespace paths: {:?}",
+        found.keys().collect::<Vec<_>>()
+    );
+    for (path, name) in [
+        ("src/core/de/mod.rs", "Deserialize"),
+        ("src/core/ser/mod.rs", "Serialize"),
+    ] {
+        assert!(
+            found
+                .get(path)
+                .is_some_and(|symbols| symbols.contains_key(name)),
+            "required original anchor missing: {path}::{name}"
+        );
+    }
+}
+
+#[test]
+fn conditional_documentation_keeps_complete_selected_library_scope() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let source = "#[macro_use] mod macros; #[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))] pub mod task; compile_error!(\"unsupported target\"); cfg_rt! { pub mod runtime; }";
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual package owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("owner origin");
+    let found = selected_anchors_for_context(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", source),
+            ("src/macros.rs", definition),
+            ("src/runtime.rs", "pub struct Runtime;"),
+        ],
+        None,
+        false,
+        &owner,
+        &origin,
+        true,
+    );
+    let identity = SymbolIdentity::parse(found["src/runtime.rs"]["Runtime"].as_str())
+        .expect("captured module identity");
+    assert_eq!(identity.owner(), &owner);
+    assert_eq!(
+        identity.qualified_path(),
+        ["crate_root", "runtime", "Runtime"]
+    );
+}
+
+#[test]
+fn conditional_documentation_refuses_mixed_unknown_path_and_macro_import_effects() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual package owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("owner origin");
+    for attribute in [
+        "cfg_attr(docsrs, doc(hidden), unknown())",
+        "cfg_attr(docsrs, doc(hidden), path = \"other.rs\")",
+        "cfg_attr(docsrs, doc(hidden), macro_use)",
+        "cfg_attr(docsrs, doc(hidden), macro_use())",
+        "cfg_attr(docsrs, unknown(), doc(hidden))",
+    ] {
+        let source = format!(
+            "#[macro_use] mod macros; #[{attribute}] pub mod task; compile_error!(\"unsupported target\"); cfg_rt! {{ pub mod runtime; }}"
+        );
+        let found = selected_anchors_for_context(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", &source),
+                ("src/macros.rs", definition),
+                ("src/runtime.rs", "pub struct Runtime;"),
+            ],
+            None,
+            false,
+            &owner,
+            &origin,
+            true,
+        );
+        assert!(!found.contains_key("src/runtime.rs"), "{attribute}");
+    }
+}
+
+#[test]
+#[ignore = "requires the immutable cold-run source artifact and verified Cargo manifest"]
+fn cold_serde_core_original_sources_keep_required_defining_anchors() {
+    let artifact_path = std::env::var("RIFT_COLD_SERDE_CORE_ARTIFACT").expect("original artifact");
+    let manifest_path = std::env::var("RIFT_COLD_SERDE_CORE_MANIFEST").expect("verified manifest");
+    let artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifact_path).expect("retained original artifact"))
+            .expect("artifact data");
+    let manifest =
+        std::fs::read_to_string(manifest_path).expect("verified original Cargo metadata");
+    let units = artifact["units"].as_array().expect("retained units");
+    let selected = units
+        .iter()
+        .filter(|unit| unit["language"].as_str() == Some("rust"))
+        .map(|unit| {
+            assert_eq!(unit["source_complete"].as_bool(), Some(true));
+            (
+                unit["path"].as_str().expect("original Rust path"),
+                unit["source"]
+                    .as_str()
+                    .expect("original complete Rust source"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 20, "complete original Rust source count");
+    let owner = serde_json::from_value(artifact["owner"].clone()).expect("actual captured owner");
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "serde_core".to_owned(),
+                version: "1.0.228".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual captured origin");
+    let found = selected_anchors_for_context(
+        &[("Cargo.toml", manifest.as_str())],
+        &selected,
+        None,
+        false,
+        &owner,
+        &origin,
+        true,
+    );
+    eprintln!(
+        "actual retained input paths: {:?}",
+        selected.iter().map(|(path, _)| path).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "admitted namespace paths: {:?}",
+        found.keys().collect::<Vec<_>>()
+    );
+    for (path, name) in [
+        ("src/de/mod.rs", "Deserialize"),
+        ("src/ser/mod.rs", "Serialize"),
+    ] {
+        assert!(
+            found
+                .get(path)
+                .is_some_and(|symbols| symbols.contains_key(name)),
+            "required original anchor missing: {path}::{name}"
+        );
+        let identity =
+            SymbolIdentity::parse(found[path][name].as_str()).expect("original defining identity");
+        assert_eq!(identity.owner(), &owner);
+        let module = if name == "Serialize" { "ser" } else { "de" };
+        assert_eq!(identity.qualified_path(), ["serde_core", module, name]);
+    }
+}
+
+#[test]
+fn documented_module_prefix_keeps_complete_selected_library_scope() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    for newline in ["\n", "\r\n"] {
+        let source = format!(
+            "#[macro_use] mod macros;{newline}/// Original module documentation.{newline}/// ```{newline}/// use crate_root::runtime::Runtime;{newline}/// ```{newline}pub mod stream {{}}{newline}cfg_rt! {{ pub mod runtime; }}"
+        );
+        let owner = SymbolIdentity::parse(
+            "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+        )
+        .expect("actual package owner")
+        .owner()
+        .clone();
+        let origin = ContributionOrigin::new(
+            Some(SourceLocation::Dependency {
+                package: PackageIdentity {
+                    manager: "cargo".to_owned(),
+                    registry: "crates.io".to_owned(),
+                    name: "crate-root".to_owned(),
+                    version: "1.0.0".to_owned(),
+                },
+            }),
+            SourceKind::Authored,
+        )
+        .expect("owner origin");
+        let found = selected_anchors_for_context(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", &source),
+                ("src/macros.rs", definition),
+                ("src/runtime.rs", "pub struct Runtime;"),
+            ],
+            None,
+            false,
+            &owner,
+            &origin,
+            true,
+        );
+        let identity = SymbolIdentity::parse(found["src/runtime.rs"]["Runtime"].as_str())
+            .expect("captured module identity");
+        assert_eq!(identity.owner(), &owner);
+        assert_eq!(
+            identity.qualified_path(),
+            ["crate_root", "runtime", "Runtime"]
+        );
+    }
+}
+
+#[test]
+fn documented_module_prefix_refuses_unknown_path_and_macro_import_effects() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("actual package owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("owner origin");
+    for attribute in ["unknown()", "path = \"other.rs\"", "macro_use()"] {
+        let source = format!(
+            "#[macro_use] mod macros; /// Original module documentation.\n#[{attribute}] pub mod stream {{}} compile_error!(\"unsupported target\"); cfg_rt! {{ pub mod runtime; }}"
+        );
+        let found = selected_anchors_for_context(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", &source),
+                ("src/macros.rs", definition),
+                ("src/runtime.rs", "pub struct Runtime;"),
+            ],
+            None,
+            false,
+            &owner,
+            &origin,
+            true,
+        );
+        assert!(!found.contains_key("src/runtime.rs"), "{attribute}");
     }
 }
