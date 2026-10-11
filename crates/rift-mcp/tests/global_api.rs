@@ -333,9 +333,7 @@ async fn global_handler(
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        let mut page = symbols(options.symbol, &body);
-        bound_case_page(&mut page, options.symbol, limit);
-        return json_response(&page);
+        return json_response(&symbols(options.symbol, &body));
     }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
@@ -499,10 +497,10 @@ fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
     json!({"manager": manager, "registry": registry, "name": name, "version": version})
 }
 
-pub(crate) fn named_identity(named: &NamedPosition) -> String {
-    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+fn named_owner(named: &NamedPosition) -> rift_protocol::identity::SymbolOwner {
+    use rift_protocol::identity::SymbolOwner;
     let (manager, name, version) = named.package;
-    let owner = if manager == "stdlib" {
+    if manager == "stdlib" {
         SymbolOwner::Runtime {
             runtime: name.to_owned(),
             version: version.to_owned(),
@@ -514,7 +512,18 @@ pub(crate) fn named_identity(named: &NamedPosition) -> String {
             name: name.to_owned(),
             version: version.to_owned(),
         }
-    };
+    }
+}
+
+pub(crate) fn named_unit(named: &NamedPosition) -> String {
+    rift_core::SourceUnitId::for_owner(named_owner(named), named.path)
+        .expect("fixture released owner and original source path")
+        .to_string()
+}
+
+pub(crate) fn named_identity(named: &NamedPosition) -> String {
+    use rift_protocol::identity::SymbolIdentity;
+    let owner = named_owner(named);
     let mut logical = named
         .path
         .trim_end_matches(".py")
@@ -542,21 +551,22 @@ fn declarations(request: &Value) -> Value {
         .into_iter()
         .flatten()
         .map(|position| {
-            let package = &position["package"];
             let named = NAMED_POSITIONS.iter().find(|named| {
-                package == &package_value(named.package)
-                    && position["path"] == named.path
+                position["unit"] == named_unit(named)
                     && named.line.is_none_or(|line| position["line"] == line)
             });
+            let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
             match named {
                 Some(named) => {
                     json!({
+                        "outcome": "found",
                         "position": position,
-                        "declaration": named_identity(named),
-                        "kind": named.kind
+                        "id": named_identity(named),
+                        "kind": named.kind,
+                        "view": view
                     })
                 }
-                None => json!({"position": position}),
+                None => json!({"outcome": "missing", "position": position, "view": view}),
             }
         })
         .collect();
@@ -580,11 +590,11 @@ fn page(items: &[Value], warnings: &Value) -> Value {
     })
 }
 
-/// The symbol page for `request`: each collected declaration its `name` matches, at the
-/// class that match reaches, with a `source_truncated` page warning.
+/// The exact result for the canonical object named by `request`, retaining its original
+/// source and the collection's captured view.
 fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
     let id = request["id"].as_str().unwrap_or_default();
-    let declaration = DECLARATIONS
+    let declaration = fixture_declarations(fixture)
         .iter()
         .copied()
         .find(|name| collected_identity(fixture, name) == id);
@@ -746,15 +756,20 @@ fn declaration_range(source: &str, declaration: &str) -> std::ops::Range<usize> 
     start..start + format!("pub fn {declaration}() {{}}").len()
 }
 
+/// Original declarations carried by the selected collection.
+fn fixture_declarations(fixture: SymbolFixture) -> &'static [&'static str] {
+    match fixture {
+        SymbolFixture::CasePairs => &CASE_DECLARATIONS,
+        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => &DECLARATIONS,
+    }
+}
+
 /// Collected declarations ordered by their best original or normalized identifier match.
 fn matched_declarations(
     fixture: SymbolFixture,
     candidates: &[String],
 ) -> impl Iterator<Item = (&'static str, IdentifierMatchClass)> {
-    let declarations = match fixture {
-        SymbolFixture::CasePairs => CASE_DECLARATIONS.as_slice(),
-        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => DECLARATIONS.as_slice(),
-    };
+    let declarations = fixture_declarations(fixture);
     let mut matched: Vec<_> = declarations
         .iter()
         .filter_map(|declaration| {
@@ -817,9 +832,7 @@ pub(crate) fn collected_identity(fixture: SymbolFixture, declaration: &str) -> S
     .wire_identity()
 }
 
-/// One collected declaration as a page item, located in [`COLLECTED_SOURCE`], before
-/// its match class. Its symbol identity is the one package analysis mints over the unit,
-/// `rift://symbol/rust/cargo/demo@1.0.0/<path>/<qualified name>`.
+/// One original declaration with its canonical package identity and physical source unit.
 fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -> Value {
     let source = match fixture {
         SymbolFixture::CasePairs => CASE_SOURCE,

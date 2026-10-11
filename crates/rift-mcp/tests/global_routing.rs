@@ -78,11 +78,11 @@ async fn call_tool(
         .ok_or_else(|| format!("{name} must return structured content").into())
 }
 
-async fn get_symbol(
+async fn search_symbols(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     args: Value,
 ) -> TestResult<Value> {
-    call_tool(client, "get_symbol", args).await
+    call_tool(client, "search", args).await
 }
 
 /// The configured package list naming the collected `demo` release. The fixture tables
@@ -130,7 +130,11 @@ async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> Test
         Some(configuration),
     )
     .await?;
-    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"global"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
+    )
+    .await?;
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("warnings are an array")?;
@@ -146,7 +150,7 @@ async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> Test
     let rendered = serde_json::to_string(warning)?;
     assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     assert!(!rendered.contains("local_beacon"));
-    assert_eq!(answer["hits"], json!([]));
+    assert_eq!(answer["results"], json!([]));
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -183,7 +187,11 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     )
     .await?;
     let started = tokio::time::Instant::now();
-    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"global"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
+    )
+    .await?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < RESOLUTION_DELAY,
@@ -206,8 +214,7 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
 /// deadline, however slow the machine running the test.
 const READ_DELAY: Duration = Duration::from_secs(10);
 
-/// A package read the request deadline cuts short discards the remote lane: `get_symbol`
-/// and `search` each answer the project hits alone, with the timeout warning, well before
+/// A package read the request deadline cuts short discards the remote lane: symbol and full-text `search` each answer the project hits alone, with the timeout warning, well before
 /// the held page would have arrived.
 #[tokio::test]
 async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
@@ -223,9 +230,9 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let (directory, client, server_task) = workspace.served;
     let reads = [
         (
-            "get_symbol",
-            "hits",
-            json!({"name": "beacon", "scope": "all"}),
+            "search",
+            "results",
+            json!({"query": "beacon", "target": "symbol", "scope": "all"}),
         ),
         (
             "search",
@@ -471,8 +478,12 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"all"})).await?;
-    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"helper_beacon","scope":"all"}),
+    )
+    .await?;
+    let hits = answer["results"].as_array().ok_or("hits are an array")?;
     assert_eq!(
         hits.iter()
             .map(|hit| hit["unit"].clone())
@@ -595,9 +606,13 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             Some(configuration),
         )
         .await?;
-        let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+        let answer = search_symbols(
+            &client,
+            json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
+        )
+        .await?;
         assert_eq!(
-            answer["hits"]
+            answer["results"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -734,7 +749,7 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
         assert_eq!(results.len(), limit, "{answer:#}");
         for (hit, name) in results.iter().zip(["helper_beacon", "beacon"]) {
             assert_eq!(hit["hit"]["symbol"]["name"], name, "{answer:#}");
-            let identity = rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/lib.rs", name);
+            let identity = global_api::collected_identity(SymbolFixture::Valid, name);
             assert_eq!(hit["hit"]["symbol"]["id"], identity, "{answer:#}");
             assert_eq!(hit["source"], format!("pub fn {name}() {{}}"), "{answer:#}");
             assert!(hit["score"].is_number(), "{answer:#}");
@@ -1074,7 +1089,7 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
         Some(configuration),
     )
     .await?;
-    let _ = get_symbol(&client, json!({"name":"local_beacon"})).await?;
+    let _ = search_symbols(&client, json!({"target":"symbol", "query":"local_beacon"})).await?;
     let _ = call_tool(
         &client,
         "search",
@@ -1092,7 +1107,7 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
 }
 
 /// A remote page that fails validation discards the remote lane: `beacon` is declared in
-/// the project and in the collected package, and the `get_symbol` and `search` answers
+/// the project and in the collected package, and symbol and full-text `search` answers
 /// carry the project hits alone, with the typed warning naming the failure and no package
 /// counts.
 #[tokio::test]
@@ -1105,7 +1120,11 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"beacon","scope":"all"}),
+    )
+    .await?;
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
@@ -1116,8 +1135,11 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
         warning,
         &json!({"code": "global_response_invalid", "failure_class": "invalid_response"})
     );
-    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
-    let names: Vec<&Value> = hits.iter().map(|hit| &hit["symbol"]["name"]).collect();
+    let hits = answer["results"].as_array().ok_or("hits are an array")?;
+    let names: Vec<&Value> = hits
+        .iter()
+        .map(|hit| &hit["hit"]["symbol"]["name"])
+        .collect();
     assert_eq!(
         names,
         [&json!("beacon"), &json!("local_beacon")],
@@ -1185,7 +1207,11 @@ async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult 
             .collect()
     };
 
-    let first = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
+    let first = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"beacon","scope":"all"}),
+    )
+    .await?;
     assert_eq!(
         global_warnings(&first),
         std::slice::from_ref(&expected),
@@ -1241,7 +1267,11 @@ async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> T
         Some(configuration),
     )
     .await?;
-    let answer = get_symbol(&client, json!({"name": "local_beacon", "scope": "all"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query": "local_beacon", "scope": "all"}),
+    )
+    .await?;
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
@@ -1252,10 +1282,10 @@ async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> T
         warning,
         &json!({"code": "global_api_unavailable", "failure_class": "non_success_response"})
     );
-    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let hits = answer["results"].as_array().ok_or("hits are an array")?;
     let located: Vec<(&Value, &Value)> = hits
         .iter()
-        .map(|hit| (&hit["symbol"]["name"], &hit["path"]))
+        .map(|hit| (&hit["hit"]["symbol"]["name"], &hit["path"]))
         .collect();
     assert_eq!(
         located,
@@ -1352,9 +1382,16 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     )
     .await?;
 
-    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"all"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"local_beacon","scope":"all"}),
+    )
+    .await?;
 
-    assert_eq!(answer["hits"][0]["symbol"]["name"], "local_beacon");
+    assert_eq!(
+        answer["results"][0]["hit"]["symbol"]["name"],
+        "local_beacon"
+    );
     assert_unserved_dependency_warnings(&answer)?;
     drop(directory);
     client.cancel().await?;
@@ -1538,23 +1575,28 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     );
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let pinned = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    let pinned = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
+    )
+    .await?;
     assert_eq!(
         substituted_versions(&pinned),
         [&json!("0.9.0")],
         "{pinned:#}"
     );
 
-    let replaced = get_symbol(
+    let replaced = search_symbols(
         &client,
         json!({
-            "name": "helper_beacon",
+            "target": "symbol",
+            "query": "helper_beacon",
             "scope": "global",
             "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
     )
     .await?;
-    let units: Vec<&Value> = replaced["hits"]
+    let units: Vec<&Value> = replaced["results"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1588,7 +1630,11 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         "the entries the request names nothing about stand: {resolutions:#?}"
     );
 
-    let again = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    let again = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
+    )
+    .await?;
     assert_eq!(
         substituted_versions(&again),
         [&json!("0.9.0")],
@@ -1672,6 +1718,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
+    let id = workspace_client::captured_seed(&client, "beacon", "src/lib.rs").await?;
     let refused = [
         (
             "search",
@@ -1695,7 +1742,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
         (
             "get_symbol",
-            json!({"name": "beacon", "scope": "all", "limit": 0}),
+            json!({"id": id, "declaration_limit": 0}),
             "limit",
         ),
     ];
@@ -2055,12 +2102,6 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
             "results",
             "documentation_search",
         ),
-        (
-            "get_symbol",
-            json!({"name": "beacon", "scope": "all", "include": ["documentation"]}),
-            "hits",
-            "symbol_documentation",
-        ),
     ];
     for (tool, request, hits, feature) in reads {
         let answer = call_tool(&client, tool, request.clone()).await?;
@@ -2094,6 +2135,16 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
             "{request}: {answer:#}"
         );
     }
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let refused = failed_call(
+        client
+            .call_tool(tool_request(
+                "get_symbol",
+                &json!({"id": id, "include": ["documentation"]}),
+            ))
+            .await,
+    )?;
+    assert!(!refused.message.is_empty(), "{}", refused.text);
     let reads_asked: Vec<String> = fixture
         .requests()
         .await
@@ -2346,14 +2397,13 @@ async fn assert_original_identifier(
         .as_str()
         .ok_or("symbol carries identity")?;
     assert!(id.ends_with(&format!("/{name}")), "{id}");
-    let args = json!({"name": name, "scope": scope, "limit": 1, "include": ["source"]});
-    let answer = get_symbol(client, args).await?;
+    let args = json!({"id": id, "include": ["source"]});
+    let answer = call_tool(client, "get_symbol", args).await?;
+    assert_eq!(answer["outcome"], "found", "{scope}: {answer:#}");
+    assert_eq!(answer["symbol"]["id"], id, "{scope}: {answer:#}");
+    assert_eq!(answer["symbol"]["name"], name, "{scope}: {answer:#}");
     assert_eq!(
-        answer["hits"][0]["symbol"]["name"], name,
-        "{scope}: {answer:#}"
-    );
-    assert_eq!(
-        answer["hits"][0]["source"], expected_source,
+        answer["declarations"][0]["source"], expected_source,
         "{scope}: {answer:#}"
     );
     Ok(())

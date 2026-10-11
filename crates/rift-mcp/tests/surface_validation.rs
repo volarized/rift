@@ -64,8 +64,8 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
-/// Proves one tool result carries no non-project source-unit
-/// resolver, that every `search` hit names exactly one location, and that a read result
+/// Proves one tool result carries source-unit resolvers the request reaches,
+/// that every `search` hit names exactly one location, and that a read result
 /// warns only what it is entitled to.
 ///
 /// `get_symbol` and `nodes` carry empty `warnings`: the live server resolves one published
@@ -81,14 +81,16 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
 /// flight while it runs, or a pool busy past that bound, fails it rather than becoming a
 /// warning every caller learned to ignore.
 ///
-/// A `get_symbol` or `search` request whose `scope` reaches packages carries the package
+/// A `get_symbol` request with a released owner, or a `search` request whose `scope`
+/// reaches packages, carries the package
 /// warnings and no other: the fixture's path dependency `helper` answers
 /// `package_unavailable`, the standard library entry the fixture global API cannot
 /// resolve answers `package_requirement_absent`, and the global API's own page warnings
 /// arrive as `global_page_warning`.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
-    let reaches_dependencies = matches!(request["scope"].as_str(), Some("global" | "all"));
+    let reaches_dependencies = request_reaches_dependencies(name, request)
+        .expect("a validated exact request carries a canonical symbol identity");
     // Schema validation above checks the separate revision and documentation digest forms.
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
     if reaches_dependencies {
@@ -178,6 +180,62 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     }
 }
 
+/// Exact retrieval reaches the released owner its canonical identity names.
+fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
+    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+    if name != "get_symbol" {
+        return Some(matches!(request["scope"].as_str(), Some("global" | "all")));
+    }
+    let identity = SymbolIdentity::parse(request["id"].as_str()?).ok()?;
+    Some(matches!(
+        identity.owner(),
+        SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+    ))
+}
+
+#[test]
+fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity() -> TestResult {
+    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+    let package = global_api::collected_identity(global_api::SymbolFixture::Valid, "beacon");
+    let runtime = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
+    let local = SymbolIdentity::new(
+        SymbolOwner::Local,
+        rift_protocol::read::Language::from_identity_segment("rust")?,
+        vec!["beacon".to_owned()],
+    )?
+    .wire_identity();
+    for (identity, reaches_dependencies) in [(package, true), (runtime, true), (local, false)] {
+        assert_eq!(
+            request_reaches_dependencies("get_symbol", &json!({"id": identity})),
+            Some(reaches_dependencies)
+        );
+    }
+    let package_source = json!({"unit": global_api::COLLECTED_UNIT});
+    assert_source_unit_ids_use_served_resolvers(&package_source, "released source", true);
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_source_unit_ids_use_served_resolvers(&package_source, "project source", false);
+        })
+        .is_err()
+    );
+    for request in [json!({"id": "beacon"}), json!({})] {
+        assert_eq!(request_reaches_dependencies("get_symbol", &request), None);
+        assert!(
+            std::panic::catch_unwind(|| assert_wire_hygiene("get_symbol", &request, &json!({})))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        request_reaches_dependencies("search", &json!({"scope": "global"})),
+        Some(true)
+    );
+    assert_eq!(
+        request_reaches_dependencies("nodes", &json!({})),
+        Some(false)
+    );
+    Ok(())
+}
+
 /// A search hit in a file is addressed by exactly one of `path` and `unit`, and a file hit
 /// carries `unit` only for a package file, which a package scope alone reaches. A commit
 /// hit carries neither.
@@ -226,8 +284,8 @@ fn assert_dependency_warnings_only(structured: &Value) {
 }
 
 /// Walks `value`, proving every `rift://source/` identity uses a resolver the request can
-/// reach: the project resolver always, and the Cargo resolver when the request's `scope`
-/// reaches the packages the global API serves.
+/// reach: the project resolver always, and the Cargo resolver when the exact owner or
+/// search scope reaches the packages the global API serves.
 fn assert_source_unit_ids_use_served_resolvers(
     value: &Value,
     context: &str,
@@ -927,14 +985,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
                 "page walk for {name} exceeded {FOLLOWED_PAGES_MAX} pages: \
                  the fixture is too large or the page count never converges"
             );
-            if name == "get_symbol" {
-                assert!(
-                    !input_validator.is_valid(&request),
-                    "removed exact selection fields refuse in schema"
-                );
-            } else {
-                assert_validates(input_validator, &request, &format!("{name} request"));
-            }
+            assert_validates(input_validator, &request, &format!("{name} request"));
             let result = call_tool_retrying_acceptance(
                 &client,
                 CallToolRequestParams::new(name).with_arguments(arguments(&request)?),
@@ -1304,11 +1355,26 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
             "{request}: {}",
             failure.text
         );
-        assert!(
-            failure.message.contains("field packages"),
-            "the refusal names the field: {request}: {}",
-            failure.message
-        );
+        if name == "get_symbol" {
+            assert!(
+                failure.message.contains("tool get_symbol")
+                    && failure.message.contains("accepted declaration_cursor")
+                    && !failure.message.contains("accepted packages"),
+                "the schema refusal lists exact retrieval fields: {request}: {}",
+                failure.message
+            );
+        } else {
+            let field = if request.get("rev").is_some() {
+                "field scope"
+            } else {
+                "field packages"
+            };
+            assert!(
+                failure.message.contains(field),
+                "the refusal names the field: {request}: {}",
+                failure.message
+            );
+        }
     }
 
     client.cancel().await?;

@@ -35,8 +35,8 @@ mod workspace_client;
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, failed_call, search_after_population, served_workspace,
-    tool_request,
+    TestResult, call_retrying_acceptance, captured_seed, failed_call, search_after_population,
+    served_workspace, tool_request,
 };
 
 /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`:
@@ -45,13 +45,21 @@ use workspace_client::{
 /// root --calls--> branch_a --calls--> leaf
 /// root --calls--> branch_b --calls--> leaf
 /// ```
-const CALL_GRAPH_FILES: &[(&str, &str)] = &[(
-    "graph.py",
-    "def leaf() -> int:\n    return 1\n\n\
+const GRAPH_METADATA: &str = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['graph']\n";
+const OUTGOING_METADATA: &str = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['graph','extra']\n";
+const RUST_LIBRARY: &str =
+    "[package]\nname='walk_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n";
+
+const CALL_GRAPH_FILES: &[(&str, &str)] = &[
+    ("pyproject.toml", GRAPH_METADATA),
+    (
+        "graph.py",
+        "def leaf() -> int:\n    return 1\n\n\
      def branch_a() -> int:\n    return leaf()\n\n\
      def branch_b() -> int:\n    return leaf()\n\n\
      def root() -> int:\n    return branch_a() + branch_b()\n",
-)];
+    ),
+];
 
 /// The engine that resolves this workspace's references, embedded in the binary.
 const ENGINE: &str = "\
@@ -59,9 +67,10 @@ const ENGINE: &str = "\
 retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 
 /// A workspace with no configured engine, so no lane resolves a reference in it.
-const ENGINELESS_FILES: &[(&str, &str)] = &[("lib.rs", "pub fn beacon() {}\n")];
-
-const LEAF: &str = "rift://symbol/python/graph.py/leaf";
+const ENGINELESS_FILES: &[(&str, &str)] = &[
+    ("Cargo.toml", RUST_LIBRARY),
+    ("lib.rs", "pub fn beacon() {}\n"),
+];
 
 #[tokio::test]
 async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> TestResult {
@@ -70,7 +79,10 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
 
     let structured = call_retrying_acceptance(
         &client,
-        tool_request("search", &json!({ "traversal": { "seed": LEAF } })),
+        tool_request(
+            "search",
+            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? } }),
+        ),
     )
     .await?;
 
@@ -110,7 +122,7 @@ async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> Te
             "search",
             &json!({
                 "traversal": {
-                    "seed": LEAF,
+                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "direction": "incoming",
                     "depth": 2
                 }
@@ -151,9 +163,9 @@ async fn search_traversal_to_keeps_only_the_path_query_target() -> TestResult {
             "search",
             &json!({
                 "traversal": {
-                    "seed": LEAF,
+                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "depth": 2,
-                    "to": "rift://symbol/python/graph.py/root"
+                    "to": captured_seed(&client, "root", "graph.py").await?
                 }
             }),
         ),
@@ -188,7 +200,7 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
             &json!({
                 "query": "branch_a",
                 "target": "symbol",
-                "traversal": { "seed": LEAF }
+                "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? }
             }),
         ),
     )
@@ -227,7 +239,7 @@ async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning()
             "search",
             &json!({
                 "traversal": {
-                    "seed": LEAF,
+                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "facets": ["implements", "references"]
                 }
             }),
@@ -260,7 +272,7 @@ async fn search_traversal_over_only_unproduced_facets_refuses() -> TestResult {
 
     let code = refusal_code(
         &client,
-        &json!({"traversal": {"seed": LEAF, "facets": ["implements"]}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "leaf", "graph.py").await?, "facets": ["implements"]}}),
     )
     .await?;
 
@@ -283,7 +295,7 @@ async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> 
             "search",
             &json!({
                 "traversal": {
-                    "seed": LEAF,
+                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
                     "facets": ["references"]
                 }
             }),
@@ -323,7 +335,7 @@ async fn search_traversal_without_an_engine_refuses_capability_unavailable() -> 
 
     let code = refusal_code(
         &client,
-        &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     )
     .await?;
 
@@ -343,7 +355,7 @@ async fn search_traversal_beside_a_change_refuses_capability_unavailable() -> Te
         &client,
         &json!({
             "change": {"base": "baseline"},
-            "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+            "traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}
         }),
     )
     .await?;
@@ -482,10 +494,13 @@ async fn incoming_walks_past_the_readiness_timeout(
         log.display()
     );
     let (_directory, client, _server_task) = served_workspace(
-        &[(
-            "lib.rs",
-            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
-        )],
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+            ),
+        ],
         Some(configuration),
     )
     .await?;
@@ -501,7 +516,7 @@ async fn incoming_walks_past_the_readiness_timeout(
             &client,
             tool_request(
                 "search",
-                &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+                &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
             ),
         )
         .await?;
@@ -574,6 +589,7 @@ async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -
     );
     let (directory, client, _server_task) = served_workspace(
         &[
+            ("Cargo.toml", RUST_LIBRARY),
             (
                 "lib.rs",
                 "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
@@ -584,13 +600,11 @@ async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -
         Some(configuration),
     )
     .await?;
+    let seed = captured_seed(&client, "beacon", "lib.rs").await?;
     let walk = || {
         call_retrying_acceptance(
             &client,
-            tool_request(
-                "search",
-                &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
-            ),
+            tool_request("search", &json!({"traversal": {"seed": seed}})),
         )
     };
     walk().await?;
@@ -719,14 +733,19 @@ async fn live_seed(
 ) -> TestResult<String> {
     let answer = call_retrying_acceptance(
         client,
-        tool_request("get_symbol", &json!({"name": name, "language": language})),
+        tool_request(
+            "search",
+            &json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000}),
+        ),
     )
     .await?;
-    let hits = answer["hits"].as_array().ok_or("captured symbol hits")?;
-    let mut exact = hits.iter().filter(|hit| hit["symbol"]["name"] == name);
+    let hits = answer["results"].as_array().ok_or("captured symbol hits")?;
+    let mut exact = hits.iter().filter(|hit| {
+        hit["hit"]["symbol"]["name"] == name && hit["hit"]["symbol"]["language"] == language
+    });
     let hit = exact.next().ok_or("captured seed declaration")?;
     assert!(exact.next().is_none(), "one exact fixture seed: {answer}");
-    let identity = hit["symbol"]["id"]
+    let identity = hit["hit"]["symbol"]["id"]
         .as_str()
         .ok_or("captured seed has an established identity")?;
     let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
@@ -1014,12 +1033,11 @@ const PUBLICATION_POLL: std::time::Duration = std::time::Duration::from_millis(5
 /// itself ready at its start, so a walk takes its first answer.
 const OUTGOING_ENGINE: &str = "[languages.python.lsp]\nembedded = \"ty\"\n";
 
-const ROOT: &str = "rift://symbol/python/graph.py/root";
-
 /// [`CALL_GRAPH_FILES`] plus a module that calls into the standard library and holds a
 /// class whose body makes a call.
 const OUTGOING_FILES: &[(&str, &str)] = &[
-    CALL_GRAPH_FILES[0],
+    ("pyproject.toml", OUTGOING_METADATA),
+    CALL_GRAPH_FILES[1],
     (
         "extra.py",
         "from graph import leaf\n\nLIMIT = 3\n\n\
@@ -1039,7 +1057,7 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
         &client,
         tool_request(
             "search",
-            &json!({ "traversal": { "seed": ROOT, "direction": "outgoing" } }),
+            &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing" } }),
         ),
     )
     .await?;
@@ -1054,7 +1072,11 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
         assert_eq!(hit["distance"], json!(1), "{hit}");
         let hop = &hit["traversal_path"][0];
         assert_eq!(hop["direction"], json!("outgoing"), "{hit}");
-        assert_eq!(hop["relationship"]["from"], json!(ROOT), "{hit}");
+        assert_eq!(
+            hop["relationship"]["from"],
+            json!(captured_seed(&client, "root", "graph.py").await?),
+            "{hit}"
+        );
         assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{hit}");
     }
     assert!(structured["warnings"].is_null(), "{structured}");
@@ -1073,7 +1095,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
         &client,
         tool_request(
             "search",
-            &json!({ "traversal": { "seed": ROOT, "direction": "outgoing", "depth": 2 } }),
+            &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "depth": 2 } }),
         ),
     )
     .await?;
@@ -1091,7 +1113,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
     assert_eq!(leaf["distance"], json!(2), "{leaf}");
     assert_eq!(
         leaf["traversal_path"][1]["relationship"]["to"],
-        json!(LEAF),
+        json!(captured_seed(&client, "leaf", "graph.py").await?),
         "{leaf}"
     );
 
@@ -1100,7 +1122,7 @@ async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees(
         tool_request(
             "search",
             &json!({
-                "traversal": { "seed": ROOT, "direction": "outgoing", "depth": 2, "to": LEAF }
+                "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "depth": 2, "to": captured_seed(&client, "leaf", "graph.py").await? }
             }),
         ),
     )
@@ -1124,7 +1146,7 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
         &json!({
             "query": "branch_a",
             "target": "symbol",
-            "traversal": { "seed": ROOT, "direction": "outgoing", "facets": ["calls"] }
+            "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["calls"] }
         }),
     )
     .await?;
@@ -1141,7 +1163,7 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
         &client,
         &json!({
             "traversal": {
-                "seed": ROOT, "direction": "outgoing", "facets": ["references", "calls"]
+                "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["references", "calls"]
             }
         }),
     )
@@ -1155,7 +1177,7 @@ async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> T
 
     let code = refusal_code(
         &client,
-        &json!({"traversal": {"seed": ROOT, "direction": "outgoing", "facets": ["references"]}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["references"]}}),
     )
     .await?;
     assert_eq!(code, ErrorCode::CapabilityUnavailable);
@@ -1181,7 +1203,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
             "search",
             &json!({
                 "traversal": {
-                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
                 }
             }),
         ),
@@ -1206,7 +1228,7 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
             "search",
             &json!({
                 "traversal": {
-                    "seed": "rift://symbol/python/extra.py/Holder", "direction": "outgoing"
+                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing"
                 }
             }),
         ),
@@ -1230,7 +1252,10 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
 {
     let (_engine, configuration) = fake_engine::rust_engine(fake_engine::READY_UNPREPARED_ENGINE)?;
     let (_directory, client, _server_task) = served_workspace(
-        &[("lib.rs", "pub struct Beacon;\n\npub fn caller() {}\n")],
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            ("lib.rs", "pub struct Beacon;\n\npub fn caller() {}\n"),
+        ],
         Some(configuration),
     )
     .await?;
@@ -1241,7 +1266,7 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
             .call_tool(tool_request(
                 "search",
                 &json!({
-                    "traversal": { "seed": "rift://symbol/rust/lib.rs/Beacon", "direction": "outgoing" }
+                    "traversal": { "seed": captured_seed(&client, "Beacon", "lib.rs").await?, "direction": "outgoing" }
                 }),
             ))
             .await,
@@ -1257,7 +1282,7 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
         &client,
         &json!({
             "change": {"base": "baseline"},
-            "traversal": {"seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing"}
+            "traversal": {"seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"}
         }),
     )
     .await?;
@@ -1292,8 +1317,16 @@ async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_
     )
     .await?;
     for (seed, direction, reached) in [
-        ("rift://symbol/rust/lib.rs/caller", "outgoing", "beacon"),
-        ("rift://symbol/rust/lib.rs/beacon", "incoming", "caller"),
+        (
+            captured_seed(&client, "caller", "lib.rs").await?,
+            "outgoing",
+            "beacon",
+        ),
+        (
+            captured_seed(&client, "beacon", "lib.rs").await?,
+            "incoming",
+            "caller",
+        ),
     ] {
         let structured = call_retrying_acceptance(
             &client,
@@ -1330,8 +1363,14 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
     let (_engine, (_directory, client, _server_task)) =
         fake_engine::scripted_calls_workspace(ANNOUNCED_WORK, UNSERVED_LINES).await?;
     for (seed, direction) in [
-        ("rift://symbol/rust/lib.rs/caller", "outgoing"),
-        ("rift://symbol/rust/lib.rs/beacon", "incoming"),
+        (
+            captured_seed(&client, "caller", "lib.rs").await?,
+            "outgoing",
+        ),
+        (
+            captured_seed(&client, "beacon", "lib.rs").await?,
+            "incoming",
+        ),
     ] {
         let structured = call_retrying_acceptance(
             &client,
@@ -1425,17 +1464,20 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         log.display()
     );
     let (_directory, client, _server_task) = served_workspace(
-        &[(
-            "lib.rs",
-            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
-        )],
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+            ),
+        ],
         Some(configuration),
     )
     .await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
     let walk = tool_request(
         "search",
-        &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     );
 
     let refused = failed_call(client.call_tool(walk.clone()).await)?;
@@ -1511,17 +1553,20 @@ async fn search_traversal_refused_while_the_engine_starts_keeps_the_start() -> T
         log.display()
     );
     let (_directory, client, _server_task) = served_workspace(
-        &[(
-            "lib.rs",
-            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
-        )],
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+            ),
+        ],
         Some(configuration),
     )
     .await?;
     call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
     let walk = tool_request(
         "search",
-        &json!({"traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}}),
+        &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
     );
 
     let refused = failed_call(client.call_tool(walk.clone()).await)?;
@@ -1585,10 +1630,13 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
         starts.display()
     );
     let (_directory, client, _server_task) = served_workspace(
-        &[(
-            "lib.rs",
-            "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
-        )],
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            (
+                "lib.rs",
+                "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+            ),
+        ],
         Some(configuration),
     )
     .await?;
@@ -1602,7 +1650,7 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
             tool_request(
                 "search",
                 &json!({"traversal": {
-                    "seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing"
+                    "seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"
                 }}),
             ),
         )
@@ -1650,7 +1698,7 @@ async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult 
                 &json!({
                     "query": "beacon",
                     "scope": "global",
-                    "traversal": {"seed": "rift://symbol/rust/lib.rs/beacon"}
+                    "traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}
                 }),
             ))
             .await,
@@ -1721,7 +1769,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
             "search",
             &json!({
                 "traversal": {
-                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
                 }
             }),
         ),
@@ -1729,7 +1777,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     .await?;
     assert_eq!(symbol_names(&counted), ["leaf", "len"], "{counted}");
     let len = callee_hit(&counted, "len")?;
-    let id = "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len";
+    let id = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
     assert_eq!(len["hit"]["symbol"]["id"], json!(id), "{len}");
     assert_eq!(len["hit"]["symbol"]["kind"], json!("function"), "{len}");
     assert_eq!(
@@ -1739,13 +1787,16 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     );
     assert_eq!(
         len["unit"],
-        json!("rift://source/stdlib/python@3.12.9/builtins.pyi"),
+        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0])),
         "{len}"
     );
     assert!(len["path"].is_null() && len["range"].is_null(), "{len}");
     assert_eq!(len["distance"], json!(1), "{len}");
     let hop = &len["traversal_path"][0]["relationship"];
-    assert_eq!(hop["from"], json!("rift://symbol/python/extra.py/counted"));
+    assert_eq!(
+        hop["from"],
+        json!(captured_seed(&client, "counted", "extra.py").await?)
+    );
     assert_eq!(hop["to"], json!(id), "{len}");
     assert_eq!(hop["facets"], json!(["calls"]), "{len}");
     assert!(counted["warnings"].is_null(), "{counted}");
@@ -1757,10 +1808,9 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         .ok_or("the request carries positions")?;
     assert_eq!(positions.len(), 1, "{requests:?}");
     assert_eq!(
-        positions[0]["package"],
-        json!({"manager": "stdlib", "name": "python", "version": "3.12.9"})
+        positions[0]["unit"],
+        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
     );
-    assert_eq!(positions[0]["path"], json!("builtins.pyi"));
 
     client.cancel().await?;
     Ok(())
@@ -1772,7 +1822,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
 const INSTALLED_FILES: &[(&str, &str)] = &[
     (
         "pyproject.toml",
-        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"greeting\"]\n",
+        "[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"greeting\"]\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n",
     ),
     (
         "uv.lock",
@@ -1824,7 +1874,7 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
         tool_request(
             "search",
             &json!({
-                "traversal": { "seed": "rift://symbol/python/app.py/hello", "direction": "outgoing" }
+                "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
             }),
         ),
     )
@@ -1833,7 +1883,7 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     let greet = callee_hit(&hello, "greet")?;
     assert_eq!(
         greet["hit"]["symbol"]["id"],
-        json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
+        json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),
         "{greet}"
     );
     assert_eq!(greet["hit"]["symbol"]["kind"], json!("function"), "{greet}");
@@ -1841,14 +1891,14 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
         greet["hit"]["symbol"]["origin"],
         json!({
             "location": "dependency",
-            "package": {"manager": "pypi", "name": "greeting", "version": "1.0.0"},
+            "package": {"manager": "pypi", "registry": "pypi.org", "name": "greeting", "version": "1.0.0"},
             "source_kind": "authored"
         }),
         "{greet}"
     );
     assert_eq!(
         greet["unit"],
-        json!("rift://source/pypi/greeting@1.0.0/greeting/core.py"),
+        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[1])),
         "{greet}"
     );
     let warnings = hello["warnings"]
@@ -1867,16 +1917,12 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     );
 
     let requests = declaration_requests(&fixture).await;
-    let mut asked: Vec<(String, String, u64)> = requests
+    let mut asked: Vec<(String, u64)> = requests
         .iter()
         .flat_map(|request| request["positions"].as_array().cloned().unwrap_or_default())
         .map(|position| {
             (
-                position["package"]["name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                position["path"].as_str().unwrap_or_default().to_owned(),
+                position["unit"].as_str().unwrap_or_default().to_owned(),
                 position["line"].as_u64().unwrap_or(u64::MAX),
             )
         })
@@ -1885,8 +1931,8 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     assert_eq!(
         asked,
         [
-            ("greeting".to_owned(), "greeting/core.py".to_owned(), 0),
-            ("greeting".to_owned(), "greeting/core.py".to_owned(), 4),
+            (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 0),
+            (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 4),
         ],
         "each callee's position at its installed path, in one request: {requests:?}"
     );
@@ -1923,7 +1969,7 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
     before.push((".venv/lib/python3.12/site-packages/_virtualenv.py", ""));
     let (directory, client, _server_task) = served_workspace(&before, Some(configuration)).await?;
     let walk = json!({
-        "traversal": { "seed": "rift://symbol/python/app.py/hello", "direction": "outgoing" }
+        "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
     });
 
     let first = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
@@ -1945,7 +1991,7 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
     let greet = callee_hit(&second, "greet")?;
     assert_eq!(
         greet["hit"]["symbol"]["id"],
-        json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
+        json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),
         "{greet}"
     );
     assert_eq!(
@@ -1979,7 +2025,7 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
             "search",
             &json!({
                 "traversal": {
-                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
                 }
             }),
         ),
@@ -2024,7 +2070,7 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
             "search",
             &json!({
                 "traversal": {
-                    "seed": "rift://symbol/python/extra.py/counted", "direction": "outgoing"
+                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
                 }
             }),
         ),
@@ -2099,7 +2145,7 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
         tool_request(
             "search",
             &json!({
-                "traversal": { "seed": "rift://symbol/python/app.py/hello", "direction": "outgoing" }
+                "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
             }),
         ),
     )
@@ -2108,7 +2154,7 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
     let greet = callee_hit(&hello, "greet")?;
     assert_eq!(
         greet["hit"]["symbol"]["id"],
-        json!("rift://symbol/python/pypi/greeting@1.0.0/greeting/core.py/greet"),
+        json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),
         "{greet}"
     );
     let requests = declaration_requests(&fixture).await;
@@ -2117,8 +2163,7 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
     assert_eq!(
         requests[0]["positions"],
         json!([{
-            "package": {"manager": "pypi", "name": "greeting", "version": "1.0.0"},
-            "path": "greeting/core.py",
+            "unit": global_api::named_unit(&global_api::NAMED_POSITIONS[1]),
             "line": 0,
             "character": 4
         }])
