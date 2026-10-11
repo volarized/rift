@@ -8,6 +8,11 @@ pub(super) fn capture(
     source: &str,
     nodes: &[SyntaxNode],
     invocations: &mut [super::MacroInvocation],
+    mut functions: Option<(
+        &super::Language,
+        crate::SyntaxLimits,
+        &mut Vec<super::SyntaxSymbol>,
+    )>,
 ) {
     let indices = invocations
         .iter()
@@ -15,6 +20,9 @@ pub(super) fn capture(
         .map(|(index, (range, _, _))| (*range, index))
         .collect::<BTreeMap<_, _>>();
     let mut previous = BTreeMap::<usize, usize>::new();
+    let mut pending = BTreeMap::<usize, (ByteRange, u64, bool, bool)>::new();
+    let mut work = 0_usize;
+    let mut token_work = 0_usize;
     let mut direct = BTreeMap::<usize, Vec<ByteRange>>::new();
     let mut unknown = std::collections::BTreeSet::new();
     for (index, node) in nodes.iter().enumerate() {
@@ -38,6 +46,18 @@ pub(super) fn capture(
         if node.has_error || parent.has_error || invocation.has_error {
             unknown.insert(index);
         }
+        if let Some(functions) = functions.as_mut()
+            && node.kind == "token_tree"
+        {
+            capture_function(
+                source,
+                node,
+                parent_index,
+                functions,
+                &mut pending,
+                (&mut work, &mut token_work),
+            );
+        }
         if node.kind != "identifier" {
             continue;
         }
@@ -53,42 +73,27 @@ pub(super) fn capture(
         ) else {
             continue;
         };
-        let Some(keyword) = prefix
-            .strip_suffix("mod ")
-            .or_else(|| prefix.trim_end().strip_suffix("mod"))
-        else {
-            continue;
-        };
-        let before = keyword.trim();
-        if !["", ";", "pub", ";pub", "; pub"].contains(&before) {
-            continue;
+        if functions.is_some() && !node.has_error && !parent.has_error && !invocation.has_error {
+            let trimmed = prefix.trim();
+            let public = trimmed == "pub fn";
+            if public || trimmed == "fn" {
+                let leading = prefix.len() - prefix.trim_start().len();
+                if let Some(start) = u64::try_from(leading)
+                    .ok()
+                    .and_then(|leading| start.checked_add(leading))
+                {
+                    pending.insert(parent_index, (node.range, start, public, false));
+                }
+            }
         }
-        let Some(tail) = text(
+        capture_module(
             source,
-            ByteRange {
-                start: node.range.end,
-                end: parent.range.end,
-            },
-        ) else {
-            continue;
-        };
-        let spaces = tail.len() - tail.trim_start().len();
-        if !tail.trim_start().starts_with(';') {
-            continue;
-        }
-        let leading = prefix.find("mod").unwrap_or(prefix.len());
-        let Some(start) = start.checked_add(u64::try_from(leading).unwrap_or(u64::MAX)) else {
-            continue;
-        };
-        let Some(end) = node
-            .range
-            .end
-            .checked_add(u64::try_from(spaces + 1).unwrap_or(u64::MAX))
-        else {
-            continue;
-        };
-        let range = ByteRange { start, end };
-        invocations[index].1.push(range);
+            node,
+            parent,
+            start,
+            prefix,
+            &mut invocations[index].1,
+        );
     }
     for (index, (invocation, modules, children)) in invocations.iter_mut().enumerate() {
         let ranges = direct.remove(&index).unwrap_or_default();
@@ -102,6 +107,116 @@ pub(super) fn capture(
             continue;
         };
         modules.retain(|module| context.direct(*module));
+    }
+}
+
+fn capture_module(
+    source: &str,
+    node: &SyntaxNode,
+    parent: &SyntaxNode,
+    start: u64,
+    prefix: &str,
+    modules: &mut Vec<ByteRange>,
+) {
+    let Some(keyword) = prefix
+        .strip_suffix("mod ")
+        .or_else(|| prefix.trim_end().strip_suffix("mod"))
+    else {
+        return;
+    };
+    let before = keyword.trim();
+    if !["", ";", "pub", ";pub", "; pub"].contains(&before) {
+        return;
+    }
+    let Some(tail) = text(
+        source,
+        ByteRange {
+            start: node.range.end,
+            end: parent.range.end,
+        },
+    ) else {
+        return;
+    };
+    let spaces = tail.len() - tail.trim_start().len();
+    if !tail.trim_start().starts_with(';') {
+        return;
+    }
+    let leading = prefix.find("mod").unwrap_or(prefix.len());
+    let Some(start) = start.checked_add(u64::try_from(leading).unwrap_or(u64::MAX)) else {
+        return;
+    };
+    let Some(end) = node
+        .range
+        .end
+        .checked_add(u64::try_from(spaces + 1).unwrap_or(u64::MAX))
+    else {
+        return;
+    };
+    let range = ByteRange { start, end };
+    modules.push(range);
+}
+
+fn capture_function(
+    source: &str,
+    node: &SyntaxNode,
+    parent_index: usize,
+    functions: &mut (
+        &super::Language,
+        crate::SyntaxLimits,
+        &mut Vec<super::SyntaxSymbol>,
+    ),
+    pending: &mut BTreeMap<usize, (ByteRange, u64, bool, bool)>,
+    work: (&mut usize, &mut usize),
+) {
+    let (language, limits, symbols) = functions;
+    let (work, token_work) = work;
+    let first = text(source, node.range)
+        .and_then(|text| text.as_bytes().first())
+        .copied();
+    if first == Some(b'(') {
+        if let Some(candidate) = pending.get_mut(&parent_index) {
+            candidate.3 = true;
+        }
+    } else if first == Some(b'{')
+        && let Some((name, start, public, true)) = pending.remove(&parent_index)
+    {
+        let header = ByteRange {
+            start,
+            end: node.range.start,
+        };
+        let width = usize::try_from(node.range.end.saturating_sub(header.start)).ok();
+        if let Some(next) = width
+            .and_then(|width| work.checked_add(width))
+            .filter(|next| *next <= limits.source_bytes_max())
+        {
+            *work = next;
+            if symbols.len() < limits.syntax_nodes_max()
+                && function_header(source, header, name, *limits, token_work)
+                && tokens(source, node.range, *limits, |_| {
+                    let Some(next) = token_work
+                        .checked_add(1)
+                        .filter(|next| *next <= limits.syntax_nodes_max())
+                    else {
+                        return false;
+                    };
+                    *token_work = next;
+                    true
+                })
+                && let Some(symbol) = crate::rust::literal_function(
+                    source,
+                    language,
+                    name,
+                    ByteRange {
+                        start,
+                        end: node.range.end,
+                    },
+                    node.range,
+                    public,
+                )
+            {
+                symbols.push(symbol);
+            }
+        }
     }
 }
 
@@ -800,4 +915,169 @@ pub fn tokens(
         callback(range)
     };
     context.scan_to(value, None, Some(&mut bounded)) && context.stack.is_empty()
+}
+
+fn function_header(
+    source: &str,
+    range: ByteRange,
+    name: ByteRange,
+    limits: crate::SyntaxLimits,
+    work: &mut usize,
+) -> bool {
+    let mut rows = Vec::new();
+    if !tokens(source, range, limits, |range| {
+        let Some(next) = work
+            .checked_add(1)
+            .filter(|next| *next <= limits.syntax_nodes_max())
+        else {
+            return false;
+        };
+        *work = next;
+        let Some(value) = text(source, range) else {
+            return false;
+        };
+        rows.push((range, value));
+        true
+    }) {
+        return false;
+    }
+    let mut offset = usize::from(rows.first().is_some_and(|(_, value)| *value == "pub"));
+    if rows.get(offset).map(|(_, value)| *value) != Some("fn")
+        || rows.get(offset + 1).map(|(range, _)| *range) != Some(name)
+    {
+        return false;
+    }
+    offset += 2;
+    let values = rows[offset..]
+        .iter()
+        .map(|(_, value)| *value)
+        .collect::<Vec<_>>();
+    let mut input = values.as_slice();
+    if consume(&mut input, "<") {
+        loop {
+            let Some(value) = input.first() else {
+                return false;
+            };
+            if !identifier(value) && !value.strip_prefix('\'').is_some_and(identifier) {
+                return false;
+            }
+            input = &input[1..];
+            if consume(&mut input, ">") {
+                break;
+            }
+            if !consume(&mut input, ",") {
+                return false;
+            }
+        }
+    }
+    if !function_parameters(&mut input) {
+        return false;
+    }
+    if consume(&mut input, "-") && (!consume(&mut input, ">") || !type_path(&mut input)) {
+        return false;
+    }
+    if consume(&mut input, "where") {
+        loop {
+            if !type_path(&mut input) || !consume(&mut input, ":") {
+                return false;
+            }
+            loop {
+                if input
+                    .first()
+                    .is_some_and(|value| value.strip_prefix('\'').is_some_and(identifier))
+                {
+                    input = &input[1..];
+                } else if !type_path(&mut input) {
+                    return false;
+                }
+                if !consume(&mut input, "+") {
+                    break;
+                }
+            }
+            if input.is_empty() {
+                break;
+            }
+            if !consume(&mut input, ",") {
+                return false;
+            }
+            if input.is_empty() {
+                break;
+            }
+        }
+    }
+    input.is_empty()
+}
+
+fn function_parameters(input: &mut &[&str]) -> bool {
+    if !consume(input, "(") {
+        return false;
+    }
+    if !consume(input, ")") {
+        loop {
+            let Some(value) = input.first() else {
+                return false;
+            };
+            if !identifier(value) {
+                return false;
+            }
+            *input = &input[1..];
+            if !consume(input, ":") || !type_path(input) {
+                return false;
+            }
+            if consume(input, ")") {
+                break;
+            }
+            if !consume(input, ",") {
+                return false;
+            }
+            if consume(input, ")") {
+                break;
+            }
+        }
+    }
+    true
+}
+
+fn consume(input: &mut &[&str], expected: &str) -> bool {
+    if input.first().copied() != Some(expected) {
+        return false;
+    }
+    *input = &input[1..];
+    true
+}
+
+fn type_path(input: &mut &[&str]) -> bool {
+    if !literal_path(input) {
+        return false;
+    }
+    if consume(input, "<") {
+        loop {
+            if !literal_path(input) {
+                return false;
+            }
+            if consume(input, ">") {
+                break;
+            }
+            if !consume(input, ",") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn literal_path(input: &mut &[&str]) -> bool {
+    loop {
+        let Some(value) = input.first() else {
+            return false;
+        };
+        if !identifier(value) {
+            return false;
+        }
+        *input = &input[1..];
+        if input.get(..2) != Some(&[":", ":"][..]) {
+            return true;
+        }
+        *input = &input[2..];
+    }
 }

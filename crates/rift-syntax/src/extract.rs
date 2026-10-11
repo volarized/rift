@@ -398,7 +398,7 @@ fn qualified_symbol(
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
     let signatures: Vec<Signature> = rules
         .renders_signature(visited)
-        .then(|| callable_signature(&declaration, node, text, language))
+        .then(|| callable_signature(&declaration, item_range, text, language))
         .flatten()
         .into_iter()
         .collect();
@@ -455,16 +455,16 @@ fn bodyless_display(item: &str) -> &str {
 /// already states whether a kind is callable (`Declaration::facets`) and
 /// where its implementation starts (`Declaration::body_range`), so deriving
 /// the header here, once, keeps a match on language out of this walk.
-fn callable_signature(
+pub(crate) fn callable_signature(
     declaration: &Declaration,
-    node: Node<'_>,
+    item_range: ByteRange,
     text: &str,
     language: &Language,
 ) -> Option<Signature> {
     if !declaration.facets.contains(&SymbolFacet::Callable) {
         return None;
     }
-    let start = node.start_byte();
+    let start = usize::try_from(item_range.start).ok()?;
     let display = match declaration.body_range {
         Some(body_range) => {
             let end = usize::try_from(body_range.start)
@@ -472,7 +472,7 @@ fn callable_signature(
                 .min(text.len());
             text.get(start..end)?.trim_end()
         }
-        None => bodyless_display(text.get(start..node.end_byte())?),
+        None => bodyless_display(text.get(start..usize::try_from(item_range.end).ok()?)?),
     };
     Some(Signature {
         display: display.to_owned(),

@@ -1989,3 +1989,50 @@ fn literal_module_paths_refuse_missing_unknown_and_conflicting_sources() {
     assert!(!ambiguous.contains_key("src/kept.rs"));
     assert!(!ambiguous.contains_key("src/kept/mod.rs"));
 }
+
+#[test]
+fn literal_macro_function_anchors_require_original_supported_invocations() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    let source = format!(
+        "{definition} cfg_rt! {{ pub fn spawn<F>(future: F) -> JoinHandle<F::Output> where F: Future + Send + 'static, F::Output: Send + 'static, {{ future }} }} pub fn plain() {{}}"
+    );
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[("src/lib.rs", &source)],
+        None,
+        false,
+    );
+    let identity = SymbolIdentity::parse(found["src/lib.rs"]["spawn"].as_str())
+        .expect("original literal identity");
+    assert_eq!(identity.qualified_path(), &["crate_root", "spawn"]);
+    assert!(found["src/lib.rs"].contains_key("plain"));
+}
+
+#[test]
+fn literal_macro_function_anchors_refuse_opaque_shadowed_and_unknown_effects() {
+    let definition =
+        "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }";
+    for source in [
+        "opaque! { pub fn spawn() {} } pub fn plain() {}".to_owned(),
+        format!(
+            "{definition} macro_rules! cfg_rt {{ () => {{}} }} cfg_rt! {{ pub fn spawn() {{}} }} pub fn plain() {{}}"
+        ),
+        format!(
+            "{definition} cfg_rt! {{ pub fn spawn() {{ unknown! {{}} }} }} pub fn plain() {{}}"
+        ),
+        format!("{definition} cfg_rt! {{ #[unknown] pub fn spawn() {{}} }} pub fn plain() {{}}"),
+        format!(
+            "#![no_std] {definition} cfg_rt! {{ pub fn spawn() {{ let _ = cfg!(feature = \"rt\"); }} }} pub fn plain() {{}}"
+        ),
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[("src/lib.rs", &source)],
+            None,
+            false,
+        );
+        assert!(!found["src/lib.rs"].contains_key("spawn"), "{source}");
+        assert!(found["src/lib.rs"].contains_key("plain"), "{source}");
+    }
+}

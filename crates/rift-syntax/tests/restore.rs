@@ -1796,3 +1796,178 @@ fn rust_macro_lifetime_gaps_refuse_malformed_and_truncated_original_groups() {
         );
     }
 }
+
+#[test]
+fn literal_macro_functions_keep_original_header_body_and_restore() {
+    let source = "cfg_rt! { #[track_caller] pub fn spawn<F>(future: F) -> JoinHandle<F::Output>\nwhere F: Future + Send + 'static, F::Output: Send + 'static, { future } fn private() {} }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let spawn = document
+        .facts()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "spawn")
+        .expect("literal original function");
+    assert_eq!(spawn.node_kind, None);
+    assert_eq!(spawn.name_range, None);
+    assert_eq!(spawn.kind, "function");
+    assert_eq!(spawn.visibility.as_deref(), Some("pub"));
+    assert!(
+        spawn
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Callable)
+    );
+    assert!(
+        spawn
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Public)
+    );
+    let body = spawn.body_range.expect("original body");
+    let start = usize::try_from(spawn.item_range.start).expect("start");
+    let body_start = usize::try_from(body.start).expect("body start");
+    let end = usize::try_from(body.end).expect("end");
+    assert_eq!(&source[body_start..end], "{ future }");
+    assert_eq!(
+        spawn.signatures[0].display,
+        source[start..body_start].trim_end()
+    );
+    assert_eq!(spawn.range.end, body.end);
+    assert_eq!(document.facts().symbols().len(), 2);
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("original function facts restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn literal_macro_functions_refuse_incomplete_or_nonliteral_headers() {
+    for source in [
+        "wrapper! { fn broken(a:) {} }",
+        "wrapper! { fn broken<T,,>() {} }",
+        "wrapper! { fn broken() arbitrary {} }",
+        "wrapper! { fn broken() -> {} }",
+        "wrapper! { fn broken() where F: {} }",
+        "wrapper! { fn broken() -> type_macro!() {} }",
+        "wrapper! { fn broken() {",
+        "wrapper! { fn broken(a: F {} }",
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        assert!(
+            !document
+                .facts()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == "broken"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn literal_macro_functions_exclude_nested_body_functions_and_keep_duplicate_names() {
+    let source = "fn same() {} opaque! { fn same() { fn hidden() {} } fn same() {} } fn plain() {}";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let names = document
+        .facts()
+        .symbols()
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"plain"));
+    assert!(names.contains(&"same~1"));
+    assert!(names.contains(&"same~2"));
+    assert!(names.contains(&"same~3"));
+    let duplicate_ranges = document
+        .facts()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "same")
+        .map(|symbol| symbol.item_range.start)
+        .collect::<Vec<_>>();
+    assert!(duplicate_ranges.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!names.iter().any(|name| name.contains("hidden")));
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("normalization and original duplicate ranges restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn literal_macro_functions_keep_name_bounds_and_reject_corrupt_body_ranges() {
+    let retained_name = "x".repeat(5000);
+    let at_bound = "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX);
+    let name = "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+    let source = format!(
+        "opaque! {{ fn {retained_name}() {{}} fn {at_bound}() {{}} fn {name}() {{}} fn kept() {{}} }}"
+    );
+    let document = parsed(ShippedLanguage::Rust, &source);
+    for retained in [&retained_name, &at_bound] {
+        let symbol = document
+            .facts()
+            .symbols()
+            .iter()
+            .find(|symbol| &symbol.name == retained)
+            .expect("provider-bound name remains an original syntax fact");
+        let item_start = usize::try_from(symbol.item_range.start).expect("item start");
+        let item_end = usize::try_from(symbol.item_range.end).expect("item end");
+        let body = symbol.body_range.expect("original body range");
+        let body_start = usize::try_from(body.start).expect("body start");
+        let body_end = usize::try_from(body.end).expect("body end");
+        assert_eq!(
+            &source[item_start..item_end],
+            format!("fn {retained}() {{}}")
+        );
+        assert_eq!(&source[body_start..body_end], "{}");
+        assert_eq!(symbol.signatures[0].display, format!("fn {retained}()"));
+    }
+    let restored =
+        SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("provider-bound original facts restore");
+    assert_eq!(&restored, document.facts());
+    assert!(
+        document
+            .facts()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == "kept")
+    );
+    assert!(
+        document
+            .facts()
+            .left_out_symbols()
+            .iter()
+            .any(|symbol| symbol.name == name)
+    );
+    let mut captured = parts(document.facts());
+    let kept = captured
+        .symbols
+        .iter_mut()
+        .find(|symbol| symbol.name == "kept")
+        .expect("kept function");
+    kept.body_range = Some(rift_syntax::ByteRange { start: 0, end: 1 });
+    assert!(SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured).is_err());
+}
+
+#[test]
+fn literal_macro_functions_obey_original_source_and_node_bounds() {
+    let source = "opaque! { fn kept<F>(future: F) -> F { future } }";
+    let language = ShippedLanguage::Rust.language();
+    let provider = rift_syntax::registry::provider_for_language(&language).expect("Rust provider");
+    let path = ProjectPath::new("source.rs").expect("source path");
+    for limits in [
+        SyntaxLimits::new(source.len() - 1, 100, 100).expect("byte bound"),
+        SyntaxLimits::new(source.len(), 2, 100).expect("node bound"),
+    ] {
+        assert!(
+            provider
+                .analyze(
+                    SyntaxSource {
+                        path: &path,
+                        text: source
+                    },
+                    limits
+                )
+                .is_err()
+        );
+    }
+}

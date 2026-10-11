@@ -363,15 +363,14 @@ impl SyntaxProvider for RustSyntaxProvider {
             &self.language,
             &RustGrammarRules,
         )?;
-        Ok(SyntaxDocument::new(
+        Ok(SyntaxDocument::new_rust(
             self.language.clone(),
-            source.path.clone(),
+            source,
+            limits,
             nodes,
             symbols,
             tree.root_node().has_error(),
-        )
-        .with_source_witness(source.text)
-        .with_syntax_limits(limits))
+        ))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
@@ -653,6 +652,52 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         .iter()
         .map(|kind| kind.word())
         .find(|word| *word == name)
+}
+
+pub(crate) fn literal_function(
+    source: &str,
+    language: &Language,
+    name_range: ByteRange,
+    item_range: ByteRange,
+    body_range: ByteRange,
+    public: bool,
+) -> Option<crate::SyntaxSymbol> {
+    let name = source
+        .get(usize::try_from(name_range.start).ok()?..usize::try_from(name_range.end).ok()?)?
+        .to_owned();
+    let visibility = if public {
+        RustVisibility::Public
+    } else {
+        RustVisibility::Private
+    };
+    let declaration = extract::Declaration {
+        name: name.clone(),
+        kind: RustSymbolKind::Function.word(),
+        facets: declaration_facets(RustSymbolKind::Function, &visibility),
+        visibility: Some(visibility.authored()),
+        body_range: Some(body_range),
+        documentation: Vec::new(),
+        documentation_ranges: Vec::new(),
+    };
+    let signatures = extract::callable_signature(&declaration, item_range, source, language)?;
+    Some(crate::SyntaxSymbol {
+        name: name.clone(),
+        qualified_name: name,
+        container: None,
+        kind: declaration.kind,
+        node_kind: None,
+        facets: declaration.facets,
+        visibility: declaration.visibility,
+        range: item_range,
+        item_range,
+        name_range: None,
+        body_range: Some(body_range),
+        signatures: std::sync::Arc::from([signatures]),
+        documentation: std::sync::Arc::from([]),
+        documentation_ranges: Vec::new(),
+        module_path: None,
+        python_overload: None,
+    })
 }
 
 #[cfg(test)]

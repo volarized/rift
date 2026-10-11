@@ -311,8 +311,77 @@ impl SyntaxDocument {
         language: Language,
         path: ProjectPath,
         nodes: Vec<SyntaxNode>,
+        symbols: Vec<SyntaxSymbol>,
+        has_errors: bool,
+    ) -> Self {
+        Self::assemble(language, path, nodes, symbols, has_errors, None)
+    }
+
+    pub(crate) fn new_rust(
+        language: Language,
+        source: crate::SyntaxSource<'_>,
+        limits: crate::SyntaxLimits,
+        nodes: Vec<SyntaxNode>,
         mut symbols: Vec<SyntaxSymbol>,
         has_errors: bool,
+    ) -> Self {
+        let mut invocations = Self::invocations(&language, &nodes);
+        if let Some(invocations) = &mut invocations {
+            rust_macros::capture(
+                source.text,
+                &nodes,
+                invocations,
+                Some((&language, limits, &mut symbols)),
+            );
+        }
+        symbols.sort_by_key(|symbol| symbol.item_range.start);
+        let mut document = Self::assemble(
+            language,
+            source.path.clone(),
+            nodes,
+            symbols,
+            has_errors,
+            invocations,
+        );
+        let facts = Arc::make_mut(&mut document.facts);
+        facts.source_digest = Some(FileDigest::of(source.text.as_bytes()));
+        facts.scope = rust_macros::capture_scope(source.text, &document.nodes, has_errors);
+        facts.syntax_limits = Some(limits);
+        document
+    }
+
+    fn invocations(language: &Language, nodes: &[SyntaxNode]) -> Option<Vec<MacroInvocation>> {
+        (language.name == "rust" && language.dialect.is_none()).then(|| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == "macro_invocation"
+                        && node
+                            .parent
+                            .and_then(|parent| nodes.get(parent))
+                            .is_some_and(|parent| {
+                                (parent.kind == "source_file" && parent.parent.is_none())
+                                    || (parent.kind == "expression_statement"
+                                        && parent
+                                            .parent
+                                            .and_then(|root| nodes.get(root))
+                                            .is_some_and(|root| {
+                                                root.kind == "source_file" && root.parent.is_none()
+                                            }))
+                            })
+                })
+                .map(|node| (node.range, Vec::new(), None))
+                .collect()
+        })
+    }
+
+    fn assemble(
+        language: Language,
+        path: ProjectPath,
+        nodes: Vec<SyntaxNode>,
+        mut symbols: Vec<SyntaxSymbol>,
+        has_errors: bool,
+        captured: Option<Vec<MacroInvocation>>,
     ) -> Self {
         suffix_duplicate_qualified_names(&mut symbols);
         let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
@@ -321,30 +390,7 @@ impl SyntaxDocument {
                 symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
             }
         }
-        let macro_invocations =
-            (language.name == "rust" && language.dialect.is_none()).then(|| {
-                nodes
-                    .iter()
-                    .filter(|node| {
-                        node.kind == "macro_invocation"
-                            && node
-                                .parent
-                                .and_then(|parent| nodes.get(parent))
-                                .is_some_and(|parent| {
-                                    (parent.kind == "source_file" && parent.parent.is_none())
-                                        || (parent.kind == "expression_statement"
-                                            && parent
-                                                .parent
-                                                .and_then(|root| nodes.get(root))
-                                                .is_some_and(|root| {
-                                                    root.kind == "source_file"
-                                                        && root.parent.is_none()
-                                                }))
-                                })
-                    })
-                    .map(|node| (node.range, Vec::new(), None))
-                    .collect()
-            });
+        let macro_invocations = captured.or_else(|| Self::invocations(&language, &nodes));
         let left_out_symbols = leave_out_refused_names(&mut symbols);
         let left_out_declarations = left_out_symbols.len();
         Self {
@@ -425,7 +471,7 @@ impl SyntaxDocument {
             facts.scope = rust_macros::capture_scope(source, &self.nodes, facts.has_errors);
         }
         if let Some(invocations) = &mut facts.macro_invocations {
-            rust_macros::capture(source, &self.nodes, invocations);
+            rust_macros::capture(source, &self.nodes, invocations, None);
         }
         self
     }

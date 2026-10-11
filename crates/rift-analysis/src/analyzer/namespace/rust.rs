@@ -68,19 +68,21 @@ pub(super) fn prepare(
         {
             continue;
         }
-        anchors.insert(
-            path.clone(),
-            file_anchors(input, file.syntax, &namespace, file.source),
-        );
-        for (child, local, child_scope) in macros::children(
+        let mut admitted = std::collections::BTreeSet::new();
+        let children = macros::children(
             file,
             &directory,
             &inventory,
             &originals,
-            scope,
+            (scope, &mut admitted),
             input.syntax().syntax_depth_max(),
             library,
-        ) {
+        );
+        anchors.insert(
+            path.clone(),
+            file_anchors(input, file.syntax, &namespace, file.source, &admitted),
+        );
+        for (child, local, child_scope) in children {
             let mut child_namespace = namespace.clone();
             child_namespace.extend(local);
             if SymbolIdentity::new(
@@ -254,10 +256,24 @@ fn file_anchors(
     syntax: &SyntaxFacts,
     namespace: &[String],
     source: &str,
+    admitted: &std::collections::BTreeSet<rift_syntax::ByteRange>,
 ) -> BTreeMap<String, SymbolId> {
     let revision = crate::documentation::content_digest(source.as_bytes()).0;
+    let supported = |symbol: &rift_syntax::SyntaxSymbol| {
+        let Some(invocations) = syntax.macro_invocations() else {
+            return true;
+        };
+        let index =
+            invocations.partition_point(|(range, _, _)| range.start <= symbol.item_range.start);
+        index
+            .checked_sub(1)
+            .and_then(|index| invocations.get(index))
+            .is_none_or(|(range, _, _)| {
+                symbol.item_range.end > range.end || admitted.contains(range)
+            })
+    };
     let mut counts = BTreeMap::<String, usize>::new();
-    for symbol in syntax.symbols() {
+    for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
         let name = match symbol.container.as_deref() {
             Some(container) => format!("{container}::{}", symbol.name),
             None => symbol.name.clone(),
@@ -265,7 +281,7 @@ fn file_anchors(
         *counts.entry(name).or_default() += 1;
     }
     let mut anchors = BTreeMap::new();
-    for symbol in syntax.symbols() {
+    for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
         let base = match symbol.container.as_deref() {
             Some(container) => format!("{container}::{}", symbol.name),
             None => symbol.name.clone(),

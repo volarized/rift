@@ -656,10 +656,11 @@ pub(super) fn children<'a>(
     directory: &str,
     inventory: &'a Inventory<'a>,
     originals: &'a BTreeMap<&'a str, &'a str>,
-    mut scope: Scope,
+    scope: (Scope, &mut std::collections::BTreeSet<ByteRange>),
     depth_max: usize,
     library: bool,
 ) -> Vec<Child> {
+    let (mut scope, admitted) = scope;
     let context = Context {
         inventory,
         originals,
@@ -736,7 +737,9 @@ pub(super) fn children<'a>(
                             })
                             .is_some()
                     });
-                if !complete {
+                if complete {
+                    admitted.insert(*range);
+                } else {
                     scope.clear();
                 }
             }
