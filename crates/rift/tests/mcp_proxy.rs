@@ -1043,13 +1043,144 @@ fn proxy_text_view(
     Ok((body, view))
 }
 
+/// Reads the exact inline view facts while preserving every other byte of the answer.
+fn proxy_row_views(
+    text: &str,
+) -> TestResult<(String, Vec<rift_protocol::symbol_read::CapturedView>)> {
+    let mut body = String::new();
+    let mut views = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let Some((before, captured)) = line.split_once(" · view ") else {
+            body.push_str(line);
+            continue;
+        };
+        let (id, expiry) = captured
+            .split_once(" · expires ")
+            .ok_or("inline view must state its expiry")?;
+        let end = expiry
+            .find(" · ")
+            .unwrap_or_else(|| expiry.trim_end_matches(['\r', '\n']).len());
+        assert!(!expiry[..end].is_empty(), "inline view expiry is empty");
+        views.push(rift_protocol::symbol_read::CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(id)?,
+            expires_at: expiry[..end].to_owned(),
+        });
+        body.push_str(before);
+        body.push_str(&expiry[end..]);
+    }
+    Ok((body, views))
+}
+
+/// Reads a row's physical source through the proxy that advertised its captured view.
+async fn proxy_row_source(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    row: &serde_json::Value,
+    view: &rift_protocol::symbol_read::CapturedView,
+) -> TestResult<String> {
+    let unit = match row["unit"].as_str() {
+        Some(unit) => rift_protocol::read::SourceUnitId::parse(unit)?,
+        None => {
+            let path = row["path"]
+                .as_str()
+                .ok_or("captured row must state its source path")?;
+            rift_protocol::read::SourceUnitId::parse(&format!(
+                "rift://source/project/{}",
+                rift_protocol::identity::encode_source_unit_key(path)
+            ))?
+        }
+    };
+    let request = json!({"unit": unit, "range": row["range"], "view": view.id});
+    let response = proxied_result(client, "get_source", &request).await?;
+    assert_ne!(
+        response.is_error,
+        Some(true),
+        "captured row source: {response:?}"
+    );
+    let (body, answered) = proxy_text_view(text_of(&response)?)?;
+    assert_eq!(
+        answered.as_ref(),
+        Some(view),
+        "row source retains the original view and expiry"
+    );
+    if let Some(structured) = &response.structured_content {
+        let result: rift_protocol::source_read::GetSourceResult =
+            serde_json::from_value(structured.clone())?;
+        let rift_protocol::source_read::GetSourceResult::Found {
+            source,
+            source_complete,
+            view: selected,
+            ..
+        } = result
+        else {
+            return Err("captured row source must remain available".into());
+        };
+        assert!(source_complete, "captured row source must be complete");
+        assert_eq!(
+            source.span.unit, unit,
+            "captured row source unit is unchanged"
+        );
+        if !row["range"].is_null() {
+            assert_eq!(
+                serde_json::to_value(source.span.range)?,
+                row["range"],
+                "captured row source range is unchanged"
+            );
+        }
+        assert_eq!(
+            &selected, view,
+            "captured row source retains the original selection"
+        );
+    }
+    Ok(body)
+}
+
+/// Validates each row selection before comparing source bytes between the proxies.
+async fn validated_proxy_rows(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    body: &str,
+    result: &CallToolResult,
+    reference: &serde_json::Value,
+) -> TestResult<(String, Vec<String>)> {
+    let (body, views) = proxy_row_views(body)?;
+    let rows: Vec<_> = reference["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| !row["view"].is_null())
+        .collect();
+    assert_eq!(
+        views.len(),
+        rows.len(),
+        "text states every captured row view"
+    );
+    if let Some(structured) = &result.structured_content {
+        let expected: Vec<rift_protocol::symbol_read::CapturedView> = structured["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| !row["view"].is_null())
+            .map(|row| serde_json::from_value(row["view"].clone()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            views, expected,
+            "text states the exact structured row views and expiries"
+        );
+    }
+    let mut sources = Vec::new();
+    for (row, view) in rows.into_iter().zip(&views) {
+        sources.push(proxy_row_source(client, row, view).await?);
+    }
+    Ok((body, sources))
+}
+
 /// Reads each advertised view through its owning proxy before comparing the remaining text.
 async fn validated_proxy_text(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &'static str,
     request: &serde_json::Value,
     result: &CallToolResult,
-) -> TestResult<String> {
+    reference: &serde_json::Value,
+) -> TestResult<(String, Vec<String>)> {
     let original = text_of(result)?;
     let (body, view) = proxy_text_view(original)?;
     if let Some(structured) = &result.structured_content {
@@ -1084,7 +1215,7 @@ async fn validated_proxy_text(
             );
         }
     }
-    Ok(body)
+    validated_proxy_rows(client, &body, result, reference).await
 }
 
 /// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
@@ -1166,9 +1297,13 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
             );
             text_complete::assert_text_states(name, &all_result);
             let all_text = text_of(&all_result)?;
+            let reference = all_result
+                .structured_content
+                .as_ref()
+                .ok_or("all proxy must return structured content")?;
             let (all_body, text_body) = tokio::join!(
-                validated_proxy_text(&all, name, &request, &all_result),
-                validated_proxy_text(&text, name, &request, &text_result),
+                validated_proxy_text(&all, name, &request, &all_result, reference),
+                validated_proxy_text(&text, name, &request, &text_result, reference),
             );
             assert_eq!(all_body?, text_body?, "{name}: texts differ");
 
