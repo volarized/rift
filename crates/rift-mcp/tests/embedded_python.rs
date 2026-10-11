@@ -14,6 +14,7 @@ use workspace_client::{
 
 const SERVICE: &str = "def serve(port: int) -> int:\n    return port\n";
 const CALLER: &str = "from service import serve\n\ndef caller() -> int:\n    return serve(8080)\n";
+const PYPROJECT: &str = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['service','main']\n";
 const CONFIGURATION: &str = "\
 [languages.python.lsp]\nembedded = \"ty\"\n\
 retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
@@ -21,7 +22,11 @@ retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 #[tokio::test]
 async fn incoming_references_resolve_cross_file_callers_without_writes() -> TestResult {
     let (directory, client, server_task) = served_relative_workspace(
-        &[("service.py", SERVICE), ("main.py", CALLER)],
+        &[
+            ("service.py", SERVICE),
+            ("main.py", CALLER),
+            ("pyproject.toml", PYPROJECT),
+        ],
         Some(CONFIGURATION.to_owned()),
     )
     .await?;
