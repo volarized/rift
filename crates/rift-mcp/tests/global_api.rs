@@ -499,6 +499,40 @@ fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
     json!({"manager": manager, "registry": registry, "name": name, "version": version})
 }
 
+pub(crate) fn named_identity(named: &NamedPosition) -> String {
+    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+    let (manager, name, version) = named.package;
+    let owner = if manager == "stdlib" {
+        SymbolOwner::Runtime {
+            runtime: name.to_owned(),
+            version: version.to_owned(),
+        }
+    } else {
+        SymbolOwner::Package {
+            manager: manager.to_owned(),
+            registry: "pypi.org".to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        }
+    };
+    let mut logical = named
+        .path
+        .trim_end_matches(".py")
+        .trim_end_matches(".pyi")
+        .split('/')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    logical.push(named.qualified_name.to_owned());
+    SymbolIdentity::new(
+        owner,
+        rift_protocol::read::Language::from_identity_segment("python")
+            .expect("fixture language is supported"),
+        logical,
+    )
+    .expect("fixture logical declaration")
+    .wire_identity()
+}
+
 /// The declaration answer for `request`: each position [`NAMED_POSITIONS`] lists names its
 /// declaration, by the identity package analysis mints, and its kind; every other position
 /// names neither.
@@ -516,13 +550,9 @@ fn declarations(request: &Value) -> Value {
             });
             match named {
                 Some(named) => {
-                    let (manager, name, version) = named.package;
-                    let (path, qualified) = (named.path, named.qualified_name);
                     json!({
                         "position": position,
-                        "declaration": format!(
-                            "rift://symbol/python/{manager}/{name}@{version}/{path}/{qualified}"
-                        ),
+                        "declaration": named_identity(named),
                         "kind": named.kind
                     })
                 }
@@ -545,7 +575,7 @@ fn page(items: &[Value], warnings: &Value) -> Value {
         "documentation_revision": "0123abcd",
         "view": {
             "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2026-10-10T10:05:00Z"
+            "expires_at": "2099-10-10T10:05:00Z"
         }
     })
 }
@@ -553,22 +583,21 @@ fn page(items: &[Value], warnings: &Value) -> Value {
 /// The symbol page for `request`: each collected declaration its `name` matches, at the
 /// class that match reaches, with a `source_truncated` page warning.
 fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
-    let name = request["name"].as_str().unwrap_or_default().to_owned();
-    let with_source = includes_source(request);
-    let items: Vec<Value> = matched_declarations(fixture, &[name])
-        .map(|(declaration, class)| {
-            let mut hit = collected_hit(fixture, declaration, with_source);
-            hit["match_class"] = json!(class_wire(class).0);
-            hit
-        })
-        .collect();
-    page(
-        &items,
-        &json!([{
-            "code": "source_truncated",
-            "detail": "source exceeded the active bound"
-        }]),
-    )
+    let id = request["id"].as_str().unwrap_or_default();
+    let declaration = DECLARATIONS
+        .iter()
+        .copied()
+        .find(|name| collected_identity(fixture, name) == id);
+    let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
+    let Some(declaration) = declaration else {
+        return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view});
+    };
+    let hit = collected_hit(fixture, declaration, includes_source(request));
+    let mut binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"source_complete":hit.get("source").is_some(),"signature_indices":[],"type_indices":[],"documentation_indices":[]});
+    if let Some(source) = hit.get("source") {
+        binding["source"] = source.clone();
+    }
+    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
 }
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
@@ -605,12 +634,8 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
     let with_source = includes_source(request);
     let items: Vec<Value> = matched_declarations(fixture, &identifiers)
         .map(|(declaration, class)| {
-            let (match_class, field) = class_wire(class);
-            let mut hit = collected_hit(fixture, declaration, with_source);
-            hit["target"] = json!("symbol");
-            hit["match_class"] = json!(match_class);
-            hit["contributing_fields"] = json!([field]);
-            hit
+            let (_, field) = class_wire(class);
+            canonical_search_hit(fixture, declaration, with_source, field)
         })
         .collect();
     let narrowed = json!({
@@ -631,10 +656,32 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
 
 /// One body match retaining the declaration's original identity and source.
 fn body_match_hit(fixture: SymbolFixture, declaration: &str, request: &Value) -> Value {
-    let mut hit = collected_hit(fixture, declaration, includes_source(request));
-    hit["target"] = json!("symbol");
-    hit["match_class"] = json!("unknown");
-    hit["contributing_fields"] = json!(["file_content"]);
+    canonical_search_hit(fixture, declaration, includes_source(request), "content")
+}
+
+/// Projects the original package facts through the shared canonical search result.
+fn canonical_search_hit(
+    fixture: SymbolFixture,
+    declaration: &str,
+    with_source: bool,
+    field: &str,
+) -> Value {
+    let original = collected_hit(fixture, declaration, with_source);
+    let matched_by = if field == "qualified_name" {
+        "name"
+    } else {
+        field
+    };
+    let mut hit = json!({
+        "hit": {"target": "symbol", "symbol": original["symbol"]},
+        "unit": original["unit"],
+        "range": original["range"],
+        "line": original["line"],
+        "matched_by": [matched_by]
+    });
+    if let Some(source) = original.get("source") {
+        hit["source"] = source.clone();
+    }
     hit
 }
 
@@ -744,14 +791,36 @@ const fn class_wire(class: IdentifierMatchClass) -> (&'static str, &'static str)
     }
 }
 
+pub(crate) fn collected_identity(fixture: SymbolFixture, declaration: &str) -> String {
+    let (manager, name, version) = COLLECTED;
+    let root = if matches!(fixture, SymbolFixture::InvalidIdentity) {
+        "other"
+    } else {
+        name
+    };
+    rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Package {
+            manager: manager.to_owned(),
+            registry: "crates.io".to_owned(),
+            name: if matches!(fixture, SymbolFixture::InvalidIdentity) {
+                "other".to_owned()
+            } else {
+                name.to_owned()
+            },
+            version: version.to_owned(),
+        },
+        rift_protocol::read::Language::from_identity_segment("rust")
+            .expect("fixture language is supported"),
+        vec![root.to_owned(), declaration.to_owned()],
+    )
+    .expect("fixture package and literal public declaration are canonical")
+    .wire_identity()
+}
+
 /// One collected declaration as a page item, located in [`COLLECTED_SOURCE`], before
 /// its match class. Its symbol identity is the one package analysis mints over the unit,
 /// `rift://symbol/rust/cargo/demo@1.0.0/<path>/<qualified name>`.
 fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -> Value {
-    let file = match fixture {
-        SymbolFixture::Valid | SymbolFixture::CasePairs => "src/lib.rs",
-        SymbolFixture::InvalidIdentity => "other.rs",
-    };
     let source = match fixture {
         SymbolFixture::CasePairs => CASE_SOURCE,
         SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
@@ -763,7 +832,7 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
     let mut hit = json!({
         "package": package,
         "symbol": {
-            "id": format!("rift://symbol/rust/{manager}/{name}@{version}/{file}/{declaration}"),
+            "id": collected_identity(fixture, declaration),
             "kind": "function",
             "language": "rust",
             "name": declaration,

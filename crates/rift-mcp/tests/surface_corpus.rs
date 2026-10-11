@@ -17,15 +17,15 @@ retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
     let mut requests = vec![
         ("get_symbol", json!({ "name": "beacon_one" })),
-        ("get_symbol", json!({ "name": "beacon", "limit": 1 })),
-        ("get_symbol", json!({ "name": "beacon", "include": [] })),
+        ("search", json!({ "query": "beacon", "limit": 1 })),
+        ("search", json!({ "query": "beacon", "include": [] })),
         // The fixture global API's collected package answers these: a package hit
         // carries `unit` in place of `path`.
         (
             "get_symbol",
             json!({ "name": "helper_beacon", "scope": "global" }),
         ),
-        ("get_symbol", json!({ "name": "beacon", "scope": "all" })),
+        ("search", json!({ "query": "beacon", "scope": "all" })),
         // The fixture's committed baseline serves the timeline: one
         // `introduced` version from the walk's first commit.
         (
@@ -51,8 +51,8 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
             json!({ "query": "beacon", "limit": 1, "page_index": 100 }),
         ),
         (
-            "get_symbol",
-            json!({ "name": "beacon", "limit": 1, "page_index": 50 }),
+            "search",
+            json!({ "query": "beacon", "limit": 1, "page_index": 50 }),
         ),
         (
             "search",
@@ -65,6 +65,10 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
                 "target": "symbol",
                 "paths": { "force_include": ["hidden.rs"] }
             }),
+        ),
+        (
+            "get_source",
+            json!({ "unit": "rift://source/project/lib.rs" }),
         ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
@@ -86,6 +90,105 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(pattern_search_corpus());
     requests.extend(traversal_search_corpus());
     requests
+}
+
+/// Resolves the corpus's original declarations through discovery before issuing exact reads.
+pub(crate) async fn prepared_corpus(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> Result<Vec<(&'static str, Value)>, Box<dyn std::error::Error>> {
+    let mut requests = corpus();
+    for (tool, request) in &mut requests {
+        if *tool == "get_symbol" {
+            let name = request["name"]
+                .as_str()
+                .ok_or("corpus declaration name")?
+                .to_owned();
+            let mut discovery =
+                json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000});
+            for field in ["scope", "packages", "rev"] {
+                if let Some(value) = request.get(field) {
+                    discovery[field] = value.clone();
+                }
+            }
+            let id = discovered_id(client, &discovery, &name, None).await?;
+            let object = request.as_object_mut().ok_or("corpus request object")?;
+            for field in ["name", "scope", "packages"] {
+                object.remove(field);
+            }
+            object.insert("id".to_owned(), json!(id));
+        }
+        for field in ["seed", "to"] {
+            let selected = request["traversal"][field].as_str();
+            let declaration = match selected {
+                Some(TRAVERSAL_CALLEE) => Some(("callee", "traversal_callee.py")),
+                Some(TRAVERSAL_CALLER) => Some(("calls_callee", "traversal_caller.py")),
+                _ => None,
+            };
+            if let Some((name, path)) = declaration {
+                request["traversal"][field] = json!(
+                    discovered_id(
+                        client,
+                        &json!({"query": name, "target": "symbol", "include": ["source"]}),
+                        name,
+                        Some(path)
+                    )
+                    .await?
+                );
+            }
+        }
+    }
+    Ok(requests)
+}
+
+async fn discovered_id(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    request: &Value,
+    name: &str,
+    path: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let result = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new("search")
+                .with_arguments(request.as_object().ok_or("discovery object")?.clone()),
+        )
+        .await?;
+    assert!(
+        !result.is_error.unwrap_or(false),
+        "discovery refused: {result:?}"
+    );
+    let answer = result.structured_content.ok_or("discovery content")?;
+    let mut rows = answer["results"]
+        .as_array()
+        .ok_or("discovery rows")?
+        .iter()
+        .filter(|row| {
+            row["hit"]["symbol"]["name"] == name && path.is_none_or(|path| row["path"] == path)
+        });
+    let row = rows
+        .next()
+        .ok_or_else(|| format!("original declaration {name}: {answer}"))?;
+    assert!(
+        rows.next().is_none(),
+        "one original declaration {name}: {answer}"
+    );
+    assert!(
+        row["source"]
+            .as_str()
+            .is_some_and(|source| !source.is_empty()),
+        "original source: {row}"
+    );
+    assert!(
+        row["range"]["start"]
+            .as_u64()
+            .zip(row["range"]["end"].as_u64())
+            .is_some_and(|(start, end)| start < end),
+        "original range: {row}"
+    );
+    let id = row["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("established declaration ID")?;
+    let _ = rift_protocol::identity::SymbolIdentity::parse(id)?;
+    Ok(id.to_owned())
 }
 
 /// Commit searches over the fixture's two commit messages. The history store fills in the
@@ -170,9 +273,9 @@ fn dependency_scope_search_corpus() -> Vec<(&'static str, Value)> {
 fn package_argument_corpus() -> Vec<(&'static str, Value)> {
     vec![
         (
-            "get_symbol",
+            "search",
             json!({
-                "name": "helper_beacon",
+                "query": "helper_beacon",
                 "scope": "global",
                 "packages": [{ "manager": "cargo", "name": "helper", "version": "0.1.0" }]
             }),
@@ -423,6 +526,10 @@ impl SurfaceFixture {
             "from traversal_callee import callee\n\n\n\
              def calls_callee() -> int:\n    return callee() + len(\"callee\")\n",
         )?;
+        fs::write(
+            directory.path().join("pyproject.toml"),
+            "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['traversal_callee','traversal_caller']\n",
+        )?;
         // No syntax provider claims it; `nodes` names the missing extension.
         fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
         // An npm scoped package directory, so the corpus mints an identity whose path holds the
@@ -452,7 +559,7 @@ impl SurfaceFixture {
         // the corpus proves the served schemas, and the rest only stretches its wait.
         let configuration = format!(
             "{}\n[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n\
-             [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
+             [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
              [providers.history]\ncpu_share = 1.0\n\n\
              {ENGINE}",
             hermetic_search::HERMETIC_TABLES,
@@ -475,6 +582,17 @@ impl SurfaceFixture {
             workspace: directory,
             _global: global,
         })
+    }
+
+    /// Admits the original Rust change file through its actual Cargo library root.
+    pub(crate) async fn start_canonical() -> Result<Self, Box<dyn std::error::Error>> {
+        let fixture = Self::start().await?;
+        let path = fixture.root().join("lib.rs");
+        let original = fs::read_to_string(&path)?;
+        assert!(fixture.root().join("change_witness.rs").is_file());
+        fs::write(path, format!("{original}pub mod change_witness;\n"))?;
+        rift_history::fixture::commit_all(fixture.root(), "declare the original change module");
+        Ok(fixture)
     }
 
     /// Returns workspace root used by direct and proxy clients.
