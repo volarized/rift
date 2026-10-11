@@ -190,7 +190,7 @@ fn ambient_containers<'source>(file: &'source SelectedFile<'_>, module: &str) ->
     containers.into_iter().collect()
 }
 
-fn literal_module_name(source: &str, range: ByteRange) -> Option<String> {
+pub(super) fn literal_module_name(source: &str, range: ByteRange) -> Option<String> {
     let start = usize::try_from(range.start).ok()?;
     let end = usize::try_from(range.end).ok()?;
     let token = source.get(start..end)?;

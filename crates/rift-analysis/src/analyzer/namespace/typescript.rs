@@ -56,6 +56,22 @@ pub(super) fn prepare(
             }
             prepare_file(input, file, module, &mut prepared);
         }
+        if matches!(input.owner(), SymbolOwner::Package { .. }) {
+            for file in selected {
+                if file.syntax.language().name == "typescript"
+                    && selected_source_is_valid(input, file)
+                {
+                    let ambient = declaration_anchors(input, file.syntax, file.source, None);
+                    if !ambient.is_empty() {
+                        prepared
+                            .anchors
+                            .entry(file.path.as_str().to_owned())
+                            .or_default()
+                            .extend(ambient);
+                    }
+                }
+            }
+        }
         map_declared_types(input, metadata, selected, &mut prepared);
     }
     observations::prepare(input, metadata.as_ref(), selected, &mut prepared);
@@ -68,7 +84,7 @@ fn prepare_file(
     module: &str,
     prepared: &mut PreparedNamespace,
 ) -> bool {
-    let anchors = declaration_anchors(input, file.syntax, file.source, module);
+    let anchors = declaration_anchors(input, file.syntax, file.source, Some(module));
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;
@@ -677,7 +693,7 @@ fn declaration_anchors(
     input: &NamespaceInput<'_>,
     syntax: &SyntaxFacts,
     source: &str,
-    module: &str,
+    module: Option<&str>,
 ) -> BTreeMap<String, SymbolId> {
     let mut groups: BTreeMap<String, Vec<&SyntaxSymbol>> = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
@@ -696,10 +712,17 @@ fn declaration_anchors(
         symbol.node_kind != Some("assignment_expression")
             || symbol.facets.contains(&SymbolFacet::Public)
     }) {
-        let Some(mut path) = container_path(symbol, &paths, module) else {
+        let literal = declared_module_name(symbol, source);
+        let Some(mut path) = literal
+            .as_ref()
+            .map(|name| vec![name.clone()])
+            .or_else(|| container_path(symbol, &paths, module))
+        else {
             continue;
         };
-        path.push(symbol.name.clone());
+        if literal.is_none() {
+            path.push(symbol.name.clone());
+        }
         let base = defining_name(symbol);
         let group = &groups[&base];
         let overload = syntax.language().name == "typescript" && is_function_overload(group);
@@ -751,14 +774,28 @@ fn defining_name(symbol: &SyntaxSymbol) -> String {
     }
 }
 
+fn declared_module_name(symbol: &SyntaxSymbol, source: &str) -> Option<String> {
+    if symbol.kind != "namespace" || symbol.container.is_some() {
+        return None;
+    }
+    let range = symbol.name_range?;
+    let start = usize::try_from(symbol.range.start).ok()?;
+    let end = usize::try_from(range.start).ok()?;
+    let prefix = source.get(start..end)?;
+    if !prefix.split_whitespace().eq(["declare", "module"]) {
+        return None;
+    }
+    observations::literal_module_name(source, range)
+}
+
 fn container_path(
     symbol: &SyntaxSymbol,
     paths: &BTreeMap<String, Vec<String>>,
-    module: &str,
+    module: Option<&str>,
 ) -> Option<Vec<String>> {
     match &symbol.container {
         Some(container) => paths.get(container).cloned(),
-        None => Some(vec![module.to_owned()]),
+        None => module.map(|module| vec![module.to_owned()]),
     }
 }
 

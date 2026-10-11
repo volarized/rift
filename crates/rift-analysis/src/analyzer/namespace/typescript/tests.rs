@@ -711,3 +711,210 @@ fn raw_anonymous_export_bindings_need_module_export_context_before_identity() {
         assert!(!anchors.contains_key("open"));
     }
 }
+
+fn ambient_prepared(
+    owner: &rift_protocol::identity::SymbolOwner,
+    metadata: Option<&str>,
+    source: &str,
+) -> (
+    super::PreparedNamespace,
+    std::sync::Arc<rift_syntax::SyntaxFacts>,
+) {
+    use rift_protocol::{identity::SymbolOwner, read::RuntimeIdentity};
+    let path = ProjectPath::new("buffer.d.ts").expect("original path");
+    let metadata_path = ProjectPath::new("package.json").expect("metadata path");
+    let files = [PackageSource::new(&path, source)];
+    let context = metadata
+        .map(|text| PackageSource::new(&metadata_path, text))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let location = match owner {
+        SymbolOwner::Package {
+            manager,
+            registry,
+            name,
+            version,
+        } => SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: manager.clone(),
+                registry: registry.clone(),
+                name: name.clone(),
+                version: version.clone(),
+            },
+        },
+        SymbolOwner::Runtime { runtime, version } => SourceLocation::Stdlib {
+            runtime: Some(RuntimeIdentity {
+                runtime: runtime.clone(),
+                version: version.clone(),
+            }),
+        },
+        _ => SourceLocation::Project { package: None },
+    };
+    let origin = ContributionOrigin::new(Some(location), SourceKind::Authored)
+        .expect("captured owner origin");
+    let language = ShippedLanguage::TypeScript.language();
+    let limits = ExactPackageLimits::new(20, 16 * 1024 * 1024);
+    let input = if matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }) {
+        crate::NamespaceInput::project(owner, &language, &files, &context, &[], limits)
+            .expect("captured local input")
+    } else {
+        ExactPackageInput::new(owner, &language, &origin, &files, limits)
+            .expect("captured release input")
+            .with_framework_context(&context, &[])
+            .expect("original metadata")
+            .namespace_input()
+    };
+    let facts = TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript)
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            input.syntax(),
+        )
+        .expect("original source parses")
+        .into_facts();
+    let selected = [super::SelectedFile {
+        path: &path,
+        source,
+        syntax: &facts,
+    }];
+    (super::prepare(&input, &selected), facts)
+}
+
+fn types_node_owner() -> rift_protocol::identity::SymbolOwner {
+    SymbolIdentity::parse(
+        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node:buffer/isUtf8",
+    )
+    .expect("exact declaration package owner")
+    .owner()
+    .clone()
+}
+
+#[test]
+fn package_ambient_original_buffer_keeps_owner_ranges_and_unknown_entry() {
+    let source = include_str!("../../../../tests/fixtures/types-node-buffer.d.ts");
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    let owner = types_node_owner();
+    let (found, facts) = ambient_prepared(&owner, Some(metadata), source);
+    assert!(!facts.has_errors());
+    let declaration = facts
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "isUtf8")
+        .expect("original callable declaration");
+    assert_eq!(
+        (declaration.item_range.start, declaration.item_range.end),
+        (391, 456)
+    );
+    assert_eq!(declaration.container.as_deref(), Some("\"node:buffer\""));
+    let identity = &found.anchors["buffer.d.ts"][&declaration.qualified_name];
+    let parsed = SymbolIdentity::parse(identity.as_str()).expect("Package ambient identity");
+    assert_eq!(parsed.owner(), &owner);
+    assert_eq!(parsed.language().name, "typescript");
+    assert_eq!(parsed.qualified_path(), ["node:buffer", "isUtf8"]);
+    assert_eq!(
+        facts.source_digest(),
+        Some(&rift_core::FileDigest::of(source.as_bytes()))
+    );
+    assert!(
+        found.mappings.is_empty(),
+        "no Runtime or JavaScript association"
+    );
+    assert!(
+        !found.anchors["buffer.d.ts"]
+            .keys()
+            .any(|name| name.starts_with("global."))
+    );
+    let metadata: super::PackageMetadata =
+        serde_json::from_str(metadata).expect("original metadata");
+    assert!(
+        super::entry_path(&metadata, "typescript").is_none(),
+        "compiler applicability remains unknown"
+    );
+}
+
+#[test]
+fn package_ambient_missing_wrong_metadata_and_other_owners_remain_unknown() {
+    use rift_protocol::identity::SymbolOwner;
+    let source =
+        "declare module \"node:buffer\" { export function isUtf8(input: unknown): boolean; }";
+    let original = include_str!("../../../../tests/fixtures/types-node-package.json");
+    for metadata in [
+        None,
+        Some("not JSON"),
+        Some(r#"{"name":"other","version":"26.6.4"}"#),
+        Some(r#"{"name":"@types/node","version":"26.6.3"}"#),
+    ] {
+        let (found, facts) = ambient_prepared(&types_node_owner(), metadata, source);
+        assert!(facts.symbols().iter().any(|symbol| symbol.name == "isUtf8"));
+        assert!(found.anchors.is_empty(), "{metadata:?}");
+    }
+    for owner in [
+        SymbolOwner::Local,
+        SymbolOwner::NamedLocal {
+            name: "node".to_owned(),
+        },
+        SymbolOwner::Runtime {
+            runtime: "node".to_owned(),
+            version: "26.6.4".to_owned(),
+        },
+    ] {
+        let (found, facts) = ambient_prepared(&owner, Some(original), source);
+        assert!(facts.symbols().iter().any(|symbol| symbol.name == "isUtf8"));
+        assert!(found.anchors.is_empty(), "{owner:?}");
+        assert!(found.mappings.is_empty());
+    }
+}
+
+#[test]
+fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    for source in [
+        "declare namespace NodeJS { function isUtf8(): boolean; }",
+        "declare global { function isUtf8(): boolean; }",
+        "export function isUtf8(): boolean;",
+        "declare module \"node:buffer\" { export function isUtf8(input: ): boolean; }",
+        "declare module \"node:buffer\" { global { interface Broken { value: } } }",
+    ] {
+        let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+        assert!(found.anchors.is_empty(), "{source}");
+    }
+    let source = "export function outside(): boolean;\ndeclare module \"node:buffer\" { export function isUtf8(): boolean; global { interface GlobalMember {} } }\n";
+    let (found, facts) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+    assert!(!facts.has_errors());
+    let anchors = &found.anchors["buffer.d.ts"];
+    assert!(anchors.contains_key("\"node:buffer\".isUtf8"));
+    assert!(!anchors.contains_key("outside"));
+    assert!(!anchors.keys().any(|name| name.starts_with("global.")));
+}
+
+#[test]
+fn package_ambient_reuses_overload_and_occurrence_identity() {
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    let overloads = "declare module \"node:buffer\" { export function read(value: string): string; export function read(value: number): string; }";
+    let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), overloads);
+    let identities = found.anchors["buffer.d.ts"]
+        .iter()
+        .filter(|(name, _)| name.contains(".read"))
+        .map(|(_, identity)| identity)
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0], identities[1]);
+    let repeated =
+        "declare module \"node:buffer\" { export function read() {} export function read() {} }";
+    let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), repeated);
+    let identities = found.anchors["buffer.d.ts"]
+        .iter()
+        .filter(|(name, _)| name.contains(".read"))
+        .map(|(_, identity)| identity)
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(identities[0], identities[1]);
+    assert!(identities[1].as_str().contains("~2?rev="));
+    assert!(
+        identities[1]
+            .as_str()
+            .ends_with(&crate::documentation::content_digest(repeated.as_bytes()).0)
+    );
+}
