@@ -2193,3 +2193,210 @@ fn literal_function_bodies_refuse_unknown_and_exported_macro_effects() {
     assert!(!found["src/lib.rs"].contains_key("spawn"));
     assert!(found["src/lib.rs"].contains_key("plain"));
 }
+
+#[test]
+fn literal_empty_matcher_definitions_keep_captured_conditional_declaration_sources() {
+    let definition = "macro_rules! crate_root { () => { #[cfg_attr(all(docsrs, if_docsrs_then_no_serde_core), path=\"core/de/mod.rs\")] pub mod de; pub mod ser; include!(concat!(env!(\"OUT_DIR\"), \"/private.rs\")); }; }";
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", "#[macro_use] mod crate_root; crate_root!();"),
+            ("src/crate_root.rs", definition),
+            ("src/de/mod.rs", "pub trait Deserialize {}"),
+            ("src/ser/mod.rs", "pub trait Serialize {}"),
+        ],
+        None,
+        false,
+    );
+    for (path, name, module) in [
+        ("src/de/mod.rs", "Deserialize", "de"),
+        ("src/ser/mod.rs", "Serialize", "ser"),
+    ] {
+        let identity = SymbolIdentity::parse(found[path][name].as_str())
+            .expect("original conditional declaration identity");
+        assert_eq!(identity.qualified_path(), ["crate_root", module, name]);
+    }
+}
+
+#[test]
+fn literal_empty_matcher_modules_keep_original_rows_before_and_after_unknown_effects() {
+    for definition in [
+        "macro_rules! crate_root { () => { pub mod de; unknown! {}; pub mod ser; }; }",
+        "macro_rules! crate_root { () => { include!(\"generated.rs\"); pub mod de; pub mod ser; }; }",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", "#[macro_use] mod crate_root; crate_root!();"),
+                ("src/crate_root.rs", definition),
+                ("src/de.rs", "pub trait Deserialize {}"),
+                ("src/ser.rs", "pub trait Serialize {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(found["src/de.rs"].contains_key("Deserialize"));
+        assert!(found["src/ser.rs"].contains_key("Serialize"));
+    }
+}
+
+#[test]
+fn literal_empty_matcher_modules_refuse_missing_conflicting_and_duplicate_sources() {
+    let root = "#[macro_use] mod crate_root; crate_root!();";
+    for definition in [
+        "macro_rules! crate_root { () => { #[path=\"missing.rs\"] pub mod de; }; }",
+        "macro_rules! crate_root { () => { pub mod de; pub mod de; }; }",
+        "macro_rules! crate_root { () => { #[cfg_attr(docsrs, path=\"other.rs\")] pub mod de; }; }",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", root),
+                ("src/crate_root.rs", definition),
+                ("src/de.rs", "pub trait Deserialize {}"),
+                ("src/other.rs", "pub trait Other {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/de.rs"), "{definition}");
+        assert!(!found.contains_key("src/other.rs"), "{definition}");
+    }
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            ("src/lib.rs", root),
+            (
+                "src/crate_root.rs",
+                "macro_rules! crate_root { () => { pub mod de; }; }",
+            ),
+            ("src/de.rs", "pub trait First {}"),
+            ("src/de/mod.rs", "pub trait Second {}"),
+        ],
+        None,
+        false,
+    );
+    assert!(!found.contains_key("src/de.rs"));
+    assert!(!found.contains_key("src/de/mod.rs"));
+}
+
+#[test]
+fn literal_empty_matcher_modules_refuse_unknown_matchers_arguments_and_shadowed_definitions() {
+    let definition = "macro_rules! crate_root { () => { pub mod de; }; }";
+    for root in [
+        "#[macro_use] mod crate_root; crate_root!(argument);",
+        "#[macro_use] mod crate_root; use other::Macro as crate_root; crate_root!();",
+        "#[macro_use] mod crate_root; unknown! {}; crate_root!();",
+        "#[macro_use] mod crate_root; macro_rules! crate_root { () => {}; } crate_root!();",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", root),
+                ("src/crate_root.rs", definition),
+                ("src/de.rs", "pub trait Refused {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/de.rs"), "{root}");
+    }
+    for definition in [
+        "macro_rules! crate_root { ($value:expr) => { pub mod de; }; }",
+        "macro_rules! crate_root { () => { pub mod de; }; () => { pub mod other; }; }",
+        "macro_rules! crate_root { () => { #[cfg_attr(docsrs, custom)] pub mod de; }; }",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", "#[macro_use] mod crate_root; crate_root!();"),
+                ("src/crate_root.rs", definition),
+                ("src/de.rs", "pub trait Refused {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/de.rs"), "{definition}");
+    }
+}
+
+#[test]
+fn literal_empty_matcher_modules_keep_references_after_opaque_exported_definitions() {
+    for attribute in ["#[macro_export]", "#[macro_export(local_inner_macros)]"] {
+        let macros = format!(
+            "{attribute} macro_rules! helper {{ ($($tokens:tt)*) => {{ unknown! {{ $($tokens)* }} }}; }}"
+        );
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                (
+                    "src/lib.rs",
+                    "#[macro_use] mod crate_root; #[macro_use] mod macros; crate_root!();",
+                ),
+                (
+                    "src/crate_root.rs",
+                    "macro_rules! crate_root { () => { pub mod de; }; }",
+                ),
+                ("src/macros.rs", macros.as_str()),
+                ("src/de.rs", "pub trait Deserialize {}"),
+            ],
+            None,
+            false,
+        );
+        let identity = SymbolIdentity::parse(found["src/de.rs"]["Deserialize"].as_str())
+            .expect("original declaration after opaque definition");
+        assert_eq!(
+            identity.qualified_path(),
+            ["crate_root", "de", "Deserialize"]
+        );
+    }
+}
+
+#[test]
+fn literal_empty_matcher_modules_refuse_exported_definition_invocations() {
+    for attribute in ["#[macro_export]", "#[macro_export(local_inner_macros)]"] {
+        let definition =
+            format!("{attribute} macro_rules! crate_root {{ () => {{ pub mod de; }}; }}");
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                ("src/lib.rs", "#[macro_use] mod crate_root; crate_root!();"),
+                ("src/crate_root.rs", definition.as_str()),
+                ("src/de.rs", "pub trait Deserialize {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/de.rs"), "{definition}");
+    }
+}
+
+#[test]
+fn literal_empty_matcher_modules_refuse_unknown_and_misattached_export_attributes() {
+    for macros in [
+        "#[macro_export(unknown)] macro_rules! helper { () => {}; }",
+        "#[macro_export(local_inner_macros)] pub fn helper() {}",
+        "#[macro_export(local_inner_macros, unknown)] macro_rules! helper { () => {}; }",
+        "#[macro_use] mod unknown; #[macro_export(local_inner_macros)] macro_rules! helper { () => {}; }",
+        "#[macro_export(local_inner_macros)] macro_rules! helper { () => {}; } helper!();",
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                (
+                    "src/lib.rs",
+                    "#[macro_use] mod crate_root; #[macro_use] mod macros; crate_root!();",
+                ),
+                (
+                    "src/crate_root.rs",
+                    "macro_rules! crate_root { () => { pub mod de; }; }",
+                ),
+                ("src/macros.rs", macros),
+                ("src/de.rs", "pub trait Deserialize {}"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/de.rs"), "{macros}");
+    }
+}

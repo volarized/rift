@@ -58,6 +58,10 @@ impl Scope {
         );
     }
 
+    fn definition(&self, name: &str) -> Option<&(rift_core::ProjectPath, ByteRange)> {
+        self.symbols.get(name)?.1.as_ref()
+    }
+
     fn clear(&mut self) {
         Arc::make_mut(&mut self.symbols).clear();
         self.complete = false;
@@ -388,6 +392,68 @@ fn macro_use(
 mod tests {
     use super::{Condition, Scope, cfg};
 
+    #[test]
+    fn captured_literal_definition_callbacks_keep_original_ranges_and_refuse_changed_definitions() {
+        let source = "macro_rules! crate_root { () => { unknown! {}; pub mod de; include!(\"generated.rs\"); }; }";
+        let path = rift_core::ProjectPath::new("src/crate_root.rs").expect("original path");
+        let facts = rift_syntax::SyntaxProvider::analyze(
+            &rift_syntax::RustSyntaxProvider::default(),
+            rift_syntax::SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            rift_syntax::SyntaxLimits::default(),
+        )
+        .expect("original definition")
+        .into_facts();
+        let file = super::SelectedFile {
+            path: &path,
+            source,
+            syntax: &facts,
+        };
+        let symbol = facts
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.kind == "macro")
+            .expect("captured definition");
+        let tokens = super::scope::Tokens::new(&file).expect("original bounded scanner");
+        let mut rows = Vec::new();
+        assert!(
+            tokens
+                .definition_modules(
+                    symbol.item_range,
+                    "crate_root",
+                    |range, name, default_path, paths| {
+                        rows.push(range);
+                        assert_eq!(name, "de");
+                        assert!(default_path && paths.is_empty());
+                        assert_eq!(super::text_range(source, range), Some("mod de;"));
+                        Some(())
+                    }
+                )
+                .is_some()
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(
+            tokens
+                .definition_modules(symbol.item_range, "wrong", |_, _, _, _| panic!(
+                    "wrong definition cannot call back"
+                ))
+                .is_none()
+        );
+        let changed = rift_syntax::ByteRange {
+            start: symbol.item_range.start + 1,
+            end: symbol.item_range.end,
+        };
+        assert!(
+            tokens
+                .definition_modules(changed, "crate_root", |_, _, _, _| panic!(
+                    "changed range cannot call back"
+                ))
+                .is_none()
+        );
+    }
+
     fn definition_scope(source: &str, changed: Option<&str>) -> Scope {
         let path = rift_core::ProjectPath::new("src/crate_root.rs").expect("captured path");
         let document = rift_syntax::SyntaxProvider::analyze(
@@ -566,11 +632,15 @@ impl Event<'_> {
 }
 
 fn macro_export_attribute(file: &SelectedFile<'_>, range: ByteRange) -> bool {
-    text_range(file.source, range).is_some_and(|source| source.trim() == "#[macro_export]")
+    let Some(source) = text_range(file.source, range) else {
+        return false;
+    };
+    let local = source.trim() == "#[macro_export(local_inner_macros)]";
+    (source.trim() == "#[macro_export]" || local)
         && file.syntax.symbols().iter().any(|symbol| {
             symbol.kind == "macro"
                 && symbol.node_kind == Some("macro_definition")
-                && symbol.visibility.as_deref() == Some("pub")
+                && (local || symbol.visibility.as_deref() == Some("pub"))
                 && symbol.range.start <= range.start
                 && range.end <= symbol.item_range.start
         })
@@ -700,6 +770,77 @@ impl Context<'_> {
         }
     }
 
+    fn definition_children(
+        &self,
+        file: &SelectedFile<'_>,
+        invocation: ByteRange,
+        name: &str,
+        directory: &str,
+        scope: &Scope,
+        tokens: &scope::Tokens<'_>,
+    ) -> Option<Vec<Child>> {
+        if !tokens.empty_invocation(invocation, name) {
+            return None;
+        }
+        let (path, range) = scope.definition(name)?;
+        let defining = self.inventory.get(path.as_str())?;
+        if self.originals.get(path.as_str()).copied() != Some(defining.source)
+            || defining.syntax.has_errors()
+            || !defining.syntax.symbols().iter().any(|symbol| {
+                symbol.name == name
+                    && symbol.kind == "macro"
+                    && symbol.node_kind == Some("macro_definition")
+                    && symbol.range.start == range.start
+                    && symbol.item_range == *range
+            })
+            || path.as_str().rsplit_once('/').map(|(parent, _)| parent)
+                != file
+                    .path
+                    .as_str()
+                    .rsplit_once('/')
+                    .map(|(parent, _)| parent)
+        {
+            return None;
+        }
+        let definition = scope::Tokens::new(defining)?;
+        let mut children = Vec::new();
+        let mut incomplete = scope.clone();
+        incomplete.clear();
+        definition.definition_modules(*range, name, |module, name, default_path, paths| {
+            if module.start < range.start || module.end > range.end {
+                return None;
+            }
+            let mut candidates = Vec::new();
+            if default_path && let Some(path) = child_path(name, directory, self.inventory) {
+                candidates.push(path);
+            }
+            let parent = file
+                .path
+                .as_str()
+                .rsplit_once('/')
+                .map_or("", |(parent, _)| parent);
+            for path in paths {
+                let candidate = if parent.is_empty() {
+                    path.as_str().to_owned()
+                } else {
+                    format!("{parent}/{}", path.as_str())
+                };
+                if rift_core::ProjectPath::new(candidate.as_str()).is_ok()
+                    && self.inventory.contains_key(candidate.as_str())
+                {
+                    candidates.push(candidate);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+            if let [path] = candidates.as_slice() {
+                children.push((path.clone(), vec![name.to_owned()], incomplete.clone()));
+            }
+            Some(())
+        })?;
+        Some(children)
+    }
+
     fn file_exports(
         &self,
         path: &str,
@@ -748,6 +889,13 @@ impl Context<'_> {
     }
 }
 
+fn invocation_name(source: &str, range: ByteRange) -> Option<&str> {
+    text_range(source, range)
+        .and_then(|source| source.split_once('!'))
+        .map(|(name, _)| name.trim())
+        .filter(|name| super::crate_name_is_valid(name))
+}
+
 pub(super) fn children<'a>(
     file: &'a SelectedFile<'a>,
     directory: &str,
@@ -783,12 +931,8 @@ pub(super) fn children<'a>(
         match event {
             Event::Symbol(symbol) if symbol.kind == "macro" => {
                 let transparent = transparent_definition(file.source, symbol, &scope);
-                scope.define(
-                    file,
-                    symbol,
-                    transparent,
-                    originals.get(file.path.as_str()).copied(),
-                );
+                let original = originals.get(file.path.as_str()).copied();
+                scope.define(file, symbol, transparent, original);
             }
             Event::Symbol(symbol) => {
                 let name = super::source_identifier(&symbol.name);
@@ -796,12 +940,8 @@ pub(super) fn children<'a>(
                 if let Some((path, local)) = child {
                     children.push((path.clone(), local.clone(), scope.clone()));
                 }
-                context.import_module(
-                    symbol,
-                    child.map(|(path, _)| path.as_str()),
-                    tokens.as_ref(),
-                    &mut scope,
-                );
+                let path = child.map(|(path, _)| path.as_str());
+                context.import_module(symbol, path, tokens.as_ref(), &mut scope);
             }
             Event::Invocation((range, modules, direct)) => {
                 if tokens
@@ -810,12 +950,17 @@ pub(super) fn children<'a>(
                 {
                     continue;
                 }
-                let source = text_range(file.source, *range);
-                let name = source
-                    .and_then(|source| source.split_once('!'))
-                    .map(|(name, _)| name.trim())
-                    .filter(|name| super::crate_name_is_valid(name));
+                let name = invocation_name(file.source, *range);
                 if name.is_none_or(|name| scope.get(name) != Some(&true)) {
+                    if let Some(name) = name
+                        && direct.is_some()
+                        && let Some(literal) = tokens.as_ref().and_then(|tokens| {
+                            context
+                                .definition_children(file, *range, name, directory, &scope, tokens)
+                        })
+                    {
+                        children.extend(literal);
+                    }
                     scope.clear();
                     continue;
                 }

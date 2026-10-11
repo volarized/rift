@@ -133,7 +133,11 @@ impl<'a> Tokens<'a> {
         while consume(&mut input, &["#"]) {
             let _ = consume(&mut input, &["!"]);
             let value = group(&mut input, "[", "]")?;
-            if value == ["macro_export"] && !exported {
+            if matches!(
+                value,
+                ["macro_export"] | ["macro_export", "(", "local_inner_macros", ")"]
+            ) && !exported
+            {
                 exported = true;
             } else if !self.attribute(value, &Scope::default(), true, self.depth, false) {
                 self.complete = false;
@@ -255,6 +259,157 @@ impl<'a> Tokens<'a> {
     pub(super) fn item(&self, range: ByteRange, scope: &mut Scope, library: bool) -> Option<()> {
         let tokens = self.range(range)?;
         self.item_tokens(&tokens, scope, library, self.depth, true, &mut None)
+    }
+
+    pub(super) fn empty_invocation(&self, range: ByteRange, name: &str) -> bool {
+        let Some(tokens) = self.range(range) else {
+            return false;
+        };
+        let mut input = tokens.as_slice();
+        if !consume(&mut input, &[name, "!"]) {
+            return false;
+        }
+        let Some(close) = input.first().and_then(|open| match *open {
+            "(" => Some(")"),
+            "[" => Some("]"),
+            "{" => Some("}"),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let open = input[0];
+        let Some(body) = group(&mut input, open, close) else {
+            return false;
+        };
+        let _ = consume(&mut input, &[";"]);
+        body.is_empty() && input.is_empty()
+    }
+
+    pub(super) fn definition_modules(
+        &self,
+        range: ByteRange,
+        name: &str,
+        mut callback: impl FnMut(ByteRange, &str, bool, &[rift_core::ProjectPath]) -> Option<()>,
+    ) -> Option<()> {
+        let tokens = self.range(range)?;
+        let mut input = tokens.as_slice();
+        if !consume(&mut input, &["macro_rules", "!", name, "{"]) {
+            return None;
+        }
+        if !group(&mut input, "(", ")")?.is_empty() || !consume(&mut input, &["=", ">"]) {
+            return None;
+        }
+        let body = group(&mut input, "{", "}")?;
+        let _ = consume(&mut input, &[";"]);
+        if !consume(&mut input, &["}"]) || !input.is_empty() {
+            return None;
+        }
+        self.charge(body.len().checked_mul(2)?)?;
+        let mut modules = Vec::new();
+        let mut names = BTreeSet::new();
+        items(body, self.depth, |item| {
+            if let Some((range, name, default_path, paths)) = self.definition_module(item) {
+                if !names.insert(name.clone()) {
+                    return None;
+                }
+                modules.push((range, name, default_path, paths));
+            }
+            Some(())
+        })?;
+        for (module, name, default_path, paths) in modules {
+            if module.start < range.start || module.end > range.end {
+                return None;
+            }
+            callback(module, &name, default_path, &paths)?;
+        }
+        Some(())
+    }
+
+    fn definition_module(
+        &self,
+        mut input: &[&str],
+    ) -> Option<(ByteRange, String, bool, Vec<rift_core::ProjectPath>)> {
+        let mut default_path = true;
+        let mut paths = Vec::new();
+        while consume(&mut input, &["#"]) {
+            if consume(&mut input, &["!"]) {
+                return None;
+            }
+            let value = group(&mut input, "[", "]")?;
+            if !self.definition_attribute(value, &mut default_path, &mut paths) {
+                return None;
+            }
+        }
+        visibility(&mut input)?;
+        let module = input;
+        if !consume(&mut input, &["mod"]) {
+            return None;
+        }
+        let name = identifier(&mut input)?;
+        if !consume(&mut input, &[";"]) || !input.is_empty() {
+            return None;
+        }
+        Some((self.module_range(module)?, name, default_path, paths))
+    }
+
+    fn definition_attribute(
+        &self,
+        input: &[&str],
+        default_path: &mut bool,
+        paths: &mut Vec<rift_core::ProjectPath>,
+    ) -> bool {
+        let (conditional, value) = match input {
+            ["path", "=", value] => (false, *value),
+            ["cfg_attr", "(", body @ .., ")"] => {
+                let mut nested = 0_usize;
+                let Some(split) = body.iter().position(|token| {
+                    match *token {
+                        "(" => nested += 1,
+                        ")" => nested = nested.saturating_sub(1),
+                        _ => {}
+                    }
+                    *token == "," && nested == 0
+                }) else {
+                    return false;
+                };
+                if super::cfg(&body[..split], false, self.depth).is_none() {
+                    return false;
+                }
+                let ["path", "=", value] = &body[split + 1..] else {
+                    return body.get(split + 1) == Some(&"doc")
+                        && self.attribute(input, &Scope::default(), false, self.depth, false);
+                };
+                (true, *value)
+            }
+            [
+                "cfg" | "doc" | "allow" | "warn" | "deny" | "forbid" | "deprecated",
+                ..,
+            ] => {
+                return self.attribute(input, &Scope::default(), false, self.depth, false);
+            }
+            _ => return false,
+        };
+        if !paths.is_empty() {
+            return false;
+        }
+        let Some(path) = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            return false;
+        };
+        if path.is_empty()
+            || path.contains('\\')
+            || path.len() > rift_core::constants::PROJECT_PATH_BYTES_MAX
+        {
+            return false;
+        }
+        let Ok(path) = rift_core::ProjectPath::new(path) else {
+            return false;
+        };
+        paths.push(path);
+        *default_path = conditional;
+        true
     }
 
     pub(super) fn item_modules(
@@ -1108,6 +1263,21 @@ mod tests {
         ] {
             assert!(!super::compile_error_tokens(tokens));
         }
+    }
+
+    #[test]
+    fn literal_definition_callbacks_refuse_work_overflow() {
+        let source = "macro_rules! crate_root { () => { pub mod de; }; }";
+        with_tokens(source, |tokens| {
+            tokens.work.set(tokens.work_max);
+            assert!(
+                tokens
+                    .definition_modules(whole(source), "crate_root", |_, _, _, _| panic!(
+                        "work overflow cannot call back"
+                    ))
+                    .is_none()
+            );
+        });
     }
 
     #[test]
