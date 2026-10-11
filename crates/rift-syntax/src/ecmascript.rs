@@ -61,6 +61,8 @@ use std::num::NonZeroU16;
 use rift_core::line::{LINE_FEED, LineEnding, lines_inclusive, without_ending};
 use rift_error::errors;
 use rift_protocol::read::{Documentation, DocumentationFormat, Language, NodeFacet, SymbolFacet};
+mod commonjs;
+
 use tree_sitter::{Node, Parser};
 
 use crate::document::{ByteRange, SyntaxDocument, SyntaxExportBinding, SyntaxExportKind};
@@ -1295,10 +1297,17 @@ pub(crate) fn analyze_included(
     let tree = parser
         .parse(source.text, None)
         .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
-    let rules = EcmaScriptRules {
+    let mut rules = EcmaScriptRules {
         kinds,
         exports: ModuleExports::read(tree.root_node(), source.text, kinds)?,
     };
+    commonjs::record(
+        tree.root_node(),
+        source,
+        limits,
+        kinds,
+        &mut rules.exports.bindings,
+    )?;
     let (nodes, symbols, export_bindings) =
         extract::extract_with_export_bindings(tree.root_node(), source, limits, language, &rules)?;
     Ok(SyntaxDocument::new(

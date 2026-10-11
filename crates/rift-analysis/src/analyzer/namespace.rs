@@ -42,6 +42,7 @@ pub(crate) struct ExportBinding {
 #[derive(Default)]
 pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
+    pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     pub(crate) mappings: BTreeMap<String, BTreeMap<String, rift_syntax::LogicalDeclaration>>,
     pub(crate) exports: Vec<ExportBinding>,
     pub(crate) unresolved_exports: bool,

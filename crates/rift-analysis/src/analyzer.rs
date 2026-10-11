@@ -405,6 +405,12 @@ fn place_namespace(
             .error()
     })?;
     for held in analyzed {
+        held.public_names.extend(
+            namespace
+                .public_names
+                .remove(held.file.path().as_str())
+                .unwrap_or_default(),
+        );
         let assigned = namespace
             .anchors
             .remove(held.file.path().as_str())

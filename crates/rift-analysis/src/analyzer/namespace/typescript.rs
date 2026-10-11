@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, de};
 use super::{ExportBinding, PreparedNamespace, SelectedFile};
 use crate::NamespaceInput;
 
+mod commonjs;
 mod observations;
 
 /// Establishes declarations in an entry module from captured owner and metadata.
@@ -566,6 +567,8 @@ struct PackageMetadata {
     exports: Option<Exports>,
     #[serde(rename = "typesVersions")]
     types_versions: Option<serde_json::Value>,
+    #[serde(rename = "type")]
+    module_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -695,10 +698,21 @@ fn declaration_anchors(
     source: &str,
     module: Option<&str>,
 ) -> BTreeMap<String, SymbolId> {
+    declaration_anchors_with_public(input, syntax, source, module, &BTreeSet::new())
+}
+
+fn declaration_anchors_with_public(
+    input: &NamespaceInput<'_>,
+    syntax: &SyntaxFacts,
+    source: &str,
+    module: Option<&str>,
+    public: &BTreeSet<String>,
+) -> BTreeMap<String, SymbolId> {
     let mut groups: BTreeMap<String, Vec<&SyntaxSymbol>> = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
         symbol.node_kind != Some("assignment_expression")
             || symbol.facets.contains(&SymbolFacet::Public)
+            || public.contains(&symbol.qualified_name)
     }) {
         groups
             .entry(defining_name(symbol))
@@ -711,6 +725,7 @@ fn declaration_anchors(
     for symbol in syntax.symbols().iter().filter(|symbol| {
         symbol.node_kind != Some("assignment_expression")
             || symbol.facets.contains(&SymbolFacet::Public)
+            || public.contains(&symbol.qualified_name)
     }) {
         let literal = declared_module_name(symbol, source);
         let Some(mut path) = literal

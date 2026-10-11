@@ -918,3 +918,293 @@ fn package_ambient_reuses_overload_and_occurrence_identity() {
             .ends_with(&crate::documentation::content_digest(repeated.as_bytes()).0)
     );
 }
+
+fn commonjs_prepared(
+    metadata: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+    conditions: &[&str],
+) -> (
+    super::PreparedNamespace,
+    Vec<std::sync::Arc<rift_syntax::SyntaxFacts>>,
+) {
+    let owner =
+        SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react@19.3.0/javascript/react/open")
+            .expect("captured package owner")
+            .owner()
+            .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "npm".to_owned(),
+                registry: "npmjs.org".to_owned(),
+                name: "react".to_owned(),
+                version: "19.3.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("original package origin");
+    let paths = files
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("original path"))
+        .collect::<Vec<_>>();
+    let sources = paths
+        .iter()
+        .zip(files)
+        .map(|(path, (_, text))| PackageSource::new(path, text))
+        .collect::<Vec<_>>();
+    let metadata_path = ProjectPath::new("package.json").expect("metadata path");
+    let context = [PackageSource::new(&metadata_path, metadata)];
+    let implementation = sources
+        .iter()
+        .find(|source| source.path().as_str() == entry)
+        .copied()
+        .expect("selected original entry");
+    let observations = [crate::NamespaceModule::new(
+        "react",
+        implementation,
+        &[],
+        conditions,
+    )];
+    let language = ShippedLanguage::JavaScript.language();
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(20, 16 * 1024 * 1024),
+    )
+    .expect("bounded original sources")
+    .with_framework_context(&context, &[])
+    .expect("original metadata")
+    .with_modules(&observations)
+    .expect("captured resolver conditions");
+    let facts = sources
+        .iter()
+        .map(|source| {
+            JavaScriptSyntaxProvider::default()
+                .analyze(
+                    SyntaxSource {
+                        path: source.path(),
+                        text: source.text(),
+                    },
+                    input.limits().syntax(),
+                )
+                .expect("original JavaScript parses")
+                .into_facts()
+        })
+        .collect::<Vec<_>>();
+    let selected = sources
+        .iter()
+        .zip(&facts)
+        .map(|(source, syntax)| super::SelectedFile {
+            path: source.path(),
+            source: source.text(),
+            syntax,
+        })
+        .collect::<Vec<_>>();
+    (super::prepare(&input.namespace_input(), &selected), facts)
+}
+
+#[test]
+fn commonjs_original_react_builds_keep_distinct_modules_and_public_bindings() {
+    let files = [
+        (
+            "index.js",
+            include_str!("../../../../tests/fixtures/react/index.js"),
+        ),
+        (
+            "cjs/react.development.js",
+            include_str!("../../../../tests/fixtures/react/cjs/react.development.js"),
+        ),
+        (
+            "cjs/react.production.js",
+            include_str!("../../../../tests/fixtures/react/cjs/react.production.js"),
+        ),
+    ];
+    let (prepared, facts) = commonjs_prepared(
+        include_str!("../../../../tests/fixtures/react/package.json"),
+        &files,
+        "index.js",
+        &["node", "require"],
+    );
+    assert!(
+        prepared.unresolved_exports,
+        "conditional facade remains unknown"
+    );
+    let mut identities = Vec::new();
+    for (index, path) in ["cjs/react.development.js", "cjs/react.production.js"]
+        .iter()
+        .enumerate()
+    {
+        let declaration = facts[index + 1]
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "useState")
+            .expect("original raw useState");
+        assert!(
+            !declaration
+                .facets
+                .contains(&rift_protocol::read::SymbolFacet::Public)
+        );
+        let anchors = prepared
+            .anchors
+            .get(*path)
+            .expect("resolved defining module");
+        identities.push(
+            anchors
+                .get(&declaration.qualified_name)
+                .expect("checked useState identity")
+                .clone(),
+        );
+        assert!(prepared.public_names[*path].contains(&declaration.qualified_name));
+        assert!(
+            facts[index + 1]
+                .export_bindings()
+                .expect("original bindings")
+                .iter()
+                .any(|binding| binding.range == declaration.item_range
+                    && binding.local == declaration.name_range)
+        );
+    }
+    assert_ne!(
+        identities[0], identities[1],
+        "different resolved CommonJS files stay distinct"
+    );
+    assert!(!prepared.anchors["index.js"].contains_key("useState"));
+}
+
+#[test]
+fn commonjs_receiver_shadow_reassignment_qualified_and_ordinary_functions_remain_unknown() {
+    let metadata = r#"{"name":"react","version":"19.3.0","main":"index.js"}"#;
+    for source in [
+        "const exports={}; exports.open=function(){};",
+        "exports={}; exports.open=function(){};",
+        "module={exports:{}}; module.exports.open=function(){};",
+        "module.exports={}; exports.open=function(){};",
+        "exports.open=function(){}; module.exports={};",
+        "module.exports=require('./other.js'); exports.open=function(){};",
+        "const {exports}=other; exports.open=function(){};",
+        "function outer(exports){exports.open=function(){};}",
+        "(function(exports){exports.open=function(){};})(other);",
+        "function outer(){exports.open=function(){};}",
+        "window.exports.open=function(){};",
+        "eval('exports = other'); exports.open=function(){};",
+    ] {
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[("index.js", source)],
+            "index.js",
+            &["node", "require"],
+        );
+        assert!(
+            !prepared
+                .anchors
+                .get("index.js")
+                .is_some_and(|anchors| anchors.contains_key("open")),
+            "{source}"
+        );
+        assert!(
+            !prepared
+                .public_names
+                .get("index.js")
+                .is_some_and(|names| names.contains("open")),
+            "{source}"
+        );
+    }
+    for source in [
+        "exports.open=function(){};",
+        "(function(){exports.open=function(){};})();",
+        "if(condition){exports.open=function(){};}",
+    ] {
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[("index.js", source)],
+            "index.js",
+            &["node", "require"],
+        );
+        assert!(
+            prepared.anchors["index.js"].contains_key("open"),
+            "{source}"
+        );
+        assert!(
+            prepared.public_names["index.js"].contains("open"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn commonjs_original_entry_conditions_owner_and_esm_context_are_required() {
+    let source = "exports.open=function(){};";
+    for (metadata, conditions) in [
+        (
+            r#"{"name":"wrong","version":"19.3.0","main":"index.js"}"#,
+            &["node", "require"][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"other.js"}"#,
+            &["node", "require"][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"index.js","type":"module"}"#,
+            &["node", "require"][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
+            &[][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
+            &["import"][..],
+        ),
+    ] {
+        let (prepared, _) =
+            commonjs_prepared(metadata, &[("index.js", source)], "index.js", conditions);
+        assert!(
+            !prepared
+                .anchors
+                .get("index.js")
+                .is_some_and(|anchors| anchors.contains_key("open"))
+        );
+        assert!(prepared.public_names.is_empty());
+    }
+}
+
+#[test]
+fn commonjs_literal_forwarding_missing_dynamic_shadow_and_cycles_stay_bounded() {
+    let metadata = r#"{"name":"react","version":"19.3.0","main":"index.js"}"#;
+    for entry in [
+        "module.exports=require(target);",
+        "const require=other; module.exports=require('./child.js');",
+        "module.exports=require('../child.js');",
+        "module.exports=require('./missing.js');",
+    ] {
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[
+                ("index.js", entry),
+                ("child.js", "exports.open=function(){};"),
+            ],
+            "index.js",
+            &["node", "require"],
+        );
+        assert!(!prepared.anchors.contains_key("child.js"), "{entry}");
+    }
+    let (prepared, _) = commonjs_prepared(
+        metadata,
+        &[
+            (
+                "index.js",
+                "module.exports=require('./child.js'); if(condition){module.exports=require('./cycle.js');}",
+            ),
+            ("child.js", "exports.open=function(){};"),
+            ("cycle.js", "module.exports=require('./index.js');"),
+        ],
+        "index.js",
+        &["node", "require"],
+    );
+    assert!(prepared.anchors["child.js"].contains_key("open"));
+    assert!(prepared.unresolved_exports);
+}
