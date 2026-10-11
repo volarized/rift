@@ -58,7 +58,7 @@ pub use selection::{
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
-pub use traversal::{TraversalWalk, walk_traversal_capped};
+pub use traversal::{TraversalWalk, walk_traversal_capped, walk_traversal_capped_async};
 
 #[cfg(feature = "collector")]
 mod package_syntax;
