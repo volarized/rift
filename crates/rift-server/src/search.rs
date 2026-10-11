@@ -5095,24 +5095,27 @@ impl Tower {
         );
     }
 
-    /// `packages` reaches the global API alone, so beside the `local` scope and beside
-    /// `rev` the search refuses naming it, and beside a scope reaching packages it passes
-    /// the rule.
+    /// `packages` reaches the global API alone, so the `local` scope refuses naming
+    /// `packages`. A scope reaching packages beside `rev` refuses naming `scope`.
+    /// Without a revision, the scope reaching packages passes the rule.
     #[test]
     fn search_packages_refuse_beside_the_local_scope_and_rev() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
         let packages = json!([{"manager": "cargo", "name": "serde"}]);
-        for (request, violation) in [
+        for (request, field, violation) in [
             (
                 json!({"query": "beacon", "packages": packages}),
+                "packages",
                 "the local scope reads the project alone",
             ),
             (
                 json!({"query": "beacon", "scope": "all", "rev": "main", "packages": packages}),
+                "scope",
                 "package facts are served for the current tree alone",
             ),
             (
                 json!({"change": {"base": "main"}, "packages": packages}),
+                "packages",
                 "the local scope reads the project alone",
             ),
         ] {
@@ -5124,7 +5127,7 @@ impl Tower {
                 error.slug() == rift_error::errors::server::read_invalid::SLUG
                     && error
                         .context()
-                        .any(|(key, value)| key == "field" && value == "packages")
+                        .any(|(key, value)| key == "field" && value == field)
                     && error
                         .context()
                         .any(|(key, value)| key == "violation" && value == violation),
