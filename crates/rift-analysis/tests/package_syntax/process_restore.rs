@@ -132,6 +132,8 @@ impl CapturedSymbol {
 
 type MacroInvocation = ([u64; 2], Vec<[u64; 2]>, Option<Vec<[u64; 2]>>);
 
+type Scope = ([u64; 2], Option<Vec<[u64; 2]>>);
+
 #[derive(Serialize, Deserialize)]
 struct CapturedFacts {
     language: Language,
@@ -140,6 +142,7 @@ struct CapturedFacts {
     limits: [u64; 3],
     symbols: Vec<CapturedSymbol>,
     macro_invocations: Option<Vec<MacroInvocation>>,
+    scope: Option<Vec<Scope>>,
     has_errors: bool,
     left_out_declarations: u64,
 }
@@ -175,6 +178,21 @@ impl CapturedFacts {
                                 .collect(),
                             direct.as_ref().map(|ranges| {
                                 ranges
+                                    .iter()
+                                    .map(|range| [range.start, range.end])
+                                    .collect()
+                            }),
+                        )
+                    })
+                    .collect()
+            }),
+            scope: syntax.facts().scope().map(|rows| {
+                rows.iter()
+                    .map(|(range, children)| {
+                        (
+                            [range.start, range.end],
+                            children.as_ref().map(|children| {
+                                children
                                     .iter()
                                     .map(|range| [range.start, range.end])
                                     .collect()
@@ -225,6 +243,21 @@ impl CapturedFacts {
                                     .collect(),
                                 direct.map(|ranges| {
                                     ranges
+                                        .into_iter()
+                                        .map(|[start, end]| ByteRange { start, end })
+                                        .collect()
+                                }),
+                            )
+                        })
+                        .collect()
+                }),
+                scope: self.scope.map(|rows| {
+                    rows.into_iter()
+                        .map(|([start, end], children)| {
+                            (
+                                ByteRange { start, end },
+                                children.map(|children| {
+                                    children
                                         .into_iter()
                                         .map(|[start, end]| ByteRange { start, end })
                                         .collect()

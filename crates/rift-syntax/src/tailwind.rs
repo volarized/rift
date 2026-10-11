@@ -671,6 +671,7 @@ pub fn append_framework_symbols(
         markdown_facts: None,
         export_bindings: result.facts().export_bindings().map(<[_]>::to_vec),
         macro_invocations: result.facts().macro_invocations().map(<[_]>::to_vec),
+        scope: result.facts().scope().map(<[_]>::to_vec),
         source_digest: FileDigest::of(source.text.as_bytes()),
     };
     SyntaxFacts::from_parts(source.text, limits, parts)?;

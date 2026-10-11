@@ -178,6 +178,9 @@ pub enum SyntaxOrigin {
 /// Captured invocation, direct module items, and optional complete direct token ranges.
 pub type MacroInvocation = (ByteRange, Vec<ByteRange>, Option<Vec<ByteRange>>);
 
+/// Original Rust scope range and optional complete direct child ranges.
+pub type Scope = (ByteRange, Option<Vec<ByteRange>>);
+
 /// Immutable syntax facts shared by documents at different paths, without complete node rows.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
@@ -189,6 +192,7 @@ pub struct SyntaxFacts {
     left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
     macro_invocations: Option<Vec<MacroInvocation>>,
+    scope: Option<Vec<Scope>>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -352,6 +356,7 @@ impl SyntaxDocument {
                 left_out_symbols,
                 export_bindings: None,
                 macro_invocations,
+                scope: None,
                 has_errors,
                 left_out_declarations,
                 markdown_facts: None,
@@ -416,6 +421,9 @@ impl SyntaxDocument {
     pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
         let facts = Arc::make_mut(&mut self.facts);
         facts.source_digest = Some(FileDigest::of(source.as_bytes()));
+        if facts.language.name == "rust" && facts.language.dialect.is_none() {
+            facts.scope = rust_macros::capture_scope(source, &self.nodes, facts.has_errors);
+        }
         if let Some(invocations) = &mut facts.macro_invocations {
             rust_macros::capture(source, &self.nodes, invocations);
         }
@@ -482,6 +490,12 @@ impl SyntaxFacts {
     #[must_use]
     pub fn export_bindings(&self) -> Option<&[SyntaxExportBinding]> {
         self.export_bindings.as_deref()
+    }
+
+    /// Returns original Rust scopes, or `None` for unrecorded scope facts.
+    #[must_use]
+    pub fn scope(&self) -> Option<&[Scope]> {
+        self.scope.as_deref()
     }
 
     /// Returns captured top-level Rust macro invocations, or `None` for unrecorded facts.
@@ -592,6 +606,7 @@ impl SyntaxFacts {
             left_out_symbols: parts.left_out_symbols,
             export_bindings: parts.export_bindings,
             macro_invocations: parts.macro_invocations,
+            scope: parts.scope,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,

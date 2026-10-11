@@ -411,6 +411,8 @@ pub struct ExactPackageInput<'input> {
             Option<ArchiveMemberKind>,
         >,
     >,
+    #[cfg(feature = "collector")]
+    library: Option<(PackageSource<'input>, PackageSource<'input>)>,
     limits: ExactPackageLimits,
 }
 
@@ -447,6 +449,8 @@ impl<'input> ExactPackageInput<'input> {
             modules: &[],
             #[cfg(feature = "collector")]
             build_paths: None,
+            #[cfg(feature = "collector")]
+            library: None,
             limits,
         })
     }
@@ -525,6 +529,27 @@ impl<'input> ExactPackageInput<'input> {
         self.import_roots
     }
 
+    /// Captures the explicitly selected non-test Cargo library acquisition.
+    ///
+    /// The manifest and library root must be original admitted sources for this owner.
+    /// The parsed manifest must select this root for the same package name and version.
+    /// This context does not establish feature, platform, or custom cfg applicability.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for a missing or mismatched owner, source,
+    /// manifest, or library target.
+    #[cfg(feature = "collector")]
+    pub fn with_library(
+        mut self,
+        owner: &SymbolOwner,
+        manifest: PackageSource<'input>,
+        root: PackageSource<'input>,
+    ) -> Result<Self, RiftError> {
+        self.namespace_input().with_library(owner, manifest, root)?;
+        self.library = Some((manifest, root));
+        Ok(self)
+    }
+
     /// Selected artifact, when its immutable content was captured.
     #[must_use]
     pub const fn artifact(self) -> Option<&'input PackageArtifact> {
@@ -586,6 +611,11 @@ impl<'input> ExactPackageInput<'input> {
         )?;
         self.context_sources = sources;
         self.frameworks = frameworks;
+        #[cfg(feature = "collector")]
+        if let Some((manifest, root)) = self.library {
+            self.namespace_input()
+                .with_library(self.owner, manifest, root)?;
+        }
         #[cfg(feature = "collector")]
         if let Some(paths) = self.build_paths {
             self.namespace_input().with_build_paths(paths)?;

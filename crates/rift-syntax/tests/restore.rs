@@ -33,6 +33,7 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         markdown_facts: facts.markdown_facts().cloned(),
         export_bindings: facts.export_bindings().map(<[_]>::to_vec),
         macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
+        scope: facts.scope().map(<[_]>::to_vec),
         source_digest: *facts.source_digest().expect("source witness"),
     }
 }
@@ -1267,6 +1268,286 @@ fn rust_macro_direct_tokens_distinguish_literals_comments_and_invalid_groups() {
             .macro_invocations()
             .is_some_and(|rows| rows.iter().all(|(_, _, direct)| direct.is_none()))
     );
+}
+
+#[test]
+fn rust_scope_preserves_original_root_and_module_children() {
+    let source = "#![allow(dead_code)]\nextern crate core;\nuse core::fmt;\nmacro_rules! cfg_rt { ($($item:item)*) => { $($item)* }; }\nmod client {\n#[derive(Debug)]\nstruct Client;\nuse super::fmt;\n}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let scopes = document.facts().scope().expect("original Rust scopes");
+    assert_eq!(scopes.len(), 2);
+    for (range, children) in scopes {
+        let (parent, _) = document
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.range == *range && matches!(node.kind, "source_file" | "declaration_list")
+            })
+            .expect("original scope node");
+        let original = document
+            .nodes()
+            .iter()
+            .filter(|node| node.parent == Some(parent))
+            .map(|node| node.range)
+            .collect::<Vec<_>>();
+        assert_eq!(children.as_ref(), Some(&original));
+    }
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("complete original scopes restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn rust_scope_omitted_imports_attributes_and_definitions_are_refused() {
+    let source = "#![allow(dead_code)]\nextern crate core;\nuse core::fmt;\nmacro_rules! cfg_rt { ($($item:item)*) => { $($item)* }; }\nmod client {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let original = captured.scope.as_ref().expect("scopes")[0]
+        .1
+        .as_ref()
+        .expect("root children");
+    assert_eq!(original.len(), 5);
+    for index in 0..original.len() {
+        let mut invalid = captured.clone();
+        invalid.scope.as_mut().expect("scopes")[0]
+            .1
+            .as_mut()
+            .expect("root children")
+            .remove(index);
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+                .expect_err("omitted original scope effect")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_range_invalid"
+        );
+    }
+}
+
+#[test]
+fn rust_scope_unknown_and_empty_remain_distinct() {
+    for source in ["", "mod client {}\n"] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        let captured = parts(document.facts());
+        assert!(captured.scope.as_ref().is_some_and(|rows| !rows.is_empty()));
+        assert!(
+            captured
+                .scope
+                .as_ref()
+                .expect("scopes")
+                .last()
+                .expect("scope")
+                .1
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        let mut unknown = captured.clone();
+        unknown.scope = None;
+        assert!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+                .expect("older unknown scope")
+                .scope()
+                .is_none()
+        );
+        let mut unknown = captured.clone();
+        unknown.scope.as_mut().expect("scopes")[0].1 = None;
+        assert!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+                .expect("unknown direct children")
+                .scope()
+                .expect("scope rows")[0]
+                .1
+                .is_none()
+        );
+        let mut absent = captured;
+        absent.scope = Some(Vec::new());
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), absent).is_err());
+    }
+    let source = "mod client { use core::; }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(document.has_errors());
+    let mut invalid = parts(document.facts());
+    invalid.scope.as_mut().expect("original scopes")[0].1 = Some(Vec::new());
+    assert_eq!(
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+            .expect_err("parser errors cannot prove complete scope children")
+            .slug()
+            .as_str(),
+        "rift.syntax.facts_structure_invalid"
+    );
+    assert!(
+        document
+            .facts()
+            .scope()
+            .expect("original scopes")
+            .iter()
+            .any(|(_, children)| children.is_none())
+    );
+}
+
+#[test]
+fn rust_scope_restore_refuses_wrong_ownership_ranges_and_bounds() {
+    let source = "mod client { mod nested {} } fn call() {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    assert_eq!(captured.scope.as_ref().expect("scopes").len(), 3);
+    for mutation in 0..6 {
+        let mut invalid = captured.clone();
+        let rows = invalid.scope.as_mut().expect("scope rows");
+        match mutation {
+            0 => rows[0].0.start = 1,
+            1 => {
+                rows[1].0 = document
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == "call")
+                    .expect("function")
+                    .body_range
+                    .expect("function body");
+            }
+            2 => rows[2].0.end = rows[1].0.end + 1,
+            3 => rows[0].1.as_mut().expect("root children")[0].end = u64::MAX,
+            4 => rows[0].1.as_mut().expect("root children").reverse(),
+            _ => rows[1].1.as_mut().expect("module children")[0].start = 0,
+        }
+        assert!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    let limits = SyntaxLimits::new(source.len(), 1, 100).expect("positive count bound");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, captured)
+            .expect_err("aggregate scope count bound")
+            .slug()
+            .as_str(),
+        "rift.syntax.facts_count_exceeded"
+    );
+}
+
+#[test]
+fn rust_scope_restore_bounds_groups_inside_complete_root_children() {
+    let source = "fn call() { let value = (((1))); }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(document.facts().scope().expect("scopes")[0].1.is_some());
+    let limits = SyntaxLimits::new(source.len(), 1000, 2).expect("positive depth bound");
+    assert!(SyntaxFacts::from_parts(source, limits, parts(document.facts())).is_err());
+}
+
+#[test]
+fn rust_scope_charge_keeps_owned_rows_and_direct_children() {
+    let source = "use core::fmt; mod client { struct Client; }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let known = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("scope material");
+    let mut without_children = captured.clone();
+    let children_charge = without_children
+        .scope
+        .as_mut()
+        .expect("scope rows")
+        .iter_mut()
+        .fold(0_usize, |charge, (_, children)| {
+            let ranges = children.take().expect("complete children");
+            charge.saturating_add(
+                ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ByteRange>()),
+            )
+        });
+    let without_children =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), without_children)
+            .expect("unknown child material");
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&known),
+        get_size2::GetSize::get_heap_size(&without_children).saturating_add(children_charge)
+    );
+    let mut without_scope = captured;
+    let rows = without_scope.scope.take().expect("owned scope rows");
+    let scope_charge = rows.iter().fold(
+        rows.capacity()
+            .saturating_mul(std::mem::size_of::<rift_syntax::Scope>()),
+        |charge, (_, children)| {
+            charge.saturating_add(children.as_ref().map_or(0, |ranges| {
+                ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ByteRange>())
+            }))
+        },
+    );
+    let without_scope = SyntaxFacts::from_parts(source, SyntaxLimits::default(), without_scope)
+        .expect("unknown scope material");
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&known),
+        get_size2::GetSize::get_heap_size(&without_scope).saturating_add(scope_charge)
+    );
+}
+
+#[test]
+fn rust_original_token_callback_preserves_literals_lifetimes_and_bounds() {
+    let source = "fn call<'a>(value: &'a str) { let character = '\\''; let text = r###\"macro_export! use fake;\"###; /* use hidden; */ nested! { value } }";
+    let range = rift_syntax::ByteRange {
+        start: 0,
+        end: u64::try_from(source.len()).expect("source bound"),
+    };
+    let mut values = Vec::new();
+    assert!(rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::default(),
+        |range| {
+            let value = source
+                .get(
+                    usize::try_from(range.start).expect("start")
+                        ..usize::try_from(range.end).expect("end"),
+                )
+                .expect("original token");
+            values.push(value);
+            true
+        }
+    ));
+    assert!(values.contains(&"'a"));
+    assert!(values.contains(&"'\\''"));
+    assert!(values.contains(&"r###\"macro_export! use fake;\"###"));
+    assert!(!values.contains(&"macro_export"));
+    assert!(!values.contains(&"hidden"));
+    assert!(values.windows(2).any(|pair| pair == ["nested", "!"]));
+    assert!(!rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::default(),
+        |_| false
+    ));
+    for value in [
+        "{ /* nested /* comment */ */ }",
+        "{ \"unfinished",
+        "{ unknown! { }",
+    ] {
+        let range = rift_syntax::ByteRange {
+            start: 0,
+            end: u64::try_from(value.len()).expect("source bound"),
+        };
+        assert!(!rift_syntax::tokens(
+            value,
+            range,
+            SyntaxLimits::default(),
+            |_| true
+        ));
+    }
+    assert!(!rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::new(source.len(), 1, 100).expect("count bound"),
+        |_| true
+    ));
+    assert!(!rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::new(source.len(), 1000, 1).expect("depth bound"),
+        |_| true
+    ));
 }
 
 #[test]

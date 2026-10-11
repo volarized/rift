@@ -117,6 +117,7 @@ pub(crate) struct Context<'source> {
     offset: usize,
     stack: Vec<u8>,
     boundary: Option<usize>,
+    depth_max: Option<usize>,
     valid: bool,
 }
 
@@ -129,6 +130,7 @@ impl<'source> Context<'source> {
             offset: 0,
             stack: Vec::new(),
             boundary: None,
+            depth_max: None,
             valid: true,
         })
     }
@@ -162,15 +164,25 @@ impl<'source> Context<'source> {
     }
 
     fn scan(&mut self, prefix: &str) -> bool {
-        self.scan_to(prefix, None)
+        self.scan_to(prefix, None, None)
     }
 
-    fn scan_to(&mut self, prefix: &str, depth_max: Option<usize>) -> bool {
+    fn scan_to(
+        &mut self,
+        prefix: &str,
+        depth_max: Option<usize>,
+        mut callback: Option<&mut dyn FnMut(ByteRange) -> bool>,
+    ) -> bool {
         let bytes = prefix.as_bytes();
         while self.offset < bytes.len() {
+            let start = self.offset;
+            let mut retained = true;
             match raw_string_end(prefix, self.offset) {
                 Ok(Some(end)) => {
                     self.offset = end;
+                    if !self.record(start, &mut callback) {
+                        return false;
+                    }
                     continue;
                 }
                 Err(()) => return false,
@@ -178,22 +190,10 @@ impl<'source> Context<'source> {
             }
             match bytes[self.offset] {
                 b'"' => {
-                    self.offset += 1;
-                    let mut ended = false;
-                    while self.offset < bytes.len() {
-                        match bytes[self.offset] {
-                            b'\\' => self.offset += 2,
-                            b'"' => {
-                                self.offset += 1;
-                                ended = true;
-                                break;
-                            }
-                            _ => self.offset += 1,
-                        }
-                    }
-                    if !ended {
+                    let Some(end) = quoted_end(prefix, self.offset) else {
                         return false;
-                    }
+                    };
+                    self.offset = end;
                 }
                 b'\'' => {
                     let Some(end) = apostrophe_end(prefix, self.offset) else {
@@ -202,6 +202,7 @@ impl<'source> Context<'source> {
                     self.offset = end;
                 }
                 b'/' if bytes.get(self.offset + 1) == Some(&b'/') => {
+                    retained = false;
                     self.offset += 2;
                     while self.offset < bytes.len() && bytes[self.offset] != b'\n' {
                         self.offset += 1;
@@ -211,6 +212,7 @@ impl<'source> Context<'source> {
                     }
                 }
                 b'/' if bytes.get(self.offset + 1) == Some(&b'*') => {
+                    retained = false;
                     let Some(end) = prefix
                         .get(self.offset + 2..)
                         .and_then(|rest| rest.find("*/"))
@@ -228,7 +230,10 @@ impl<'source> Context<'source> {
                 }
                 open @ (b'(' | b'[' | b'{') => {
                     self.stack.push(open);
-                    if depth_max.is_some_and(|limit| self.stack.len() > limit) {
+                    if depth_max
+                        .or(self.depth_max)
+                        .is_some_and(|limit| self.stack.len() > limit)
+                    {
                         return false;
                     }
                     self.offset += 1;
@@ -247,7 +252,7 @@ impl<'source> Context<'source> {
                     }
                     self.offset += 1;
                     if depth_max.is_some() && self.stack.is_empty() {
-                        return true;
+                        return self.record(start, &mut callback);
                     }
                     if self.stack.len() == 1 && close == b'}' {
                         self.boundary = Some(self.offset);
@@ -257,10 +262,46 @@ impl<'source> Context<'source> {
                     self.offset += 1;
                     self.boundary = Some(self.offset);
                 }
+                byte if callback.is_some() && identifier_byte(byte) => {
+                    self.offset += 1;
+                    while bytes
+                        .get(self.offset)
+                        .is_some_and(|byte| identifier_byte(*byte))
+                    {
+                        self.offset += 1;
+                    }
+                }
+                byte if callback.is_some() && byte.is_ascii_whitespace() => {
+                    retained = false;
+                    self.offset += 1;
+                }
+                byte if callback.is_some() && !byte.is_ascii() => return false,
                 _ => self.offset += 1,
+            }
+            if retained && !self.record(start, &mut callback) {
+                return false;
             }
         }
         true
+    }
+
+    fn record(
+        &self,
+        start: usize,
+        callback: &mut Option<&mut dyn FnMut(ByteRange) -> bool>,
+    ) -> bool {
+        let Some(callback) = callback else {
+            return true;
+        };
+        let range = u64::try_from(start)
+            .ok()
+            .and_then(|start| self.invocation.start.checked_add(start))
+            .zip(
+                u64::try_from(self.offset)
+                    .ok()
+                    .and_then(|end| self.invocation.start.checked_add(end)),
+            );
+        range.is_some_and(|(start, end)| callback(ByteRange { start, end }))
     }
 }
 
@@ -596,7 +637,151 @@ fn group_end(source: &str, depth_max: usize) -> Option<usize> {
         },
     )?;
     context
-        .scan_to(source, Some(depth_max))
+        .scan_to(source, Some(depth_max), None)
         .then_some(context.offset)
         .filter(|_| context.stack.is_empty())
+}
+
+pub(super) fn capture_scope(
+    source: &str,
+    nodes: &[SyntaxNode],
+    has_errors: bool,
+) -> Option<Vec<super::Scope>> {
+    nodes
+        .iter()
+        .find(|node| node.kind == "source_file" && node.parent.is_none())?;
+    let mut rows = BTreeMap::<usize, (ByteRange, Vec<ByteRange>, bool)>::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let root = node.kind == "source_file" && node.parent.is_none();
+        let module = node.kind == "declaration_list"
+            && node
+                .parent
+                .and_then(|parent| nodes.get(parent))
+                .is_some_and(|parent| parent.kind == "mod_item");
+        if root || module {
+            rows.insert(index, (node.range, Vec::new(), !node.has_error));
+        }
+    }
+    for node in nodes {
+        if let Some(parent) = node.parent.and_then(|index| rows.get_mut(&index)) {
+            parent.1.push(node.range);
+            parent.2 &= !node.has_error;
+        }
+    }
+    let mut scopes = rows
+        .into_values()
+        .map(|(range, children, valid)| {
+            let root = range.start == 0 && usize::try_from(range.end).ok() == Some(source.len());
+            let complete = !has_errors
+                && valid
+                && scope_children_valid(source, range, &children, root, nodes.len());
+            (range, complete.then_some(children))
+        })
+        .collect::<Vec<_>>();
+    scopes.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
+    Some(scopes)
+}
+
+pub(crate) fn scope_children_valid(
+    source: &str,
+    range: ByteRange,
+    children: &[ByteRange],
+    root: bool,
+    depth_max: usize,
+) -> bool {
+    let Some(scope) = text(source, range) else {
+        return false;
+    };
+    let (start, end) = if root {
+        if range.start != 0 || usize::try_from(range.end).ok() != Some(source.len()) {
+            return false;
+        }
+        (range.start, range.end)
+    } else {
+        if !scope.starts_with('{')
+            || !scope.ends_with('}')
+            || group_end(scope, depth_max) != Some(scope.len())
+        {
+            return false;
+        }
+        let Some(start) = range.start.checked_add(1) else {
+            return false;
+        };
+        let Some(end) = range.end.checked_sub(1) else {
+            return false;
+        };
+        (start, end)
+    };
+    let mut previous = start;
+    for child in children {
+        if child.start < previous || child.start == child.end || child.end > end {
+            return false;
+        }
+        let Some(gap) = text(
+            source,
+            ByteRange {
+                start: previous,
+                end: child.start,
+            },
+        ) else {
+            return false;
+        };
+        if !gap.chars().all(char::is_whitespace) {
+            return false;
+        }
+        let Some(value) = text(source, *child) else {
+            return false;
+        };
+        let Some(mut context) = Context::new(source, *child) else {
+            return false;
+        };
+        context.depth_max = Some(depth_max);
+        if !context.scan(value) || !context.stack.is_empty() {
+            return false;
+        }
+        previous = child.end;
+    }
+    text(
+        source,
+        ByteRange {
+            start: previous,
+            end,
+        },
+    )
+    .is_some_and(|gap| gap.chars().all(char::is_whitespace))
+}
+
+/// Visits bounded original token ranges with the existing literal source scanner.
+///
+/// The caller supplies original captured source and its checked range. Comments are
+/// omitted; literals remain whole. Invalid groups, unsupported text, exhausted bounds,
+/// or a refused callback return `false`. This operation stores no token table.
+pub fn tokens(
+    source: &str,
+    range: ByteRange,
+    limits: crate::SyntaxLimits,
+    mut callback: impl FnMut(ByteRange) -> bool,
+) -> bool {
+    if source.len() > limits.source_bytes_max() {
+        return false;
+    }
+    let Some(value) = text(source, range) else {
+        return false;
+    };
+    let Some(mut context) = Context::new(source, range) else {
+        return false;
+    };
+    context.depth_max = Some(limits.syntax_depth_max());
+    let mut count = 0_usize;
+    let mut bounded = |range| {
+        let Some(next) = count
+            .checked_add(1)
+            .filter(|count| *count <= limits.syntax_nodes_max())
+        else {
+            return false;
+        };
+        count = next;
+        callback(range)
+    };
+    context.scan_to(value, None, Some(&mut bounded)) && context.stack.is_empty()
 }

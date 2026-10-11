@@ -143,6 +143,7 @@ fn selected_anchors_for_owner(
                     markdown_facts: None,
                     export_bindings: None,
                     macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
+                    scope: facts.scope().map(<[_]>::to_vec),
                     source_digest: rift_core::FileDigest::of(source.as_bytes()),
                 },
             )
@@ -1038,5 +1039,145 @@ fn transparent_item_macros_refuse_unproved_forwarding_and_changed_items() {
             false,
         );
         assert!(!found.contains_key("src/runtime.rs"), "{definitions}");
+    }
+}
+
+#[test]
+fn selected_non_test_library_context_requires_original_owner_manifest_and_root() {
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("exact owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual owner origin");
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let root_path = ProjectPath::new("src/lib.rs").expect("library path");
+    let missing_path = ProjectPath::new("src/missing.rs").expect("missing source path");
+    let files = [PackageSource::new(&root_path, "pub struct Example;\n")];
+    let metadata = [PackageSource::new(&manifest_path, MANIFEST)];
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &files,
+        ExactPackageLimits::new(20, 16 * 1024 * 1024),
+    )
+    .expect("bounded original sources")
+    .with_framework_context(&metadata, &[])
+    .expect("original metadata");
+    assert!(input.namespace_input().library().is_none());
+    let accepted = input
+        .with_library(&owner, metadata[0], files[0])
+        .expect("explicit selected library role");
+    let (manifest, root) = accepted
+        .namespace_input()
+        .library()
+        .expect("captured selected context");
+    assert_eq!(manifest.path(), &manifest_path);
+    assert_eq!(manifest.text(), MANIFEST);
+    assert_eq!(root.path(), &root_path);
+    assert_eq!(root.text(), files[0].text());
+    assert!(
+        input
+            .with_library(
+                &rift_protocol::identity::SymbolOwner::Local,
+                metadata[0],
+                files[0]
+            )
+            .is_err()
+    );
+    assert!(
+        input
+            .with_library(
+                &owner,
+                PackageSource::new(
+                    &manifest_path,
+                    "[package]\nname='foreign'\nversion='1.0.0'\n"
+                ),
+                files[0]
+            )
+            .is_err()
+    );
+    assert!(
+        input
+            .with_library(
+                &owner,
+                metadata[0],
+                PackageSource::new(&missing_path, files[0].text())
+            )
+            .is_err()
+    );
+    assert!(
+        input
+            .with_library(
+                &owner,
+                metadata[0],
+                PackageSource::new(&root_path, "pub struct Changed;\n")
+            )
+            .is_err()
+    );
+    assert!(accepted.with_framework_context(&[], &[]).is_err());
+}
+
+#[test]
+fn selected_library_context_refuses_admitted_manifest_with_wrong_release_or_target() {
+    let owner = SymbolIdentity::parse(
+        "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/Example",
+    )
+    .expect("exact owner")
+    .owner()
+    .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "crate-root".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("actual owner origin");
+    let language = rift_syntax::ShippedLanguage::Rust.language();
+    let manifest_path = ProjectPath::new("Cargo.toml").expect("manifest path");
+    let root_path = ProjectPath::new("src/lib.rs").expect("library path");
+    let files = [PackageSource::new(&root_path, "pub struct Example;\n")];
+    for text in [
+        "[package]\nname='foreign'\nversion='1.0.0'\n",
+        "[package]\nname='crate-root'\nversion='2.0.0'\n",
+        "[package]\nname='crate-root'\nversion='1.0.0'\n[lib]\npath='src/other.rs'\n",
+        "[package]\nname='crate-root'\nversion='1.0.0'\nautolib=false\n",
+        "[package",
+    ] {
+        let metadata = [PackageSource::new(&manifest_path, text)];
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(20, 16 * 1024 * 1024),
+        )
+        .expect("bounded original sources")
+        .with_framework_context(&metadata, &[])
+        .expect("original metadata");
+        assert!(
+            input.with_library(&owner, metadata[0], files[0]).is_err(),
+            "manifest {text}"
+        );
+        assert!(input.namespace_input().library().is_none());
     }
 }

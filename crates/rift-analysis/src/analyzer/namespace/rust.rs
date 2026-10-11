@@ -256,7 +256,7 @@ fn file_anchors(
     anchors
 }
 
-fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
+pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
     let SymbolOwner::Package {
         manager,
         name,

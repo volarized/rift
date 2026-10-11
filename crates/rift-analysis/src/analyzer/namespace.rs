@@ -100,6 +100,10 @@ pub(super) fn prepare(
     prepare_context(&input.namespace_input(), selected)
 }
 
+pub(crate) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
+    rust::library(input)
+}
+
 pub(crate) fn prepare_context(
     input: &NamespaceInput<'_>,
     selected: &[SelectedFile<'_>],

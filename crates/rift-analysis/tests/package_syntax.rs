@@ -241,6 +241,7 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
             markdown_facts: facts.markdown_facts().cloned(),
             export_bindings: facts.export_bindings().map(<[_]>::to_vec),
             macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
+            scope: facts.scope().map(<[_]>::to_vec),
             source_digest: digest,
         },
     )

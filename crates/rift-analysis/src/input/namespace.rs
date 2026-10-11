@@ -22,6 +22,7 @@ pub struct NamespaceInput<'input> {
     files_max: usize,
     bytes_max: u64,
     syntax: SyntaxLimits,
+    library: Option<(PackageSource<'input>, PackageSource<'input>)>,
     modules: &'input [NamespaceModule<'input>],
     build_paths:
         Option<&'input BTreeMap<rift_protocol::read::ProjectPath, Option<ArchiveMemberKind>>>,
@@ -41,6 +42,7 @@ impl<'input> NamespaceInput<'input> {
                 .min(input.limits.publication().units) as usize,
             bytes_max: input.limits.bytes_max(),
             syntax: input.limits.syntax(),
+            library: input.library,
             modules: input.modules,
             build_paths: input.build_paths,
         }
@@ -125,6 +127,7 @@ impl<'input> NamespaceInput<'input> {
             files_max,
             bytes_max,
             syntax,
+            library: None,
             modules: &[],
             build_paths: None,
         })
@@ -142,7 +145,7 @@ impl<'input> NamespaceInput<'input> {
         mut self,
         modules: &'input [NamespaceModule<'input>],
     ) -> Result<Self, RiftError> {
-        validate_modules(self, modules)?;
+        validate_modules(&self, modules)?;
         self.modules = modules;
         Ok(self)
     }
@@ -184,6 +187,60 @@ impl<'input> NamespaceInput<'input> {
         }
         self.build_paths = Some(paths);
         Ok(self)
+    }
+
+    /// Captures an explicitly selected non-test Cargo library acquisition.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal unless owner, manifest, and library root
+    /// match the original admitted sources and parsed library target.
+    pub fn with_library(
+        mut self,
+        owner: &SymbolOwner,
+        manifest: PackageSource<'input>,
+        root: PackageSource<'input>,
+    ) -> Result<Self, RiftError> {
+        if owner != self.owner || self.language.name != "rust" || self.language.dialect.is_some() {
+            return Err(invalid());
+        }
+        for (source, admitted) in [
+            (
+                manifest,
+                self.files
+                    .iter()
+                    .chain(self.context_sources)
+                    .find(|file| file.path == manifest.path),
+            ),
+            (root, self.files.iter().find(|file| file.path == root.path)),
+        ] {
+            let Some(admitted) = admitted else {
+                return Err(invalid());
+            };
+            if source.text != admitted.text || source.physical != admitted.physical {
+                return Err(invalid());
+            }
+        }
+        let files = [root];
+        let context = [manifest];
+        let selected = NamespaceInput {
+            files: &files,
+            context_sources: &context,
+            library: None,
+            ..self
+        };
+        if crate::analyzer::namespace::library(&selected)
+            .is_none_or(|(path, _)| path != root.path.as_str())
+        {
+            return Err(invalid());
+        }
+        self.library = Some((manifest, root));
+        Ok(self)
+    }
+
+    /// Explicitly selected non-test library sources, or unknown acquisition context.
+    #[must_use]
+    pub const fn library(self) -> Option<(PackageSource<'input>, PackageSource<'input>)> {
+        self.library
     }
 
     /// Captured build-path observations, or no supplied observations.
@@ -287,7 +344,7 @@ impl<'input> NamespaceModule<'input> {
 }
 
 fn validate_modules(
-    input: NamespaceInput<'_>,
+    input: &NamespaceInput<'_>,
     modules: &[NamespaceModule<'_>],
 ) -> Result<(), RiftError> {
     input.validate_count(modules.len())?;

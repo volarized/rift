@@ -137,6 +137,19 @@ impl GetSize for SyntaxFacts {
                 },
             )
         });
+        let scope = self.scope.as_ref().map_or(0, |rows| {
+            rows.iter().fold(
+                rows.capacity()
+                    .saturating_mul(std::mem::size_of::<super::Scope>()),
+                |charge, (_, children)| {
+                    charge.saturating_add(children.as_ref().map_or(0, |ranges| {
+                        ranges
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<super::ByteRange>())
+                    }))
+                },
+            )
+        });
         let (markdown, tracker) = self.markdown_facts.get_heap_size_with_tracker(tracker);
         (
             language
@@ -144,6 +157,7 @@ impl GetSize for SyntaxFacts {
                 .saturating_add(retained)
                 .saturating_add(exports)
                 .saturating_add(macros)
+                .saturating_add(scope)
                 .saturating_add(markdown),
             tracker,
         )

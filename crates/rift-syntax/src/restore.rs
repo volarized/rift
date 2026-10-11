@@ -32,6 +32,8 @@ pub struct SyntaxFactsParts {
     /// Captured top-level Rust macro invocations and their direct module item ranges.
     /// Missing facts remain unknown.
     pub macro_invocations: Option<Vec<crate::MacroInvocation>>,
+    /// Captured root and module scopes; missing direct ranges remain unknown.
+    pub scope: Option<Vec<crate::Scope>>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
     /// Number of extracted declarations the provider omitted.
@@ -757,6 +759,7 @@ impl SyntaxFacts {
         validate_symbols(source, limits, &parts)?;
         validate_export_bindings(source, limits, &parts)?;
         validate_macro_invocations(source, limits, &parts)?;
+        validate_scope(source, limits, &parts)?;
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {
                 return Err(errors::syntax::facts_structure_invalid().error());
@@ -910,6 +913,92 @@ fn validate_macro_invocations(
             }
         }
         previous_end = invocation.end;
+    }
+    Ok(())
+}
+
+fn validate_scope(
+    source: &str,
+    limits: SyntaxLimits,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    let Some(scopes) = &parts.scope else {
+        return Ok(());
+    };
+    if parts.language != ShippedLanguage::Rust.language() {
+        return errors::syntax::facts_structure_invalid().fail();
+    }
+    let end =
+        u64::try_from(source.len()).map_err(|_| errors::syntax::facts_range_invalid().error())?;
+    if scopes.first().map(|(range, _)| *range) != Some(ByteRange { start: 0, end }) {
+        return errors::syntax::facts_range_invalid().fail();
+    }
+    let scope_count = scopes
+        .iter()
+        .try_fold(scopes.len(), |total, (_, children)| {
+            total.checked_add(children.as_ref().map_or(0, Vec::len))
+        })
+        .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
+    let retained_count = parts
+        .macro_invocations
+        .as_ref()
+        .map_or(Some(scope_count), |rows| {
+            rows.iter().try_fold(
+                scope_count.checked_add(rows.len())?,
+                |total, (_, modules, children)| {
+                    total
+                        .checked_add(modules.len())?
+                        .checked_add(children.as_ref().map_or(0, Vec::len))
+                },
+            )
+        })
+        .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
+    count(retained_count, limits)?;
+    ordered(scopes.iter().map(|(range, _)| *range))?;
+    let mut enclosing = Vec::<ByteRange>::new();
+    for (index, (scope, children)) in scopes.iter().enumerate() {
+        range(source, *scope)?;
+        while enclosing
+            .last()
+            .is_some_and(|parent| parent.end <= scope.start)
+        {
+            enclosing.pop();
+        }
+        if index > 0
+            && (enclosing
+                .last()
+                .is_none_or(|parent| scope.start <= parent.start || scope.end > parent.end)
+                || !parts
+                    .symbols
+                    .iter()
+                    .chain(&parts.left_out_symbols)
+                    .any(|symbol| {
+                        symbol.kind == "module"
+                            && symbol.node_kind == Some("mod_item")
+                            && symbol.body_range == Some(*scope)
+                    }))
+        {
+            return errors::syntax::facts_range_invalid().fail();
+        }
+        if let Some(children) = children {
+            if parts.has_errors {
+                return errors::syntax::facts_structure_invalid().fail();
+            }
+            ordered(children.iter().copied())?;
+            if !crate::document::rust_macros::scope_children_valid(
+                source,
+                *scope,
+                children,
+                index == 0,
+                limits.syntax_depth_max(),
+            ) {
+                return errors::syntax::facts_range_invalid().fail();
+            }
+        }
+        enclosing.push(*scope);
+        if enclosing.len() > limits.syntax_depth_max() {
+            return errors::syntax::facts_count_exceeded().fail();
+        }
     }
     Ok(())
 }
