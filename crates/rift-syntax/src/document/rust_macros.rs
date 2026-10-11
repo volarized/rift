@@ -449,7 +449,9 @@ fn named_token(value: &str, depth_max: usize) -> bool {
         return group_end(value, depth_max) == Some(value.len());
     }
     if value.starts_with("//") {
-        return !value.contains('\n');
+        return value
+            .find('\n')
+            .is_none_or(|end| end == value.len().saturating_sub(1));
     }
     if value.starts_with("/*") {
         return value.ends_with("*/") && !value[2..value.len().saturating_sub(2)].contains("/*");

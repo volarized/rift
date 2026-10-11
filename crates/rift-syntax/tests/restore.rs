@@ -1335,3 +1335,66 @@ fn rust_root_expression_macro_invocations_keep_original_parent_and_restore_charg
         Err(errors::syntax::facts_count_exceeded::SLUG)
     );
 }
+
+#[test]
+fn rust_macro_doc_comments_keep_original_line_endings_and_refuse_hidden_code() {
+    for ending in ["\n", "\r\n"] {
+        let source = format!(
+            "known! {{{ending}/// original comment{ending}pub mod child;{ending}}}{ending}"
+        );
+        let document = parsed(ShippedLanguage::Rust, &source);
+        assert!(!document.has_errors());
+        let mut captured = parts(document.facts());
+        let rows = captured
+            .macro_invocations
+            .as_mut()
+            .expect("captured invocation");
+        assert_eq!(rows.len(), 1);
+        let children = rows[0]
+            .2
+            .as_mut()
+            .expect("original comment retains complete children");
+        let comment = children
+            .iter()
+            .position(|range| {
+                source[usize::try_from(range.start).expect("start")
+                    ..usize::try_from(range.end).expect("end")]
+                    .starts_with("///")
+            })
+            .expect("original named comment range");
+        let range = children[comment];
+        assert_eq!(
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")],
+            format!("/// original comment{ending}")
+        );
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured.clone())
+                .expect("exact comment restores"),
+            *document.facts()
+        );
+        let children = captured
+            .macro_invocations
+            .as_mut()
+            .expect("captured invocation")[0]
+            .2
+            .as_mut()
+            .expect("complete children");
+        children[comment].end += 1;
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_range_invalid::SLUG),
+            "a named comment cannot hide code after its line ending"
+        );
+    }
+    let source = "known! { /* unterminated }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(document.has_errors());
+    assert!(
+        document
+            .facts()
+            .macro_invocations()
+            .is_none_or(|rows| rows.iter().all(|(_, _, children)| children.is_none()))
+    );
+}
