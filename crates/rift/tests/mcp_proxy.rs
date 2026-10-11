@@ -75,11 +75,11 @@ use rift_protocol::lock::{
 use rift_protocol::retry::RetryPolicy;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use serde_json::json;
-use surface_corpus::{SurfaceFixture, corpus};
+use surface_corpus::SurfaceFixture;
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
+const SERVED_TOOL_NAMES: [&str; 4] = ["get_source", "get_symbol", "nodes", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -141,7 +141,7 @@ fn document_path(root: &Path) -> PathBuf {
 
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
-        ServerPresence::Serving(lock) => Some(lock),
+        ServerPresence::Serving(lock) => Some(*lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
@@ -171,16 +171,24 @@ async fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
-/// One proxied `get_symbol` round trip for the fixture's `beacon` symbol.
+/// One proxied search round trip for the fixture's `beacon` symbol.
 async fn beacon_lookup(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<serde_json::Value> {
     await_workspace_ready(client).await?;
-    proxied_call(client, "get_symbol", &json!({"name": "beacon"})).await
+    proxied_call(
+        client,
+        "search",
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
-    assert_eq!(lookup["hits"][0]["symbol"]["name"], json!("beacon"));
+    assert_eq!(
+        lookup["results"][0]["hit"]["symbol"]["name"],
+        json!("beacon")
+    );
 }
 
 /// Retains only the foreground child this fixture started.
@@ -233,7 +241,7 @@ async fn repository_foreground(
                 return None;
             }
             match rift_mcp::probe_state_directory(state_directory) {
-                ServerPresence::Serving(lock) if lock.pid == child.0.id() => Some(lock),
+                ServerPresence::Serving(lock) if lock.pid == child.0.id() => Some(*lock),
                 _ => None,
             }
         },
@@ -284,21 +292,32 @@ async fn repository_workspace_reads(
         .as_str()
         .ok_or("map carries its revision")?
         .to_owned();
-    let lookup = proxied_call(client, "get_symbol", &json!({"name": name}))
-        .await
-        .map_err(|error| format!("positive get_symbol: {error:?}"))?;
-    assert_eq!(lookup["hits"][0]["symbol"]["name"], name, "{lookup}");
+    let lookup = proxied_call(
+        client,
+        "search",
+        &json!({"query": name, "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("positive search: {error:?}"))?;
+    assert_eq!(
+        lookup["results"][0]["hit"]["symbol"]["name"], name,
+        "{lookup}"
+    );
     let other = names
         .iter()
         .find(|other| **other != name)
         .ok_or("fixture has another symbol")?;
-    let absent = proxied_call(client, "get_symbol", &json!({"name": other}))
-        .await
-        .map_err(|error| format!("negative get_symbol: {error:?}"))?;
+    let absent = proxied_call(
+        client,
+        "search",
+        &json!({"query": other, "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("negative search: {error:?}"))?;
     assert!(
-        absent["hits"]
+        absent["results"]
             .as_array()
-            .ok_or("lookup carries hits")?
+            .ok_or("search carries results")?
             .is_empty(),
         "{absent}"
     );
@@ -583,7 +602,7 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         "source catalog follows workspace bytes"
     );
     let after = match rift_mcp::probe_state_directory(&state_directory) {
-        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Serving(lock) => *lock,
         other => return Err(format!("repository must remain serving: {other:?}").into()),
     };
     assert_eq!(
@@ -593,10 +612,17 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let changed = fs::read_to_string(main.path().join("rift.toml"))?
         .replace("[server]\n", "[server]\nnum_workers = 2\n");
     fs::write(main.path().join("rift.toml"), &changed)?;
-    let pinned = proxied_call(&clients[3], "get_symbol", &json!({"name": "quartz"}))
-        .await
-        .map_err(|error| format!("workspace quartz after settings change get_symbol: {error:?}"))?;
-    assert_eq!(pinned["hits"][0]["symbol"]["name"], "quartz", "{pinned}");
+    let pinned = proxied_call(
+        &clients[3],
+        "search",
+        &json!({"query": "quartz", "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
+    assert_eq!(
+        pinned["results"][0]["hit"]["symbol"]["name"], "quartz",
+        "{pinned}"
+    );
     require_success(
         &run_rift(&roots[3], &["server", "status", "--repository"]).await?,
         "status after authority settings change",
@@ -710,7 +736,12 @@ async fn beacon_result(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<CallToolResult> {
     await_workspace_ready(client).await?;
-    proxied_result(client, "get_symbol", &json!({"name": "beacon"})).await
+    proxied_result(
+        client,
+        "search",
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await
 }
 
 /// Every tool one proxy lists, within the proxied-call bound.
@@ -948,9 +979,11 @@ fn stated_identities<'value>(
     name: &str,
     structured: &'value serde_json::Value,
 ) -> Vec<&'value str> {
+    if name == "get_symbol" {
+        return structured["symbol"]["id"].as_str().into_iter().collect();
+    }
     let (key, pointer) = match name {
         "search" => ("results", "/hit/symbol/id"),
-        "get_symbol" => ("hits", "/symbol/id"),
         _ => ("nodes", "/id"),
     };
     structured
@@ -997,7 +1030,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
     await_search_population(&all, &json!({"query": "beacon"})).await?;
     await_commit_population(&all).await?;
 
-    'cases: for (name, initial_request) in corpus() {
+    'cases: for (name, initial_request) in surface_corpus::prepared_corpus(&all).await? {
         let mut request = initial_request;
         let mut page_index = request["page_index"].as_u64().unwrap_or(0);
         loop {
@@ -1211,6 +1244,8 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
         pid: 1,
         identity: rift_binary_identity()?,
         server: None,
+        root: None,
+        owner: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -1489,8 +1524,8 @@ async fn assert_refused_without_a_stop(version: &str) -> TestResult {
     let refusal = within(
         "the refusal from a server this proxy does not replace",
         client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         ),
     )
     .await?
@@ -1611,6 +1646,8 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         pid: 1,
         identity: rift_binary_identity()?,
         server: None,
+        root: None,
+        owner: None,
     })?;
 
     let (client, stderr) = relayed_proxy_client(root).await?;
@@ -1618,8 +1655,8 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     let refusal = within(
         "the unserved workspace's refusal",
         client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         ),
     )
     .await?
@@ -1682,8 +1719,8 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr
     let refusal = within(
         "the refusal from a server that could not bind its port",
         client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         ),
     )
     .await?
@@ -1766,8 +1803,13 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    let declaration = proxied_call(&client, "get_symbol", &json!({"name": "beacon"})).await?;
-    let seed = declaration["hits"][0]["symbol"]["id"]
+    let declaration = proxied_call(
+        &client,
+        "search",
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await?;
+    let seed = declaration["results"][0]["hit"]["symbol"]["id"]
         .as_str()
         .ok_or("beacon declaration must carry its symbol identity")?;
     let result = proxied_engine_call(

@@ -674,18 +674,23 @@ mod tests {
             },
         ] {
             let command = super::detached_command_with_owner(directory.path(), &owner)?;
-            let arguments: Vec<_> = command.get_args().collect();
+            let scope = owner.local_scope()?;
+            let expected = ["server", "start", "--foreground", "--scope", &scope];
+            #[cfg(not(windows))]
             assert_eq!(
-                arguments,
-                [
-                    "server",
-                    "start",
-                    "--foreground",
-                    "--scope",
-                    &owner.local_scope()?,
-                ]
-                .map(std::ffi::OsStr::new)
+                command.get_args().collect::<Vec<_>>(),
+                expected.map(std::ffi::OsStr::new)
             );
+            #[cfg(windows)]
+            {
+                let arguments = expected
+                    .map(|argument| format!("Text({argument:?})"))
+                    .join(", ");
+                assert!(
+                    format!("{command:?}").contains(&format!("args: [{arguments}]")),
+                    "the detached command retains every original argument: {command:?}"
+                );
+            }
             assert_eq!(command.get_current_dir(), Some(directory.path()));
         }
         assert!(!directory.path().join(".rift").exists());

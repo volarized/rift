@@ -104,6 +104,7 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
 
         let position = u64::try_from(source.find("灯").ok_or("Unicode source")?)?;
         let nodes = service.nodes(NodesParams {
+            view: None,
             path: rift_protocol::read::ProjectPath("component.ts".to_owned()),
             position,
             rev: None,
@@ -125,6 +126,7 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
             } if unit.0 == "rift://file/component.ts" && !detail.is_empty()
         )));
         let plain_nodes = service.nodes(NodesParams {
+            view: None,
             path: rift_protocol::read::ProjectPath("view.html".to_owned()),
             position: u64::try_from(plain.find("灯").ok_or("plain Unicode source")?)?,
             rev: None,

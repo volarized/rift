@@ -537,7 +537,7 @@ fn stop_line_of(stderr: &str) -> TestResult<&str> {
 
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
-        ServerPresence::Serving(lock) => Some(lock),
+        ServerPresence::Serving(lock) => Some(*lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
@@ -588,7 +588,7 @@ fn symbol_request(port: u16, token: &str, name: &str) -> TestResult<String> {
         port,
         token,
         "tools/call",
-        &serde_json::json!({"name": "get_symbol", "arguments": {"name": name}}),
+        &serde_json::json!({"name": "search", "arguments": {"query": name, "target": "symbol"}}),
     )
 }
 
@@ -2318,6 +2318,8 @@ fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
         pid: 1,
         identity: stale_identity(),
         server: None,
+        root: None,
+        owner: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -2609,6 +2611,8 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
         pid: 1,
         identity: stale_identity(),
         server: None,
+        root: None,
+        owner: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     let stale_status = rift(root, &["server", "status"])?;
