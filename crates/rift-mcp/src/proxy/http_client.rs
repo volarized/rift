@@ -5,6 +5,9 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use futures_util::{StreamExt as _, stream};
+use sse_stream::SseStream;
+
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue, WWW_AUTHENTICATE};
 use rmcp::model::{ClientJsonRpcMessage, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::common::client_side_sse::BoxedSseResponse;
@@ -19,7 +22,7 @@ use serde::Serialize;
 
 use crate::transport::INBOUND_FRAME_BYTES_MAX;
 
-/// JSON-only POST responses from Rift's loopback HTTP services.
+/// Bounded JSON and SSE POST responses from Rift's loopback HTTP services.
 #[derive(Clone, Debug)]
 pub(super) struct HttpClient {
     inner: reqwest::Client,
@@ -42,7 +45,30 @@ impl StreamableHttpClient for HttpClient {
         auth_header: Option<String>,
         custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
-        let mut request = self.inner.post(uri.as_ref()).header(ACCEPT, JSON_MIME_TYPE);
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            INBOUND_FRAME_BYTES_MAX,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
+        let mut request = self
+            .inner
+            .post(uri.as_ref())
+            .header(ACCEPT, "application/json, text/event-stream");
         for (name, value) in custom_headers {
             if [
                 ACCEPT.as_str(),
@@ -80,6 +106,7 @@ impl StreamableHttpClient for HttpClient {
             &message,
             session_attached,
             INBOUND_FRAME_BYTES_MAX,
+            max_sse_event_size,
         )
         .await
     }
@@ -136,6 +163,7 @@ async fn decode_response(
     message: &ClientJsonRpcMessage,
     session_attached: bool,
     limit: usize,
+    max_sse_event_size: usize,
 ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
     let status = response.status();
     if let Some(header) = response.headers().get(WWW_AUTHENTICATE)
@@ -185,6 +213,16 @@ async fn decode_response(
         return Ok(StreamableHttpPostResponse::Accepted);
     }
     if status.is_success()
+        && content_type
+            .as_deref()
+            .is_some_and(|value| value.starts_with("text/event-stream"))
+    {
+        return Ok(StreamableHttpPostResponse::Sse(
+            read_sse_response(response, limit.min(max_sse_event_size))?,
+            session,
+        ));
+    }
+    if status.is_success()
         && !content_type
             .as_deref()
             .is_some_and(|value| value.starts_with(JSON_MIME_TYPE))
@@ -214,6 +252,38 @@ fn header_scope(header: &str) -> Option<String> {
         .find(|character: char| character == ',' || character == ';' || character.is_whitespace())
         .unwrap_or(value.len());
     (end > 0).then(|| value[..end].to_owned())
+}
+
+/// Bounds the complete POST response before the SSE parser retains any bytes.
+/// The response bound also bounds every event, including an unfinished event.
+fn read_sse_response(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<BoxedSseResponse, StreamableHttpError<reqwest::Error>> {
+    let declared = response.content_length();
+    if declared.is_some_and(|length| length > u64::try_from(limit).unwrap_or(u64::MAX)) {
+        return Err(refused("SSE response exceeds byte limit"));
+    }
+    let bytes = stream::try_unfold(
+        (response, 0_usize),
+        move |(mut response, received)| async move {
+            let chunk = response.chunk().await.map_err(io::Error::other)?;
+            let Some(chunk) = chunk else {
+                if declared
+                    .is_some_and(|length| length != u64::try_from(received).unwrap_or(u64::MAX))
+                {
+                    return Err(io::Error::other("SSE response content length differs"));
+                }
+                return Ok(None);
+            };
+            let received = received
+                .checked_add(chunk.len())
+                .filter(|received| *received <= limit)
+                .ok_or_else(|| io::Error::other("SSE response exceeds byte limit"))?;
+            Ok(Some((chunk, (response, received))))
+        },
+    );
+    Ok(SseStream::from_bytes_stream(bytes).boxed())
 }
 
 async fn read_response(

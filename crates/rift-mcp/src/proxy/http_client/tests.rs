@@ -245,6 +245,7 @@ async fn authorized_post_preserves_root_protocol_and_session_headers() -> TestRe
     let received = served.received.lock().expect("captured headers");
     assert_eq!(received.len(), 1);
     assert_eq!(received[0]["authorization"], "Bearer token");
+    assert_eq!(received[0]["accept"], "application/json, text/event-stream");
     assert_eq!(
         received[0][crate::http::WORKSPACE_ROOT_HEADER],
         "/captured/root"
@@ -306,7 +307,7 @@ async fn auth_scope_status_and_json_rpc_error_survive_transport() -> TestResult 
 }
 
 #[tokio::test]
-async fn accepted_session_expiry_and_unexpected_sse_do_not_replay() -> TestResult {
+async fn accepted_session_expiry_and_sse_do_not_replay() -> TestResult {
     for status in [StatusCode::ACCEPTED, StatusCode::NO_CONTENT] {
         let served = fixture(status, "", &[]).await?;
         assert!(matches!(
@@ -341,12 +342,17 @@ async fn accepted_session_expiry_and_unexpected_sse_do_not_replay() -> TestResul
         &[("content-type", "text/event-stream")],
     )
     .await?;
-    assert!(matches!(
-        client()
-            .post_message(Arc::clone(&sse.uri), request(), None, None, HashMap::new())
-            .await,
-        Err(StreamableHttpError::UnexpectedContentType(_))
-    ));
+    let StreamableHttpPostResponse::Sse(mut events, _) = client()
+        .post_message(Arc::clone(&sse.uri), request(), None, None, HashMap::new())
+        .await?
+    else {
+        return Err("expected SSE response".into());
+    };
+    assert_eq!(
+        events.next().await.ok_or("SSE event")??.data.as_deref(),
+        Some("{}")
+    );
+    assert!(events.next().await.is_none());
     assert_eq!(
         sse.received.lock().expect("requests").len(),
         1,
@@ -384,5 +390,205 @@ async fn redirects_are_not_followed_and_reserved_headers_are_refused() -> TestRe
         1,
         "refused before forwarding"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sse_declared_and_chunked_response_bounds_precede_parsing() -> TestResult {
+    let body = format!("event: message\ndata: {REPLY}\n\n");
+    for chunked in [false, true] {
+        let mut headers = vec![
+            ("content-type", "text/event-stream"),
+            (HEADER_SESSION_ID, "returned"),
+        ];
+        if chunked {
+            headers.push(("transfer-encoding", "chunked"));
+        }
+        let served = fixture(StatusCode::OK, &body, &headers).await?;
+        let exact = client()
+            .post_message_with_max_sse_event_size(
+                Arc::clone(&served.uri),
+                request(),
+                None,
+                None,
+                HashMap::new(),
+                body.len(),
+            )
+            .await?;
+        let StreamableHttpPostResponse::Sse(mut events, session) = exact else {
+            return Err("expected SSE response".into());
+        };
+        assert_eq!(session.as_deref(), Some("returned"));
+        let event = events.next().await.ok_or("SSE event")??;
+        assert_eq!(event.event.as_deref(), Some("message"));
+        assert_eq!(event.data.as_deref(), Some(REPLY));
+        assert!(events.next().await.is_none());
+        let over = client()
+            .post_message_with_max_sse_event_size(
+                Arc::clone(&served.uri),
+                request(),
+                None,
+                None,
+                HashMap::new(),
+                body.len() - 1,
+            )
+            .await;
+        if chunked {
+            let StreamableHttpPostResponse::Sse(mut events, _) = over? else {
+                return Err("expected bounded SSE stream".into());
+            };
+            assert!(events.next().await.ok_or("stream refusal")?.is_err());
+            assert!(events.next().await.is_none());
+        } else {
+            assert!(matches!(
+                over,
+                Err(StreamableHttpError::UnexpectedServerResponse(_))
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unfinished_sse_and_complete_post_response_share_the_raw_byte_bound() -> TestResult {
+    for body in [
+        "data: unfinished".to_owned(),
+        "data: one\n\ndata: two\n\n".to_owned(),
+    ] {
+        let served = fixture(
+            StatusCode::OK,
+            &body,
+            &[
+                ("content-type", "text/event-stream"),
+                ("transfer-encoding", "chunked"),
+            ],
+        )
+        .await?;
+        let StreamableHttpPostResponse::Sse(mut events, _) = client()
+            .post_message_with_max_sse_event_size(
+                Arc::clone(&served.uri),
+                request(),
+                None,
+                None,
+                HashMap::new(),
+                body.len() - 1,
+            )
+            .await?
+        else {
+            return Err("expected bounded SSE stream".into());
+        };
+        let mut refused = false;
+        while let Some(event) = events.next().await {
+            if event.is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(
+            refused,
+            "the raw response limit includes unfinished and multiple events"
+        );
+    }
+    let over = fixture(
+        StatusCode::OK,
+        &"x".repeat(INBOUND_FRAME_BYTES_MAX + 1),
+        &[("content-type", "text/event-stream")],
+    )
+    .await?;
+    assert!(
+        client()
+            .post_message(Arc::clone(&over.uri), request(), None, None, HashMap::new(),)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[derive(Clone)]
+struct HttpHandler;
+impl rmcp::ServerHandler for HttpHandler {}
+
+async fn response_value(
+    answer: StreamableHttpPostResponse,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    match answer {
+        StreamableHttpPostResponse::Json(message, _) => Ok(serde_json::to_value(message)?),
+        StreamableHttpPostResponse::Sse(mut events, _) => {
+            while let Some(event) = events.next().await {
+                let event = event?;
+                if let Some(data) = event.data {
+                    return Ok(serde_json::from_str(&data)?);
+                }
+            }
+            Err("SSE reply is missing".into())
+        }
+        _ => Err("JSON-RPC reply is missing".into()),
+    }
+}
+
+#[tokio::test]
+async fn initialize_and_list_tools_accept_json_and_sse_from_pinned_http_service() -> TestResult {
+    use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+    };
+
+    for json_response in [true, false] {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let uri: Arc<str> = Arc::from(format!(
+            "http://127.0.0.1:{}/",
+            listener.local_addr()?.port()
+        ));
+        let service = StreamableHttpService::new(
+            || Ok(HttpHandler),
+            Arc::new(NeverSessionManager::default()),
+            StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(false)
+                .with_json_response(json_response),
+        );
+        let router = axum::Router::new().fallback_service(service);
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let served = Fixture {
+            uri,
+            received: Arc::new(Mutex::new(Vec::new())),
+            task,
+        };
+        let initialize = serde_json::from_value(json!({
+            "jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+                "protocolVersion":"2025-11-25", "capabilities":{},
+                "clientInfo":{"name":"transport-test-client", "version":"0.0.0"}
+            }
+        }))?;
+        let answer = client()
+            .post_message(
+                Arc::clone(&served.uri),
+                initialize,
+                None,
+                None,
+                HashMap::new(),
+            )
+            .await?;
+        let answer = response_value(answer).await?;
+        assert_eq!(answer["id"], 1);
+        assert!(answer.get("error").is_none(), "initialize: {answer}");
+        assert_eq!(answer["result"]["protocolVersion"], "2025-11-25");
+        let tools =
+            serde_json::from_value(json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}))?;
+        let headers = HashMap::from([(
+            HeaderName::from_static("mcp-protocol-version"),
+            HeaderValue::from_static("2025-11-25"),
+        )]);
+        let answer = response_value(
+            client()
+                .post_message(Arc::clone(&served.uri), tools, None, None, headers)
+                .await?,
+        )
+        .await?;
+        assert_eq!(answer["id"], 2);
+        assert!(answer.get("error").is_none(), "list tools: {answer}");
+        assert_eq!(answer["result"]["tools"], json!([]));
+    }
     Ok(())
 }

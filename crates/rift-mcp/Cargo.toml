@@ -16,6 +16,8 @@ autotests = false
 workspace = true
 
 [dependencies]
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+sse-stream = "=0.2.5"
 axum.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
