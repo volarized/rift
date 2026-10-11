@@ -463,6 +463,22 @@ fn anonymous_gap(value: &str) -> bool {
             rest = &rest[length..];
         } else {
             let byte = rest.as_bytes()[0];
+            if byte == b'\'' {
+                if rest == "'" {
+                    return true;
+                }
+                let Some(end) = apostrophe_end(rest, 0) else {
+                    return false;
+                };
+                let Some(name) = rest.get(1..end).filter(|name| identifier(name)) else {
+                    return false;
+                };
+                if !anonymous_gap(name) {
+                    return false;
+                }
+                rest = &rest[end..];
+                continue;
+            }
             if !b"!#$%&*+,-./:;<=>?@^|~".contains(&byte)
                 || rest.starts_with("//")
                 || rest.starts_with("/*")

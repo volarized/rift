@@ -1515,4 +1515,71 @@ mod tests {
         let main = main.expect("fixture declares a trait default method named main");
         assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
     }
+
+    #[test]
+    fn test_documentation_cfg_attributes_keep_original_module_path_facts() {
+        for (prefix, body) in [
+            (
+                "#[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))]\n",
+                "pub mod task;",
+            ),
+            ("#[cfg_attr(docsrs, doc(hidden))]\r\n", "mod child;"),
+            (
+                "",
+                "mod inline { #![cfg_attr(docsrs, doc(hidden))] mod child; }",
+            ),
+        ] {
+            let text = format!("{prefix}{body}");
+            let document = analyze(&text);
+            assert!(!document.has_errors());
+            let symbol = &document.symbols()[0];
+            assert_eq!(symbol.module_path, Some(crate::RustModulePath::Absent));
+            assert_eq!(text_at(&text, symbol.item_range), body);
+        }
+        let text = "#[path = \"mapped.rs\"]\n#[cfg_attr(docsrs, doc(hidden))]\nmod child;";
+        let document = analyze(text);
+        let Some(crate::RustModulePath::Literal { path, range }) =
+            &document.symbols()[0].module_path
+        else {
+            panic!("original literal path survives documentation attribute");
+        };
+        assert_eq!(path.as_str(), "mapped.rs");
+        assert_eq!(text_at(text, *range), "mapped.rs");
+    }
+
+    #[test]
+    fn test_documentation_cfg_attributes_refuse_unknown_or_mixed_effects() {
+        for attribute in [
+            "cfg_attr(docsrs, doc(hidden), path = \"other.rs\")",
+            "cfg_attr(docsrs, doc(hidden), macro_use)",
+            "cfg_attr(docsrs, doc(hidden), custom)",
+            "cfg_attr(docsrs, path = \"other.rs\")",
+            "cfg_attr(feature = \"rt\", doc(hidden))",
+            "cfg_attr(docsrs, doc(include_str!(\"other.rs\")))",
+            "cfg_attr(docsrs, doc[hidden])",
+            "cfg_attr(docsrs, doc(hidden);)",
+            "cfg_attr(docsrs, doc(hidden),)",
+        ] {
+            for text in [
+                format!("#[{attribute}]\nmod child;"),
+                format!("mod inline {{ #![{attribute}] mod child; }}"),
+            ] {
+                let document = analyze(&text);
+                assert_eq!(
+                    document.symbols()[0].module_path,
+                    Some(crate::RustModulePath::Unknown),
+                    "{text}"
+                );
+            }
+        }
+        let attribute = format!(
+            "#[cfg_attr(docsrs, doc({}))]",
+            "hidden,".repeat(rift_core::constants::PROJECT_PATH_BYTES_MAX)
+        );
+        let document = analyze(&format!("{attribute}\nmod child;"));
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Unknown)
+        );
+    }
 }

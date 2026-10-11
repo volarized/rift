@@ -1679,3 +1679,120 @@ fn rust_macro_doc_comments_keep_original_line_endings_and_refuse_hidden_code() {
             .is_none_or(|rows| rows.iter().all(|(_, _, children)| children.is_none()))
     );
 }
+
+#[test]
+fn documentation_cfg_module_paths_restore_original_source_and_unknown_effects() {
+    for (source, expected) in [
+        (
+            "#[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))]\npub mod task;",
+            rift_syntax::RustModulePath::Absent,
+        ),
+        (
+            "#[cfg_attr(docsrs, doc(hidden), path = \"other.rs\")]\nmod task;",
+            rift_syntax::RustModulePath::Unknown,
+        ),
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        assert_eq!(document.symbols()[0].module_path, Some(expected));
+        let restored =
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+                .expect("original documentation attachment facts");
+        assert_eq!(&restored, document.facts());
+        assert_eq!(
+            restored.symbols()[0].item_range,
+            document.symbols()[0].item_range
+        );
+    }
+}
+
+#[test]
+fn rust_macro_multiline_lifetimes_keep_original_direct_children() {
+    let source = "cfg_rt! {\n    pub fn spawn<'a, F>(future: F) -> F\n    where\n        F: Future + Send + 'static,\n        F::Output: Send + 'static,\n    { future }\n}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("original invocation");
+    assert_eq!(invocations.len(), 1);
+    let children = invocations[0]
+        .2
+        .as_ref()
+        .expect("complete original lifetime tokens");
+    assert!(children.iter().any(|range| &source
+        [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+        == "a"));
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
+        .expect("original lifetime ranges restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn rust_macro_lifetime_gaps_refuse_omitted_identifiers_and_character_tokens() {
+    let source = "cfg_rt! { fn named<'a>() {} const LETTER: char = 'x'; const ESCAPED: char = '\\n'; const RAW: &str = r#\"held\"#; }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let children = captured.macro_invocations.as_ref().expect("invocation")[0]
+        .2
+        .as_ref()
+        .expect("original direct tokens");
+    for expected in ["a", "'x'", "'\\n'", "r#\"held\"#"] {
+        let index = children
+            .iter()
+            .position(|range| {
+                &source[usize::try_from(range.start).expect("start")
+                    ..usize::try_from(range.end).expect("end")]
+                    == expected
+            })
+            .expect("original named token");
+        let mut invalid = captured.clone();
+        invalid.macro_invocations.as_mut().expect("invocation")[0]
+            .2
+            .as_mut()
+            .expect("direct tokens")
+            .remove(index);
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+                .expect_err("omitted token cannot become anonymous lifetime gap")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_range_invalid",
+            "{expected}"
+        );
+    }
+}
+
+#[test]
+fn rust_macro_lifetime_gaps_refuse_malformed_and_truncated_original_groups() {
+    for source in [
+        "cfg_rt! { ' }",
+        "cfg_rt! { '\\ }",
+        "cfg_rt! { 'unterminated",
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        assert!(
+            document
+                .facts()
+                .macro_invocations()
+                .is_none_or(|rows| rows.iter().all(|(_, _, children)| children.is_none()))
+        );
+        let mut captured = parts(document.facts());
+        captured.macro_invocations = Some(vec![(
+            rift_syntax::ByteRange {
+                start: 0,
+                end: u64::try_from(source.len()).expect("source length"),
+            },
+            Vec::new(),
+            Some(Vec::new()),
+        )]);
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
+                .expect_err("malformed original group cannot claim complete direct children")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_range_invalid"
+        );
+    }
+}

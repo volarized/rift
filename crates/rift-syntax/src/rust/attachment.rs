@@ -135,6 +135,7 @@ pub(super) fn module_path(
                     | "deprecated"
                     | "no_implicit_prelude",
                 ) => {}
+                Some("cfg_attr") if documentation_cfg_attribute(attribute, text) => {}
                 _ => return Ok(crate::RustModulePath::Unknown),
             }
         }
@@ -175,6 +176,7 @@ pub(super) fn module_path(
             | "forbid"
             | "deprecated"
             | "no_implicit_prelude" => {}
+            "cfg_attr" if documentation_cfg_attribute(attribute, text) => {}
             _ => return Ok(crate::RustModulePath::Unknown),
         }
         previous = sibling.previous_sibling();
@@ -190,6 +192,72 @@ fn semantic_attribute_name<'source>(
         .named_child(0)
         .filter(|node| node.kind() == "identifier")
         .and_then(|node| text.get(node.byte_range()))
+}
+
+fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
+    let Some(arguments) = attribute.child_by_field_name("arguments") else {
+        return false;
+    };
+    if attribute.has_error()
+        || attribute.named_child_count() != 2
+        || arguments.kind() != "token_tree"
+        || arguments.child_count() != 6
+        || arguments.end_byte() - arguments.start_byte()
+            > rift_core::constants::PROJECT_PATH_BYTES_MAX
+    {
+        return false;
+    }
+    for (index, expected) in [(0, "("), (1, "docsrs"), (2, ","), (3, "doc"), (5, ")")] {
+        if arguments
+            .child(index)
+            .and_then(|node| text.get(node.byte_range()))
+            != Some(expected)
+        {
+            return false;
+        }
+    }
+    let Some(documentation) = arguments
+        .child(4)
+        .filter(|node| node.kind() == "token_tree")
+    else {
+        return false;
+    };
+    documentation_tokens(documentation, text)
+}
+
+fn documentation_tokens(documentation: Node<'_>, text: &str) -> bool {
+    if documentation.child(0).is_none_or(|node| node.kind() != "(")
+        || documentation
+            .child(documentation.child_count() - 1)
+            .is_none_or(|node| node.kind() != ")")
+    {
+        return false;
+    }
+    let mut cursor = documentation.walk();
+    for _ in 0..rift_core::constants::PROJECT_PATH_BYTES_MAX {
+        let node = cursor.node();
+        if matches!(node.kind(), "metavariable" | "token_repetition")
+            || (!node.is_named()
+                && text.get(node.byte_range()).is_none_or(|token| {
+                    token
+                        .chars()
+                        .any(|value| ['$', '!', '{', '}', '[', ']', ';'].contains(&value))
+                }))
+            || node.is_missing()
+            || node.is_error()
+        {
+            return false;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn literal_path(attribute: Node<'_>, text: &str) -> Result<crate::RustModulePath, RiftError> {
