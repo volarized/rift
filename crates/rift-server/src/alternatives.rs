@@ -295,7 +295,7 @@ mod tests {
     use std::error::Error;
 
     use rift_core::{SourceVisibility, TextFileInclusion};
-    use rift_index::{WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSymbolView};
+    use rift_index::{WorkspaceIndex, WorkspaceIndexLimits};
 
     use super::Work;
 
