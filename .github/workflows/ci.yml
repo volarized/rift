@@ -132,7 +132,7 @@ jobs:
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
         run: uv run --locked --project dev rift-dev build-cache
 
-      - run: uv run --locked --project dev pre-commit run --all-files
+      - run: uv run --locked --project dev pre-commit run --all-files --show-diff-on-failure
         timeout-minutes: 30
       - run: just audit
         timeout-minutes: 1
