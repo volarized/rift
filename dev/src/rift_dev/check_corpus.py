@@ -156,7 +156,7 @@ CHURN_REQUESTS: dict[str, JsonObject] = {
         "include": ["source"],
         "limit": 1,
     },
-    "get_symbol": {"name": "corpus_probe"},
+    "get_symbol": {"include": ["source"]},
     "nodes": {"path": PROBE_PATH, "position": 0},
 }
 # The convergence loop resends every churn tool until the newest source lands, so it
@@ -850,8 +850,15 @@ class Corpus:
         sizes = database_bytes(self.root)
         path = self.root / PROBE_PATH
         path.write_bytes(PROBE_SOURCE.encode())
-        answer = await client.call("get_symbol", {"name": "corpus_probe"})
-        hits = objects(answer, "hits")
+        request: JsonObject = {
+            "query": "corpus_probe",
+            "target": "symbol",
+            "paths": {"include": [PROBE_PATH]},
+            "include": ["source"],
+            "limit": 5,
+        }
+        answer = await client.call("search", request)
+        hits = objects(answer, "results")
         require(
             len(hits) == 1 and hits[0].get("source") == PROBE_SOURCE.rstrip("\n"),
             f"new source was absent from reads: {answer}",
@@ -869,9 +876,9 @@ class Corpus:
             "lexical_persistence", before=sizes, after=database_bytes(self.root)
         )
         path.unlink()
-        answer = await client.call("get_symbol", {"name": "corpus_probe"})
+        answer = await client.call("search", request)
         require(
-            not objects(answer, "hits"), f"removed source remained indexed: {answer}"
+            not objects(answer, "results"), f"removed source remained indexed: {answer}"
         )
         await self.await_probe(False)
         require(
@@ -969,9 +976,7 @@ class Corpus:
                 async with server.connect() as client:
                     # Listener readiness precedes file preparation. Observe the existing
                     # startup budget before measuring reads against external writes.
-                    await settled_local(
-                        client, "get_symbol", CHURN_REQUESTS["get_symbol"]
-                    )
+                    await settled_local(client, "search", CHURN_REQUESTS["search"])
                     await self.churn(client, probe.relative_to(self.root).as_posix())
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
@@ -986,6 +991,7 @@ class Corpus:
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
         requests["nodes"]["path"] = probe_path
+        requests["search"]["paths"] = {"include": [probe_path]}
         sources: list[str] = []
         written: list[float] = []
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
@@ -1060,7 +1066,8 @@ class Corpus:
         write(0)
         task: asyncio.Task[None] | None = None
         try:
-            identity, _revision = await read("get_symbol", None)
+            identity, _revision = await read("search", None)
+            requests["get_symbol"]["id"] = identity
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -1146,18 +1153,18 @@ class Corpus:
             async with server.connect() as client:
                 found = await settled_local(
                     client,
-                    "get_symbol",
+                    "search",
                     {
-                        "name": "FastAPI",
-                        "language": "python",
-                        "include": ["history"],
-                        "limit": 5,
+                        "query": "FastAPI",
+                        "target": "symbol",
+                        "paths": {"include": ["fastapi/**/*.py"]},
+                        "limit": 1000,
                     },
                 )
-                hits = objects(found, "hits")
                 selected = []
-                for hit in hits:
-                    symbol = object_value(hit.get("symbol"), "shallow symbol")
+                for hit in objects(found, "results"):
+                    target = object_value(hit.get("hit"), "shallow hit")
+                    symbol = object_value(target.get("symbol"), "shallow symbol")
                     if (
                         symbol.get("name") == "FastAPI"
                         and symbol.get("kind") == "class"
@@ -1180,29 +1187,38 @@ class Corpus:
                     len(selected) == 1,
                     "shallow checkout must have one canonical FastAPI class",
                 )
-                for hit in selected:
-                    symbol = hit.get("symbol")
-                    evidence = {
-                        "name": symbol.get("name")
-                        if isinstance(symbol, dict)
-                        else hit.get("name"),
-                        "id": symbol.get("id")
-                        if isinstance(symbol, dict)
-                        else hit.get("id"),
-                        "path": hit.get("path"),
-                        "history": hit.get("history"),
-                        "view": found.get("view"),
-                        "revision": found.get("revision"),
-                        "root": str(root),
-                    }
-                    history = object_value(
-                        hit.get("history"),
-                        "symbol history " + json.dumps(evidence, sort_keys=True)[:4096],
-                    )
-                    require(
-                        history.get("complete") is False,
-                        "shallow history must report complete=false",
-                    )
+                hit = selected[0]
+                symbol = object_value(
+                    object_value(hit.get("hit"), "shallow hit").get("symbol"),
+                    "shallow symbol",
+                )
+                answer = await settled_local(
+                    client,
+                    "get_symbol",
+                    {"id": symbol["id"], "include": ["history"]},
+                )
+                require(answer.get("outcome") == "found", "shallow class was not found")
+                require(
+                    object_value(answer.get("symbol"), "shallow symbol").get("id")
+                    == symbol["id"],
+                    "shallow class changed its identity",
+                )
+                evidence = {
+                    "name": symbol.get("name"),
+                    "id": symbol.get("id"),
+                    "path": hit.get("path"),
+                    "history": answer.get("history"),
+                    "view": answer.get("view"),
+                    "root": str(root),
+                }
+                history = object_value(
+                    answer.get("history"),
+                    "symbol history " + json.dumps(evidence, sort_keys=True)[:4096],
+                )
+                require(
+                    history.get("complete") is False,
+                    "shallow history must report complete=false",
+                )
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("shallow_history", complete=False, depth=1)
@@ -1218,7 +1234,7 @@ class Corpus:
                     while True:
                         try:
                             answer = await client.call(
-                                "get_symbol", {"name": "corpus_probe"}
+                                "search", CHURN_REQUESTS["search"]
                             )
                         except ToolFailure as error:
                             require(
@@ -1302,15 +1318,19 @@ class Corpus:
                     bool(objects(answer, "results")),
                     "lexical overflow removed identifier matches",
                 )
+                captured = await client.call(
+                    "search", {"query": "TEST", "target": "symbol", "limit": 1000}
+                )
+                canonical = symbol_pool(objects(captured, "results"))
+                anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
                 require(
-                    bool(
-                        objects(
-                            await client.call(
-                                "get_symbol", {"name": "test", "limit": 1}
-                            ),
-                            "hits",
-                        )
-                    ),
+                    anchor in canonical, "Bun lost its established Rust TEST identity"
+                )
+                exact = await client.call("get_symbol", {"id": anchor})
+                require(
+                    exact.get("outcome") == "found"
+                    and object_value(exact.get("symbol"), "symbol").get("id") == anchor
+                    and bool(objects(exact, "declarations")),
                     "lexical overflow removed symbol reads",
                 )
             self.stop(server)
