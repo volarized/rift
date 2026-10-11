@@ -266,7 +266,7 @@ impl GlobalFixture {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let expires = std::time::SystemTime::now()
-            .checked_add(Duration::from_secs(15 * 60))
+            .checked_add(Duration::from_mins(15))
             .expect("fixture view expiry fits the clock bound");
         let view = json!({
             "id": "a".repeat(64),
