@@ -2,11 +2,12 @@
 //! across `RelationshipStore`'s edges, merged into `search`'s hit set. Extracted from `search`
 //! so that module stays below its size bound.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rift_core::{LoopBudget, SymbolId as CoreSymbolId};
+use rift_core::SymbolId as CoreSymbolId;
 use rift_error::errors;
+use rift_index::TraversalWalk;
 use rift_index::{
     IndexedFile, PathMatcher, RelationshipEdge, RelationshipStore, SymbolMatch, WorkspaceIndex,
 };
@@ -287,13 +288,6 @@ pub(crate) fn resolve_graph_symbol<'a>(
         .map(|matched| (matched.file, matched.symbol)))
 }
 
-/// One traversal walk's outcome: each discovered symbol with its shortest path, and whether
-/// the node bound stopped the walk before the reachable graph was exhausted.
-pub(crate) struct TraversalWalk {
-    pub(crate) discovered: Vec<(CoreSymbolId, Vec<GraphHop>)>,
-    pub(crate) truncated: bool,
-}
-
 /// The warning a truncated traversal walk attaches: the bound the walk hit, and the
 /// narrowing that fits a walk under it.
 pub(crate) fn traversal_truncation_warning() -> ReadWarning {
@@ -337,46 +331,12 @@ pub(crate) fn walk_traversal_with_references(
     nodes_max: usize,
     references: &EngineReferences,
 ) -> TraversalWalk {
-    let mut enqueued: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
-    let mut recorded: BTreeSet<CoreSymbolId> = BTreeSet::from([seed.clone()]);
-    let mut budget = LoopBudget::new(nodes_max);
-    let mut truncated = false;
-    let mut queue: VecDeque<(CoreSymbolId, Vec<GraphHop>)> =
-        VecDeque::from([(seed.clone(), Vec::new())]);
-    let mut discovered = Vec::new();
-    while let Some((current, path)) = queue.pop_front() {
-        if path.len() as u64 >= traversal.depth {
-            continue;
-        }
-        for edge in combined_edges(store, &current, references, traversal.direction) {
-            if !edge.eligible(&traversal.facets) {
-                continue;
-            }
-            let Some(next) = edge.next() else {
-                continue;
-            };
-            if recorded.contains(&next) {
-                continue;
-            }
-            if budget.consume().is_err() {
-                truncated = true;
-                continue;
-            }
-            recorded.insert(next.clone());
-            let mut next_path = path.clone();
-            next_path.push(edge.hop());
-            discovered.push((next.clone(), next_path.clone()));
-            // A seed reached by another seed is already queued at its own empty path, so
-            // it takes this discovery and keeps the walk it started.
-            if enqueued.insert(next.clone()) {
-                queue.push_back((next, next_path));
-            }
-        }
-    }
-    TraversalWalk {
-        discovered,
-        truncated,
-    }
+    rift_index::walk_traversal_capped(seed, traversal, nodes_max, |current, direction| {
+        combined_edges(store, current, references, direction)
+            .into_iter()
+            .filter(|edge| edge.eligible(&traversal.facets))
+            .filter_map(|edge| edge.next().map(|next| (next, edge.hop())))
+    })
 }
 
 enum TraversalEdge<'edge> {

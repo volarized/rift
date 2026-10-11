@@ -23,6 +23,7 @@ mod selection;
 mod semantic;
 #[cfg(feature = "collector")]
 mod source;
+mod traversal;
 
 #[cfg(feature = "collector")]
 pub use analyzer::{
@@ -57,6 +58,7 @@ pub use selection::{
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
+pub use traversal::{TraversalWalk, walk_traversal_capped};
 
 #[cfg(feature = "collector")]
 mod package_syntax;
