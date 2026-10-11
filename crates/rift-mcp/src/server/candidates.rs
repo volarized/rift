@@ -804,6 +804,26 @@ impl CandidateResponses {
             || retained.is_none_or(|bytes| bytes > BYTES_MAX)
             || saved.iter().any(|row| row.id == id)
         {
+            let stored_bytes = saved
+                .iter()
+                .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.len()));
+            let stored_capacity = saved
+                .iter()
+                .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.capacity()));
+            rift_tracing::warn!(
+                component = "mcp",
+                operation = "search_candidates",
+                rows = saved.len(),
+                views_max = SLOTS_MAX,
+                ?retained,
+                bytes_max = BYTES_MAX,
+                ?stored_bytes,
+                ?stored_capacity,
+                incoming_bytes = encoded.len(),
+                incoming_capacity = encoded.capacity(),
+                duplicate = saved.iter().any(|row| row.id == id),
+                "captured candidates exceed the byte or view bound"
+            );
             return Err(errors::server::read_unavailable()
                 .operation("search_candidates")
                 .detail("captured candidates exceed the byte or view bound")
