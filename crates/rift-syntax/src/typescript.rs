@@ -628,4 +628,96 @@ mod tests {
             Some("read(size?: number): string")
         );
     }
+    #[test]
+    fn test_original_ambient_global_keeps_source_ranges_and_global_scope() {
+        let text = include_str!("../../rift-analysis/tests/fixtures/types-node-buffer.d.ts");
+        let document = analyze(text);
+        assert!(!document.has_errors());
+        assert_eq!(
+            document.source_digest(),
+            Some(&rift_core::FileDigest::of(text.as_bytes()))
+        );
+        let declaration = document
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "isUtf8")
+            .expect("original isUtf8 declaration remains");
+        assert_eq!(
+            declaration.item_range,
+            crate::ByteRange {
+                start: 391,
+                end: 456
+            }
+        );
+        assert_eq!(
+            declaration.range,
+            crate::ByteRange {
+                start: 89,
+                end: 456
+            }
+        );
+        assert_eq!(declaration.container.as_deref(), Some("\"node:buffer\""));
+        assert!(
+            document
+                .nodes()
+                .iter()
+                .any(|node| node.kind == "global_namespace")
+        );
+        let globals = document
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.container.as_deref().is_some_and(|container| {
+                    container == "global" || container.starts_with("global.")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(!globals.is_empty());
+        for symbol in globals {
+            assert!(!symbol.qualified_name.starts_with("\"node:buffer\"."));
+            let start = usize::try_from(symbol.range.start).expect("source range fits");
+            let end = usize::try_from(symbol.range.end).expect("source range fits");
+            assert!(text.get(start..end).is_some());
+        }
+    }
+
+    #[test]
+    fn test_ambient_global_keeps_malformed_declarations_and_blocks_unknown() {
+        for text in [
+            "declare module \"node:buffer\" { global { interface Broken { field: } } }",
+            "declare module \"node:buffer\" { global { function broken(: void; } }",
+            "declare module \"node:buffer\" { global { interface Broken {}",
+            "declare module \"node:buffer\" { function broken(: void; global { interface Valid {} } }",
+        ] {
+            let document = analyze(text);
+            assert!(
+                document.has_errors(),
+                "malformed source remains unknown: {text}"
+            );
+            assert_eq!(
+                document.source_digest(),
+                Some(&rift_core::FileDigest::of(text.as_bytes()))
+            );
+        }
+    }
+
+    #[test]
+    fn test_global_scope_does_not_inherit_ambient_module_or_namespace() {
+        let text = "declare module \"node:buffer\" { global { interface Buffer {} }\n function local(): void; } declare global { interface Window {} } namespace outer { namespace inner { interface Member {} } }";
+        let document = analyze(text);
+        assert!(!document.has_errors());
+        for (name, container) in [
+            ("Buffer", "global"),
+            ("Window", "global"),
+            ("local", "\"node:buffer\""),
+            ("Member", "outer.inner"),
+        ] {
+            let symbol = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .expect("original declaration");
+            assert_eq!(symbol.container.as_deref(), Some(container), "{name}");
+        }
+    }
 }

@@ -140,6 +140,14 @@ pub(crate) trait GrammarRules {
     /// scope.
     fn container_name(&self, node: Node<'_>, text: &str) -> Option<String>;
 
+    /// The qualification declarations under this node take.
+    fn child_qualification(&self, node: Node<'_>, text: &str, parent: &str) -> String {
+        self.container_name(node, text).map_or_else(
+            || parent.to_owned(),
+            |name| qualify(self.qualification_separator(), parent, &name),
+        )
+    }
+
     /// Byte offset where the visited node's whole declaration starts,
     /// attached attributes and doc comments included.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize;
@@ -311,10 +319,7 @@ pub(crate) fn extract_with_export_bindings(
                 grammar,
             )?);
         }
-        let child_qualification = rules.container_name(node, text).map_or_else(
-            || qualification.clone(),
-            |name| qualify(rules.qualification_separator(), &qualification, &name),
-        );
+        let child_qualification = rules.child_qualification(node, text, &qualification);
 
         if pending.len() + nodes.len() + node.named_child_count() > limits.syntax_nodes_max() {
             return errors::syntax::too_many_nodes()
@@ -483,7 +488,7 @@ fn callable_signature(
     })
 }
 
-fn qualify(separator: &str, parent: &str, name: &str) -> String {
+pub(crate) fn qualify(separator: &str, parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.into()
     } else {

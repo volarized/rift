@@ -21,7 +21,7 @@ fn complete_source_inventory_keeps_parser_error_coverage_separate() {
 }
 
 #[test]
-fn complete_source_inventory_keeps_captured_declaration_file_parser_errors_separate() {
+fn complete_source_inventory_keeps_original_declaration_file_without_entry_context() {
     // Original admitted @types/node 26.6.4 buffer.d.ts, retained without editing.
     let source = include_str!("../../tests/fixtures/types-node-buffer.d.ts");
     let analysis = super::fixture::package_analysis(
@@ -29,7 +29,7 @@ fn complete_source_inventory_keeps_captured_declaration_file_parser_errors_separ
         vec![("buffer.d.ts", source)],
     );
     let syntax = analysis.files()[0].file().syntax();
-    assert!(syntax.has_errors());
+    assert!(!syntax.has_errors());
     assert_eq!(syntax.left_out_declaration_count(), 0);
     assert_eq!(analysis.files()[0].file().source(), source);
     assert!(

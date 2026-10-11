@@ -282,6 +282,8 @@ pub(crate) struct EcmaScriptKinds {
     /// accessibility.
     accessibility_modifier: Option<u16>,
     ambient_declaration: Option<u16>,
+    global_namespace: Option<u16>,
+    global_token: Option<u16>,
     function_type: Option<u16>,
     type_annotation: Option<u16>,
     declaration_type: Option<NonZeroU16>,
@@ -357,6 +359,8 @@ impl EcmaScriptKinds {
             comment: kind_id(language, COMMENT_KIND),
             accessibility_modifier: None,
             ambient_declaration: None,
+            global_namespace: None,
+            global_token: None,
             function_type: None,
             type_annotation: None,
             declaration_type: None,
@@ -438,6 +442,8 @@ impl EcmaScriptKinds {
         ];
         kinds.accessibility_modifier = Some(kind_id(language, ACCESSIBILITY_MODIFIER_KIND));
         kinds.ambient_declaration = Some(kind_id(language, AMBIENT_DECLARATION_KIND));
+        kinds.global_namespace = Some(kind_id(language, "global_namespace"));
+        kinds.global_token = Some(token_id(language, "global"));
         kinds.function_type = Some(kind_id(language, FUNCTION_TYPE_KIND));
         kinds.type_annotation = Some(kind_id(language, TYPE_ANNOTATION_KIND));
         kinds.declaration_type = Some(field_id(language, "type"));
@@ -1175,6 +1181,22 @@ impl GrammarRules for EcmaScriptRules<'_> {
             documentation,
             documentation_ranges,
         }))
+    }
+
+    fn child_qualification(&self, node: Node<'_>, text: &str, parent: &str) -> String {
+        let global = self.kinds.global_namespace == Some(node.kind_id())
+            || (self.kinds.ambient_declaration == Some(node.kind_id())
+                && self
+                    .kinds
+                    .global_token
+                    .is_some_and(|token| Self::has_token(node, &[token])));
+        if global {
+            return "global".to_owned();
+        }
+        self.container_name(node, text).map_or_else(
+            || parent.to_owned(),
+            |name| extract::qualify(self.qualification_separator(), parent, &name),
+        )
     }
 
     fn container_name(&self, node: Node<'_>, text: &str) -> Option<String> {
