@@ -1178,3 +1178,173 @@ fn local_view_continuation_charges_owned_context_and_refuses_byte_overflow() {
     assert!(state.views.contains_key(limited_view.id.as_str()));
     assert!(state.material_bytes() <= before);
 }
+
+fn distinct_text_generations() -> (tempfile::TempDir, Vec<rift_index::WorkspaceIndex>, String) {
+    let directory = tempfile::tempdir().expect("workspace");
+    let original = "original captured text\n".repeat(8192);
+    for path in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(directory.path().join(path), &original).expect("original source");
+    }
+    let mut preparation = rift_index::WorkspaceIndexPreparation::new(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &TextFileInclusion::default(),
+        &rift_core::LanguageFileSelections::default(),
+    )
+    .expect("preparation");
+    assert_eq!(
+        preparation
+            .discover(&SourceVisibility::default(), &|| false)
+            .expect("discovery"),
+        3
+    );
+    let first = preparation
+        .advance_to(1, &|| false)
+        .expect("first generation");
+    let second = preparation
+        .advance_to_with_previous(2, Some(&first), &|| false)
+        .expect("second generation");
+    let third = preparation
+        .advance_to_with_previous(3, Some(&second), &|| false)
+        .expect("third generation");
+    (directory, vec![first, second, third], original)
+}
+
+fn text_generation_input(index: &rift_index::WorkspaceIndex) -> LocalSymbolViewInput {
+    let metadata = serde_json::to_vec(&CapturedMetadata {
+        revision: None,
+        warnings: Vec::new(),
+    })
+    .expect("captured metadata");
+    local_view_input(
+        index.symbol_view().expect("captured generation"),
+        metadata,
+        None,
+        None,
+        true,
+    )
+}
+
+#[test]
+fn distinct_generation_admission_counts_shared_allocations_and_keeps_original_source() {
+    let (directory, indexes, original) = distinct_text_generations();
+    let now = SystemTime::now();
+    let measured = LocalSymbolViews::new(usize::MAX, [38; 32]);
+    for index in &indexes[..2] {
+        measured
+            .capture_at(text_generation_input(index), now)
+            .expect("capture")
+            .expect("view");
+    }
+    let (cached, shared) = {
+        let state = measured.state.lock().expect("state");
+        (
+            state.material_bytes(),
+            state.material_bytes_with_shared_indexes(true),
+        )
+    };
+    assert!(
+        cached > shared + original.len(),
+        "original source allocation is shared between distinct generations"
+    );
+    let limited = LocalSymbolViews::new(shared, [39; 32]);
+    let first = limited
+        .capture_at(text_generation_input(&indexes[0]), now)
+        .expect("first capture")
+        .expect("first view");
+    let second = limited
+        .capture_at(text_generation_input(&indexes[1]), now)
+        .expect("second capture")
+        .expect("shared generation admission");
+    {
+        let state = limited.state.lock().expect("state");
+        assert!(
+            state.material_bytes() > shared,
+            "cached charges alone would refuse"
+        );
+        assert_eq!(state.admitted_material_bytes(shared), shared);
+        assert!(state.views.contains_key(first.id.as_str()));
+        assert!(state.views.contains_key(second.id.as_str()));
+    }
+    assert!(
+        limited
+            .capture_at(text_generation_input(&indexes[2]), now)
+            .expect("actual byte bound")
+            .is_none()
+    );
+    std::fs::write(directory.path().join("a.txt"), "changed current bytes\n")
+        .expect("later source");
+    let request = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/a.txt")
+            .expect("physical unit"),
+        range: None,
+        view: Some(first.id.clone()),
+        rev: None,
+    };
+    let result = limited
+        .get_source(&request, indexes[0].root(), indexes[0].owner())
+        .expect("held original source");
+    let rift_protocol::source_read::GetSourceResult::Found {
+        source,
+        source_complete,
+        view,
+        ..
+    } = result
+    else {
+        panic!("previously advertised source remains available");
+    };
+    assert!(source_complete);
+    assert_eq!(source.text, original);
+    assert_eq!(view, first);
+    let state = limited.state.lock().expect("state");
+    assert_eq!(
+        state.views.len(),
+        2,
+        "refused third generation cannot replace either held view"
+    );
+    assert!(state.views.contains_key(second.id.as_str()));
+    println!("cached_material_bytes={cached} shared_material_bytes={shared}");
+}
+
+#[test]
+fn shared_generation_accounting_preserves_slot_and_overflow_refusals() {
+    let (_directory, reads, id) = fixture(true);
+    let budget = usize::try_from(8_u64 << 30).expect("existing byte bound");
+    let store = LocalSymbolViews::new(budget, [40; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let first = capture(&store, &reads, now);
+    for _ in 1..VIEW_SLOTS {
+        capture(&store, &reads, now);
+    }
+    assert!(
+        store
+            .capture_at(captured_input(&reads), now)
+            .expect("slot refusal")
+            .is_none()
+    );
+    assert!(matches!(
+        store
+            .resolve_at(
+                &request(id, first.id),
+                reads.index.root(),
+                reads.index.owner(),
+                now
+            )
+            .expect("original held view"),
+        GetSymbolResult::Found { .. }
+    ));
+    let state = store.state.lock().expect("state");
+    assert_eq!(state.views.len(), VIEW_SLOTS);
+    assert!(state.admitted_material_bytes(budget) <= budget);
+    drop(state);
+    let overflow = LocalSymbolViews::new(budget, [41; 32]);
+    let mut input = captured_input(&reads);
+    input.retained_bytes = usize::MAX;
+    assert!(
+        overflow
+            .capture_at(input, now)
+            .expect("MAX refusal")
+            .is_none()
+    );
+    assert!(overflow.state.lock().expect("state").views.is_empty());
+}

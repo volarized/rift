@@ -162,6 +162,19 @@ impl State {
     }
 
     fn material_bytes(&self) -> usize {
+        self.material_bytes_with_shared_indexes(false)
+    }
+
+    fn admitted_material_bytes(&self, bytes_max: usize) -> usize {
+        let cached = self.material_bytes();
+        if cached != usize::MAX && cached > bytes_max {
+            self.material_bytes_with_shared_indexes(true)
+        } else {
+            cached
+        }
+    }
+
+    fn material_bytes_with_shared_indexes(&self, shared: bool) -> usize {
         use get_size2::{GetSize, GetSizeTracker};
         let mut total = rift_protocol::btree_material_bytes::<String, HeldView>(self.views.len())
             .saturating_add(rift_protocol::btree_material_bytes::<String, Continuation>(
@@ -178,8 +191,15 @@ impl State {
                 .saturating_add(held.view.id.get_heap_size())
                 .saturating_add(held.view.expires_at.capacity());
             if charged.track(Arc::as_ptr(&held.material.index)) {
+                let bytes = if shared {
+                    let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
+                    charged = next;
+                    bytes
+                } else {
+                    held.material.index.retained_material_bytes()
+                };
                 total = total
-                    .saturating_add(held.material.index.retained_material_bytes())
+                    .saturating_add(bytes)
                     .saturating_add(2 * std::mem::size_of::<usize>());
             }
             if charged.track(Arc::as_ptr(&held.material)) {
@@ -292,7 +312,7 @@ impl LocalSymbolViews {
                 expires,
             },
         );
-        let material_bytes = state.material_bytes();
+        let material_bytes = state.admitted_material_bytes(self.material_bytes_max);
         if material_bytes == usize::MAX || material_bytes > self.material_bytes_max {
             rift_tracing::warn!(
                 component = "server",
@@ -493,7 +513,7 @@ impl LocalSymbolViews {
             state.expire(now);
             let key = self.next_key(&mut state)?;
             state.cursors.insert(key.clone(), continuation);
-            if state.material_bytes() > self.material_bytes_max {
+            if state.admitted_material_bytes(self.material_bytes_max) > self.material_bytes_max {
                 state.cursors.remove(&key);
                 return Ok(unavailable(
                     request,
