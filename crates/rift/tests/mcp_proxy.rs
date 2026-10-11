@@ -1015,9 +1015,81 @@ fn text_of(result: &CallToolResult) -> TestResult<&str> {
         .as_str())
 }
 
-/// The text block is the same through the `all` and the `text` proxy of one server, the `text`
-/// result carries no structured content, and the text states the identity of each symbol hit
-/// and each node of the `all` result's structured content as a bare token.
+/// Removes one rendered view after parsing its exact identity and expiry.
+fn proxy_text_view(
+    text: &str,
+) -> TestResult<(String, Option<rift_protocol::symbol_read::CapturedView>)> {
+    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
+    let mut body = String::new();
+    let mut view = None;
+    for line in text.split_inclusive('\n') {
+        if let Some(value) = line.trim_end_matches(['\r', '\n']).strip_prefix("view ") {
+            let (id, expires_at) = value
+                .split_once(" · expires ")
+                .ok_or("the captured view must state its expiry")?;
+            assert!(view.is_none(), "one captured view per result");
+            assert!(
+                !expires_at.is_empty(),
+                "the captured expiry must be present"
+            );
+            view = Some(CapturedView {
+                id: CapturedViewId::parse(id)?,
+                expires_at: expires_at.to_owned(),
+            });
+        } else {
+            body.push_str(line);
+        }
+    }
+    Ok((body, view))
+}
+
+/// Reads each advertised view through its owning proxy before comparing the remaining text.
+async fn validated_proxy_text(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &'static str,
+    request: &serde_json::Value,
+    result: &CallToolResult,
+) -> TestResult<String> {
+    let original = text_of(result)?;
+    let (body, view) = proxy_text_view(original)?;
+    if let Some(structured) = &result.structured_content {
+        assert_eq!(
+            structured.get("view").filter(|value| !value.is_null()),
+            view.as_ref()
+                .map(serde_json::to_value)
+                .transpose()?
+                .as_ref(),
+            "{name}: text states the exact structured view and expiry"
+        );
+    }
+    if let Some(view) = view {
+        let mut held_request = request.clone();
+        held_request["view"] = serde_json::to_value(&view.id)?;
+        held_request
+            .as_object_mut()
+            .ok_or("tool arguments must be an object")?
+            .remove("rev");
+        let held = proxied_result(client, name, &held_request).await?;
+        assert_ne!(held.is_error, Some(true), "{name}: {held:?}");
+        assert_eq!(
+            text_of(&held)?,
+            original,
+            "{name}: the owning proxy retains the view, expiry, identities and source"
+        );
+        if let Some(structured) = &held.structured_content {
+            assert_eq!(
+                structured.get("view"),
+                Some(&serde_json::to_value(view)?),
+                "{name}: held structured content retains the original view and expiry"
+            );
+        }
+    }
+    Ok(body)
+}
+
+/// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
+/// view is read back through that proxy with its original expiry. The `text` result carries no
+/// structured content, and each symbol and node identity is a bare token in the `all` text.
 ///
 /// The text-against-structured checks of `rift-mcp` (`crates/rift-mcp/tests/text_complete`) live
 /// in that crate's test binary and are not shared here: they run over the whole surface corpus
@@ -1094,7 +1166,11 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
             );
             text_complete::assert_text_states(name, &all_result);
             let all_text = text_of(&all_result)?;
-            assert_eq!(all_text, text_of(&text_result)?, "{name}: texts differ");
+            let (all_body, text_body) = tokio::join!(
+                validated_proxy_text(&all, name, &request, &all_result),
+                validated_proxy_text(&text, name, &request, &text_result),
+            );
+            assert_eq!(all_body?, text_body?, "{name}: texts differ");
 
             let structured = all_result
                 .structured_content
