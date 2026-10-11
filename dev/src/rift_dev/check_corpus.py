@@ -1147,11 +1147,40 @@ class Corpus:
                 found = await settled_local(
                     client,
                     "get_symbol",
-                    {"name": "FastAPI", "include": ["history"], "limit": 5},
+                    {
+                        "name": "FastAPI",
+                        "language": "python",
+                        "include": ["history"],
+                        "limit": 5,
+                    },
                 )
                 hits = objects(found, "hits")
-                require(bool(hits), "shallow checkout has no FastAPI declaration")
+                selected = []
                 for hit in hits:
+                    symbol = object_value(hit.get("symbol"), "shallow symbol")
+                    if (
+                        symbol.get("name") == "FastAPI"
+                        and symbol.get("kind") == "class"
+                    ):
+                        identity = string_value(
+                            symbol.get("id"), "shallow class identity"
+                        )
+                        require(
+                            identity.startswith("rift://symbol/local/python/"),
+                            "shallow class lost its canonical Python identity",
+                        )
+                        require(
+                            string_value(
+                                hit.get("path"), "shallow class path"
+                            ).endswith(".py"),
+                            "shallow class lost its original Python source path",
+                        )
+                        selected.append(hit)
+                require(
+                    len(selected) == 1,
+                    "shallow checkout must have one canonical FastAPI class",
+                )
+                for hit in selected:
                     symbol = hit.get("symbol")
                     evidence = {
                         "name": symbol.get("name")
