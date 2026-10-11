@@ -4765,10 +4765,9 @@ dependencies = [
 name = "rift-mcp"
 version = "0.0.67"
 dependencies = [
- "futures-util",
- "sse-stream",
  "axum",
  "data-encoding",
+ "futures-util",
  "getrandom 0.4.3",
  "jiff",
  "jsonschema",
@@ -4797,6 +4796,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "sha2",
+ "sse-stream",
  "stats_alloc",
  "strum",
  "tempfile",
