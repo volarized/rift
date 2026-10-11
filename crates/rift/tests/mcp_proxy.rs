@@ -1077,17 +1077,16 @@ async fn proxy_row_source(
     row: &serde_json::Value,
     view: &rift_protocol::symbol_read::CapturedView,
 ) -> TestResult<String> {
-    let unit = match row["unit"].as_str() {
-        Some(unit) => rift_protocol::read::SourceUnitId::parse(unit)?,
-        None => {
-            let path = row["path"]
-                .as_str()
-                .ok_or("captured row must state its source path")?;
-            rift_protocol::read::SourceUnitId::parse(&format!(
-                "rift://source/project/{}",
-                rift_protocol::identity::encode_source_unit_key(path)
-            ))?
-        }
+    let unit = if let Some(unit) = row["unit"].as_str() {
+        rift_protocol::read::SourceUnitId::parse(unit)?
+    } else {
+        let path = row["path"]
+            .as_str()
+            .ok_or("captured row must state its source path")?;
+        rift_protocol::read::SourceUnitId::parse(&format!(
+            "rift://source/project/{}",
+            rift_protocol::identity::encode_source_unit_key(path)
+        ))?
     };
     let request = json!({"unit": unit, "range": row["range"], "view": view.id});
     let response = proxied_result(client, "get_source", &request).await?;
