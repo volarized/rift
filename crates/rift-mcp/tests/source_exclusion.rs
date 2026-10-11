@@ -60,12 +60,11 @@ async fn call(
         .ok_or_else(|| format!("{tool} must return structured content").into())
 }
 
-/// A Rust source file's declaration reaches `get_symbol` by name; a plain-text file's prose
-/// reaches only the lexical search store, since identifier search never parses a non-source
-/// file and `get_symbol` resolves declarations alone. Excluding both in one `rift.toml`
-/// write proves the reconcile path drops a file from each store it was ever indexed into.
+/// A Rust source file's declaration reaches symbol search with its original source range.
+/// A plain-text file's prose reaches the lexical search store. Excluding both in one
+/// `rift.toml` write proves reconciliation drops both files from their stores.
 #[tokio::test]
-async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_lexical_store()
+async fn source_exclude_drops_an_already_indexed_file_from_symbol_search_and_the_lexical_store()
 -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(
@@ -83,17 +82,26 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
     let client = client_for(directory.path()).await?;
 
     // Baseline: both files are indexed before the exclusion lands.
-    let symbol = call(
-        &client,
-        "get_symbol",
-        json!({ "name": "phantom_generated" }),
-    )
-    .await?;
+    let symbol_arguments = json!({
+        "query": "phantom_generated", "target": "symbol", "include": ["source"],
+        "paths": {"include": ["phantom_symbol.rs"]},
+    });
+    let symbol = search_after_population(&client, &symbol_arguments).await?;
+    let declarations = symbol["results"]
+        .as_array()
+        .ok_or("symbol search results")?;
     assert_eq!(
-        symbol["hits"].as_array().map(Vec::len),
-        Some(1),
-        "the symbol must be indexed before exclusion: {symbol:#}"
+        declarations.len(),
+        1,
+        "symbol indexed before exclusion: {symbol:#}"
     );
+    let declaration = &declarations[0];
+    assert_eq!(declaration["path"], "phantom_symbol.rs");
+    assert_eq!(declaration["hit"]["symbol"]["name"], "phantom_generated");
+    assert!(declaration["hit"]["symbol"]["id"].is_null());
+    assert_eq!(declaration["source"], "pub fn phantom_generated() {}");
+    assert_eq!(declaration["range"]["start"], 0);
+    assert_eq!(declaration["range"]["end"], 29);
 
     let prose_arguments = json!({ "query": "wandering falcon migrations" });
     let prose = search_after_population(&client, &prose_arguments).await?;
@@ -113,16 +121,11 @@ async fn source_exclude_drops_an_already_indexed_file_from_get_symbol_and_the_le
     fs::write(directory.path().join("rift.toml"), excluded_configuration)?;
 
     // One request each proves the file left both stores, with no restart.
-    let symbol_after = call(
-        &client,
-        "get_symbol",
-        json!({ "name": "phantom_generated" }),
-    )
-    .await?;
+    let symbol_after = search_after_population(&client, &symbol_arguments).await?;
     assert_eq!(
-        symbol_after["hits"].as_array().map(Vec::len),
+        symbol_after["results"].as_array().map(Vec::len),
         Some(0),
-        "an excluded symbol must leave get_symbol on the next request: {symbol_after:#}"
+        "an excluded symbol must leave symbol search on the next request: {symbol_after:#}"
     );
 
     let prose_after = search_after_population(&client, &prose_arguments).await?;
