@@ -5,8 +5,8 @@ use rift_protocol::configuration::{
     WorkspaceConfiguration,
 };
 
-#[test]
-fn test_collection_documentation_source_uses_smaller_configured_and_advertised_bound() {
+#[tokio::test]
+async fn test_collection_documentation_source_uses_smaller_configured_and_advertised_bound() {
     use serde_json::json;
     let mut capabilities: Capabilities =
         serde_json::from_str(&capabilities_json()).expect("capabilities");
@@ -61,35 +61,28 @@ fn test_collection_documentation_source_uses_smaller_configured_and_advertised_b
     capabilities
         .supported_features
         .push("symbol_documentation".to_owned());
-    let mut value = symbol_page_json("demo", None, "analyzer-v1", "first");
-    value["documentation_revision"] = json!("0123abcd");
-    value["items"][0]["documentation"] = json!({
-        "documentation_revision":"0123abcd","truncated":false,
-        "references":[{
-            "reference":{"identity":"5".repeat(64),"block":"1".repeat(64),
-                "target":symbol_json("demo","first")["id"],"evidence":"unique_name",
-                "authored":"demo","range":{"start":1,"end":5}},
-            "documentation":documentation,"excerpt":"guide"
-        }]
+    let mut value = symbol_result_json("demo", "first");
+    value["declarations"] = json!([]);
+    let request = symbol_request();
+    value["documentation"] = json!({
+        "documentation_revision": "0123abcd", "truncated": false,
+        "references": [{"reference": {"identity": "5".repeat(64), "block": "1".repeat(64),
+            "target": request.id, "evidence": "unique_name", "authored": "demo", "range": {"start": 1, "end": 5}},
+            "documentation": documentation, "excerpt": "guide"}]
     });
-    let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol context page");
-    let mut request = symbol_request();
-    request.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
-    assert_registered_field(
-        &validate_symbol_page(&request, &capabilities, &page, None, 1)
-            .expect_err("configured bound refusal"),
-        "rift.client.response_invalid",
-        "source",
-    );
-    validate_symbol_page(&request, &capabilities, &page, None, config.max_source)
-        .expect("exact configured documentation excerpt bound");
-    capabilities.bounds.source_bytes_max = 4;
-    assert_registered_field(
-        &validate_symbol_page(&request, &capabilities, &page, None, config.max_source)
-            .expect_err("configured bound refusal"),
-        "rift.client.response_invalid",
-        "source",
-    );
+    let mut request = request;
+    request.include = vec![GetSymbolInclude::Documentation];
+    let error = canonical_symbol_response(value.clone(), &request, 1)
+        .await
+        .expect_err("configured excerpt bound");
+    assert_registered_field(&error, "rift.client.response_invalid", "body");
+    canonical_symbol_response(value.clone(), &request, config.max_source)
+        .await
+        .expect("exact configured excerpt bound");
+    let error = canonical_symbol_response_with_bounds(value, &request, config.max_source, 4)
+        .await
+        .expect_err("advertised excerpt bound");
+    assert_registered_field(&error, "rift.client.response_invalid", "body");
 }
 
 #[test]
@@ -220,19 +213,18 @@ async fn test_collection_config_and_environment_deliver_source_past_default_boun
     assert_eq!(config.max_source, 2 << 20);
     let client = GlobalClient::new(config).expect("environment client");
     let mut symbols = symbol_request();
-    symbols.include = Some(vec![PackageSymbolRequestInclude::Source]);
-    let page = client
-        .list_package_symbols(&symbols, 20, None)
+    symbols.include = vec![GetSymbolInclude::Source];
+    let result = client
+        .get_symbol(&symbols)
         .await
         .expect("configured symbol source");
-    let candidate =
-        PackageSymbolCandidate::try_from(page.items.into_iter().next().expect("symbol item"))
-            .expect("source conversion accepts supported size");
+    let GetSymbolResult::Found { declarations, .. } = result else {
+        panic!("found symbol")
+    };
     assert_eq!(
-        candidate.hit.source.as_ref().map(String::len),
+        declarations[0].source.as_ref().map(String::len),
         Some(source_bytes)
     );
-
     let mut patterns = pattern::pattern_request();
     patterns.include = Some(vec!["source".to_owned()]);
     let page = client

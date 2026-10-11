@@ -5,9 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rift_cloud_client::contract::{self, ContractError};
+use rift_cloud_client::search::PackageSearchPage;
 use rift_cloud_client::{
     Capabilities, PackagePatternPage, PackageResolutionResponse, PackageSearchCandidate,
-    PackageSearchPage, PackageSymbolCandidate, PackageSymbolPage,
 };
 use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Map, Value, json};
@@ -200,9 +200,32 @@ fn bound_and_shared_schema_changes_fail_validation() -> TestResult {
     )?;
 
     let mut document = contract()?;
-    document["components"]["schemas"]["PackageSymbolPage"]["properties"]["items"]["maxItems"] =
+    document["components"]["schemas"]["GetSymbolResult"]["oneOf"][0]["properties"]["declarations"]
+        ["maxItems"] = json!(200);
+    assert_invalid(&document, "GetSymbolResult/found/declarations/maxItems")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["GetSymbolParams"]["properties"]["declaration_limit"]["maximum"] =
         json!(200);
-    assert_invalid(&document, "PackageSymbolPage/properties/items/maxItems")?;
+    assert_invalid(&document, "GetSymbolParams/declaration_limit/maximum")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["GetSymbolParams"]["properties"]["declaration_cursor"]["maxLength"] =
+        json!(4095);
+    assert_invalid(&document, "GetSymbolParams/declaration_cursor/maxLength")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["GetSymbolResult"]["oneOf"][0]["properties"]["declaration_cursor"]
+        ["maxLength"] = json!(4095);
+    assert_invalid(
+        &document,
+        "GetSymbolResult/found/declaration_cursor/maxLength",
+    )?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["SymbolDeclaration"]["properties"]["source"]["maxLength"] =
+        json!(67_108_863);
+    assert_invalid(&document, "SymbolDeclaration/properties/source/maxLength")?;
 
     let mut document = contract()?;
     document["components"]["parameters"]["Cursor"]["schema"]["maxLength"] = json!(4095);
@@ -367,11 +390,13 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
                 PackageSearchCandidate::try_from(item)?;
             }
         }
-        "#/components/schemas/PackageSymbolPage" => {
-            let page = serde_json::from_value::<PackageSymbolPage>(value)?;
-            for item in page.items {
-                PackageSymbolCandidate::try_from(item)?;
-            }
+        "#/components/schemas/GetSymbolResult" => {
+            let result =
+                serde_json::from_value::<rift_protocol::symbol_read::GetSymbolResult>(value)?;
+            let identity = rift_protocol::read::SymbolId::parse(
+                "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+            )?;
+            assert!(result.is_valid_for(&identity));
         }
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;
@@ -381,8 +406,8 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
         }
         "#/components/schemas/PackageResolutionRequest"
         | "#/components/schemas/PackageSearchRequest"
-        | "#/components/schemas/PackageSymbolRequest"
         | "#/components/schemas/PackagePatternRequest"
+        | "#/components/schemas/GetSymbolParams"
         | "#/components/schemas/FindDeclarationsParams" => return Ok(false),
         other => return Err(format!("contract example names no generated type: {other}").into()),
     }
@@ -477,7 +502,7 @@ fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult 
     }
     for component in [
         "PackageSearchHit",
-        "PackageSymbol",
+        "SymbolDeclaration",
         "PackagePatternDeclaration",
         "PackagePatternHit",
     ] {
@@ -489,5 +514,58 @@ fn collection_schema_ceilings_do_not_revert_to_runtime_defaults() -> TestResult 
             &format!("{component}/properties/source/maxLength"),
         )?;
     }
+    Ok(())
+}
+
+#[test]
+fn exact_symbol_contract_rejects_name_selectors_and_legacy_pages() -> TestResult {
+    let mut document = contract()?;
+    document["paths"]["/v1/symbols"]["post"]["requestBody"]["content"]["application/json"]["schema"] =
+        json!({"$ref": "#/components/schemas/PackageSymbolRequest"});
+    assert_invalid(&document, "request must use GetSymbolParams")?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/symbols"]["post"]["parameters"] =
+        json!([{"$ref": "#/components/parameters/Limit"}]);
+    assert_invalid(&document, "must not declare query selectors")?;
+
+    for status in ["200", "404", "503"] {
+        let mut document = contract()?;
+        document["paths"]["/v1/symbols"]["post"]["responses"][status]["content"]["application/json"]
+            ["schema"] = json!({"$ref": "#/components/schemas/PackageSymbolPage"});
+        assert_invalid(
+            &document,
+            &format!("{status} response must use GetSymbolResult"),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exact_symbol_contract_requires_typed_miss_and_unavailability() -> TestResult {
+    let mut document = contract()?;
+    document["paths"]["/v1/symbols"]["post"]["responses"]
+        .as_object_mut()
+        .ok_or("responses must be an object")?
+        .remove("404");
+    assert_invalid(&document, "response statuses differ")?;
+
+    let mut document = contract()?;
+    document["paths"]["/v1/symbols"]["post"]["responses"]["503"]["content"]
+        .as_object_mut()
+        .ok_or("response content must be an object")?
+        .remove("application/json");
+    assert_invalid(&document, "must declare typed outcomes and problem details")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["GetSymbolParams"]["required"] = json!([]);
+    assert_invalid(&document, "shared schema `GetSymbolParams` differs")?;
+
+    let mut document = contract()?;
+    document["components"]["schemas"]["GetSymbolResult"]["oneOf"]
+        .as_array_mut()
+        .ok_or("symbol outcomes must be an array")?
+        .truncate(1);
+    assert_invalid(&document, "shared schema `GetSymbolResult` differs")?;
     Ok(())
 }
