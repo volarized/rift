@@ -119,7 +119,7 @@ fn cfg_attribute(input: &[&str]) -> bool {
             && body.last() == Some(&")"))
 }
 
-fn transparent_definition(source: &str, symbol: &SyntaxSymbol) -> bool {
+fn transparent_definition(source: &str, symbol: &SyntaxSymbol, scope: &Scope) -> bool {
     let prefix = ByteRange {
         start: symbol.range.start,
         end: symbol.item_range.start,
@@ -163,12 +163,11 @@ fn transparent_definition(source: &str, symbol: &SyntaxSymbol) -> bool {
             "=",
             ">",
             "{",
-            "$",
-            "(",
         ],
     ) {
         return false;
     }
+    let repeated = consume(&mut input, &["$", "("]);
     let mut attributes = 0;
     while input.first() == Some(&"#") {
         let Some(value) = attribute(&mut input) else {
@@ -179,8 +178,26 @@ fn transparent_definition(source: &str, symbol: &SyntaxSymbol) -> bool {
         }
         attributes += 1;
     }
-    if attributes == 0 || !consume(&mut input, &["$", "item", ")", "*", "}"]) {
+    if attributes == 0 {
         return false;
+    }
+    if repeated {
+        if !consume(&mut input, &["$", "item", ")", "*", "}"]) {
+            return false;
+        }
+    } else {
+        let Some(&target) = input.first() else {
+            return false;
+        };
+        if target == symbol.name
+            || scope.get(target) != Some(&true)
+            || !consume(
+                &mut input,
+                &[target, "!", "{", "$", "(", "$", "item", ")", "*", "}", "}"],
+            )
+        {
+            return false;
+        }
     }
     let _ = consume(&mut input, &[";"]);
     consume(&mut input, &["}"]) && input.is_empty()
@@ -332,10 +349,8 @@ impl Context<'_> {
         for event in events(file) {
             match event {
                 Event::Symbol(symbol) if symbol.kind == "macro" => {
-                    Arc::make_mut(scope).insert(
-                        symbol.name.clone(),
-                        transparent_definition(file.source, symbol),
-                    );
+                    let transparent = transparent_definition(file.source, symbol, scope);
+                    Arc::make_mut(scope).insert(symbol.name.clone(), transparent);
                 }
                 Event::Symbol(symbol) if macro_use(file.source, symbol) => {
                     if !super::module_has_default_path(symbol) || symbol.body_range.is_some() {
@@ -388,10 +403,8 @@ pub(super) fn children<'a>(
     for event in events(file) {
         match event {
             Event::Symbol(symbol) if symbol.kind == "macro" => {
-                Arc::make_mut(&mut scope).insert(
-                    symbol.name.clone(),
-                    transparent_definition(file.source, symbol),
-                );
+                let transparent = transparent_definition(file.source, symbol, &scope);
+                Arc::make_mut(&mut scope).insert(symbol.name.clone(), transparent);
             }
             Event::Symbol(symbol) => {
                 let name = super::source_identifier(&symbol.name);

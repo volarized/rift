@@ -975,3 +975,68 @@ fn transparent_item_macros_keep_direct_modules_in_mixed_item_bodies() {
     }
     assert!(!found.contains_key("src/task/hidden.rs"));
 }
+
+#[test]
+fn transparent_item_macros_accept_forwarding_to_earlier_definitions() {
+    let definitions = "macro_rules! cfg_process { ($($item:item)*) => { $( #[cfg(feature = \"process\")] $item )* } }\nmacro_rules! cfg_process_driver { ($($item:item)*) => { #[cfg(unix)] #[cfg(not(loom))] cfg_process! { $($item)* } } }";
+    let found = selected_anchors(
+        &[("Cargo.toml", MANIFEST)],
+        &[
+            (
+                "src/lib.rs",
+                "#[macro_use] mod macros; cfg_process_driver! { pub mod runtime; }",
+            ),
+            ("src/macros.rs", definitions),
+            ("src/runtime.rs", "pub struct Runtime;"),
+        ],
+        None,
+        false,
+    );
+    let identity = SymbolIdentity::parse(found["src/runtime.rs"]["Runtime"].as_str())
+        .expect("captured forwarding module identity");
+    assert_eq!(
+        identity.qualified_path(),
+        ["crate_root", "runtime", "Runtime"]
+    );
+}
+
+#[test]
+fn transparent_item_macros_refuse_unproved_forwarding_and_changed_items() {
+    let target = "macro_rules! cfg_process { ($($item:item)*) => { $( #[cfg(feature = \"process\")] $item )* } }";
+    for definitions in [
+        "macro_rules! forward { ($($item:item)*) => { #[cfg(unix)] unknown! { $($item)* } } }"
+            .to_owned(),
+        format!(
+            "macro_rules! forward {{ ($($item:item)*) => {{ #[cfg(unix)] cfg_process! {{ $($item)* }} }} }} {target}"
+        ),
+        "macro_rules! forward { ($($item:item)*) => { #[cfg(unix)] forward! { $($item)* } } }"
+            .to_owned(),
+        format!(
+            "{target} macro_rules! cfg_process {{ () => {{}}; }} macro_rules! forward {{ ($($item:item)*) => {{ #[cfg(unix)] cfg_process! {{ $($item)* }} }} }}"
+        ),
+        format!(
+            "{target} macro_rules! forward {{ ($($item:item)*) => {{ #[cfg(unix)] cfg_process! {{ pub mod runtime; }} }} }}"
+        ),
+        format!(
+            "{target} macro_rules! forward {{ ($($item:item)*) => {{ #[path = \"runtime.rs\"] cfg_process! {{ $($item)* }} }} }}"
+        ),
+        format!(
+            "{target} macro_rules! forward {{ ($($item:item)*) => {{ #[cfg(unix)] cfg_process! {{ $($item)* }} }}; () => {{}}; }}"
+        ),
+    ] {
+        let found = selected_anchors(
+            &[("Cargo.toml", MANIFEST)],
+            &[
+                (
+                    "src/lib.rs",
+                    "#[macro_use] mod macros; forward! { pub mod runtime; }",
+                ),
+                ("src/macros.rs", &definitions),
+                ("src/runtime.rs", "pub struct Runtime;"),
+            ],
+            None,
+            false,
+        );
+        assert!(!found.contains_key("src/runtime.rs"), "{definitions}");
+    }
+}
