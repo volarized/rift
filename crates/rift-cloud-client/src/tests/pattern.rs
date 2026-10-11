@@ -14,11 +14,33 @@ type PageEdit = (&'static str, fn(&mut Value));
 const FILE_SIZE: u64 = 64;
 
 fn pattern_hit_json(unit: &str, start: u64) -> Value {
+    let mut symbol = symbol_json("demo", "first");
+    symbol["id"] = json!(pattern_symbol_identity(
+        "demo",
+        "crates.io",
+        "1.0.0",
+        "rust"
+    ));
     json!({
         "package": package_json("demo"), "unit": unit,
         "range": {"start": start, "end": start + 4}, "line": 2, "size": FILE_SIZE,
-        "declaration": {"symbol": symbol_json("demo", "first"), "range": {"start": 0, "end": 40}, "line": 1}
+        "declaration": {"symbol": symbol, "range": {"start": 0, "end": 40}, "line": 1}
     })
+}
+
+fn pattern_symbol_identity(package: &str, registry: &str, version: &str, language: &str) -> String {
+    rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Package {
+            manager: "cargo".to_owned(),
+            registry: registry.to_owned(),
+            name: package.to_owned(),
+            version: version.to_owned(),
+        },
+        rift_protocol::read::Language::from_identity_segment(language).expect("fixture language"),
+        vec!["library".to_owned(), "demo".to_owned()],
+    )
+    .expect("canonical declaration identity")
+    .wire_identity()
 }
 
 /// The fixture's pattern page: one match, then a second page behind the `next` cursor.
@@ -343,6 +365,67 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
             field,
         );
     }
+}
+
+#[test]
+fn test_pattern_declarations_validate_canonical_owner_and_language() {
+    let request = pattern_request();
+    let capabilities = pattern_capabilities();
+    let page = pattern_page_json(None);
+    check(&request, &capabilities, page.clone(), None).expect("canonical declaration accepted");
+    let hit: PackagePatternHit =
+        serde_json::from_value(page["items"][0].clone()).expect("pattern hit fixture");
+    let converted = PackagePatternMatch::try_from(&hit).expect("canonical declaration converts");
+    let declaration = converted.declaration.expect("declaration retained");
+    assert_eq!(
+        declaration.unit.as_ref().map(|unit| unit.0.as_str()),
+        Some(UNIT)
+    );
+    let rift_protocol::read::SearchHitTarget::Symbol { symbol } = declaration.hit else {
+        panic!("declaration retains symbol");
+    };
+    assert_eq!(
+        symbol.id.as_ref().map(|id| id.0.as_str()),
+        hit.declaration
+            .as_ref()
+            .and_then(|declaration| declaration.symbol.id.as_deref())
+    );
+
+    let invalid_ids = [
+        "not-an-identity".to_owned(),
+        "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo".to_owned(),
+        pattern_symbol_identity("other", "crates.io", "1.0.0", "rust"),
+        pattern_symbol_identity("demo", "other.example", "1.0.0", "rust"),
+        pattern_symbol_identity("demo", "crates.io", "2.0.0", "rust"),
+        pattern_symbol_identity("demo", "crates.io", "1.0.0", "typescript"),
+    ];
+    for id in invalid_ids {
+        let mut invalid_page = page.clone();
+        invalid_page["items"][0]["declaration"]["symbol"]["id"] = json!(id);
+        assert_registered_field(
+            &check(&request, &capabilities, invalid_page.clone(), None)
+                .expect_err("invalid canonical declaration refused"),
+            "rift.client.response_invalid",
+            "symbol_identity",
+        );
+        let invalid_hit: PackagePatternHit =
+            serde_json::from_value(invalid_page["items"][0].clone()).expect("pattern hit fixture");
+        assert_registered_field(
+            &PackagePatternMatch::try_from(&invalid_hit).expect_err("invalid declaration refused"),
+            "rift.client.response_invalid",
+            "symbol_identity",
+        );
+    }
+    let mut missing = page;
+    missing["items"][0]["declaration"]["symbol"]
+        .as_object_mut()
+        .expect("symbol object")
+        .remove("id");
+    assert_registered_field(
+        &check(&request, &capabilities, missing, None).expect_err("missing identity refused"),
+        "rift.client.response_invalid",
+        "symbol_identity",
+    );
 }
 
 #[test]

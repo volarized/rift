@@ -908,7 +908,7 @@ fn helper_beacon_pattern_hits() -> Value {
             "hit": {
                 "target": "symbol",
                 "symbol": {
-                    "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                    "id": global_api::collected_identity(SymbolFixture::Valid, "helper_beacon"),
                     "language": "rust",
                     "name": "helper_beacon",
                     "kind": "function",

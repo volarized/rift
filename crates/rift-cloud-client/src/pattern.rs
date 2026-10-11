@@ -10,7 +10,7 @@ use crate::{
     PackagePatternRequest, PageMetadata, SearchPackagePatternsRequestQuery,
     active_response_body_bytes_max, advertised_page_limit, bounded_nonempty_characters, contract,
     failure, includes_source, package_key, package_source_path, response, serialize_body,
-    smaller_bound, supports_feature, validate_body_for_capabilities, validate_hit_common,
+    smaller_bound, supports_feature, validate_body_for_capabilities, validate_canonical_hit,
     validate_packages, validate_page, validate_read_bounds,
 };
 
@@ -277,7 +277,7 @@ impl PatternPageCheck<'_> {
             line: declaration.line,
             source: declaration.source.as_deref(),
         };
-        validate_hit_common(
+        validate_canonical_hit(
             &hit.package,
             &declaration.symbol,
             location,

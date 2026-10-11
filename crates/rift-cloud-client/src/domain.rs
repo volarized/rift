@@ -89,14 +89,22 @@ fn declaration_hit(
     unit: &str,
     declaration: &PackagePatternDeclaration,
 ) -> Result<rift_protocol::read::SearchHit, RiftError> {
-    let (_, _, line) = validate_location(
+    let source_bytes_max = usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
+        .map_err(|source| invalid_source("source", source))?;
+    crate::validate_canonical_hit(
         package,
         &declaration.symbol,
-        unit,
-        &declaration.range,
-        declaration.line,
-        declaration.source.as_deref(),
+        HitLocation {
+            unit,
+            range: &declaration.range,
+            line: declaration.line,
+            source: declaration.source.as_deref(),
+        },
+        None,
+        source_bytes_max,
     )?;
+    let line =
+        u64::try_from(declaration.line).map_err(|source| invalid_source("location", source))?;
     Ok(rift_protocol::read::SearchHit {
         view: None,
         hit: rift_protocol::read::SearchHitTarget::Symbol {

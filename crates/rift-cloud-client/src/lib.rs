@@ -2321,6 +2321,54 @@ fn validate_hit_common(
     packages: Option<&HashSet<(String, String, String, String)>>,
     source_bytes_max: usize,
 ) -> Result<String, RiftError> {
+    let source_path = validate_hit_fields(package, symbol, location, packages, source_bytes_max)?;
+    validate_symbol_identity(symbol, package, &source_path)
+}
+
+fn validate_canonical_hit(
+    package: &PackageIdentity,
+    symbol: &Symbol,
+    location: HitLocation<'_>,
+    packages: Option<&HashSet<(String, String, String, String)>>,
+    source_bytes_max: usize,
+) -> Result<(), RiftError> {
+    validate_hit_fields(package, symbol, location, packages, source_bytes_max)?;
+    let invalid = || {
+        failure::response_invalid(
+            "validate_canonical_hit",
+            "symbol_identity",
+            "field failed validation",
+            None,
+        )
+    };
+    let id = symbol.id.as_deref().ok_or_else(invalid)?;
+    let identity = rift_protocol::identity::SymbolIdentity::parse(id).map_err(|source| {
+        failure::response_source(
+            "validate_canonical_hit",
+            "symbol_identity",
+            "field failed validation",
+            None,
+            source,
+        )
+    })?;
+    let owner = domain::package_identity(package)
+        .owner()
+        .map_err(|_| invalid())?;
+    let language = rift_protocol::read::Language::from_identity_segment(&symbol.language)
+        .map_err(|_| invalid())?;
+    if identity.owner() != &owner || identity.language() != &language {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn validate_hit_fields(
+    package: &PackageIdentity,
+    symbol: &Symbol,
+    location: HitLocation<'_>,
+    packages: Option<&HashSet<(String, String, String, String)>>,
+    source_bytes_max: usize,
+) -> Result<String, RiftError> {
     validate_package_identity(package).map_err(|source| {
         failure::response_source(
             "validate_hit_common",
@@ -2376,7 +2424,7 @@ fn validate_hit_common(
             None,
         ));
     }
-    validate_symbol_identity(symbol, package, &source_path)
+    Ok(source_path)
 }
 
 /// The package-relative path of `unit`, after its exact defining registry owner is validated.
