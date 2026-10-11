@@ -1120,3 +1120,151 @@ fn rust_macro_invocation_restore_refuses_invalid_ranges_language_and_count() {
         Err(errors::syntax::facts_count_exceeded::SLUG)
     );
 }
+
+#[test]
+fn rust_macro_direct_tokens_keep_original_ranges_unknown_empty_and_charge() {
+    let source = "cfg_rt! { pub mod runtime; use crate::time::Instant; #[derive(Debug)] enum Timer { Value } impl Timer { fn poll<'a>(&'a self) { let x = '}'; let y = '\\\''; let raw = r##\"} fake! {}\"##; 'again: loop { break 'again; } } } }\ncfg_rt! {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured invocations");
+    assert_eq!(invocations.len(), 2);
+    let direct = invocations[0].2.as_ref().expect("complete direct tokens");
+    let expected = document
+        .nodes()
+        .iter()
+        .filter(|node| {
+            node.parent
+                .and_then(|parent| document.nodes().get(parent))
+                .is_some_and(|parent| {
+                    parent.kind == "token_tree"
+                        && parent
+                            .parent
+                            .and_then(|parent| document.nodes().get(parent))
+                            .is_some_and(|parent| parent.range == invocations[0].0)
+                })
+        })
+        .map(|node| node.range)
+        .collect::<Vec<_>>();
+    assert_eq!(direct, &expected);
+    assert!(direct.iter().any(|range| &source
+        [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+        == "runtime"));
+    assert_eq!(invocations[1].2.as_deref(), Some([].as_slice()));
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("original complete ranges restore");
+    assert_eq!(&restored, document.facts());
+    let mut unknown = captured;
+    let rows = unknown.macro_invocations.as_mut().expect("captured rows");
+    let owned = rows[0].2.take().expect("owned direct ranges");
+    let charge = get_size2::GetSize::get_heap_size(&Some(owned));
+    let unknown = SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+        .expect("old unknown direct ranges remain unknown");
+    assert_eq!(unknown.macro_invocations().expect("rows")[0].2, None);
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&restored),
+        get_size2::GetSize::get_heap_size(&unknown).saturating_add(charge)
+    );
+}
+
+#[test]
+fn rust_macro_direct_tokens_refuse_missing_split_group_and_bound_witnesses() {
+    let source = "cfg_rt! { pub mod runtime; use crate::time; impl Timer { fn value() {} } }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let direct = captured.macro_invocations.as_ref().expect("rows")[0]
+        .2
+        .as_ref()
+        .expect("complete direct ranges");
+    let identifier = direct
+        .iter()
+        .position(|range| {
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")]
+                == "runtime"
+        })
+        .expect("module identifier");
+    let group = direct
+        .iter()
+        .position(|range| source.as_bytes()[usize::try_from(range.start).expect("start")] == b'{')
+        .expect("implementation group");
+    for mutation in 0..6 {
+        let mut invalid = captured.clone();
+        let ranges = invalid.macro_invocations.as_mut().expect("rows")[0]
+            .2
+            .as_mut()
+            .expect("direct rows");
+        match mutation {
+            0 => {
+                ranges.remove(identifier);
+            }
+            1 => {
+                ranges.remove(group);
+            }
+            2 => ranges.clear(),
+            3 => ranges[identifier].end -= 1,
+            4 => ranges[identifier].start = 0,
+            _ => ranges.swap(0, 1),
+        }
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+                .map_err(|error| error.slug()),
+            Err(if mutation == 5 {
+                errors::syntax::facts_order_invalid::SLUG
+            } else {
+                errors::syntax::facts_range_invalid::SLUG
+            })
+        );
+    }
+    let count = captured
+        .macro_invocations
+        .as_ref()
+        .expect("rows")
+        .iter()
+        .map(|(_, modules, direct)| 1 + modules.len() + direct.as_ref().map_or(0, Vec::len))
+        .sum::<usize>();
+    let limits = SyntaxLimits::new(source.len(), count - 1, 100).expect("positive limits");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, captured).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG)
+    );
+}
+
+#[test]
+fn rust_macro_direct_tokens_distinguish_literals_comments_and_invalid_groups() {
+    for body in [
+        "impl Timer { fn poll<'a>(&'a self) { 'again: loop { break 'again; } } }",
+        "const VALUE: char = '}'; const QUOTE: char = '\\\''; const BYTE: u8 = b'}';",
+        "const VALUE: &str = r##\"} /* not comment */ fake! {}\"##;",
+        "// named comment\nimpl Timer { /* comment } */ fn value() {} }",
+    ] {
+        let source = format!("cfg_rt! {{ {body} }}");
+        let document = parsed(ShippedLanguage::Rust, &source);
+        let captured = parts(document.facts());
+        assert!(
+            captured.macro_invocations.as_ref().expect("rows")[0]
+                .2
+                .is_some(),
+            "complete original body: {body}"
+        );
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured)
+                .expect("original literal ranges restore"),
+            *document.facts()
+        );
+    }
+    let document = parsed(
+        ShippedLanguage::Rust,
+        "cfg_rt! { impl Timer { fn value() {} }",
+    );
+    assert!(document.has_errors());
+    assert!(
+        document
+            .facts()
+            .macro_invocations()
+            .is_some_and(|rows| rows.iter().all(|(_, _, direct)| direct.is_none()))
+    );
+}

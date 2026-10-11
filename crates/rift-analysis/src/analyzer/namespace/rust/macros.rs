@@ -279,14 +279,14 @@ fn child_directory(path: &str) -> &str {
 #[derive(Clone, Copy)]
 enum Event<'a> {
     Symbol(&'a SyntaxSymbol),
-    Invocation(&'a (ByteRange, Vec<ByteRange>)),
+    Invocation(&'a rift_syntax::MacroInvocation),
 }
 
 impl Event<'_> {
     fn start(self) -> u64 {
         match self {
             Self::Symbol(symbol) => symbol.item_range.start,
-            Self::Invocation((range, _)) => range.start,
+            Self::Invocation((range, _, _)) => range.start,
         }
     }
 }
@@ -360,7 +360,7 @@ impl Context<'_> {
                     *scope =
                         self.exports(&path, child_directory(&path), Arc::clone(scope), visiting)?;
                 }
-                Event::Invocation((range, _)) => {
+                Event::Invocation((range, _, _)) => {
                     let (name, _) = invocation_modules(text_range(file.source, *range)?)?;
                     if scope.get(name) != Some(&true) {
                         return None;
@@ -425,7 +425,7 @@ pub(super) fn children<'a>(
                         .unwrap_or_default();
                 }
             }
-            Event::Invocation((range, modules)) => {
+            Event::Invocation((range, modules, _)) => {
                 let source = text_range(file.source, *range);
                 let name = source
                     .and_then(|source| source.split_once('!'))

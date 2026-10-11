@@ -118,7 +118,25 @@ impl GetSize for SyntaxFacts {
         let (retained, tracker) =
             rift_protocol::retained_vector_material(&self.left_out_symbols, tracker);
         let (exports, tracker) = self.export_bindings.get_heap_size_with_tracker(tracker);
-        let (macros, tracker) = self.macro_invocations.get_heap_size_with_tracker(tracker);
+        let macros = self.macro_invocations.as_ref().map_or(0, |rows| {
+            rows.iter().fold(
+                rows.capacity()
+                    .saturating_mul(std::mem::size_of::<super::MacroInvocation>()),
+                |charge, (_, modules, direct)| {
+                    charge
+                        .saturating_add(
+                            modules
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<super::ByteRange>()),
+                        )
+                        .saturating_add(direct.as_ref().map_or(0, |ranges| {
+                            ranges
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<super::ByteRange>())
+                        }))
+                },
+            )
+        });
         let (markdown, tracker) = self.markdown_facts.get_heap_size_with_tracker(tracker);
         (
             language

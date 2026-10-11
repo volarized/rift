@@ -31,7 +31,7 @@ pub struct SyntaxFactsParts {
     pub export_bindings: Option<Vec<crate::SyntaxExportBinding>>,
     /// Captured top-level Rust macro invocations and their direct module item ranges.
     /// Missing facts remain unknown.
-    pub macro_invocations: Option<Vec<(ByteRange, Vec<ByteRange>)>>,
+    pub macro_invocations: Option<Vec<crate::MacroInvocation>>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
     /// Number of extracted declarations the provider omitted.
@@ -867,14 +867,16 @@ fn validate_macro_invocations(
     }
     let retained_count = invocations
         .iter()
-        .try_fold(invocations.len(), |total, (_, modules)| {
-            total.checked_add(modules.len())
+        .try_fold(invocations.len(), |total, (_, modules, direct)| {
+            total
+                .checked_add(modules.len())?
+                .checked_add(direct.as_ref().map_or(0, Vec::len))
         })
         .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
     count(retained_count, limits)?;
-    ordered(invocations.iter().map(|(range, _)| *range))?;
+    ordered(invocations.iter().map(|(range, _, _)| *range))?;
     let mut previous_end = 0;
-    for (invocation, modules) in invocations {
+    for (invocation, modules, direct) in invocations {
         count(modules.len(), limits)?;
         ordered(modules.iter().copied())?;
         range(source, *invocation)?;
@@ -894,6 +896,18 @@ fn validate_macro_invocations(
                 return errors::syntax::facts_range_invalid().fail();
             }
             module_end = module.end;
+        }
+        if let Some(direct) = direct {
+            count(direct.len(), limits)?;
+            ordered(direct.iter().copied())?;
+            if !crate::document::rust_macros::direct_children_valid(
+                source,
+                *invocation,
+                direct,
+                limits.syntax_depth_max(),
+            ) {
+                return errors::syntax::facts_range_invalid().fail();
+            }
         }
         previous_end = invocation.end;
     }

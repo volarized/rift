@@ -32,8 +32,8 @@ pub use contribution::{
 };
 pub use css::CssSyntaxProvider;
 pub use document::{
-    ByteRange, PythonOverload, RustModulePath, SyntaxDocument, SyntaxExportBinding,
-    SyntaxExportKind, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
+    ByteRange, MacroInvocation, PythonOverload, RustModulePath, SyntaxDocument,
+    SyntaxExportBinding, SyntaxExportKind, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
 };
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;

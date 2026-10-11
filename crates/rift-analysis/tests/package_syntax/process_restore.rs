@@ -130,7 +130,7 @@ impl CapturedSymbol {
     }
 }
 
-type MacroInvocation = ([u64; 2], Vec<[u64; 2]>);
+type MacroInvocation = ([u64; 2], Vec<[u64; 2]>, Option<Vec<[u64; 2]>>);
 
 #[derive(Serialize, Deserialize)]
 struct CapturedFacts {
@@ -166,13 +166,19 @@ impl CapturedFacts {
             macro_invocations: syntax.facts().macro_invocations().map(|ranges| {
                 ranges
                     .iter()
-                    .map(|(range, modules)| {
+                    .map(|(range, modules, direct)| {
                         (
                             [range.start, range.end],
                             modules
                                 .iter()
                                 .map(|range| [range.start, range.end])
                                 .collect(),
+                            direct.as_ref().map(|ranges| {
+                                ranges
+                                    .iter()
+                                    .map(|range| [range.start, range.end])
+                                    .collect()
+                            }),
                         )
                     })
                     .collect()
@@ -210,13 +216,19 @@ impl CapturedFacts {
                 macro_invocations: self.macro_invocations.map(|ranges| {
                     ranges
                         .into_iter()
-                        .map(|([start, end], modules)| {
+                        .map(|([start, end], modules, direct)| {
                             (
                                 ByteRange { start, end },
                                 modules
                                     .into_iter()
                                     .map(|[start, end]| ByteRange { start, end })
                                     .collect(),
+                                direct.map(|ranges| {
+                                    ranges
+                                        .into_iter()
+                                        .map(|[start, end]| ByteRange { start, end })
+                                        .collect()
+                                }),
                             )
                         })
                         .collect()

@@ -175,6 +175,9 @@ pub enum SyntaxOrigin {
     Framework,
 }
 
+/// Captured invocation, direct module items, and optional complete direct token ranges.
+pub type MacroInvocation = (ByteRange, Vec<ByteRange>, Option<Vec<ByteRange>>);
+
 /// Immutable syntax facts shared by documents at different paths, without complete node rows.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
@@ -185,7 +188,7 @@ pub struct SyntaxFacts {
     symbols: Vec<SyntaxSymbol>,
     left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
-    macro_invocations: Option<Vec<(ByteRange, Vec<ByteRange>)>>,
+    macro_invocations: Option<Vec<MacroInvocation>>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -327,7 +330,7 @@ impl SyntaxDocument {
                                     parent.kind == "source_file" && parent.parent.is_none()
                                 })
                     })
-                    .map(|node| (node.range, Vec::new()))
+                    .map(|node| (node.range, Vec::new(), None))
                     .collect()
             });
         let left_out_symbols = leave_out_refused_names(&mut symbols);
@@ -475,7 +478,7 @@ impl SyntaxFacts {
 
     /// Returns captured top-level Rust macro invocations, or `None` for unrecorded facts.
     #[must_use]
-    pub fn macro_invocations(&self) -> Option<&[(ByteRange, Vec<ByteRange>)]> {
+    pub fn macro_invocations(&self) -> Option<&[MacroInvocation]> {
         self.macro_invocations.as_deref()
     }
     /// Returns whether these facts came from a provider or framework context.
