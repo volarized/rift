@@ -40,6 +40,7 @@ from rift_dev.corpus_assertions import (
     sample_symbols,
     startup_published,
     stop_sizes,
+    symbol_pool,
     token_past_chunk,
     warnings,
 )
@@ -677,7 +678,7 @@ class Corpus:
         )
 
     async def symbols(self, client: Client, candidates: list[JsonObject]) -> None:
-        """Resolve 200 sampled symbol identities through syntax reads."""
+        """Check 200 physical declarations and every sampled established identity."""
         initial = language_counts(candidates)
         pool = list(candidates)
         workspace = await client.resource("rift://workspace")
@@ -705,9 +706,50 @@ class Corpus:
             )
             warnings(answer)
             pool.extend(objects(answer, "results"))
+        if self.pin.name == "fastapi":
+            answer = await client.call(
+                "search",
+                {
+                    "query": "APIRouter",
+                    "target": "symbol",
+                    "paths": {"include": ["fastapi/**"]},
+                    "limit": 1000,
+                    "order": "identity",
+                },
+            )
+            warnings(answer)
+            pool.extend(objects(answer, "results"))
         selected = sample_symbols(
             pool, SYMBOL_COUNT, SEED, REQUIRED_LANGUAGES[self.pin.name]
         )
+        canonical = symbol_pool(pool)
+        require(bool(canonical), "symbol pool has no established canonical identities")
+        anchor = min(canonical)
+        if self.pin.name == "bun":
+            anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
+            require(
+                anchor in canonical,
+                "Bun lost its established Rust TEST identity",
+            )
+        elif self.pin.name == "fastapi":
+            anchor = "rift://symbol/local/python/fastapi/routing/APIRouter"
+            require(
+                anchor in canonical, "FastAPI lost its established APIRouter identity"
+            )
+        anchor_hit = canonical[anchor]
+        anchor_symbol = object_value(
+            object_value(anchor_hit["hit"], "search hit")["symbol"], "symbol"
+        )
+        if anchor_hit not in selected:
+            position = next(
+                index
+                for index, hit in enumerate(selected)
+                if object_value(
+                    object_value(hit["hit"], "search hit")["symbol"], "symbol"
+                )["language"]
+                == anchor_symbol["language"]
+            )
+            selected[position] = anchor_hit
         details: list[Json] = []
         for hit in selected:
             symbol = object_value(
@@ -733,11 +775,14 @@ class Corpus:
             symbol = object_value(
                 object_value(hit.get("hit"), "search hit").get("symbol"), "symbol"
             )
-            identity = string_value(symbol.get("id"), "symbol identity")
-            require(
-                identity not in identities, f"duplicate sampled identity: {identity}"
-            )
-            identities.add(identity)
+            identity = symbol.get("id")
+            if identity is not None:
+                identity = string_value(identity, "symbol identity")
+                require(
+                    identity not in identities,
+                    f"duplicate sampled identity: {identity}",
+                )
+                identities.add(identity)
             path = self.root / string_value(hit.get("path"), "symbol path")
             span = object_value(hit.get("range"), "symbol range")
             start, end = (
@@ -752,11 +797,50 @@ class Corpus:
                 "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
             )
             nodes = objects(answer, "nodes")
-            require(
-                any(node.get("symbol") == identity for node in nodes),
-                f"nodes omitted sampled declaration: {identity} at {end - 1}; "
-                f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
-            )
+            excerpts = array_value(answer.get("source"), "node sources")
+            require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
+            for node, excerpt in zip(nodes, excerpts, strict=True):
+                node_span = object_value(node.get("range"), "node range")
+                node_start = number(node_span.get("start"), "node start")
+                node_end = number(node_span.get("end"), "node end")
+                require(
+                    0 <= node_start <= node_end <= len(content),
+                    "node range exceeds source",
+                )
+                require(
+                    isinstance(excerpt, str)
+                    and excerpt.encode() == content[node_start:node_end],
+                    f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
+                )
+            if identity is not None:
+                require(
+                    any(node.get("symbol") == identity for node in nodes),
+                    f"nodes omitted sampled declaration: {identity} at {end - 1}; "
+                    f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
+                )
+            else:
+                matching = [
+                    node
+                    for node in nodes
+                    if number(
+                        object_value(node.get("range"), "node range").get("end"),
+                        "node end",
+                    )
+                    >= end
+                    and number(node["range"].get("start"), "node start") <= end - 1
+                    and (
+                        node["range"].get("end") == end
+                        or "declaration" in node.get("facets", [])
+                    )
+                ]
+                require(
+                    bool(matching),
+                    f"nodes omitted raw declaration at {path}:{start}-{end}",
+                )
+                require(
+                    all(node.get("symbol") is None for node in matching),
+                    f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
+                )
             require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
 
@@ -871,19 +955,37 @@ class Corpus:
 
     async def churn_case(self) -> None:
         """Run sustained reads and edits in their own required bounded case."""
-        with self.server() as server:
-            async with server.connect() as client:
-                # Listener readiness precedes file preparation. Observe the existing
-                # startup budget before measuring reads against external writes.
-                await settled_local(client, "get_symbol", CHURN_REQUESTS["get_symbol"])
-                await self.churn(client)
-                no_failed_builds(await logged(server, "index"))
-            self.stop(server)
-            self.record("stop", state="after_churn", process_gone=True)
+        directory = self.root / "rift_corpus_probe"
+        directory.mkdir()
+        manifest = directory / "Cargo.toml"
+        probe = directory / PROBE_PATH
+        try:
+            manifest.write_text(
+                '[package]\nname = "rift_corpus_probe"\nversion = "1.0.0"\n'
+                f'[lib]\npath = "{PROBE_PATH}"\n[workspace]\n',
+                encoding="utf-8",
+            )
+            with self.server() as server:
+                async with server.connect() as client:
+                    # Listener readiness precedes file preparation. Observe the existing
+                    # startup budget before measuring reads against external writes.
+                    await settled_local(
+                        client, "get_symbol", CHURN_REQUESTS["get_symbol"]
+                    )
+                    await self.churn(client, probe.relative_to(self.root).as_posix())
+                    no_failed_builds(await logged(server, "index"))
+                self.stop(server)
+                self.record("stop", state="after_churn", process_gone=True)
+        finally:
+            probe.unlink(missing_ok=True)
+            manifest.unlink(missing_ok=True)
+            directory.rmdir()
 
-    async def churn(self, client: Client) -> None:
+    async def churn(self, client: Client, probe_path: str = PROBE_PATH) -> None:
         """Read complete source revisions while external writes continue every two seconds."""
-        path = self.root / PROBE_PATH
+        path = self.root / probe_path
+        requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
+        requests["nodes"]["path"] = probe_path
         sources: list[str] = []
         written: list[float] = []
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
@@ -916,7 +1018,7 @@ class Corpus:
                     answer = await read_settled_local(
                         client,
                         name,
-                        CHURN_REQUESTS[name],
+                        requests[name],
                         seconds=budget,
                         poll_seconds=POLL_SECONDS,
                     )
@@ -924,7 +1026,9 @@ class Corpus:
                     string_value(warning.get("code"), "warning code")
                     for warning in warnings(answer)
                 ]
-                found, source = churn_answer(name, answer, sources, identity)
+                found, source = churn_answer(
+                    name, answer, sources, identity, probe_path
+                )
                 revision = sources.index(source)
                 require(
                     revision >= before - 1 or "stale_index" in codes,

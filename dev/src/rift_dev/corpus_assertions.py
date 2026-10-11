@@ -114,15 +114,17 @@ def map_paths(answer: JsonObject) -> set[str]:
 
 
 def symbol_pool(candidates: list[JsonObject]) -> dict[str, JsonObject]:
-    """Deduplicate overlapping search pages while checking each emitted language."""
+    """Keep established symbol identities for exact reads without minting raw IDs."""
     require(len(candidates) <= SYMBOL_POOL_MAX, "symbol pool exceeded 4000 hits")
     identities: dict[str, JsonObject] = {}
     for candidate in candidates:
         symbol = object_value(
             object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
         )
-        identity = string_value(symbol.get("id"), "symbol identity")
         language = string_value(symbol.get("language"), "symbol language")
+        if symbol.get("id") is None:
+            continue
+        identity = string_value(symbol.get("id"), "symbol identity")
         if identity in identities:
             previous = object_value(
                 object_value(identities[identity].get("hit"), "search hit").get(
@@ -139,9 +141,38 @@ def symbol_pool(candidates: list[JsonObject]) -> dict[str, JsonObject]:
     return identities
 
 
+def declaration_pool(
+    candidates: list[JsonObject],
+) -> dict[tuple[str, str, int, int], JsonObject]:
+    """Deduplicate physical declarations while retaining unresolved source facts."""
+    require(len(candidates) <= SYMBOL_POOL_MAX, "symbol pool exceeded 4000 hits")
+    declarations: dict[tuple[str, str, int, int], JsonObject] = {}
+    for candidate in candidates:
+        symbol = object_value(
+            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
+        )
+        language = string_value(symbol.get("language"), "symbol language")
+        string_value(symbol.get("name"), "symbol name")
+        path = string_value(candidate.get("path"), "symbol path")
+        span = object_value(candidate.get("range"), "symbol range")
+        start = number(span.get("start"), "range start")
+        end = number(span.get("end"), "range end")
+        require(start < end, "symbol range must be nonempty")
+        key = (language, path, start, end)
+        if key in declarations:
+            previous = object_value(
+                object_value(declarations[key].get("hit"), "search hit").get("symbol"),
+                "symbol",
+            )
+            require(previous == symbol, f"one declaration named two symbols: {key}")
+        else:
+            declarations[key] = candidate
+    return declarations
+
+
 def language_counts(candidates: list[JsonObject]) -> JsonObject:
     counts: dict[str, int] = {}
-    for candidate in symbol_pool(candidates).values():
+    for candidate in declaration_pool(candidates).values():
         symbol = object_value(
             object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
         )
@@ -153,10 +184,12 @@ def language_counts(candidates: list[JsonObject]) -> JsonObject:
 def sample_symbols(
     candidates: list[JsonObject], count: int, seed: int, required: set[str]
 ) -> list[JsonObject]:
-    """Sample across emitted languages without losing rare languages or repeating IDs."""
+    """Sample physical declarations across every emitted language without repetition."""
     require(0 < count <= SYMBOL_COUNT, "symbol sample count must be within 1..200")
-    pool = symbol_pool(candidates)
-    require(len(pool) >= count, f"symbol pool has fewer than {count} unique identities")
+    pool = declaration_pool(candidates)
+    require(
+        len(pool) >= count, f"symbol pool has fewer than {count} unique declarations"
+    )
     groups: dict[str, list[JsonObject]] = {}
     for identity in sorted(pool):
         candidate = pool[identity]
@@ -550,7 +583,11 @@ def probe_units(root: Path) -> int:
 
 
 def churn_answer(
-    tool: str, answer: JsonObject, sources: list[str], identity: str | None
+    tool: str,
+    answer: JsonObject,
+    sources: list[str],
+    identity: str | None,
+    probe_path: str = PROBE_PATH,
 ) -> tuple[str, str]:
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
@@ -575,7 +612,7 @@ def churn_answer(
         owner = object_value(hit.get("hit"), "search hit") if tool == "search" else hit
         symbol = object_value(owner.get("symbol"), "probe symbol")
         found = string_value(symbol.get("id"), "probe identity")
-        require(hit.get("path") == PROBE_PATH, f"{tool} returned another probe path")
+        require(hit.get("path") == probe_path, f"{tool} returned another probe path")
         excerpt = hit.get("source")
     require(identity is None or found == identity, f"{tool} changed probe identity")
     source = string_value(excerpt, "probe source")
