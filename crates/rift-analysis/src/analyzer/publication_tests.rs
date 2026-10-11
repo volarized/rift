@@ -170,19 +170,52 @@ fn unproved_namespace_keeps_object_facts_and_refuses_directory_binding() {
 
 #[test]
 fn malformed_and_omitted_declarations_cannot_prove_complete_coverage() {
-    let omitted = format!(
-        "def {}(): pass\n",
-        "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1)
-    );
-    for (source, inventory_complete) in [("def echo(".to_owned(), true), (omitted, false)] {
+    let name = "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+    let refused = format!("def {name}(): pass\n");
+    for source in ["def echo(".to_owned(), refused] {
         let result = publication(&[("click/core.py", &source)], None, &["click"]);
         assert_eq!(result.units.len(), 1);
         assert_eq!(result.units[0].source, source);
         assert!(result.units[0].source_complete);
         let coverage = &result.coverage[0];
-        assert_eq!(coverage.inventory_complete, inventory_complete);
+        assert!(coverage.inventory_complete);
         assert!(!coverage.identity_complete);
         assert!(!coverage.applicability_complete);
+        if source.contains(&name) {
+            let objects = result
+                .objects
+                .iter()
+                .filter(|object| object.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(objects.len(), 1);
+            assert!(objects[0].id.is_none());
+            assert!(result.declarations.is_empty());
+            let range = result
+                .warnings
+                .iter()
+                .find_map(|warning| match warning {
+                    rift_protocol::index::PackageAnalysisWarning::ObjectUnavailable {
+                        unit: Some(unit),
+                        range: Some(range),
+                        qualified_name,
+                        field,
+                        bound,
+                    } if unit == &result.units[0].unit && qualified_name == &name => {
+                        assert_eq!(field, "name");
+                        assert_eq!(
+                            *bound,
+                            u64::try_from(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+                                .expect("public name bound")
+                        );
+                        Some(range)
+                    }
+                    _ => None,
+                })
+                .expect("retained object public refusal");
+            let start = usize::try_from(range.start).expect("range start");
+            let end = usize::try_from(range.end).expect("range end");
+            assert_eq!(source.get(start..end), Some(source.trim_end()));
+        }
     }
 }
 
