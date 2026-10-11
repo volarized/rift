@@ -1,3 +1,4 @@
+import { BookOpenIcon, GlobeHemisphereWestIcon } from "@phosphor-icons/react/ssr";
 import type { BaseLayoutProps } from "fumadocs-ui/layouts/shared";
 
 import { ThemeTogglerButton } from "@/components/animate-ui/components/buttons/theme-toggler";
@@ -37,13 +38,27 @@ export function baseOptions(): BaseLayoutProps {
         />
       ),
     },
-    // see https://fumadocs.dev/docs/ui/navigation/links
-    // links: [
-    //   {
-    //     text: 'Documentation',
-    //     url: '/docs',
-    //     active: 'nested-url',
-    //   },
-    // ],
+    links: [
+      {
+        text: (
+          <span key="documentation" className="inline-flex items-center gap-2">
+            <BookOpenIcon size={16} weight="light" aria-hidden="true" />
+            Documentation
+          </span>
+        ),
+        url: "/docs",
+        active: "nested-url",
+      },
+      {
+        text: (
+          <span key="global-index" className="inline-flex items-center gap-2">
+            <GlobeHemisphereWestIcon size={16} weight="light" aria-hidden="true" />
+            Global Index
+          </span>
+        ),
+        url: "/global-index",
+        active: "nested-url",
+      },
+    ],
   };
 }

@@ -1,38 +1,16 @@
 ---
 title: Implementation
+icon: Wrench
 ---
 
-import { FlatDiagram } from "@/components/flat-diagram";
+import { ImplementationDiagram } from "@/components/system-diagrams";
 
 This page goes into how Rift is built. It's developer-oriented - if you just want to use Rift,
 check the [main documentation](/docs).
 
-<FlatDiagram
-  alt="rift mcp forwards requests over Streamable HTTP to the Axum server on Tokio. Providers build an in-memory index and persist search data through Toasty over SQLite into the index and vectors databases; the server writes its logs into the metrics database through rusqlite."
-  chart={`
-    flowchart LR
-      agent["agent"]:::agent -- "MCP over stdio" --> mcp["rift mcp<br/>rmcp proxy"]:::rift
-      mcp -- "Streamable HTTP /api/mcp" --> server["rift server<br/>Axum on Tokio"]:::rift
-      toml["rift.toml"]:::config -- "acceptance" --> server
-      subgraph indexing["providers and index"]
-        providers["providers<br/>tree-sitter"]:::provider
-        normalization["normalization<br/>SymbolRecord graph"]:::rift
-        memory["in-memory index<br/>symbols + nodes"]:::store
-        index[".rift/index<br/>lexical index"]:::store
-        vectors[".rift/vectors<br/>semantic vectors"]:::store
-        providers -- "Contributions" --> normalization
-        normalization -- "readable Symbols" --> memory
-        memory -- "publish units<br/>Toasty over SQLite" --> index
-        memory -- "embedded units<br/>Toasty over SQLite" --> vectors
-      end
-      server -- "compositions" --> providers
-      server -- "log records<br/>rusqlite" --> metrics[".rift/metrics<br/>server logs"]:::store
-  `}
-/>
+<ImplementationDiagram />
 
 ## The rift binary
-
-<VersionBadge version="v0.0.11" />
 
 Rift is delivered as one binary, installed as the [Install](/docs/installation#install) section describes.
 The CLI is implemented with [clap](https://docs.rs/clap), and Rift's two main capabilities are
@@ -44,7 +22,7 @@ implemented as `rift mcp` and `rift server`.
 agent over the stdio transport and forwards each request to the workspace's `rift server` over
 Streamable HTTP; the process holds no state of its own - state lives in the `rift server`. To
 reach the workspace's server it checks the server lock file -
-[`ServerLock`](/docs/developer/protocol/reference#ServerLock) at `.rift/server.json` - and starts a
+`ServerLock` at `.rift/server.json` - and starts a
 server when no live one stands behind it.
 
 A server that `rift mcp` or `rift server start` starts exits when its claim on `.rift/server.lock`
@@ -60,12 +38,10 @@ building, and the agent resends it. A holder that wrote nothing keeps the refusa
 operator action.
 
 Each forwarded request waits at most the proxy's forward budget: the
-[`[server]`](/docs/developer/configuration#server) `readiness_timeout` and `worker_queue_timeout`
+[`[server]`](/docs/configuration#server) `readiness_timeout` and `worker_queue_timeout`
 the workspace accepts, plus an allowance for the answer. When the budget ends, the proxy cancels
 the request, which closes its Streamable HTTP response stream, and the caller gets a
 `temporarily_unavailable` refusal naming the budget.
-
-<VersionBadge version="v0.0.62" />
 
 `rift mcp` takes one `--output` choice: `text`, the default, or `all`. The proxy keeps the choice
 for its lifetime, across upstream reconnects, so the tool listing it advertises stays stable. With
@@ -113,8 +89,6 @@ runtime. MCP clients use its `/api/mcp` route, which serves Streamable HTTP thro
 [rmcp](https://github.com/modelcontextprotocol/rust-sdk)'s service layer; `/api/stop` serves
 `rift server stop`.
 
-<VersionBadge version="v0.0.62" />
-
 When the server builds a tool result, it renders compact text from the typed answer into
 `content` and serializes the same answer into `structuredContent`. Typed layout code renders every
 tool answer, every failure, and the workspace resource as sections: a title at column 0 that counts its
@@ -142,9 +116,9 @@ Startup runs one cycle:
 4. Publish an empty index carrying `local_index_preparing`, then start background discovery
    and preparation on the bounded worker pool.
 5. Bind the first free loopback port of the accepted
-   [`[server]` selection](/docs/developer/configuration#server) - the pinned `port` or the configured
+   [`[server]` selection](/docs/configuration#server) - the pinned `port` or the configured
    `port_range` - mint the bearer token, and write both into `.rift/server.json`.
-6. Serve until no request remains active and the [`idle_timeout`](/docs/developer/configuration#server)
+6. Serve until no request remains active and the [`idle_timeout`](/docs/configuration#server)
    span passes after the last response completes, then stop.
 
 `rift server start` runs that cycle detached, with the child's standard error on
@@ -162,8 +136,6 @@ A probe counts a server as serving
 only when its election is held and its recorded port accepts a connect. `--foreground` keeps
 the cycle in the calling process, where Ctrl-C stops it.
 
-<VersionBadge version="v0.0.33" />
-
 `--auth skip` serves every request that clears the loopback boundary without the bearer check.
 The MCP specification's own conformance runner forced it: the runner addresses a server by URL
 alone and sends no `Authorization` header, so a checked server refuses it at the door. The CLI
@@ -171,19 +143,15 @@ accepts the flag only together with `--foreground`, so no detached server ever s
 unchecked; the server still mints its token and writes it into `.rift/server.json`, so
 `rift mcp` reaches it unchanged; and the serving process records one `WARN` naming the run.
 
-<VersionBadge version="v0.0.47" />
-
 Filesystem and parser work runs through one named Rayon pool. Admission bounds concurrent
 operations before a Tokio blocking task enters that pool, and cancellation is checked
 between files. This behavior is configurable via the
 `num_workers` and `worker_queue_timeout` keys in the
-[`[server]` section](/docs/developer/configuration#server).
+[`[server]` section](/docs/configuration#server).
 
 Freeing a large index can take longer than closing the listener. After the index supervisor
 stops, the blocking pool releases its retained index while the foreground process finishes
 the log drain and releases the election.
-
-<VersionBadge version="v0.0.62" />
 
 A foreground stop runs its stages under one deadline, `SERVER_STOP_DEADLINE` (4 s) from where the
 stop begins, and each stage takes only what the one before it left:
@@ -255,8 +223,6 @@ that worker left open is rolled back at the next open. An index supervisor still
 bound is aborted the same way: its stage ends with `timeout` and the table of operations in
 flight, and blocking work it started ends with the process.
 
-<VersionBadge version="v0.0.62" />
-
 A server records each step of its life at `INFO`, so the store keeps them under the default
 `[logs]` `capture`. A record that opens a step carries `phase = "start"`, one that ends it
 carries `outcome = "ok"`, and one that fails it carries `outcome = "error"`; a printed line
@@ -314,8 +280,6 @@ started behind a publication can run for minutes with nothing able to cancel it.
 
 The project resolver skips symlinks and the `.git`, `.rift`, and `target` directories.
 
-<VersionBadge version="v0.0.47" />
-
 Discovery and event filtering also skip nested linked Git worktrees. Submodules and independent
 nested repositories retain the existing source visibility rules.
 
@@ -323,8 +287,6 @@ The symbol index stays in memory as one immutable value: a rebuild constructs th
 accepted configuration outside the async lock, then swaps the complete value under its write
 lock. Each request clones the published value under a read lock and retains that capture through
 its result, so reads never combine state from two index revisions.
-
-<VersionBadge version="v0.0.25" />
 
 Watcher events advance one workspace change counter and enter the same
 serialized rebuild lane. Each observation carries the paths it saw, and the rebuild reads only
@@ -357,8 +319,6 @@ the next rebuild, and wakes the waiting reads.
 A later observation of the bytes the rebuild already read, such as a read's own request, leaves
 it running, and its index publishes for that observation. The comparison reads at most 64
 observed paths over one rebuild; a larger observation is decided at publication.
-
-<VersionBadge version="v0.0.47" />
 
 The capture records each file's stat beside its digests: length and modification time, and on
 Unix status change time, device, inode, and mode. It reads a timestamp from a temporary file on
@@ -404,8 +364,6 @@ shutdown cancels the wait.
 
 ### Repository serving
 
-<VersionBadge version="v0.0.47" />
-
 Repository serving requires an explicit foreground start:
 
 ```sh
@@ -417,7 +375,7 @@ rift server stop --repository
 The repository process accepts server settings from the main worktree and records them at
 startup. A proxy adopts it only when the workspace and main worktree accept those same settings;
 otherwise the workspace starts its own process, as the
-[`[server]` configuration](/docs/developer/configuration#server) describes.
+[`[server]` configuration](/docs/configuration#server) describes.
 
 The process holds its election under `<common git directory>/.rift/<product identity digest>/`.
 The digest is SHA-256 of the canonical product identity, and the directory contains `server.lock`
@@ -438,18 +396,16 @@ carrying its `root`. History retains the existing common Git store and its fill 
 
 ### Local index preparation
 
-<VersionBadge version="v0.0.47" />
-
 The initial publication answers reads before discovery finishes. The supervisor discovers visible
 paths, publishes their map counts, and then captures and analyzes bounded batches. Each publication
 owns its map, source catalog, configuration, and preparation counts.
 
 `search` and `get_symbol` use the declarations already prepared. Their
-[`local_index_preparing`](/docs/developer/protocol/mcp#reads) warning remains until their selected
+[`local_index_preparing`](/docs/developer/mcp#reads) warning remains until their selected
 local scope is complete, including a name lookup that already found a match. A `nodes` read can
 prepare its supplied path within the request budget without changing published progress.
 
-The [`rift://workspace`](/docs/developer/protocol/mcp#resource-workspace) resource projects only
+The [`rift://workspace`](/docs/developer/mcp#resource-workspace) resource projects only
 the requested page from published visible file digests. It performs no whole-tree capture per
 page; the completed catalog includes unclassified and disabled-language files as well as files
 whose syntax was refused.
@@ -463,19 +419,12 @@ A read that meets a recorded rebuild failure at or past the published counter wa
 it answers from the published index and carries `stale_index`, whose `detail` names the counter
 the failed rebuild answered for, the counter the tree is at, and the failure's causes. The next observation retries the rebuild.
 
-<VersionBadge version="v0.0.34" />
-
 With debug capture enabled, `index.build` records its start and epoch before reading a candidate
 tree. A `get_symbol` history read records its start and retains a span until the history request
 ends. The corpus shutdown tests use these records to observe work in progress before issuing
 `rift server stop`; starting a client request alone does not prove that work has started.
 
 ## Databases
-
-<VersionBadge
-  version="v0.0.9"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
 
 Three [SQLite](https://www.sqlite.org/) files under `.rift` hold what a server persists for its
 workspace:
@@ -494,8 +443,6 @@ through [rusqlite](https://github.com/rusqlite/rusqlite) directly, as the histor
 The server never reads, migrates, or removes a `.rift/db` file left in the state directory;
 delete it and its `-wal`, `-shm`, and `.lock` files by hand.
 
-<VersionBadge version="v0.0.62" />
-
 An elected server opens the metrics database first, then the index database, so the index
 database's open lands as a record. The vectors database opens through `LazyDatabase`, a handle
 that opens the file at the first vector operation, at most once, under the same election owner;
@@ -504,12 +451,10 @@ an open that fails leaves the handle unopened, and the next vector operation tri
 Each open stands alone. A refused index database emits a `database.open` warning and the server
 starts without it, while logs keep recording and `rift server logs` prints that warning.
 
-<VersionBadge version="v0.0.47" />
-
 Each of the index and vectors databases is one `WorkspaceDatabase`: one owned SQLite worker
 thread executes driver operations for its file. Async callers send operations through a bounded
 queue and await their replies, so SQLite lock waits and statement execution occupy that thread.
-Each queue uses the accepted [`[search]`](/docs/developer/configuration#search) `pool_slots` and
+Each queue uses the accepted [`[search]`](/docs/configuration#search) `pool_slots` and
 `busy_timeout` bounds.
 
 Every process that opens `.rift/index` or `.rift/vectors` holds an exclusive lock on
@@ -517,9 +462,7 @@ Every process that opens `.rift/index` or `.rift/vectors` holds an exclusive loc
 database's migration set. SQLite refuses a second process's WAL switch at once, without waiting
 for the first, and Toasty applies every migration it read as missing, so two processes preparing
 one new file side by side leave one of them without the database. A process that meets the lock
-waits for it up to [`[search]`](/docs/developer/configuration#search) `busy_timeout`.
-
-<VersionBadge version="v0.0.62" />
+waits for it up to [`[search]`](/docs/configuration#search) `busy_timeout`.
 
 `LogStore::open` in `rift-tracing` spawns `rift-db-metrics`, which opens the one write connection
 to `.rift/metrics` and keeps it for its life. One thread owns the only write connection, so
@@ -583,7 +526,7 @@ serializes index commits and trigram batches, and the vectors database's turn it
 each transaction starts with `BEGIN IMMEDIATE`. Log batches run on the metrics writer thread.
 
 A write commits in transactions of at most
-[`[search.lexical]`](/docs/developer/configuration#search) `transaction_units` units and
+[`[search.lexical]`](/docs/configuration#search) `transaction_units` units and
 `transaction_size` content bytes, one file's rows always in one transaction. Every transaction
 but the last stamps no tree, so a reader meets no publication rather than a mix of two, and only
 the last names the tree the write answers for. A server that stops during a write aborts one
@@ -607,9 +550,9 @@ Every other checkout refuses, a write among them, with `index.database_failed`, 
 database and its path, as a failed open does.
 
 Every checkout sets its pragmas again. `mmap_size` comes from
-[`[search.lexical]`](/docs/developer/configuration#search) `mmap_size` on the index database and
+[`[search.lexical]`](/docs/configuration#search) `mmap_size` on the index database and
 is zero on the vectors database, and `journal_size_limit` comes from
-[`[search]`](/docs/developer/configuration#search) `journal_size_limit` on both.
+[`[search]`](/docs/configuration#search) `journal_size_limit` on both.
 
 Each close is the operation `database.close`, component `storage`, naming its `database`: it
 records `operation opened` when it starts, sits in the table of operations in flight while it
@@ -650,7 +593,7 @@ The index database's tables:
 
 - `lexical_documents` - one row per indexed document: a declaration, carrying its names,
   signature, and documentation, or an indexed file's text, the one copy of it the store keeps,
-  split into chunks past the [`[search.text]`](/docs/developer/configuration#search) chunk
+  split into chunks past the [`[search.text]`](/docs/configuration#search) chunk
   bound. The row carries an integer `id`, the document's identity, path, kind, and content digest
   beside the searchable fields, and a chunk row its `byte_offset` in the file, so a position in
   the chunk maps back to the file without chunking it again.
@@ -706,13 +649,11 @@ included: two rebuilds captured from one publication both write what they read, 
 leaves what the first left.
 
 Search is a layered configuration: the default is this full-text store beside identifier
-matching, and [`[search.vector]`](/docs/developer/configuration#search) adds the vector store
+matching, and [`[search.vector]`](/docs/configuration#search) adds the vector store
 below. All three fuse by weighted reciprocal rank, under the shares
-[`[search.ranking]`](/docs/developer/configuration#search) sets.
+[`[search.ranking]`](/docs/configuration#search) sets.
 
 ## History store
-
-<VersionBadge version="v0.0.46" />
 
 The history store is a SQLite database apart from the workspace's three, so lexical and log
 writes never wait on a fill. It sits in the `.rift/` folder of the common git directory, one file per
@@ -751,12 +692,12 @@ The flags narrow what prints:
 - `-n`, `--tail` prints only the newest records
 - `--since` prints records recorded at or after an age such as `10m`, or an RFC 3339 timestamp
   such as `2026-10-04T20:42:58Z`
-- `--until` <VersionBadge version="v0.0.62" inline /> prints records recorded before a bound, in the same two forms; with `--since` it
+- `--until` prints records recorded before a bound, in the same two forms; with `--since` it
   selects one window
 - `--level` selects one severity
 - `--component` selects records from one component
 
-The [`[logs]`](/docs/developer/configuration#logs) table bounds how many the server keeps.
+The [`[logs]`](/docs/configuration#logs) table bounds how many the server keeps.
 
 `rift-tracing` holds a record from its capture to its row. The `LogSink` layer publishes each
 event and span close that `[logs]` `capture` admits to the persistence queue and independent
@@ -792,7 +733,7 @@ at most 128 MiB of records; explicit copies made by a caller sit outside those b
 The byte accounting includes the publication envelope, record, shared ownership header, and
 string lengths. Bounded channel slots and allocator overhead sit outside that accounting.
 
-The [`[logs]`](/docs/developer/configuration#logs) keys `queue_records`, `flush_interval`,
+The [`[logs]`](/docs/configuration#logs) keys `queue_records`, `flush_interval`,
 and `retry_interval` configure queue capacity, partial-batch flushes, and retained retries. Under repository serving, a routing drain sends records
 to one bounded consumer per admitted workspace, selected from the request span's `workspace`.
 Each consumer holds at most `min(queue_records, 256)` queued records and the same number in a
@@ -800,8 +741,6 @@ batch, sharing a 1 MiB byte budget. At most 64 consumer budgets remain retained,
 replaced consumers and their queued records or writer batches. Admission at that bound refuses
 the new consumer before replacing the current route. These budgets sit outside the 128 MiB
 subscription budgets.
-
-<VersionBadge version="v0.0.62" />
 
 An event record names the spans it was emitted in, so the records of one request group by its
 `request_id` even while a background task logs between them. When a span opens, an unfiltered
@@ -949,7 +888,7 @@ collection, then publish to the SDK and release that map. A process that install
 records nothing, at the cost of two atomic reads per recording.
 
 A view on the meter provider bounds every instrument at
-[`[logs] cardinality_limit`](/docs/developer/configuration#logs) label sets,
+[`[logs] cardinality_limit`](/docs/configuration#logs) label sets,
 and the SDK records a label set past that into one series carrying `otel.metric.overflow`. A test reads what the SDK exported through
 `ScopedRecorder::metrics`, each series naming its scope, printed as `otel.scope.name` and
 `otel.scope.version`. Every `traced!` operation records `traces.span.metrics.calls` and
@@ -966,8 +905,6 @@ The metrics follow
 the operation, not its span: the duration is read once, at the operation's end, and the close
 record's `elapsed_ms` states the same reading, so a span clone held elsewhere lengthens neither,
 and the span's filters do not select it.
-
-<VersionBadge version="v0.0.62" />
 
 Every request `rift server` answers records `mcp.server.operation.duration`, and every request
 `rift mcp` forwards to it records `mcp.client.operation.duration`, in seconds, bucketed at the
@@ -1006,8 +943,6 @@ preparation at start, `filesystem` for a rebuild that reads the paths its observ
 native event counts `watch.events` by `watch.event.kind` and `watch.event.route`. An observation
 whose signal the full invalidation channel refused counts `index.invalidation.dropped` under
 `event` and writes no record.
-
-<VersionBadge version="v0.0.62" />
 
 Every build carries the OTLP export, and a process exports nothing until an operator sets an
 endpoint variable. With `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT`
@@ -1080,8 +1015,6 @@ blocking pool reports `worker_pool.permit.count` by `worker_pool.permit.state`, 
 the 64 workspaces a repository process admits; a read past that is refused, and the first refusal
 per instrument is a `WARN` record naming it.
 
-<VersionBadge version="v0.0.62" />
-
 Work that has not finished is evidence too. The runtime keeps a table of operations in flight:
 every span carrying an `operation` field, every lock wait, and every held lock, from its opening
 to its close, with its name, kind (`operation`, `wait`, or `held`), component, lock name, parent
@@ -1093,7 +1026,7 @@ that bound as `untracked`.
 `rift_tracing::publish_in_flight(reason)` writes the table as one `operations in flight` record,
 and the panic hook writes it at `WARN` with the reason `panic`, right after its `the server
 panicked` record. The stall report, a task of its own, reads the table every quarter of
-[`[logs]`](/docs/developer/configuration#logs) `stall_delay`, and at least every 5 s, and writes
+[`[logs]`](/docs/configuration#logs) `stall_delay`, and at least every 5 s, and writes
 one `operations in flight past the stall delay` record, at `WARN`, for the entries open longer
 than `stall_delay`, each entry once. The table also feeds `operation.active`, the entries open at
 each collection by `span.name`, and `operation.untracked`, the entries it refused.
@@ -1117,8 +1050,6 @@ within 4 KiB, and count what did not fit in `left_out`:
 `traced!(component = .., operation = .., open = true, ..)` also records its opening: one
 `operation opened` event inside the operation's span, so the store holds the operation while it
 runs and a killed server leaves it behind. `lexical.commit` opens this way.
-
-<VersionBadge version="v0.0.62" />
 
 `rift_tracing::lock(name).acquire(future)` wraps the caller's own acquisition future, such as
 `mutex.lock()`, and polls it as the caller would, so the lock's queue order and cancellation
@@ -1213,11 +1144,6 @@ or unexpected file; CI runs that check through `just generate-check`.
 
 ## Vector search
 
-<VersionBadge
-  version="v0.0.16"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
 `rift-search` owns the tier. The default runs the encoder in the server's own process, so
 answering a query touches neither the network nor a subprocess.
 
@@ -1259,7 +1185,7 @@ else is read as a BERT checkpoint through
 retrieval query carries the prefix that checkpoint was trained with. A static model runs no
 forward pass, so neither the prefix nor the pooling applies to it.
 
-The shipped [default](/docs/developer/configuration#search) is static. A workspace is embedded once
+The shipped [default](/docs/configuration#search) is static. A workspace is embedded once
 before its first search can rank by vector, and a forward pass over every declaration
 costs minutes on a laptop CPU where a row gather costs seconds.
 
@@ -1270,7 +1196,7 @@ is that a load holds the file's bytes once while the tensors are built.
 Every encoder call runs on a blocking thread. Candle's forward pass would otherwise hold a
 runtime worker for the length of a batch, and a request arriving meanwhile would wait behind
 it. Passes run one at a time, bounded by
-[`batch_inputs` and `max_tokens`](/docs/developer/configuration#search). A BERT checkpoint's
+[`batch_inputs` and `max_tokens`](/docs/configuration#search). A BERT checkpoint's
 attention memory grows with the square of the token window, and candle's kernels already
 spread one pass across the thread pool, so running several at once buys nothing and costs the
 machine its memory.
@@ -1296,8 +1222,8 @@ differs from the loaded model's is skipped, which invalidates a checkpoint that 
 rather than reading it as noise.
 
 Two sweeps keep the table bounded: one drops what the previous model wrote when
-[`model`](/docs/developer/configuration#search) changes, the other drops digests no live declaration
-addresses. [`max_vectors`](/docs/developer/configuration#search) bounds what the table may hold at all.
+[`model`](/docs/configuration#search) changes, the other drops digests no live declaration
+addresses. [`max_vectors`](/docs/configuration#search) bounds what the table may hold at all.
 
 The vector table joins the lexical index's migration set rather than opening a second database
 handle with its own. Toasty records applied migrations in one `__toasty_migrations` table per
@@ -1305,8 +1231,6 @@ file, so two independent sets on one file would interleave their ids; one set co
 tiers, and each store applies the same idempotent set whatever order the two open in.
 
 ## Language providers
-
-<VersionBadge version="v0.0.23" />
 
 A provider composition is a typed pipeline of named stages - source resolvers, fact providers,
 and transforms - connected through declared input and output flows, with keyed joins for
@@ -1328,8 +1252,6 @@ APIs never leave the syntax crate.
 The registry itself assembles from one shipped definition list in `rift-syntax`: each entry
 names a language's identity, the file extensions it claims, and the provider parsing it, so
 adding a language is one definition plus one list entry.
-
-<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
 
 HTML preserves elements, attributes, and source references as syntax nodes. CSS publishes
 selectors, properties, custom properties, and at-rules as declarations; import and URL syntax
@@ -1368,7 +1290,7 @@ applicable configuration or stylesheet evidence. A captured npm lockfile pin tak
 over the declared version; an invalid or unsupported pin leaves context unresolved. Version 3
 uses `tailwind.config.*` or captured
 `@tailwind` syntax; version 4 uses a captured CSS import of `tailwindcss`. Explicit
-[`providers.syntax.frameworks`](/docs/developer/configuration#providers) entries supply context
+[`providers.syntax.frameworks`](/docs/configuration#providers) entries supply context
 when captured evidence leaves it unresolved.
 
 Under that context, static HTML, JSX, Angular, Vue, and Svelte classes publish authored utility
@@ -1403,8 +1325,6 @@ Stored facts validate each node kind against the host grammar or its supported i
 grammars. Restoration retains the host identity, original source digest, embedded signature
 identity, and configured parsing bounds.
 
-<VersionBadge version="v0.0.46" languages={["JavaScript", "TypeScript"]} />
-
 The JavaScript and TypeScript providers publish a declaration's attached JSDoc as its
 `documentation`. The walk starts at the statement carrying the declaration - an `export`, or the
 `const`, `let`, or `var` statement it is the first declarator of - and the declaration's `range`
@@ -1413,8 +1333,6 @@ with a line break, `@` tags stay as written, and the `/**`, `*/`, and leading `*
 stripped; a `//` or `/* */` comment or a blank line ends the walk.
 
 ## Dependency context
-
-<VersionBadge version="v0.0.46" />
 
 `rift-dependency` holds the resolvers and the standard library pass. The resolvers read through a
 reader that offers a file read and a directory listing, so a resolver cannot start a process.
@@ -1425,8 +1343,6 @@ Cargo package's `<name>-<version>` folder minted from the lockfile, an npm packa
 `.dist-info/RECORD` lists, and the Rust standard library below `rustc --print sysroot`. Those
 folders never reach the global API.
 
-<VersionBadge version="v0.0.47" />
-
 Global resolution retains one latest dependency context and its checked request bytes. The cache
 key compares the published dependency context, requested packages, and advertised entry bound;
 repeated reads reuse the bounded context even when the global API accepts fewer entries.
@@ -1434,7 +1350,7 @@ The client compares a full request digest and analyzer and corpus revisions befo
 
 The standard library pass runs `rustup --version`, `rustc --version`, `rustc --print sysroot`,
 and `node --version` through the server's bounded command runner, under
-[`[dependencies]`](/docs/developer/configuration#dependencies) `resolution = "auto"` alone. Every
+[`[dependencies]`](/docs/configuration#dependencies) `resolution = "auto"` alone. Every
 probe runs with `RUSTUP_AUTO_INSTALL=0` and `MISE_AUTO_INSTALL=0` laid over its environment and
 `RUSTUP_TOOLCHAIN` removed from it. A rustup proxy or a mise shim installs the toolchain a pin
 names when it runs in that pin's folder, and `RUSTUP_TOOLCHAIN` beats the project's toolchain
@@ -1445,108 +1361,6 @@ filesystem root, where no toolchain file applies. Below 1.28.1, or when its firs
 version, `rustc` does not run and the entry keeps its static reading; the output decides, because
 `rustup --version` exits 0 whether or not it reached the active toolchain. Where no `rustup`
 starts, as beside a distribution's `rustc`, `rustc --version` runs directly.
-
-## Package analysis
-
-<VersionBadge version="v0.0.39" />
-
-One package's source reaches the global index through package analysis in `rift-analysis`, which
-holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
-providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
-the declarations, and renders one `PackagePublication`. That publication is the logical package
-index global ingestion consumes. The local server runs no package analysis; its package facts
-come from the global index.
-
-`ExactPackageLimits::with_declarations` sets the declaration bound for semantic assembly;
-stub and implementation declarations both count.
-`ExactPackageLimits::from_configuration` validates the configuration and uses the file, aggregate
-byte, declaration, and relationship bounds from [`[source]`](/docs/developer/configuration#source).
-
-The adapter also applies per-file parsing bounds from
-[`[providers.syntax]`](/docs/developer/configuration#providerssyntax), documentation collection
-bounds from [`[documentation]`](/docs/developer/configuration#documentation), and publication
-bounds from [`[package]`](/docs/developer/configuration#package).
-Callers accept the configuration through `rift_core::acceptance::accept_configuration` to apply
-the same environment overrides as the local server, such as `RIFT_SOURCE_DECLARATIONS`.
-
-`ExactPackageLimits::new` keeps the provider's 100,000-declaration default unless the caller
-sets an override. The configuration adapter leaves file selection to the caller.
-
-`package.retained_source` bounds each retained source string; `package.retained_total`, when set,
-bounds their aggregate bytes. Units, symbols, and search documents each count their own source
-copy, and the analyzer checks the aggregate before allocation.
-
-`ArchiveLimits::from_configuration` applies `[package.archive]` when the caller decodes an archive
-before constructing package input. Archive admission and package input each enforce their selected
-bounds; increasing compressed bytes alone does not raise expanded bytes or declaration capacity.
-
-<VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
-
-File selection decides which files of a package the analysis reads, from package-relative paths
-alone. It keeps:
-
-- the source files the package language's definitions claim: `.rs` for Rust, `.py` and `.pyi` for
-  Python, and every JavaScript and TypeScript extension for a TypeScript package, whose builds
-  ship `.js`, `.mjs`, and `.cjs` beside their declaration files
-- the documentation files the workspace's own documentation selection keeps, narrowed by a
-  package's `context7.json`
-
-It skips `node_modules`, `__pycache__`, `target`, and `.git`, and the files a caller's
-[`[source]`](/docs/developer/configuration#source) `exclude` patterns match, through the matcher
-the workspace's `[source]` table uses. Tests, examples, and benchmarks stay, since they show how a
-package is used.
-
-<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
-
-Package selection also accepts HTML, Angular, CSS, Vue, Svelte, C, C++, Cython, and JSONC.
-TypeScript packages include HTML, CSS, Vue, and Svelte sources beside JavaScript and TypeScript;
-Python packages include Cython sources. A C++ package selects `.h` as C++, and an Angular package
-selects `.html` and `.htm` as `html:angular`; ordinary workspace selection keeps `.h` as C and
-`.html` as HTML.
-
-`ExactPackageInput::with_framework_context` adds captured metadata and explicit framework
-selections. Selected sources already belong to context; additional metadata paths must be
-distinct. The combined sources share package file and aggregate byte bounds. Metadata informs
-analysis without becoming a published source unit. `PackageAnalysis::warnings` reports unresolved
-framework context and dynamic expressions. Fresh, supplied, and checked restored raw syntax
-produce the same contextual publication; files with framework context parse current source before applying framework facts.
-
-The stub and module join pairs a stub with the module it declares: `mod.pyi` with `mod.py`,
-`index.d.ts` with `index.js`, `.d.mts` with `.mjs`, and `.d.cts` with `.cjs`. A `.d.ts` beside no
-`.js` pairs with its `.mjs`, then its `.cjs`, so an ESM build claims a stub before a bundled one.
-Each name both files declare answers one symbol, addressed at the module: its source, range, and
-documentation come from the module, and its signatures and types from the stub, with the stub's
-overload forms gathered into one `signatures` list.
-
-A declaration counts as public by its language's rule:
-
-- Rust - `pub` declarations, and the items of a `pub` trait and the variants of a `pub` enum
-- Python - names without a leading underscore
-- TypeScript - every member but `private` and `protected` ones
-- JavaScript - the declarations an `export` wraps or names, including `module.exports` and
-  `exports.name` assignments, and the members of an exported class other than a `#` private
-  element
-
-In a paired module the stub defines the public set, and a stub declaration with no implementation
-answers from the stub alone.
-
-Two publications are comparable by their own fields. `format_revision` states the shape;
-`analyzer_revision` is the digest of the analyzer manifest, which names each shipped grammar's
-version and checksum and the content digest of every source file that decides what a
-publication holds: all Rust source in `rift-core`, `rift-analysis`, `rift-index`, `rift-provider`,
-`rift-protocol`, `rift-ranking`, and `rift-syntax`, plus the history repository, MCP server and
-validation, and server read implementations.
-Every record - a source unit, a declaration, a search document - carries a digest over its own
-content, and the whole document renders as
-[RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) canonical JSON, so two runs over the same
-bytes under the same analyzer revision produce byte-identical output, and an adapter can compute
-added, replaced, and removed records by identity and digest alone. A publication addresses source
-by package-relative path and source unit, so no machine's directory layout reaches a consumer.
-
-The analyzer manifest is generated beside the served schemas and committed at
-`crates/rift-analysis/src/analyzer-manifest.json`, so a change to any of those files
-that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
-exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
 ## Language engines
 
@@ -1568,7 +1382,7 @@ changed files are owed than the record holds, the server replaces the session at
 instead, and the new session reads every file from disk.
 
 Each process has configured startup and request timeouts. The
-[`[lsp]`](/docs/developer/configuration#languages-and-lsp) configuration also bounds retries
+[`[lsp]`](/docs/configuration#languages-and-lsp) configuration also bounds retries
 and process replacements.
 
 LSP startup records `engine child spawned` with the child's `pid` and its piped `stdin`,
@@ -1586,4 +1400,4 @@ remains visible in the operations in flight.
 `rift.toml` at the workspace root is accepted at startup and re-accepted on change. Its schema
 is exported beside the MCP surface as [`rift.schema.json`](https://volar.sh/rift/rift.schema.json).
 A quantity value carries its unit: `timeout = "120s"`.
-The [configuration](/docs/developer/configuration) page states the keys and defaults.
+The [configuration](/docs/configuration) page states the keys and defaults.

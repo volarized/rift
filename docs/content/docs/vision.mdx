@@ -1,9 +1,11 @@
 ---
 title: Vision
+icon: Eye
 description: A new perspective to development lifecycle and codebase intelligence
 ---
 
-import { CodebaseIntelligence, CodebaseLanguages } from "@/components/codebase-intelligence";
+import { CodebaseIntelligence } from "@/components/codebase-intelligence";
+import { CodebaseLanguages } from "@/components/codebase-languages";
 import { VersionBadge } from "@/components/version-badge";
 
 ## Preface
@@ -44,8 +46,8 @@ So, after criticising every single available tool and approach, it's time to ans
 The main idea of Rift is to bring as much deterministic, fact-based (or fact-derived by a set of
 deterministic algorithms) introspection into source code as possible. We must therefore keep in
 mind that this information is split between the local index, which covers the project actively
-edited by agents, and the global index, which covers collected OSS packages. Both indexes use the
-same layers of intelligence outlined below.
+edited by agents, and the global index, which covers collected OSS packages. The local index uses the
+layers of intelligence outlined below.
 
 ## Concept
 
@@ -83,8 +85,6 @@ unnecessary context pollution. We primarily do this to ensure that if a language
 by Rift, it can still contribute (yet without any additional structural knowledge) to the signal
 that the agent might be looking for in the codebase.
 
-<VersionBadge version="v0.0.46" />
-
 Agents already write regular expressions for `grep` and ripgrep, so the local server answers
 them too. A trigram index over the text the local index stores selects the files a pattern's
 literals can occur in, and the pattern then checks those files, so a
@@ -117,7 +117,7 @@ Syntax tells us how code is constructed, but it doesn't tell us what names refer
 language engine concludes about them. That missing meaning belongs to semantics. In Rift today,
 semantic facts come through language engines.
 
-A [language engine](/docs/developer/configuration#languages-and-lsp) runs the language's own
+A [language engine](/docs/configuration#languages-and-lsp) runs the language's own
 analysis and returns facts the parse does not contain. Rift currently asks language engines for
 references, call hierarchy, and diagnostics through LSP.
 
@@ -131,8 +131,6 @@ configured language engines run as separate LSP processes.
 
 #### Relationship traversal [#relationship-graph]
 
-<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
-
 For reads over the local index, Rift supports incoming traversal within the current project. A
 language engine returns the source locations that reference the requested declaration, and syntax
 identifies the declaration containing each location. Together they establish a relationship from
@@ -141,7 +139,7 @@ each caller to the requested declaration for that read.
 At the next depth, each caller becomes the declaration whose references Rift requests. This gives
 Rift bounded traversal within the project without indexing every relationship in advance.
 
-<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> Outgoing
+Outgoing
 traversal walks the other way, from a declaration to the declarations it calls. Rift asks the
 engine for the declaration's
 [call hierarchy](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy),
@@ -156,15 +154,12 @@ between OSS packages, allowing similar traversal.
 
 ### Documentation
 
-<VersionBadge version="v0.0.44" />
-
 Documentation is another layer derived from the same source. As Rift runs syntax and semantic
 analysis, it can extract doc comments and documentation files together with the code, then
 associate that text with the declarations and packages it describes.
 
 The documentation carries the same revision and origin as the source it accompanies. Search and
-symbol lookup can return it together with the code, while the global index can run the same
-extraction once for each published package version.
+symbol lookup can return it together with the code.
 
 ## Revision and origin
 
@@ -178,10 +173,10 @@ Git supplies committed source along a file's first-parent history. Rift parses p
 the same syntax provider it uses for the working tree, allowing a declaration in the current code
 to be traced through its earlier states.
 
-<VersionBadge version="v0.0.46" inline /> Walking git on every read gets slower as history grows,
+Walking git on every read gets slower as history grows,
 so the local server analyzes past revisions ahead of time, in the background, into a history
 store. There is one store per repository, and every worktree of that repository reads it. The
-[`[providers.history]`](/docs/developer/configuration#providers) strategy decides which revisions
+[`[providers.history]`](/docs/configuration#providers) strategy decides which revisions
 the store holds:
 
 - `everything` - the newest first-parent commits of every worktree, 100 by default
@@ -191,11 +186,6 @@ The store fills at a bounded share of one core, and no request waits for it: whi
 read answers from what the store already holds.
 
 #### Symbol history
-
-<VersionBadge
-  version="v0.0.46"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
 
 A [symbol lookup with history](/docs/mcp#tool-get_symbol) follows a declaration through the
 revisions the history store holds, newest first. It shows changes to the declaration's body,
@@ -235,14 +225,14 @@ resolution.
 
 <CodebaseLanguages />
 
-Engine selection belongs to each [language identity](/docs/developer/configuration#languages-and-lsp).
+Engine selection belongs to each [language identity](/docs/configuration#languages-and-lsp).
 Several identities can share one named process. Available facts depend on the syntax provider and
 engine selected for that language.
 
 ## Index
 
-Rift uses two indexes: local and global. Both collect the same kinds of facts across the layers
-outlined above. They differ in which source they cover and where that analysis runs.
+The local index covers project source. The [global index](/global-index) supplies public declarations
+and documentation for OSS packages.
 
 ### Local
 
@@ -257,99 +247,22 @@ of the current project. The local server analyzes no package source itself. When
 is unavailable or holds no release of a dependency, the read still answers from project source,
 and a warning in the answer names the package facts it lacks.
 
-### Global <VersionBadge version="planned" inline />
+### Global
 
-The global index is a cached continuation of the local index. Rift populates it by applying the
-same layers of intelligence to collected OSS package versions. It holds facts about those packages
-and links between packages, so each local project does not have to reproduce the same analysis.
+The [Global Index](/global-index) API accepts package versions and returns public declarations
+and documentation. A local server supplies the project's dependency context with its requests.
 
-The global server exposes that index through two entrypoints. An agent connected directly over MCP
-can search and inspect the collected OSS packages. A local Rift server reaches it through an API,
-and the global server answers using the package context supplied by that project.
+<VersionBadge version="planned" inline /> Direct MCP access exposes package reads to agents.
+The [MCP tab](/global-index) provides a client for sending requests when an endpoint is available.
 
 ## Search
 
-The local server processes and indexes project source on the user's machine. The global service
-does not process or index that source. <VersionBadge version="planned" inline /> Global search
-uses a separate index of collected OSS package versions.
+When an agent doesn't know which declaration it needs, [`search`](/docs/mcp#tool-search)
+finds relevant code and documentation. Rift matches names and text, so `loadConfig` can find
+`load_config`. Optional vector search also matches descriptions of behavior, such as
+"read project settings from disk", and Rift combines the matches into one ranked answer.
 
-### Local ranking
-
-<VersionBadge
-  version="v0.0.9"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
-The local baseline combines identifier-aware matching with a
-[SQLite FTS5](https://www.sqlite.org/fts5.html) index over declaration names and the text of the
-indexed files, which the index stores once. FTS5 ranks matching units with BM25.
-
-<VersionBadge
-  version="v0.0.16"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
-Local search can add optional vector search to this baseline. The reviewed local model families
-are:
-
-- Model2Vec retrieval models, including the default `minishlab/potion-retrieval-32M`
-- BGE retrieval models that use Rift's supported BERT configuration and query contract, including
-  `BAAI/bge-small-en-v1.5`
-
-Rift can download supported model weights from Hugging Face or read them from a configured
-workspace directory. Both paths execute the model inside the local server, so neither path sends
-project text to an embedding service.
-
-<VersionBadge
-  version="v0.0.39"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
-The full-text index covers more of a declaration than its name and its source: the name, the
-qualified name, the identifier words those two split into, the rendered signature, the attached
-documentation, the declaration's own source, and the text of a selected file, each weighted so a
-name outranks a body. An answer states which of them carried the term.
-
-Identifier matching, full-text matching, and vector similarity now rank one query together,
-rather than answering as lanes in turn. They score in units nothing converts between, so Rift
-reads the position each puts a result in and combines those by weighted reciprocal rank.
-[`[search.ranking]`](/docs/developer/configuration#search) carries `identifier_weight`,
-`lexical_weight`, `vector_weight`, and `fusion_k`. Only the rankings that answered take part, so
-a vector index still building changes no order.
-
-An OpenAI-compatible embedding endpoint adds optional remote embedding execution, configured
-through [`[search.vector.embedding]`](/docs/developer/configuration#search) with the credential
-read from the environment variable `api_key_env` names. Endpoint execution is explicit because it
-sends declaration text while building vectors and query text while searching, which is the one
-path that takes project text off the machine.
-
-Rift supports these local model families and OpenAI-compatible embedding endpoints. Hugging Face
-repository support does not mean that Rift can execute every model in that repository. Other model
-families, including Qwen3 embeddings, require a separate reviewed local runtime.
-
-### Global ranking
-
-<VersionBadge version="v0.0.43" />
-
-The global server ranks facts from collected OSS package versions. A local server supplies the
-resolved package versions for its project, which keeps the remote answer within the dependencies
-that project can use.
-
-The local and global rankings do not need the same embedding model. Each index ranks its own
-corpus, then Rift merges their ranks rather than comparing their model-specific scores.
-
-### Query routing
-
-<VersionBadge version="v0.0.43" />
-
-The request's `scope` follows the two-index model:
-
-- `local`, the default, searches the local index
-- `global` searches package facts within the project's resolved package versions
-- `all` searches project and package facts and merges the ranked results
-
-<VersionBadge version="v0.0.46" />
-
-A read can also name package versions of its own through [`packages`](/docs/mcp#search-scope),
-such as an upgrade target or a package the project does not use yet. The global index then
-answers for those versions in place of, or beside, the ones the project resolves.
+Project search runs on the local server, but can also include dependencies from the global index
+if the search parameter [`scope`](/docs/mcp#search-scope) is set to `global` or `all`. An optional,
+explicitly configured [remote endpoint](/docs/configuration#search) can be added to add vector
+search capabilities if necessary.

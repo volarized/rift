@@ -1,5 +1,4 @@
 import {
-  AsteriskIcon,
   BracketsCurlyIcon,
   ClockCounterClockwiseIcon,
   CpuIcon,
@@ -8,22 +7,21 @@ import {
   GraphIcon,
   HardDrivesIcon,
   MagnifyingGlassIcon,
-  PlugsConnectedIcon,
   RankingIcon,
+  TerminalIcon,
   TextTIcon,
 } from "@phosphor-icons/react/ssr";
 import type { ReactNode } from "react";
-
 import { FlatDiagram } from "@/components/flat-diagram";
-import { Badge } from "@/components/ui/badge";
+import { McpIcon } from "@/components/mcp-icon";
 import { HuggingFace } from "@/components/ui/svgs/huggingFace";
 import { Openai } from "@/components/ui/svgs/openai";
 
 const CHART = `
   flowchart BT
-    subgraph surface["MCP entrypoints"]
+    local_agent["Local agent"]
+    subgraph surface["MCP entrypoint"]
       local_mcp["Local server<br/>Project reads"]
-      global_mcp["Global server<br/>Direct MCP"]
     end
 
     subgraph local["Local index"]
@@ -40,16 +38,8 @@ const CHART = `
       local_ranking["Ranking<br/>Weighted reciprocal rank fusion"]
     end
 
-    subgraph global["Global index"]
-      global_source["OSS package versions"]
-      global_text["Text"]
-      global_syntax["Syntax"]
-      global_semantics["Semantics<br/>Package relationships"]
-      global_documentation["Documentation"]
-      global_context["Revision + origin"]
-      global_search["FTS + vector<br/>(hybrid)"]
-      global_ranking["Ranking"]
-    end
+
+    global_index["Global Index"]
 
     local_source --> local_text --> local_syntax --> local_semantics
     local_syntax --> local_documentation
@@ -63,80 +53,45 @@ const CHART = `
     local_search --> local_ranking
     local_ranking -->|local| local_mcp
 
-    global_source --> global_text --> global_syntax --> global_semantics
-    global_syntax --> global_documentation
-    global_source --> global_context
-    global_text --> global_search
-    global_semantics --> global_search
-    global_documentation --> global_search
-    global_context --> global_search
-    global_search --> global_ranking
-    global_ranking --> global_mcp
-    global_ranking -. "API · global / all · project package context" .-> local_mcp
+    local_mcp -- "MCP · project reads" --> local_agent
+    local_mcp -. "API · package context only" .-> global_index
 `;
 
-function Logo({ name, size = 24 }: { name: string; size?: number }) {
-  return (
-    <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true">
-      <image
-        href={`${process.env.NEXT_PUBLIC_BASE_PATH ?? ""}/icons/svgl/${name}.svg`}
-        width="24"
-        height="24"
-        className={
-          name === "javascript" || name === "typescript" ? "grayscale" : "brightness-0 dark:invert"
-        }
-      />
-    </svg>
-  );
-}
-
 const ICONS: Record<string, ReactNode> = {
-  local_mcp: <Logo name="mcp" />,
-  global_mcp: <Logo name="mcp" />,
+  local_mcp: <McpIcon size={24} aria-hidden="true" />,
+  local_agent: <TerminalIcon size={24} weight="light" />,
   local_source: <HardDrivesIcon size={24} />,
-  global_source: <GlobeHemisphereWestIcon size={24} />,
+  global_index: <GlobeHemisphereWestIcon size={24} />,
   local_text: <TextTIcon size={24} />,
-  global_text: <TextTIcon size={24} />,
   local_syntax: <BracketsCurlyIcon size={24} />,
-  global_syntax: <BracketsCurlyIcon size={24} />,
   local_semantics: <GraphIcon size={24} />,
-  global_semantics: <GraphIcon size={24} />,
   local_documentation: <FileTextIcon size={24} />,
-  global_documentation: <FileTextIcon size={24} />,
   local_context: <ClockCounterClockwiseIcon size={24} />,
-  global_context: <ClockCounterClockwiseIcon size={24} />,
   local_fts: <TextTIcon size={24} />,
   local_vector: <GraphIcon size={24} />,
   local_embeddings: <CpuIcon size={24} />,
   local_search: <MagnifyingGlassIcon size={24} />,
-  global_search: <MagnifyingGlassIcon size={24} />,
   local_ranking: <RankingIcon size={24} />,
-  global_ranking: <RankingIcon size={24} />,
 };
 
 export function CodebaseIntelligence() {
   return (
     <section aria-label="Codebase intelligence" className="not-prose my-10">
-      <div className="border-b border-border pb-4 font-mono text-xs text-muted-foreground">
-        <span>Overview</span>
-      </div>
       <FlatDiagram
+        title="Codebase intelligence"
         chart={CHART}
-        alt="The local index applies text, syntax, semantics, planned documentation, revision, and origin to the current project. Hybrid local search indexes names, signatures, documentation, and file content for full-text search, and qualified names with declaration source for vector search. Identifier, BM25, and vector results enter weighted reciprocal rank fusion. Embeddings can come from Hugging Face, a workspace directory, or a planned OpenAI-compatible endpoint. Planned global search combines full-text and vector search, with ranking details still to be defined. The local server exposes local, global, and all search scopes, while the planned global server also provides direct MCP access."
+        alt="The local index applies text, syntax, semantics, documentation, revision, and origin to the current project. Hybrid local search indexes names, signatures, documentation, and file content for full-text search, and qualified names with declaration source for vector search. Identifier, BM25, and vector results enter weighted reciprocal rank fusion. Embeddings can come from Hugging Face, a workspace directory, or an OpenAI-compatible endpoint. A local agent reads project facts through the local server. The Global Index supplies public package facts through a separate API request carrying package context only. The local server exposes local, global, and all search scopes."
         variant="soft"
+        cards={{
+          local_agent: {
+            icon: TerminalIcon,
+            description: "The agent reads project facts through MCP.",
+            address: "MCP",
+            owner: "Agent",
+          },
+          global_index: { icon: GlobeHemisphereWestIcon, dashed: true },
+        }}
         icons={ICONS}
-        nodeBadges={{
-          global_mcp: "Planned",
-          local_documentation: "Planned",
-          global_documentation: "Planned",
-          global_search: "Planned",
-          global_ranking: "Planned",
-        }}
-        groupBadges={{ global: "Planned" }}
-        connectorRoutes={{
-          "global_ranking->global_mcp": { from: "top", to: "bottom" },
-          "global_ranking->local_mcp": { from: "left", to: "right" },
-        }}
         nodePanels={{
           local_embeddings: {
             title: "Embedding",
@@ -152,7 +107,6 @@ export function CodebaseIntelligence() {
               },
               {
                 label: "OpenAI-compatible",
-                badge: "Planned",
                 icon: (
                   <Openai width="100%" height="100%" className="dark:invert" aria-hidden="true" />
                 ),
@@ -173,151 +127,5 @@ export function CodebaseIntelligence() {
         className="mx-auto my-8"
       />
     </section>
-  );
-}
-
-const CAPABILITY_ICONS = {
-  Text: <TextTIcon size={14} />,
-  Syntax: <BracketsCurlyIcon size={14} />,
-  LSP: <PlugsConnectedIcon size={14} />,
-  ty: <CpuIcon size={14} />,
-} satisfies Record<string, ReactNode>;
-
-type Capability = keyof typeof CAPABILITY_ICONS;
-
-interface LanguageSummary {
-  name: string;
-  logos: string[];
-  icon?: ReactNode;
-  local: Capability[];
-  global?: Capability[];
-  description: string;
-  wide?: boolean;
-}
-
-const LANGUAGES: LanguageSummary[] = [
-  {
-    name: "Any language",
-    logos: [],
-    icon: <AsteriskIcon size={24} />,
-    local: ["Text", "LSP"],
-    description:
-      "Every visible UTF-8 file can participate in local text search. Any configured language identity can start an LSP process, but structured declarations and relationship traversal still require a shipped syntax provider.",
-    wide: true,
-  },
-  {
-    name: "Rust",
-    logos: ["rust"],
-    local: ["Syntax", "LSP"],
-    global: ["Syntax", "LSP"],
-    description:
-      "tree-sitter extracts declarations. A configured rust-analyzer supplies incoming references on request.",
-  },
-  {
-    name: "Python",
-    logos: ["python"],
-    local: ["Syntax", "ty"],
-    global: ["Syntax", "ty"],
-    description:
-      "tree-sitter extracts declarations. The embedded ty engine supplies references through the same LSP session contract used by external language engines.",
-  },
-  {
-    name: "JavaScript / TypeScript",
-    logos: ["javascript", "typescript"],
-    local: ["Syntax", "LSP"],
-    global: ["Syntax", "LSP"],
-    description:
-      "Separate syntax providers parse JavaScript, TypeScript, and TSX. Each language identity selects its engine; TypeScript and TSX can share a named typescript-language-server process.",
-  },
-  {
-    name: "HTML / CSS / Vue / Svelte / Angular",
-    logos: [],
-    local: ["Syntax", "LSP"],
-    global: ["Syntax", "LSP"],
-    description:
-      "Syntax providers preserve templates, styles, and embedded JavaScript or TypeScript ranges. Angular template ownership follows component declarations or explicit configuration. Tailwind context publishes authored utilities and variants; dynamic expressions retain source facts and warnings. Compiler resolution remains separate.",
-  },
-  {
-    name: "C / C++ / Cython",
-    logos: [],
-    local: ["Syntax", "LSP"],
-    global: ["Syntax", "LSP"],
-    description:
-      "Syntax providers extract native declarations and include syntax. The .h extension selects C by default; C++ headers require explicit language selection. Cython keeps its own source identity for .pyx, .pxd, and .pxi files.",
-  },
-  {
-    name: "Markdown / JSON / JSONC / YAML / TOML",
-    logos: [],
-    local: ["Syntax"],
-    global: ["Syntax"],
-    description:
-      "Syntax providers extract document structure and declarations, so documentation and configuration can participate in structured reads alongside program source.",
-  },
-];
-
-function CapabilityTags({ capabilities }: { capabilities: Capability[] }) {
-  return (
-    <div className="flex flex-wrap gap-2">
-      {capabilities.map((capability) => (
-        <Badge
-          key={capability}
-          variant="outline"
-          className="gap-1.5 rounded-md font-mono text-[10px]"
-        >
-          {CAPABILITY_ICONS[capability]}
-          {capability}
-        </Badge>
-      ))}
-    </div>
-  );
-}
-
-export function CodebaseLanguages() {
-  return (
-    <div className="not-prose my-8 grid gap-4 lg:grid-cols-2">
-      {LANGUAGES.map((language) => (
-        <section
-          key={language.name}
-          className={`rounded-xl border border-border bg-muted/30 px-6 py-4 ${language.wide ? "lg:col-span-2" : ""}`}
-        >
-          <div className="mb-2 flex items-center gap-3">
-            {language.logos.length ? (
-              <div className="flex shrink-0 gap-2">
-                {language.logos.map((logo) => (
-                  <Logo key={logo} name={logo} />
-                ))}
-              </div>
-            ) : (
-              <span className="shrink-0" aria-hidden="true">
-                {language.icon ?? <FileTextIcon size={24} />}
-              </span>
-            )}
-            <h3 className="text-sm font-medium">{language.name}</h3>
-          </div>
-          <div className="mb-3 grid gap-1.5">
-            <div className="flex flex-wrap items-center gap-3">
-              <div className="flex min-w-20 items-center gap-2 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                <HardDrivesIcon size={14} />
-                Local:
-              </div>
-              <CapabilityTags capabilities={language.local} />
-            </div>
-            {language.global ? (
-              <div className="flex flex-wrap items-center gap-3">
-                <div className="flex min-w-20 items-center gap-2 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
-                  <GlobeHemisphereWestIcon size={14} />
-                  Global:
-                </div>
-                <CapabilityTags capabilities={language.global} />
-                <Badge variant="secondary" className="rounded-sm px-1.5 py-0 text-[9px]">
-                  Planned
-                </Badge>
-              </div>
-            ) : null}
-          </div>
-          <p className="text-sm leading-relaxed text-muted-foreground">{language.description}</p>
-        </section>
-      ))}
-    </div>
   );
 }

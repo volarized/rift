@@ -1,14 +1,11 @@
-import {
-  BracketsCurlyIcon,
-  PlugsConnectedIcon,
-  TextAlignLeftIcon,
-} from "@phosphor-icons/react/ssr";
+import { BracketsCurlyIcon, TextAlignLeftIcon } from "@phosphor-icons/react/ssr";
 import { Tabs, TabsList, TabsTrigger } from "fumadocs-ui/components/tabs";
 import type { ReactNode } from "react";
+import { McpIcon } from "@/components/mcp-icon";
 
 // The views one example can show, with the title and icon of each tab.
 const views = {
-  call: { label: "MCP call", icon: PlugsConnectedIcon },
+  call: { label: "MCP call", icon: McpIcon },
   text: { label: "Text response", icon: TextAlignLeftIcon },
   json: { label: "JSON response", icon: BracketsCurlyIcon },
 } as const;

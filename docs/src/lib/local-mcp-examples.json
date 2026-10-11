@@ -1,0 +1,95 @@
+{
+  "schema_sha256": "b0d05f97729b1e1140a4292e871c4a1a282dcd5004219c50d320e9857a2aed78",
+  "tools": {
+    "get_symbol": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "1 result\n\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\tsrc/config.rs:10\n\trift://symbol/local/rust/app/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\thistory:\n\t\t2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>\n\t\t\tReturn ConfigError from load_config\n\t\t2026-08-17 · 82590265 · introduced · Alice <alice@example.com>\n\t\t\tAdd workspace configuration loading\n\n\t/// Loads the workspace configuration from `rift.toml`.\n\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t    let text = std::fs::read_to_string(path)?;\n\t    parse_config(&text)\n\t}\n"
+          }
+        ]
+      }
+    ],
+    "nodes": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "5 nodes\n\t[1] source_file · 14 lines\n\t\trift://node/rust/src/config.rs@0-356#dcbef6dd\n\t[2] function_item · 4 lines\n\t\trift://node/rust/src/config.rs@218-355#67ecfb36\n\t\trift://symbol/rust/src/config.rs/load_config\n\t\tname 225..236 · body 281..355\n\t[3] block · 4 lines\n\t\trift://node/rust/src/config.rs@281-355#4e554fa8\n\t[4] call_expression\n\t\trift://node/rust/src/config.rs@334-353#4df4426e\n\t[5] identifier\n\t\trift://node/rust/src/config.rs@334-346#03f22dac\n\n\t\tparse_config\n"
+          }
+        ]
+      }
+    ],
+    "search": [
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "2 results · page 1/3\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 · name\n\t\trift://symbol/local/rust/app/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] src/lib.rs:7 · content\n\t\t    let config = load_config(&arguments.path)?;\n"
+          }
+        ]
+      },
+      {
+        "content": [
+          {
+            "type": "text",
+            "text": "1 result\n\t9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00\n\tBound comparisons at 512 changed paths\n\n\tA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n\n\t2 paths:\n\t\tcrates/rift-protocol/src/search.rs\n\t\tcrates/rift-server/src/change.rs\n"
+          }
+        ]
+      }
+    ]
+  },
+  "resources": [
+    {
+      "name": "workspace",
+      "title": "Workspace",
+      "uri": "rift://workspace",
+      "description": "The server's effective language configuration, with one page of the captured source catalog.",
+      "mimeType": "application/json",
+      "examples": [
+        {
+          "contents": [
+            {
+              "uri": "rift://workspace",
+              "mimeType": "text/plain",
+              "text": "workspace 3f9a1c2e\nlanguages:\n\ttypescript:tsx · syntax · lsp typescript:tsx ready\n\t\tinclude src/**/*.tsx\n\t\texclude src/generated/**\nsource:\n\tsrc/view.tsx · typescript:tsx · 8a4d20bc\n"
+            },
+            {
+              "uri": "rift://workspace",
+              "mimeType": "application/json",
+              "text": "{\n  \"configuration_revision\": \"3f9a1c2e\",\n  \"languages\": [\n    {\n      \"enabled\": true,\n      \"exclude\": [\n        \"src/generated/**\"\n      ],\n      \"execution\": false,\n      \"include\": [\n        \"src/**/*.tsx\"\n      ],\n      \"language\": \"typescript:tsx\",\n      \"lsp\": {\n        \"process\": \"typescript:tsx\",\n        \"state\": \"ready\"\n      },\n      \"syntax\": true\n    }\n  ],\n  \"pagination\": {\n    \"page_index\": 0,\n    \"total_pages\": 1\n  },\n  \"source\": [\n    {\n      \"digest\": \"8a4d20bc\",\n      \"language\": \"typescript:tsx\",\n      \"path\": \"src/view.tsx\"\n    }\n  ]\n}"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "map",
+      "title": "Workspace map",
+      "uri": "rift://map",
+      "description": "Workspace orientation snapshot, computed once per index publication and served from cache. Carries language totals, the module tree, the most-referenced symbols, entry points, and documentation paths.",
+      "mimeType": "application/json",
+      "examples": [
+        {
+          "contents": [
+            {
+              "uri": "rift://map",
+              "mimeType": "application/json",
+              "text": "{\n  \"revision\": \"3f9a1c2e\",\n  \"languages\": [\n    {\n      \"language\": \"rust\",\n      \"files\": 191,\n      \"symbols\": 3204\n    }\n  ],\n  \"modules\": [\n    {\n      \"path\": \"crates\",\n      \"files\": 191,\n      \"symbols\": 3204,\n      \"children\": [\n        {\n          \"path\": \"crates/rift-server\",\n          \"files\": 16,\n          \"symbols\": 418\n        }\n      ]\n    }\n  ],\n  \"entry_points\": [\n    \"rift://symbol/rust/crates/rift/src/main.rs/main\"\n  ],\n  \"docs\": [\n    \"README.md\"\n  ],\n  \"packages\": [\n    {\n      \"manager\": \"cargo\",\n      \"name\": \"tokio\",\n      \"version\": \"1.53.1\",\n      \"availability\": \"canonical\"\n    },\n    {\n      \"manager\": \"stdlib\",\n      \"name\": \"rust\",\n      \"version\": \"1.98.1\",\n      \"availability\": \"canonical\"\n    }\n  ],\n  \"pagination\": {\n    \"page_index\": 0,\n    \"total_pages\": 1\n  }\n}"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "resourceTemplates": [
+    {
+      "name": "workspace-page",
+      "title": "Workspace page",
+      "uriTemplate": "rift://workspace{?page_index}",
+      "description": "One page of the workspace resource, selected by zero-based `page_index`.",
+      "mimeType": "application/json"
+    }
+  ]
+}

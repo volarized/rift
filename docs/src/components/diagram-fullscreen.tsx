@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
  * button to frame the whole drawing again.
  */
 export type DiagramFullscreenProps = {
+  title: string;
   children: React.ReactNode;
   className?: string;
 };
@@ -29,7 +30,7 @@ const MAX_SCALE = 8;
 /** How much one press of a zoom button changes the scale. */
 const STEP = 1.4;
 
-export function DiagramFullscreen({ children, className }: DiagramFullscreenProps) {
+export function DiagramFullscreen({ title, children, className }: DiagramFullscreenProps) {
   const [open, setOpen] = useState(false);
   const [view, setView] = useState<View>(FIT);
   const host = useRef<HTMLDivElement>(null);
@@ -121,28 +122,29 @@ export function DiagramFullscreen({ children, className }: DiagramFullscreenProp
         if (next) setView(FIT);
       }}
     >
-      <figure className={cn("my-8 min-w-0", className)}>
-        <Dialog.Trigger
-          render={
-            <button
-              type="button"
-              aria-label="Open the diagram in fullscreen"
-              className="group relative block w-full cursor-zoom-in"
-            />
-          }
-        >
-          {children}
-          <span className="absolute right-2 top-2 grid size-6 place-items-center border border-border bg-background text-muted-foreground opacity-60 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+      <figure className={cn("not-prose my-8 min-w-0", className)}>
+        <figcaption className="mb-5 flex items-center justify-between gap-2 border-b border-border pb-3 font-mono text-xs text-muted-foreground">
+          <span>{title}</span>
+          <Dialog.Trigger
+            render={
+              <button
+                type="button"
+                aria-label={`Open ${title} in fullscreen`}
+                className="grid size-6 cursor-zoom-in place-items-center text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+              />
+            }
+          >
             <Maximize2 className="size-3" aria-hidden="true" />
-          </span>
-        </Dialog.Trigger>
+          </Dialog.Trigger>
+        </figcaption>
+        {children}
       </figure>
       <Dialog.Portal>
         <Dialog.Backdrop className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm" />
         <Dialog.Viewport className="fixed inset-0 z-[60] flex p-2 sm:p-4">
           <Dialog.Popup className="flex min-h-0 w-full flex-col overflow-hidden border border-border bg-background shadow-2xl outline-none">
             <div className="flex shrink-0 items-center justify-between border-b border-border px-3 py-2">
-              <Dialog.Title className="font-mono text-sm font-medium">Diagram</Dialog.Title>
+              <Dialog.Title className="font-mono text-sm font-medium">{title}</Dialog.Title>
               <div className="flex items-center gap-1">
                 <Button
                   variant="ghost"
@@ -192,7 +194,7 @@ export function DiagramFullscreen({ children, className }: DiagramFullscreenProp
               onDoubleClick={() => setView(FIT)}
             >
               <div
-                className="pointer-events-none absolute inset-0 select-none p-4 [&_svg]:h-full [&_svg]:w-full"
+                className="pointer-events-none absolute inset-0 select-none p-4 [&>svg]:h-full [&>svg]:w-full"
                 style={{
                   transform: `translate(${view.x}px, ${view.y}px) scale(${view.scale})`,
                   transformOrigin: "0 0",

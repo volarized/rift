@@ -3,6 +3,7 @@ import { DocsBody, DocsDescription, DocsPage, DocsTitle } from "fumadocs-ui/page
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { BackToTop } from "@/components/back-to-top";
+import { getDocsIcon } from "@/lib/docs-icons";
 import { source } from "@/lib/source";
 import { getMDXComponents } from "@/mdx-components";
 
@@ -28,7 +29,10 @@ export default async function Page(props: PageProps<"/docs/[[...slug]]">) {
           : { enabled: true, component: <></> }
       }
     >
-      <DocsTitle>{page.data.title}</DocsTitle>
+      <DocsTitle className="flex items-center gap-3">
+        {getDocsIcon(page.data.icon, 28)}
+        {page.data.title}
+      </DocsTitle>
       <DocsDescription>{page.data.description}</DocsDescription>
       <DocsBody>
         <MDXContent

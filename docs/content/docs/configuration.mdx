@@ -1,8 +1,7 @@
 ---
 title: Configuration
+icon: Gear
 ---
-
-<VersionBadge version="v0.0.5" />
 
 Rift reads `rift.toml` from the workspace root. The generated
 [`rift.schema.json`](https://volar.sh/rift/rift.schema.json)
@@ -26,8 +25,6 @@ show those defaults; the stated ranges are the supported bounds, so a limit can 
 raised within its range. A value outside that range fails configuration validation.
 
 ## Environment variables
-
-<VersionBadge version="v0.0.44" />
 
 A CI job or a container often needs one bound raised without editing the workspace's
 `rift.toml`. Every key has an environment variable for that: `RIFT_`, then the key's path with
@@ -55,8 +52,6 @@ The server reads the variables from the environment of the `rift server start` o
 that started it. A running server keeps that environment, so a changed variable applies after
 `rift server stop` and the next start.
 
-<VersionBadge version="v0.0.46" />
-
 A `[languages.<name>]` entry for a language Rift ships takes variables too, spelled
 `RIFT_LANGUAGES_<NAME>_<KEY>`: `RIFT_LANGUAGES_PYTHON_STDLIB=false` sets the `stdlib` key of
 `[languages.python]`. A dialect's `:` becomes `_`, so `RIFT_LANGUAGES_TYPESCRIPT_TSX_<KEY>` sets a
@@ -64,8 +59,6 @@ key of `[languages."typescript:tsx"]`, such as `RIFT_LANGUAGES_TYPESCRIPT_TSX_ST
 naming a language Rift doesn't ship fails with `configuration_invalid`, as a misspelled key does.
 
 ## Server
-
-<VersionBadge version="v0.0.8" />
 
 `server` bounds the server's own blocking work - the filesystem scans and parses behind reads,
 and index rebuilds:
@@ -96,10 +89,8 @@ The worker pool exists before the first request, so the server sizes it once at 
 change to this table applies on the next start, while every other table applies to later
 requests as soon as the file is accepted.
 
-<VersionBadge version="v0.0.47" />
-
 Initial source preparation runs in the background. A local read can return prepared files with
-[`local_index_preparing`](/docs/developer/protocol/mcp#reads); a targeted `nodes` read spends
+[`local_index_preparing`](/docs/developer/mcp#reads); a targeted `nodes` read spends
 its remaining `readiness_timeout` budget preparing the requested file. The warning reports
 incomplete source independently of lexical and vector readiness.
 
@@ -132,8 +123,6 @@ also selects a workspace server. Existing connections retain their startup setti
 
 ## Logs
 
-<VersionBadge version="v0.0.22" />
-
 `logs` bounds what the server records about itself. Diagnostics admitted by `capture` enter a
 bounded queue and land in the metrics database at `.rift/metrics`. `rift server logs` reads
 those records directly, with or without a running server:
@@ -162,12 +151,12 @@ stderr_limit = "1mb"
 - `capture` selects which targets are recorded, in the `RUST_LOG` spelling `tracing` takes -
   `rift_mcp=debug` records the index lane's own rebuild decisions. A target this filter
   excludes never reaches the store, whatever the terminal shows
-- `stall_delay` <VersionBadge version="v0.0.62" inline /> is how long an operation, lock wait, or held lock stays open before the server
+- `stall_delay` is how long an operation, lock wait, or held lock stays open before the server
   reports it, 1s to 1h. The server checks every quarter of the delay, and at least every 5s, and
   reports each such entry once, in one record of the operations in flight with their age, so a
   request that runs out its deadline leaves the work it waited on in the store. A lock the server
   keeps for as long as it runs is never reported
-- `stderr_limit` <VersionBadge version="v0.0.62" inline /> is how many bytes a foreground server writes to a standard error that
+- `stderr_limit` is how many bytes a foreground server writes to a standard error that
   is not a terminal, 1kb to 1gb. Past it the server prints one notice there and discards the
   rest, counting the discarded bytes in `log.stderr.discarded`; the store keeps every record
   `capture` admits either way. The server's stop records the count as
@@ -179,8 +168,6 @@ index, so a workspace whose index will not settle, or whose index database anoth
 holds locked, still answers `rift server logs`.
 
 ## Source
-
-<VersionBadge version="v0.0.6" />
 
 `source` controls which files below the workspace root the index and reads consider visible.
 `include` and `exclude` take exact project-relative paths or globs, matched the same way
@@ -245,8 +232,6 @@ reach one such file on demand, through the request-side `force_include` override
 into one answer, while this table's `force_include` puts them in the index every read serves from.
 
 ## Documentation
-
-<VersionBadge version="v0.0.46" />
 
 `documentation` describes which documentation files the index collects for
 [`search`](/docs/mcp#tool-search) with `target: "documentation"` and for the `documentation`
@@ -334,8 +319,6 @@ RIFT_DOCUMENTATION_MAX_FILE=16mb RIFT_DOCUMENTATION_MAX_NODES=5000000 rift serve
 ```
 
 ## Dependencies
-
-<VersionBadge version="v0.0.39" languages={["Rust", "Python", "TypeScript"]} />
 
 `dependencies` shapes the [dependency context](/docs/developer/architecture#dependency-context) a
 `global` or `all` read sends to the global index: which packages you name beside the ones the
@@ -486,8 +469,6 @@ so raising a publication limit does not raise archive admission.
 
 ## Global
 
-<VersionBadge version="v0.0.43" />
-
 `global` controls package reads through the configured REST API. The local server creates this
 client on the first `global` or `all` read that can return package declarations.
 
@@ -549,8 +530,6 @@ repository, a private registry, or a URL - never reaches the global API and repo
 
 ## Languages and LSP
 
-<VersionBadge version="v0.0.25" />
-
 An exact language entry connects visible paths to shipped syntax and an optional LSP process. Its key is a language name, or `name:dialect` for an exact dialect:
 
 ```toml
@@ -584,8 +563,6 @@ matches from the effective list. `enabled` defaults to `true`, `exclude` default
 and `lsp` is absent by default. A bare language and each of its dialect entries are independent.
 `enabled = false` turns off syntax and LSP service for paths the entry matches.
 
-<VersionBadge version="v0.0.66" languages={["HTML", "CSS", "Vue", "Svelte", "Angular", "C", "C++", "Cython", "JSONC"]} />
-
 Shipped providers select `.html`, `.htm`, `.css`, `.vue`, `.svelte`, `.c`, C++ source and header
 extensions, `.pyx`, `.pxd`, `.pxi`, and `.jsonc`. Extension selection ignores ASCII case;
 configured path patterns retain their own matching rules. Rift selects C for `.h` files by
@@ -618,8 +595,6 @@ published revision keeps serving.
 A visible file no language claims remains available to generic reads, and joins lexical search as
 plain text when `[search.text].include` selects it. So does a file whose entry is disabled, or
 whose language ships no grammar: what those entries drop is syntax analysis, not the file.
-
-<VersionBadge version="v0.0.46" languages={["Rust", "JavaScript", "TypeScript", "Python"]} />
 
 `stdlib` decides whether the [dependency context](/docs/developer/architecture#standard-libraries)
 names the language's standard library, so a `global` or `all` read can answer for it:
@@ -660,8 +635,6 @@ command = ["node_modules/.bin/typescript-language-server", "--stdio"]
 [lsp.typescript.initialization_options.tsserver]
 useSyntaxServer = "never"
 ```
-
-<VersionBadge version="v0.0.31" languages={["Python"]} />
 
 An entry may select the embedded engine instead of a spawned command. The build links the
 engine in, so nothing is installed or started beside the server:
@@ -780,11 +753,6 @@ byte bound. Any workspace with an installed package directory needs the same ent
 
 ## Providers
 
-<VersionBadge
-  version="v0.0.7"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
-
 The built-in providers run without configuration; the `providers` table exists to bound or
 disable them:
 
@@ -803,8 +771,6 @@ cpu_share = 0.25
 [change comparison](/docs/mcp#search-change), and a [commit search](/docs/mcp#search-commits)
 with `capability_unavailable`. A workspace without version control cannot serve those reads
 whatever this table says.
-
-<VersionBadge version="v0.0.46" />
 
 The history provider fills the [history store](/docs/developer/architecture#history) in the
 background, and the configuration allows you to describe:
@@ -830,8 +796,6 @@ A fill waits a bounded time for the server to run no request before each batch, 
 on the next start. The store keeps one file per server build and strategy, so changing `strategy`
 or `releases` fills a new store file.
 
-<VersionBadge version="v0.0.44" />
-
 A syntax provider's cost grows with the source it parses, so `[providers.syntax]` bounds each
 source every syntax provider takes:
 
@@ -851,8 +815,6 @@ generated file of deeply nested literals answers no [`search`](/docs/mcp#tool-se
 every other file still does. The server records each such file under
 `rift server logs --component index`, with the path and the bound it crossed; raise that key to
 index the file.
-
-<VersionBadge version="v0.0.66" languages={["Angular", "Tailwind"]} />
 
 Framework context is separate from language selection. Angular component imports establish
 ownership for literal inline and external templates; Tailwind requires a captured package
@@ -891,15 +853,11 @@ in `warnings` naming the two tree revision digests.
 
 ## Search
 
-<VersionBadge version="v0.0.9" />
-
 [`search`](/docs/mcp#tool-search) runs on a lexical index. `[search.text]` selects the
 plain-text files that join it through `include` and bounds their chunks. The lexical index
 lives in the index database at `.rift/index`, and the vector ranking's rows in the vectors
 database at `.rift/vectors`. `pool_slots`, `busy_timeout`, and `journal_size_limit` bound each
 of the two on its own, and writes to one wait for that database's turn alone.
-
-<VersionBadge version="v0.0.25" />
 
 A visible file joins the lexical index through its effective language entry, or through
 `[search.text].include` when no language claims it. Documentation collection also selects visible
@@ -943,12 +901,10 @@ journal_size_limit = "64mb"
 - `busy_timeout` bounds how long a read or write waits for one of those connections to come
   free, and how long a connection waits for a database lock held by another process before
   failing with `SQLITE_BUSY`, 100ms to 30s
-- `journal_size_limit` <VersionBadge version="v0.0.62" inline /> bounds the size the write-ahead log of the index database, and
+- `journal_size_limit` bounds the size the write-ahead log of the index database, and
   separately of the vectors database, is cut back to at the commit that restarts it after a
   checkpoint, 0b to 64gb, default `64mb`. A transaction larger than the limit still grows the
   log past it until that commit
-
-<VersionBadge version="v0.0.46" />
 
 `large_files` decides what search does with a file whose text runs past `max_chunk`, and
 `excluded_lockfiles` names the lockfiles search leaves out:
@@ -976,7 +932,7 @@ A lockfile search leaves out answers no search and no symbol lookup, while
 `paths.include` selects one warns `lockfile_excluded`, and naming it in `paths.force_include`
 searches it for one request.
 
-A regex [`pattern`](/docs/developer/protocol/mcp#search-pattern) search runs under four `[search]`
+A regex [`pattern`](/docs/developer/mcp#search-pattern) search runs under four `[search]`
 keys:
 
 ```toml
@@ -999,11 +955,6 @@ A search that would pass one of the first three refuses naming the key. A file p
 While the trigram index catches up after a write, the rows it lacks are verified within what the
 selection leaves of `pattern_candidate_rows` and `pattern_verified_size`. Past either, the search
 answers from the rows the index holds and warns `pattern_index_preparing` rather than refusing.
-
-<VersionBadge
-  version="v0.0.16"
-  languages={["Rust", "JavaScript", "TypeScript", "Markdown", "JSON", "YAML", "TOML", "Python"]}
-/>
 
 The rankings are combined by reciprocal-rank fusion: a result scores as the weighted sum of
 `1 / (k + rank)` over the rankings that returned it. `[search.ranking]` carries the weights
@@ -1122,8 +1073,6 @@ vector operation. Set `disabled` where the workspace must not fetch model weight
 disabled = true
 ```
 
-<VersionBadge version="v0.0.32" />
-
 `[search.lexical].units_max` bounds how many units the lexical index holds, one per indexed
 file, text chunk, and declaration, 1000 to 50000000:
 
@@ -1138,7 +1087,7 @@ mmap_size = "1gb"
 A workspace past it publishes its index without the lexical ranking: the store refuses the
 commit, and `search` answers from identifier matching with a `lexical_ranking_unavailable`
 warning naming `units_max`, the observed count, and the maximum. Raise the key, or narrow
-[`[source]`](/docs/developer/configuration#source) so fewer files reach the index.
+[`[source]`](/docs/configuration#source) so fewer files reach the index.
 
 `transaction_units`, 100 to 1000000, and `transaction_size`, 1mb to 1gb, bound one
 transaction of a lexical write. A write past either commits in several transactions, and the
@@ -1151,8 +1100,6 @@ the same two bounds.
 One unit holds at most 16mb of content, the largest chunk `max_chunk` accepts, so every chunk
 the configuration derives fits. A declaration's unit carries its names, signature, and
 documentation alone; its text lives in its file's chunks.
-
-<VersionBadge version="v0.0.46" />
 
 `mmap_size` sets how much of the index database each connection reads through a memory map,
 0b to 2147418112b, the most the bundled SQLite maps; the default `1gb` maps the whole store of a

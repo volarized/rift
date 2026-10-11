@@ -1,0 +1,19 @@
+---
+title: MCP reference
+icon: MCP
+description: Local tools, resources, and example MCP results.
+full: true
+---
+
+import { LocalMcpReference } from "@/components/local-mcp-reference";
+
+Select a tool or resource to inspect its parameters and example results. This demo uses stored
+payloads and sends no requests.
+
+Tool descriptions, schemas, and JSON examples come from the exported [MCP schema](/mcp.json).
+`rift mcp --output=all` returns both `content` and `structuredContent`; the demo shows both
+representations. Resource reads return `contents` with each entry's MIME type.
+
+<LocalMcpReference />
+
+The [MCP guide](/docs/mcp) follows these tools through project discovery, search, and source reads.

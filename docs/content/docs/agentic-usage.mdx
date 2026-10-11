@@ -1,8 +1,7 @@
 ---
 title: Usage
+icon: TerminalWindow
 ---
-
-<VersionBadge version="v0.0.29" />
 
 Claude Code decides which tool to call from a skill's description and its supporting files.
 Without one naming Rift's tools, an agent falls back to grepping the repository even when a
@@ -35,8 +34,6 @@ rift install claude --user --remove
 ```
 
 ## Install as a plugin
-
-<VersionBadge version="v0.0.31" />
 
 The repository doubles as a Claude Code plugin marketplace, so the skill installs without the
 `rift` CLI:
@@ -78,8 +75,6 @@ when a refusal alone doesn't say why.
 
 ## Steering
 
-<VersionBadge version="v0.0.29" />
-
 A skill changes what an agent reaches for; habit still wins the first time it needs to search.
 Claude Code agents call `Grep` and `Glob` from training, even in a workspace `rift mcp` already
 indexes, and a session whose tool set lists neither runs `grep`, `rg`, or `find` through `Bash`.
@@ -110,8 +105,6 @@ call as JSON on stdin. In a workspace Rift has indexed and version control track
 search call of a session is denied: the reason names the [`search`](/docs/mcp#tool-search) call
 that answers the same question, [`get_symbol`](/docs/mcp#tool-get_symbol) for a known name,
 and [`rift://map`](/docs/mcp#resource-map) for orientation.
-
-<VersionBadge version="v0.0.46" />
 
 The suggested call carries the agent's own search:
 
