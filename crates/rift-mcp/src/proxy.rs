@@ -3736,6 +3736,15 @@ mod tests {
         );
     }
 
+    fn assert_named_held_get(
+        held_value: &serde_json::Value,
+        initial_revision: &serde_json::Value,
+        held: &serde_json::Value,
+    ) {
+        assert_eq!(&held_value["view"], initial_revision);
+        assert_eq!(held_value["symbol"]["id"], held["id"]);
+    }
+
     fn assert_named_walk(initial: &serde_json::Value) {
         assert_eq!(initial["results"][0]["hit"]["symbol"]["name"], "zulu");
         assert_eq!(initial["results"][1]["hit"]["symbol"]["name"], "alpha");
@@ -3844,19 +3853,13 @@ mod tests {
         let CallToolResponse::Complete(held_response) = held_response else {
             return Err("complete held result".into());
         };
-        assert_eq!(
+        assert_named_held_get(
             held_response
                 .structured_content
                 .as_ref()
-                .ok_or("held value")?["view"],
-            initial_revision
-        );
-        assert_eq!(
-            held_response
-                .structured_content
-                .as_ref()
-                .ok_or("held value")?["symbol"]["id"],
-            held["id"]
+                .ok_or("held value")?,
+            &initial_revision,
+            &held,
         );
         assert_eq!(answering.await??, 2);
         proxy.backends = Arc::new(std::collections::BTreeMap::new());
