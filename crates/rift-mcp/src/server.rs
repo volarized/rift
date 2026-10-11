@@ -7557,7 +7557,7 @@ done
             text,
             "1 error\n\tinvalid_request · retry never\n\
              \t\tthe request does not match the documented form: field query, \
-             violation empty; \
+             violation query is empty: subject query; \
              correct the reported field and resend the request\n\
              \t\trift.server.read_invalid\n"
         );
