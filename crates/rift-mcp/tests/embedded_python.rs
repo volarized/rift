@@ -30,14 +30,7 @@ async fn incoming_references_resolve_cross_file_callers_without_writes() -> Test
         Some(CONFIGURATION.to_owned()),
     )
     .await?;
-    let lookup = call_retrying_acceptance(
-        &client,
-        tool_request("get_symbol", &json!({"name":"serve", "language":"python"})),
-    )
-    .await?;
-    let seed = lookup["hits"][0]["symbol"]["id"]
-        .as_str()
-        .ok_or("serve must have a symbol identity")?;
+    let seed = workspace_client::captured_seed(&client, "serve", "service.py").await?;
     let answer = call_retrying_acceptance(
         &client,
         tool_request(
