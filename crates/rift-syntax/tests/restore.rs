@@ -1268,3 +1268,70 @@ fn rust_macro_direct_tokens_distinguish_literals_comments_and_invalid_groups() {
             .is_some_and(|rows| rows.iter().all(|(_, _, direct)| direct.is_none()))
     );
 }
+
+#[test]
+fn rust_root_expression_macro_invocations_keep_original_parent_and_restore_charge() {
+    let source = "first!(value);\nsecond! { pub mod neighbor; }\nmod nested { inside!(value); }\npub fn body() { inside!(value); }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured root invocations");
+    assert_eq!(invocations.len(), 2);
+    for (index, expected) in ["first!(value)", "second! { pub mod neighbor; }"]
+        .iter()
+        .enumerate()
+    {
+        let range = invocations[index].0;
+        assert_eq!(
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")],
+            *expected
+        );
+        let original = document
+            .nodes()
+            .iter()
+            .find(|node| node.kind == "macro_invocation" && node.range == range)
+            .expect("original invocation node");
+        let parent = document
+            .nodes()
+            .get(original.parent.expect("original parent"))
+            .expect("parent node");
+        if index == 0 {
+            assert_eq!(parent.kind, "expression_statement");
+            let root = document
+                .nodes()
+                .get(parent.parent.expect("original root"))
+                .expect("root node");
+            assert_eq!(root.kind, "source_file");
+            assert_eq!(root.parent, None);
+        } else {
+            assert_eq!(parent.kind, "source_file");
+            assert_eq!(parent.parent, None);
+        }
+        assert!(
+            invocations[index].2.is_some(),
+            "original direct token ranges remain complete"
+        );
+    }
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("original root forms restore");
+    assert_eq!(&restored, document.facts());
+    let mut unknown = captured.clone();
+    let charge = get_size2::GetSize::get_heap_size(&unknown.macro_invocations);
+    unknown.macro_invocations = None;
+    let unknown = SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+        .expect("old invocation facts remain unknown");
+    assert_eq!(unknown.macro_invocations(), None);
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&restored),
+        get_size2::GetSize::get_heap_size(&unknown).saturating_add(charge)
+    );
+    let limits = SyntaxLimits::new(source.len(), 1, 100).expect("positive limits");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, captured).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG)
+    );
+}

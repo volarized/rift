@@ -327,7 +327,15 @@ impl SyntaxDocument {
                                 .parent
                                 .and_then(|parent| nodes.get(parent))
                                 .is_some_and(|parent| {
-                                    parent.kind == "source_file" && parent.parent.is_none()
+                                    (parent.kind == "source_file" && parent.parent.is_none())
+                                        || (parent.kind == "expression_statement"
+                                            && parent
+                                                .parent
+                                                .and_then(|root| nodes.get(root))
+                                                .is_some_and(|root| {
+                                                    root.kind == "source_file"
+                                                        && root.parent.is_none()
+                                                }))
                                 })
                     })
                     .map(|node| (node.range, Vec::new(), None))
