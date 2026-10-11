@@ -110,7 +110,14 @@ impl<'a> Tokens<'a> {
         if !consume(&mut input, &["!"]) {
             return None;
         }
-        let body = group(&mut input, "{", "}")?;
+        let close = match *input.first()? {
+            "(" => ")",
+            "[" => "]",
+            "{" => "}",
+            _ => return None,
+        };
+        let open = *input.first()?;
+        let body = group(&mut input, open, close)?;
         if !input.is_empty() {
             return None;
         }
@@ -900,6 +907,57 @@ mod tests {
             &["compile_error", "!", "(", "message", ")"][..],
         ] {
             assert!(!super::compile_error_tokens(tokens));
+        }
+    }
+
+    #[test]
+    fn original_macro_delimiters_keep_constructor_ranges_and_unknown_effects() {
+        for source in ["crate_root!();", "crate_root![];", "crate_root!{}"] {
+            with_tokens(source, |tokens| {
+                assert!(tokens.complete, "{source}");
+                assert!(tokens.bindings.is_empty(), "{source}");
+                let range = ByteRange {
+                    start: 0,
+                    end: u64::try_from(source.trim_end_matches(';').len())
+                        .expect("bounded original invocation"),
+                };
+                assert_eq!(
+                    tokens.range(range).expect("original invocation").first(),
+                    Some(&"crate_root")
+                );
+                assert!(
+                    tokens.effects(range, &mut Scope::default(), true).is_none(),
+                    "{source}"
+                );
+                assert!(
+                    tokens.item(range, &mut Scope::default(), true).is_none(),
+                    "{source}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn original_macro_delimiters_keep_literal_import_names_and_refuse_shadowed_derive() {
+        for source in [
+            "cfg_rt!(use other::Debug;);",
+            "cfg_rt![use other::Debug;];",
+            "cfg_rt!{use other::Debug;}",
+        ] {
+            with_tokens(source, |tokens| {
+                assert!(tokens.complete, "{source}");
+                assert!(tokens.bindings.contains("Debug"), "{source}");
+                assert!(
+                    !tokens.attribute(
+                        &["derive", "(", "Debug", ")"],
+                        &Scope::default(),
+                        true,
+                        20,
+                        true,
+                    ),
+                    "{source}"
+                );
+            });
         }
     }
 }
