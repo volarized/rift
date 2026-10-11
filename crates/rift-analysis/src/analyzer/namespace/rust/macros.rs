@@ -9,9 +9,11 @@ use rift_syntax::{ByteRange, SyntaxSymbol};
 
 use super::super::SelectedFile;
 
+type Binding = (bool, Option<(rift_core::ProjectPath, ByteRange)>);
+
 #[derive(Clone)]
 pub(super) struct Scope {
-    symbols: Arc<BTreeMap<String, bool>>,
+    symbols: Arc<BTreeMap<String, Binding>>,
     complete: bool,
 }
 
@@ -26,14 +28,36 @@ impl Default for Scope {
 
 impl Scope {
     fn get(&self, name: &str) -> Option<&bool> {
-        self.symbols.get(name)
+        self.symbols.get(name).map(|(transparent, _)| transparent)
     }
     fn contains_key(&self, name: &str) -> bool {
         self.symbols.contains_key(name)
     }
     fn insert(&mut self, name: String, transparent: bool) {
-        Arc::make_mut(&mut self.symbols).insert(name, transparent);
+        Arc::make_mut(&mut self.symbols).insert(name, (transparent, None));
     }
+    fn define(
+        &mut self,
+        file: &SelectedFile<'_>,
+        symbol: &SyntaxSymbol,
+        transparent: bool,
+        original: Option<&str>,
+    ) {
+        if symbol.kind != "macro"
+            || symbol.node_kind != Some("macro_definition")
+            || original != Some(file.source)
+            || file.syntax.has_errors()
+            || text_range(file.source, symbol.item_range).is_none()
+        {
+            self.insert(symbol.name.clone(), false);
+            return;
+        }
+        Arc::make_mut(&mut self.symbols).insert(
+            symbol.name.clone(),
+            (transparent, Some((file.path.clone(), symbol.item_range))),
+        );
+    }
+
     fn clear(&mut self) {
         Arc::make_mut(&mut self.symbols).clear();
         self.complete = false;
@@ -362,7 +386,80 @@ fn macro_use(
 
 #[cfg(test)]
 mod tests {
-    use super::{Condition, cfg};
+    use super::{Condition, Scope, cfg};
+
+    fn definition_scope(source: &str, changed: Option<&str>) -> Scope {
+        let path = rift_core::ProjectPath::new("src/crate_root.rs").expect("captured path");
+        let document = rift_syntax::SyntaxProvider::analyze(
+            &rift_syntax::RustSyntaxProvider::default(),
+            rift_syntax::SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            rift_syntax::SyntaxLimits::default(),
+        )
+        .expect("original captured definition");
+        let facts = document.into_facts();
+        let file = super::SelectedFile {
+            path: &path,
+            source: changed.unwrap_or(source),
+            syntax: &facts,
+        };
+        let symbol = facts
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.kind == "macro")
+            .expect("captured macro");
+        let mut scope = Scope::default();
+        let transparent = super::transparent_definition(source, symbol, &scope);
+        scope.define(&file, symbol, transparent, Some(source));
+        scope
+    }
+
+    #[test]
+    fn captured_macro_definition_references_keep_original_range_across_clones() {
+        let source = "macro_rules! crate_root { () => { pub mod de; }; }";
+        let scope = definition_scope(source, None);
+        let cloned = scope.clone();
+        assert_eq!(cloned.get("crate_root"), Some(&false));
+        let (path, range) = cloned.symbols["crate_root"]
+            .1
+            .as_ref()
+            .expect("original definition");
+        assert_eq!(path.as_str(), "src/crate_root.rs");
+        assert_eq!(range.start, 0);
+        assert_eq!(
+            range.end,
+            u64::try_from(source.len()).expect("bounded source")
+        );
+        assert!(scope.complete && cloned.complete);
+    }
+
+    #[test]
+    fn captured_macro_definition_references_clear_on_rebinding_and_unknown_effects() {
+        let source = "macro_rules! crate_root { () => { pub mod de; }; }";
+        let mut scope = definition_scope(source, None);
+        scope.insert("crate_root".to_owned(), false);
+        assert!(scope.symbols["crate_root"].1.is_none());
+        scope = definition_scope(source, None);
+        scope.clear();
+        assert!(scope.symbols.is_empty());
+        assert!(!scope.complete);
+        scope.insert("later".to_owned(), true);
+        assert!(!scope.complete);
+        assert_eq!(scope.get("later"), Some(&true));
+    }
+
+    #[test]
+    fn captured_macro_definition_references_refuse_changed_source_and_keep_templates_opaque() {
+        let source = "macro_rules! crate_root { () => { #[cfg(feature = \"std\")] mod de; include!(\"generated.rs\"); }; }";
+        let scope = definition_scope(source, None);
+        assert_eq!(scope.get("crate_root"), Some(&false));
+        assert!(scope.symbols["crate_root"].1.is_some());
+        let changed = definition_scope(source, Some("macro_rules! other { () => {}; }"));
+        assert_eq!(changed.get("crate_root"), Some(&false));
+        assert!(changed.symbols["crate_root"].1.is_none());
+    }
 
     #[test]
     fn selected_library_test_predicate_keeps_other_configuration_unknown() {
@@ -617,7 +714,7 @@ impl Context<'_> {
             match event {
                 Event::Symbol(symbol) if symbol.kind == "macro" => {
                     let transparent = transparent_definition(file.source, symbol, scope);
-                    scope.insert(symbol.name.clone(), transparent);
+                    scope.define(file, symbol, transparent, self.originals.get(path).copied());
                 }
                 Event::Symbol(symbol)
                     if macro_use(tokens, symbol, self.library, self.depth_max)? =>
@@ -686,7 +783,12 @@ pub(super) fn children<'a>(
         match event {
             Event::Symbol(symbol) if symbol.kind == "macro" => {
                 let transparent = transparent_definition(file.source, symbol, &scope);
-                scope.insert(symbol.name.clone(), transparent);
+                scope.define(
+                    file,
+                    symbol,
+                    transparent,
+                    originals.get(file.path.as_str()).copied(),
+                );
             }
             Event::Symbol(symbol) => {
                 let name = super::source_identifier(&symbol.name);
