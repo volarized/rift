@@ -158,11 +158,14 @@ pub(crate) async fn served_root_unsettled(
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
+        let held = server.clone();
         let service = server
             .serve(server_transport)
             .await
             .expect("server must initialize");
-        service.waiting().await.expect("server must stop cleanly");
+        let stopped = service.waiting().await;
+        held.engine_pool().await.shutdown().await;
+        stopped.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
     Ok((client, server_task))
