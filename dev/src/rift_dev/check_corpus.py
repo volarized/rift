@@ -1301,6 +1301,7 @@ class Corpus:
         self.configure("[search.lexical]\nunits_max = 20000\n")
         with self.server() as server:
             async with server.connect() as client:
+                await settled_local(client, "search", {"query": "test", "limit": 1})
                 await observed(
                     server,
                     "search",

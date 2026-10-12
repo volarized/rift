@@ -480,7 +480,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     let (directory, client, server_task) = workspace.served;
     let answer = search_symbols(
         &client,
-        json!({"target":"symbol", "query":"helper_beacon","scope":"all"}),
+        json!({"target":"symbol", "query":"\"helper_beacon\"","scope":"all"}),
     )
     .await?;
     let hits = answer["results"].as_array().ok_or("hits are an array")?;
