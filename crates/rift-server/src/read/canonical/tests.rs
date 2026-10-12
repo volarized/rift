@@ -201,7 +201,7 @@ fn force_included_search_retains_original_source_after_mutation_and_removal() {
     };
     assert!(source_complete);
     assert_eq!(answered, &view);
-    assert_eq!(excerpt.text, original);
+    assert_eq!(excerpt.text, "pub fn phantom_signal() {}");
     std::fs::write(
         directory.path().join("hidden.rs"),
         "pub fn replacement() {}\n",
@@ -1499,4 +1499,157 @@ fn shared_generation_accounting_preserves_slot_and_overflow_refusals() {
             .is_none()
     );
     assert!(overflow.state.lock().expect("state").views.is_empty());
+}
+
+#[test]
+#[ignore = "retained material measurement"]
+fn captured_preparation_views_measure_shared_accounting_cost() {
+    let root = std::path::PathBuf::from(
+        std::env::var_os("RIFT_RETAINED_MATERIAL_ROOT").expect("measurement root"),
+    );
+    let mut preparation = rift_index::WorkspaceIndexPreparation::new(
+        &root,
+        WorkspaceIndexLimits::default(),
+        &TextFileInclusion::default(),
+        &Default::default(),
+    )
+    .expect("workspace preparation");
+    let total = preparation
+        .discover(&SourceVisibility::default(), &|| false)
+        .expect("selected files");
+    assert!(total > 0, "measurement requires selected files");
+    let mut reads = ReadService::from_prepared_index(
+        preparation.empty_snapshot().expect("empty snapshot"),
+        None,
+        Arc::new(rift_dependency::DependencyContext::default()),
+        HistoryConfiguration::default(),
+        Default::default(),
+    );
+    let budget = usize::try_from(8_u64 << 30).expect("existing byte bound");
+    let store = LocalSymbolViews::new(budget, [23; 32]);
+    let now = SystemTime::now();
+    let mut held_source = None;
+    let mut prepared = 0;
+    let mut target = 0;
+    for _ in 0..64 {
+        if target != 0 {
+            let index = reads
+                .advance_workspace_preparation(&mut preparation, target, &|| false)
+                .expect("preparation snapshot");
+            reads = ReadService::from_prepared_index(
+                index,
+                None,
+                Arc::new(rift_dependency::DependencyContext::default()),
+                HistoryConfiguration::default(),
+                Default::default(),
+            );
+            prepared = target;
+        }
+        let input = reads
+            .local_search_view_input(prepared == total)
+            .expect("captured preparation material");
+        if held_source.is_none()
+            && let Some(file) = reads
+                .index
+                .files()
+                .find(|file| !file.source().is_empty() && file.source().len() <= 65_536)
+        {
+            let original = input
+                .material
+                .index
+                .source(file.path())
+                .expect("original captured source")
+                .to_owned();
+            held_source = Some((file.path().clone(), original, None));
+        }
+        let started = std::time::Instant::now();
+        let admitted = store
+            .capture_at(input, now)
+            .expect("material admission")
+            .expect("original byte bound admits shared material");
+        let capture_elapsed = started.elapsed();
+        if let Some((path, original, view)) = &mut held_source
+            && view.is_none()
+        {
+            assert_measured_held_source(&store, &reads, path, original, &admitted);
+            *view = Some(admitted);
+        }
+        if measured_shared_accounting(&store, budget, prepared, total, capture_elapsed) {
+            let (path, original, view) = held_source.expect("observed held source");
+            assert_measured_held_source(
+                &store,
+                &reads,
+                &path,
+                &original,
+                &view.expect("advertised view"),
+            );
+            return;
+        }
+        assert!(
+            prepared < total,
+            "completed preparation did not reach finite cached overflow"
+        );
+        target = target.saturating_add(512).min(total);
+    }
+    panic!("measurement did not reach finite cached overflow within 64 captures");
+}
+
+fn measured_shared_accounting(
+    store: &LocalSymbolViews,
+    budget: usize,
+    prepared: usize,
+    total: usize,
+    capture_elapsed: Duration,
+) -> bool {
+    let state = store.state.lock().expect("store");
+    let cached = state.material_bytes();
+    assert_ne!(cached, usize::MAX, "finite cached material measurement");
+    if cached <= budget {
+        return false;
+    }
+    let started = std::time::Instant::now();
+    let shared = state.admitted_material_bytes(budget);
+    let shared_elapsed = started.elapsed();
+    assert!(
+        shared <= budget,
+        "shared material remains within original byte bound"
+    );
+    println!(
+        "cached_material_bytes={cached} shared_material_bytes={shared} budget_bytes={budget} view_count={} prepared={prepared} total={total} capture_elapsed={capture_elapsed:?} shared_elapsed={shared_elapsed:?}",
+        state.views.len(),
+    );
+    true
+}
+
+fn assert_measured_held_source(
+    store: &LocalSymbolViews,
+    reads: &ReadService,
+    path: &rift_core::ProjectPath,
+    original: &str,
+    view: &CapturedView,
+) {
+    let result = store
+        .get_source(
+            &rift_protocol::source_read::GetSourceParams {
+                unit: crate::read::source_unit_id(path),
+                range: None,
+                view: Some(view.id.clone()),
+                rev: None,
+            },
+            reads.index.root(),
+            reads.index.owner(),
+        )
+        .expect("held original source");
+    let rift_protocol::source_read::GetSourceResult::Found {
+        source,
+        source_complete,
+        view: answered,
+        ..
+    } = result
+    else {
+        panic!("previously advertised original source remains available");
+    };
+    assert!(source_complete);
+    assert_eq!(source.text, original);
+    assert_eq!(answered, *view);
 }
