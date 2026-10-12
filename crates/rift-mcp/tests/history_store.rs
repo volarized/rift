@@ -88,17 +88,40 @@ async fn travelled_history(
     let view = search
         .get("view")
         .ok_or("search carries its captured view")?;
-    let structured = call_retrying_acceptance(
+    let unavailable = call_retrying_acceptance(
         client,
         tool_request(
             "get_symbol",
-            &json!({"id": id, "include": ["history"], "view": view}),
+            &json!({"id": id, "include": ["history"], "view": view["id"]}),
         ),
+    )
+    .await?;
+    assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
+    assert_eq!(unavailable["reason"], "insufficient_coverage");
+    assert_eq!(unavailable["id"], id);
+    assert_eq!(unavailable["view"], *view);
+    let structured = call_retrying_acceptance(
+        client,
+        tool_request("get_symbol", &json!({"id": id, "include": ["history"]})),
     )
     .await?;
     assert_eq!(structured["outcome"], "found", "{structured}");
     assert_eq!(structured["symbol"]["id"], id);
-    assert_eq!(structured["view"], *view);
+    let history_view = structured
+        .get("view")
+        .ok_or("history carries its captured view")?;
+    let repeated = call_retrying_acceptance(
+        client,
+        tool_request(
+            "get_symbol",
+            &json!({"id": id, "include": ["history"], "view": history_view["id"]}),
+        ),
+    )
+    .await?;
+    assert_eq!(repeated["outcome"], "found", "{repeated}");
+    assert_eq!(repeated["symbol"]["id"], id);
+    assert_eq!(repeated["view"], *history_view);
+    assert_eq!(repeated["history"], structured["history"]);
     structured
         .get("history")
         .cloned()
