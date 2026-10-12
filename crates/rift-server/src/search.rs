@@ -1385,7 +1385,8 @@ impl ResolvedCandidate<'_> {
 /// A candidate the full-text ranking placed names the columns that carried the term. A
 /// candidate only the vector ranking placed names no column at all, because no literal
 /// byte of the query appears in it, and answers [`MatchedField::Ranked`] instead.
-fn matched_fields(candidate: &FusedCandidate) -> Vec<MatchedField> {
+#[must_use]
+pub fn matched_fields(candidate: &FusedCandidate) -> Vec<MatchedField> {
     let mut fields: Vec<MatchedField> = Vec::new();
     for field in candidate.fields().fields() {
         let wire = match field {

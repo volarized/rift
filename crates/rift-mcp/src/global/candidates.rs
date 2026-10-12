@@ -135,6 +135,7 @@ pub(crate) fn merge_candidate_pools(
         .iter()
         .filter_map(|candidate| {
             payloads.get(candidate.identity()).cloned().map(|mut hit| {
+                hit.matched_by = rift_server::matched_fields(candidate);
                 hit.score = include_score.then(|| candidate.score());
                 hit
             })

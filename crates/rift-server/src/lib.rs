@@ -35,7 +35,7 @@ pub use rift_error::RiftError;
 pub use rift_lsp::capabilities::PositionEncoding;
 pub use search::{
     PatternBounds, SearchCandidateInput, SearchCandidateInputs, SearchCandidateItem, StoreAnswer,
-    accepted_pattern, search_page_limit,
+    accepted_pattern, matched_fields, search_page_limit,
 };
 
 /// Compile-time marker for server-layer ownership.
