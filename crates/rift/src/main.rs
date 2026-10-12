@@ -382,7 +382,7 @@ async fn run(
     match cli.command {
         None => Ok(None),
         Some(CliCommand::Config { command }) => {
-            let home = install::home_directory(&|name| std::env::var_os(name));
+            let home = std::env::home_dir();
             let result = update::run_blocking(move || {
                 config::run(&command, Path::new("."), home.as_deref())
             })

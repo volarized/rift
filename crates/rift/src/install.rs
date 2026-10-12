@@ -207,7 +207,7 @@ fn resolve_scope_root(scope: InstallScope) -> Result<PathBuf, RiftError> {
 /// The operator's home directory: `HOME` first, `USERPROFILE` (Windows)
 /// second. An empty value counts as unset. The lookup is injected so a test
 /// exercises the fallback without mutating the process environment.
-pub(crate) fn home_directory(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+fn home_directory(lookup: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     let set = |name: &str| lookup(name).filter(|value| !value.is_empty());
     set("HOME")
         .or_else(|| set("USERPROFILE"))

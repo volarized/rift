@@ -88,7 +88,7 @@ fn test_other_configuration_tables_do_not_change_telemetry_default() -> TestResu
 }
 
 #[test]
-fn test_environment_values_and_home_fallback_preserve_opt_out() -> TestResult {
+fn test_environment_values_and_unresolved_home_preserve_opt_out() -> TestResult {
     let root = tempfile::tempdir()?;
     let home = tempfile::tempdir()?;
     for (value, disabled) in [
@@ -98,25 +98,28 @@ fn test_environment_values_and_home_fallback_preserve_opt_out() -> TestResult {
         (Some("invalid"), true),
     ] {
         let environment = |name: &str| match name {
-            "HOME" => Some(std::ffi::OsString::new()),
-            "USERPROFILE" => Some(home.path().as_os_str().to_owned()),
             "RIFT_TELEMETRY_DISABLED" => value.map(std::ffi::OsString::from),
             _ => None,
         };
-        let policy = Policy::of_environment(root.path(), &environment);
+        let policy =
+            Policy::of_environment(root.path(), Some(home.path().to_path_buf()), &environment);
         assert_eq!(policy.home.as_deref(), Some(home.path()));
         assert_eq!(policy.read_disabled()?, disabled);
     }
-    assert!(Policy::of_environment(root.path(), &|_| None).read_disabled()?);
+    for home in [None, Some(PathBuf::new())] {
+        assert!(Policy::of_environment(root.path(), home, &|_| None).read_disabled()?);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStringExt as _;
         let environment = |name: &str| match name {
-            "HOME" => Some(home.path().as_os_str().to_owned()),
             "RIFT_TELEMETRY_DISABLED" => Some(std::ffi::OsString::from_vec(vec![0xff])),
             _ => None,
         };
-        assert!(Policy::of_environment(root.path(), &environment).read_disabled()?);
+        assert!(
+            Policy::of_environment(root.path(), Some(home.path().to_path_buf()), &environment)
+                .read_disabled()?
+        );
     }
     Ok(())
 }

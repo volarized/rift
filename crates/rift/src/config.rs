@@ -34,12 +34,13 @@ pub(super) fn run(
         user,
     } = command;
     let path = if *user {
-        home.ok_or_else(|| {
-            errors::cli::config_home_unresolved()
-                .checked("HOME, USERPROFILE")
-                .error()
-        })?
-        .join(rift_mcp::telemetry::USER_CONFIGURATION_FILE)
+        home.filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| {
+                errors::cli::config_home_unresolved()
+                    .checked("operating system home directory")
+                    .error()
+            })?
+            .join(rift_mcp::telemetry::USER_CONFIGURATION_FILE)
     } else {
         root.join(WORKSPACE_CONFIGURATION_FILE)
     };
@@ -255,17 +256,19 @@ mod tests {
         fs::write(&path, "[broken")?;
         assert!(set(&path, true).is_err());
         assert_eq!(fs::read_to_string(&path)?, "[broken");
-        assert!(
-            run(
-                &ConfigCommand::Set {
-                    telemetry_disabled: true,
-                    user: true
-                },
-                root.path(),
-                None
-            )
-            .is_err()
-        );
+        for home in [None, Some(Path::new(""))] {
+            assert!(
+                run(
+                    &ConfigCommand::Set {
+                        telemetry_disabled: true,
+                        user: true
+                    },
+                    root.path(),
+                    home
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 
