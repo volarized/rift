@@ -28,10 +28,8 @@ include retries and updates. They do not confirm installations or unique users.
 Downloading a release directly from GitHub bypasses the download service.
 
 The purpose is to plan service capacity, maintain supported downloads, and identify HTTP
-failures. Where this processing involves personal data, its legal basis is legitimate
-interests under GDPR Article 6(1)(f). Those interests are operating and improving the services.
-The statistics do not use cookies or create local identifiers. These services make no
-automated decisions about individuals from the counters.
+failures. Where this processing involves personal data, we pursue those interests under
+GDPR Article 6(1)(f).
 
 ## Telemetry settings
 
@@ -53,12 +51,10 @@ rift config set --telemetry.disabled=true --user
 
 The first command writes `[telemetry] disabled = true` in the current directory's `rift.toml`.
 The second writes it in `~/.rift/config.toml`. A global disable takes precedence over a
-project's setting. The cloud client and updater check those files before network requests.
+project's setting.
 `RIFT_TELEMETRY_DISABLED=true` also disables counters. A `false` value removes only that
-source's disable; it cannot override another source's disable. Malformed or unreadable
-settings, or an unresolved home directory, suppress counters while requests continue.
-A disable sends `DNT: 1` with existing requests, and Rift Cloud excludes those requests from
-the counters described here. Downloads and API use continue to work.
+source's disable; it cannot override another source's disable. Downloads and API use continue
+to work.
 
 Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` in their environment; they do
 not read these TOML files. Other API clients can send `DNT: 1`. Opt-out excludes future requests; previous counters

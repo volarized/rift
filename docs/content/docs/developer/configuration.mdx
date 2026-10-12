@@ -515,11 +515,6 @@ A global disable takes precedence over a project's `false` value. Set the global
 `false` to allow each project to choose its own value. `RIFT_TELEMETRY_DISABLED=true` also
 suppresses counters; `false` cannot override a disable in either file.
 
-The cloud client and updater read current settings before each network request. A disable
-adds `DNT: 1` to that request, and Rift Cloud skips its counters entirely. Missing settings
-use the default; unreadable or invalid telemetry settings, or an unresolved home directory,
-send the opt-out header. Disabling counters does not prevent downloads or global API use.
-
 Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` for the same opt-out. They do
 not read the CLI's TOML files. Local-only use creates no telemetry request, so these counters
 cannot measure offline activity or unique daily active users. A disable affects future
