@@ -1511,7 +1511,7 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
         &root,
         WorkspaceIndexLimits::default(),
         &TextFileInclusion::default(),
-        &Default::default(),
+        &rift_core::LanguageFileSelections::default(),
     )
     .expect("workspace preparation");
     let total = preparation
@@ -1523,7 +1523,7 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
         None,
         Arc::new(rift_dependency::DependencyContext::default()),
         HistoryConfiguration::default(),
-        Default::default(),
+        rift_protocol::dependencies::DependenciesConfiguration::default(),
     );
     let budget = usize::try_from(8_u64 << 30).expect("existing byte bound");
     let store = LocalSymbolViews::new(budget, [23; 32]);
@@ -1541,7 +1541,7 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
                 None,
                 Arc::new(rift_dependency::DependencyContext::default()),
                 HistoryConfiguration::default(),
-                Default::default(),
+                rift_protocol::dependencies::DependenciesConfiguration::default(),
             );
             prepared = target;
         }
