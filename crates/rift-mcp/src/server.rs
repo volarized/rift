@@ -5938,6 +5938,7 @@ done
         super::hermetic_workspace(directory.path(), "")?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        wait_for_complete_publication(&server).await?;
         let _ = search_after_population(&server, "restart_marker").await?;
         let publication = current_publication(&server).await;
         let derivation = crate::validation::derivation_revision(
@@ -5964,6 +5965,7 @@ done
 
         let restarted =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        wait_for_complete_publication(&restarted).await?;
         let empty = search_after_population(&restarted, "restart_marker").await?;
         assert!(empty.results.is_empty(), "removed source has no search hit");
         assert!(
@@ -6124,6 +6126,7 @@ done
         super::hermetic_workspace(directory.path(), &configuration)?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        wait_for_complete_publication(&server).await?;
         let result = search_symbols(&server, "wide").await?;
         assert!(result.results.is_empty());
         assert!(result.warnings.iter().any(|warning| matches!(
@@ -6140,6 +6143,7 @@ done
         super::hermetic_workspace(directory.path(), configuration)?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
+        wait_for_complete_publication(&server).await?;
         let result = search_symbols(&server, "wide").await?;
         assert!(result.results.is_empty());
         let expected_limit =
