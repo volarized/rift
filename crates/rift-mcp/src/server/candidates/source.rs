@@ -6,9 +6,20 @@ use rift_protocol::symbol_read::SymbolUnavailableReason;
 use std::{path::Path, sync::Arc};
 
 impl RiftMcp {
+    #[cfg(test)]
     pub(in crate::server) async fn exact_source(
         &self,
         params: GetSourceParams,
+    ) -> Result<Json<GetSourceResult>, super::ToolFailure> {
+        self.exact_source_with_context(params, None).await
+    }
+
+    pub(in crate::server) async fn exact_source_with_context(
+        &self,
+        params: GetSourceParams,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
     ) -> Result<Json<GetSourceResult>, super::ToolFailure> {
         if !params.is_valid() {
             return Err(read_failure(
@@ -44,7 +55,7 @@ impl RiftMcp {
                 .configuration
                 .accepted_for_tool(super::wire::ErrorPhase::Read)?;
             let configuration = resolved.published.configuration.global_configuration();
-            return tokio::time::timeout_at(
+            let result = tokio::time::timeout_at(
                 deadline.at(),
                 self.global.exact_source(&configuration, &params),
             )
@@ -57,8 +68,8 @@ impl RiftMcp {
                         .error(),
                 )
             })?
-            .map(Json)
-            .map_err(read_failure);
+            .map_err(read_failure)?;
+            return source_context(context, result, configuration.endpoint);
         }
         let rev = params.rev.clone();
         let server = self.clone();
@@ -119,6 +130,31 @@ impl super::ReadAnswer for GetSourceResult {
             | Self::Unavailable { warnings, .. } => warnings,
         }
     }
+}
+
+fn source_context(
+    context: Option<&std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>>,
+    result: GetSourceResult,
+    root: String,
+) -> Result<Json<GetSourceResult>, super::ToolFailure> {
+    let view = match &result {
+        GetSourceResult::Found { view, .. } | GetSourceResult::Missing { view, .. } => Some(view),
+        GetSourceResult::Unavailable { view, .. } => view.as_ref(),
+    };
+    if let (Some(context), Some(view)) = (context, view) {
+        let selected = crate::global::candidates::SavedCandidateBackend {
+            backend: "global".to_owned(),
+            root,
+            owner: None,
+            view: view.clone(),
+        };
+        crate::proxy::encode_bounded(&selected, super::BYTES_MAX)
+            .map_err(super::transport_failure)?;
+        *context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selected);
+    }
+    Ok(Json(result))
 }
 
 #[cfg(test)]

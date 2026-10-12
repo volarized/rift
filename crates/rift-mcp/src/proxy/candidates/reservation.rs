@@ -25,11 +25,21 @@ impl CandidateViews {
         owner: &SymbolOwner,
         now: SystemTime,
     ) -> Result<CandidateReservation<'_>, RiftError> {
+        self.reserve_backend(backend, root, Some(owner), now)
+    }
+
+    pub(super) fn reserve_backend(
+        &self,
+        backend: &str,
+        root: &str,
+        owner: Option<&SymbolOwner>,
+        now: SystemTime,
+    ) -> Result<CandidateReservation<'_>, RiftError> {
         let expires = now
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
         let template = SavedCandidateBackend {
-            owner: Some(owner.clone()),
+            owner: owner.cloned(),
             backend: backend.to_owned(),
             root: root.to_owned(),
             view: CapturedView {
@@ -397,5 +407,26 @@ mod tests {
             drop(pending);
             assert!(store.rows.lock().expect("rows").is_empty());
         }
+    }
+
+    #[test]
+    fn symbol_reservation_retains_exact_global_context_without_project_owner() {
+        let store = CandidateViews::default();
+        let mut pending = store
+            .reserve_backend("global", "/fixture/global", None, clock())
+            .expect("reserve global");
+        let mut response = selected("claims.global");
+        response.backend = "global".to_owned();
+        response.root = "/fixture/global".to_owned();
+        response.owner = None;
+        pending
+            .finalize(&response, clock())
+            .expect("global context");
+        let retained = store
+            .backend(&response.view.id, clock())
+            .expect("decode")
+            .expect("accepted")
+            .expect("backend");
+        assert_eq!(retained, response);
     }
 }

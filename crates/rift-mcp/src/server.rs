@@ -2305,7 +2305,12 @@ impl RiftMcp {
         Parameters(params): Parameters<rift_protocol::symbol_read::GetSymbolParams>,
         extensions: rmcp::model::Extensions,
     ) -> Result<Json<rift_protocol::symbol_read::GetSymbolResult>, ToolFailure> {
-        let result = self.exact_symbol(params).await;
+        let context = extensions.get::<std::sync::Arc<
+            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >>();
+        let result = self
+            .exact_symbol_with_context(params, context.map(std::sync::Arc::as_ref))
+            .await;
         if let Err(ToolFailure::Registered(failure, _)) = &result
             && let Some(operation) = extensions.get::<rift_tracing::Span>()
         {
@@ -2323,7 +2328,12 @@ impl RiftMcp {
         Parameters(params): Parameters<rift_protocol::source_read::GetSourceParams>,
         extensions: rmcp::model::Extensions,
     ) -> Result<Json<rift_protocol::source_read::GetSourceResult>, ToolFailure> {
-        let result = self.exact_source(params).await;
+        let captured = extensions.get::<std::sync::Arc<
+            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >>();
+        let result = self
+            .exact_source_with_context(params, captured.map(std::sync::Arc::as_ref))
+            .await;
         if let Err(ToolFailure::Registered(failure, _)) = &result
             && let Some(operation) = extensions.get::<rift_tracing::Span>()
         {
@@ -4182,6 +4192,14 @@ impl ServerHandler for RiftMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         let parameter_failure = ParameterFailure::default();
         let _ = context.extensions.insert(parameter_failure.clone());
+        let captured = matches!(request.name.as_ref(), "get_symbol" | "get_source").then(|| {
+            std::sync::Arc::new(std::sync::Mutex::new(
+                None::<crate::global::candidates::SavedCandidateBackend>,
+            ))
+        });
+        if let Some(captured) = &captured {
+            let _ = context.extensions.insert(std::sync::Arc::clone(captured));
+        }
         let measured =
             McpRequest::tool_call(&request.name).served(context.protocol_version().as_ref());
         // `workspace` routes every record inside the request to this workspace's log store
@@ -4219,7 +4237,7 @@ impl ServerHandler for RiftMcp {
                         };
                         let _ = context.extensions.insert(SymbolExamples(examples));
                     }
-                    let result = if request.name == "search_candidates" {
+                    let mut result = if request.name == "search_candidates" {
                         self.search_candidates_call(request, &operation).await
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
@@ -4240,6 +4258,21 @@ impl ServerHandler for RiftMcp {
                             Ok(response) => Ok(response),
                         }
                     };
+                    if let Ok(CallToolResponse::Complete(response)) = &mut result
+                        && let Some(captured) = &captured
+                        && let Some(selected) = captured
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take()
+                    {
+                        let meta = response
+                            .meta
+                            .get_or_insert_with(rmcp::model::MetaObject::new);
+                        meta.insert("backend".to_owned(), serde_json::json!(selected.backend));
+                        meta.insert("root".to_owned(), serde_json::json!(selected.root));
+                        meta.insert("owner".to_owned(), serde_json::json!(selected.owner));
+                        meta.insert("view".to_owned(), serde_json::json!(selected.view));
+                    }
                     rift_tracing::debug!(
                         is_error = Ending::of_tool_call(&result) != Ending::Answered,
                         "tool request completed"

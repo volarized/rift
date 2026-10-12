@@ -107,9 +107,20 @@ impl RiftMcp {
         Ok(saved)
     }
 
+    #[cfg(test)]
     pub(in crate::server) async fn exact_symbol(
         &self,
         params: GetSymbolParams,
+    ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
+        self.exact_symbol_with_context(params, None).await
+    }
+
+    pub(in crate::server) async fn exact_symbol_with_context(
+        &self,
+        params: GetSymbolParams,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
         let owner = SymbolIdentity::parse(params.id.as_str())
             .map_err(read_failure)?
@@ -139,7 +150,7 @@ impl RiftMcp {
             owner,
             SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
         ) {
-            return self.global_symbol(&params).await;
+            return self.global_symbol(&params, context).await;
         }
         let rev = params.rev.clone();
         let server = self.clone();
@@ -193,6 +204,9 @@ impl RiftMcp {
     async fn global_symbol(
         &self,
         params: &GetSymbolParams,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
         let deadline = self.request_deadline().await;
         let resolved = self
@@ -203,7 +217,7 @@ impl RiftMcp {
             .configuration
             .accepted_for_tool(super::wire::ErrorPhase::Read)?;
         let configuration = resolved.published.configuration.global_configuration();
-        tokio::time::timeout_at(
+        let result = tokio::time::timeout_at(
             deadline.at(),
             self.global.exact_symbol(&configuration, params),
         )
@@ -216,8 +230,29 @@ impl RiftMcp {
                     .error(),
             )
         })?
-        .map(Json)
-        .map_err(read_failure)
+        .map_err(read_failure)?;
+        let view = match &result {
+            GetSymbolResult::Found { view, .. } | GetSymbolResult::Missing { view, .. } => {
+                Some(view)
+            }
+            GetSymbolResult::Unavailable { view, .. } => view.as_ref(),
+        };
+        if let Some(context) = context
+            && let Some(view) = view
+        {
+            let selected = crate::global::candidates::SavedCandidateBackend {
+                backend: "global".to_owned(),
+                root: configuration.endpoint,
+                owner: None,
+                view: view.clone(),
+            };
+            crate::proxy::encode_bounded(&selected, super::BYTES_MAX)
+                .map_err(super::transport_failure)?;
+            *context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selected);
+        }
+        Ok(Json(result))
     }
 }
 

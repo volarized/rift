@@ -55,7 +55,8 @@ impl RiftProxy {
                 validate_symbol(&dispatched, &decoded, Some(&selected.view))?;
                 super::super::identity::qualify_symbol_result(&mut decoded, &selected.backend)?;
                 validate_symbol(&params, &decoded, Some(&selected.view))?;
-                response = bounded_response(crate::output::Json(decoded).into_call_tool_result())?;
+                validate_global_backend(result, &selected, symbol_view(&decoded))?;
+                response = symbol_response(decoded, result)?;
             }
             return Ok(Some(response));
         }
@@ -81,19 +82,37 @@ impl RiftProxy {
             let mut decoded = decode_symbol(result)?;
             validate_symbol(&dispatched, &decoded, None)?;
             if let Some(view) = symbol_view(&decoded) {
-                reservation.finalize(
-                    &SavedCandidateBackend {
-                        backend: name.to_owned(),
-                        root: root.to_owned(),
-                        owner: Some(actual_owner),
-                        view: view.clone(),
-                    },
-                    SystemTime::now(),
-                )?;
+                let selected = symbol_backend(result, view, name, root, &actual_owner)?;
+                let retained = self
+                    .candidate_views
+                    .backend(&view.id, SystemTime::now())?
+                    .map_err(|reason| view_refusal(&view.id, reason))?;
+                if retained.is_some() {
+                    let (selected_backend, held) =
+                        self.selected_read_backend(&view.id, Some(&owner))?;
+                    if !std::ptr::eq(selected_backend, backend) || held != selected {
+                        return Err(view_refusal(
+                            &view.id,
+                            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+                        ));
+                    }
+                    validate_symbol(&dispatched, &decoded, Some(&selected.view))?;
+                } else if selected.backend == "global" {
+                    drop(reservation);
+                    let mut accepted = self.candidate_views.reserve_backend(
+                        &selected.backend,
+                        &selected.root,
+                        selected.owner.as_ref(),
+                        SystemTime::now(),
+                    )?;
+                    accepted.finalize(&selected, SystemTime::now())?;
+                } else {
+                    reservation.finalize(&selected, SystemTime::now())?;
+                }
             }
             super::super::identity::qualify_symbol_result(&mut decoded, name)?;
             validate_symbol(&params, &decoded, None)?;
-            response = bounded_response(crate::output::Json(decoded).into_call_tool_result())?;
+            response = symbol_response(decoded, result)?;
         }
         Ok(Some(response))
     }
@@ -139,15 +158,32 @@ impl RiftProxy {
                 )
             })?;
             if let Some(view) = returned_view(request, value.clone())? {
-                reservation.finalize(
-                    &SavedCandidateBackend {
-                        backend: "local".to_owned(),
-                        root: root.to_owned(),
-                        owner: Some(owner),
-                        view,
-                    },
-                    SystemTime::now(),
-                )?;
+                let accepted = symbol_backend(result, &view, "local", root, &owner)?;
+                let retained = self
+                    .candidate_views
+                    .backend(&view.id, SystemTime::now())?
+                    .map_err(|reason| view_refusal(&view.id, reason))?;
+                if retained.is_some() {
+                    let (selected_backend, selected) =
+                        self.selected_read_backend(&view.id, Some(&owner))?;
+                    if !std::ptr::eq(selected_backend, backend) || selected != accepted {
+                        return Err(view_refusal(
+                            &view.id,
+                            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+                        ));
+                    }
+                } else if accepted.backend == "global" {
+                    drop(reservation);
+                    let mut pending = self.candidate_views.reserve_backend(
+                        &accepted.backend,
+                        &accepted.root,
+                        accepted.owner.as_ref(),
+                        SystemTime::now(),
+                    )?;
+                    pending.finalize(&accepted, SystemTime::now())?;
+                } else {
+                    reservation.finalize(&accepted, SystemTime::now())?;
+                }
             }
         }
         Ok(Some(response))
@@ -266,7 +302,14 @@ impl RiftProxy {
             if returned.as_ref().is_some_and(|view| view != &selected.view) {
                 return Err(invalid("view", "captured backend context does not match"));
             }
-            response = qualified_read_response(request, value.clone(), &selected.backend)?;
+            if request.name == "get_source" {
+                validate_global_backend(result, &selected, returned.as_ref())?;
+            }
+            let mut qualified = qualified_read_response(request, value.clone(), &selected.backend)?;
+            if let Ok(CallToolResponse::Complete(answered)) = &mut qualified {
+                answered.meta.clone_from(&result.meta);
+            }
+            response = qualified;
         }
         Ok(Some(response))
     }
@@ -303,7 +346,7 @@ impl RiftProxy {
                 )
             })?,
         };
-        if accepted_root(backend)? != selected.root {
+        if selected.backend != "global" && accepted_root(backend)? != selected.root {
             return Err(view_refusal(
                 view,
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
@@ -445,6 +488,122 @@ fn decode_symbol(result: &rmcp::model::CallToolResult) -> Result<GetSymbolResult
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
 }
 
+fn symbol_response(
+    decoded: GetSymbolResult,
+    original: &rmcp::model::CallToolResult,
+) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
+    let response = crate::output::Json(decoded)
+        .into_call_tool_result()
+        .map(|mut response| {
+            if let CallToolResponse::Complete(result) = &mut response {
+                result.meta.clone_from(&original.meta);
+            }
+            response
+        });
+    bounded_response(response)
+}
+
+fn symbol_backend(
+    result: &rmcp::model::CallToolResult,
+    view: &CapturedView,
+    backend: &str,
+    root: &str,
+    owner: &SymbolOwner,
+) -> Result<SavedCandidateBackend, RiftError> {
+    let global = matches!(
+        owner,
+        SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+    );
+    let Some(meta) = result.meta.as_ref().filter(|meta| {
+        ["backend", "root", "owner", "view"]
+            .iter()
+            .any(|field| meta.contains_key(*field))
+    }) else {
+        if global {
+            return Err(view_refusal(
+                &view.id,
+                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+            ));
+        }
+        return Ok(SavedCandidateBackend {
+            backend: backend.to_owned(),
+            root: root.to_owned(),
+            owner: Some(owner.clone()),
+            view: view.clone(),
+        });
+    };
+    if !global {
+        return Err(view_refusal(
+            &view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+        ));
+    }
+    global_backend(meta, view)
+}
+
+fn global_backend(
+    meta: &rmcp::model::MetaObject,
+    view: &CapturedView,
+) -> Result<SavedCandidateBackend, RiftError> {
+    let mut context = serde_json::Map::new();
+    for field in ["backend", "root", "owner", "view"] {
+        let value = meta.get(field).ok_or_else(|| {
+            view_refusal(
+                &view.id,
+                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+            )
+        })?;
+        context.insert(field.to_owned(), value.clone());
+    }
+    super::super::encode_bounded(&context, CANDIDATE_BYTES_MAX)
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    let selected: SavedCandidateBackend = serde_json::from_value(context.into())
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    if selected.backend != "global"
+        || selected.owner.is_some()
+        || selected.root.is_empty()
+        || selected.view != *view
+    {
+        return Err(view_refusal(
+            &view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+        ));
+    }
+    if super::captured_expiry(view)? <= SystemTime::now() {
+        return Err(view_refusal(
+            &view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
+        ));
+    }
+    Ok(selected)
+}
+
+fn validate_global_backend(
+    result: &rmcp::model::CallToolResult,
+    selected: &SavedCandidateBackend,
+    returned: Option<&CapturedView>,
+) -> Result<(), RiftError> {
+    if selected.backend != "global" {
+        return Ok(());
+    }
+    let Some(returned) = returned else {
+        return Ok(());
+    };
+    let meta = result.meta.as_ref().ok_or_else(|| {
+        view_refusal(
+            &selected.view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+        )
+    })?;
+    if global_backend(meta, returned)? != *selected {
+        return Err(view_refusal(
+            &selected.view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+        ));
+    }
+    Ok(())
+}
+
 fn symbol_view(result: &GetSymbolResult) -> Option<&CapturedView> {
     match result {
         GetSymbolResult::Found { view, .. } | GetSymbolResult::Missing { view, .. } => Some(view),
@@ -539,5 +698,218 @@ fn view_refusal(
             .operation("captured read")
             .view(view.as_str())
             .error(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::{CallToolResult, MetaObject};
+
+    fn owner() -> SymbolOwner {
+        SymbolOwner::Package {
+            manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
+            name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+    }
+
+    fn view() -> CapturedView {
+        CapturedView {
+            id: CapturedViewId::parse("claims.global").expect("view"),
+            expires_at: "2030-01-01T00:15:00+00:00".to_owned(),
+        }
+    }
+
+    fn response(view: &CapturedView) -> CallToolResult {
+        let mut meta = MetaObject::new();
+        meta.insert("backend".to_owned(), serde_json::json!("global"));
+        meta.insert("root".to_owned(), serde_json::json!("/fixture/global"));
+        meta.insert("owner".to_owned(), serde_json::Value::Null);
+        meta.insert("view".to_owned(), serde_json::json!(view));
+        CallToolResult::success(Vec::new()).with_meta(Some(meta))
+    }
+
+    #[test]
+    fn symbol_backend_retains_global_context_and_original_view() {
+        let view = view();
+        let mut response = response(&view);
+        response
+            .meta
+            .as_mut()
+            .expect("metadata")
+            .insert("traceparent".to_owned(), serde_json::json!("captured"));
+        let selected = symbol_backend(&response, &view, "local", "/fixture/main", &owner())
+            .expect("global context");
+        assert_eq!(selected.backend, "global");
+        assert_eq!(selected.root, "/fixture/global");
+        assert_eq!(selected.owner, None);
+        assert_eq!(selected.view, view);
+    }
+
+    #[test]
+    fn validate_global_backend_retains_original_frame_and_unavailable_without_view() {
+        let view = view();
+        let response = response(&view);
+        let selected = symbol_backend(&response, &view, "local", "/fixture/main", &owner())
+            .expect("global context");
+        assert!(validate_global_backend(&response, &selected, Some(&view)).is_ok());
+        let unavailable = CallToolResult::success(Vec::new());
+        assert!(validate_global_backend(&unavailable, &selected, None).is_ok());
+    }
+
+    #[test]
+    fn validate_global_backend_refuses_changed_endpoint_and_missing_held_metadata() {
+        let view = view();
+        let response = response(&view);
+        let selected = symbol_backend(&response, &view, "local", "/fixture/main", &owner())
+            .expect("global context");
+        let mut changed = response.clone();
+        changed
+            .meta
+            .as_mut()
+            .expect("metadata")
+            .insert("root".to_owned(), serde_json::json!("/fixture/foreign"));
+        assert!(validate_global_backend(&changed, &selected, Some(&view)).is_err());
+        let mut missing = response.clone();
+        missing.meta = None;
+        assert!(validate_global_backend(&missing, &selected, Some(&view)).is_err());
+    }
+
+    #[test]
+    fn source_backend_retains_global_context_and_refuses_changed_endpoint() {
+        let params: rift_protocol::source_read::GetSourceParams = serde_json::from_value(
+            serde_json::json!({"unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"}),
+        )
+        .expect("source request");
+        assert!(params.is_valid());
+        assert!(params.view.is_none());
+        let (owner, _) = rift_protocol::identity::parse_source_unit_identity(params.unit.as_str())
+            .expect("source owner");
+        let owner = owner.expect("released owner");
+        let view = view();
+        let response = response(&view);
+        let selected = symbol_backend(&response, &view, "local", "/fixture/main", &owner)
+            .expect("fresh global source context");
+        assert_eq!(selected.backend, "global");
+        assert_eq!(selected.owner, None);
+        assert_eq!(selected.root, "/fixture/global");
+        assert_eq!(selected.view, view);
+        let mut changed = response.clone();
+        changed
+            .meta
+            .as_mut()
+            .expect("metadata")
+            .insert("root".to_owned(), serde_json::json!("/fixture/foreign"));
+        assert!(validate_global_backend(&changed, &selected, Some(&view)).is_err());
+    }
+
+    #[test]
+    fn symbol_backend_refuses_missing_global_context() {
+        let view = view();
+        assert!(
+            symbol_backend(
+                &CallToolResult::success(Vec::new()),
+                &view,
+                "local",
+                "/fixture/main",
+                &owner(),
+            )
+            .is_err()
+        );
+        for field in ["backend", "root", "owner", "view"] {
+            let mut response = response(&view);
+            response.meta.as_mut().expect("metadata").remove(field);
+            assert!(symbol_backend(&response, &view, "local", "/fixture/main", &owner()).is_err());
+        }
+    }
+
+    #[test]
+    fn symbol_backend_refuses_changed_backend_root_owner_or_view() {
+        let view = view();
+        for (field, value) in [
+            ("backend", serde_json::json!("local")),
+            ("root", serde_json::json!("")),
+            ("owner", serde_json::json!(SymbolOwner::Local)),
+            (
+                "view",
+                serde_json::json!(CapturedView {
+                    id: CapturedViewId::parse("claims.foreign").expect("foreign view"),
+                    expires_at: view.expires_at.clone(),
+                }),
+            ),
+            (
+                "view",
+                serde_json::json!(CapturedView {
+                    id: view.id.clone(),
+                    expires_at: "2030-01-01T00:14:00+00:00".to_owned(),
+                }),
+            ),
+        ] {
+            let mut response = response(&view);
+            response
+                .meta
+                .as_mut()
+                .expect("metadata")
+                .insert(field.to_owned(), value);
+            assert!(symbol_backend(&response, &view, "local", "/fixture/main", &owner()).is_err());
+        }
+    }
+
+    #[test]
+    fn symbol_backend_refuses_expired_or_invalid_global_context() {
+        let mut expired = view();
+        expired.expires_at = "2000-01-01T00:00:00+00:00".to_owned();
+        assert!(
+            symbol_backend(
+                &response(&expired),
+                &expired,
+                "local",
+                "/fixture/main",
+                &owner()
+            )
+            .is_err()
+        );
+        let view = view();
+        let mut response = response(&view);
+        response
+            .meta
+            .as_mut()
+            .expect("metadata")
+            .insert("backend".to_owned(), serde_json::json!(false));
+        assert!(symbol_backend(&response, &view, "local", "/fixture/main", &owner()).is_err());
+    }
+
+    #[test]
+    fn symbol_backend_keeps_project_context_and_refuses_foreign_global_metadata() {
+        let view = view();
+        for (backend, owner) in [
+            ("local", SymbolOwner::Local),
+            (
+                "extra",
+                SymbolOwner::NamedLocal {
+                    name: "extra".to_owned(),
+                },
+            ),
+        ] {
+            let response = CallToolResult::success(Vec::new());
+            let selected = symbol_backend(&response, &view, backend, "/fixture/main", &owner)
+                .expect("project context");
+            assert_eq!(selected.backend, backend);
+            assert_eq!(selected.root, "/fixture/main");
+            assert_eq!(selected.owner, Some(owner.clone()));
+            assert_eq!(selected.view, view);
+            assert!(
+                symbol_backend(
+                    &self::response(&view),
+                    &view,
+                    backend,
+                    "/fixture/main",
+                    &owner
+                )
+                .is_err()
+            );
+        }
     }
 }

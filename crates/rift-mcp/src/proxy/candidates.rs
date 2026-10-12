@@ -54,14 +54,7 @@ struct SavedCandidateSearch {
     view: CapturedView,
     captured: CapturedCandidates,
 }
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SavedCandidateBackend {
-    owner: Option<SymbolOwner>,
-    backend: String,
-    root: String,
-    view: CapturedView,
-}
+use crate::global::candidates::SavedCandidateBackend;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(
@@ -826,6 +819,29 @@ mod tests {
         response.owner = SymbolOwner::Local;
         response.root = "/fixture/replaced".to_owned();
         assert!(validate_project_response("/fixture/extra", &response).is_err());
+    }
+
+    #[test]
+    fn captured_search_backend_reuses_identical_global_view_between_captures() {
+        let store = CandidateViews::default();
+        let now = SystemTime::UNIX_EPOCH;
+        let mut first = captured();
+        first.pools[1].backend = "global".to_owned();
+        first.pools[1].owner = None;
+        first.pools[1].root = first.pools[0].root.clone();
+        store.save(&params(), &first, now).expect("first capture");
+        let mut second = first.clone();
+        second.pools[0].view.id = CapturedViewId::parse("claims.second").expect("second view");
+        store.save(&params(), &second, now).expect("second capture");
+        let selected = store
+            .backend(&first.pools[1].view.id, now)
+            .expect("decode")
+            .expect("accepted")
+            .expect("backend");
+        assert_eq!(selected.backend, first.pools[1].backend);
+        assert_eq!(selected.owner, first.pools[1].owner);
+        assert_eq!(selected.root, first.pools[1].root);
+        assert_eq!(selected.view, first.pools[1].view);
     }
 
     #[test]

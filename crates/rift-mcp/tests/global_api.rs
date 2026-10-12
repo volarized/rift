@@ -362,6 +362,12 @@ async fn global_handler(
         state.hold_read().await;
         return state.response(symbols(options.symbol, &body));
     }
+    if path.ends_with("/source") {
+        return source(options.symbol, &body, &state.view).map_or_else(
+            || StatusCode::BAD_REQUEST.into_response(),
+            |answer| state.response(answer),
+        );
+    }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
@@ -635,6 +641,44 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         binding["source"] = source.clone();
     }
     json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
+}
+
+/// Reads the original collected source under its exact unit, range, and captured view.
+fn source(fixture: SymbolFixture, body: &Value, view: &Value) -> Option<Value> {
+    let request: rift_protocol::source_read::GetSourceParams =
+        serde_json::from_value(body.clone()).ok()?;
+    if !request.is_valid() {
+        return None;
+    }
+    if request
+        .view
+        .as_ref()
+        .is_some_and(|selected| Some(selected.as_str()) != view["id"].as_str())
+    {
+        return Some(json!({
+            "outcome": "unavailable", "unit": request.unit, "reason": "view_context"
+        }));
+    }
+    if request.unit.as_str() != COLLECTED_UNIT {
+        return Some(json!({"outcome": "missing", "unit": request.unit, "view": view}));
+    }
+    let text = match fixture {
+        SymbolFixture::CasePairs => CASE_SOURCE,
+        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
+    };
+    let range = request.range.unwrap_or(rift_protocol::read::TextRange {
+        start: 0,
+        end: u64::try_from(text.len()).ok()?,
+    });
+    let start = usize::try_from(range.start).ok()?;
+    let end = usize::try_from(range.end).ok()?;
+    let selected = text.get(start..end)?;
+    Some(json!({
+        "outcome": "found",
+        "source": {"span": {"unit": request.unit, "range": range}, "text": selected},
+        "source_complete": true,
+        "view": view
+    }))
 }
 
 /// The search page for `request`: in the precise phase, each collected declaration one of

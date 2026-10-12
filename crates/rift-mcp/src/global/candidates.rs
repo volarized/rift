@@ -14,6 +14,15 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const CANDIDATE_BYTES_MAX: usize = 16 * 1024 * 1024;
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SavedCandidateBackend {
+    pub(crate) owner: Option<rift_protocol::identity::SymbolOwner>,
+    pub(crate) backend: String,
+    pub(crate) root: String,
+    pub(crate) view: CapturedView,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchCandidatePool {
