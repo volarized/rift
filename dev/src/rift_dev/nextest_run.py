@@ -696,6 +696,54 @@ def controlled_arguments(arguments: Sequence[str]) -> list[str]:
     return retained
 
 
+def reuse_archive(command: Command, arguments: Sequence[str], directory: Path) -> None:
+    """Run from discovery's extracted archive and coverage environment."""
+    from rift_dev.suites import parse_coverage_environment
+
+    retained: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            retained.extend(arguments[index:])
+            break
+        name, separator, _ = argument.partition("=")
+        if name in {"--archive-file", "--archive-format", "--extract-to"}:
+            index += 1 if separator else 2
+            continue
+        if name not in {
+            "--extract-overwrite",
+            "--persist-extract-tempdir",
+            "--no-report",
+        }:
+            retained.append(argument)
+        index += 1
+
+    metadata = directory / "target/nextest"
+    cargo_metadata = metadata / "cargo-metadata.json"
+    binaries_metadata = metadata / "binaries-metadata.json"
+    if not cargo_metadata.is_file() or not binaries_metadata.is_file():
+        raise ValueError("Nextest archive metadata is missing after discovery")
+    coverage = (
+        CargoCommand("llvm-cov", "show-env", "--sh")
+        .with_environment(command.environment() or os.environ)
+        .with_env(CARGO_TARGET_DIR=str(directory))
+    )
+    command.with_env(
+        **parse_coverage_environment(coverage.output()), CARGO_TARGET_DIR=str(directory)
+    )
+    command.arguments = ["nextest", "run", *retained]
+    append_options(
+        command,
+        "--cargo-metadata",
+        str(cargo_metadata),
+        "--binaries-metadata",
+        str(binaries_metadata),
+        "--target-dir-remap",
+        str(directory / "target"),
+    )
+
+
 def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path]:
     """Discover exact identities using the same instrumented build as execution."""
     arguments = controlled_arguments(command.arguments[2:])
@@ -773,6 +821,8 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
     )
     discovery.with_timeout(RUN_SECONDS_MAX).with_output_limit(RUN_LOG_BYTES_MAX)
     discovered = TestList.model_validate_json(discovery.output_bytes(echo_stderr=False))
+    if archive_directory is not None:
+        reuse_archive(command, arguments, archive_directory)
     outcomes: dict[str, Outcome] = {}
     for suite in discovered.rust_suites.values():
         for name, test in suite.testcases.items():
