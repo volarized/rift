@@ -372,13 +372,12 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     } else {
         "/resolutions"
     };
+    let requests = fixture.requests().await;
     assert!(
-        fixture
-            .requests()
-            .await
+        requests
             .iter()
             .any(|request| request.uri.ends_with(held_route)),
-        "the deadline ends an actual held {held_route} request"
+        "the deadline ends an actual held {held_route} request: answer={answer:#}; requests={requests:#?}"
     );
     rift_tracing::info!(stage = "client.cancel", "stop stage started");
     client.cancel().await?;
