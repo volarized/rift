@@ -291,7 +291,10 @@ jobs:
           RIFT_RETAINED_MATERIAL_ROOT="$(uv run --locked --project dev rift-dev corpus sync bun)"
           export RIFT_RETAINED_MATERIAL_ROOT
           uv run --locked --project dev rift-dev test nextest run \
-            --archive-file target/fast.tar.zst --workspace-remap . \
+            --workspace-remap . \
+            --cargo-metadata target/llvm-cov-target/target/nextest/cargo-metadata.json \
+            --binaries-metadata target/llvm-cov-target/target/nextest/binaries-metadata.json \
+            --target-dir-remap target/llvm-cov-target/target \
             --profile corpus --no-tests fail --run-ignored all \
             -E 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
       - name: Preserve Rust coverage and test results
