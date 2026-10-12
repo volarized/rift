@@ -118,6 +118,7 @@
         "required": [
           "unit"
         ],
+        "rift:since": "v0.0.67",
         "type": "object"
       },
       "name": "get_source",
@@ -2027,6 +2028,13 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "outcome": "unavailable",
+            "reason": "insufficient_coverage",
+            "unit": "rift://source/project/src/lib.rs"
+          }
+        ],
         "oneOf": [
           {
             "additionalProperties": false,
@@ -2243,6 +2251,7 @@
         "required": [
           "id"
         ],
+        "rift:since": "v0.0.4",
         "type": "object"
       },
       "name": "get_symbol",
@@ -5565,6 +5574,13 @@
           }
         },
         "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "examples": [
+          {
+            "id": "rift://symbol/local/rust/app/parser/parse",
+            "outcome": "unavailable",
+            "reason": "insufficient_coverage"
+          }
+        ],
         "oneOf": [
           {
             "additionalProperties": false,

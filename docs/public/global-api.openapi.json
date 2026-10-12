@@ -5073,7 +5073,8 @@
           {
             "unit": "rift://source/project/src/lib.rs"
           }
-        ]
+        ],
+        "rift:since": "v0.0.67"
       },
       "GetSourceResult": {
         "oneOf": [
@@ -5180,7 +5181,14 @@
             "description": "The exact selection cannot establish presence or absence."
           }
         ],
-        "description": "Source bytes, definite absence, or explicit selection unavailability."
+        "description": "Source bytes, definite absence, or explicit selection unavailability.",
+        "examples": [
+          {
+            "outcome": "unavailable",
+            "reason": "insufficient_coverage",
+            "unit": "rift://source/project/src/lib.rs"
+          }
+        ]
       },
       "GetSymbolInclude": {
         "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
@@ -5248,7 +5256,8 @@
               "source"
             ]
           }
-        ]
+        ],
+        "rift:since": "v0.0.4"
       },
       "GetSymbolResult": {
         "oneOf": [
@@ -5373,7 +5382,14 @@
             "description": "The exact selection cannot establish presence or absence."
           }
         ],
-        "description": "Exactly one logical object, definite absence, or explicit selection unavailability."
+        "description": "Exactly one logical object, definite absence, or explicit selection unavailability.",
+        "examples": [
+          {
+            "id": "rift://symbol/local/rust/app/parser/parse",
+            "outcome": "unavailable",
+            "reason": "insufficient_coverage"
+          }
+        ]
       },
       "GlobalFailureClass": {
         "description": "Bounded classes a global API failure can carry in a read warning.",
