@@ -2130,6 +2130,43 @@ impl IndexContents {
         self.text_files.len()
     }
 
+    pub(crate) fn namespace_paths(
+        &self,
+        owner: &SymbolOwner,
+        limits: WorkspaceIndexLimits,
+        contains: &dyn Fn(&str) -> bool,
+        selected: &BTreeSet<ProjectPath>,
+    ) -> Result<BTreeSet<ProjectPath>, RiftError> {
+        let documents = self.files.values().map(Arc::as_ref).collect::<Vec<_>>();
+        let Some(first) = documents.first() else {
+            return Ok(BTreeSet::new());
+        };
+        let files = documents
+            .iter()
+            .map(|file| rift_analysis::PackageSource::new(file.path(), file.source()))
+            .collect::<Vec<_>>();
+        let metadata = self
+            .text_files
+            .iter()
+            .chain(&self.framework_sources)
+            .filter(|(path, _)| !self.files.contains_key(*path))
+            .map(|(_, file)| rift_analysis::PackageSource::new(file.path(), file.content()))
+            .collect::<Vec<_>>();
+        rift_analysis::NamespaceInput::workspace(
+            owner,
+            first.syntax().language(),
+            &files,
+            &metadata,
+            &[],
+            (
+                limits.files_max(),
+                u64::try_from(limits.workspace_bytes_max()).unwrap_or(u64::MAX),
+                limits.syntax(),
+            ),
+        )?
+        .namespace_paths(&documents, contains, selected)
+    }
+
     /// Holds one cataloged file a provider claims: in both maps when its syntax facts fit
     /// the provider's bounds. A file the provider refuses under one of its bounds keeps
     /// only its digests, so a capture of the tree still agrees with the index, and

@@ -475,3 +475,13 @@ mod tests {
 
 #[cfg(test)]
 mod runtime_tests;
+
+pub(crate) fn namespace_paths(
+    input: &NamespaceInput<'_>,
+    documents: &[&crate::IndexedFile],
+    contains: &dyn Fn(&str) -> bool,
+    selected: &BTreeSet<rift_core::ProjectPath>,
+    files_max: usize,
+) -> Result<BTreeSet<rift_core::ProjectPath>, rift_error::RiftError> {
+    rust::namespace_paths(input, documents, contains, selected, files_max)
+}

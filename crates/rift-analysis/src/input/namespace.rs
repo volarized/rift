@@ -340,6 +340,29 @@ impl<'input> NamespaceInput<'input> {
         self.syntax
     }
 
+    /// Returns captured Cargo targets and literal module paths needed by selected declarations.
+    ///
+    /// The supplied inventory contains paths from the same committed tree. Returned paths
+    /// request source witnesses; they do not establish object identities.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal when requested source paths exceed the input bound.
+    pub fn namespace_paths(
+        self,
+        documents: &[&crate::IndexedFile],
+        contains: &dyn Fn(&str) -> bool,
+        selected: &std::collections::BTreeSet<rift_core::ProjectPath>,
+    ) -> Result<std::collections::BTreeSet<rift_core::ProjectPath>, RiftError> {
+        self.validate_count(documents.len())?;
+        crate::analyzer::namespace::namespace_paths(
+            &self,
+            documents,
+            contains,
+            selected,
+            self.files_max,
+        )
+    }
+
     fn validate_count(self, observed: usize) -> Result<(), RiftError> {
         super::validate_source_count_at_bound(observed, self.files_max)
     }

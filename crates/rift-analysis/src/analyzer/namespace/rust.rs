@@ -179,6 +179,14 @@ fn module_children(
     directory: &str,
     inventory: &BTreeMap<&str, &super::SelectedFile<'_>>,
 ) -> Vec<(String, Vec<String>)> {
+    module_paths(file, directory, &|path| inventory.contains_key(path))
+}
+
+fn module_paths(
+    file: &super::SelectedFile<'_>,
+    directory: &str,
+    contains: &dyn Fn(&str) -> bool,
+) -> Vec<(String, Vec<String>)> {
     let syntax = file.syntax;
     let symbols = syntax
         .symbols()
@@ -263,9 +271,7 @@ fn module_children(
             };
         let admitted = candidates
             .iter()
-            .filter(|path| {
-                ProjectPath::new(path.as_str()).is_ok() && inventory.contains_key(path.as_str())
-            })
+            .filter(|path| ProjectPath::new(path.as_str()).is_ok() && contains(path.as_str()))
             .collect::<Vec<_>>();
         if let [child] = admitted.as_slice() {
             children.push(((*child).clone(), local));
@@ -417,6 +423,13 @@ fn libraries(
     input: &NamespaceInput<'_>,
     selected: &BTreeMap<&str, &super::SelectedFile<'_>>,
 ) -> Vec<(String, String)> {
+    library_roots(input, &|path| selected.contains_key(path))
+}
+
+fn library_roots(
+    input: &NamespaceInput<'_>,
+    contains: &dyn Fn(&str) -> bool,
+) -> Vec<(String, String)> {
     let mut libraries = BTreeMap::new();
     for source in input.files().iter().chain(input.context_sources()) {
         let manifest = source.path().as_str();
@@ -456,7 +469,7 @@ fn libraries(
                 };
                 ProjectPath::new(path).ok()
             })
-            .filter(|root| selected.contains_key(root.as_str()))
+            .filter(|root| contains(root.as_str()))
             .map(|root| root.as_str().to_owned());
         match libraries.entry(name) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -722,3 +735,79 @@ fn local_target<'input>(
 
 #[cfg(test)]
 mod tests;
+
+pub(super) fn namespace_paths(
+    input: &NamespaceInput<'_>,
+    documents: &[&crate::IndexedFile],
+    contains: &dyn Fn(&str) -> bool,
+    selected: &std::collections::BTreeSet<ProjectPath>,
+    files_max: usize,
+) -> Result<std::collections::BTreeSet<ProjectPath>, rift_error::RiftError> {
+    let mut paths = std::collections::BTreeSet::new();
+    let reaches = |path: &str, directory: &str| {
+        selected.iter().any(|selected| {
+            selected.as_str() == path
+                || directory.is_empty()
+                || selected
+                    .as_str()
+                    .strip_prefix(directory)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    };
+    let mut insert = |path: String| -> Result<(), rift_error::RiftError> {
+        let Ok(path) = ProjectPath::new(path) else {
+            return Ok(());
+        };
+        if !paths.contains(&path) && paths.len() >= files_max {
+            return rift_error::errors::analysis::package_input_too_many_files()
+                .field("package_files_max")
+                .bound(u64::try_from(files_max).unwrap_or(u64::MAX))
+                .observed(u64::try_from(paths.len().saturating_add(1)).unwrap_or(u64::MAX))
+                .fail();
+        }
+        paths.insert(path);
+        Ok(())
+    };
+    let roots = library_roots(input, contains);
+    let root_paths = roots
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (path, _) in &roots {
+        let directory = path.rsplit_once('/').map_or("", |(directory, _)| directory);
+        if reaches(path, directory) {
+            insert(path.clone())?;
+        }
+    }
+    for document in documents {
+        if document.syntax().language().name != "rust" {
+            continue;
+        }
+        let path = document.path().as_str();
+        let directory = if let Some(directory) = path.strip_suffix("/mod.rs") {
+            directory
+        } else if root_paths.contains(path) {
+            path.rsplit_once('/').map_or("", |(directory, _)| directory)
+        } else {
+            path.strip_suffix(".rs").unwrap_or(path)
+        };
+        for (path, _) in module_paths(
+            &super::SelectedFile {
+                path: document.path(),
+                source: document.source(),
+                syntax: document.syntax(),
+            },
+            directory,
+            contains,
+        ) {
+            let directory = path
+                .strip_suffix("/mod.rs")
+                .or_else(|| path.strip_suffix(".rs"))
+                .unwrap_or(&path);
+            if reaches(&path, directory) {
+                insert(path)?;
+            }
+        }
+    }
+    Ok(paths)
+}
