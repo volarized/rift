@@ -652,7 +652,9 @@ mod tests {
                 .filter(|subcommand| !subcommand.is_hide_set())
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "server", "update", "install", "steer", "help"]
+            [
+                "config", "mcp", "server", "update", "install", "steer", "help"
+            ]
         );
     }
 

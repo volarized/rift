@@ -137,6 +137,7 @@ fn replacement(
             let ending = line_ending(raw);
             Ok((0..0, format!("telemetry.disabled = {disabled}{ending}")))
         }
+        Item::Table(table) if table.is_implicit() => Ok(append_table(raw, disabled)),
         Item::Table(table) => match table.span() {
             Some(header) => {
                 let line = lines_inclusive(&raw[header.start..])
@@ -316,7 +317,16 @@ mod tests {
         ] {
             let changed = edit(Path::new("rift.toml"), original, true).expect("accepted table");
             let accepted = Document::parse(changed.as_str()).expect("valid rendered TOML");
-            assert_eq!(accepted["telemetry"]["disabled"].as_bool(), Some(true));
+            assert_eq!(
+                accepted
+                    .as_table()
+                    .get("telemetry")
+                    .and_then(Item::as_table_like)
+                    .and_then(|table| table.get("disabled"))
+                    .and_then(Item::as_bool),
+                Some(true),
+                "original={original:?}; changed={changed:?}"
+            );
             assert!(changed.contains("# choice") || !original.contains("# choice"));
         }
     }
