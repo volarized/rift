@@ -8,6 +8,8 @@ mod fake_engine;
 )]
 mod global_api;
 mod hermetic_search;
+#[path = "python_runtime/environment.rs"]
+mod python_runtime_environment;
 // This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
@@ -1262,12 +1264,13 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
          [languages.python.lsp]\nembedded = \"ty\"\n",
         global.endpoint
     );
-    let (_directory, client, _server_task) = workspace_client::served_workspace(
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
         &[("pyproject.toml", "[build-system]\nrequires=[\"setuptools==80.9.0\"]\nbuild-backend=\"setuptools.build_meta\"\n[tool.setuptools]\npy-modules=[\"caller\"]\n"), (
             "caller.py",
             "import json\n\n\ndef caller() -> int:\n    return len(json.dumps(1))\n",
         )],
         Some(configuration),
+        python_runtime_environment::prepare,
     )
     .await?;
     let validators = tool_validators(&client.list_all_tools().await?)?;
@@ -1297,7 +1300,9 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         .collect();
     assert_eq!(
         units,
-        [&json!("rift://source/stdlib/python@3.12.9/builtins.pyi")],
+        [&json!(global_api::named_unit(
+            &global_api::NAMED_POSITIONS[0]
+        ))],
         "{structured:#}"
     );
     assert_eq!(

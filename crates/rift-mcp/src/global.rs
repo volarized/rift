@@ -453,6 +453,7 @@ pub(crate) async fn callee_declarations(
 ) -> Result<CalleeDeclarations, RiftError> {
     use rift_protocol::source_read::DeclarationPositionResult;
     let mut named = HashMap::new();
+    let mut sources = HashMap::new();
     let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
     for mut request in declaration_requests(callees) {
         request.view = selected.as_ref().map(|view| view.id.clone());
@@ -484,11 +485,19 @@ pub(crate) async fn callee_declarations(
         };
         for result in answer.results {
             let DeclarationPositionResult::Found {
-                position, id, kind, ..
+                position,
+                id,
+                kind,
+                view,
+                ..
             } = result
             else {
                 continue;
             };
+            if !captured_callee_source(client, callees, &position, &id, &view, &mut sources).await?
+            {
+                continue;
+            }
             let key = CalleePosition {
                 unit: position.unit.as_str().to_owned(),
                 line: position.line,
@@ -501,6 +510,78 @@ pub(crate) async fn callee_declarations(
         }
     }
     Ok(CalleeDeclarations { named })
+}
+
+async fn captured_callee_source(
+    client: &GlobalClient,
+    callees: &[PackageCallee],
+    position: &rift_protocol::source_read::SourcePosition,
+    id: &SymbolId,
+    view: &rift_protocol::symbol_read::CapturedView,
+    sources: &mut HashMap<String, bool>,
+) -> Result<bool, RiftError> {
+    for callee in callees {
+        let Some(held) = callee.captured_source() else {
+            continue;
+        };
+        let Some(origin) = callee_origin(callee) else {
+            continue;
+        };
+        let Ok(unit) = rift_core::SourceUnitId::for_origin(&origin, callee.path()) else {
+            continue;
+        };
+        let unit = rift_protocol::read::SourceUnitId(unit.to_string());
+        if unit.0 != position.unit.as_str() {
+            continue;
+        }
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(id.as_str());
+        let CalleePackage::Runtime(runtime) = callee.package() else {
+            return Ok(false);
+        };
+        if parsed
+            .ok()
+            .is_none_or(|identity| runtime.owner().ok().as_ref() != Some(identity.owner()))
+        {
+            return Ok(false);
+        }
+        let request = rift_protocol::source_read::GetSourceParams {
+            unit: position.unit.clone(),
+            range: None,
+            rev: None,
+            view: Some(view.id.clone()),
+        };
+        if let Some(matched) = sources.get(position.unit.as_str()) {
+            return Ok(*matched);
+        }
+        let answer = client.get_source(&request).await?;
+        let matched = captured_source_matches(&answer, &position.unit, view, held);
+        sources.insert(position.unit.as_str().to_owned(), matched);
+        return Ok(matched);
+    }
+    Ok(true)
+}
+
+fn captured_source_matches(
+    answer: &rift_protocol::source_read::GetSourceResult,
+    unit: &rift_protocol::read::SourceUnitId,
+    view: &rift_protocol::symbol_read::CapturedView,
+    held: &str,
+) -> bool {
+    let rift_protocol::source_read::GetSourceResult::Found {
+        source,
+        source_complete,
+        view: returned,
+        ..
+    } = answer
+    else {
+        return false;
+    };
+    *source_complete
+        && returned == view
+        && source.span.unit == *unit
+        && source.span.range.start == 0
+        && usize::try_from(source.span.range.end).ok() == Some(held.len())
+        && source.text == held
 }
 
 /// The requests asking for `callees`' positions: one per position encoding, each within
@@ -2908,5 +2989,59 @@ mod tests {
         assert_eq!(refused_codes.len(), bound + 1, "{refused_codes:?}");
         assert_eq!(refused_codes[0], "global_api_unavailable");
         assert_eq!(refused_codes[1..], answered_codes[..]);
+    }
+}
+
+#[cfg(test)]
+mod captured_runtime_tests {
+    use super::captured_source_matches;
+    use rift_protocol::source_read::GetSourceResult;
+    use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
+
+    #[test]
+    fn runtime_stub_source_requires_complete_exact_bytes_and_view() {
+        let view: CapturedView = serde_json::from_value(serde_json::json!({
+            "id": "cv:runtime", "expires_at": "2099-01-01T00:00:00Z"
+        }))
+        .expect("captured view");
+        let unit = serde_json::from_value(serde_json::json!(
+            "rift://source/stdlib/cpython@3.12.3/builtins.pyi"
+        ))
+        .expect("runtime source unit");
+        let mut value = serde_json::json!({
+            "outcome": "found", "source_complete": true, "view": view,
+            "source": {"span": {"unit": unit, "range": {"start": 0, "end": 4}}, "text": "stub"}
+        });
+        let answer: GetSourceResult = serde_json::from_value(value.clone()).expect("source answer");
+        assert!(captured_source_matches(&answer, &unit, &view, "stub"));
+        assert!(!captured_source_matches(&answer, &unit, &view, "other"));
+        let mut wrong = value.clone();
+        wrong["source"]["span"]["unit"] =
+            serde_json::json!("rift://source/stdlib/cpython@3.11.3/builtins.pyi");
+        let answer = serde_json::from_value(wrong).expect("different source owner");
+        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+        let mut wrong = value.clone();
+        wrong["source"]["span"]["range"] = serde_json::json!({"start": 1, "end": 5});
+        let answer = serde_json::from_value(wrong).expect("different source range");
+        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+        value["source_complete"] = serde_json::json!(false);
+        let answer = serde_json::from_value(value.clone()).expect("partial source");
+        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+        value["source_complete"] = serde_json::json!(true);
+        value["view"]["id"] = serde_json::json!("cv:other");
+        let answer = serde_json::from_value(value).expect("other view");
+        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+        for reason in [
+            SymbolUnavailableReason::ViewExpired,
+            SymbolUnavailableReason::InsufficientCoverage,
+        ] {
+            let answer = GetSourceResult::Unavailable {
+                unit: unit.clone(),
+                view: Some(view.clone()),
+                reason,
+                warnings: Vec::new(),
+            };
+            assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+        }
     }
 }

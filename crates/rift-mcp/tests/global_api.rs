@@ -14,6 +14,9 @@
 //! [`NAMED_POSITIONS`] lists at a position in their files, as the declaration endpoint does
 //! for the callees an outgoing walk meets.
 
+#[path = "python_runtime.rs"]
+pub(crate) mod python_runtime;
+
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -75,9 +78,10 @@ pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
 /// The prose query the fixture answers only in the broad phase, in full-text order.
 pub(crate) const BROAD_BODY_MATCH_QUERY: &str = "network handshake";
 
-/// The Python standard library release a Python collection holds: every `stdlib/python`
+/// The Python standard library release a Python collection holds: every `stdlib/cpython`
 /// entry resolves to it, as the nearest release when it names another.
-pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) = ("stdlib", "python", "3.12.9");
+pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) =
+    ("stdlib", "cpython", python_runtime::VERSION);
 
 /// The `pypi` release a Python collection holds, whose `greeting/core.py` declares `greet`
 /// on its first line.
@@ -659,13 +663,15 @@ fn source(fixture: SymbolFixture, body: &Value, view: &Value) -> Option<Value> {
             "outcome": "unavailable", "unit": request.unit, "reason": "view_context"
         }));
     }
-    if request.unit.as_str() != COLLECTED_UNIT {
+    let runtime_unit = named_unit(&NAMED_POSITIONS[0]);
+    if request.unit.as_str() != COLLECTED_UNIT && request.unit.as_str() != runtime_unit {
         return Some(json!({"outcome": "missing", "unit": request.unit, "view": view}));
     }
-    let text = match fixture {
+    let runtime_source = (request.unit.as_str() == runtime_unit).then(python_runtime::builtins);
+    let text = runtime_source.as_deref().unwrap_or(match fixture {
         SymbolFixture::CasePairs => CASE_SOURCE,
         SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
-    };
+    });
     let range = request.range.unwrap_or(rift_protocol::read::TextRange {
         start: 0,
         end: u64::try_from(text.len()).ok()?,

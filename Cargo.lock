@@ -4803,6 +4803,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-service",
+ "ty_vendored",
  "windows-spawn",
 ]
 
@@ -4933,6 +4934,7 @@ dependencies = [
  "ty_ide",
  "ty_project",
  "ty_python_core",
+ "ty_site_packages",
  "url",
  "which",
  "windows-spawn",

@@ -333,11 +333,81 @@ fn initialize_result() -> Value {
 struct TreeDatabase {
     database: ProjectDatabase,
     environment: TreeEnvironment,
+    runtime: Option<(rift_protocol::read::RuntimeIdentity, SystemPathBuf)>,
 }
 
 /// The process-wide database cache, keyed by canonical tree root: one
 /// workspace server serves one tree, and a replaced session reuses the
 /// database its predecessor built.
+fn captured_python_runtime(
+    metadata: &ProjectMetadata,
+    root: &SystemPath,
+    system: &HermeticSystem,
+) -> Option<(rift_protocol::read::RuntimeIdentity, SystemPathBuf)> {
+    let merged = metadata.to_merged_options();
+    let configured = merged.options().environment.as_ref()?.python.as_ref()?;
+    let path = configured.absolute(root, system);
+    let mut inputs = FilesystemInputs::new(ResolutionPolicy::default());
+    let before = rift_dependency::python_environment_runtime(path.as_std_path(), &mut inputs)?;
+    let environment = ty_site_packages::PythonEnvironment::new(
+        &path,
+        ty_site_packages::SysPrefixPathOrigin::PythonCliFlag,
+        system,
+    )
+    .ok()?;
+    environment.real_stdlib_path(system).ok()?;
+    let after = rift_dependency::python_environment_runtime(path.as_std_path(), &mut inputs)?;
+    (before == after).then_some((before, path))
+}
+
+/// Holds the selected embedded stub and the observed exact runtime together.
+pub(crate) fn python_standard_library(
+    root: &Path,
+    path: &rift_core::ProjectPath,
+) -> Option<(rift_protocol::read::RuntimeIdentity, Arc<str>)> {
+    with_tree(root, |tree, _| {
+        let Some((runtime, environment)) = tree.runtime.as_ref() else {
+            return Ok(None);
+        };
+        let mut inputs = FilesystemInputs::new(ResolutionPolicy::default());
+        if rift_dependency::python_environment_runtime(environment.as_std_path(), &mut inputs)
+            .as_ref()
+            != Some(runtime)
+        {
+            return Ok(None);
+        }
+        let version = semver::Version::parse(&runtime.version).ok();
+        let program = tree.database.project().program(&tree.database);
+        let selected = program.python_version(&tree.database);
+        if version.is_none_or(|version| {
+            version.major != u64::from(selected.major) || version.minor != u64::from(selected.minor)
+        }) {
+            return Ok(None);
+        }
+        if program.custom_stdlib_search_path(&tree.database).is_some() {
+            return Ok(None);
+        }
+        let file = ruff_db::files::vendored_path_to_file(
+            &tree.database,
+            format!("stdlib/{}", path.as_str()),
+        )
+        .ok();
+        let Some(file) = file else {
+            return Ok(None);
+        };
+        let source = source_text(&tree.database, file);
+        let bound = rift_protocol::dependencies::DependenciesCollectionConfiguration::default()
+            .project_size
+            .bytes();
+        if u64::try_from(source.as_str().len()).map_or(true, |length| length > bound) {
+            return Ok(None);
+        }
+        Ok(Some((runtime.clone(), Arc::from(source.as_str()))))
+    })
+    .ok()
+    .flatten()
+}
+
 fn databases() -> &'static Mutex<HashMap<PathBuf, TreeDatabase>> {
     static DATABASES: OnceLock<Mutex<HashMap<PathBuf, TreeDatabase>>> = OnceLock::new();
     DATABASES.get_or_init(Mutex::default)
@@ -357,6 +427,13 @@ fn with_database<T>(
     tree_root: &Path,
     answer: impl FnOnce(&mut ProjectDatabase, &Path) -> Result<T, AnswerRefusal>,
 ) -> Result<T, AnswerRefusal> {
+    with_tree(tree_root, |tree, root| answer(&mut tree.database, root))
+}
+
+fn with_tree<T>(
+    tree_root: &Path,
+    answer: impl FnOnce(&mut TreeDatabase, &Path) -> Result<T, AnswerRefusal>,
+) -> Result<T, AnswerRefusal> {
     let root = tree_root.canonicalize().map_err(|error| {
         AnswerRefusal::Invalid(format!("tree root {}: {error}", tree_root.display()))
     })?;
@@ -372,7 +449,7 @@ fn with_database<T>(
         }
         Entry::Vacant(entry) => entry.insert(TreeDatabase::built(&root, environment)?),
     };
-    answer(&mut tree.database, &root)
+    answer(tree, &root)
 }
 
 impl TreeDatabase {
@@ -398,11 +475,13 @@ impl TreeDatabase {
         if let Some(options) = environment.options(&system_root) {
             metadata.apply_fallback_options(options);
         }
+        let runtime = captured_python_runtime(&metadata, &system_root, &system);
         let database = ProjectDatabase::fallible(metadata, system)
             .map_err(|error| AnswerRefusal::Invalid(format!("ty database: {error}")))?;
         Ok(Self {
             database,
             environment,
+            runtime,
         })
     }
 }
@@ -1684,5 +1763,111 @@ mod tests {
             offset_at(text, &serde_json::json!({ "line" : 9, "character": 0 })).is_err(),
             "a position past the document refuses"
         );
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    fn environment(implementation: &str, version: &str) -> tempfile::TempDir {
+        let directory = tempfile::tempdir().expect("runtime tree");
+        let root = directory.path();
+        let home = root.join("base/bin");
+        std::fs::create_dir_all(&home).expect("runtime home");
+        std::fs::write(home.join("python3.12"), "").expect("interpreter file");
+        std::fs::create_dir_all(root.join("base/lib/python3.12")).expect("runtime library");
+        std::fs::create_dir_all(root.join("base/Lib")).expect("runtime library");
+        std::fs::create_dir_all(home.join("Lib")).expect("runtime library");
+        std::fs::create_dir_all(root.join(".venv/lib/python3.12/site-packages"))
+            .expect("selected environment packages");
+        std::fs::create_dir_all(root.join(".venv/Lib/site-packages"))
+            .expect("selected environment packages");
+        std::fs::write(
+            root.join(".venv/pyvenv.cfg"),
+            format!(
+                "home = {}\nimplementation = {implementation}\nversion_info = {version}\n",
+                home.display(),
+            ),
+        )
+        .expect("runtime metadata");
+        std::fs::write(
+            root.join("pyproject.toml"),
+            "[project]\nname = \"runtime-test\"\nversion = \"0.0.1\"\n[tool.ty.environment]\npython = \".venv\"\n",
+        )
+        .expect("project marker");
+        directory
+    }
+
+    #[test]
+    fn captured_python_runtime_keeps_exact_version_and_original_stub() {
+        let tree = environment("CPython", "3.12.3");
+        let path = rift_core::ProjectPath::new("builtins.pyi").expect("stub path");
+        let (runtime, source) =
+            python_standard_library(tree.path(), &path).expect("observed runtime");
+        assert_eq!(runtime.runtime, "cpython");
+        assert_eq!(runtime.version, "3.12.3");
+        assert!(source.contains("def len("));
+        assert_eq!(
+            python_standard_library(tree.path(), &path),
+            Some((runtime, source))
+        );
+    }
+
+    #[test]
+    fn captured_python_runtime_refuses_other_or_partial_metadata() {
+        let path = rift_core::ProjectPath::new("builtins.pyi").expect("stub path");
+        for (implementation, version) in [("PyPy", "3.12.3"), ("CPython", "3.12")] {
+            let tree = environment(implementation, version);
+            assert!(python_standard_library(tree.path(), &path).is_none());
+        }
+    }
+
+    #[test]
+    fn captured_python_runtime_refuses_missing_conflicting_and_stale_markers() {
+        use std::io::Write as _;
+
+        let path = rift_core::ProjectPath::new("builtins.pyi").expect("stub path");
+        let tree = environment("CPython", "3.12.3");
+        std::fs::remove_file(tree.path().join(".venv/pyvenv.cfg")).expect("marker removal");
+        assert!(python_standard_library(tree.path(), &path).is_none());
+        for extra in ["version_info = 3.12.4\n", "version = 3.12.4\n"] {
+            let tree = environment("CPython", "3.12.3");
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(tree.path().join(".venv/pyvenv.cfg"))
+                .expect("marker")
+                .write_all(extra.as_bytes())
+                .expect("conflicting marker");
+            assert!(python_standard_library(tree.path(), &path).is_none());
+        }
+        let tree = environment("CPython", "3.12.3");
+        assert!(python_standard_library(tree.path(), &path).is_some());
+        with_tree(tree.path(), |held, _| {
+            held.runtime.as_mut().expect("captured runtime").0.version = "3.12.4".to_owned();
+            Ok(())
+        })
+        .expect("held metadata");
+        assert!(python_standard_library(tree.path(), &path).is_none());
+    }
+
+    #[test]
+    fn captured_python_runtime_refuses_different_analysis_version_and_custom_stubs() {
+        let path = rift_core::ProjectPath::new("builtins.pyi").expect("stub path");
+        let tree = environment("CPython", "3.12.3");
+        std::fs::write(
+            tree.path().join("ty.toml"),
+            "[environment]\npython = \".venv\"\npython-version = \"3.11\"\n",
+        )
+        .expect("configured analysis version");
+        assert!(python_standard_library(tree.path(), &path).is_none());
+        let custom = environment("CPython", "3.12.3");
+        std::fs::create_dir_all(custom.path().join("stubs/stdlib")).expect("custom stubs");
+        std::fs::write(
+            custom.path().join("ty.toml"),
+            "[environment]\npython = \".venv\"\ntypeshed = \"stubs\"\n",
+        )
+        .expect("custom selection");
+        assert!(python_standard_library(custom.path(), &path).is_none());
     }
 }

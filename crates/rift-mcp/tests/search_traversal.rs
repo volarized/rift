@@ -24,6 +24,8 @@ mod global_api;
 mod hermetic_search;
 #[path = "../../rift-lsp/tests/live_engine_gate.rs"]
 mod live_engine_gate;
+#[path = "python_runtime/environment.rs"]
+mod python_runtime_environment;
 #[cfg(unix)]
 #[path = "../../rift-lsp/tests/typescript_install.rs"]
 mod typescript_install;
@@ -1760,8 +1762,12 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
 {
     let fixture = python_global_api().await?;
     let configuration = format!("{}\n{OUTGOING_ENGINE}", global_table(&fixture.endpoint));
-    let (_directory, client, _server_task) =
-        served_workspace(OUTGOING_FILES, Some(configuration)).await?;
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        OUTGOING_FILES,
+        Some(configuration),
+        python_runtime_environment::prepare,
+    )
+    .await?;
 
     let counted = call_retrying_acceptance(
         &client,
@@ -1811,6 +1817,24 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         positions[0]["unit"],
         json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
     );
+
+    let source_requests: Vec<Value> = fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.ends_with("/source"))
+        .filter_map(|request| request.body)
+        .collect();
+    assert_eq!(
+        source_requests.len(),
+        1,
+        "one original stub read: {source_requests:?}"
+    );
+    assert_eq!(
+        source_requests[0]["unit"],
+        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
+    );
+    assert!(source_requests[0]["view"].is_string());
 
     client.cancel().await?;
     Ok(())
@@ -2016,8 +2040,12 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
         "{}\n{OUTGOING_ENGINE}",
         global_table(&format!("http://127.0.0.1:{port}/rift/rest"))
     );
-    let (_directory, client, _server_task) =
-        served_workspace(OUTGOING_FILES, Some(configuration)).await?;
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        OUTGOING_FILES,
+        Some(configuration),
+        python_runtime_environment::prepare,
+    )
+    .await?;
 
     let counted = call_retrying_acceptance(
         &client,
@@ -2061,8 +2089,12 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
     })
     .await?;
     let configuration = format!("{}\n{OUTGOING_ENGINE}", global_table(&fixture.endpoint));
-    let (_directory, client, _server_task) =
-        served_workspace(OUTGOING_FILES, Some(configuration)).await?;
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        OUTGOING_FILES,
+        Some(configuration),
+        python_runtime_environment::prepare,
+    )
+    .await?;
 
     let counted = call_retrying_acceptance(
         &client,

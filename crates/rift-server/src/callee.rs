@@ -345,6 +345,7 @@ pub struct PackageCallee {
     position: Position,
     encoding: PositionEncoding,
     name: String,
+    captured_source: Option<Arc<str>>,
 }
 
 /// The declaration the global API named at one package callee's position.
@@ -360,6 +361,11 @@ pub struct CalleeDeclaration {
 }
 
 impl PackageCallee {
+    /// Complete embedded stub bytes held with the observed runtime owner.
+    #[must_use]
+    pub fn captured_source(&self) -> Option<&str> {
+        self.captured_source.as_deref()
+    }
     /// The package holding the callee.
     #[must_use]
     pub const fn package(&self) -> &CalleePackage {
@@ -496,9 +502,25 @@ pub(crate) fn callee_file(
             position: call.position,
             encoding: call.encoding,
             name: call.name.to_owned(),
+            captured_source: None,
         })
     };
     if let Some(stub) = call.uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
+        if let Ok(path) = ProjectPath::new(stub) {
+            let mut captures = trees
+                .iter()
+                .filter_map(|root| crate::embedded::python_standard_library(root, &path));
+            if let Some((runtime, source)) = captures.next() {
+                if captures.any(|other| other != (runtime.clone(), Arc::clone(&source))) {
+                    return Ok(CalleeFile::Unaddressed);
+                }
+                if let CalleeFile::Package(mut callee) = held(CalleePackage::Runtime(runtime), path)
+                {
+                    callee.captured_source = Some(source);
+                    return Ok(CalleeFile::Package(callee));
+                }
+            }
+        }
         return Ok(
             ProjectPath::new(stub).map_or(CalleeFile::Unaddressed, |path| {
                 held(
@@ -922,6 +944,7 @@ mod tests {
             },
             encoding: PositionEncoding::Utf16,
             name: "greet".to_owned(),
+            captured_source: None,
         }
     }
 
