@@ -2636,7 +2636,30 @@ mod tests {
         });
         let files = vec![("pkg/a.py", source.as_str()), ("pkg/b.py", source.as_str())];
         let raised = rift_syntax::SyntaxLimits::new(8 << 20, 4_000_000, 512).expect("bounds");
-        let Err(error) = package_result(ShippedLanguage::Python, files, Some(raised)) else {
+        let mut parsed: Option<crate::PackageSyntax> = None;
+        let mut provider_calls = 0;
+        let mut reused_files = 0;
+        let result = super::fixture::package_result_with_syntax(
+            ShippedLanguage::Python,
+            files,
+            Some(raised),
+            None,
+            |source| {
+                if let Some(syntax) = &parsed {
+                    assert!(source.accepts(syntax));
+                    reused_files += 1;
+                    return Some(syntax.clone());
+                }
+                let syntax = source.parse().expect("fixture syntax");
+                assert_eq!(syntax.facts().symbols().len(), per_file);
+                provider_calls += 1;
+                parsed = Some(syntax.clone());
+                Some(syntax)
+            },
+        );
+        assert_eq!(provider_calls, 1);
+        assert_eq!(reused_files, 1);
+        let Err(error) = result else {
             panic!("a package past the declaration bound must be refused");
         };
         assert_eq!(
