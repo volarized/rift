@@ -1,5 +1,6 @@
 import { GithubLogoIcon } from "@phosphor-icons/react/dist/ssr";
 import { HomeLayout } from "fumadocs-ui/layouts/home";
+import Link from "next/link";
 
 import { baseOptions } from "@/lib/layout.shared";
 
@@ -27,6 +28,14 @@ export default function Layout({ children }: LayoutProps<"/">) {
           >
             Contact us
           </a>
+        </div>
+        <div className="mx-auto flex max-w-190 justify-center gap-6 px-6 pb-6 font-mono text-[11px] text-muted-foreground">
+          <Link className="underline underline-offset-2 hover:text-foreground" href="/docs/privacy">
+            Privacy
+          </Link>
+          <Link className="underline underline-offset-2 hover:text-foreground" href="/impressum">
+            Impressum
+          </Link>
         </div>
       </footer>
     </HomeLayout>
