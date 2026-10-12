@@ -153,7 +153,7 @@ syn = { version = "2.0.119", features = ["full"] }
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
 tokio = { version = "=1.53.2", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "=0.7.19", features = ["rt"] }
+tokio-util = { version = "=0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
