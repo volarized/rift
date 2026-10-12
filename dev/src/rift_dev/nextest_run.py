@@ -304,7 +304,15 @@ class ArtifactStore:
     def write(
         self, evidence: LogEvidence | SpanEvidence | MetricEvidence | RequestEvidence
     ) -> None:
-        data = EVIDENCE.dump_json(evidence) + b"\n"
+        excluded = None
+        if (
+            isinstance(evidence, MetricEvidence)
+            and evidence.record.count is None
+            and not evidence.record.bounds
+            and not evidence.record.bucket_counts
+        ):
+            excluded = {"record": {"count", "bounds", "bucket_counts"}}
+        data = EVIDENCE.dump_json(evidence, exclude=excluded) + b"\n"
         with self.lock:
             self.received += 1
             self.received_bytes += len(data)
