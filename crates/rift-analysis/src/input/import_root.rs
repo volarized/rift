@@ -11,6 +11,9 @@ pub const PACKAGE_IMPORT_ENTRIES_MAX: usize = 64;
 /// Maximum aggregate UTF-8 bytes in retained import roots and module names.
 pub const PACKAGE_IMPORT_BYTES_MAX: usize = 65_536;
 
+/// Runtime names accepted for a selected Python standard library.
+const PYTHON_RUNTIME_NAMES: [&str; 2] = ["python", "cpython"];
+
 /// Captured metadata that establishes an installed Python import root.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageImportRootOrigin {
@@ -84,6 +87,7 @@ impl PackageImportRoot {
     /// The caller supplies the prefix admitted from the verified runtime archive.
     /// `None` names the selected library root after acquisition removed its archive prefix.
     /// Input validation requires the same owner and an admitted Python source under this root.
+    /// `python` and `cpython` retain their supplied runtime names.
     ///
     /// # Errors
     /// Returns the existing identity refusal for a different runtime, invalid version,
@@ -94,7 +98,7 @@ impl PackageImportRoot {
                 .cause(source)
                 .error()
         })?;
-        if !matches!(&owner, SymbolOwner::Runtime { runtime, .. } if runtime == "python")
+        if !matches!(&owner, SymbolOwner::Runtime { runtime, .. } if PYTHON_RUNTIME_NAMES.contains(&runtime.as_str()))
             || prefix.as_ref().is_some_and(|path| path.as_str().is_empty())
         {
             return invalid();

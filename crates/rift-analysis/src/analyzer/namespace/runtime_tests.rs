@@ -7,8 +7,12 @@ use crate::{
 };
 
 fn runtime(version: &str) -> (SymbolOwner, ContributionOrigin) {
+    python_runtime("python", version)
+}
+
+fn python_runtime(name: &str, version: &str) -> (SymbolOwner, ContributionOrigin) {
     let runtime = RuntimeIdentity {
-        runtime: "python".to_owned(),
+        runtime: name.to_owned(),
         version: version.to_owned(),
     };
     let owner = runtime.owner().expect("exact runtime owner");
@@ -24,7 +28,16 @@ fn runtime(version: &str) -> (SymbolOwner, ContributionOrigin) {
 
 #[test]
 fn runtime_library_root_preserves_original_sources_and_logical_owner() {
-    let (owner, origin) = runtime("3.14.7");
+    assert_runtime_library_root("python");
+}
+
+#[test]
+fn cpython_library_root_preserves_original_sources_and_logical_owner() {
+    assert_runtime_library_root("cpython");
+}
+
+fn assert_runtime_library_root(name: &str) {
+    let (owner, origin) = python_runtime(name, "3.14.7");
     let language = rift_syntax::ShippedLanguage::Python.language();
     let path = ProjectPath::new("json/__init__.py").expect("original selected path");
     let text = "def dumps(obj):\n    return str(obj)\n\ndef loads(text):\n    return text\n";
@@ -47,15 +60,15 @@ fn runtime_library_root_preserves_original_sources_and_logical_owner() {
     assert_eq!(publication.units[0].source, text);
     assert!(publication.units[0].source_complete);
     assert_eq!(publication.objects.len(), 2);
-    for name in ["dumps", "loads"] {
+    for declaration_name in ["dumps", "loads"] {
         let object = publication
             .objects
             .iter()
-            .find(|object| object.name == name)
+            .find(|object| object.name == declaration_name)
             .expect("original declaration");
         assert_eq!(
             object.id.as_ref().expect("canonical runtime object").0,
-            format!("rift://symbol/stdlib/python@3.14.7/python/json/{name}")
+            format!("rift://symbol/stdlib/{name}@3.14.7/python/json/{declaration_name}")
         );
         assert!(
             publication
@@ -138,6 +151,35 @@ fn runtime_root_refuses_foreign_owner_language_and_unselected_prefix() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn python_runtime_names_cannot_transfer_layout_authority() {
+    let language = rift_syntax::ShippedLanguage::Python.language();
+    let path = ProjectPath::new("json/__init__.py").expect("original selected path");
+    let files = [PackageSource::new(&path, "def dumps(obj): return obj\n")];
+    for (name, other) in [("python", "cpython"), ("cpython", "python")] {
+        let (owner, origin) = python_runtime(name, "3.14.7");
+        let roots = [
+            PackageImportRoot::runtime(python_runtime(other, "3.14.7").0, None)
+                .expect("other runtime layout"),
+        ];
+        let input = ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &files,
+            ExactPackageLimits::new(1, 1024),
+        )
+        .expect("original selected source");
+        let error = input
+            .with_import_roots(&roots)
+            .expect_err("different runtime name cannot transfer authority");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.analysis.package_input_identity_invalid"
+        );
+    }
 }
 
 #[test]
