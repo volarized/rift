@@ -1,11 +1,11 @@
 ---
 name: rift
-description: Use when finding or reading code in a workspace Rift serves: structured search across declarations and source text, symbol reads by exact name, and syntax inspection.
+description: Use when finding or reading code in a workspace Rift serves: structured search across declarations and source text, symbol reads by exact identity, and syntax inspection.
 ---
 
 # Rift
 
-Rift indexes this workspace's source and serves it over MCP: structured search, symbol reads by exact name, and syntax inspection.
+Rift indexes this workspace's source and serves it over MCP: structured search, symbol reads by exact identity, and syntax inspection.
 
 Rift writes no source: apply a change with your own edit tools.
 
@@ -17,9 +17,9 @@ Start an unfamiliar repository at `rift://map`; it names the served languages an
 | --- | --- |
 | The target is unknown. | `search` |
 | Every match of a regex in the project's text is needed. | `search` (with `pattern`) |
-| The declaration name is known. | `get_symbol` |
-| A dependency's public declaration is needed. | `get_symbol`, `search` (with `scope: "global"`, or `"all"` to answer the project's own too) |
-| A package version the project does not use, or a package it lacks, is needed. | `get_symbol`, `search` (with `packages` and `scope: "global"` or `"all"`) |
+| The exact symbol identity is known. | `get_symbol` |
+| A package or runtime declaration is needed. | `search` (with `scope: "global"` or `"all"`; read the returned `id` with `get_symbol`) |
+| A package version the project does not use, or a package it lacks, is needed. | `search` (with `packages` and `scope: "global"` or `"all"`; read the returned `id` with `get_symbol`) |
 | The syntax structure at one position is needed. | `nodes` |
 | The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with a `traversal` block) |
 | The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with a `change` block) |

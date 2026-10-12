@@ -3,6 +3,8 @@ title: MCP reference
 description: Tool arguments, resource responses, and failure behavior.
 ---
 
+import { ReadExample } from "@/components/read-example";
+
 This reference defines Rift's MCP tools and resources, including optional fields, paging,
 limits, and failures. For an introduction through an agent's workflow, see the
 [MCP guide](/docs/mcp).
@@ -71,51 +73,7 @@ or `stdlib/python`. Its version comes from the workspace's pins, or from a versi
 A read of `rift://map` returns one `application/json` content under either
 [output selection](#result-content):
 
-**Request:** `rift://map`
-
-**Response, JSON:**
-
-```json
-{
-  "revision": "3f9a1c2e",
-  "languages": [
-    { "language": "rust", "files": 191, "symbols": 3204 }
-  ],
-  "modules": [
-    {
-      "path": "crates",
-      "files": 191,
-      "symbols": 3204,
-      "children": [
-        {
-          "path": "crates/rift-server",
-          "files": 16,
-          "symbols": 418
-        }
-      ]
-    }
-  ],
-  "entry_points": ["rift://symbol/rust/crates/rift/src/main.rs/main"],
-  "docs": ["README.md"],
-  "packages": [
-    {
-      "manager": "cargo",
-      "name": "tokio",
-      "version": "1.53.1",
-      "availability": "canonical"
-    },
-    {
-      "manager": "stdlib",
-      "name": "rust",
-      "version": "1.98.1",
-      "availability": "canonical"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 }
-}
-```
-
-
+<ReadExample name="map" />
 
 ## Search
 
@@ -181,61 +139,7 @@ indexed field carries the query's literal bytes at all.
 { "query": "loads workspace configuration", "target": "symbol" }
 ```
 
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`search` result holding this hit, compact text:**
-
-```text
-1 result
-	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-	src/config.rs:10 · documentation
-	rift://symbol/rust/src/config.rs/load_config
-	Loads the workspace configuration from `rift.toml`.
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/config.rs/load_config",
-      "language": "rust",
-      "name": "load_config",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub",
-      "signatures": [
-        {
-          "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-          "language": "rust"
-        }
-      ],
-      "documentation": [
-        {
-          "format": "markdown",
-          "text": "Loads the workspace configuration from `rift.toml`."
-        }
-      ]
-    }
-  },
-  "matched_by": ["documentation"],
-  "range": { "start": 162, "end": 355 },
-  "line": 10,
-  "path": "src/config.rs"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+<ReadExample name="documentation-search" />
 
 The index holds a file's text once, in the file's own rows, and a declaration's row carries its
 names, signature, and documentation alone. A term only a declaration's body holds therefore
@@ -449,172 +353,19 @@ from `seed` to the hit. Every `GraphHop` carries the
 [`Relationship`](/docs/developer/protocol/reference) it followed and the direction it
 followed it in; `seed` itself is never a hit.
 
-For a Python workspace with the embedded engine configured, this request asks which declarations
-reference `serve` in `service.py`:
+The example project uses the canonical identity returned by search. Without a language engine
+that serves this seed, both directions refuse explicitly:
 
-**Request:**
+<ReadExample name="incoming-traversal" />
 
-```json
-{
-  "traversal": {
-    "seed": "rift://symbol/python/service.py/serve",
-    "direction": "incoming",
-    "facets": ["references"],
-    "depth": 1
-  },
-  "target": "symbol"
-}
-```
+<ReadExample name="outgoing-traversal" />
 
-Each caller's `traversal_path` carries a relationship from the caller to `serve`, with
-`facets: ["references"]` and `derivation: "resolution"`. The hop's direction is `incoming`.
-
-In the same workspace, `serve` returns `handle(port) + len("serve")`, and `handle` lives in
-`handlers.py`. `len` is Python's own, declared in the typeshed stubs the embedded engine ships,
-and the global API resolves the workspace's Python to release 3.12.9. This request asks which
-declarations `serve` calls:
-
-**Request:**
-
-```json
-{
-  "traversal": {
-    "seed": "rift://symbol/python/service.py/serve",
-    "direction": "outgoing",
-    "facets": ["calls"],
-    "depth": 1
-  },
-  "target": "symbol"
-}
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Response, compact text:**
-
-```text
-2 results
-	at rift://symbol/python/service.py/serve
-
-		↳ calls
-			def handle(port: int) -> int:
-			in handlers.py:1
-			at rift://symbol/python/handlers.py/handle
-
-		↳ calls
-			function len
-			in rift://source/stdlib/python@3.12.9/builtins.pyi · stdlib
-			at rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Response, JSON:**
-
-```json
-{
-  "results": [
-    {
-      "hit": {
-        "target": "symbol",
-        "symbol": {
-          "id": "rift://symbol/python/handlers.py/handle",
-          "language": "python",
-          "name": "handle",
-          "kind": "function",
-          "facets": [
-            "value",
-            "callable"
-          ],
-          "signatures": [
-            {
-              "display": "def handle(port: int) -> int:",
-              "language": "python"
-            }
-          ]
-        }
-      },
-      "matched_by": [
-        "relationship"
-      ],
-      "range": {
-        "start": 0,
-        "end": 45
-      },
-      "line": 1,
-      "path": "handlers.py",
-      "traversal_path": [
-        {
-          "relationship": {
-            "from": "rift://symbol/python/service.py/serve",
-            "kind": "calls",
-            "facets": [
-              "calls"
-            ],
-            "to": "rift://symbol/python/handlers.py/handle",
-            "derivation": "resolution"
-          },
-          "direction": "outgoing"
-        }
-      ],
-      "distance": 1
-    },
-    {
-      "hit": {
-        "target": "symbol",
-        "symbol": {
-          "id": "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len",
-          "language": "python",
-          "name": "len",
-          "kind": "function",
-          "origin": {
-            "location": "stdlib",
-            "source_kind": "authored"
-          }
-        }
-      },
-      "matched_by": [
-        "relationship"
-      ],
-      "unit": "rift://source/stdlib/python@3.12.9/builtins.pyi",
-      "traversal_path": [
-        {
-          "relationship": {
-            "from": "rift://symbol/python/service.py/serve",
-            "kind": "calls",
-            "facets": [
-              "calls"
-            ],
-            "to": "rift://symbol/python/stdlib/python@3.12.9/builtins.pyi/len",
-            "derivation": "resolution"
-          },
-          "direction": "outgoing"
-        }
-      ],
-      "distance": 1
-    }
-  ],
-  "pagination": {
-    "page_index": 0,
-    "total_pages": 1
-  }
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-`handle`'s `traversal_path` carries a relationship from `serve` to `handle`, with
-`facets: ["calls"]` and `derivation: "resolution"`, followed in the `outgoing` direction. The local
-index holds no declaration of `len`, so its hit carries the identity and the `kind` the global
-index holds for it, the same a `get_symbol` hit with `scope: "global"` carries. Its `unit` names
-the stub it is declared in, in place of `path`, and it carries no `range` or `line`: the local
-index holds none of its bytes.
+With a configured engine, each caller's `traversal_path` carries a relationship from that caller
+to the seed, with `facets: ["references"]` and `derivation: "resolution"`, followed in the
+`incoming` direction. An outgoing hop carries `facets: ["calls"]` and follows the relationship
+from the seed to its callee. A callee in an installed package or runtime can carry the global
+index's exact identity. Its physical `unit` names its defining source; a source-less builtin can
+have no declaration binding. The walk stops at a global object.
 
 `facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference)
 values; an empty or omitted list follows every facet a lane populates, which is `references` on
@@ -736,118 +487,14 @@ Each hit is tagged `matched_by: ["change"]` and carries a
 above and the `base_path` and `head_path` the declaration lives at on each side. The hit's
 `symbol`, `path`, `range`, `line`, and `source` read the head revision:
 
-**Request:**
+This fixture changes the body of `load_config` from `42` to `43` and removes `old_loader`.
+The comparison retains the changed declaration's head source and the removed declaration's
+base source, each under its canonical identity:
 
-```json
-{ "change": { "base": "main", "head": "HEAD" }, "include": ["source"] }
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`search` result holding this hit, compact text:**
-
-```text
-1 result
-	pub function load_config
-	src/config.rs:1 · change
-	rift://symbol/rust/src/config.rs/load_config
-	signature changed
-
-	/// Loads the workspace configuration from `rift.toml`.
-	pub fn load_config(path: &Path, strict: bool) -> Result<Config, ConfigError> {
-	    let text = std::fs::read_to_string(path)?;
-	    parse_config(&text)
-	}
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/config.rs/load_config",
-      "language": "rust",
-      "name": "load_config",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["change"],
-  "change": {
-    "kind": "signature_changed",
-    "base_path": "src/config.rs",
-    "head_path": "src/config.rs"
-  },
-  "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path, strict: bool) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-  "range": { "start": 0, "end": 207 },
-  "line": 1,
-  "path": "src/config.rs"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+<ReadExample name="change" />
 
 A removed declaration is the exception: the head revision no longer holds it, so its hit keeps
-its base-side identity, path, range, and source, and its `change` carries `base_path` alone:
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`search` result holding this hit, compact text:**
-
-```text
-1 result
-	pub function load_legacy_config
-	src/legacy.rs:1 · change
-	rift://symbol/rust/src/legacy.rs/load_legacy_config
-	removed
-
-	pub fn load_legacy_config() {}
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "symbol",
-    "symbol": {
-      "id": "rift://symbol/rust/src/legacy.rs/load_legacy_config",
-      "language": "rust",
-      "name": "load_legacy_config",
-      "kind": "function",
-      "facets": ["value", "callable", "public"],
-      "visibility": "pub"
-    }
-  },
-  "matched_by": ["change"],
-  "change": { "kind": "removed", "base_path": "src/legacy.rs" },
-  "source": "pub fn load_legacy_config() {}",
-  "range": { "start": 0, "end": 30 },
-  "line": 1,
-  "path": "src/legacy.rs"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+its base-side identity, path, range, and source, and its `change` carries `base_path` alone.
 
 Against the working tree, the head side is the current publication, so staged and unstaged edits,
 files git does not track, and deleted files all take part, and the answer carries `stale_index`
@@ -1003,13 +650,18 @@ one with no git repository.
 
 ### Package scope [#search-scope]
 
-`scope` selects what `query` and `pattern` run over, with the three values
-[`get_symbol`](#get_symbol-scope) takes. `local`, the default, runs the lanes above: the
-indexed declarations and lines, the `paths.force_include` files, the ranked tier, and
-`traversal`. `global` runs none of them and answers from the public declarations the global
-index holds for the workspace's dependency packages. `all` runs both and orders the two sides
-together under `order`: by score under `relevance`; under `path`, every project path first,
-then the package hits in unit order.
+`scope` selects where `query` and `pattern` run. `local`, the default, selects the primary
+project. `local@name` selects one extra project accepted by the connection. `global` selects
+collected package and runtime facts named by the dependency context. Explicit `packages`
+replaces versions of named packages or adds packages the context lacks. `all`
+merges the primary project, accepted extra projects, and global facts. Search returns each
+logical owner in the canonical identity, preserving physical declaration locations separately:
+
+<ReadExample name="all-search" />
+
+Local search runs the indexed declarations and lines, `paths.force_include`, ranked tier,
+and traversal. Global search runs the global query and pattern lanes. Under `order: "path"`,
+project paths precede released source units.
 
 A package hit is addressed by `unit` in place of `path` - the
 [`SourceUnitId`](/docs/developer/protocol/reference) of the package file - with `range` and
@@ -1019,18 +671,17 @@ A package contributes no file to `query`, so `target: "file"` answers nothing fr
 
 A `pattern` reaches the package files too. The global index answers each match as a `file` hit
 addressed by `unit`, with the file's `size`, and each declaration holding a match as a `symbol`
-hit at its first match, both tagged `matched_by: ["content"]`. `global` answers the package
-matches alone; `all` answers them after the project's, in package, path, and offset order.
+hit at its first match, both tagged `matched_by: ["content"]`. `global` answers released source
+matches; `all` includes project matches too, retaining each matched owner.
 
 The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
 package facts are served for the current tree alone, and refuses `traversal` together with
 `global` the same way, since a walk runs over the project alone; `all` still walks the
-project graph. The package warnings under [Reads](#reads) ride a `search` answer whose
-`scope` reaches packages, as they ride a `get_symbol` answer.
+project graph. Package warnings under [Reads](#reads) ride a `search` answer whose
+`scope` reaches packages. Exact reads report the selection and projection facts they retain.
 
 The resolvers read at most 256 manifests per workspace, taken in path order, so a `global` or
-`all` search over a workspace reaches packages those manifests declare. The package side takes
-the same global API route as [`get_symbol`](#get_symbol-scope).
+`all` search over a workspace reaches packages those manifests declare. Exact [`get_symbol`](#get_symbol-scope) reads use the returned canonical identity.
 
 The server asks the global API for one page per query phase, at most 1,000 declarations or the
 smaller page the API advertises, and for one page of matches per `pattern`. A declaration page the
@@ -1038,438 +689,118 @@ global API stopped at its response bound, or a `pattern` page it stopped at its 
 bound, or its verified-text bound, answers what it holds and carries a `global_page_warning` with
 `warning_code: "result_truncated"`; the server does not ask for the rest.
 
-This search runs in a workspace whose `Cargo.lock` pins the `demo` crate at 1.0.1, which the
-global index holds no release of, so the nearest collected release, 1.0.0, answers. Its
-`Cargo.toml` names a `helper` crate by a path outside the workspace, and its Rust toolchain is
-1.98.1, a `stdlib/rust` release the global publication lacks:
+This search requests `demo` 1.1.0. The fixture serves collected release 1.0.0, reports
+`package_substituted`, and returns that served owner in the symbol and source addresses:
 
-**Request:**
+<ReadExample name="requested-served" />
 
-```json
-{ "query": "helper_beacon", "scope": "global" }
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Response, compact text:**
-
-```text
-1 result
-	pub fn helper_beacon()
-	rift://source/cargo/demo@1.0.0/src/lib.rs:1 · name · dependency demo@1.0.0
-	rift://symbol/rust/src/lib.rs/helper_beacon
-3 warnings
-	package_unavailable · entry helper@0.1.0 (cargo, path) · reason Currently rift doesn't support indexing dependencies by path. If you're interested in this capability, please upvote it at https://github.com/volarized/rift/issues/392.
-	package_absent · package rust@1.98.1 (stdlib)
-	package_substituted · entry demo@1.0.1 (cargo) · package demo@1.0.0 (cargo)
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Response, JSON:**
-
-```json
-{
-  "results": [
-    {
-      "hit": {
-        "target": "symbol",
-        "symbol": {
-          "id": "rift://symbol/rust/src/lib.rs/helper_beacon",
-          "language": "rust",
-          "name": "helper_beacon",
-          "kind": "function",
-          "facets": ["value", "callable", "public"],
-          "visibility": "pub",
-          "signatures": [{ "display": "pub fn helper_beacon()", "language": "rust" }],
-          "origin": {
-            "location": "dependency",
-            "package": { "manager": "cargo", "name": "demo", "version": "1.0.0" },
-            "source_kind": "authored"
-          }
-        }
-      },
-      "matched_by": ["name"],
-      "range": { "start": 0, "end": 25 },
-      "line": 1,
-      "unit": "rift://source/cargo/demo@1.0.0/src/lib.rs"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 },
-  "warnings": [
-    {
-      "code": "package_unavailable",
-      "entry": {
-        "manager": "cargo",
-        "name": "helper",
-        "version": "0.1.0",
-        "availability": "path"
-      },
-      "reason": "Currently rift doesn't support indexing dependencies by path. If you're interested in this capability, please upvote it at https://github.com/volarized/rift/issues/392."
-    },
-    {
-      "code": "package_absent",
-      "package": { "manager": "stdlib", "name": "rust", "version": "1.98.1" }
-    },
-    {
-      "code": "package_substituted",
-      "entry": {
-        "manager": "cargo",
-        "name": "demo",
-        "version": "1.0.1",
-        "availability": "canonical"
-      },
-      "package": { "manager": "cargo", "name": "demo", "version": "1.0.0" }
-    }
-  ]
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-`packages` names package versions this search reaches beside the workspace's own; see
+`packages` names package versions this search reaches beside the snapshot context; see
 [requested packages](#requested-packages).
 
 ## Symbol retrieval
 
 <McpTool name="get_symbol" />
 
-A lookup with no matching declaration carries `symbol_not_found`, naming the requested
-name and up to three closest project declaration identities in `alternatives`. The complete
-ranking uses case-insensitive Unicode Levenshtein distance to short and qualified names,
-then qualified-name and path order for equal distances. A revision read uses that revision's
-declarations. `global` carries no alternatives; `all` proposes project declarations alone.
+`id` selects one canonical logical symbol. Ownership and language are encoded in that
+identity; declaration source addresses remain separate. `get_symbol` accepts neither
+name discovery nor `scope`, `packages`, `limit`, or `page_index`.
 
-The [search configuration](/docs/developer/configuration#search) bounds this optional work
-through `symbol_alternatives_work` and `symbol_alternatives_lowercase_work`. If the complete
-ranking cannot fit, alternatives are empty and `detail` carries the registered failure's
-message, recovery action, configured bound, and observed reservation. The lookup remains
-successful. A lookup with matching declarations carries no named-miss warning, including
-an empty continuation page.
+<ReadExample name="local-symbol" />
 
-`include` selects the optional fields a hit carries:
+`outcome` distinguishes `found`, `missing`, and `unavailable`. `found` contains one
+`symbol` and its declaration bindings, including an empty declaration list for a source-less
+object:
 
-- `source` - the node identity and declaration excerpt
-- `documentation` - bounded documentation referring to the declaration
-- `history` - the version-control timeline
+<ReadExample name="source-less-runtime" />
 
-An omitted `include` defaults to `["source"]`; an explicit empty list requests none of these fields.
+<ReadExample name="source-less-builtin" />
 
-`include: ["history"]` attaches the symbol's version-control timeline as a
-[`SymbolHistory`](/docs/developer/protocol/reference). The server reads the timeline from the
-[history store](/docs/developer/architecture#history), following the revisions it holds from the
-served revision, and classifies what each revision did: `introduced`, `body_changed`,
-`signature_changed`, `moved`, `removed`, or `decorators_changed`. A revision whose source cannot be
-parsed, or where the symbol is absent, contributes no version.
+`missing` means the exact selection was searched completely; `symbol_not_found`
+names the requested identity and up to three actual structural alternatives. An incomplete
+selection answers `unavailable` with a typed reason.
 
-Each [`SymbolVersion`](/docs/developer/protocol/reference) names the commit's `author`, name and
-email, as the commit records them; `timestamp` stays the committer time. A file renamed without a
-changed byte, or a declaration moved unchanged into another file, answers a `moved` version, and
-the timeline goes on at the path the declaration came from.
+The [search configuration](/docs/developer/configuration#search) bounds optional alternative
+work through `symbol_alternatives_work` and `symbol_alternatives_lowercase_work`. Reached
+bounds retain the definite miss and report incomplete alternative work.
 
-`complete` says whether the timeline reached the repository's first commit. `false` means the
-`max_revisions` key in [`[providers.history]`](/docs/developer/configuration#providers), a shallow
-clone's boundary, or the oldest selected release ended it first, or that the store has not yet
-analyzed the served revision, so revisions older than the listed ones may have touched the symbol.
-A server whose store did not open walks git per request instead.
+<ReadExample name="missing-symbol" />
 
-This lookup requests the source and the history of `load_config`:
+`include` selects projections: `source` adds declaration excerpts and node identities when
+available, `documentation` adds bounded referring documentation, and `history` adds the
+logical symbol's timeline. Omitted `include` defaults to `["source"]`; `[]` requests none.
 
-**Request:**
+`view` retains a preceding immutable selection. Its expiry refuses the read; it never selects
+latest implicitly. `declaration_limit` defaults to 5 and accepts 1 through 10000.
+`declaration_cursor` continues the exact symbol, projections, and serving view. Each binding
+retains `origin`, exactly one of `path` and `unit`, `range`, `line`, `source_complete`, and
+indices into the symbol's signatures, types, and documentation.
 
-```json
-{ "name": "load_config", "include": ["source", "history"] }
-```
+<ReadExample name="multi-declaration-full" />
 
-<ExampleTabs items={["text", "json"]}>
+<ReadExample name="multi-declaration-first" />
 
-<Tab value="text">
+<ReadExample name="multi-declaration-next" />
 
-**Response, compact text:**
+`history` follows the revisions held by the [history store](/docs/developer/architecture#history)
+from the served revision. It records `introduced`, `body_changed`, `signature_changed`,
+`moved`, `removed`, and `decorators_changed`. A revision whose source cannot be parsed,
+or where the symbol is absent, contributes no version. Commit author name and email remain
+the commit's author; timestamps remain committer time. An unchanged file rename or unchanged
+declaration move records `moved` and follows the previous path.
 
-```text
-1 result
-	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-	src/config.rs:10
-	rift://symbol/rust/src/config.rs/load_config
+`complete: false` means history depth, a shallow clone, the oldest selected release, or a store
+still filling ended the timeline before the repository's first commit. When the store did not
+open, the server walks Git per request instead.
 
-	Loads the workspace configuration from `rift.toml`.
+### Symbol ownership [#get_symbol-scope]
 
-	history:
-		2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>
-			Return ConfigError from load_config
-		2026-08-17 · 82590265 · introduced · Alice <alice@example.com>
-			Add workspace configuration loading
+A `local@name` identity selects an extra project accepted by the connection:
 
-	/// Loads the workspace configuration from `rift.toml`.
-	pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-	    let text = std::fs::read_to_string(path)?;
-	    parse_config(&text)
-	}
-```
+<ReadExample name="named-symbol" />
 
-</Tab>
+A package or runtime identity selects its exact served version. Search's `scope` and
+`packages` discover these identities. Requested package substitutions are reported by search;
+the returned identity names the served owner. Exact reads never silently replace that version.
+The declaration's `unit` keeps the physical defining owner even when the logical owner differs.
 
-<Tab value="json">
+<ReadExample name="global-search" />
 
-**Response, JSON:**
+<ReadExample name="global-symbol-documentation" />
 
-```json
-{
-  "hits": [
-    {
-      "history": {
-        "complete": true,
-        "symbol": "rift://symbol/rust/src/config.rs/load_config",
-        "versions": [
-          {
-            "author": {
-              "email": "alice@example.com",
-              "name": "Alice"
-            },
-            "kind": "signature_changed",
-            "path": "src/config.rs",
-            "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
-            "summary": "Return ConfigError from load_config",
-            "timestamp": "2026-08-21T14:03:22+00:00"
-          },
-          {
-            "author": {
-              "email": "alice@example.com",
-              "name": "Alice"
-            },
-            "kind": "introduced",
-            "path": "src/config.rs",
-            "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
-            "summary": "Add workspace configuration loading",
-            "timestamp": "2026-08-17T09:41:05+00:00"
-          }
-        ]
-      },
-      "line": 10,
-      "node": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-      "path": "src/config.rs",
-      "range": {
-        "end": 355,
-        "start": 162
-      },
-      "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-      "symbol": {
-        "documentation": [
-          {
-            "format": "markdown",
-            "text": "Loads the workspace configuration from `rift.toml`."
-          }
-        ],
-        "facets": [
-          "value",
-          "callable",
-          "public"
-        ],
-        "id": "rift://symbol/rust/src/config.rs/load_config",
-        "kind": "function",
-        "language": "rust",
-        "name": "load_config",
-        "signatures": [
-          {
-            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-            "language": "rust",
-            "links": [
-              {
-                "range": {
-                  "end": 48,
-                  "start": 42
-                },
-                "symbol": "rift://symbol/rust/src/config.rs/Config"
-              }
-            ],
-            "parameters": [
-              {
-                "name": "path",
-                "optional": false,
-                "types": [
-                  {
-                    "origin": "declared",
-                    "role": "parameter",
-                    "type": {
-                      "language": "rust",
-                      "source": "&Path"
-                    }
-                  }
-                ],
-                "variadic": false
-              }
-            ],
-            "returns": [
-              {
-                "origin": "declared",
-                "role": "return",
-                "type": {
-                  "language": "rust",
-                  "source": "Result<Config, ConfigError>"
-                }
-              }
-            ]
-          }
-        ],
-        "types": [
-          {
-            "origin": "declared",
-            "role": "return",
-            "type": {
-              "language": "rust",
-              "source": "Result<Config, ConfigError>"
-            }
-          }
-        ],
-        "visibility": "pub"
-      }
-    }
-  ],
-  "pagination": {
-    "page_index": 0,
-    "total_pages": 1
-  }
-}
-```
+<ReadExample name="requested-served" />
 
-</Tab>
+`rev` selects a local Git revision. It is refused beside `view` and for package or runtime
+identities. Unknown named local projects, expired views, and incomplete coverage are explicit
+selection failures. A malformed identity is refused before lookup:
 
-</ExampleTabs>
+<ReadExample name="malformed-symbol" />
 
-### Package scope [#get_symbol-scope]
+## Source retrieval
 
-`scope` selects which corpus the lookup searches, by what the corpus holds rather than by
-where it is stored. `local`, the default, searches the workspace tree. `global` searches the
-public declarations the global index holds for the workspace's dependency packages. `all`
-searches both and lists a project hit before a package hit of equal rank.
+<McpTool name="get_source" />
 
-A package hit carries `unit` in place of `path`: the
-[`SourceUnitId`](/docs/developer/protocol/reference) of the package file, spelled
-`rift://source/<manager>/<name>@<version>/<file>`. Its `symbol.origin` names the owning
-package. The hit carries neither `node` nor `history`.
+`unit` selects one physical source unit. Omitted `range` requests the whole unit; a supplied
+range is half-open UTF-8 byte offsets. Documentation does not require a symbol declaration:
 
-A `local` read reaches no package declaration and resolves no package. A `global` or `all` read
-sends the dependency context's `canonical` entries to the configured global REST API, which
-answers capabilities and package resolution, and a valid response serves the package declarations
-the global index holds for each entry. An entry no public registry serves never reaches the
-global API and answers `package_unavailable`.
+<ReadExample name="project-source" />
 
-When the global index holds no release at the version an entry names, or none inside the range a
-declared requirement states, the nearest collected release answers, and the answer names the
-substitution in `package_substituted`. An entry whose package holds no collected release adds
-`package_absent` or `package_requirement_absent`, and the rest of the read answers as usual.
+<ReadExample name="project-section" />
 
-When the REST API is unavailable, the read answers the project hits it has, carries no package
-facts, and adds `global_api_unavailable` with its bounded `failure_class`. Disabled access adds
-`global_access_disabled`. Callers still reach this route through the local `rift mcp` and
-`rift server` processes; they do not connect to a global MCP or server directly.
+The `view` returned by the preceding named-project symbol read selects that project's
+documentation. The project unit keeps its repository-relative path:
 
-The server refuses `rev` together with a scope beyond `local` as `invalid_request`: package
-facts are served for the current tree alone.
+<ReadExample name="named-project-source" />
 
-This lookup runs in the workspace the [search example](#search-scope) describes, where the
-nearest collected release of the `demo` crate, 1.0.0, answers for the 1.0.1 its `Cargo.lock`
-pins:
+<ReadExample name="named-project-section" />
 
-**Request:**
+A released source read uses its physical owner address:
 
-```json
-{ "name": "helper_beacon", "scope": "global" }
-```
+<ReadExample name="global-source" />
 
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Response, compact text:**
-
-```text
-1 result
-	pub fn helper_beacon()
-	rift://source/cargo/demo@1.0.0/src/lib.rs:1
-	rift://symbol/rust/src/lib.rs/helper_beacon
-	dependency demo@1.0.0
-
-	pub fn helper_beacon() {}
-3 warnings
-	package_unavailable · entry helper@0.1.0 (cargo, path) · reason Currently rift doesn't support indexing dependencies by path. If you're interested in this capability, please upvote it at https://github.com/volarized/rift/issues/392.
-	package_absent · package rust@1.98.1 (stdlib)
-	package_substituted · entry demo@1.0.1 (cargo) · package demo@1.0.0 (cargo)
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Response, JSON:**
-
-```json
-{
-  "hits": [
-    {
-      "symbol": {
-        "id": "rift://symbol/rust/src/lib.rs/helper_beacon",
-        "language": "rust",
-        "name": "helper_beacon",
-        "kind": "function",
-        "facets": ["value", "callable", "public"],
-        "visibility": "pub",
-        "signatures": [{ "display": "pub fn helper_beacon()", "language": "rust" }],
-        "origin": {
-          "location": "dependency",
-          "package": { "manager": "cargo", "name": "demo", "version": "1.0.0" },
-          "source_kind": "authored"
-        }
-      },
-      "unit": "rift://source/cargo/demo@1.0.0/src/lib.rs",
-      "range": { "start": 0, "end": 25 },
-      "line": 1,
-      "source": "pub fn helper_beacon() {}"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 },
-  "warnings": [
-    {
-      "code": "package_unavailable",
-      "entry": {
-        "manager": "cargo",
-        "name": "helper",
-        "version": "0.1.0",
-        "availability": "path"
-      },
-      "reason": "Currently rift doesn't support indexing dependencies by path. If you're interested in this capability, please upvote it at https://github.com/volarized/rift/issues/392."
-    },
-    {
-      "code": "package_absent",
-      "package": { "manager": "stdlib", "name": "rust", "version": "1.98.1" }
-    },
-    {
-      "code": "package_substituted",
-      "entry": {
-        "manager": "cargo",
-        "name": "demo",
-        "version": "1.0.1",
-        "availability": "canonical"
-      },
-      "package": { "manager": "cargo", "name": "demo", "version": "1.0.0" }
-    }
-  ]
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-`packages` names package versions this lookup reads beside the workspace's own; see
-[requested packages](#requested-packages).
+`found` returns `source.span`, `source.text`, `source_complete`, and an immutable `view`.
+`missing` requires complete captured coverage; `unavailable` states why presence or absence
+could not be established. A package or runtime source address retains its defining owner.
+`view` retains a preceding selection; `rev` is refused beside `view` and for released sources.
 
 ## Nodes
 
@@ -1486,137 +817,7 @@ nodes with that warning.
 
 This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
 
-**Request:**
-
-```json
-{ "path": "src/config.rs", "position": 338 }
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**Response, compact text:**
-
-```text
-5 nodes
-	[1] source_file · 14 lines
-		rift://node/rust/src/config.rs@0-356#dcbef6dd
-	[2] function_item · 4 lines
-		rift://node/rust/src/config.rs@218-355#67ecfb36
-		rift://symbol/rust/src/config.rs/load_config
-		name 225..236 · body 281..355
-	[3] block · 4 lines
-		rift://node/rust/src/config.rs@281-355#4e554fa8
-	[4] call_expression
-		rift://node/rust/src/config.rs@334-353#4df4426e
-	[5] identifier
-		rift://node/rust/src/config.rs@334-346#03f22dac
-
-		parse_config
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Response, JSON:**
-
-```json
-{
-  "nodes": [
-    {
-      "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
-      "kind": "source_file",
-      "language": "rust",
-      "range": {
-        "end": 356,
-        "start": 0
-      },
-      "unit": "rift://file/src/config.rs"
-    },
-    {
-      "facets": [
-        "declaration",
-        "definition"
-      ],
-      "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-      "kind": "function_item",
-      "language": "rust",
-      "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
-      "range": {
-        "end": 355,
-        "start": 218
-      },
-      "regions": [
-        {
-          "range": {
-            "end": 236,
-            "start": 225
-          },
-          "role": "name"
-        },
-        {
-          "range": {
-            "end": 355,
-            "start": 281
-          },
-          "role": "body"
-        }
-      ],
-      "symbol": "rift://symbol/rust/src/config.rs/load_config",
-      "unit": "rift://file/src/config.rs"
-    },
-    {
-      "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
-      "kind": "block",
-      "language": "rust",
-      "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-      "range": {
-        "end": 355,
-        "start": 281
-      },
-      "unit": "rift://file/src/config.rs"
-    },
-    {
-      "facets": [
-        "expression"
-      ],
-      "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
-      "kind": "call_expression",
-      "language": "rust",
-      "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
-      "range": {
-        "end": 353,
-        "start": 334
-      },
-      "unit": "rift://file/src/config.rs"
-    },
-    {
-      "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
-      "kind": "identifier",
-      "language": "rust",
-      "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
-      "range": {
-        "end": 346,
-        "start": 334
-      },
-      "unit": "rift://file/src/config.rs"
-    }
-  ],
-  "source": [
-    "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-    "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-    "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-    "parse_config(&text)",
-    "parse_config"
-  ]
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+<ReadExample name="local-nodes" />
 
 ## Reads
 
@@ -1624,7 +825,8 @@ Callers read code through these tools:
 
 | Tool | Result |
 | --- | --- |
-| [`get_symbol`](#tool-get_symbol) | declarations and their source by known name |
+| [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
+| [`get_source`](#tool-get_source) | one physical source unit or byte range |
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
 
@@ -1633,11 +835,11 @@ Callers read code through these tools:
 The index never follows or indexes a symlink, so no read returns one; the file a link points
 at answers under its own path.
 
-`get_symbol` and `search` page by `page_index`. The request names the zero-based page under its
-`limit`, at most 10,000, and the result's `pagination` carries the served `page_index` and the
-true `total_pages`; a larger `limit` is refused as `invalid_request` naming the field. The server
-retains no capture between pages: each page is computed from the request, and a `page_index` past
-the last page returns an empty page whose `pagination` still carries the true `total_pages`.
+`search` pages by `page_index` under `limit`, at most 10,000. Its `pagination` carries
+the served page and true page count, including an empty page past the last page.
+`get_symbol` bounds declaration bindings with `declaration_limit` and continues with
+`declaration_cursor`. Search and exact reads return an immutable `view` with an expiry;
+later reads can retain that selection. Expiry never selects latest implicitly.
 
 Every read result also carries `warnings`. A `stale_index` warning reports an answer computed
 from an index that lags the tree the read captured, and names the two tree revision digests that
@@ -1648,46 +850,9 @@ incomplete. `prepared` counts visible files whose capture and analysis finished,
 refused under an accepted bound; `total` is omitted until discovery finishes. `ready_in` is
 omitted because the server has no preparation estimate.
 
-A `get_symbol` answer retains this warning after finding a match because an unprepared file
-can hold another declaration with the same name. Global-only reads omit local preparation
-warnings. Preparation counts describe the answer's publication and can decrease when source
-selection changes.
-
-**Request:**
-
-```json
-{ "name": "ReadService" }
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`get_symbol` result carrying only this warning, compact text:**
-
-```text
-0 results
-1 warning
-	local_index_preparing · prepared 0: selected local files are still being prepared
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Warning before discovery completes:**
-
-```json
-{
-  "code": "local_index_preparing",
-  "prepared": 0,
-  "detail": "selected local files are still being prepared"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
+An exact symbol read cannot establish complete declaration coverage while selected files
+remain unprepared. Global-only reads omit local preparation warnings. Preparation counts
+describe the answer's publication and can decrease when source selection changes.
 
 A read served while the last rebuild's failure stands carries `stale_index` too, with a `detail`
 naming the failure; the next filesystem event retries the rebuild. When its two digests are equal,
@@ -1836,7 +1001,8 @@ Direct HTTP access to `rift server` returns both tool representations, because o
 applies the selection. The workspace resource carries both contents over direct HTTP; the map
 carries one JSON content.
 
-The compact text of `search`, `get_symbol`, and `nodes` results follows one layout. The text lists what an agent reads to choose its next call and leaves the normal state of each field out, and the facts of one line are separated by ` · `. Under the `all` selection, `structuredContent` carries every field of the result, including each field the layout leaves implicit.
+The compact text of search and nodes lists items. Exact symbol and source reads state their
+selected object or outcome and serving view. The text lists what an agent reads to choose its next call and leaves the normal state of each field out, and the facts of one line are separated by ` · `. Under the `all` selection, `structuredContent` carries every field of the result, including each field the layout leaves implicit.
 
 The text is a sequence of sections. A section is a title line at column 0, then its entries, each indented by at least one level. A title is `N` and a noun, with the noun in the singular when N is 1, so a line at column 0 is always a title.
 
@@ -1844,9 +1010,9 @@ The server **MUST** indent with tabs, one tab per level, and **MUST NOT** indent
 
 The server **MUST NOT** write a blank line between a title and its first entry, between two items, or between two sections. A blank line inside an item stays, and the server writes it empty. The tree of a relationship walk, described below, is the one exception: a blank line separates its parts.
 
-The server **MUST** write the items section first: `N results`, or `1 result`, for `search` and `get_symbol`, and `N nodes`, or `1 node`, for `nodes`. The title is written also when the result holds no item.
+The server **MUST** write the items section first: `N results`, or `1 result`, for `search`, and `N nodes`, or `1 node`, for `nodes`. The title is written also when the result holds no item.
 
-For `search` and `get_symbol`, the server **MUST** append ` · page P/T` to the title of the items section when `total_pages` is greater than 1 or the requested `page_index` lies past the last page, where P is `page_index` plus 1 and T is `total_pages`. The title is the only place the text carries pagination, so a caller requests the next page with a `page_index` equal to P.
+For `search`, the server **MUST** append ` · page P/T` to the title of the items section when `total_pages` is greater than 1 or the requested `page_index` lies past the last page, where P is `page_index` plus 1 and T is `total_pages`. The title is the only place the text carries pagination, so a caller requests the next page with a `page_index` equal to P.
 
 When the result carries warnings, the server **MUST** write the warnings section after the items section: the title `N warnings`, or `1 warning`, then one line per warning. A result without warnings has no warnings section. The line of a warning has these parts:
 
@@ -1932,14 +1098,13 @@ A commit hit has these lines:
 - `message truncated`, when `message_truncated` is `true`
 - a blank line, then `N paths:` and one changed path per line, one level below `N paths:`; when `paths_truncated` is `true`, the label is `N+ paths · truncated` and a last line of `...` follows
 
-A `get_symbol` hit has these lines:
-
-- the declaration, as for a symbol hit of `search`
-- the location, then the symbol identity or the byte range, then one line of the exceptional facts below
-- each documentation text, after a blank line, with its lines unchanged
-- `documentation:` or `documentation (truncated):` when the call requested documentation, then each referenced block as its location and heading path, with its excerpt indented below, then one line per warning of the documentation context, written as the `documentation` warning line of the warnings section
-- `history:` or `history (incomplete):` when the call requested history, then one entry per version as the date, the revision, the kind, and the author, with the path added when it differs from the hit's path, and the summary indented below
-- a blank line, then the source, last
+A found `get_symbol` result writes the declaration, exact identity, exceptional facts,
+then documentation and requested documentation context or history. A `declarations:` section
+retains each physical location, byte range, available node identity, and requested source.
+A returned `declaration_cursor` names remaining bindings. There is no hit count or hit paging.
+A missing result writes `symbol_not_found`, the requested identity and bounded alternatives;
+an unavailable result writes its typed reason and requested identity. A captured selection ends
+with `view ID · expires TIMESTAMP`, followed by warnings when present.
 
 A `nodes` result lists the nodes from the outermost to the innermost. Each node has these lines:
 
@@ -1984,231 +1149,19 @@ answer's text and refuses an answer that crosses it.
 
 The tabs below show the compact text of `search`, `get_symbol`, and `nodes` results, and of the warnings of an answer:
 
-<Tabs items={["search", "search (commit)", "search (traversal)", "search (change)", "get_symbol", "nodes", "warnings", "items and warnings"]}>
+These examples retain compact text and canonical JSON from the same answers:
 
-<Tab value="search">
+<ReadExample name="local-search" />
 
-**`search` result, compact text** of the first `search` example, a symbol hit and a file hit:
+<ReadExample name="local-symbol" />
 
-```text
-2 results · page 1/3
-	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-		src/config.rs:10 · name
-		rift://symbol/rust/src/config.rs/load_config
-		Loads the workspace configuration from `rift.toml`.
+<ReadExample name="local-nodes" />
 
-		/// Loads the workspace configuration from `rift.toml`.
-		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-		    let text = std::fs::read_to_string(path)?;
-		    parse_config(&text)
-		}
-	[2] src/lib.rs:7 · content
-		    let config = load_config(&arguments.path)?;
-```
+<ReadExample name="requested-served" />
 
-</Tab>
+<ReadExample name="incoming-traversal" />
 
-<Tab value="search (commit)">
 
-**`search` result, compact text** of the second `search` example, a commit hit:
-
-```text
-1 result
-	9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
-	Bound comparisons at 512 changed paths
-
-	A comparison that reaches the bound answers from the paths that fit and warns change_truncated.
-
-	2 paths:
-		crates/rift-protocol/src/search.rs
-		crates/rift-server/src/change.rs
-```
-
-</Tab>
-
-<Tab value="search (traversal)">
-
-**`search` result, compact text** of an `incoming` walk of two hops from `load_config`. `run` and `reload_config` reference `load_config`, and `main` references `run`:
-
-```text
-3 results
-	at rift://symbol/rust/src/config.rs/load_config
-
-		↳ referenced
-			by fn run(args: &Arguments) -> Result<(), ConfigError>
-			in src/app.rs:20
-			at rift://symbol/rust/src/app.rs/run
-
-			↳ referenced
-				by async fn main() -> Result<(), ConfigError>
-				in src/main.rs:9
-				at rift://symbol/rust/src/main.rs/main
-
-		↳ referenced
-			by fn reload_config() -> Result<(), ConfigError>
-			in src/watch.rs:41
-			at rift://symbol/rust/src/watch.rs/reload_config
-```
-
-**`search` result, compact text** of the second page of a walk. The hit of `run` lies on the first page, so its branch writes only its head line and the `at` line. The second branch comes from an `outgoing` hop with a `heuristic` relationship:
-
-```text
-2 results · page 2/2
-	at rift://symbol/rust/src/config.rs/load_config
-
-		↳ referenced
-			at rift://symbol/rust/src/app.rs/run
-
-			↳ referenced
-				by async fn main() -> Result<(), ConfigError>
-				in src/main.rs:9
-				at rift://symbol/rust/src/main.rs/main
-
-		↳ probably implements
-			impl ConfigLoader for WorkspaceLoader
-			in src/workspace.rs:84
-			at rift://symbol/rust/src/workspace.rs/WorkspaceLoader
-1 warning
-	traversal_truncated · visited 1000: the walk stopped at its node bound
-```
-
-**`search` result, compact text** of a `traversal` beside a `query`. The file hit is outside the walk, and the lexical hit of `load_config` is the root:
-
-```text
-5 results
-	README.md:3 · content
-	A Rust project that reads workspace configuration
-
-	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-	in src/config.rs:10 · name
-	at rift://symbol/rust/src/config.rs/load_config
-
-		↳ referenced
-			by fn run(args: &Arguments) -> Result<(), ConfigError>
-			in src/app.rs:20
-			at rift://symbol/rust/src/app.rs/run
-
-			↳ referenced
-				by async fn main() -> Result<(), ConfigError>
-				in src/main.rs:9
-				at rift://symbol/rust/src/main.rs/main
-
-		↳ referenced
-			by fn reload_config() -> Result<(), ConfigError>
-			in src/watch.rs:41
-			at rift://symbol/rust/src/watch.rs/reload_config
-```
-
-</Tab>
-
-<Tab value="search (change)">
-
-**`search` result, compact text** of a symbol hit that a comparison found moved:
-
-```text
-1 result
-	struct A
-	a.rs:1 · name
-	rift://symbol/rust/a.rs/A
-	moved · old/a.rs → new/a.rs
-```
-
-</Tab>
-
-<Tab value="get_symbol">
-
-**`get_symbol` result, compact text** of the `get_symbol` example, with source, documentation text, and
-history:
-
-```text
-1 result
-	pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-	src/config.rs:10
-	rift://symbol/rust/src/config.rs/load_config
-
-	Loads the workspace configuration from `rift.toml`.
-
-	history:
-		2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>
-			Return ConfigError from load_config
-		2026-08-17 · 82590265 · introduced · Alice <alice@example.com>
-			Add workspace configuration loading
-
-	/// Loads the workspace configuration from `rift.toml`.
-	pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-	    let text = std::fs::read_to_string(path)?;
-	    parse_config(&text)
-	}
-```
-
-</Tab>
-
-<Tab value="nodes">
-
-**`nodes` result, compact text** of the authored example, five nodes and the excerpt of the innermost:
-
-```text
-5 nodes
-	[1] source_file · 14 lines
-		rift://node/rust/src/config.rs@0-356#dcbef6dd
-	[2] function_item · 4 lines
-		rift://node/rust/src/config.rs@218-355#67ecfb36
-		rift://symbol/rust/src/config.rs/load_config
-		name 225..236 · body 281..355
-	[3] block · 4 lines
-		rift://node/rust/src/config.rs@281-355#4e554fa8
-	[4] call_expression
-		rift://node/rust/src/config.rs@334-353#4df4426e
-	[5] identifier
-		rift://node/rust/src/config.rs@334-346#03f22dac
-
-		parse_config
-```
-
-</Tab>
-
-<Tab value="warnings">
-
-**`search` result, compact text** of an answer without a hit, whose items section is followed by its warnings section:
-
-```text
-0 results
-5 warnings
-	global_access_disabled
-	results_truncated · results_max 100
-	package_substituted · entry serde@1.0.0 (cargo) · package serde@1.0.1 (cargo)
-	pattern_matches_truncated · matches_per_file 5 · files rift://file/a.rs, rift://file/b.rs
-	stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree
-```
-
-</Tab>
-
-<Tab value="items and warnings">
-
-**`search` result, compact text** of the first `search` example carrying two warnings, whose section follows the items:
-
-```text
-2 results · page 1/3
-	[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>
-		src/config.rs:10 · name
-		rift://symbol/rust/src/config.rs/load_config
-		Loads the workspace configuration from `rift.toml`.
-
-		/// Loads the workspace configuration from `rift.toml`.
-		pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
-		    let text = std::fs::read_to_string(path)?;
-		    parse_config(&text)
-		}
-	[2] src/lib.rs:7 · content
-		    let config = load_config(&arguments.path)?;
-2 warnings
-	results_truncated · results_max 100
-	stale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree
-```
-
-</Tab>
-
-</Tabs>
 
 ### Revision-addressed reads [#revision-reads]
 
@@ -2222,7 +1175,7 @@ This `get_symbol` request reads a declaration as it stands on `main`, whatever t
 currently holds:
 
 ```json
-{ "name": "ReadService", "rev": "main" }
+{ "id": "rift://symbol/local/rust/example_project/config/load_config", "rev": "main" }
 ```
 
 A name may carry git's ancestry suffixes: `~N` walks `N` first parents and `^N` picks the `N`th
@@ -2234,7 +1187,7 @@ the field. This request reads the declaration one commit back:
 **Request:**
 
 ```json
-{ "name": "ReadService", "rev": "HEAD~1" }
+{ "id": "rift://symbol/local/rust/example_project/config/load_config", "rev": "HEAD~1" }
 ```
 
 A revision search refuses `force_include`: reaching index-excluded files is a walk of the
@@ -2279,7 +1232,7 @@ refuses every revision read.
 
 ### Requested packages [#requested-packages]
 
-`packages` names package versions a `get_symbol` or `search` read reaches beside the ones the
+`packages` names package versions a `search` reaches beside the ones the
 workspace's manifests and lockfiles name, at most 64 entries. Each entry is a
 [`RequestedPackage`](/docs/developer/protocol/reference) carrying `manager`, `name`, and an
 optional exact `version`. The server applies the list to this read's dependency context alone:

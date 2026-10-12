@@ -1925,16 +1925,16 @@ fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
 const ANCESTRY_MARKERS: [u8; 2] = *b"~^";
 
 /// Which corpus a read searches. The names identify logical corpora, not storage
-/// locations: `global` reaches dependency package facts wherever the server holds them.
+/// locations: `global` reaches collected package and runtime facts selected by the dependency context.
 /// A `local@name` scope selects an extra project accepted by the current connection.
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SearchScope {
     /// The project tree the server serves.
     #[default]
     Local,
-    /// The dependency packages, answered from their public declarations alone.
+    /// Collected package and runtime facts selected by the dependency context.
     Global,
-    /// Both: hits merge by rank; at equal rank a project hit orders before a package hit.
+    /// The primary project, accepted extra projects, and global facts, merged by rank.
     All,
     /// One extra project accepted by the current connection.
     NamedLocal {

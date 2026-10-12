@@ -342,11 +342,12 @@ corpus, then Rift merges their ranks rather than comparing their model-specific 
 
 <VersionBadge version="v0.0.43" />
 
-The request's `scope` follows the two-index model:
+The request's `scope` selects its corpus:
 
-- `local`, the default, searches the local index
-- `global` searches package facts within the project's resolved package versions
-- `all` searches project and package facts and merges the ranked results
+- `local`, the default, searches the primary project
+- `local@name` searches one extra project accepted by the connection
+- `global` searches collected package and runtime facts selected by the dependency context
+- `all` searches the primary project, accepted extra projects, and global facts and merges the ranked results
 
 <VersionBadge version="v0.0.46" />
 
