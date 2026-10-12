@@ -1644,7 +1644,7 @@ fn assert_measured_held_source(
     let held = store
         .state
         .lock()
-        .unwrap()
+        .expect("retained material state")
         .views
         .get(view.id.as_str())
         .expect("retained original material")
@@ -1692,6 +1692,6 @@ fn assert_measured_held_source(
     assert_eq!(source.span.range.start, 0);
     assert_eq!(
         source.span.range.end,
-        u64::try_from(original.len()).unwrap()
+        u64::try_from(original.len()).expect("source byte range")
     );
 }
