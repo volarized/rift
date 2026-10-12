@@ -312,6 +312,29 @@ class ArtifactStore:
             and not evidence.record.bucket_counts
         ):
             excluded = {"record": {"count", "bounds", "bucket_counts"}}
+        elif isinstance(evidence, LogEvidence):
+            excluded = {
+                "record": {
+                    name
+                    for name in ("trace_id", "span_id")
+                    if getattr(evidence.record, name) == ""
+                }
+            }
+        elif isinstance(evidence, SpanEvidence):
+            excluded = {
+                "record": {
+                    name
+                    for name, default in (
+                        ("instance", ""),
+                        ("resource", ()),
+                        ("parent_span_id", ""),
+                        ("status_code", 0),
+                        ("status_message", ""),
+                        ("kind", 0),
+                    )
+                    if getattr(evidence.record, name) == default
+                }
+            }
         data = EVIDENCE.dump_json(evidence, exclude=excluded) + b"\n"
         with self.lock:
             self.received += 1
