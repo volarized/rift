@@ -1,0 +1,2100 @@
+{
+  "all-search": {
+    "tool": "search",
+    "arguments": {
+      "query": "beacon",
+      "scope": "all",
+      "target": "symbol",
+      "include": ["source"],
+      "limit": 10,
+      "paths": {
+        "include": ["src/**"]
+      }
+    },
+    "text": "4 results\n\t[1] pub fn beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature, content \u00b7 view 185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91 \u00b7 expires 2026-10-12T16:01:30.984578+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/beacon\n\n\t\tpub fn beacon() {}\n\t[2] pub fn beacon()\n\t\tsrc/lib.rs:2 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/beacon\n\n\t\tpub fn beacon() {}\n\t[3] function beacon\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\t\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\t\tpub fn beacon() {}\n\t[4] pub fn local_beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/local_beacon\n\n\t\tpub fn local_beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n",
+    "json": {
+      "view": {
+        "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
+        "expires_at": "2026-10-12T16:01:30.980861+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91",
+            "expires_at": "2026-10-12T16:01:30.984578+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local@sdk/rust/docs_sdk/beacon",
+              "language": "rust",
+              "name": "beacon",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn beacon()",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature", "content"],
+          "source": "pub fn beacon() {}",
+          "range": {
+            "start": 0,
+            "end": 18
+          },
+          "line": 1,
+          "path": "src/lib.rs"
+        },
+        {
+          "view": {
+            "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
+            "expires_at": "2026-10-12T16:01:30.980861+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/docs_global_app/beacon",
+              "language": "rust",
+              "name": "beacon",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn beacon()",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature"],
+          "source": "pub fn beacon() {}",
+          "range": {
+            "start": 25,
+            "end": 43
+          },
+          "line": 2,
+          "path": "src/lib.rs"
+        },
+        {
+          "view": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expires_at": "2099-10-10T10:05:00Z"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "language": "rust",
+              "name": "beacon",
+              "kind": "function",
+              "origin": {
+                "location": "dependency",
+                "package": {
+                  "manager": "cargo",
+                  "registry": "crates.io",
+                  "name": "demo",
+                  "version": "1.0.0"
+                },
+                "source_kind": "authored"
+              }
+            }
+          },
+          "matched_by": ["name"],
+          "source": "pub fn beacon() {}",
+          "range": {
+            "start": 26,
+            "end": 44
+          },
+          "line": 2,
+          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+        },
+        {
+          "view": {
+            "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
+            "expires_at": "2026-10-12T16:01:30.980861+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/docs_global_app/local_beacon",
+              "language": "rust",
+              "name": "local_beacon",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn local_beacon()",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature"],
+          "source": "pub fn local_beacon() {}",
+          "range": {
+            "start": 0,
+            "end": 24
+          },
+          "line": 1,
+          "path": "src/lib.rs"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      },
+      "warnings": [
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "npm",
+            "name": "typescript",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "stdlib",
+            "name": "node",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "stdlib",
+            "name": "rust",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        }
+      ]
+    }
+  },
+  "named-search": {
+    "tool": "search",
+    "arguments": {
+      "query": "load_config",
+      "scope": "local@sdk",
+      "target": "symbol",
+      "include": ["source"],
+      "limit": 10
+    },
+    "text": "6 results\n\t[1] pub fn load_config() -> u32\n\t\tsrc/lib.rs:1 \u00b7 name, signature, documentation, content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\t\tLoads configuration.\n\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\n\t[2] heading Configuration\n\t\tREADME.md:5 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t43..81\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Example project\n\t\tREADME.md:1 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t0..81\n\n\t\t# Example project\n\n\t\tProject documentation.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] member name\n\t\tCargo.toml:2 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t10..27\n\n\t\tname = \"docs_sdk\"\n\t[5] member version\n\t\tCargo.toml:3 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t28..45\n\n\t\tversion = \"0.1.0\"\n\t[6] table package\n\t\tCargo.toml:1 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t0..63\n\n\t\t[package]\n\t\tname = \"docs_sdk\"\n\t\tversion = \"0.1.0\"\n\t\tedition = \"2021\"\n\nview 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n",
+    "json": {
+      "view": {
+        "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+        "expires_at": "2026-10-12T15:50:28.704474+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+            "expires_at": "2026-10-12T15:50:28.704474+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config",
+              "language": "rust",
+              "name": "load_config",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn load_config() -> u32",
+                  "language": "rust"
+                }
+              ],
+              "documentation": [
+                {
+                  "format": "markdown",
+                  "text": "Loads configuration."
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature", "documentation", "content"],
+          "source": "/// Loads configuration.\npub fn load_config() -> u32 { 42 }",
+          "range": {
+            "start": 0,
+            "end": 59
+          },
+          "line": 1,
+          "path": "src/lib.rs"
+        },
+        {
+          "view": {
+            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+            "expires_at": "2026-10-12T15:50:28.704474+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "markdown",
+              "name": "Configuration",
+              "kind": "heading"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "## Configuration\n\nCall `load_config`.\n",
+          "range": {
+            "start": 43,
+            "end": 81
+          },
+          "line": 5,
+          "path": "README.md"
+        },
+        {
+          "view": {
+            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+            "expires_at": "2026-10-12T15:50:28.704474+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "markdown",
+              "name": "Example project",
+              "kind": "heading"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "# Example project\n\nProject documentation.\n\n## Configuration\n\nCall `load_config`.\n",
+          "range": {
+            "start": 0,
+            "end": 81
+          },
+          "line": 1,
+          "path": "README.md"
+        },
+        {
+          "view": {
+            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+            "expires_at": "2026-10-12T15:50:28.704474+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "toml",
+              "name": "name",
+              "kind": "member"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "name = \"docs_sdk\"",
+          "range": {
+            "start": 10,
+            "end": 27
+          },
+          "line": 2,
+          "path": "Cargo.toml"
+        },
+        {
+          "view": {
+            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+            "expires_at": "2026-10-12T15:50:28.704474+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "toml",
+              "name": "version",
+              "kind": "member"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "version = \"0.1.0\"",
+          "range": {
+            "start": 28,
+            "end": 45
+          },
+          "line": 3,
+          "path": "Cargo.toml"
+        },
+        {
+          "view": {
+            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
+            "expires_at": "2026-10-12T15:50:28.704474+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "toml",
+              "name": "package",
+              "kind": "table"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "[package]\nname = \"docs_sdk\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+          "range": {
+            "start": 0,
+            "end": 63
+          },
+          "line": 1,
+          "path": "Cargo.toml"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      }
+    }
+  },
+  "local-symbol": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/local/rust/example_project/config/load_config"
+    },
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\n\t\trift://node/rust/src/config.rs@162-355#3e7a78cf\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/local/rust/example_project/config/load_config",
+        "language": "rust",
+        "name": "load_config",
+        "kind": "function",
+        "facets": ["value", "callable", "public"],
+        "visibility": "pub",
+        "signatures": [
+          {
+            "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+            "language": "rust"
+          }
+        ],
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Loads the workspace configuration from `rift.toml`."
+          }
+        ]
+      },
+      "view": {
+        "id": "e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3",
+        "expires_at": "2026-10-12T15:50:28.711117+00:00"
+      },
+      "declarations": [
+        {
+          "origin": {
+            "location": "project",
+            "source_kind": "authored"
+          },
+          "path": "src/config.rs",
+          "range": {
+            "start": 218,
+            "end": 355
+          },
+          "line": 11,
+          "node": "rift://node/rust/src/config.rs@162-355#3e7a78cf",
+          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+          "source_complete": true,
+          "signature_indices": [0],
+          "type_indices": [],
+          "documentation_indices": [0]
+        }
+      ]
+    }
+  },
+  "named-symbol": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
+    },
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\n\t\trift://node/rust/src/lib.rs@0-59#b0b58466\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config",
+        "language": "rust",
+        "name": "load_config",
+        "kind": "function",
+        "facets": ["value", "callable", "public"],
+        "visibility": "pub",
+        "signatures": [
+          {
+            "display": "pub fn load_config() -> u32",
+            "language": "rust"
+          }
+        ],
+        "documentation": [
+          {
+            "format": "markdown",
+            "text": "Loads configuration."
+          }
+        ]
+      },
+      "view": {
+        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
+        "expires_at": "2026-10-12T16:17:02.916991+00:00"
+      },
+      "declarations": [
+        {
+          "origin": {
+            "location": "project",
+            "source_kind": "authored"
+          },
+          "path": "src/lib.rs",
+          "range": {
+            "start": 25,
+            "end": 59
+          },
+          "line": 2,
+          "node": "rift://node/rust/src/lib.rs@0-59#b0b58466",
+          "source": "/// Loads configuration.\npub fn load_config() -> u32 { 42 }",
+          "source_complete": true,
+          "signature_indices": [0],
+          "type_indices": [],
+          "documentation_indices": [0]
+        }
+      ]
+    }
+  },
+  "missing-symbol": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/local/rust/example_project/config/load_configs"
+    },
+    "text": "\tunavailable \u00b7 InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\nview 52889776a11e04e3e6d9e9cc23476830656e159470c991b595ff493600732298 \u00b7 expires 2026-10-12T15:50:28.794765+00:00\n",
+    "json": {
+      "outcome": "unavailable",
+      "id": "rift://symbol/local/rust/example_project/config/load_configs",
+      "view": {
+        "id": "52889776a11e04e3e6d9e9cc23476830656e159470c991b595ff493600732298",
+        "expires_at": "2026-10-12T15:50:28.794765+00:00"
+      },
+      "reason": "insufficient_coverage"
+    }
+  },
+  "malformed-symbol": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/rust/src/lib.rs/load_config"
+    },
+    "text": "1 error\n\tinvalid_request \u00b7 retry never\n\t\ttool arguments do not match the served schema: accepted rift://symbol/<owner>/<language>/<qualified_path>; an occurrence uses ~2?rev=<revision>, example {\"id\":\"rift://symbol/local/rust/example_project/config/Config\"}, {\"id\":\"rift://symbol/local/rust/example_project/config/load_config\"}, field id, tool get_symbol; correct the reported field and resend the request\n\t\trift.mcp.parameter_invalid\n",
+    "json": null
+  },
+  "project-source": {
+    "tool": "get_source",
+    "arguments": {
+      "unit": "rift://source/project/README.md"
+    },
+    "text": "rift://source/project/README.md\n0..398\n\t# Example project\n\n\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t- `src/main.rs` starts the application.\n\t- `src/config.rs` loads the workspace configuration.\n\t- `src/error.rs` defines the error type returned by the loader.\n\n\tRift reads the project structure, source, and documentation to help\n\tan agent find the code relevant to its task.\n\n\t## Configuration\n\n\tCall `load_config`.\n\nview 815047e7e6f2f275e58e2b16ada429efb25cb8fc6bd70e4ad5153b6ed8540aae \u00b7 expires 2026-10-12T15:50:28.799521+00:00\n",
+    "json": {
+      "outcome": "found",
+      "source": {
+        "span": {
+          "unit": "rift://source/project/README.md",
+          "range": {
+            "start": 0,
+            "end": 398
+          }
+        },
+        "text": "# Example project\n\nA Rust project that reads workspace configuration from `rift.toml`.\n\n- `src/main.rs` starts the application.\n- `src/config.rs` loads the workspace configuration.\n- `src/error.rs` defines the error type returned by the loader.\n\nRift reads the project structure, source, and documentation to help\nan agent find the code relevant to its task.\n\n## Configuration\n\nCall `load_config`.\n"
+      },
+      "source_complete": true,
+      "view": {
+        "id": "815047e7e6f2f275e58e2b16ada429efb25cb8fc6bd70e4ad5153b6ed8540aae",
+        "expires_at": "2026-10-12T15:50:28.799521+00:00"
+      }
+    }
+  },
+  "project-section": {
+    "tool": "get_source",
+    "arguments": {
+      "unit": "rift://source/project/README.md",
+      "range": {
+        "start": 360,
+        "end": 398
+      }
+    },
+    "text": "rift://source/project/README.md\n360..398\n\t## Configuration\n\n\tCall `load_config`.\n\nview 4c04e9840ee7a9d270a923cd35c010c840baef4da46fc29c64f921b2e76e4bc4 \u00b7 expires 2026-10-12T15:50:28.847106+00:00\n",
+    "json": {
+      "outcome": "found",
+      "source": {
+        "span": {
+          "unit": "rift://source/project/README.md",
+          "range": {
+            "start": 360,
+            "end": 398
+          }
+        },
+        "text": "## Configuration\n\nCall `load_config`.\n"
+      },
+      "source_complete": true,
+      "view": {
+        "id": "4c04e9840ee7a9d270a923cd35c010c840baef4da46fc29c64f921b2e76e4bc4",
+        "expires_at": "2026-10-12T15:50:28.847106+00:00"
+      }
+    }
+  },
+  "pattern-search": {
+    "tool": "search",
+    "arguments": {
+      "pattern": "load_config",
+      "include": ["source"],
+      "limit": 10
+    },
+    "text": "7 results\n\t[1] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[2] README.md:14 \u00b7 content\n\t\tCall `load_config`.\n\t[3] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[4] src/config.rs:11 \u00b7 content\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t[5] src/main.rs:6 \u00b7 content\n\t\tuse config::load_config;\n\t[6] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\n\t[7] src/main.rs:12 \u00b7 content\n\t\t        load_config(Path::new(\"rift.toml\"))\n",
+    "json": {
+      "results": [
+        {
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "markdown",
+              "name": "Configuration",
+              "kind": "heading"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "## Configuration\n\nCall `load_config`.\n",
+          "range": {
+            "start": 360,
+            "end": 398
+          },
+          "line": 12,
+          "path": "README.md"
+        },
+        {
+          "hit": {
+            "target": "file",
+            "size": 398,
+            "languages": ["markdown"]
+          },
+          "matched_by": ["content"],
+          "source": "Call `load_config`.",
+          "range": {
+            "start": 384,
+            "end": 395
+          },
+          "line": 14,
+          "path": "README.md"
+        },
+        {
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/config/load_config",
+              "language": "rust",
+              "name": "load_config",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                  "language": "rust"
+                }
+              ],
+              "documentation": [
+                {
+                  "format": "markdown",
+                  "text": "Loads the workspace configuration from `rift.toml`."
+                }
+              ]
+            }
+          },
+          "matched_by": ["content"],
+          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+          "range": {
+            "start": 162,
+            "end": 355
+          },
+          "line": 10,
+          "path": "src/config.rs"
+        },
+        {
+          "hit": {
+            "target": "file",
+            "size": 356,
+            "languages": ["rust"]
+          },
+          "matched_by": ["content"],
+          "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {",
+          "range": {
+            "start": 225,
+            "end": 236
+          },
+          "line": 11,
+          "path": "src/config.rs"
+        },
+        {
+          "hit": {
+            "target": "file",
+            "size": 344,
+            "languages": ["rust"]
+          },
+          "matched_by": ["content"],
+          "source": "use config::load_config;",
+          "range": {
+            "start": 58,
+            "end": 69
+          },
+          "line": 6,
+          "path": "src/main.rs"
+        },
+        {
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "rust",
+              "name": "main",
+              "kind": "function",
+              "facets": ["value", "callable", "entrypoint"],
+              "visibility": "private",
+              "signatures": [
+                {
+                  "display": "async fn main() -> Result<(), ConfigError>",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["content"],
+          "source": "#[tokio::main]\nasync fn main() -> Result<(), ConfigError> {\n    let config = tokio::task::spawn_blocking(|| {\n        load_config(Path::new(\"rift.toml\"))\n    })\n    .await??;\n\n    println!(\"Workspace root: {}\", config.root.display());\n    Ok(())\n}",
+          "range": {
+            "start": 96,
+            "end": 343
+          },
+          "line": 9,
+          "path": "src/main.rs"
+        },
+        {
+          "hit": {
+            "target": "file",
+            "size": 344,
+            "languages": ["rust"]
+          },
+          "matched_by": ["content"],
+          "source": "        load_config(Path::new(\"rift.toml\"))",
+          "range": {
+            "start": 214,
+            "end": 225
+          },
+          "line": 12,
+          "path": "src/main.rs"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      }
+    }
+  },
+  "local-nodes": {
+    "tool": "nodes",
+    "arguments": {
+      "path": "src/config.rs",
+      "position": 338
+    },
+    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\trift://node/rust/src/config.rs@0-356#dcbef6dd\n\t[2] function_item \u00b7 4 lines\n\t\trift://node/rust/src/config.rs@218-355#67ecfb36\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\trift://node/rust/src/config.rs@281-355#4e554fa8\n\t[4] call_expression\n\t\trift://node/rust/src/config.rs@334-353#4df4426e\n\t[5] identifier\n\t\trift://node/rust/src/config.rs@334-346#03f22dac\n\n\t\tparse_config\n",
+    "json": {
+      "nodes": [
+        {
+          "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "source_file",
+          "range": {
+            "start": 0,
+            "end": 356
+          }
+        },
+        {
+          "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+          "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "function_item",
+          "facets": ["declaration", "definition"],
+          "range": {
+            "start": 218,
+            "end": 355
+          }
+        },
+        {
+          "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "block",
+          "range": {
+            "start": 281,
+            "end": 355
+          }
+        },
+        {
+          "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "call_expression",
+          "facets": ["expression"],
+          "range": {
+            "start": 334,
+            "end": 353
+          }
+        },
+        {
+          "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "identifier",
+          "range": {
+            "start": 334,
+            "end": 346
+          }
+        }
+      ],
+      "source": [
+        "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
+        "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+        "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+        "parse_config(&text)",
+        "parse_config"
+      ]
+    }
+  },
+  "local-search": {
+    "tool": "search",
+    "arguments": {
+      "query": "load configuration",
+      "include": ["source"],
+      "limit": 5
+    },
+    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 name, signature, documentation, content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] Example project\n\t\tREADME.md:3 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t[3] Example project > Example project > Configuration\n\t\tREADME.md:12 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\t## Configuration\n\n\t[4] private module config\n\t\tsrc/main.rs:1 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\t0..11\n\n\t\tmod config;\n\t[5] pub module config\n\t\tsrc/lib.rs:1 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\trift://symbol/local/rust/example_project/config\n\n\t\tpub mod config;\nview c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n",
+    "json": {
+      "view": {
+        "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
+        "expires_at": "2026-10-12T15:50:28.932788+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
+            "expires_at": "2026-10-12T15:50:28.932788+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/config/load_config",
+              "language": "rust",
+              "name": "load_config",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                  "language": "rust"
+                }
+              ],
+              "documentation": [
+                {
+                  "format": "markdown",
+                  "text": "Loads the workspace configuration from `rift.toml`."
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature", "documentation", "content"],
+          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+          "range": {
+            "start": 162,
+            "end": 355
+          },
+          "line": 10,
+          "path": "src/config.rs"
+        },
+        {
+          "view": {
+            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
+            "expires_at": "2026-10-12T15:50:28.932788+00:00"
+          },
+          "hit": {
+            "target": "documentation",
+            "documentation": {
+              "block": {
+                "identity": "267a7120d9e291a212e357b27cef32af9cc0712bee291b04be6c7ba33e9586d0",
+                "source": {
+                  "source": {
+                    "kind": "project",
+                    "path": "README.md"
+                  }
+                },
+                "content_digest": "7622d3a710feb453a9b9b41e7b5667ec6b91615aa02f3297213dda1084046fc9",
+                "heading_path": [
+                  {
+                    "level": 1,
+                    "name": "Example project"
+                  }
+                ],
+                "range": {
+                  "start": 19,
+                  "end": 87
+                },
+                "line": 3,
+                "kind": "prose",
+                "chunks": [
+                  {
+                    "identity": "README.md",
+                    "range": {
+                      "start": 0,
+                      "end": 398
+                    }
+                  }
+                ]
+              },
+              "source": {
+                "identity": {
+                  "source": {
+                    "kind": "project",
+                    "path": "README.md"
+                  }
+                },
+                "revision": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
+                "content_digest": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
+                "origin": {
+                  "location": "project",
+                  "source_kind": "authored"
+                },
+                "format": "markdown",
+                "media_type": "text/markdown",
+                "selection": "workspace",
+                "byte_length": 398
+              },
+              "documentation_revision": "c4629d47"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "A Rust project that reads workspace configuration from `rift.toml`.\n",
+          "range": {
+            "start": 19,
+            "end": 87
+          },
+          "line": 3,
+          "path": "README.md"
+        },
+        {
+          "view": {
+            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
+            "expires_at": "2026-10-12T15:50:28.932788+00:00"
+          },
+          "hit": {
+            "target": "documentation",
+            "documentation": {
+              "block": {
+                "identity": "5eba7f9860bfbaf37fa910ede4b4b3181f70e5fa2199b169f949f5f08766bc41",
+                "source": {
+                  "source": {
+                    "kind": "project",
+                    "path": "README.md"
+                  }
+                },
+                "content_digest": "af2764b825b4b9417dbf637a70b4e95be01e0f45626134189f47d9b0c046d0c4",
+                "heading_path": [
+                  {
+                    "level": 1,
+                    "name": "Example project"
+                  },
+                  {
+                    "level": 2,
+                    "name": "Example project > Configuration"
+                  }
+                ],
+                "range": {
+                  "start": 360,
+                  "end": 377
+                },
+                "line": 12,
+                "kind": "prose",
+                "chunks": [
+                  {
+                    "identity": "README.md",
+                    "range": {
+                      "start": 0,
+                      "end": 398
+                    }
+                  }
+                ]
+              },
+              "source": {
+                "identity": {
+                  "source": {
+                    "kind": "project",
+                    "path": "README.md"
+                  }
+                },
+                "revision": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
+                "content_digest": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
+                "origin": {
+                  "location": "project",
+                  "source_kind": "authored"
+                },
+                "format": "markdown",
+                "media_type": "text/markdown",
+                "selection": "workspace",
+                "byte_length": 398
+              },
+              "documentation_revision": "c4629d47"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "## Configuration\n",
+          "range": {
+            "start": 360,
+            "end": 377
+          },
+          "line": 12,
+          "path": "README.md"
+        },
+        {
+          "view": {
+            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
+            "expires_at": "2026-10-12T15:50:28.932788+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "rust",
+              "name": "config",
+              "kind": "module",
+              "facets": ["namespace", "module"],
+              "visibility": "private"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "mod config;",
+          "range": {
+            "start": 0,
+            "end": 11
+          },
+          "line": 1,
+          "path": "src/main.rs"
+        },
+        {
+          "view": {
+            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
+            "expires_at": "2026-10-12T15:50:28.932788+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/config",
+              "language": "rust",
+              "name": "config",
+              "kind": "module",
+              "facets": ["namespace", "module", "public"],
+              "visibility": "pub"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "pub mod config;",
+          "range": {
+            "start": 0,
+            "end": 15
+          },
+          "line": 1,
+          "path": "src/lib.rs"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 4
+      }
+    }
+  },
+  "documentation-search": {
+    "tool": "search",
+    "arguments": {
+      "query": "loads workspace configuration",
+      "target": "symbol",
+      "include": ["source"],
+      "limit": 5
+    },
+    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 documentation, content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] heading Example project\n\t\tREADME.md:1 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t0..398\n\n\t\t# Example project\n\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t\t- `src/main.rs` starts the application.\n\t\t- `src/config.rs` loads the workspace configuration.\n\t\t- `src/error.rs` defines the error type returned by the loader.\n\n\t\tRift reads the project structure, source, and documentation to help\n\t\tan agent find the code relevant to its task.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Configuration\n\t\tREADME.md:12 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] pub struct Config\n\t\tsrc/config.rs:5 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\trift://symbol/local/rust/example_project/config/Config\n\t\tWorkspace configuration read from `rift.toml`.\n\n\t\t/// Workspace configuration read from `rift.toml`.\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n\t[5] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\nview 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n",
+    "json": {
+      "view": {
+        "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
+        "expires_at": "2026-10-12T15:50:28.954251+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
+            "expires_at": "2026-10-12T15:50:28.954251+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/config/load_config",
+              "language": "rust",
+              "name": "load_config",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
+                  "language": "rust"
+                }
+              ],
+              "documentation": [
+                {
+                  "format": "markdown",
+                  "text": "Loads the workspace configuration from `rift.toml`."
+                }
+              ]
+            }
+          },
+          "matched_by": ["documentation", "content"],
+          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
+          "range": {
+            "start": 162,
+            "end": 355
+          },
+          "line": 10,
+          "path": "src/config.rs"
+        },
+        {
+          "view": {
+            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
+            "expires_at": "2026-10-12T15:50:28.954251+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "markdown",
+              "name": "Example project",
+              "kind": "heading"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "# Example project\n\nA Rust project that reads workspace configuration from `rift.toml`.\n\n- `src/main.rs` starts the application.\n- `src/config.rs` loads the workspace configuration.\n- `src/error.rs` defines the error type returned by the loader.\n\nRift reads the project structure, source, and documentation to help\nan agent find the code relevant to its task.\n\n## Configuration\n\nCall `load_config`.\n",
+          "range": {
+            "start": 0,
+            "end": 398
+          },
+          "line": 1,
+          "path": "README.md"
+        },
+        {
+          "view": {
+            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
+            "expires_at": "2026-10-12T15:50:28.954251+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "markdown",
+              "name": "Configuration",
+              "kind": "heading"
+            }
+          },
+          "matched_by": ["content"],
+          "source": "## Configuration\n\nCall `load_config`.\n",
+          "range": {
+            "start": 360,
+            "end": 398
+          },
+          "line": 12,
+          "path": "README.md"
+        },
+        {
+          "view": {
+            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
+            "expires_at": "2026-10-12T15:50:28.954251+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/config/Config",
+              "language": "rust",
+              "name": "Config",
+              "kind": "struct",
+              "facets": ["type", "public"],
+              "visibility": "pub",
+              "documentation": [
+                {
+                  "format": "markdown",
+                  "text": "Workspace configuration read from `rift.toml`."
+                }
+              ]
+            }
+          },
+          "matched_by": ["content"],
+          "source": "/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}",
+          "range": {
+            "start": 54,
+            "end": 160
+          },
+          "line": 5,
+          "path": "src/config.rs"
+        },
+        {
+          "view": {
+            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
+            "expires_at": "2026-10-12T15:50:28.954251+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "rust",
+              "name": "main",
+              "kind": "function",
+              "facets": ["value", "callable", "entrypoint"],
+              "visibility": "private",
+              "signatures": [
+                {
+                  "display": "async fn main() -> Result<(), ConfigError>",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["content"],
+          "source": "#[tokio::main]\nasync fn main() -> Result<(), ConfigError> {\n    let config = tokio::task::spawn_blocking(|| {\n        load_config(Path::new(\"rift.toml\"))\n    })\n    .await??;\n\n    println!(\"Workspace root: {}\", config.root.display());\n    Ok(())\n}",
+          "range": {
+            "start": 96,
+            "end": 343
+          },
+          "line": 9,
+          "path": "src/main.rs"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 4
+      }
+    }
+  },
+  "incoming-traversal": {
+    "tool": "search",
+    "arguments": {
+      "traversal": {
+        "seed": "rift://symbol/local/rust/example_project/config/load_config",
+        "direction": "incoming",
+        "depth": 1
+      },
+      "target": "symbol",
+      "include": ["source"]
+    },
+    "text": "1 error\n\tcapability_unavailable \u00b7 retry operator_action\n\t\trequest uses unsupported capability relationship traversal (no language engine serves the seed); adjust the request to a served capability, or configure a provider that serves it\n\t\trift.server.read_unsupported\n",
+    "json": null
+  },
+  "outgoing-traversal": {
+    "tool": "search",
+    "arguments": {
+      "traversal": {
+        "seed": "rift://symbol/local/rust/example_project/config/load_config",
+        "direction": "outgoing",
+        "depth": 2
+      },
+      "target": "symbol",
+      "include": ["source"]
+    },
+    "text": "1 error\n\tcapability_unavailable \u00b7 retry operator_action\n\t\trequest uses unsupported capability relationship traversal (no language engine serves the seed); adjust the request to a served capability, or configure a provider that serves it\n\t\trift.server.read_unsupported\n",
+    "json": null
+  },
+  "global-search": {
+    "tool": "search",
+    "arguments": {
+      "query": "beacon",
+      "scope": "global",
+      "packages": [
+        {
+          "manager": "cargo",
+          "registry": "crates.io",
+          "name": "demo",
+          "version": "1.0.0"
+        }
+      ],
+      "target": "symbol",
+      "include": ["source"]
+    },
+    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\tpub fn beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405 \u00b7 expires 2026-10-12T16:01:30.993123+00:00\n",
+    "json": {
+      "view": {
+        "id": "aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405",
+        "expires_at": "2026-10-12T16:01:30.993123+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expires_at": "2099-10-10T10:05:00Z"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "language": "rust",
+              "name": "beacon",
+              "kind": "function",
+              "origin": {
+                "location": "dependency",
+                "package": {
+                  "manager": "cargo",
+                  "registry": "crates.io",
+                  "name": "demo",
+                  "version": "1.0.0"
+                },
+                "source_kind": "authored"
+              }
+            }
+          },
+          "matched_by": ["name"],
+          "source": "pub fn beacon() {}",
+          "range": {
+            "start": 26,
+            "end": 44
+          },
+          "line": 2,
+          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      },
+      "warnings": [
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "npm",
+            "name": "typescript",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "stdlib",
+            "name": "node",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "stdlib",
+            "name": "rust",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        }
+      ]
+    }
+  },
+  "requested-served": {
+    "tool": "search",
+    "arguments": {
+      "query": "beacon",
+      "scope": "global",
+      "packages": [
+        {
+          "manager": "cargo",
+          "registry": "crates.io",
+          "name": "demo",
+          "version": "1.1.0"
+        }
+      ],
+      "target": "symbol",
+      "include": ["source"]
+    },
+    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\tpub fn beacon() {}\n4 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\n\tpackage_substituted \u00b7 entry demo@1.1.0 (cargo) \u00b7 package demo@1.0.0 (cargo)\nview 1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058 \u00b7 expires 2026-10-12T16:01:30.999711+00:00\n",
+    "json": {
+      "view": {
+        "id": "1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058",
+        "expires_at": "2026-10-12T16:01:30.999711+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expires_at": "2099-10-10T10:05:00Z"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "language": "rust",
+              "name": "beacon",
+              "kind": "function",
+              "origin": {
+                "location": "dependency",
+                "package": {
+                  "manager": "cargo",
+                  "registry": "crates.io",
+                  "name": "demo",
+                  "version": "1.0.0"
+                },
+                "source_kind": "authored"
+              }
+            }
+          },
+          "matched_by": ["name"],
+          "source": "pub fn beacon() {}",
+          "range": {
+            "start": 26,
+            "end": 44
+          },
+          "line": 2,
+          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      },
+      "warnings": [
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "npm",
+            "name": "typescript",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "stdlib",
+            "name": "node",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_requirement_absent",
+          "entry": {
+            "manager": "stdlib",
+            "name": "rust",
+            "requirement": ">=0",
+            "availability": "canonical"
+          }
+        },
+        {
+          "code": "package_substituted",
+          "entry": {
+            "manager": "cargo",
+            "name": "demo",
+            "registry": "crates.io",
+            "version": "1.1.0",
+            "availability": "canonical"
+          },
+          "package": {
+            "manager": "cargo",
+            "registry": "crates.io",
+            "name": "demo",
+            "version": "1.0.0"
+          }
+        }
+      ]
+    }
+  },
+  "global-symbol-documentation": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+      "include": ["source", "documentation"]
+    },
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\n\t\tpub fn beacon() {}\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+        "language": "rust",
+        "name": "beacon",
+        "kind": "function",
+        "origin": {
+          "location": "dependency",
+          "package": {
+            "manager": "cargo",
+            "registry": "crates.io",
+            "name": "demo",
+            "version": "1.0.0"
+          },
+          "source_kind": "authored"
+        }
+      },
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      },
+      "declarations": [
+        {
+          "origin": {
+            "location": "dependency",
+            "package": {
+              "manager": "cargo",
+              "registry": "crates.io",
+              "name": "demo",
+              "version": "1.0.0"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+          "range": {
+            "start": 26,
+            "end": 44
+          },
+          "line": 2,
+          "source": "pub fn beacon() {}",
+          "source_complete": true,
+          "signature_indices": [],
+          "type_indices": [],
+          "documentation_indices": []
+        }
+      ],
+      "documentation": {
+        "documentation_revision": "0123abcd",
+        "references": [
+          {
+            "reference": {
+              "identity": "5555555555555555555555555555555555555555555555555555555555555555",
+              "block": "1111111111111111111111111111111111111111111111111111111111111111",
+              "target": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "range": {
+                "start": 1,
+                "end": 7
+              },
+              "authored": "beacon",
+              "evidence": "unique_name"
+            },
+            "documentation": {
+              "block": {
+                "identity": "1111111111111111111111111111111111111111111111111111111111111111",
+                "source": {
+                  "source": {
+                    "kind": "package",
+                    "unit": "rift://source/cargo/crates.io/demo@1.0.0/README.md"
+                  }
+                },
+                "content_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+                "range": {
+                  "start": 0,
+                  "end": 40
+                },
+                "line": 1,
+                "kind": "prose"
+              },
+              "source": {
+                "identity": {
+                  "source": {
+                    "kind": "package",
+                    "unit": "rift://source/cargo/crates.io/demo@1.0.0/README.md"
+                  }
+                },
+                "revision": "3333333333333333333333333333333333333333333333333333333333333333",
+                "content_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+                "origin": {
+                  "location": "dependency",
+                  "package": {
+                    "manager": "cargo",
+                    "registry": "crates.io",
+                    "name": "demo",
+                    "version": "1.0.0"
+                  },
+                  "source_kind": "authored"
+                },
+                "format": "markdown",
+                "media_type": "text/markdown",
+                "selection": "package_archive",
+                "byte_length": 40
+              },
+              "documentation_revision": "0123abcd"
+            },
+            "excerpt": "guide"
+          }
+        ],
+        "truncated": false
+      }
+    }
+  },
+  "global-source": {
+    "tool": "get_source",
+    "arguments": {
+      "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+    },
+    "text": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs\n0..45\n\tpub fn helper_beacon() {}\n\tpub fn beacon() {}\n\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "source": {
+        "span": {
+          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+          "range": {
+            "start": 0,
+            "end": 45
+          }
+        },
+        "text": "pub fn helper_beacon() {}\npub fn beacon() {}\n"
+      },
+      "source_complete": true,
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      }
+    }
+  },
+  "source-less-runtime": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
+    },
+    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile",
+        "language": "javascript",
+        "name": "readFile",
+        "kind": "function",
+        "origin": {
+          "location": "stdlib",
+          "runtime": {
+            "runtime": "node",
+            "version": "26.11.1"
+          },
+          "source_kind": "authored"
+        }
+      },
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      },
+      "declarations": []
+    }
+  },
+  "source-less-builtin": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+    },
+    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
+        "language": "python",
+        "name": "len",
+        "kind": "function",
+        "origin": {
+          "source_kind": "synthetic"
+        }
+      },
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      },
+      "declarations": []
+    }
+  },
+  "multi-declaration-full": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
+    },
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+        "language": "typescript",
+        "name": "format",
+        "kind": "function",
+        "origin": {
+          "location": "dependency",
+          "package": {
+            "manager": "npm",
+            "registry": "npmjs.org",
+            "name": "prettier",
+            "version": "3.8.5"
+          },
+          "source_kind": "authored"
+        }
+      },
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      },
+      "declarations": [
+        {
+          "origin": {
+            "location": "dependency",
+            "package": {
+              "manager": "npm",
+              "registry": "npmjs.org",
+              "name": "prettier",
+              "version": "3.8.5"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "range": {
+            "start": 0,
+            "end": 46
+          },
+          "line": 1,
+          "source": "export function format(value: string): string;",
+          "source_complete": true,
+          "signature_indices": [],
+          "type_indices": [],
+          "documentation_indices": []
+        },
+        {
+          "origin": {
+            "location": "dependency",
+            "package": {
+              "manager": "npm",
+              "registry": "npmjs.org",
+              "name": "prettier",
+              "version": "3.8.5"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "range": {
+            "start": 47,
+            "end": 93
+          },
+          "line": 2,
+          "source": "export function format(value: number): string;",
+          "source_complete": true,
+          "signature_indices": [],
+          "type_indices": [],
+          "documentation_indices": []
+        }
+      ]
+    }
+  },
+  "multi-declaration-first": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+      "declaration_limit": 1
+    },
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+        "language": "typescript",
+        "name": "format",
+        "kind": "function",
+        "origin": {
+          "location": "dependency",
+          "package": {
+            "manager": "npm",
+            "registry": "npmjs.org",
+            "name": "prettier",
+            "version": "3.8.5"
+          },
+          "source_kind": "authored"
+        }
+      },
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      },
+      "declarations": [
+        {
+          "origin": {
+            "location": "dependency",
+            "package": {
+              "manager": "npm",
+              "registry": "npmjs.org",
+              "name": "prettier",
+              "version": "3.8.5"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "range": {
+            "start": 0,
+            "end": 46
+          },
+          "line": 1,
+          "source": "export function format(value: string): string;",
+          "source_complete": true,
+          "signature_indices": [],
+          "type_indices": [],
+          "documentation_indices": []
+        }
+      ],
+      "declaration_cursor": "fixture-next"
+    }
+  },
+  "multi-declaration-next": {
+    "tool": "get_symbol",
+    "arguments": {
+      "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+      "declaration_limit": 1,
+      "declaration_cursor": "fixture-next",
+      "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "json": {
+      "outcome": "found",
+      "symbol": {
+        "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+        "language": "typescript",
+        "name": "format",
+        "kind": "function",
+        "origin": {
+          "location": "dependency",
+          "package": {
+            "manager": "npm",
+            "registry": "npmjs.org",
+            "name": "prettier",
+            "version": "3.8.5"
+          },
+          "source_kind": "authored"
+        }
+      },
+      "view": {
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expires_at": "2099-10-10T10:05:00Z"
+      },
+      "declarations": [
+        {
+          "origin": {
+            "location": "dependency",
+            "package": {
+              "manager": "npm",
+              "registry": "npmjs.org",
+              "name": "prettier",
+              "version": "3.8.5"
+            },
+            "source_kind": "authored"
+          },
+          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "range": {
+            "start": 47,
+            "end": 93
+          },
+          "line": 2,
+          "source": "export function format(value: number): string;",
+          "source_complete": true,
+          "signature_indices": [],
+          "type_indices": [],
+          "documentation_indices": []
+        }
+      ]
+    }
+  },
+  "multi-declaration-discovery": {
+    "tool": "search",
+    "arguments": {
+      "query": "format",
+      "scope": "local",
+      "target": "symbol",
+      "include": ["source"]
+    },
+    "text": "2 results\n\t[1] function format(value: string): string\n\t\toverload.d.ts:1 \u00b7 name, signature \u00b7 view 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n\t\t0..46\n\n\t\texport function format(value: string): string;\n\t[2] function format(value: number): string\n\t\toverload.d.ts:2 \u00b7 name, signature \u00b7 view 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n\t\t47..93\n\n\t\texport function format(value: number): string;\nview 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n",
+    "json": {
+      "view": {
+        "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
+        "expires_at": "2026-10-12T16:01:31.145575+00:00"
+      },
+      "results": [
+        {
+          "view": {
+            "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
+            "expires_at": "2026-10-12T16:01:31.145575+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "typescript",
+              "name": "format",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "signatures": [
+                {
+                  "display": "function format(value: string): string",
+                  "language": "typescript"
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature"],
+          "source": "export function format(value: string): string;",
+          "range": {
+            "start": 0,
+            "end": 46
+          },
+          "line": 1,
+          "path": "overload.d.ts"
+        },
+        {
+          "view": {
+            "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
+            "expires_at": "2026-10-12T16:01:31.145575+00:00"
+          },
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "language": "typescript",
+              "name": "format",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "signatures": [
+                {
+                  "display": "function format(value: number): string",
+                  "language": "typescript"
+                }
+              ]
+            }
+          },
+          "matched_by": ["name", "signature"],
+          "source": "export function format(value: number): string;",
+          "range": {
+            "start": 47,
+            "end": 93
+          },
+          "line": 2,
+          "path": "overload.d.ts"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      }
+    }
+  },
+  "map": {
+    "tool": "read_resource",
+    "arguments": {
+      "uri": "rift://map"
+    },
+    "text": "{\"revision\":\"159fb324\",\"languages\":[{\"language\":\"json\",\"files\":1,\"symbols\":2},{\"language\":\"rust\",\"files\":1,\"symbols\":2},{\"language\":\"toml\",\"files\":2,\"symbols\":22},{\"language\":\"typescript\",\"files\":1,\"symbols\":2}],\"modules\":[{\"path\":\"src\",\"files\":1,\"symbols\":2}],\"hubs\":[{\"symbol\":\"rift://symbol/local/rust/docs_global_app/beacon\",\"kind\":\"function\",\"references\":0},{\"symbol\":\"rift://symbol/local/rust/docs_global_app/local_beacon\",\"kind\":\"function\",\"references\":0}],\"packages\":[{\"manager\":\"cargo\",\"name\":\"demo\",\"registry\":\"crates.io\",\"version\":\"1.0.0\",\"availability\":\"canonical\"},{\"manager\":\"npm\",\"name\":\"typescript\",\"requirement\":\">=0\",\"availability\":\"canonical\"},{\"manager\":\"stdlib\",\"name\":\"node\",\"requirement\":\">=0\",\"availability\":\"canonical\"},{\"manager\":\"stdlib\",\"name\":\"rust\",\"requirement\":\">=0\",\"availability\":\"canonical\"}],\"pagination\":{\"page_index\":0,\"total_pages\":1}}",
+    "json": {
+      "revision": "159fb324",
+      "languages": [
+        {
+          "language": "json",
+          "files": 1,
+          "symbols": 2
+        },
+        {
+          "language": "rust",
+          "files": 1,
+          "symbols": 2
+        },
+        {
+          "language": "toml",
+          "files": 2,
+          "symbols": 22
+        },
+        {
+          "language": "typescript",
+          "files": 1,
+          "symbols": 2
+        }
+      ],
+      "modules": [
+        {
+          "path": "src",
+          "files": 1,
+          "symbols": 2
+        }
+      ],
+      "hubs": [
+        {
+          "symbol": "rift://symbol/local/rust/docs_global_app/beacon",
+          "kind": "function",
+          "references": 0
+        },
+        {
+          "symbol": "rift://symbol/local/rust/docs_global_app/local_beacon",
+          "kind": "function",
+          "references": 0
+        }
+      ],
+      "packages": [
+        {
+          "manager": "cargo",
+          "name": "demo",
+          "registry": "crates.io",
+          "version": "1.0.0",
+          "availability": "canonical"
+        },
+        {
+          "manager": "npm",
+          "name": "typescript",
+          "requirement": ">=0",
+          "availability": "canonical"
+        },
+        {
+          "manager": "stdlib",
+          "name": "node",
+          "requirement": ">=0",
+          "availability": "canonical"
+        },
+        {
+          "manager": "stdlib",
+          "name": "rust",
+          "requirement": ">=0",
+          "availability": "canonical"
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      }
+    }
+  },
+  "change": {
+    "tool": "search",
+    "arguments": {
+      "change": {
+        "base": "8422c73786ef5c78648ad3168949cb974e073e22",
+        "head": {
+          "kind": "working_tree"
+        }
+      },
+      "target": "symbol",
+      "include": ["source"],
+      "limit": 10
+    },
+    "text": "2 results\n\t[1] pub fn load_config() -> u32\n\t\tsrc/lib.rs:1 \u00b7 change\n\t\trift://symbol/local/rust/example_project/load_config\n\t\tbody changed\n\n\t\tpub fn load_config() -> u32 { 43 }\n\t[2] pub fn old_loader() -> u32\n\t\tsrc/lib.rs:2 \u00b7 change\n\t\trift://symbol/local/rust/example_project/old_loader\n\t\tremoved\n\n\t\tpub fn old_loader() -> u32 { 1 }\n",
+    "json": {
+      "results": [
+        {
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/load_config",
+              "language": "rust",
+              "name": "load_config",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn load_config() -> u32",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["change"],
+          "source": "pub fn load_config() -> u32 { 43 }",
+          "range": {
+            "start": 0,
+            "end": 34
+          },
+          "line": 1,
+          "path": "src/lib.rs",
+          "change": {
+            "kind": "body_changed",
+            "base_path": "src/lib.rs",
+            "head_path": "src/lib.rs"
+          }
+        },
+        {
+          "hit": {
+            "target": "symbol",
+            "symbol": {
+              "id": "rift://symbol/local/rust/example_project/old_loader",
+              "language": "rust",
+              "name": "old_loader",
+              "kind": "function",
+              "facets": ["value", "callable", "public"],
+              "visibility": "pub",
+              "signatures": [
+                {
+                  "display": "pub fn old_loader() -> u32",
+                  "language": "rust"
+                }
+              ]
+            }
+          },
+          "matched_by": ["change"],
+          "source": "pub fn old_loader() -> u32 { 1 }",
+          "range": {
+            "start": 35,
+            "end": 67
+          },
+          "line": 2,
+          "path": "src/lib.rs",
+          "change": {
+            "kind": "removed",
+            "base_path": "src/lib.rs"
+          }
+        }
+      ],
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      }
+    }
+  },
+  "named-project-source": {
+    "tool": "get_source",
+    "arguments": {
+      "unit": "rift://source/project/README.md",
+      "view": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd"
+    },
+    "text": "rift://source/project/README.md\n0..81\n\t# Example project\n\n\tProject documentation.\n\n\t## Configuration\n\n\tCall `load_config`.\n\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "json": {
+      "outcome": "found",
+      "source": {
+        "span": {
+          "unit": "rift://source/project/README.md",
+          "range": {
+            "start": 0,
+            "end": 81
+          }
+        },
+        "text": "# Example project\n\nProject documentation.\n\n## Configuration\n\nCall `load_config`.\n"
+      },
+      "source_complete": true,
+      "view": {
+        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
+        "expires_at": "2026-10-12T16:17:02.916991+00:00"
+      }
+    }
+  },
+  "named-project-section": {
+    "tool": "get_source",
+    "arguments": {
+      "unit": "rift://source/project/README.md",
+      "view": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
+      "range": {
+        "start": 43,
+        "end": 81
+      }
+    },
+    "text": "rift://source/project/README.md\n43..81\n\t## Configuration\n\n\tCall `load_config`.\n\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "json": {
+      "outcome": "found",
+      "source": {
+        "span": {
+          "unit": "rift://source/project/README.md",
+          "range": {
+            "start": 43,
+            "end": 81
+          }
+        },
+        "text": "## Configuration\n\nCall `load_config`.\n"
+      },
+      "source_complete": true,
+      "view": {
+        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
+        "expires_at": "2026-10-12T16:17:02.916991+00:00"
+      }
+    }
+  }
+}

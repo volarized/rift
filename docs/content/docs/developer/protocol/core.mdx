@@ -31,9 +31,10 @@ the environment.
 
 [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId) names one unit in that catalog,
 and a package file the global index answers from takes the same form:
-`rift://source/pypi/pydantic@2.8.2/pydantic/main.py`. After `rift://source/`, an id is two parts:
-the resolver identity (`pypi`), then that resolver's own human-readable key for the unit
-(`pydantic@2.8.2/pydantic/main.py`).
+`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`. This package address names its manager,
+registry, package and exact served version, then the physical path in that release. A project
+source address uses `rift://source/project/` followed by its project-relative path. Logical
+symbol identities remain separate from these physical addresses.
 
 The key is never a digest. A [`Digest`](/docs/developer/protocol/reference#Digest) reaches the
 wire only as a short witness where byte identity matters: the first eight hex characters of a
@@ -46,14 +47,19 @@ declaration's source belongs: project, dependency, standard library, or external
 authored, generated, or synthetic for a declaration with no source unit. The two stay separate
 because generated code can belong to the project or to a dependency.
 
-A declaration in that pydantic file carries both in its
+A declaration in that package file carries both in its
 [`SymbolOrigin`](/docs/developer/protocol/reference#SymbolOrigin), beside the package that owns
 it:
 
 ```json
 {
   "location": "dependency",
-  "package": { "manager": "pypi", "name": "pydantic", "version": "2.8.2" },
+  "package": {
+    "manager": "cargo",
+    "registry": "crates.io",
+    "name": "demo",
+    "version": "1.0.0"
+  },
   "source_kind": "authored"
 }
 ```
@@ -72,7 +78,8 @@ between symbols, resolved types, diagnostics, and history. A family no provider 
 refuses with `capability_unavailable`. Signatures and documentation travel on the symbol itself,
 covered under the `types` family.
 
-A read result carries the answer, `pagination`, and `warnings`. A condition the caller must
+A search result carries the answer, `pagination`, and `warnings`. Exact symbol and source
+reads carry an `outcome` and immutable `view`; a symbol read can carry a `declaration_cursor`. A condition the caller must
 weigh - an index that lags the tree - arrives as a typed entry in `warnings`; the
 [Reads](/docs/developer/protocol/mcp#reads) section in the MCP reference states the paging and warning
 contract.
@@ -81,8 +88,9 @@ contract.
 source kind. A synthetic symbol carries neither a location nor a package; dependency and
 standard-library symbols can carry facts even when their provider cannot return source bytes.
 The declaration's own source-catalog unit, where its location differs from the project, rides on
-the [`get_symbol`](/docs/mcp#tool-get_symbol) hit itself, addressed by `unit` beside the
-`path` a project declaration carries.
+a [`get_symbol`](/docs/mcp#tool-get_symbol) declaration binding, addressed by `unit` instead
+of the `path` a project declaration carries. The logical symbol identity remains separate from
+that physical source address.
 
 ## History facts
 
@@ -97,4 +105,4 @@ surrounding changes. A [`SymbolId`](/docs/developer/protocol/reference#SymbolId)
 language includes a module path in its qualified name; the timeline still records the move.
 
 The walk is bounded by the configured history depth, and the timeline rides a
-[`get_symbol`](/docs/mcp#tool-get_symbol) hit when the request asks for history.
+[`get_symbol`](/docs/mcp#tool-get_symbol) result when the request asks for history.

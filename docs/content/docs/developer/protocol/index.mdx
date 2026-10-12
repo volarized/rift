@@ -19,8 +19,10 @@ exported as JSON Schema at [`mcp.json`](https://volar.sh/rift/mcp.json), and the
 
 An agent's `rift mcp` reads the workspace's
 [`ServerLock`](/docs/developer/protocol/reference#ServerLock) - or starts the server that writes
-it - and forwards MCP requests to the endpoint it names. Each request carries its own arguments. The server retains no capture between paged reads: a
-request names its page with `page_index`, and each page is computed from that request.
+it - and forwards MCP requests to the endpoint it names. Each request carries its own arguments. Search and exact reads return an immutable `view`
+with an expiry. A later request can name that view; expiry refuses the read instead of selecting
+latest implicitly. Search uses `page_index`; `get_symbol` uses `declaration_cursor` for remaining
+declarations of one logical symbol in the same view.
 
 ## Versioning
 

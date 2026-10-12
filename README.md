@@ -39,7 +39,7 @@ installer resolves the latest release.
 ## MCP
 
 Run `rift mcp` from a codebase. Rift exposes structured reads through `search`, `get_symbol`,
-and `nodes` over stdio MCP. Later reads include filesystem changes made by a formatter or
+`get_source`, and `nodes` over stdio MCP. Later reads include filesystem changes made by a formatter or
 another process.
 
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration

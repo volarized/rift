@@ -64,12 +64,12 @@ answers each match and each declaration holding one, in place of `query` and
 revision, or the working tree, hold differently, in place of `query` and `traversal`.
 `rev` searches a version-control revision instead of the current tree, and never
 combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
-tree: `global` answers `query` from the public declarations the global index holds for
-the workspace's dependencies alone and `pattern` from their source, `all` from both,
-ordered together. `packages` names package versions `query` and `pattern` search beside
-the workspace's own, such as an upgrade target or a package the project does not use
-yet. `target: "commit"` matches `query` alone against the messages of the commits the
-history store holds. Use `get_symbol` when the declaration name is known.
+tree: `global` answers collected package and runtime facts selected by the project's
+dependency context. Explicit `packages` replaces versions of named packages or adds
+packages the context lacks. `local@name` selects an accepted extra project; `all` merges the primary
+project, accepted extra projects, and global results. `target: "commit"` matches
+`query` alone against the messages of the commits the history store holds.
+Use `get_symbol` with an exact canonical identity returned by search.
 For a current-tree search, the published workspace is resolved exactly once and
 threaded through both the search index's revision check and the executed
 `ReadService::search` call: a concurrent rebuild between two separate resolutions
@@ -83,7 +83,7 @@ Parameters:
 - `order` - Which total order the page comes back in.
 - `query` - Text to match against declaration names, qualified names, signatures, attached documentation, and file contents.
 - `pattern` - A regex matched against the text of every indexed file, in the syntax of the Rust `regex` crate that ripgrep reads.
-- `scope` - Which sources `query` and `pattern` search: the project tree, the dependency packages, or both.
+- `scope` - Which corpus is selected.
 - `packages` - Packages `query` and `pattern` search beside the ones the workspace's manifests and lockfiles name, at most 64.
 - `paths` - Files eligible for the search, selected by project-relative globs.
 - `include` - Extra payload to attach to every hit.

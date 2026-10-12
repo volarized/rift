@@ -740,9 +740,9 @@ One that crash-loops does: once the budget is spent, requests for its languages 
 The first process a workspace starts is the start, not a replacement, and a refused `command`
 program, empty or an absolute path, is reported at once rather than started again.
 
-A symbol address spells its language as an identity segment, and a declaration in a `.tsx` file
-is addressed under the dialect: `rift://symbol/typescript:tsx/view.tsx/Banner`. The server looks
-the entry up by that exact identity, so the bare language and the dialect are two independent
+A symbol identity carries its exact language, including the dialect for a declaration in a
+`.tsx` file. The server looks the language entry up by that exact identity, so the bare language
+and the dialect are two independent
 entries, each selecting its own process, and both may select the same named one. Each dialect needs its own entry.
 
 A minimal entry names its process inline. This one names
