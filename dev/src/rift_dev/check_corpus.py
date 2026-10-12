@@ -311,7 +311,7 @@ class Corpus:
                     "path": str(
                         self.report.parent
                         / f"{self.report.stem}.telemetry"
-                        / "telemetry.jsonl"
+                        / "telemetry.jsonl.gz"
                     ),
                     "error": str(error),
                 }
@@ -351,7 +351,7 @@ class Corpus:
             (directory / "telemetry-summary.json").read_bytes()
         )
         return {
-            "path": str(directory / "telemetry.jsonl"),
+            "path": str(directory / "telemetry.jsonl.gz"),
             "summary": str(directory / "telemetry-summary.json"),
             "received": summary.received,
             "retained": summary.retained,

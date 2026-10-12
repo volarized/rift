@@ -62,21 +62,20 @@ class DoctestSummary(CollectionSummary):
 def telemetry_of(path: Path) -> CaseTelemetry:
     """Read the suite's original JSONL records through the shared Pydantic model."""
     telemetry = CaseTelemetry()
-    with path.open("rb") as source:
-        for line in source:
-            row = EVIDENCE.validate_json(line)
-            if isinstance(row, LogEvidence):
-                if len(telemetry.logs) == telemetry.logs.maxlen:
-                    telemetry.dropped.logs += 1
-                telemetry.logs.append(row.record)
-            elif isinstance(row, SpanEvidence):
-                if len(telemetry.spans) == telemetry.spans.maxlen:
-                    telemetry.dropped.spans += 1
-                telemetry.spans.append(row.record)
-            elif isinstance(row, MetricEvidence):
-                if len(telemetry.points) == telemetry.points.maxlen:
-                    telemetry.dropped.points += 1
-                telemetry.points.append(row.record)
+    for line in ArtifactStore.read(path):
+        row = EVIDENCE.validate_json(line)
+        if isinstance(row, LogEvidence):
+            if len(telemetry.logs) == telemetry.logs.maxlen:
+                telemetry.dropped.logs += 1
+            telemetry.logs.append(row.record)
+        elif isinstance(row, SpanEvidence):
+            if len(telemetry.spans) == telemetry.spans.maxlen:
+                telemetry.dropped.spans += 1
+            telemetry.spans.append(row.record)
+        elif isinstance(row, MetricEvidence):
+            if len(telemetry.points) == telemetry.points.maxlen:
+                telemetry.dropped.points += 1
+            telemetry.points.append(row.record)
     return telemetry
 
 
@@ -130,7 +129,7 @@ def run(command: Command) -> None:
     directory = REPORT_DIRECTORY / f"doctest-{uuid.uuid4()}"
     directory.mkdir(parents=True)
     started = start("tests")
-    artifact = ArtifactStore(directory / "telemetry.jsonl", {})
+    artifact = ArtifactStore(directory / "telemetry.jsonl.gz", {})
     errors: list[str] = []
     status: int | None = None
     failure: BaseException | None = None

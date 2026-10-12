@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import math
 import os
 import platform
@@ -10,6 +11,7 @@ import re
 import threading
 import time
 import uuid
+import zlib
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,11 +20,11 @@ from typing import Annotated, Literal
 
 import tomllib
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-
 from rift_dev.commands import REPOSITORY, CargoCommand, Command, CommandFailed
 from rift_dev.progress import start
 from rift_dev.trace import (
     EXPORT_REQUEST_REPORT_MAX,
+    GZIP_WINDOW,
     PID_KEY,
     SPAN_REQUEST_KEY,
     Attributes,
@@ -238,7 +240,7 @@ class RunSummary(CollectionSummary):
 def retained_collector(directory: Path) -> Iterator[Collector]:
     """Keep scenario telemetry through server cleanup and collector shutdown."""
     directory.mkdir(parents=True, exist_ok=True)
-    artifact = ArtifactStore(directory / "telemetry.jsonl", {})
+    artifact = ArtifactStore(directory / "telemetry.jsonl.gz", {})
     served = Collector()
     try:
         with collector(
@@ -336,10 +338,16 @@ class ArtifactStore:
                 }
             }
         data = EVIDENCE.dump_json(evidence, exclude=excluded) + b"\n"
+        decoded_bytes = len(data)
+        if self.path.suffix == ".gz":
+            data = zlib.compress(data, wbits=GZIP_WINDOW)
         with self.lock:
             self.received += 1
             self.received_bytes += len(data)
-            if self.written + len(data) > RUN_TELEMETRY_BYTES_MAX:
+            if (
+                decoded_bytes > RUN_TELEMETRY_BYTES_MAX
+                or self.written + len(data) > RUN_TELEMETRY_BYTES_MAX
+            ):
                 self.omitted += 1
                 return
             try:
@@ -399,6 +407,19 @@ class ArtifactStore:
             with self.lock:
                 self.request_errors += 1
 
+    @staticmethod
+    def read(path: Path) -> Iterator[bytes]:
+        """Read original JSONL records with a bounded decoded row."""
+        with (
+            gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb") as source
+        ):
+            while line := source.readline(RUN_TELEMETRY_BYTES_MAX + 1):
+                if len(line) > RUN_TELEMETRY_BYTES_MAX:
+                    raise ValueError(
+                        f"telemetry record exceeded {RUN_TELEMETRY_BYTES_MAX} bytes"
+                    )
+                yield line
+
     def telemetry(self, outcomes: Sequence[Outcome]) -> dict[str, CaseTelemetry]:
         selected = {(o.case.binary, o.case.test): o.case.full_name for o in outcomes}
         attempts = {
@@ -407,28 +428,27 @@ class ArtifactStore:
             if (identity.binary, identity.test) in selected
         }
         held = {o.case.full_name: CaseTelemetry() for o in outcomes}
-        with self.path.open("rb") as source:
-            for line in source:
-                row = EVIDENCE.validate_json(line)
-                if isinstance(row, RequestEvidence):
-                    continue
-                attempt = dict(row.record.resource).get("test.case.name", "")
-                full_name = attempts.get(attempt)
-                if full_name is None:
-                    continue
-                telemetry = held[full_name]
-                if isinstance(row, LogEvidence):
-                    if len(telemetry.logs) == telemetry.logs.maxlen:
-                        telemetry.dropped.logs += 1
-                    telemetry.logs.append(row.record)
-                elif isinstance(row, SpanEvidence):
-                    if len(telemetry.spans) == telemetry.spans.maxlen:
-                        telemetry.dropped.spans += 1
-                    telemetry.spans.append(row.record)
-                else:
-                    if len(telemetry.points) == telemetry.points.maxlen:
-                        telemetry.dropped.points += 1
-                    telemetry.points.append(row.record)
+        for line in self.read(self.path):
+            row = EVIDENCE.validate_json(line)
+            if isinstance(row, RequestEvidence):
+                continue
+            attempt = dict(row.record.resource).get("test.case.name", "")
+            full_name = attempts.get(attempt)
+            if full_name is None:
+                continue
+            telemetry = held[full_name]
+            if isinstance(row, LogEvidence):
+                if len(telemetry.logs) == telemetry.logs.maxlen:
+                    telemetry.dropped.logs += 1
+                telemetry.logs.append(row.record)
+            elif isinstance(row, SpanEvidence):
+                if len(telemetry.spans) == telemetry.spans.maxlen:
+                    telemetry.dropped.spans += 1
+                telemetry.spans.append(row.record)
+            else:
+                if len(telemetry.points) == telemetry.points.maxlen:
+                    telemetry.dropped.points += 1
+                telemetry.points.append(row.record)
         return held
 
 
@@ -1074,14 +1094,13 @@ def collection_report(
     from collections import deque
 
     requests: deque[RequestEvidence] = deque(maxlen=EXPORT_REQUEST_REPORT_MAX)
-    with artifact.path.open("rb") as source:
-        for line in source:
-            try:
-                evidence = EVIDENCE.validate_json(line)
-            except ValidationError:
-                continue
-            if isinstance(evidence, RequestEvidence):
-                requests.append(evidence)
+    for line in ArtifactStore.read(artifact.path):
+        try:
+            evidence = EVIDENCE.validate_json(line)
+        except ValidationError:
+            continue
+        if isinstance(evidence, RequestEvidence):
+            requests.append(evidence)
     lines = [
         "==== collection errors ====",
         *errors,
@@ -1167,7 +1186,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     config: Path | None = None
     stdout_path = directory / "stdout.jsonl"
     stderr_path = directory / "stderr.log"
-    raw_path = directory / "telemetry.jsonl"
+    raw_path = directory / "telemetry.jsonl.gz"
     omitted_log = 0
     served = Collector()
     artifact = ArtifactStore(raw_path, outcomes)
