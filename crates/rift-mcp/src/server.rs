@@ -7989,13 +7989,28 @@ done
         )?;
         let server =
             RiftMcp::build_settled(directory.path(), WorkspaceIndexLimits::default()).await?;
-        let root = directory.path().to_path_buf();
-        server.force_capture_after(CAPTURE, move |current| captured_tree(&root, current));
         let published = Arc::clone(&server.published.read().await.current);
         let seed = captured_traversal_seed(&published.reads, "beacon")?;
         let params = serde_json::from_value(json!({"traversal": {
             "seed": seed
         }}))?;
+        let resolved = super::ResolvedWorkspace::current(published, Duration::ZERO);
+        let started = server
+            .engine_references(
+                &resolved,
+                &params,
+                RequestDeadline::starting(Duration::ZERO),
+            )
+            .await?
+            .ok_or("the original tree must still match")?;
+        let warnings = serde_json::to_value(started.warnings())?;
+        assert_eq!(
+            warnings[0]["code"], "engine_analysis_unavailable",
+            "{warnings}"
+        );
+        assert!(server.engine_pool().await.runs_an_engine());
+        let root = directory.path().to_path_buf();
+        server.force_capture_after(CAPTURE, move |current| captured_tree(&root, current));
         let answer = server
             .answered_search(Parameters(params))
             .await
