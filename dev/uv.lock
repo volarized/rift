@@ -825,7 +825,7 @@ dev = [
     { name = "tree-sitter", specifier = "==0.26.0" },
     { name = "tree-sitter-rust", specifier = "==0.24.2" },
     { name = "ty", specifier = "==0.0.84" },
-    { name = "types-pywin32", specifier = "==312.0.0.20260827" },
+    { name = "types-pywin32", specifier = "==312.0.0.20261006" },
 ]
 
 [[package]]
@@ -1083,11 +1083,11 @@ wheels = [
 
 [[package]]
 name = "types-pywin32"
-version = "312.0.0.20260827"
+version = "312.0.0.20261006"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/d2/ba/de660e0aa3dcde61b2cada38c79fdaafcaaf2a7c811512fbe577d03c7245/types_pywin32-312.0.0.20260827.tar.gz", hash = "sha256:348facaabb9b3dfbeec50399ef430b660f7454529acf4c7e24874019cb721d58", size = 357427, upload-time = "2026-08-27T12:07:04.192Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/03/56/602c6f487a6d572356166d83c201a572aac03b209b165d13be54e891a8a6/types_pywin32-312.0.0.20261006.tar.gz", hash = "sha256:f7e4360ed0421021c3f98f47031bb37d92a93797d2561efc906c6fecc5418060", size = 357616, upload-time = "2026-10-06T08:15:00.329Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/53/9c90587245adee3a73af4b8c5374dcfb1f3f0d710d1ab139dfe35dd7258e/types_pywin32-312.0.0.20260827-py3-none-any.whl", hash = "sha256:f22580e0d59c9cea33cf172396a7fb2f19a934c3eb82370bb74ca98f8e3db71e", size = 419299, upload-time = "2026-08-27T12:07:03.081Z" },
+    { url = "https://files.pythonhosted.org/packages/a1/49/793ff1f063bfc549d5ce01aedb284945484b18a5bd41ae39ae29fbb446df/types_pywin32-312.0.0.20261006-py3-none-any.whl", hash = "sha256:d96f96c2d6dd61a3bee72a212d855fd6b56ed0e8fc27660a3d6b5ebe36c49ebb", size = 419371, upload-time = "2026-10-06T08:14:58.947Z" },
 ]
 
 [[package]]
