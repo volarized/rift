@@ -114,6 +114,8 @@ pub struct NotebookContent {
     warnings: Vec<DocumentationWarning>,
 }
 
+mod retained_size;
+
 impl NotebookContent {
     /// Returns selected markdown and code cells in notebook order.
     #[must_use]

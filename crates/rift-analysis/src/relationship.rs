@@ -51,6 +51,28 @@ pub struct RelationshipEdge {
 }
 
 impl RelationshipEdge {
+    /// Projects this resolved reference without dropping a physical occurrence when no
+    /// source node was supplied.
+    #[must_use]
+    pub fn to_protocol(&self) -> rift_protocol::read::Relationship {
+        rift_protocol::read::Relationship {
+            from: rift_protocol::read::SymbolId(self.from.as_str().to_owned()),
+            to: rift_protocol::read::SymbolId(self.to.as_str().to_owned()),
+            kind: rift_protocol::read::ExactKind(self.facet.as_ref().to_owned()),
+            facets: vec![self.facet],
+            evidence: self.occurrence.node().cloned().into_iter().collect(),
+            occurrence: Some(rift_protocol::read::SourceUnitSpan {
+                unit: rift_protocol::read::SourceUnitId(self.occurrence.unit().to_string()),
+                range: rift_protocol::read::TextRange {
+                    start: self.occurrence.range().start(),
+                    end: self.occurrence.range().end(),
+                },
+            }),
+            derivation: rift_protocol::read::RelationshipDerivation::Resolution,
+            confidence: None,
+            extensions: rift_protocol::read::Extensions::default(),
+        }
+    }
     /// The enclosing definition the edge starts at.
     #[must_use]
     pub const fn from(&self) -> &SymbolId {
@@ -194,6 +216,60 @@ pub struct RelationshipStore {
     dropped_edges: u64,
 }
 
+impl get_size2::GetSize for RelationshipEdge {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.from, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.to, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.occurrence, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for RelationshipStore {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (outgoing, tracker) = rift_protocol::retained_map_material(
+            &self.outgoing,
+            tracker,
+            rift_protocol::retained_vector_material,
+        );
+        let (incoming, tracker) = rift_protocol::retained_map_material(
+            &self.incoming,
+            tracker,
+            rift_protocol::retained_vector_material,
+        );
+        (outgoing.saturating_add(incoming), tracker)
+    }
+}
+
 impl RelationshipStore {
     /// Builds the adjacency from every reference in `graph`, capped at
     /// [`RELATIONSHIP_EDGES_MAX`].
@@ -327,6 +403,19 @@ mod tests {
         .expect("fixture origin")
     }
 
+    fn fixture_symbol(name: &str) -> SymbolId {
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            Language {
+                name: "rust".to_owned(),
+                dialect: None,
+            },
+            vec!["fixture".to_owned(), name.to_owned()],
+        )
+        .expect("canonical fixture identity");
+        SymbolId::new(identity.wire_identity()).expect("fixture symbol")
+    }
+
     /// One definition contribution: an established identity, anchored at `range` in `path`.
     fn definition(symbol: &str, identity: &str, path: &str, range: (u64, u64)) -> Contribution {
         let facts = PortableSymbolFacts::new(
@@ -435,13 +524,13 @@ mod tests {
         let contributions = vec![
             definition(
                 "beta",
-                "rift://symbol/rust/src/lib.rs/beta",
+                fixture_symbol("beta").as_str(),
                 "src/lib.rs",
                 (0, 40),
             ),
             definition(
                 "alpha",
-                "rift://symbol/rust/src/lib.rs/alpha",
+                fixture_symbol("alpha").as_str(),
                 "src/lib.rs",
                 (40, 60),
             ),
@@ -449,8 +538,8 @@ mod tests {
         ];
         let store = RelationshipStore::build(&graph(contributions));
 
-        let beta = symbol("rift://symbol/rust/src/lib.rs/beta");
-        let alpha = symbol("rift://symbol/rust/src/lib.rs/alpha");
+        let beta = symbol(fixture_symbol("beta").as_str());
+        let alpha = symbol(fixture_symbol("alpha").as_str());
         let outgoing = store.outgoing(&beta);
         let incoming = store.incoming(&alpha);
         assert_eq!(outgoing.len(), 1);
@@ -469,19 +558,19 @@ mod tests {
         let contributions = vec![
             definition(
                 "outer",
-                "rift://symbol/rust/src/lib.rs/outer",
+                fixture_symbol("outer").as_str(),
                 "src/lib.rs",
                 (0, 60),
             ),
             definition(
                 "inner",
-                "rift://symbol/rust/src/lib.rs/inner",
+                fixture_symbol("inner").as_str(),
                 "src/lib.rs",
                 (10, 40),
             ),
             definition(
                 "helper",
-                "rift://symbol/rust/src/lib.rs/helper",
+                fixture_symbol("helper").as_str(),
                 "src/lib.rs",
                 (60, 80),
             ),
@@ -494,8 +583,8 @@ mod tests {
         ];
         let store = RelationshipStore::build(&graph(contributions));
 
-        let outer = symbol("rift://symbol/rust/src/lib.rs/outer");
-        let inner = symbol("rift://symbol/rust/src/lib.rs/inner");
+        let outer = symbol(fixture_symbol("outer").as_str());
+        let inner = symbol(fixture_symbol("inner").as_str());
         assert!(
             store.outgoing(&outer).is_empty(),
             "the outer definition gets no edge"
@@ -585,19 +674,19 @@ mod tests {
         let contributions = vec![
             definition(
                 "beta",
-                "rift://symbol/rust/src/lib.rs/beta",
+                fixture_symbol("beta").as_str(),
                 "src/lib.rs",
                 (0, 40),
             ),
             definition(
                 "alpha",
-                "rift://symbol/rust/src/lib.rs/alpha",
+                fixture_symbol("alpha").as_str(),
                 "src/lib.rs",
                 (40, 60),
             ),
             definition(
                 "gamma",
-                "rift://symbol/rust/src/lib.rs/gamma",
+                fixture_symbol("gamma").as_str(),
                 "src/lib.rs",
                 (60, 80),
             ),
@@ -618,7 +707,7 @@ mod tests {
 
         assert!(!store.is_complete());
         assert_eq!(store.dropped_edges(), 1);
-        let beta = symbol("rift://symbol/rust/src/lib.rs/beta");
+        let beta = symbol(fixture_symbol("beta").as_str());
         assert_eq!(
             store.outgoing(&beta).len(),
             1,
@@ -632,7 +721,7 @@ mod tests {
         let contributions = vec![
             definition(
                 "recurse",
-                "rift://symbol/rust/src/lib.rs/recurse",
+                fixture_symbol("recurse").as_str(),
                 "src/lib.rs",
                 (0, 40),
             ),
@@ -640,7 +729,7 @@ mod tests {
         ];
         let store = RelationshipStore::build(&graph(contributions));
 
-        let recurse = symbol("rift://symbol/rust/src/lib.rs/recurse");
+        let recurse = symbol(fixture_symbol("recurse").as_str());
         let outgoing = store.outgoing(&recurse);
         let incoming = store.incoming(&recurse);
         assert_eq!(outgoing.len(), 1, "outgoing={outgoing:?}");
@@ -654,13 +743,13 @@ mod tests {
         let contributions = vec![
             definition(
                 "caller",
-                "rift://symbol/rust/src/lib.rs/caller",
+                fixture_symbol("caller").as_str(),
                 "src/lib.rs",
                 (0, 40),
             ),
             definition(
                 "callee",
-                "rift://symbol/rust/src/lib.rs/callee",
+                fixture_symbol("callee").as_str(),
                 "src/lib.rs",
                 (40, 60),
             ),
@@ -679,8 +768,8 @@ mod tests {
         ];
         let store = RelationshipStore::build(&graph(contributions));
 
-        let from_symbol = symbol("rift://symbol/rust/src/lib.rs/caller");
-        let to_symbol = symbol("rift://symbol/rust/src/lib.rs/callee");
+        let from_symbol = symbol(fixture_symbol("caller").as_str());
+        let to_symbol = symbol(fixture_symbol("callee").as_str());
         let outgoing = store.outgoing(&from_symbol);
         assert_eq!(outgoing.len(), 2, "outgoing={outgoing:?}");
         assert!(outgoing.iter().all(|edge| edge.to() == &to_symbol));

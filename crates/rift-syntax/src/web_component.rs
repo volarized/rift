@@ -232,7 +232,9 @@ pub fn append_angular_templates(
     let mut nodes = document.nodes().to_vec();
     let mut has_errors = document.has_errors();
     let mut symbols = document.symbols().to_vec();
-    let mut omitted = document.left_out_declaration_count();
+    symbols.extend_from_slice(document.facts().left_out_symbols());
+    let mut omitted =
+        document.left_out_declaration_count() - document.facts().left_out_symbols().len();
     for range in ranges {
         if range.start == range.end {
             continue;
@@ -246,7 +248,9 @@ pub fn append_angular_templates(
         crate::embedded::admit_depth(source, limits, depth, &template)?;
         has_errors |= template.has_errors();
         omitted = omitted
-            .checked_add(template.left_out_declaration_count())
+            .checked_add(
+                template.left_out_declaration_count() - template.facts().left_out_symbols().len(),
+            )
             .ok_or_else(|| {
                 errors::syntax::too_many_nodes()
                     .path(source.path)
@@ -254,6 +258,7 @@ pub fn append_angular_templates(
                     .error()
             })?;
         symbols.extend_from_slice(template.symbols());
+        symbols.extend_from_slice(template.facts().left_out_symbols());
         crate::embedded::append_nodes(&mut nodes, &template, parent);
     }
     crate::embedded::order_nodes(&mut nodes);

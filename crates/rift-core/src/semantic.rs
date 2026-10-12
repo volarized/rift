@@ -1,5 +1,8 @@
 //! Provider Contributions and normalized symbol records.
 
+mod retained_extensions;
+mod retained_size;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -513,6 +516,8 @@ pub enum RelationshipKind {
     Implementation,
     /// Source is a type definition for target.
     TypeDefinition,
+    /// Source is another name for target.
+    Alias,
 }
 
 /// One relationship declared by a provider.
@@ -520,13 +525,49 @@ pub enum RelationshipKind {
 pub struct ContributionRelationship {
     kind: RelationshipKind,
     target: ContributionReference,
+    derivation: Option<rift_protocol::read::RelationshipDerivation>,
+    occurrence: Option<DeclarationBinding>,
 }
 
 impl ContributionRelationship {
     /// Creates one relationship.
     #[must_use]
     pub const fn new(kind: RelationshipKind, target: ContributionReference) -> Self {
-        Self { kind, target }
+        Self {
+            kind,
+            target,
+            derivation: None,
+            occurrence: None,
+        }
+    }
+
+    /// Retains the provider's supplied derivation without inferring it from the kind.
+    #[must_use]
+    pub const fn with_derivation(
+        mut self,
+        derivation: rift_protocol::read::RelationshipDerivation,
+    ) -> Self {
+        self.derivation = Some(derivation);
+        self
+    }
+
+    /// Retains the exact source occurrence, including an optional supplied node.
+    #[must_use]
+    pub fn with_occurrence(mut self, occurrence: DeclarationBinding) -> Self {
+        self.occurrence = Some(occurrence);
+        self
+    }
+
+    /// The supplied derivation. Absent means the provider did not establish it.
+    #[must_use]
+    pub const fn derivation(&self) -> Option<rift_protocol::read::RelationshipDerivation> {
+        self.derivation
+    }
+
+    /// The supplied physical occurrence. Source-less relationships have no occurrence.
+    #[must_use]
+    pub const fn occurrence(&self) -> Option<&DeclarationBinding> {
+        self.occurrence.as_ref()
     }
 
     /// Returns portable relationship kind.
@@ -543,7 +584,7 @@ impl ContributionRelationship {
 }
 
 /// One immutable provider record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Contribution {
     key: ContributionKey,
     applicability: SourceApplicability,
@@ -555,9 +596,31 @@ pub struct Contribution {
     references: Vec<SemanticReference>,
     relationships: Vec<ContributionRelationship>,
     namespaced: Extensions,
+    namespaced_material_bytes: usize,
+}
+
+impl PartialEq for Contribution {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.applicability == other.applicability
+            && self.facts == other.facts
+            && self.origin == other.origin
+            && self.source == other.source
+            && self.identity_anchor == other.identity_anchor
+            && self.equivalence == other.equivalence
+            && self.references == other.references
+            && self.relationships == other.relationships
+            && self.namespaced == other.namespaced
+    }
 }
 
 impl Contribution {
+    /// Material retained by validated provider-specific facts, including clones.
+    #[must_use]
+    pub const fn namespaced_material_bytes(&self) -> usize {
+        self.namespaced_material_bytes
+    }
+
     /// Starts one Contribution builder with portable facts.
     #[must_use]
     pub fn builder(
@@ -578,6 +641,7 @@ impl Contribution {
                 references: Vec::new(),
                 relationships: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
+                namespaced_material_bytes: 0,
             },
         }
     }
@@ -601,6 +665,7 @@ impl Contribution {
                 references: Vec::new(),
                 relationships: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
+                namespaced_material_bytes: 0,
             },
         }
     }
@@ -680,7 +745,7 @@ impl ContributionBuilder {
         self
     }
 
-    /// Sets identity anchored by exact declaration binding.
+    /// Sets a semantic identity anchor, with or without a source declaration.
     #[must_use]
     pub fn identity_anchor(mut self, identity: SymbolId) -> Self {
         self.contribution.identity_anchor = Some(identity);
@@ -720,8 +785,10 @@ impl ContributionBuilder {
     /// # Errors
     ///
     /// Returns [`RiftError`] for invalid facts, bounds, origin, or identity evidence.
-    pub fn build(self) -> Result<Contribution, RiftError> {
+    pub fn build(mut self) -> Result<Contribution, RiftError> {
         validate_contribution(&self.contribution)?;
+        self.contribution.namespaced_material_bytes =
+            retained_extensions::compact(&mut self.contribution.namespaced);
         Ok(self.contribution)
     }
 }
@@ -905,10 +972,20 @@ fn validate_portable_facts(facts: &PortableSymbolFacts) -> Result<(), RiftError>
 }
 
 fn validate_source_and_origin(contribution: &Contribution) -> Result<(), RiftError> {
-    if contribution.identity_anchor.is_some() && contribution.source.is_none() {
-        return errors::core::contribution_unbound_identity()
-            .field("identity_anchor")
-            .fail();
+    if contribution.source.is_none()
+        && let Some(anchor) = &contribution.identity_anchor
+    {
+        let identity = rift_protocol::identity::SymbolIdentity::parse(anchor.as_str())
+            .map_err(|_| errors::core::identity_invalid().error())?;
+        if contribution
+            .facts
+            .as_ref()
+            .is_some_and(|facts| facts.language() != identity.language())
+        {
+            return errors::core::contribution_invalid_language()
+                .field("identity_anchor")
+                .fail();
+        }
     }
     let synthetic = contribution.origin.source_kind == SourceKind::Synthetic;
     if contribution.source.is_some() && synthetic {
@@ -1004,6 +1081,29 @@ fn valid_namespace(value: &str) -> bool {
         .is_some_and(|byte| byte.is_ascii_alphabetic())
         && field_bytes.all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte));
     prefix_valid && field_valid
+}
+
+/// Finds each supplied fact's position in the complete normalized array.
+///
+/// Repeated facts retain the first matching position and supplied order.
+///
+/// # Errors
+/// Returns the caller's registered failure when a supplied fact is absent.
+pub fn fact_indices<T: PartialEq>(
+    combined: &[T],
+    supplied: &[T],
+    missing: impl Fn() -> rift_error::RiftError,
+) -> Result<Vec<u64>, rift_error::RiftError> {
+    supplied
+        .iter()
+        .map(|fact| {
+            combined
+                .iter()
+                .position(|value| value == fact)
+                .and_then(|index| u64::try_from(index).ok())
+                .ok_or_else(&missing)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1215,11 +1315,8 @@ mod tests {
         )
         .identity_anchor(SymbolId::new("rust:Beacon").expect("symbol"))
         .build()
-        .expect_err("unbound identity");
-        assert_eq!(
-            error.slug().as_str(),
-            "rift.core.contribution_unbound_identity"
-        );
+        .expect_err("noncanonical identity anchor");
+        assert_eq!(error.slug().as_str(), "rift.core.identity_invalid");
 
         let source = super::DeclarationBinding::new(
             source_unit(),
@@ -1243,6 +1340,62 @@ mod tests {
             error.slug().as_str(),
             "rift.core.contribution_invalid_origin"
         );
+    }
+
+    #[test]
+    fn test_source_less_identity_anchors_keep_owner_and_language() {
+        for address in [
+            "rift://symbol/local/rust/Beacon",
+            "rift://symbol/stdlib/rust@1.98.0/rust/core/Beacon",
+            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+        ] {
+            let identity = SymbolId::new(address).expect("canonical identity");
+            let contribution = Contribution::builder(
+                ContributionKey::new(provider("lsp"), publication(1), provider_symbol("Beacon")),
+                SourceApplicability::Independent,
+                facts(),
+                ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+            )
+            .identity_anchor(identity.clone())
+            .build()
+            .expect("source-less canonical identity anchor");
+            assert!(contribution.source().is_none());
+            assert_eq!(contribution.identity_anchor(), Some(&identity));
+            assert_eq!(contribution.facts().expect("facts").language().name, "rust");
+        }
+    }
+
+    #[test]
+    fn test_source_less_identity_anchor_refuses_conflicting_language() {
+        let error = Contribution::builder(
+            ContributionKey::new(provider("lsp"), publication(1), provider_symbol("Beacon")),
+            SourceApplicability::Independent,
+            facts(),
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+        )
+        .identity_anchor(SymbolId::new("rift://symbol/local/python/Beacon").expect("identity"))
+        .build()
+        .expect_err("conflicting language");
+        assert_eq!(
+            error.slug().as_str(),
+            "rift.core.contribution_invalid_language"
+        );
+    }
+
+    #[test]
+    fn test_source_less_identity_anchor_without_presentation_remains_validated() {
+        let identity = SymbolId::new("rift://symbol/local/rust/Beacon").expect("identity");
+        let contribution = Contribution::fact_builder(
+            ContributionKey::new(provider("lsp"), publication(1), provider_symbol("Beacon")),
+            SourceApplicability::Independent,
+            ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
+        )
+        .identity_anchor(identity.clone())
+        .build()
+        .expect("identity without presentation");
+        assert!(contribution.facts().is_none());
+        assert!(contribution.source().is_none());
+        assert_eq!(contribution.identity_anchor(), Some(&identity));
     }
 
     #[test]
@@ -1282,6 +1435,10 @@ mod tests {
 
         assert!(contribution.facts().is_none());
         assert_eq!(contribution.namespaced(), &namespaced);
+        let bytes = contribution.namespaced_material_bytes();
+        assert!(bytes > 0 && bytes < usize::MAX);
+        assert_eq!(contribution.clone(), contribution);
+        assert!(get_size2::GetSize::get_heap_size(&contribution) >= bytes);
     }
 
     #[test]
@@ -1625,5 +1782,39 @@ mod tests {
             empty.slug().as_str(),
             "rift.core.contribution_invalid_record"
         );
+    }
+}
+
+#[cfg(test)]
+mod fact_indices_tests {
+    use std::cell::Cell;
+
+    #[test]
+    fn fact_indices_preserve_full_array_positions_and_failure_factory() {
+        let calls = Cell::new(0);
+        let missing = || {
+            calls.set(calls.get() + 1);
+            rift_error::errors::analysis::package_provider_failed()
+                .package("captured fixture")
+                .error()
+        };
+        assert_eq!(
+            super::fact_indices(
+                &["implementation", "first", "second"],
+                &["second", "first", "second"],
+                missing
+            )
+            .expect("retained facts"),
+            [2, 1, 2]
+        );
+        assert_eq!(calls.get(), 0);
+        assert!(super::fact_indices(&["first"], &["absent"], missing).is_err());
+        assert_eq!(calls.get(), 1);
+        assert!(
+            super::fact_indices::<&str>(&[], &[], missing)
+                .expect("source-less binding has no facts")
+                .is_empty()
+        );
+        assert_eq!(calls.get(), 1);
     }
 }

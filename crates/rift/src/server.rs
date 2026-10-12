@@ -534,7 +534,7 @@ async fn stop_repository(root: &Path, attempt_count: u32) -> Result<ServerOutcom
         return Ok(ServerOutcome::NotRunning);
     };
     let lock = match rift_mcp::probe_state_directory(&state_directory) {
-        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Serving(lock) => *lock,
         ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
             await_repository_election_released(&state_directory, pid, attempt_count).await?;
@@ -737,7 +737,7 @@ where
         let presence = observe(root).await;
         let election_held = presence.election_held();
         let serving = match presence {
-            ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(lock),
+            ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(*lock),
             _ => None,
         };
         match spawns.poll(serving, election_held) {
@@ -1437,7 +1437,7 @@ fn foreground_refused(root: &Path, error: RiftError) -> RiftError {
 /// derives from [`STOP_WAIT_MAX`] over the poll interval.
 async fn stop(root: &Path, attempt_count: u32) -> Result<ServerOutcome, RiftError> {
     let lock = match probe(root) {
-        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Serving(lock) => *lock,
         ServerPresence::Starting => return Ok(ServerOutcome::Starting { pid: None }),
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
             await_election_released(root, pid, attempt_count).await?;
@@ -1791,6 +1791,8 @@ mod tests {
                 schema_digest: "b".repeat(64),
             },
             server: None,
+            root: None,
+            owner: None,
         }
     }
 

@@ -70,13 +70,22 @@ pub fn search_change(
         (text_inclusion, languages),
     )?;
     let mut results = compared.hits(params)?;
+    let mut object_warnings = Vec::new();
+    crate::search::retain_public_symbol_hits(
+        &mut results,
+        &mut object_warnings,
+        &[Some(&compared.base), Some(compared.head())],
+    )?;
     order_change_hits(&mut results, params.order);
     let results_max_reached = bound_hits(&mut results, compared.head().results_max());
     let (results, pagination) = page(results, params.page_index, limit);
+    let mut warnings = compared.warnings(results_max_reached);
+    warnings.extend(object_warnings);
     Ok(SearchResult {
+        view: None,
         results,
         pagination,
-        warnings: compared.warnings(results_max_reached),
+        warnings,
     })
 }
 

@@ -665,6 +665,7 @@ mod tests {
             origin: SymbolOrigin {
                 location: Some(SourceLocationKind::Project),
                 package: None,
+                runtime: None,
                 source_kind: SourceKind::Authored,
             },
             format: DocumentationSourceFormat::Markdown,
@@ -1173,8 +1174,15 @@ mod tests {
         };
         let language = Language::from_identity_segment("rust")?;
         let names = ["Compass", "Apex"];
-        let symbols =
-            names.map(|name| SymbolId(rift_core::symbol_identity("rust", "lib.rs", name)));
+        let symbols = names.map(|name| {
+            let identity = rift_protocol::identity::SymbolIdentity::new(
+                rift_protocol::identity::SymbolOwner::Local,
+                language.clone(),
+                vec!["fixture".into(), name.into()],
+            )
+            .expect("canonical fixture identity");
+            SymbolId::parse(&identity.wire_identity()).expect("accepted fixture identity")
+        });
         let mut declarations = Vec::new();
         for (symbol, name) in symbols.iter().zip(names) {
             declarations.push(DocumentationDeclaration::new(
@@ -1200,6 +1208,7 @@ mod tests {
                 origin: SymbolOrigin {
                     location: Some(SourceLocationKind::Project),
                     package: None,
+                    runtime: None,
                     source_kind: SourceKind::Authored,
                 },
                 format: DocumentationSourceFormat::Markdown,

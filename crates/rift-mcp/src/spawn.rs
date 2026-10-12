@@ -18,6 +18,7 @@ use process::{Child, Command, Stdio, detached_command_for, spawn_detached};
 
 use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_core::{CapturedStream, STREAM_READ_BYTES, STREAM_TOTAL_BYTES_MAX};
+use rift_error::{RiftError, errors};
 
 /// Bytes of a detached server's startup stderr kept verbatim; the rest is
 /// only counted, the same split [`CapturedStream`] reports for captured streams.
@@ -68,6 +69,21 @@ fn detached_command(root: &Path) -> Result<Command, io::Error> {
     ))
 }
 
+fn detached_command_with_owner(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Result<Command, RiftError> {
+    let scope = owner.local_scope()?;
+    let mut command = detached_command(root).map_err(|source| {
+        errors::cli::server_spawn_failed()
+            .operation("prepare detached server")
+            .source(source)
+            .error()
+    })?;
+    command.args(["--scope", &scope]);
+    Ok(command)
+}
+
 /// Spawns `rift server start --foreground` for `root`, fully detached,
 /// with its stderr routed to the workspace's [`SERVER_STDERR_FILE_NAME`].
 ///
@@ -99,12 +115,41 @@ pub fn spawn_detached_server(root: &Path) -> Result<SpawnedServer, io::Error> {
     spawn_with_stderr_file(detached_command(root)?, root)
 }
 
+/// Spawns a detached server with its fixed local scope and independent stderr file.
+///
+/// # Errors
+/// Returns the existing spawn failure for an invalid owner, root, or process.
+pub fn spawn_detached_server_with_owner(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Result<SpawnedServer, RiftError> {
+    let command = detached_command_with_owner(root, owner)?;
+    let state = crate::storage::workspace_state_directory(root, owner)?;
+    let path = state.join(SERVER_STDERR_FILE_NAME);
+    let destination = std::fs::create_dir_all(&state).and_then(|()| File::create(&path));
+    let destination = stderr_destination_result(destination, &path);
+    spawn_with_stderr_output(command, destination, path).map_err(|source| {
+        errors::cli::server_spawn_failed()
+            .operation("spawn detached server")
+            .source(source)
+            .error()
+    })
+}
+
 /// Spawns `command` detached, with its stderr on the workspace's
 /// [`SERVER_STDERR_FILE_NAME`] below `root`, or discarded when that file
 /// cannot be created.
-fn spawn_with_stderr_file(mut command: Command, root: &Path) -> Result<SpawnedServer, io::Error> {
+fn spawn_with_stderr_file(command: Command, root: &Path) -> Result<SpawnedServer, io::Error> {
     let destination = stderr_destination(root);
-    let stderr = destination.is_some().then(|| stderr_file_path(root));
+    spawn_with_stderr_output(command, destination, stderr_file_path(root))
+}
+
+fn spawn_with_stderr_output(
+    mut command: Command,
+    destination: Option<File>,
+    path: PathBuf,
+) -> Result<SpawnedServer, io::Error> {
+    let stderr = destination.is_some().then_some(path);
     command.stderr(destination.map_or_else(Stdio::null, Stdio::from));
     let child = spawn_detached(&mut command)?;
     record_spawn(child.id(), if stderr.is_some() { "file" } else { "null" });
@@ -141,12 +186,16 @@ pub fn stderr_file_path(root: &Path) -> PathBuf {
 /// Where a detached server's standard error goes: the workspace's stderr
 /// file, truncated for this start, or nowhere when it cannot be created.
 fn stderr_destination(root: &Path) -> Option<File> {
-    match stderr_file(root) {
+    stderr_destination_result(stderr_file(root), &stderr_file_path(root))
+}
+
+fn stderr_destination_result(result: io::Result<File>, path: &Path) -> Option<File> {
+    match result {
         Ok(file) => Some(file),
         Err(error) => {
             rift_tracing::warn!(
                 component = "mcp",
-                path = %stderr_file_path(root).display(),
+                path = %path.display(),
                 %error,
                 "the server stderr file could not be created; the detached server's stderr is \
                  discarded"
@@ -205,7 +254,22 @@ impl SpawnedServer {
 pub(crate) fn spawn_detached_server_with_captured_stderr(
     root: &Path,
 ) -> Result<StartupCapture, io::Error> {
-    let mut command = detached_command(root)?;
+    capture_command(detached_command(root)?)
+}
+
+pub(crate) fn spawn_detached_server_with_captured_stderr_and_owner(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Result<StartupCapture, RiftError> {
+    capture_command(detached_command_with_owner(root, owner)?).map_err(|source| {
+        errors::cli::server_spawn_failed()
+            .operation("spawn detached server")
+            .source(source)
+            .error()
+    })
+}
+
+fn capture_command(mut command: Command) -> Result<StartupCapture, io::Error> {
     command.stderr(Stdio::piped());
     let mut child = spawn_detached(&mut command)?;
     record_spawn(child.id(), "piped");
@@ -458,6 +522,13 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
     ///
     /// Returns `launch`'s failure; the attempt still counts.
     pub fn spawn(&mut self, launch: impl FnOnce() -> io::Result<Spawned>) -> io::Result<()> {
+        self.spawn_with(launch)
+    }
+
+    fn spawn_with<Error>(
+        &mut self,
+        launch: impl FnOnce() -> Result<Spawned, Error>,
+    ) -> Result<(), Error> {
         if self.is_spent() {
             self.latest = SpawnWatch::Idle;
             return Ok(());
@@ -562,6 +633,14 @@ impl StartSpawns<StartupCapture> {
             rift_tracing::warn!(component = "mcp", %error, "detached server spawn failed");
         }
     }
+
+    pub(crate) fn spawn_captured_with_owner(
+        &mut self,
+        root: &Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+    ) -> Result<(), RiftError> {
+        self.spawn_with(|| spawn_detached_server_with_captured_stderr_and_owner(root, owner))
+    }
 }
 
 #[cfg(test)]
@@ -582,6 +661,73 @@ mod tests {
 
     /// Poll attempts while waiting on a spawned child to exit: 10 seconds.
     const EXIT_POLL_ATTEMPT_COUNT: u32 = 100;
+
+    #[test]
+    fn detached_owner_scope_uses_the_shared_spelling_without_allocating_state() -> TestResult {
+        use rift_protocol::identity::SymbolOwner;
+
+        let directory = tempfile::tempdir()?;
+        for owner in [
+            SymbolOwner::Local,
+            SymbolOwner::NamedLocal {
+                name: "cloud".to_owned(),
+            },
+        ] {
+            let command = super::detached_command_with_owner(directory.path(), &owner)?;
+            let scope = owner.local_scope()?;
+            let expected = ["server", "start", "--foreground", "--scope", &scope];
+            #[cfg(not(windows))]
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                expected.map(std::ffi::OsStr::new)
+            );
+            #[cfg(windows)]
+            {
+                let arguments = expected
+                    .map(|argument| format!("Text({argument:?})"))
+                    .join(", ");
+                assert!(
+                    format!("{command:?}").contains(&format!("args: [{arguments}]")),
+                    "the detached command retains every original argument: {command:?}"
+                );
+            }
+            assert_eq!(command.get_current_dir(), Some(directory.path()));
+        }
+        assert!(!directory.path().join(".rift").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_detached_owner_preserves_registered_failure_before_spawn() -> TestResult {
+        use rift_protocol::identity::SymbolOwner;
+
+        let directory = tempfile::tempdir()?;
+        let owner = SymbolOwner::NamedLocal {
+            name: String::new(),
+        };
+        let error = super::spawn_detached_server_with_owner(directory.path(), &owner)
+            .expect_err("an invalid owner must refuse before launching");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::core::symbol_identity_invalid::SLUG
+        );
+        assert!(!directory.path().join(".rift").exists());
+        let mut spawns = StartSpawns::<StartupCapture>::default();
+        for count in 1..=START_SPAWN_COUNT_MAX {
+            let error = spawns
+                .spawn_captured_with_owner(directory.path(), &owner)
+                .expect_err("an invalid captured owner must retain the registered refusal");
+            assert_eq!(
+                error.slug(),
+                rift_error::errors::core::symbol_identity_invalid::SLUG
+            );
+            assert_eq!(spawns.spawn_count, count);
+        }
+        spawns.spawn_captured_with_owner(directory.path(), &owner)?;
+        assert_eq!(spawns.spawn_count, START_SPAWN_COUNT_MAX);
+        assert!(!directory.path().join(".rift").exists());
+        Ok(())
+    }
 
     /// Spawns `sh -c script` in the detached shape, the way
     /// `spawn_detached_server` spawns a server, with its stderr on the

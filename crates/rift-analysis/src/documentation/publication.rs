@@ -135,6 +135,8 @@ pub struct DocumentationCollection {
     resolution_cache: Option<super::resolution::ResolutionCache>,
 }
 
+mod retained_size;
+
 impl DocumentationCollection {
     /// Validates a bounded set of stored blocks and their source facts for search projection.
     ///
@@ -803,7 +805,7 @@ fn valid_text(text: &str, limits: Option<&super::DocumentationLimits>) -> bool {
 }
 
 fn valid_symbol_identity(symbol: &SymbolId) -> bool {
-    rift_core::parse_symbol_identity(&symbol.0).is_ok()
+    SymbolId::parse(&symbol.0).is_ok() || rift_core::parse_symbol_identity(&symbol.0).is_ok()
 }
 
 fn validate_headings(
@@ -1293,6 +1295,7 @@ mod tests {
             origin: SymbolOrigin {
                 location: Some(SourceLocationKind::Project),
                 package: None,
+                runtime: None,
                 source_kind: SourceKind::Authored,
             },
             format: DocumentationSourceFormat::Markdown,

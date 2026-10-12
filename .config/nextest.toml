@@ -104,6 +104,14 @@ success-output = "immediate"
 failure-output = "immediate-final"
 slow-timeout = { period = "60s", terminate-after = 1, grace-period = "30s" }
 
+# This ignored measurement builds the verified Bun index before measuring
+# shared accounting. Keep its bound separate from the ordinary unit cases.
+[[profile.corpus.overrides]]
+filter = 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
+slow-timeout = { period = "300s", terminate-after = 1, grace-period = "30s" }
+success-output = "immediate"
+junit.store-success-output = true
+
 [[profile.corpus.overrides]]
 filter = 'binary(=corpus_fastapi) & test(=test_fastapi_corpus)'
 slow-timeout = { period = "240s", terminate-after = 1, grace-period = "30s" }

@@ -18,6 +18,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.analysis.documentation_range_invalid",
     "rift.analysis.documentation_revision_invalid",
     "rift.analysis.documentation_target_missing",
+    "rift.analysis.package_artifact_invalid",
     "rift.analysis.package_declarations_exceeded",
     "rift.analysis.package_identity_invalid",
     "rift.analysis.package_input_duplicate_path",
@@ -70,6 +71,15 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.cli.update_rollback_failed",
     "rift.cli.update_staging_failed",
     "rift.cli.update_version_invalid",
+    "rift.client.body_limit",
+    "rift.client.configuration_invalid",
+    "rift.client.remote_failed",
+    "rift.client.remote_permission_denied",
+    "rift.client.remote_unavailable",
+    "rift.client.request_cancelled",
+    "rift.client.request_failed",
+    "rift.client.request_invalid",
+    "rift.client.response_invalid",
     "rift.core.configuration_command_argument_oversized",
     "rift.core.configuration_command_program_absolute",
     "rift.core.configuration_command_program_dot_segment",
@@ -99,6 +109,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.core.configuration_lsp_name_invalid",
     "rift.core.configuration_malformed",
     "rift.core.configuration_oversized",
+    "rift.core.configuration_package_registry_invalid",
     "rift.core.configuration_package_selector_invalid",
     "rift.core.configuration_path_pattern_invalid",
     "rift.core.configuration_port_range_inverted",
@@ -143,6 +154,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.core.source_unit_id_invalid_resolver",
     "rift.core.source_unit_id_non_canonical",
     "rift.core.source_unit_id_too_long",
+    "rift.core.symbol_identity_invalid",
     "rift.history.blob_too_large",
     "rift.history.contribution_invalid",
     "rift.history.path_unrepresentable",
@@ -223,6 +235,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.mcp.election_already_serving",
     "rift.mcp.election_document_invalid",
     "rift.mcp.election_storage_failed",
+    "rift.mcp.forward_failed",
     "rift.mcp.forward_unanswered",
     "rift.mcp.http_ports_exhausted",
     "rift.mcp.http_serve_failed",
@@ -236,9 +249,11 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.mcp.proxy_initialization_failed",
     "rift.mcp.proxy_task_failed",
     "rift.mcp.proxy_unexpected_quit",
+    "rift.mcp.server_identity_mismatch",
     "rift.mcp.spawn_failed",
     "rift.mcp.spawn_no_output",
     "rift.mcp.start_building",
+    "rift.mcp.start_unreachable",
     "rift.provider.cache_too_many_keys",
     "rift.provider.composition_dangling_input",
     "rift.provider.composition_duplicate_stage",
@@ -292,6 +307,10 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.server.read_unavailable",
     "rift.server.read_unclaimed_extension",
     "rift.server.read_unsupported",
+    "rift.server.search_coverage_unavailable",
+    "rift.server.search_exact_release_unavailable",
+    "rift.server.search_view_context",
+    "rift.server.search_view_expired",
     "rift.syntax.facts_count_exceeded",
     "rift.syntax.facts_depth_exceeded",
     "rift.syntax.facts_kind_invalid",
@@ -328,6 +347,9 @@ pub mod analysis;
 
 /// Registered errors under `rift.cli`.
 pub mod cli;
+
+/// Registered errors under `rift.client`.
+pub mod client;
 
 /// Registered errors under `rift.core`.
 pub mod core;

@@ -7,7 +7,10 @@ use rift_syntax::{ShippedLanguage, SyntaxLimits};
 
 use super::fixture::{identity, language, origin};
 use super::{PackageAnalysis, PackageAnalyzer};
-use crate::{ExactPackageInput, ExactPackageLimits, PackageSource};
+use crate::{
+    ExactPackageInput, ExactPackageLimits, PackageImportRoot, PackageImportRootOrigin,
+    PackageSource,
+};
 use rift_error::RiftError;
 
 #[test]
@@ -26,7 +29,7 @@ fn test_package_publication_configuration_reaches_record_bounds() {
     .expect("bounded publication");
     let publication = result.publication();
     assert_eq!(publication.units.len(), 2);
-    assert_eq!(publication.symbols.len(), 1);
+    assert_eq!(publication.declarations.len(), 1);
     assert_eq!(publication.documents.len(), 1);
     assert_eq!(publication.warnings.len(), 1);
     assert!(publication.units.iter().all(|unit| unit.source.len() <= 8));
@@ -67,7 +70,7 @@ fn test_package_environment_overrides_reach_publication_and_retention() {
     let limits =
         ExactPackageLimits::from_configuration(accepted.configuration()).expect("accepted limits");
     let result = analyze(limits, &source(2), &source(2)).expect("configured package");
-    assert_eq!(result.publication().symbols.len(), 4);
+    assert_eq!(result.publication().declarations.len(), 4);
     assert_eq!(result.publication().documents.len(), 6);
     assert!(
         result
@@ -79,7 +82,7 @@ fn test_package_environment_overrides_reach_publication_and_retention() {
     assert!(
         result
             .publication()
-            .symbols
+            .declarations
             .iter()
             .all(|symbol| symbol.source_complete)
     );
@@ -150,6 +153,7 @@ fn test_package_publication_limits_validate_supported_capacity_and_ordering() {
 #[test]
 fn test_relationship_configuration_preserves_declaration_only_package_analysis() {
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Rust);
     let origin = origin(&package);
     let path = ProjectPath::new("src/lib.rs").expect("source path");
@@ -163,7 +167,7 @@ fn test_relationship_configuration_preserves_declaration_only_package_analysis()
         let limits =
             ExactPackageLimits::from_configuration(&configuration).expect("relationship bounds");
         assert_eq!(limits.relationships_max() as u64, relationships);
-        let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)
             .expect("package input");
         PackageAnalyzer::analyze(input, 1).expect("package analysis")
     };
@@ -172,7 +176,10 @@ fn test_relationship_configuration_preserves_declaration_only_package_analysis()
     let one_over = analyze_bound(1);
     assert!(one_over.semantics.relationships().is_complete());
     assert_eq!(one_over.semantics.relationships().dropped_edges(), 0);
-    assert_eq!(exact.publication().symbols, one_over.publication().symbols);
+    assert_eq!(
+        exact.publication().declarations,
+        one_over.publication().declarations
+    );
 }
 
 fn source(count: u32) -> String {
@@ -188,6 +195,7 @@ fn analyze(
     second: &str,
 ) -> Result<PackageAnalysis, RiftError> {
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Python);
     let origin = origin(&package);
     let first_path = ProjectPath::new("pkg/a.py").expect("path");
@@ -196,7 +204,13 @@ fn analyze(
         PackageSource::new(&first_path, first),
         PackageSource::new(&second_path, second),
     ];
-    let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+    let roots = [PackageImportRoot::new(
+        None,
+        vec!["pkg".to_owned()],
+        PackageImportRootOrigin::Wheel,
+    )?];
+    let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?
+        .with_import_roots(&roots)?;
     PackageAnalyzer::analyze(input, 1)
 }
 
@@ -208,7 +222,7 @@ fn test_declaration_limit_accepts_exact_count_and_refuses_one_more() {
     let first = source(2);
     let second = source(2);
     let analysis = analyze(limits, &first, &second).expect("exact declaration count");
-    assert_eq!(analysis.publication().symbols.len(), 4);
+    assert_eq!(analysis.publication().declarations.len(), 4);
     assert!(analysis.publication().warnings.is_empty());
 
     let error = analyze(limits, &first, &source(3)).expect_err("one more declaration");
@@ -234,7 +248,7 @@ fn test_declaration_limit_preserves_default_and_uses_configured_bound() {
     let source_max = rift_protocol::index::PACKAGE_SOURCE_BYTES_MAX as usize;
     assert!(first.len() <= source_max && second.len() <= source_max);
     let baseline = analyze(limits, &first, &second).expect("default declaration bound");
-    assert_eq!(baseline.publication().symbols.len(), 3);
+    assert_eq!(baseline.publication().declarations.len(), 3);
     let selected = limits
         .with_declarations(2)
         .expect("selected declaration bound");
@@ -248,7 +262,7 @@ fn test_declaration_limit_preserves_default_and_uses_configured_bound() {
         .with_declarations(3)
         .expect("raised declaration bound");
     let analysis = analyze(raised, &first, &second).expect("larger package");
-    assert_eq!(analysis.publication().symbols.len(), 3);
+    assert_eq!(analysis.publication().declarations.len(), 3);
     assert!(analysis.publication().warnings.is_empty());
 }
 
@@ -292,7 +306,7 @@ fn test_configuration_and_environment_declaration_limits_reach_analysis() {
         SyntaxLimits::new(16 << 20, 5_000_000, 1024).expect("syntax")
     );
     let analysis = analyze(limits, &first, &second).expect("environment raises declaration bound");
-    assert_eq!(analysis.publication().symbols.len(), 10_001);
+    assert_eq!(analysis.publication().declarations.len(), 10_001);
     assert!(analysis.publication().warnings.is_empty());
 }
 
@@ -372,12 +386,13 @@ fn test_retained_total_counts_only_published_document_copies() {
 fn test_notebook_document_bound_keeps_cells_and_counts_only_published_source() {
     let notebook = r#"{"cells":[{"cell_type":"markdown","id":"first","source":"First."},{"cell_type":"markdown","id":"second","source":"Second."}],"metadata":{}}"#;
     let package = identity();
+    let owner = package.owner().expect("fixture owner");
     let language = language(ShippedLanguage::Python);
     let origin = origin(&package);
     let path = ProjectPath::new("notebooks/guide.ipynb").expect("notebook path");
     let files = [PackageSource::new(&path, notebook)];
     let analyze_notebook = |limits| {
-        let input = ExactPackageInput::new(&package, &language, &origin, &files, limits)?;
+        let input = ExactPackageInput::new(&owner, &language, &origin, &files, limits)?;
         PackageAnalyzer::analyze(input, 1)
     };
     let default = analyze_notebook(ExactPackageLimits::new(1, notebook.len() as u64))

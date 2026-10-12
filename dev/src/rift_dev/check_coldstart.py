@@ -162,8 +162,20 @@ async def check_first_use(client: Client, name: str) -> None:
 async def check_missing_executable(client: Client, name: str) -> None:
     """Keep syntax reads after a configured language engine fails to launch."""
     configuration = '[languages.rust.lsp]\ncommand = ["rust-analyzer"]\n'
+    metadata = (
+        '[package]\nname = "beacon_cold"\nversion = "0.1.0"\nedition = "2024"\n'
+        '\n[lib]\npath = "lib.rs"\n'
+    )
     container_command(
-        name, ["sh", "-c", 'printf %s "$1" > rift.toml', "sh", configuration]
+        name,
+        [
+            "sh",
+            "-c",
+            'printf %s "$1" > Cargo.toml; printf %s "$2" > rift.toml',
+            "sh",
+            metadata,
+            configuration,
+        ],
     )
     hit = await symbol_hit(client, "beacon_cold")
     try:

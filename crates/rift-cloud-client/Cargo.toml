@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 http.workspace = true
 oas3-gen-support.workspace = true
 oas3.workspace = true
@@ -20,6 +21,7 @@ reqwest = { workspace = true, features = ["json", "query"] }
 regex.workspace = true
 rift-core.workspace = true
 rift-analysis.workspace = true
+rift-error.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-tracing.workspace = true

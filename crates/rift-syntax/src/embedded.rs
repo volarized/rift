@@ -36,8 +36,10 @@ pub(crate) fn append(
     let selections = selected_languages(document, source.text);
     let mut nodes = document.nodes().to_vec();
     let mut symbols = document.symbols().to_vec();
+    symbols.extend_from_slice(document.facts().left_out_symbols());
     let mut has_errors = document.has_errors();
-    let mut omitted = document.left_out_declaration_count();
+    let mut omitted =
+        document.left_out_declaration_count() - document.facts().left_out_symbols().len();
     for (index, node) in document.nodes().iter().enumerate() {
         if node.kind != RAW_TEXT {
             continue;
@@ -56,7 +58,9 @@ pub(crate) fn append(
         admit_depth(source, limits, depth, &embedded)?;
         has_errors |= embedded.has_errors();
         omitted = omitted
-            .checked_add(embedded.left_out_declaration_count())
+            .checked_add(
+                embedded.left_out_declaration_count() - embedded.facts().left_out_symbols().len(),
+            )
             .ok_or_else(|| {
                 errors::syntax::too_many_nodes()
                     .path(source.path)
@@ -65,6 +69,7 @@ pub(crate) fn append(
             })?;
         append_nodes(&mut nodes, &embedded, index);
         symbols.extend_from_slice(embedded.symbols());
+        symbols.extend_from_slice(embedded.facts().left_out_symbols());
     }
     order_nodes(&mut nodes);
     symbols.sort_by_key(|symbol| symbol.range.start);

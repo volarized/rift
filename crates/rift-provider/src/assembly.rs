@@ -51,7 +51,7 @@ impl PresentationDisagreement {
 }
 
 /// Readable symbol assembled from one normalized record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct AssembledSymbol {
     index_revision: IndexRevision,
     identity: Option<SymbolId>,
@@ -63,7 +63,24 @@ pub struct AssembledSymbol {
     references: Vec<crate::NormalizedReference>,
     relationships: Vec<crate::NormalizedRelationship>,
     namespaced: Vec<(ProviderId, Extensions)>,
+    namespaced_material_bytes: usize,
     disagreements: Vec<PresentationDisagreement>,
+}
+
+impl PartialEq for AssembledSymbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.index_revision == other.index_revision
+            && self.identity == other.identity
+            && self.resolution == other.resolution
+            && self.contributions == other.contributions
+            && self.facts == other.facts
+            && self.origin == other.origin
+            && self.container == other.container
+            && self.references == other.references
+            && self.relationships == other.relationships
+            && self.namespaced == other.namespaced
+            && self.disagreements == other.disagreements
+    }
 }
 
 impl AssembledSymbol {
@@ -144,28 +161,46 @@ impl AssembledSymbol {
                     .or_insert_with(|| value.clone());
             }
         }
+        let mut symbol = Self::wire_facts(facts, &self.origin);
+        symbol.id = self
+            .identity
+            .as_ref()
+            .map(|identity| WireSymbolId(identity.as_str().to_owned()));
+        symbol.container = self
+            .container
+            .as_ref()
+            .map(|container| WireSymbolId(container.as_str().to_owned()));
+        symbol.extensions = Extensions(extension_values);
+        symbol
+    }
+
+    /// Converts retained facts without assigning a logical identity or container.
+    /// Portable Contribution admission remains separate from this factual projection.
+    #[must_use]
+    pub fn wire_facts(facts: &PortableSymbolFacts, origin: &ContributionOrigin) -> Symbol {
         Symbol {
-            id: self
-                .identity
-                .as_ref()
-                .map(|identity| WireSymbolId(identity.as_str().to_owned())),
+            id: None,
             language: facts.language().clone(),
             name: facts.name().to_owned(),
             kind: facts.kind().clone(),
             facets: facts.symbol_facets().to_vec(),
-            origin: wire_symbol_origin(&self.origin),
-            container: self
-                .container
-                .as_ref()
-                .map(|container| WireSymbolId(container.as_str().to_owned())),
+            origin: wire_symbol_origin(origin),
+            container: None,
             modifiers: facts.modifier_words().to_vec(),
             visibility: facts.visibility_spelling().map(str::to_owned),
             types: facts.type_bindings().to_vec(),
             signatures: facts.signatures_slice().to_vec(),
             documentation: facts.documentation_blocks().to_vec(),
-            extensions: Extensions(extension_values),
+            extensions: Extensions::default(),
             document_local: facts.is_document_local(),
         }
+    }
+
+    /// Converts a captured Contribution origin using the same read representation as
+    /// logical objects and their physical declarations.
+    #[must_use]
+    pub fn wire_origin(origin: &ContributionOrigin) -> SymbolOrigin {
+        wire_symbol_origin(origin)
     }
 }
 
@@ -175,13 +210,19 @@ fn wire_symbol_origin(origin: &ContributionOrigin) -> SymbolOrigin {
         location: location.map(|location| match location {
             rift_core::SourceLocation::Project { .. } => SourceLocationKind::Project,
             rift_core::SourceLocation::Dependency { .. } => SourceLocationKind::Dependency,
-            rift_core::SourceLocation::Stdlib {} => SourceLocationKind::Stdlib,
+            rift_core::SourceLocation::Stdlib { .. } => SourceLocationKind::Stdlib,
             rift_core::SourceLocation::External {} => SourceLocationKind::External,
         }),
         package: location.and_then(|location| match location {
             rift_core::SourceLocation::Project { package } => package.clone(),
             rift_core::SourceLocation::Dependency { package } => Some(package.clone()),
-            rift_core::SourceLocation::Stdlib {} | rift_core::SourceLocation::External {} => None,
+            rift_core::SourceLocation::Stdlib { .. } | rift_core::SourceLocation::External {} => {
+                None
+            }
+        }),
+        runtime: location.and_then(|location| match location {
+            rift_core::SourceLocation::Stdlib { runtime } => runtime.clone(),
+            _ => None,
         }),
         source_kind: origin.source_kind(),
     }
@@ -246,6 +287,9 @@ impl SymbolAssembler {
                 selected_container,
             )
         });
+        let namespaced_material_bytes = contributions.iter().fold(0usize, |bytes, (_, value)| {
+            bytes.saturating_add(value.namespaced_material_bytes())
+        });
         let namespaced = contributions
             .iter()
             .map(|(key, contribution)| {
@@ -278,6 +322,7 @@ impl SymbolAssembler {
             references,
             relationships,
             namespaced,
+            namespaced_material_bytes,
             disagreements,
         })
     }
@@ -423,6 +468,89 @@ fn retain_difference(
     }
 }
 
+impl get_size2::GetSize for PresentationDisagreement {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.contribution, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for AssembledSymbol {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.identity, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.contributions, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.facts, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.origin, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.container, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.references, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        bytes = bytes
+            .saturating_add(self.namespaced_material_bytes)
+            .saturating_add(
+                self.namespaced
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(ProviderId, Extensions)>()),
+            );
+        for (provider, _) in &self.namespaced {
+            let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(provider, tracker);
+            bytes = bytes.saturating_add(field);
+            tracker = next;
+        }
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.disagreements, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -513,7 +641,7 @@ mod tests {
             1,
             "syntax-beacon",
             "Beacon",
-            Some("symbol:beacon"),
+            Some("rift://symbol/local/rust/app/Beacon"),
             None,
         );
         let lsp = contribution(
@@ -567,6 +695,67 @@ mod tests {
     }
 
     #[test]
+    fn source_less_raw_facts_keep_full_names_signatures_and_documentation() {
+        let origin = ContributionOrigin::new(None, SourceKind::Synthetic).expect("origin");
+        for characters in [3000, 4097] {
+            let name = "𐐀".repeat(characters);
+            let signature = serde_json::from_value(serde_json::json!({
+                "display": format!("fn {name}()"), "language":"rust",
+            }))
+            .expect("signature");
+            let facts = PortableSymbolFacts::new(
+                Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                },
+                &name,
+                &name,
+                ExactKind("function".to_owned()),
+            )
+            .signatures(vec![signature])
+            .documentation(vec![Documentation {
+                format: DocumentationFormat::Markdown,
+                text: "Original source-less documentation.".to_owned(),
+            }]);
+            assert!(!rift_core::is_portable_name(&name));
+            let refused = Contribution::builder(
+                ContributionKey::new(
+                    provider("syntax"),
+                    ProviderRevision::new(1).expect("revision"),
+                    ProviderSymbolId::new("raw").expect("provider symbol"),
+                ),
+                SourceApplicability::Independent,
+                facts.clone(),
+                origin.clone(),
+            )
+            .build();
+            assert!(
+                refused.is_err(),
+                "raw facts cannot bypass portable admission"
+            );
+            let symbol = super::AssembledSymbol::wire_facts(&facts, &origin);
+            assert_eq!(symbol.id, None);
+            assert_eq!(symbol.container, None);
+            assert_eq!(symbol.name, name);
+            assert_eq!(symbol.name_is_public(), characters <= 4096);
+            assert!(symbol.name_is_retained(name.len()));
+            assert!(!symbol.name_is_retained(name.len() - 1));
+            assert_eq!(symbol.signatures.len(), 1);
+            assert_eq!(
+                symbol.documentation[0].text,
+                "Original source-less documentation."
+            );
+            assert_eq!(symbol.origin.source_kind, SourceKind::Synthetic);
+            let wire = serde_json::to_value(&symbol).expect("retained symbol serializes");
+            assert_eq!(
+                serde_json::from_value::<rift_protocol::read::Symbol>(wire)
+                    .expect("retained symbol roundtrip"),
+                symbol
+            );
+        }
+    }
+
+    #[test]
     fn assembly_preserves_identity_and_applies_presentation_precedence() {
         let graph = graph();
         let record = graph
@@ -578,7 +767,7 @@ mod tests {
             .expect("assembled symbol");
         assert_eq!(
             lsp_first.identity().map(SymbolId::as_str),
-            Some("symbol:beacon")
+            Some("rift://symbol/local/rust/app/Beacon")
         );
         assert_eq!(lsp_first.facts().expect("portable facts").name(), "beacon");
         assert_eq!(
@@ -699,6 +888,9 @@ mod tests {
 
         assert!(assembled.facts().is_none());
         assert_eq!(assembled.namespaced(), &[(provider("git"), namespaced)]);
+        let bytes = get_size2::GetSize::get_heap_size(&assembled);
+        assert!(bytes > 0 && bytes < usize::MAX);
+        assert_eq!(assembled.clone(), assembled);
     }
 
     #[test]

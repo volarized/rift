@@ -116,6 +116,7 @@ impl ReadService {
             warnings.push(results_truncation_warning(results_max));
         }
         Ok(SearchResult {
+            view: None,
             results,
             pagination,
             warnings,
@@ -208,6 +209,7 @@ pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHi
         paths_truncated,
     };
     Ok(Some(SearchHit {
+        view: None,
         hit: SearchHitTarget::Commit {
             commit: Box::new(hit),
         },

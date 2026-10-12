@@ -370,12 +370,15 @@ fn entry_points(graph: &NormalizedGraph) -> Vec<SymbolId> {
 /// record cannot be assembled - no established identity, or no provider ever contributed
 /// portable facts for it - is skipped
 /// rather than reported with a guessed kind; ranking continues past it toward the next
-/// candidate, bounded by the same reference graph the tally already walked once.
+/// candidate, bounded by the established records and reference graph the tally walks once.
 fn hubs(
     graph: &NormalizedGraph,
     records_by_identity: &BTreeMap<&CoreSymbolId, &SymbolRecord>,
 ) -> Vec<MapHub> {
-    let mut reference_counts: BTreeMap<CoreSymbolId, u64> = BTreeMap::new();
+    let mut reference_counts: BTreeMap<CoreSymbolId, u64> = records_by_identity
+        .keys()
+        .map(|identity| ((*identity).clone(), 0))
+        .collect();
     for reference in graph.references() {
         for target in reference.targets() {
             if let NormalizedTarget::Symbol(identity) = target {
@@ -457,6 +460,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::read::ReadService;
+    use crate::traversal::tests::graph_identity;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -490,6 +494,10 @@ mod tests {
     /// map as neither hub nor module relationship.
     fn fixture() -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )?;
         fs::create_dir_all(directory.path().join("src"))?;
         fs::write(
             directory.path().join("src/lib.rs"),
@@ -607,7 +615,7 @@ mod tests {
                 Ok(
                     Contribution::builder(key, applicability()?, facts, origin()?)
                         .source(binding(path, *range)?)
-                        .identity_anchor(SymbolId::new(*identity)?)
+                        .identity_anchor(SymbolId::new(graph_identity(symbol))?)
                         .build()?,
                 )
             })
@@ -619,11 +627,11 @@ mod tests {
     fn fact_less_contributions(definitions: &[Definition<'_>]) -> TestResult<Vec<Contribution>> {
         definitions
             .iter()
-            .map(|(symbol, identity, path, range)| {
+            .map(|(symbol, _identity, path, range)| {
                 let key = contribution_key(symbol)?;
                 Ok(Contribution::fact_builder(key, applicability()?, origin()?)
                     .source(binding(path, *range)?)
-                    .identity_anchor(SymbolId::new(*identity)?)
+                    .identity_anchor(SymbolId::new(graph_identity(symbol))?)
                     .build()?)
             })
             .collect()
@@ -894,9 +902,9 @@ mod tests {
         assert_eq!(
             ranked,
             [
-                ("rift://symbol/rust/src/lib.rs/use_alpha", 2),
-                ("rift://symbol/rust/src/lib.rs/alpha", 1),
-                ("rift://symbol/rust/src/lib.rs/beta", 1),
+                (graph_identity("use_alpha").as_str(), 2),
+                (graph_identity("alpha").as_str(), 1),
+                (graph_identity("beta").as_str(), 1),
             ],
             "twice-referenced use_alpha ranks first; alpha and beta tie at one reference each \
              and sort by identity"
@@ -952,7 +960,8 @@ mod tests {
             "a record with no portable facts never ranks as a hub: hubs={hubs:?}"
         );
         assert_eq!(
-            hubs[0].symbol.0, "rift://symbol/rust/src/lib.rs/callee_00",
+            hubs[0].symbol.0,
+            graph_identity("callee_00"),
             "the twice-referenced ghost would rank first were it assemblable; the ranked \
              callees follow in identity order"
         );
@@ -968,7 +977,7 @@ mod tests {
                 .iter()
                 .map(|id| id.0.as_str())
                 .collect::<Vec<_>>(),
-            ["rift://symbol/rust/src/lib.rs/main"]
+            [graph_identity("main").as_str()]
         );
         Ok(())
     }
@@ -1020,6 +1029,51 @@ mod tests {
     }
 
     #[test]
+    fn workspace_map_keeps_declarations_with_no_references() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )?;
+        let map = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?
+        .workspace_map();
+
+        assert!(map.entry_points.is_empty());
+        assert_eq!(map.hubs.len(), 2);
+        assert!(map.hubs.iter().all(|hub| hub.references == 0));
+        assert!(
+            map.hubs
+                .windows(2)
+                .all(|pair| pair[0].symbol.0 < pair[1].symbol.0)
+        );
+        let names = map
+            .hubs
+            .iter()
+            .map(|hub| {
+                let identity = rift_protocol::identity::SymbolIdentity::parse(&hub.symbol.0)?;
+                assert_eq!(
+                    identity.owner(),
+                    &rift_protocol::identity::SymbolOwner::Local
+                );
+                Ok(identity.qualified_path().last().cloned())
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        assert_eq!(names, [Some("alpha".to_owned()), Some("beta".to_owned())]);
+        Ok(())
+    }
+
+    #[test]
     fn workspace_map_is_deterministic_across_two_builds_of_the_same_tree() -> TestResult {
         let directory = tempfile::tempdir()?;
         fs::create_dir_all(directory.path().join("src"))?;
@@ -1057,7 +1111,7 @@ mod tests {
     #[test]
     fn hubs_skip_a_resolved_target_whose_record_carries_no_portable_facts() -> TestResult {
         let graph = fact_less_target_graph()?;
-        let ghost = SymbolId::new(GHOST_IDENTITY)?;
+        let ghost = SymbolId::new(graph_identity("ghost"))?;
         assert!(
             resolved_targets(&graph).contains(&ghost),
             "the ghost target must resolve to an established identity so the skip arm runs"

@@ -12,6 +12,9 @@ use crate::markdown::MarkdownFacts;
 /// the `~N` suffix `SymbolId` advertises.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
+mod retained_size;
+pub(crate) mod rust_macros;
+
 /// Half-open UTF-8 byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteRange {
@@ -40,6 +43,28 @@ pub struct SyntaxNode {
     pub parent: Option<usize>,
     /// Whether the parser marked the node erroneous or missing.
     pub has_error: bool,
+}
+
+/// Python overload state established from the original import and decorator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PythonOverload {
+    /// Ordinary function declaration without an overload decorator.
+    Ordinary,
+    /// Import or decorator association was not established.
+    Unknown,
+    /// A typing overload import supplies this decorator.
+    Overload {
+        /// Whole original import statement.
+        import_statement: ByteRange,
+        /// Imported typing module token.
+        module: ByteRange,
+        /// Imported overload token, absent for a module import.
+        imported: Option<ByteRange>,
+        /// Name bound by the import.
+        binding: ByteRange,
+        /// Original decorator expression, excluding the leading `@`.
+        decorator: ByteRange,
+    },
 }
 
 /// One named declaration extracted from a source file.
@@ -87,6 +112,58 @@ pub struct SyntaxSymbol {
     pub documentation: Arc<[Documentation]>,
     /// Exact source ranges for attached documentation.
     pub documentation_ranges: Vec<ByteRange>,
+    /// Captured Rust module path state. Missing state remains unknown when facts are restored.
+    pub module_path: Option<RustModulePath>,
+    /// Captured Python overload state; absent for older or other language facts.
+    pub python_overload: Option<PythonOverload>,
+}
+
+/// Form of one captured export binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyntaxExportKind {
+    /// Named local export or named reexport.
+    Named,
+    /// All exports from another module.
+    All,
+    /// A namespace export from another module.
+    Namespace,
+    /// A default export.
+    Default,
+}
+
+/// Exact source ranges retained for one export binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyntaxExportBinding {
+    /// Authored export form.
+    pub kind: SyntaxExportKind,
+    /// Complete export statement.
+    pub range: ByteRange,
+    /// Defining local name or imported name.
+    pub local: Option<ByteRange>,
+    /// Exported name, when the statement names it.
+    pub exported: Option<ByteRange>,
+    /// Module source token, when the statement names another module.
+    pub source: Option<ByteRange>,
+    /// Existing declaration container, when present.
+    pub container: Option<String>,
+    /// Whether the binding exports only a type.
+    pub type_only: bool,
+}
+
+/// Path attributes captured for one Rust module during the original syntax walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RustModulePath {
+    /// The semantic attribute run contains no module path or conditional path attribute.
+    Absent,
+    /// An accepted literal path and its exact unescaped source content.
+    Literal {
+        /// Validated path below the source root.
+        path: rift_core::ProjectPath,
+        /// Original literal content, before the module item.
+        range: ByteRange,
+    },
+    /// Unsupported or conflicting attributes prevent an established module path.
+    Unknown,
 }
 
 /// Origin of syntax facts before or after framework context applies.
@@ -98,6 +175,12 @@ pub enum SyntaxOrigin {
     Framework,
 }
 
+/// Captured invocation, direct module items, and optional complete direct token ranges.
+pub type MacroInvocation = (ByteRange, Vec<ByteRange>, Option<Vec<ByteRange>>);
+
+/// Original Rust scope range and optional complete direct child ranges.
+pub type Scope = (ByteRange, Option<Vec<ByteRange>>);
+
 /// Immutable syntax facts shared by documents at different paths, without complete node rows.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
@@ -106,6 +189,10 @@ pub struct SyntaxFacts {
     origin: SyntaxOrigin,
     language: Language,
     symbols: Vec<SyntaxSymbol>,
+    left_out_symbols: Vec<SyntaxSymbol>,
+    export_bindings: Option<Vec<SyntaxExportBinding>>,
+    macro_invocations: Option<Vec<MacroInvocation>>,
+    scope: Option<Vec<Scope>>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -192,26 +279,18 @@ fn unused_suffixed_name(name: &str, count: &mut u32, taken: &HashSet<String>) ->
     }
 }
 
-/// Leaves out every declaration whose `name` or `qualified_name` the
-/// Contribution contract refuses - empty, past `PROVIDER_SYMBOL_ID_BYTES_MAX`
-/// bytes, or holding a control character - and returns how many left.
-///
-/// The rule is `rift_core::is_portable_name`, the predicate the contract
-/// itself checks a Contribution's name with, so a declaration this pass
-/// keeps is one the contract accepts. A declaration nested under a refused
-/// one carries the refused bytes in its own qualified name, so the same rule
-/// leaves it out. The pass runs after the suffix pass, so the bound holds
-/// for the qualified name the Contribution carries.
-///
-/// Every provider funnels through [`SyntaxDocument::new`], so no provider
-/// can emit a name the contract refuses. Work is one predicate per
-/// declaration, already bounded by the provider's node bound.
-fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> usize {
-    let extracted = symbols.len();
-    symbols.retain(|symbol| {
-        is_portable_name(&symbol.name) && is_portable_name(&symbol.qualified_name)
-    });
-    extracted - symbols.len()
+/// Keeps Contribution-admitted declarations in `symbols` and retains the full omitted facts.
+/// The provider's source and node bounds apply to both collections.
+fn leave_out_refused_names(symbols: &mut Vec<SyntaxSymbol>) -> Vec<SyntaxSymbol> {
+    let mut left_out = Vec::new();
+    for symbol in std::mem::take(symbols) {
+        if is_portable_name(&symbol.name) && is_portable_name(&symbol.qualified_name) {
+            symbols.push(symbol);
+        } else {
+            left_out.push(symbol);
+        }
+    }
+    left_out
 }
 
 impl SyntaxDocument {
@@ -226,27 +305,118 @@ impl SyntaxDocument {
 
     /// Assembles one document from a provider's extracted facts, suffixing
     /// every repeated qualified name apart so each declaration addresses
-    /// one identity, then leaving out every declaration whose name the
-    /// Contribution contract refuses.
+    /// one identity. Declarations outside the Contribution name bounds retain
+    /// their complete syntax facts in the omitted collection.
     pub(crate) fn new(
+        language: Language,
+        path: ProjectPath,
+        nodes: Vec<SyntaxNode>,
+        symbols: Vec<SyntaxSymbol>,
+        has_errors: bool,
+    ) -> Self {
+        Self::assemble(language, path, nodes, symbols, has_errors, None)
+    }
+
+    /// Checks literal Rust function header tokens within the token and source byte bounds.
+    ///
+    /// The tokens must come from the caller's checked original source range.
+    #[must_use]
+    pub fn function_header(input: &[&str], bounds: (usize, usize)) -> bool {
+        let (tokens_max, source_bytes_max) = bounds;
+        input.len() <= tokens_max
+            && input
+                .iter()
+                .try_fold(0_usize, |bytes, token| bytes.checked_add(token.len()))
+                .is_some_and(|bytes| bytes <= source_bytes_max)
+            && rust_macros::function_header_tokens(input)
+    }
+
+    pub(crate) fn new_rust(
+        language: Language,
+        source: crate::SyntaxSource<'_>,
+        limits: crate::SyntaxLimits,
+        nodes: Vec<SyntaxNode>,
+        mut symbols: Vec<SyntaxSymbol>,
+        has_errors: bool,
+    ) -> Self {
+        let mut invocations = Self::invocations(&language, &nodes);
+        if let Some(invocations) = &mut invocations {
+            rust_macros::capture(
+                source.text,
+                &nodes,
+                invocations,
+                Some((&language, limits, &mut symbols)),
+            );
+        }
+        symbols.sort_by_key(|symbol| symbol.item_range.start);
+        let mut document = Self::assemble(
+            language,
+            source.path.clone(),
+            nodes,
+            symbols,
+            has_errors,
+            invocations,
+        );
+        let facts = Arc::make_mut(&mut document.facts);
+        facts.source_digest = Some(FileDigest::of(source.text.as_bytes()));
+        facts.scope = rust_macros::capture_scope(source.text, &document.nodes, has_errors);
+        facts.syntax_limits = Some(limits);
+        document
+    }
+
+    fn invocations(language: &Language, nodes: &[SyntaxNode]) -> Option<Vec<MacroInvocation>> {
+        (language.name == "rust" && language.dialect.is_none()).then(|| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == "macro_invocation"
+                        && node
+                            .parent
+                            .and_then(|parent| nodes.get(parent))
+                            .is_some_and(|parent| {
+                                (parent.kind == "source_file" && parent.parent.is_none())
+                                    || (parent.kind == "expression_statement"
+                                        && parent
+                                            .parent
+                                            .and_then(|root| nodes.get(root))
+                                            .is_some_and(|root| {
+                                                root.kind == "source_file" && root.parent.is_none()
+                                            }))
+                            })
+                })
+                .map(|node| (node.range, Vec::new(), None))
+                .collect()
+        })
+    }
+
+    fn assemble(
         language: Language,
         path: ProjectPath,
         nodes: Vec<SyntaxNode>,
         mut symbols: Vec<SyntaxSymbol>,
         has_errors: bool,
+        captured: Option<Vec<MacroInvocation>>,
     ) -> Self {
         suffix_duplicate_qualified_names(&mut symbols);
-        let left_out_declarations = leave_out_refused_names(&mut symbols);
         let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
         for symbol in &mut symbols {
-            symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            if symbol.node_kind.is_none() {
+                symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            }
         }
+        let macro_invocations = captured.or_else(|| Self::invocations(&language, &nodes));
+        let left_out_symbols = leave_out_refused_names(&mut symbols);
+        let left_out_declarations = left_out_symbols.len();
         Self {
             path,
             facts: Arc::new(SyntaxFacts {
                 origin: SyntaxOrigin::Provider,
                 language,
                 symbols,
+                left_out_symbols,
+                export_bindings: None,
+                macro_invocations,
+                scope: None,
                 has_errors,
                 left_out_declarations,
                 markdown_facts: None,
@@ -278,6 +448,12 @@ impl SyntaxDocument {
         self
     }
 
+    /// Attaches export bindings extracted from the same syntax tree.
+    pub(crate) fn with_export_bindings(mut self, bindings: Vec<SyntaxExportBinding>) -> Self {
+        Arc::make_mut(&mut self.facts).export_bindings = Some(bindings);
+        self
+    }
+
     /// Returns the language identity these facts are filed under.
     #[must_use]
     pub fn language(&self) -> &Language {
@@ -303,7 +479,14 @@ impl SyntaxDocument {
     }
 
     pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
-        Arc::make_mut(&mut self.facts).source_digest = Some(FileDigest::of(source.as_bytes()));
+        let facts = Arc::make_mut(&mut self.facts);
+        facts.source_digest = Some(FileDigest::of(source.as_bytes()));
+        if facts.language.name == "rust" && facts.language.dialect.is_none() {
+            facts.scope = rust_macros::capture_scope(source, &self.nodes, facts.has_errors);
+        }
+        if let Some(invocations) = &mut facts.macro_invocations {
+            rust_macros::capture(source, &self.nodes, invocations, None);
+        }
         self
     }
 
@@ -363,6 +546,23 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Returns recorded export bindings, or `None` for unrecorded facts.
+    #[must_use]
+    pub fn export_bindings(&self) -> Option<&[SyntaxExportBinding]> {
+        self.export_bindings.as_deref()
+    }
+
+    /// Returns original Rust scopes, or `None` for unrecorded scope facts.
+    #[must_use]
+    pub fn scope(&self) -> Option<&[Scope]> {
+        self.scope.as_deref()
+    }
+
+    /// Returns captured top-level Rust macro invocations, or `None` for unrecorded facts.
+    #[must_use]
+    pub fn macro_invocations(&self) -> Option<&[MacroInvocation]> {
+        self.macro_invocations.as_deref()
+    }
     /// Returns whether these facts came from a provider or framework context.
     #[must_use]
     pub const fn origin(&self) -> SyntaxOrigin {
@@ -385,6 +585,12 @@ impl SyntaxFacts {
     #[must_use]
     pub fn symbols(&self) -> &[SyntaxSymbol] {
         &self.symbols
+    }
+
+    /// Full declarations omitted from the portable Contribution collection.
+    #[must_use]
+    pub fn left_out_symbols(&self) -> &[SyntaxSymbol] {
+        &self.left_out_symbols
     }
 
     /// How many extracted declarations this document leaves out.
@@ -457,6 +663,10 @@ impl SyntaxFacts {
             origin: parts.origin,
             language: parts.language,
             symbols: parts.symbols,
+            left_out_symbols: parts.left_out_symbols,
+            export_bindings: parts.export_bindings,
+            macro_invocations: parts.macro_invocations,
+            scope: parts.scope,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,
@@ -519,6 +729,8 @@ mod tests {
             signatures: Arc::from([]),
             documentation: Arc::from([]),
             documentation_ranges: Vec::new(),
+            module_path: None,
+            python_overload: None,
         }
     }
 

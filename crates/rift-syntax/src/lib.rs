@@ -27,12 +27,13 @@ mod yaml;
 
 pub use angular::{AngularComponent, AngularTemplate, angular_components};
 pub use contribution::{
-    DocumentPlacement, SYNTAX_PROVIDER_ID, SyntaxPublicationBuilder, source_unit,
-    source_unit_for_path,
+    DocumentPlacement, LogicalDeclaration, PlacedAlias, SYNTAX_PROVIDER_ID,
+    SyntaxPublicationBuilder, source_unit, source_unit_for_path,
 };
 pub use css::CssSyntaxProvider;
 pub use document::{
-    ByteRange, SyntaxDocument, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
+    ByteRange, MacroInvocation, PythonOverload, RustModulePath, Scope, SyntaxDocument,
+    SyntaxExportBinding, SyntaxExportKind, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
 };
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
@@ -62,3 +63,5 @@ mod restore;
 pub use restore::{MarkdownFactsParts, SyntaxFactsParts, SyntaxNames};
 
 pub use tailwind::{TailwindFacts, append_framework_symbols, tailwind_symbols};
+
+pub use document::rust_macros::tokens;

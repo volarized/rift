@@ -2,6 +2,8 @@
 
 #[cfg(feature = "collector")]
 mod analyzer;
+#[cfg(feature = "collector")]
+pub use analyzer::namespace::python::build_paths;
 #[cfg(feature = "archive")]
 pub mod archive;
 mod chunk;
@@ -21,6 +23,7 @@ mod selection;
 mod semantic;
 #[cfg(feature = "collector")]
 mod source;
+mod traversal;
 
 #[cfg(feature = "collector")]
 pub use analyzer::{
@@ -33,7 +36,12 @@ pub use enclosing::EnclosingDefinitions;
 pub use framework::{FrameworkContext, ResolvedFramework};
 #[cfg(feature = "collector")]
 pub use glob::{ForceIncludeReach, PathMatcher, PathVerdict};
-pub use input::{ExactPackageInput, ExactPackageLimits, PackageSource};
+pub use input::{
+    ArchiveMemberKind, ExactPackageInput, ExactPackageLimits, PACKAGE_IMPORT_BYTES_MAX,
+    PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot, PackageImportRootOrigin, PackageSource,
+};
+#[cfg(feature = "collector")]
+pub use input::{NamespaceInput, NamespaceModule, PackageDependency};
 #[cfg(feature = "collector")]
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
@@ -50,6 +58,7 @@ pub use selection::{
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
+pub use traversal::{TraversalWalk, walk_traversal_capped, walk_traversal_capped_async};
 
 #[cfg(feature = "collector")]
 mod package_syntax;

@@ -69,6 +69,16 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    forward_failed,
+    slug = "rift.mcp.forward_failed",
+    message = "the workspace's rift server failed the forwarded request: {source}",
+    action = "check the server with `rift server start --foreground`",
+    fields = {
+        source: required(source),
+    },
+);
+
+__rift_error_definition!(
     forward_unanswered,
     slug = "rift.mcp.forward_unanswered",
     message = "workspace server did not answer forwarded request within {waited}",
@@ -204,6 +214,20 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    server_identity_mismatch,
+    slug = "rift.mcp.server_identity_mismatch",
+    message = "workspace server identity differs from this rift process: server pid {pid}, version {server_version}, schema digest {server_schema_digest}; this process version {version}, schema digest {schema_digest}",
+    action = "run rift server stop, then retry",
+    fields = {
+        pid: required(pid),
+        schema_digest: required(string),
+        server_schema_digest: required(string),
+        server_version: required(string),
+        version: required(string),
+    },
+);
+
+__rift_error_definition!(
     spawn_failed,
     slug = "rift.mcp.spawn_failed",
     message = "spawned server exited before serving",
@@ -227,6 +251,16 @@ __rift_error_definition!(
     slug = "rift.mcp.start_building",
     message = "workspace server did not finish building its first index within {waited}",
     action = "resend the same request after a short delay",
+    fields = {
+        waited: required(duration),
+    },
+);
+
+__rift_error_definition!(
+    start_unreachable,
+    slug = "rift.mcp.start_unreachable",
+    message = "no rift server answered for this workspace within {waited}; the workspace has no server this caller can reach",
+    action = "starting a server is an operator action on this host",
     fields = {
         waited: required(duration),
     },

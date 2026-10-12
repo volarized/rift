@@ -69,7 +69,10 @@ const IDENTIFIER_DERIVATION: &str = "case-acronym-underscore-1";
 ///
 /// Declaration order is column order in the FTS table and weight order in
 /// `bm25`, so the two cannot drift: both read this enum.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchableField {
     /// A declaration name, or a text file's final path segment with its
     /// extension.
@@ -170,6 +173,19 @@ impl SearchableField {
 /// representation.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FieldSet(u8);
+
+impl serde::Serialize for FieldSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.fields())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for FieldSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let fields = <Vec<SearchableField> as serde::Deserialize>::deserialize(deserializer)?;
+        Ok(fields.into_iter().collect())
+    }
+}
 
 impl FieldSet {
     /// The empty set.
@@ -289,6 +305,19 @@ impl DocumentKind {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DocumentIdentity(String);
 
+impl serde::Serialize for DocumentIdentity {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for DocumentIdentity {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl DocumentIdentity {
     /// Constructs one document identity.
     ///
@@ -393,6 +422,8 @@ pub struct DocumentFields {
     documentation: Option<String>,
     file_content: Option<String>,
 }
+
+mod retained_size;
 
 impl DocumentFields {
     /// A document with no field filled.
@@ -923,6 +954,7 @@ mod tests {
         };
         let package = PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "registry.example".to_owned(),
             name: "helper".to_owned(),
             version: "0.1.0".to_owned(),
         };

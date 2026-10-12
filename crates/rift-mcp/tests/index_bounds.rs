@@ -225,16 +225,6 @@ async fn a_raised_providers_syntax_bound_indexes_the_file_the_default_leaves_out
     Ok(())
 }
 
-/// A declaration named exactly `PROVIDER_SYMBOL_ID_BYTES_MAX` bytes: the document keeps
-/// it, and the identity minted from it passes the bound, so the Contribution contract
-/// refuses it when the file is published.
-fn wide_source() -> String {
-    format!(
-        "pub struct {};\n",
-        "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
-    )
-}
-
 /// Whether one search answer names `path` in a `source_unavailable` warning.
 fn names_unavailable(answer: &Value, path: &str) -> bool {
     let unit = format!("rift://file/{path}");
@@ -245,19 +235,19 @@ fn names_unavailable(answer: &Value, path: &str) -> bool {
     })
 }
 
-/// `search` with `paths.force_include` naming a file the walk skipped and the Contribution
-/// contract refuses answers from the other file, with the refused file named in a
+/// `search` with `paths.force_include` naming a binary file the walk skipped
+/// answers from the other file, with the refused file named in a
 /// `source_unavailable` warning, instead of failing the request. A plain search carries
 /// no such warning: the file is left out by the on-demand index alone.
 #[tokio::test]
 async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_warns() -> TestResult
 {
-    let wide = wide_source();
+    let refused = "pub fn refused() {}\0\n";
     let (_directory, client, server_task) = served_workspace(
         &[
             (".gitignore", "src/wide.rs\n"),
             ("src/lib.rs", "pub fn beacon() {}\n"),
-            ("src/wide.rs", wide.as_str()),
+            ("src/wide.rs", refused),
         ],
         None,
     )
@@ -323,7 +313,7 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
 
     let (client, server_task) = served_root_unsettled(directory.path()).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let params = tool_request("get_symbol", &json!({"name": "beacon"}));
+    let params = tool_request("search", &json!({"query": "beacon"}));
     let refusal = loop {
         let result = tokio::time::timeout_at(deadline, client.call_tool(params.clone())).await??;
         if result.is_error == Some(true) {

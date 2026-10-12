@@ -37,7 +37,10 @@ const QUALIFIER_SEPARATORS: [char; 2] = ['.', ':'];
 /// How precisely a caller's identifier matched an indexed declaration.
 ///
 /// Declaration order is precedence order: an identity keeps its best class.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum IdentifierMatchClass {
     /// The candidate equals the complete qualified name.
     QualifiedExact,
@@ -65,14 +68,20 @@ impl IdentifierMatchClass {
 ///
 /// An exact original name or qualified name precedes every normalized fallback.
 /// The class retains the same field meaning for callers carrying lowercase candidates.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(deny_unknown_fields)]
 pub struct IdentifierMatch {
     spelling: IdentifierSpelling,
     class: IdentifierMatchClass,
 }
 
 /// Whether equality preserves the spelling the caller supplied.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 enum IdentifierSpelling {
     Original,
     Normalized,

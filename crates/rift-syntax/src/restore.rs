@@ -25,6 +25,15 @@ pub struct SyntaxFactsParts {
     pub language: Language,
     /// Normalized declarations in source order.
     pub symbols: Vec<SyntaxSymbol>,
+    /// Full declarations omitted by the portable name bounds, in source order.
+    pub left_out_symbols: Vec<SyntaxSymbol>,
+    /// Recorded export bindings. Missing facts remain unknown.
+    pub export_bindings: Option<Vec<crate::SyntaxExportBinding>>,
+    /// Captured top-level Rust macro invocations and their direct module item ranges.
+    /// Missing facts remain unknown.
+    pub macro_invocations: Option<Vec<crate::MacroInvocation>>,
+    /// Captured root and module scopes; missing direct ranges remain unknown.
+    pub scope: Option<Vec<crate::Scope>>,
     /// Whether the provider reported parser errors.
     pub has_errors: bool,
     /// Number of extracted declarations the provider omitted.
@@ -313,20 +322,63 @@ pub(crate) fn validate_symbols(
     )?;
     let names = SyntaxNames::new(&parts.language)
         .ok_or_else(|| errors::syntax::facts_kind_invalid().error())?;
+    if parts.left_out_symbols.len() > parts.left_out_declarations {
+        return errors::syntax::facts_count_exceeded().fail();
+    }
     ordered(parts.symbols.iter().map(|symbol| symbol.range))?;
+    ordered(parts.left_out_symbols.iter().map(|symbol| symbol.range))?;
     let mut positions = BTreeMap::new();
-    for (position, symbol) in parts.symbols.iter().enumerate() {
+    for symbol in &parts.symbols {
         if !rift_core::is_portable_name(&symbol.name)
             || !rift_core::is_portable_name(&symbol.qualified_name)
-            || positions
-                .insert(symbol.qualified_name.as_str(), position)
-                .is_some()
         {
             return Err(errors::syntax::facts_name_invalid().error());
         }
         validate_symbol(source, limits, &names, &parts.language, symbol)?;
     }
-    validate_symbol_parents(&parts.symbols, limits, &positions)
+    let mut symbols = parts
+        .symbols
+        .iter()
+        .chain(&parts.left_out_symbols)
+        .collect::<Vec<_>>();
+    symbols.sort_by_key(|symbol| symbol.range.start);
+    for (position, symbol) in symbols.iter().enumerate() {
+        if positions
+            .insert(symbol.qualified_name.as_str(), position)
+            .is_some()
+        {
+            return errors::syntax::facts_name_invalid().fail();
+        }
+    }
+    validate_left_out_symbols(source, limits, &names, parts)?;
+    validate_symbol_parents(&symbols, limits, &positions)
+}
+
+fn retained_name(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
+    text(value, limits)?;
+    if !rift_protocol::read::symbol_name_is_retained(value, limits.source_bytes_max()) {
+        return errors::syntax::facts_name_invalid().fail();
+    }
+    Ok(())
+}
+
+fn validate_left_out_symbols(
+    source: &str,
+    limits: SyntaxLimits,
+    names: &SyntaxNames,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    for symbol in &parts.left_out_symbols {
+        if rift_core::is_portable_name(&symbol.name)
+            && rift_core::is_portable_name(&symbol.qualified_name)
+        {
+            return errors::syntax::facts_name_invalid().fail();
+        }
+        retained_name(&symbol.name, limits)?;
+        retained_name(&symbol.qualified_name, limits)?;
+        validate_symbol(source, limits, names, &parts.language, symbol)?;
+    }
+    Ok(())
 }
 
 fn text(value: &str, limits: SyntaxLimits) -> Result<(), RiftError> {
@@ -377,6 +429,8 @@ fn validate_symbol(
     }
     range(source, symbol.range)?;
     range(source, symbol.item_range)?;
+    validate_module_path(source, language, symbol)?;
+    validate_python_overload(source, language, symbol)?;
     if !contains(symbol.range, symbol.item_range) {
         return Err(errors::syntax::facts_range_invalid().error());
     }
@@ -408,8 +462,106 @@ fn validate_symbol(
     Ok(())
 }
 
+fn validate_python_overload(
+    source: &str,
+    language: &Language,
+    symbol: &SyntaxSymbol,
+) -> Result<(), RiftError> {
+    let Some(state) = &symbol.python_overload else {
+        return Ok(());
+    };
+    if language != &ShippedLanguage::Python.language() || symbol.kind != "function" {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    let crate::PythonOverload::Overload {
+        import_statement,
+        module,
+        imported,
+        binding,
+        decorator,
+    } = state
+    else {
+        return Ok(());
+    };
+    let slice = |value: ByteRange| -> Result<&str, RiftError> {
+        range(source, value)?;
+        let start = usize::try_from(value.start)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        let end = usize::try_from(value.end)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        source
+            .get(start..end)
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| errors::syntax::facts_range_invalid().error())
+    };
+    let statement = slice(*import_statement)?;
+    let module_text = slice(*module)?;
+    let binding_text = slice(*binding)?;
+    let decorator_text = slice(*decorator)?;
+    if !matches!(module_text, "typing" | "typing_extensions")
+        || !contains(*import_statement, *module)
+        || !contains(*import_statement, *binding)
+        || import_statement.end > symbol.range.start
+        || !contains(symbol.range, *decorator)
+        || decorator.end > symbol.item_range.start
+    {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    let valid = match imported {
+        Some(imported) => {
+            contains(*import_statement, *imported)
+                && slice(*imported)? == "overload"
+                && statement.starts_with("from ")
+                && decorator_text == binding_text
+        }
+        None => {
+            statement.starts_with("import ")
+                && decorator_text.strip_suffix(".overload") == Some(binding_text)
+        }
+    };
+    if !valid {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    Ok(())
+}
+
+fn validate_module_path(
+    source: &str,
+    language: &Language,
+    symbol: &SyntaxSymbol,
+) -> Result<(), RiftError> {
+    let Some(state) = &symbol.module_path else {
+        return Ok(());
+    };
+    if language != &ShippedLanguage::Rust.language()
+        || symbol.kind != "module"
+        || symbol.node_kind.is_some_and(|kind| kind != "mod_item")
+    {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    if let crate::RustModulePath::Literal {
+        path,
+        range: literal,
+    } = state
+    {
+        range(source, *literal)?;
+        let start = usize::try_from(literal.start)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        let end = usize::try_from(literal.end)
+            .map_err(|_| errors::syntax::facts_range_invalid().error())?;
+        if path.as_str().is_empty()
+            || literal.start == literal.end
+            || literal.end > symbol.item_range.start
+            || source.get(start..end) != Some(path.as_str())
+        {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+    }
+    Ok(())
+}
+
 fn validate_symbol_parents(
-    symbols: &[SyntaxSymbol],
+    symbols: &[&SyntaxSymbol],
     limits: SyntaxLimits,
     positions: &BTreeMap<&str, usize>,
 ) -> Result<(), RiftError> {
@@ -418,12 +570,15 @@ fn validate_symbol_parents(
         let depth = match symbol.container.as_deref() {
             None => 1,
             Some(container) => {
-                if !rift_core::is_portable_name(container) {
-                    return Err(errors::syntax::facts_name_invalid().error());
-                }
+                retained_name(container, limits)?;
                 // Duplicate suffixing changes qualified names but retains authored containers.
                 match positions.get(container).copied() {
-                    None => 1,
+                    None => {
+                        if container.chars().any(char::is_control) {
+                            return errors::syntax::facts_name_invalid().fail();
+                        }
+                        1
+                    }
                     Some(parent) => {
                         if parent >= position || !contains(symbols[parent].range, symbol.range) {
                             return Err(errors::syntax::facts_reference_invalid().error());
@@ -602,6 +757,9 @@ impl SyntaxFacts {
         parts: SyntaxFactsParts,
     ) -> Result<Self, RiftError> {
         validate_symbols(source, limits, &parts)?;
+        validate_export_bindings(source, limits, &parts)?;
+        validate_macro_invocations(source, limits, &parts)?;
+        validate_scope(source, limits, &parts)?;
         if let Some(markdown) = &parts.markdown_facts {
             if parts.language != ShippedLanguage::Markdown.language() {
                 return Err(errors::syntax::facts_structure_invalid().error());
@@ -625,7 +783,222 @@ fn embedded_symbol_kind(name: &str) -> Option<&'static str> {
         .or_else(|| crate::css::restored_symbol_kind(name))
 }
 
+fn validate_export_bindings(
+    source: &str,
+    limits: SyntaxLimits,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    let Some(bindings) = &parts.export_bindings else {
+        return Ok(());
+    };
+    if ![
+        ShippedLanguage::JavaScript.language(),
+        ShippedLanguage::TypeScript.language(),
+        ShippedLanguage::TypeScriptTsx.language(),
+    ]
+    .contains(&parts.language)
+    {
+        return Err(errors::syntax::facts_structure_invalid().error());
+    }
+    count(bindings.len(), limits)?;
+    ordered(bindings.iter().map(|binding| binding.range))?;
+    let containers = parts
+        .symbols
+        .iter()
+        .chain(&parts.left_out_symbols)
+        .map(|symbol| (symbol.qualified_name.as_str(), symbol.range))
+        .collect::<BTreeMap<_, _>>();
+    let mut previous = None;
+    for binding in bindings {
+        range(source, binding.range)?;
+        if binding.range.start == binding.range.end || previous == Some(binding) {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+        previous = Some(binding);
+        for token in binding
+            .local
+            .into_iter()
+            .chain(binding.exported)
+            .chain(binding.source)
+        {
+            range(source, token)?;
+            if token.start == token.end || !contains(binding.range, token) {
+                return Err(errors::syntax::facts_range_invalid().error());
+            }
+        }
+        if let Some(container) = &binding.container {
+            retained_name(container, limits)?;
+            if !containers
+                .get(container.as_str())
+                .is_some_and(|range| contains(*range, binding.range))
+            {
+                return errors::syntax::facts_reference_invalid().fail();
+            }
+        }
+        let form_valid = match binding.kind {
+            crate::SyntaxExportKind::Named => binding.local.is_some() && binding.exported.is_some(),
+            crate::SyntaxExportKind::All => {
+                binding.source.is_some() && binding.local.is_none() && binding.exported.is_none()
+            }
+            crate::SyntaxExportKind::Namespace => {
+                binding.source.is_some() && binding.exported.is_some() && binding.local.is_none()
+            }
+            crate::SyntaxExportKind::Default => binding.source.is_none(),
+        };
+        if !form_valid {
+            return Err(errors::syntax::facts_structure_invalid().error());
+        }
+    }
+    Ok(())
+}
+
 fn grammar_node_kind(grammar: &'static tree_sitter::Language, name: &str) -> Option<&'static str> {
     let id = grammar.id_for_node_kind(name, true);
     grammar.node_kind_for_id(id).filter(|kind| *kind == name)
+}
+
+fn validate_macro_invocations(
+    source: &str,
+    limits: SyntaxLimits,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    let Some(invocations) = &parts.macro_invocations else {
+        return Ok(());
+    };
+    if parts.language != ShippedLanguage::Rust.language() {
+        return errors::syntax::facts_structure_invalid().fail();
+    }
+    let retained_count = invocations
+        .iter()
+        .try_fold(invocations.len(), |total, (_, modules, direct)| {
+            total
+                .checked_add(modules.len())?
+                .checked_add(direct.as_ref().map_or(0, Vec::len))
+        })
+        .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
+    count(retained_count, limits)?;
+    ordered(invocations.iter().map(|(range, _, _)| *range))?;
+    let mut previous_end = 0;
+    for (invocation, modules, direct) in invocations {
+        count(modules.len(), limits)?;
+        ordered(modules.iter().copied())?;
+        range(source, *invocation)?;
+        if invocation.start == invocation.end || invocation.start < previous_end {
+            return errors::syntax::facts_range_invalid().fail();
+        }
+        let mut context = crate::document::rust_macros::Context::new(source, *invocation)
+            .ok_or_else(|| errors::syntax::facts_range_invalid().error())?;
+        let mut module_end = invocation.start;
+        for module in modules {
+            range(source, *module)?;
+            if module.start < module_end
+                || module.end > invocation.end
+                || module.start == module.end
+                || !context.direct(*module)
+            {
+                return errors::syntax::facts_range_invalid().fail();
+            }
+            module_end = module.end;
+        }
+        if let Some(direct) = direct {
+            count(direct.len(), limits)?;
+            ordered(direct.iter().copied())?;
+            if !crate::document::rust_macros::direct_children_valid(
+                source,
+                *invocation,
+                direct,
+                limits.syntax_depth_max(),
+            ) {
+                return errors::syntax::facts_range_invalid().fail();
+            }
+        }
+        previous_end = invocation.end;
+    }
+    Ok(())
+}
+
+fn validate_scope(
+    source: &str,
+    limits: SyntaxLimits,
+    parts: &SyntaxFactsParts,
+) -> Result<(), RiftError> {
+    let Some(scopes) = &parts.scope else {
+        return Ok(());
+    };
+    if parts.language != ShippedLanguage::Rust.language() {
+        return errors::syntax::facts_structure_invalid().fail();
+    }
+    let end =
+        u64::try_from(source.len()).map_err(|_| errors::syntax::facts_range_invalid().error())?;
+    if scopes.first().map(|(range, _)| *range) != Some(ByteRange { start: 0, end }) {
+        return errors::syntax::facts_range_invalid().fail();
+    }
+    let scope_count = scopes
+        .iter()
+        .try_fold(scopes.len(), |total, (_, children)| {
+            total.checked_add(children.as_ref().map_or(0, Vec::len))
+        })
+        .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
+    let retained_count = parts
+        .macro_invocations
+        .as_ref()
+        .map_or(Some(scope_count), |rows| {
+            rows.iter().try_fold(
+                scope_count.checked_add(rows.len())?,
+                |total, (_, modules, children)| {
+                    total
+                        .checked_add(modules.len())?
+                        .checked_add(children.as_ref().map_or(0, Vec::len))
+                },
+            )
+        })
+        .ok_or_else(|| errors::syntax::facts_count_exceeded().error())?;
+    count(retained_count, limits)?;
+    ordered(scopes.iter().map(|(range, _)| *range))?;
+    let mut enclosing = Vec::<ByteRange>::new();
+    for (index, (scope, children)) in scopes.iter().enumerate() {
+        range(source, *scope)?;
+        while enclosing
+            .last()
+            .is_some_and(|parent| parent.end <= scope.start)
+        {
+            enclosing.pop();
+        }
+        if index > 0
+            && (enclosing
+                .last()
+                .is_none_or(|parent| scope.start <= parent.start || scope.end > parent.end)
+                || !parts
+                    .symbols
+                    .iter()
+                    .chain(&parts.left_out_symbols)
+                    .any(|symbol| {
+                        symbol.kind == "module"
+                            && symbol.node_kind == Some("mod_item")
+                            && symbol.body_range == Some(*scope)
+                    }))
+        {
+            return errors::syntax::facts_range_invalid().fail();
+        }
+        if let Some(children) = children {
+            if parts.has_errors {
+                return errors::syntax::facts_structure_invalid().fail();
+            }
+            ordered(children.iter().copied())?;
+            if !crate::document::rust_macros::scope_children_valid(
+                source,
+                *scope,
+                children,
+                index == 0,
+                limits.syntax_depth_max(),
+            ) {
+                return errors::syntax::facts_range_invalid().fail();
+            }
+        }
+        enclosing.push(*scope);
+        if enclosing.len() > limits.syntax_depth_max() {
+            return errors::syntax::facts_count_exceeded().fail();
+        }
+    }
+    Ok(())
 }

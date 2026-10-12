@@ -172,3 +172,121 @@ fn version_entry(
     lines.line(ENTRY_INDENT, facts.as_str())?;
     lines.line(DETAIL_INDENT, summary.as_deref().unwrap_or_default())
 }
+
+pub(super) fn canonical(
+    out: &mut crate::output::text::TextWriter,
+    result: &rift_protocol::symbol_read::GetSymbolResult,
+) -> Result<(), TextError> {
+    use rift_protocol::symbol_read::GetSymbolResult;
+    let (view, warnings) = match result {
+        GetSymbolResult::Found {
+            symbol,
+            view,
+            declarations,
+            declaration_cursor,
+            history,
+            documentation,
+            warnings,
+        } => {
+            let mut lines = Lines::new(out, 0, 1);
+            let described = describe(symbol)?;
+            lines.head(&described.declaration)?;
+            if let Some(id) = described.id {
+                lines.line(0, id.as_str())?;
+            }
+            lines.line(0, described.facts.as_str())?;
+            for block in described.documentation {
+                text_section(&mut lines, &block.text)?;
+            }
+            if let Some(context) = documentation {
+                context_section(&mut lines, context)?;
+            }
+            if let Some(history) = history {
+                history_section(
+                    &mut lines,
+                    history,
+                    declarations
+                        .first()
+                        .and_then(|declaration| declaration.path.as_ref()),
+                )?;
+            }
+            declarations_section(&mut lines, declarations)?;
+            if let Some(cursor) = declaration_cursor {
+                lines.line(0, &format!("declaration_cursor {cursor}"))?;
+            }
+            (Some(view), warnings)
+        }
+        GetSymbolResult::Missing {
+            symbol_not_found,
+            view,
+            warnings,
+        } => {
+            let mut lines = Lines::new(out, 0, 1);
+            lines.head("symbol_not_found")?;
+            lines.line(0, symbol_not_found.id.as_str())?;
+            for alternative in &symbol_not_found.alternatives {
+                lines.line(
+                    0,
+                    &format!("{} · {}", alternative.id.as_str(), alternative.name),
+                )?;
+                lines.line(1, &format!("{:?}", alternative.match_context))?;
+            }
+            if let Some(detail) = &symbol_not_found.detail {
+                lines.verbatim(0, detail)?;
+            }
+            (Some(view), warnings)
+        }
+        GetSymbolResult::Unavailable {
+            id,
+            view,
+            reason,
+            warnings,
+        } => {
+            let mut lines = Lines::new(out, 0, 1);
+            lines.head(&format!("unavailable · {reason:?}"))?;
+            lines.line(0, id.as_str())?;
+            (view.as_ref(), warnings)
+        }
+    };
+    if let Some(view) = view {
+        out.raw_line(
+            0,
+            &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+        )?;
+    }
+    warning::section(out, warnings)
+}
+
+fn declarations_section(
+    lines: &mut Lines<'_>,
+    declarations: &[rift_protocol::symbol_read::SymbolDeclaration],
+) -> Result<(), TextError> {
+    if !declarations.is_empty() {
+        lines.blank()?;
+        lines.line(0, "declarations:")?;
+    }
+    for declaration in declarations {
+        lines.line(
+            1,
+            &location(
+                declaration.path.as_ref(),
+                declaration.unit.as_ref(),
+                Some(declaration.line),
+            ),
+        )?;
+        lines.line(
+            1,
+            &format!("{}..{}", declaration.range.start, declaration.range.end),
+        )?;
+        if let Some(node) = &declaration.node {
+            lines.line(1, &node.0)?;
+        }
+        if let Some(source) = &declaration.source {
+            if !declaration.source_complete {
+                lines.line(1, "source (incomplete):")?;
+            }
+            lines.verbatim(1, source)?;
+        }
+    }
+    Ok(())
+}

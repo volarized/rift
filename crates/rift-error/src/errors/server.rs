@@ -128,3 +128,47 @@ __rift_error_definition!(
         capability: required(string),
     },
 );
+
+__rift_error_definition!(
+    search_coverage_unavailable,
+    slug = "rift.server.search_coverage_unavailable",
+    message = "accepted facts do not cover {operation} in the captured selection",
+    action = "supply a publication covering the requested selection, then retry",
+    fields = {
+        operation: required(string),
+        view: optional(string),
+    },
+);
+
+__rift_error_definition!(
+    search_exact_release_unavailable,
+    slug = "rift.server.search_exact_release_unavailable",
+    message = "exact release {release} has no accepted publication",
+    action = "supply an accepted publication for the exact release, then retry",
+    fields = {
+        operation: required(string),
+        release: required(string),
+    },
+);
+
+__rift_error_definition!(
+    search_view_context,
+    slug = "rift.server.search_view_context",
+    message = "captured view {view} belongs to another workspace or scope mapping",
+    action = "use the matching workspace, scope mapping, and captured view",
+    fields = {
+        operation: required(string),
+        view: required(string),
+    },
+);
+
+__rift_error_definition!(
+    search_view_expired,
+    slug = "rift.server.search_view_expired",
+    message = "captured view {view} expired or was removed",
+    action = "capture a new view and resend the request with its key",
+    fields = {
+        operation: required(string),
+        view: required(string),
+    },
+);

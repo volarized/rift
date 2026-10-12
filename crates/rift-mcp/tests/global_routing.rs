@@ -2,6 +2,14 @@
 //! come from the served snapshot, the package hits from a fixture global API, and every
 //! context entry no public registry serves answers with its typed warning.
 
+#[allow(
+    dead_code,
+    reason = "shared integration fixture exposes helpers this suite does not use"
+)]
+mod fake_engine;
+
+#[path = "announced_work/mod.rs"]
+mod announced_work;
 mod global_api;
 mod hermetic_search;
 #[allow(
@@ -70,23 +78,22 @@ async fn call_tool(
         .ok_or_else(|| format!("{name} must return structured content").into())
 }
 
-async fn get_symbol(
+async fn search_symbols(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     args: Value,
 ) -> TestResult<Value> {
-    call_tool(client, "get_symbol", args).await
+    call_tool(client, "search", args).await
 }
 
 /// The configured package list naming the collected `demo` release. The fixture tables
 /// already open `[dependencies]`, so the list lands as an array of tables below it.
-const DEMO_PACKAGE: &str =
-    "[[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n";
+const DEMO_PACKAGE: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"1.0.0\"\n";
 
 /// The configured package list naming `demo`, an exact `absent` the fixture collection
 /// lacks, and a `wanted` requirement it cannot resolve.
-const THREE_PACKAGES: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
-     [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"absent\"\nversion = \"1.0.0\"\n\n\
-     [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"wanted\"\nrequirement = \"^1\"\n";
+const THREE_PACKAGES: &str = "[[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"1.0.0\"\n\n\
+     [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"absent\"\nversion = \"1.0.0\"\n\n\
+     [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"wanted\"\nrequirement = \"^1\"\n";
 
 /// The `[global]` connect bound under which a refused loopback port still answers as
 /// refused.
@@ -123,7 +130,11 @@ async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> Test
         Some(configuration),
     )
     .await?;
-    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"global"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
+    )
+    .await?;
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("warnings are an array")?;
@@ -139,7 +150,7 @@ async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> Test
     let rendered = serde_json::to_string(warning)?;
     assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     assert!(!rendered.contains("local_beacon"));
-    assert_eq!(answer["hits"], json!([]));
+    assert_eq!(answer["results"], json!([]));
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -176,7 +187,11 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     )
     .await?;
     let started = tokio::time::Instant::now();
-    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"global"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
+    )
+    .await?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < RESOLUTION_DELAY,
@@ -199,8 +214,7 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
 /// deadline, however slow the machine running the test.
 const READ_DELAY: Duration = Duration::from_secs(10);
 
-/// A package read the request deadline cuts short discards the remote lane: `get_symbol`
-/// and `search` each answer the project hits alone, with the timeout warning, well before
+/// A package read the request deadline cuts short discards the remote lane: symbol and full-text `search` each answer the project hits alone, with the timeout warning, well before
 /// the held page would have arrived.
 #[tokio::test]
 async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
@@ -216,9 +230,9 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let (directory, client, server_task) = workspace.served;
     let reads = [
         (
-            "get_symbol",
-            "hits",
-            json!({"name": "beacon", "scope": "all"}),
+            "search",
+            "results",
+            json!({"query": "beacon", "target": "symbol", "scope": "all"}),
         ),
         (
             "search",
@@ -261,35 +275,82 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
 const CALLEE_HOLD: Duration = Duration::from_secs(60);
 
 /// The `[server] readiness_timeout` an outgoing walk against a held global answer runs
-/// under: the embedded engine's walk fits in the nine tenths of it the walk may spend,
+/// under: the scripted engine's walk fits in the nine tenths of it the walk may spend,
 /// and the held answer outlasts all of it.
 const CALLEE_WALK_BUDGET: &str = "5s";
 
 /// A module whose `counted` calls the standard library's `len`, the callee an outgoing
 /// walk asks the global API to name.
-const CALLEE_FILES: &[(&str, &str)] = &[("app.py", "def counted() -> int:\n    return len([1])\n")];
+const CALLEE_FILES: &[(&str, &str)] = &[
+    (
+        "pyproject.toml",
+        "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['app']\n",
+    ),
+    ("app.py", "def counted() -> int:\n    return len([1])\n"),
+];
 
-/// An outgoing walk from `counted` against a fixture holding `hold` past the request
+/// An outgoing walk from `caller` against a fixture holding `hold` past the request
 /// deadline: the walk answers well before the held answer would have arrived, the
 /// standard library callee drops, and the answer carries the timeout warning.
 async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         hold: Some(hold),
-        python_collection: true,
         ..FixtureOptions::default()
     })
     .await?;
     let configuration = format!(
         "[server]\nreadiness_timeout = \"{CALLEE_WALK_BUDGET}\"\n\n\
          [global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
-         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n\n\
-         [languages.python.lsp]\nembedded = \"ty\"\n",
+         request_timeout = \"30s\"\nconnect_timeout = \"100ms\"\n",
         fixture.endpoint
     );
+    let runtime = matches!(hold, Hold::Declarations(_));
+    let (callee_uri, callee_line) = if runtime {
+        runtime_callee_position()?
+    } else {
+        ("${uri%/lib.rs}/node_modules/demo/index.js".to_owned(), 0)
+    };
+    let source_uri =
+        "\\\"uri\\\":\\\"$uri\\\",\\\"range\\\":{\\\"start\\\":{\\\"line\\\":CALLEE_LINE";
+    let scripted_uri = format!(
+        "\\\"uri\\\":\\\"{callee_uri}\\\",\\\"range\\\":{{\\\"start\\\":{{\\\"line\\\":CALLEE_LINE"
+    );
+    let script = fake_engine::SCRIPTED_CALLS_ENGINE
+        .replace(source_uri, &scripted_uri)
+        .replace("PROGRESS", announced_work::ANNOUNCED_WORK)
+        .replace("CALLEE_LINE", &callee_line.to_string())
+        .replace("CALLER_LINE", "3");
+    let (_engine, engine_configuration) = fake_engine::rust_engine(&script)?;
+    let configuration = format!("{configuration}\n{engine_configuration}");
+    let mut files = vec![
+        (
+            "Cargo.toml",
+            "[package]\nname = \"walk\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+        ),
+        ("rust-toolchain.toml", "[toolchain]\nchannel = \"1.98\"\n"),
+        (
+            "lib.rs",
+            "pub fn beacon() {}\n\npub fn caller() {\n    std::cmp::max(1, 2);\n}\n",
+        ),
+    ];
+    if !runtime {
+        files.extend([
+            ("package.json", r#"{"name":"walk","dependencies":{"demo":"1.0.0"}}"#),
+            (".npmrc", "registry=https://registry.npmjs.org/\n"),
+            ("package-lock.json", r#"{"packages":{"node_modules/demo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}}}"#),
+            ("node_modules/demo/package.json", r#"{"name":"demo","version":"1.0.0"}"#),
+            ("node_modules/demo/index.js", "function beacon() {}\n"),
+        ]);
+    }
     let (_directory, client, server_task) =
-        served_workspace(CALLEE_FILES, Some(configuration)).await?;
+        workspace_client::served_prepared_workspace(&files, Some(configuration), |root| {
+            if runtime {
+                enable_runtime_resolution(root);
+            }
+        })
+        .await?;
     let walk = json!({
-        "traversal": { "seed": "rift://symbol/python/app.py/counted", "direction": "outgoing" }
+        "traversal": { "seed": "rift://symbol/local/rust/walk/caller", "direction": "outgoing" }
     });
     let started = tokio::time::Instant::now();
     let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
@@ -306,9 +367,59 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         json!({"code": "global_api_unavailable", "failure_class": "timeout"}),
         "{answer:#}"
     );
+    let held_route = if runtime {
+        "/declarations"
+    } else {
+        "/resolutions"
+    };
+    let requests = fixture.requests().await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.uri.ends_with(held_route)),
+        "the deadline ends an actual held {held_route} request: answer={answer:#}; requests={requests:#?}"
+    );
+    rift_tracing::info!(stage = "client.cancel", "stop stage started");
     client.cancel().await?;
+    rift_tracing::info!(stage = "client.cancel", "stop stage ended");
+    rift_tracing::info!(stage = "server_task", "stop stage started");
     server_task.await?;
+    rift_tracing::info!(stage = "server_task", "stop stage ended");
+    rift_tracing::info!(stage = "return", "stop stage ended");
     Ok(())
+}
+
+fn enable_runtime_resolution(root: &std::path::Path) {
+    let path = root.join("rift.toml");
+    let text = fs::read_to_string(&path).expect("the fixture configuration reads");
+    fs::write(
+        path,
+        text.replace("resolution = \"static\"", "resolution = \"auto\""),
+    )
+    .expect("the fixture enables the existing runtime resolver");
+}
+
+fn runtime_callee_position() -> Result<(String, usize), Box<dyn std::error::Error>> {
+    let sysroot = std::process::Command::new("rustup")
+        .args(["run", "1.98", "rustc", "--print", "sysroot"])
+        .output()?;
+    assert!(
+        sysroot.status.success(),
+        "the installed runtime names its sysroot"
+    );
+    let source = std::path::PathBuf::from(String::from_utf8(sysroot.stdout)?.trim())
+        .join("lib/rustlib/src/rust/library/core/src/cmp.rs");
+    let text = fs::read_to_string(&source)?;
+    let line = text
+        .lines()
+        .position(|line| line.starts_with("pub ") && line.contains("fn max<"))
+        .ok_or("the installed runtime source declares max")?;
+    Ok((
+        reqwest::Url::from_file_path(&source)
+            .map_err(|()| "the installed runtime source has an absolute path")?
+            .to_string(),
+        line,
+    ))
 }
 
 /// A resolution held past the request deadline names no callee.
@@ -321,6 +432,44 @@ async fn request_deadline_bounds_the_resolution_an_outgoing_walk_waits_for() -> 
 #[tokio::test]
 async fn request_deadline_bounds_the_declarations_an_outgoing_walk_waits_for() -> TestResult {
     outgoing_walk_past_a_held_global_answer(Hold::Declarations(CALLEE_HOLD)).await
+}
+
+/// A Python version pin does not establish an installed runtime owner for bundled stubs.
+#[tokio::test]
+async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
+    let fixture =
+        GlobalFixture::start_holding(SymbolFixture::Valid, Some(Hold::Declarations(CALLEE_HOLD)))
+            .await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n\
+         [languages.python.lsp]\nembedded = \"ty\"\n",
+        fixture.endpoint
+    );
+    let mut files = CALLEE_FILES.to_vec();
+    files.push((".python-version", "3.12.3\n"));
+    let (_directory, client, server_task) = served_workspace(&files, Some(configuration)).await?;
+    let walk = json!({
+        "traversal": {"seed": "rift://symbol/local/python/app/counted", "direction": "outgoing"}
+    });
+    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    assert_eq!(
+        answer["warnings"][0]["code"], "callees_dropped",
+        "{answer:#}"
+    );
+    assert_eq!(answer["warnings"][0]["callees"], 1, "{answer:#}");
+    assert!(
+        answer["warnings"]
+            .as_array()
+            .is_some_and(|warnings| warnings.len() == 1),
+        "an unproved runtime owner does not become a global service failure: {answer:#}"
+    );
+    assert!(
+        fixture.requests().await.is_empty(),
+        "unversioned positions are unasked"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
 }
 
 /// A path dependency outside the workspace reaches no index: the package hits come from
@@ -337,8 +486,12 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"all"})).await?;
-    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"\"helper_beacon\"","scope":"all"}),
+    )
+    .await?;
+    let hits = answer["results"].as_array().ok_or("hits are an array")?;
     assert_eq!(
         hits.iter()
             .map(|hit| hit["unit"].clone())
@@ -350,6 +503,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|warning| warning["code"] != "lexical_ranking_unavailable")
         .partition(|warning| warning["code"] != "global_page_warning");
     let codes: Vec<&str> = warnings
         .iter()
@@ -370,7 +524,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
             .iter()
             .map(|warning| &warning["warning_code"])
             .collect::<Vec<_>>(),
-        [&json!("source_truncated")]
+        [&json!("query_narrowed")]
     );
     assert_eq!(
         *warnings[0],
@@ -389,7 +543,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     );
     assert_eq!(
         warnings[1]["package"],
-        json!({"manager":"cargo","name":"absent","version":"1.0.0"})
+        json!({"manager":"cargo", "registry": "crates.io","name":"absent","version":"1.0.0"})
     );
     let requirements: Vec<&Value> = warnings[2..4]
         .iter()
@@ -399,7 +553,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         requirements,
         [
             &json!({
-                "manager":"cargo",
+                "manager":"cargo", "registry": "crates.io",
                 "name":"wanted",
                 "requirement":"^1",
                 "availability":"canonical"
@@ -426,12 +580,12 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
     let cases = [
         (
             "version = \"1.0.3\"".to_owned(),
-            json!({"manager":"cargo","name":"demo","version":"1.0.3","availability":"canonical"}),
+            json!({"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.3","availability":"canonical"}),
         ),
         (
             format!("requirement = \"{UNSATISFIED_REQUIREMENT}\""),
             json!({
-                "manager":"cargo",
+                "manager":"cargo", "registry": "crates.io",
                 "name":"demo",
                 "requirement":UNSATISFIED_REQUIREMENT,
                 "availability":"canonical"
@@ -443,7 +597,7 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
         let configuration = format!(
             "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
              request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-             [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\n{selector}\n",
+             [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\n{selector}\n",
             fixture.endpoint
         );
         let (directory, client, server_task) = served_workspace(
@@ -461,9 +615,13 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             Some(configuration),
         )
         .await?;
-        let answer = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+        let answer = search_symbols(
+            &client,
+            json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
+        )
+        .await?;
         assert_eq!(
-            answer["hits"]
+            answer["results"]
                 .as_array()
                 .into_iter()
                 .flatten()
@@ -483,7 +641,7 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             [&json!({
                 "code": "package_substituted",
                 "entry": entry,
-                "package": {"manager":"cargo","name":"demo","version":"1.0.0"}
+                "package": {"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0"}
             })],
             "{answer:#}"
         );
@@ -562,7 +720,7 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
         let body = request.body.as_ref().ok_or("search body is recorded")?;
         assert_eq!(
             body["packages"],
-            json!([{"manager":"cargo","name":"demo","version":"1.0.0"}])
+            json!([{"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0"}])
         );
         let rendered = body.to_string();
         assert!(!rendered.contains("src/lib.rs"));
@@ -600,7 +758,7 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
         assert_eq!(results.len(), limit, "{answer:#}");
         for (hit, name) in results.iter().zip(["helper_beacon", "beacon"]) {
             assert_eq!(hit["hit"]["symbol"]["name"], name, "{answer:#}");
-            let identity = rift_core::symbol_identity("rust", "cargo/demo@1.0.0/src/lib.rs", name);
+            let identity = global_api::collected_identity(SymbolFixture::Valid, name);
             assert_eq!(hit["hit"]["symbol"]["id"], identity, "{answer:#}");
             assert_eq!(hit["source"], format!("pub fn {name}() {{}}"), "{answer:#}");
             assert!(hit["score"].is_number(), "{answer:#}");
@@ -758,13 +916,13 @@ fn helper_beacon_pattern_hits() -> Value {
             "hit": {
                 "target": "symbol",
                 "symbol": {
-                    "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                    "id": global_api::collected_identity(SymbolFixture::Valid, "helper_beacon"),
                     "language": "rust",
                     "name": "helper_beacon",
                     "kind": "function",
                     "origin": {
                         "location": "dependency",
-                        "package": {"manager": "cargo", "name": "demo", "version": "1.0.0"},
+                        "package": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"},
                         "source_kind": "authored"
                     }
                 }
@@ -868,12 +1026,12 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
         [
             &json!({
                 "pattern": r"fn helper_\w+",
-                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+                "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
                 "include": ["source"]
             }),
             &json!({
                 "pattern": r"fn \w*beacon",
-                "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+                "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
             }),
         ]
     );
@@ -940,7 +1098,7 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
         Some(configuration),
     )
     .await?;
-    let _ = get_symbol(&client, json!({"name":"local_beacon"})).await?;
+    let _ = search_symbols(&client, json!({"target":"symbol", "query":"local_beacon"})).await?;
     let _ = call_tool(
         &client,
         "search",
@@ -958,7 +1116,7 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
 }
 
 /// A remote page that fails validation discards the remote lane: `beacon` is declared in
-/// the project and in the collected package, and the `get_symbol` and `search` answers
+/// the project and in the collected package, and symbol and full-text `search` answers
 /// carry the project hits alone, with the typed warning naming the failure and no package
 /// counts.
 #[tokio::test]
@@ -971,7 +1129,11 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"beacon","scope":"all"}),
+    )
+    .await?;
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
@@ -982,8 +1144,11 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
         warning,
         &json!({"code": "global_response_invalid", "failure_class": "invalid_response"})
     );
-    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
-    let names: Vec<&Value> = hits.iter().map(|hit| &hit["symbol"]["name"]).collect();
+    let hits = answer["results"].as_array().ok_or("hits are an array")?;
+    let names: Vec<&Value> = hits
+        .iter()
+        .map(|hit| &hit["hit"]["symbol"]["name"])
+        .collect();
     assert_eq!(
         names,
         [&json!("beacon"), &json!("local_beacon")],
@@ -1051,7 +1216,11 @@ async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult 
             .collect()
     };
 
-    let first = get_symbol(&client, json!({"name":"beacon","scope":"all"})).await?;
+    let first = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"beacon","scope":"all"}),
+    )
+    .await?;
     assert_eq!(
         global_warnings(&first),
         std::slice::from_ref(&expected),
@@ -1107,7 +1276,11 @@ async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> T
         Some(configuration),
     )
     .await?;
-    let answer = get_symbol(&client, json!({"name": "local_beacon", "scope": "all"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query": "local_beacon", "scope": "all"}),
+    )
+    .await?;
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
@@ -1118,10 +1291,10 @@ async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> T
         warning,
         &json!({"code": "global_api_unavailable", "failure_class": "non_success_response"})
     );
-    let hits = answer["hits"].as_array().ok_or("hits are an array")?;
+    let hits = answer["results"].as_array().ok_or("hits are an array")?;
     let located: Vec<(&Value, &Value)> = hits
         .iter()
-        .map(|hit| (&hit["symbol"]["name"], &hit["path"]))
+        .map(|hit| (&hit["hit"]["symbol"]["name"], &hit["path"]))
         .collect();
     assert_eq!(
         located,
@@ -1194,6 +1367,8 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
                     [[package]]\nname = \"outside\"\nversion = \"0.2.0\"\n\n\
                     [[package]]\nname = \"private\"\nversion = \"0.6.1\"\n\
                     source = \"registry+https://registry.example.test/index\"\n\n\
+                    [[package]]\nname = \"private\"\nversion = \"0.6.1\"\n\
+                    source = \"registry+https://registry.foreign.test/index\"\n\n\
                     [[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
                     [[package]]\nname = \"sourced\"\nversion = \"0.3.0\"\n\
                     source = \"git+https://example.test/sourced#0123456789abcdef\"\n";
@@ -1216,15 +1391,38 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     )
     .await?;
 
-    let answer = get_symbol(&client, json!({"name":"local_beacon","scope":"all"})).await?;
+    let answer = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"local_beacon","scope":"all"}),
+    )
+    .await?;
 
-    assert_eq!(answer["hits"][0]["symbol"]["name"], "local_beacon");
+    assert_eq!(
+        answer["results"][0]["hit"]["symbol"]["name"],
+        "local_beacon"
+    );
+    assert_unserved_dependency_warnings(&answer)?;
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn assert_unserved_dependency_warnings(answer: &Value) -> TestResult {
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("warnings are an array")?;
-    assert_eq!(warnings[0], json!({"code": "global_access_disabled"}));
-    let unavailable: Vec<(String, String, String)> = warnings[1..]
+    let disabled: Vec<&Value> = warnings
         .iter()
+        .filter(|warning| warning["code"] == "global_access_disabled")
+        .collect();
+    assert_eq!(disabled, [&json!({"code": "global_access_disabled"})]);
+    let unavailable: Vec<(String, String, String)> = warnings
+        .iter()
+        .filter(|warning| {
+            warning["code"] != "global_access_disabled"
+                && warning["code"] != "lexical_ranking_unavailable"
+        })
         .map(|warning| {
             (
                 warning["entry"]["name"]
@@ -1256,6 +1454,17 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
         ),
         (
             "private",
+            "registry_unresolved",
+            "Package registry endpoint is unresolved.".to_owned(),
+        ),
+        (
+            "private",
+            "private_registry",
+            "Currently rift doesn't support indexing dependencies from private registries."
+                .to_owned(),
+        ),
+        (
+            "private",
             "private_registry",
             "Currently rift doesn't support indexing dependencies from private registries."
                 .to_owned(),
@@ -1276,14 +1485,46 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     ]
     .map(|(name, availability, reason)| (name.to_owned(), availability.to_owned(), reason));
     assert_eq!(unavailable, expected, "{answer:#}");
+    assert_distinct_registry_observations(warnings, answer);
     assert!(
         !answer.to_string().contains("\"inner\""),
         "a path dependency inside the workspace is project source: {answer:#}"
     );
-    drop(directory);
-    client.cancel().await?;
-    server_task.await?;
     Ok(())
+}
+
+fn assert_distinct_registry_observations(warnings: &[Value], answer: &Value) {
+    let private: Vec<&Value> = warnings
+        .iter()
+        .filter(|warning| warning["entry"]["name"] == "private")
+        .map(|warning| &warning["entry"])
+        .collect();
+    assert_eq!(
+        private,
+        [
+            &json!({
+                "manager": "cargo",
+                "name": "private",
+                "requirement": "0.6",
+                "availability": "registry_unresolved"
+            }),
+            &json!({
+                "manager": "cargo",
+                "registry": "registry.example.test/index",
+                "name": "private",
+                "version": "0.6.1",
+                "availability": "private_registry"
+            }),
+            &json!({
+                "manager": "cargo",
+                "registry": "registry.foreign.test/index",
+                "name": "private",
+                "version": "0.6.1",
+                "availability": "private_registry"
+            })
+        ],
+        "an unresolved registry alias cannot identify the locked registry owner: {answer:#}"
+    );
 }
 
 /// A served Rust workspace with no dependency of its own, under `configuration`.
@@ -1346,28 +1587,33 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-         [[dependencies.packages]]\nmanager = \"cargo\"\nname = \"demo\"\nversion = \"0.9.0\"\n",
+         [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"0.9.0\"\n",
         fixture.endpoint
     );
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let pinned = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    let pinned = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
+    )
+    .await?;
     assert_eq!(
         substituted_versions(&pinned),
         [&json!("0.9.0")],
         "{pinned:#}"
     );
 
-    let replaced = get_symbol(
+    let replaced = search_symbols(
         &client,
         json!({
-            "name": "helper_beacon",
+            "target": "symbol",
+            "query": "helper_beacon",
             "scope": "global",
-            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
     )
     .await?;
-    let units: Vec<&Value> = replaced["hits"]
+    let units: Vec<&Value> = replaced["results"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1383,11 +1629,15 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     assert_eq!(resolutions.len(), 2, "{resolutions:#?}");
     assert_eq!(
         demo_entries(&resolutions[0]),
-        [&json!({"manager":"cargo","name":"demo","version":"0.9.0","availability":"canonical"})]
+        [
+            &json!({"manager":"cargo", "registry": "crates.io","name":"demo","version":"0.9.0","availability":"canonical"})
+        ]
     );
     assert_eq!(
         demo_entries(&resolutions[1]),
-        [&json!({"manager":"cargo","name":"demo","version":"1.0.0","availability":"canonical"})],
+        [
+            &json!({"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0","availability":"canonical"})
+        ],
         "the read sends the requested version in place of the pinned one"
     );
     assert!(
@@ -1397,7 +1647,11 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         "the entries the request names nothing about stand: {resolutions:#?}"
     );
 
-    let again = get_symbol(&client, json!({"name":"helper_beacon","scope":"global"})).await?;
+    let again = search_symbols(
+        &client,
+        json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
+    )
+    .await?;
     assert_eq!(
         substituted_versions(&again),
         [&json!("0.9.0")],
@@ -1428,7 +1682,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
         json!({
             "query": "helper_beacon",
             "scope": "all",
-            "packages": [{"manager": "cargo", "name": "demo"}]
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo"}]
         }),
     )
     .await?;
@@ -1443,7 +1697,9 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
     assert_eq!(resolutions.len(), 1, "{resolutions:#?}");
     assert_eq!(
         demo_entries(&resolutions[0]),
-        [&json!({"manager":"cargo","name":"demo","requirement":">=0","availability":"canonical"})]
+        [
+            &json!({"manager":"cargo", "registry": "crates.io","name":"demo","requirement":">=0","availability":"canonical"})
+        ]
     );
     let searches: Vec<Value> = fixture
         .requests()
@@ -1456,7 +1712,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
     for body in searches {
         assert_eq!(
             body["packages"],
-            json!([{"manager":"cargo","name":"demo","version":"1.0.0"}]),
+            json!([{"manager":"cargo", "registry": "crates.io","name":"demo","version":"1.0.0"}]),
             "the search reads the release the requirement resolved to"
         );
     }
@@ -1479,6 +1735,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
+    let id = workspace_client::captured_seed(&client, "beacon", "src/lib.rs").await?;
     let refused = [
         (
             "search",
@@ -1502,7 +1759,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         ),
         (
             "get_symbol",
-            json!({"name": "beacon", "scope": "all", "limit": 0}),
+            json!({"id": id, "declaration_limit": 0}),
             "limit",
         ),
     ];
@@ -1571,7 +1828,7 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
     let request = json!({
         "query": "helper_beacon",
         "scope": "global",
-        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
     let answer = call_tool(&client, "search", request).await?;
     assert!(
@@ -1663,8 +1920,8 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
         "query": "helper_beacon",
         "scope": "global",
         "packages": [
-            {"manager": "cargo", "name": "zlib", "version": "1.3.1"},
-            {"manager": "cargo", "name": "demo", "version": "1.0.0"}
+            {"manager": "cargo", "registry": "crates.io", "name": "zlib", "version": "1.3.1"},
+            {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}
         ]
     });
     let answer = call_tool(&client, "search", request).await?;
@@ -1680,7 +1937,7 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
         sent[0],
         [json!({
             "availability": "canonical",
-            "manager": "cargo",
+            "manager": "cargo", "registry": "crates.io",
             "name": "demo",
             "version": "1.0.0"
         })],
@@ -1770,7 +2027,7 @@ async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() ->
     let request = json!({
         "query": "helper_beacon",
         "scope": "global",
-        "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+        "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
     let answer = call_tool(&client, "search", request).await?;
     assert!(
@@ -1862,12 +2119,6 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
             "results",
             "documentation_search",
         ),
-        (
-            "get_symbol",
-            json!({"name": "beacon", "scope": "all", "include": ["documentation"]}),
-            "hits",
-            "symbol_documentation",
-        ),
     ];
     for (tool, request, hits, feature) in reads {
         let answer = call_tool(&client, tool, request.clone()).await?;
@@ -1901,6 +2152,16 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
             "{request}: {answer:#}"
         );
     }
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let refused = failed_call(
+        client
+            .call_tool(tool_request(
+                "get_symbol",
+                &json!({"id": id, "include": ["documentation"]}),
+            ))
+            .await,
+    )?;
+    assert!(!refused.message.is_empty(), "{}", refused.text);
     let reads_asked: Vec<String> = fixture
         .requests()
         .await
@@ -1977,7 +2238,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
             "scope": "global",
             "target": "all",
             "include": ["source"],
-            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}]
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
         }),
     )
     .await?;
@@ -1996,7 +2257,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
         bodies,
         [json!({
             "pattern": r"fn helper_\w+",
-            "packages": [{"manager": "cargo", "name": "demo", "version": "1.0.0"}],
+            "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}],
             "include": ["source"]
         })]
     );
@@ -2055,7 +2316,17 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
     );
     let source = global_api::CASE_SOURCE;
     let (_directory, client, server_task) =
-        served_workspace(&[("src/lib.rs", source)], Some(configuration)).await?;
+        served_workspace(
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname='case_pairs'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+                ),
+                ("src/lib.rs", source),
+            ],
+            Some(configuration),
+        )
+        .await?;
     for scope in ["local", "global", "all"] {
         for name in [
             "SearchHit",
@@ -2143,14 +2414,13 @@ async fn assert_original_identifier(
         .as_str()
         .ok_or("symbol carries identity")?;
     assert!(id.ends_with(&format!("/{name}")), "{id}");
-    let args = json!({"name": name, "scope": scope, "limit": 1, "include": ["source"]});
-    let answer = get_symbol(client, args).await?;
+    let args = json!({"id": id, "include": ["source"]});
+    let answer = call_tool(client, "get_symbol", args).await?;
+    assert_eq!(answer["outcome"], "found", "{scope}: {answer:#}");
+    assert_eq!(answer["symbol"]["id"], id, "{scope}: {answer:#}");
+    assert_eq!(answer["symbol"]["name"], name, "{scope}: {answer:#}");
     assert_eq!(
-        answer["hits"][0]["symbol"]["name"], name,
-        "{scope}: {answer:#}"
-    );
-    assert_eq!(
-        answer["hits"][0]["source"], expected_source,
+        answer["declarations"][0]["source"], expected_source,
         "{scope}: {answer:#}"
     );
     Ok(())
@@ -2169,13 +2439,13 @@ async fn test_native_client_accepts_original_identifier_candidates() -> TestResu
     let page = client.search_packages(&request, 10, None).await?;
     assert_eq!(page.items.len(), 2);
     for name in ["SearchHit", "searchHit", "createProgram", "load_config"] {
-        request.query = name.to_owned();
-        request.terms = vec![QueryTerm {
+        request.query = Some(name.to_owned());
+        request.terms = Some(vec![QueryTerm {
             text: name.to_owned(),
             phrase: false,
             prefix: false,
-        }];
-        request.identifiers = vec![name.to_owned()];
+        }]);
+        request.identifiers = Some(vec![name.to_owned()]);
         let page = client.search_packages(&request, 1, None).await?;
         let hit = rift_cloud_client::PackageSearchCandidate::try_from(page.items[0].clone())?;
         let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit.hit else {
@@ -2195,29 +2465,36 @@ fn case_search_request(query: &str) -> TestResult<rift_cloud_client::PackageSear
     use rift_cloud_client::{PackageSearchRequest, PackageSearchRequestPhase, QueryTerm};
     let parsed = rift_ranking::ParsedQuery::parse(query)?;
     Ok(PackageSearchRequest {
-        query: query.to_owned(),
-        terms: parsed
-            .members()
-            .iter()
-            .map(|member| QueryTerm {
-                text: member.text().to_owned(),
-                phrase: member.is_phrase(),
-                prefix: false,
-            })
-            .collect(),
-        identifiers: parsed
-            .candidates()
-            .iter()
-            .map(|candidate| candidate.text().to_owned())
-            .collect(),
+        query: Some(query.to_owned()),
+        terms: Some(
+            parsed
+                .members()
+                .iter()
+                .map(|member| QueryTerm {
+                    text: member.text().to_owned(),
+                    phrase: member.is_phrase(),
+                    prefix: false,
+                })
+                .collect(),
+        ),
+        identifiers: Some(
+            parsed
+                .candidates()
+                .iter()
+                .map(|candidate| candidate.text().to_owned())
+                .collect(),
+        ),
         include: Some(vec!["source".to_owned()]),
-        packages: vec![rift_cloud_client::PackageIdentity {
+        packages: Some(vec![rift_cloud_client::PackageIdentity {
             manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
             name: "demo".to_owned(),
             version: "1.0.0".to_owned(),
-        }],
-        phase: PackageSearchRequestPhase::Precise,
+        }]),
+        phase: Some(PackageSearchRequestPhase::Precise),
         target: None,
+        traversal: None,
+        view: None,
     })
 }
 

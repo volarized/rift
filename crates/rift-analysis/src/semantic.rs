@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+mod captured;
+
 use rift_core::{
     ContributionReference, IndexRevision, ProjectPath, ProviderId, ProviderRevision,
     ProviderSymbolId, SourceRevision, TreeRevision,
@@ -66,6 +68,9 @@ pub struct BuiltSemantics {
     /// Documents whose Contribution the publication refused.
     pub refused_contributions: Vec<(ProjectPath, RiftError)>,
 }
+
+type ExternalTarget<'input> =
+    dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
 
 impl WorkspaceSemantics {
     /// Builds one syntax publication and one normalized graph over one file set.
@@ -176,6 +181,7 @@ impl WorkspaceSemantics {
             revision,
             previous,
             true,
+            None,
         )
     }
 
@@ -217,6 +223,25 @@ impl WorkspaceSemantics {
             revision,
             previous,
             false,
+            None,
+        )
+    }
+
+    pub(crate) fn build_facts_placed_with_external(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        relationships_max: usize,
+        revision: u64,
+        external: &dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        Self::build_facts_placed_inner(
+            documents,
+            declarations_max,
+            relationships_max,
+            revision,
+            None,
+            false,
+            Some(external),
         )
     }
 
@@ -227,6 +252,7 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
         collect_refused_contributions: bool,
+        external: Option<&ExternalTarget<'_>>,
     ) -> Result<BuiltSemantics, RiftError> {
         let index_revision = IndexRevision::new(revision)?;
         let source_revision = SourceRevision::new(revision)?;
@@ -242,7 +268,13 @@ impl WorkspaceSemantics {
         let mut beyond_declaration_bound = Vec::new();
         let mut refused_contributions = Vec::new();
         for (offered, placed) in documents.iter().enumerate() {
-            if placed.facts.symbols().len() > builder.declarations_remaining() {
+            if placed
+                .facts
+                .symbols()
+                .len()
+                .saturating_add(placed.placement.aliases_count())
+                > builder.declarations_remaining()
+            {
                 beyond_declaration_bound = documents[offered..]
                     .iter()
                     .map(|left_out| left_out.path.clone())
@@ -273,13 +305,22 @@ impl WorkspaceSemantics {
         }
         let publication = builder.build()?;
         let publications = Arc::new(PublicationSet::empty(limits).replaced(publication)?);
-        let graph = Normalizer::normalize(
-            index_revision,
-            source_revision,
-            tree_revision,
-            &publications,
-            previous,
-        )?;
+        let graph = match external {
+            Some(external) => Normalizer::normalize_with(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &publications,
+                external,
+            )?,
+            None => Normalizer::normalize(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &publications,
+                previous,
+            )?,
+        };
         let relationships = RelationshipStore::build_capped(&graph, relationships_max);
         Ok(BuiltSemantics {
             semantics: Self {
@@ -304,12 +345,38 @@ impl WorkspaceSemantics {
         &self.relationships
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_graph(
+        graph: NormalizedGraph,
+        syntax_provider: ProviderId,
+        relationships_max: usize,
+    ) -> Self {
+        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
+        Self {
+            graph,
+            relationships,
+            syntax_provider,
+        }
+    }
+
+    /// Returns the exact captured syntax Contribution for a provider-local identity.
+    #[must_use]
+    pub fn syntax_contribution(&self, provider_symbol: &str) -> Option<&rift_core::Contribution> {
+        let publication = self.graph.publications().provider(&self.syntax_provider)?;
+        let key = rift_core::ContributionKey::new(
+            self.syntax_provider.clone(),
+            publication.revision(),
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
+        );
+        self.graph.contribution(&key)
+    }
+
     /// Assembles readable symbol for syntax provider-local identity.
     #[must_use]
     pub fn assembled(&self, provider_symbol: &str) -> Option<AssembledSymbol> {
         let reference = ContributionReference::new(
             self.syntax_provider.clone(),
-            ProviderSymbolId::new(provider_symbol).ok()?,
+            ProviderSymbolId::for_symbol(provider_symbol).ok()?,
         );
         let record = self.graph.record_for(&reference)?;
         SymbolAssembler::assemble(
@@ -317,6 +384,46 @@ impl WorkspaceSemantics {
             record,
             std::slice::from_ref(&self.syntax_provider),
         )
+    }
+
+    /// Assembles one captured record, including records with no source declaration.
+    #[must_use]
+    pub fn assembled_record(&self, record: &rift_core::SymbolRecord) -> Option<AssembledSymbol> {
+        SymbolAssembler::assemble(
+            &self.graph,
+            record,
+            std::slice::from_ref(&self.syntax_provider),
+        )
+    }
+}
+
+impl get_size2::GetSize for WorkspaceSemantics {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.graph, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.syntax_provider, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
     }
 }
 
@@ -365,14 +472,36 @@ mod tests {
     #[test]
     fn syntax_graph_assembles_existing_symbol_identity() {
         let document = document();
-        let semantics = WorkspaceSemantics::build([&document], 1, 7, None)
-            .expect("semantics")
-            .semantics;
-        let identity = "rift://symbol/rust/src/lib.rs/beacon";
-        let assembled = semantics.assembled(identity).expect("assembled symbol");
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            document.language().clone(),
+            vec!["fixture".to_owned(), "beacon".to_owned()],
+        )
+        .expect("canonical fixture identity");
+        let identity = rift_core::SymbolId::new(identity.wire_identity()).expect("fixture symbol");
+        let placement = DocumentPlacement::project(&document)
+            .expect("physical project placement")
+            .with_identity_anchors(std::collections::BTreeMap::from([(
+                "beacon".to_owned(),
+                identity.clone(),
+            )]));
+        let semantics = WorkspaceSemantics::build_placed(
+            &[PlacedDocument {
+                document: &document,
+                placement,
+            }],
+            1,
+            7,
+            None,
+        )
+        .expect("semantics")
+        .semantics;
+        let assembled = semantics
+            .assembled("rift://symbol/rust/src/lib.rs/beacon")
+            .expect("assembled symbol");
         assert_eq!(
             assembled.identity().map(rift_core::SymbolId::as_str),
-            Some(identity)
+            Some(identity.as_str())
         );
         assert_eq!(assembled.index_revision().get(), 7);
         assert_eq!(semantics.graph().records().len(), 1);

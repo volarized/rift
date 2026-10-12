@@ -45,6 +45,9 @@ enum CliCommand {
         /// Forwards text and structured tool answers with `all`, and text alone with `text`.
         #[arg(long, value_enum, default_value_t = mcp::OutputMode::Text, value_name = "MODE")]
         output: mcp::OutputMode,
+        /// Adds a configured local project by registration name.
+        #[arg(long, value_name = "NAME")]
+        extra: Vec<String>,
     },
     /// Manage this workspace's HTTP MCP server.
     Server {
@@ -362,10 +365,16 @@ async fn run(
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
-        Some(CliCommand::Mcp { output }) => {
-            rift_mcp::serve_proxy(Path::new("."), BUILD_CHECKOUT, output.into())
-                .await
-                .map_err(|error| CliError::Mcp(error.mcp()))?;
+        Some(CliCommand::Mcp { output, extra }) => {
+            rift_mcp::serve_proxy(
+                Path::new("."),
+                BUILD_CHECKOUT,
+                output.into(),
+                &extra,
+                std::env::home_dir().as_deref(),
+            )
+            .await
+            .map_err(|error| CliError::Mcp(error.mcp()))?;
             Ok(None)
         }
         Some(CliCommand::Server { command }) => {
@@ -622,7 +631,7 @@ mod tests {
 
     fn parsed_output(arguments: &[&str]) -> mcp::OutputMode {
         let parsed = Cli::try_parse_from(arguments).expect("mcp must parse");
-        let Some(CliCommand::Mcp { output }) = parsed.command else {
+        let Some(CliCommand::Mcp { output, .. }) = parsed.command else {
             panic!("expected the mcp command, got {:?}", parsed.command);
         };
         output

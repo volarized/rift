@@ -363,15 +363,14 @@ impl SyntaxProvider for RustSyntaxProvider {
             &self.language,
             &RustGrammarRules,
         )?;
-        Ok(SyntaxDocument::new(
+        Ok(SyntaxDocument::new_rust(
             self.language.clone(),
-            source.path.clone(),
+            source,
+            limits,
             nodes,
             symbols,
             tree.root_node().has_error(),
-        )
-        .with_source_witness(source.text)
-        .with_syntax_limits(limits))
+        ))
     }
 
     fn node_facets(&self, kind: &str) -> Vec<NodeFacet> {
@@ -462,6 +461,17 @@ impl GrammarRules for RustGrammarRules {
 
     fn qualification_separator(&self) -> &'static str {
         "::"
+    }
+
+    fn module_path(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<crate::RustModulePath>, RiftError> {
+        if visited.node().kind() != RustGrammarNodeKind::ModItem.as_str() {
+            return Ok(None);
+        }
+        attachment::module_path(visited, text).map(Some)
     }
 }
 
@@ -644,6 +654,52 @@ pub(crate) fn restored_symbol_kind(name: &str) -> Option<&'static str> {
         .find(|word| *word == name)
 }
 
+pub(crate) fn literal_function(
+    source: &str,
+    language: &Language,
+    name_range: ByteRange,
+    item_range: ByteRange,
+    body_range: ByteRange,
+    public: bool,
+) -> Option<crate::SyntaxSymbol> {
+    let name = source
+        .get(usize::try_from(name_range.start).ok()?..usize::try_from(name_range.end).ok()?)?
+        .to_owned();
+    let visibility = if public {
+        RustVisibility::Public
+    } else {
+        RustVisibility::Private
+    };
+    let declaration = extract::Declaration {
+        name: name.clone(),
+        kind: RustSymbolKind::Function.word(),
+        facets: declaration_facets(RustSymbolKind::Function, &visibility),
+        visibility: Some(visibility.authored()),
+        body_range: Some(body_range),
+        documentation: Vec::new(),
+        documentation_ranges: Vec::new(),
+    };
+    let signatures = extract::callable_signature(&declaration, item_range, source, language)?;
+    Some(crate::SyntaxSymbol {
+        name: name.clone(),
+        qualified_name: name,
+        container: None,
+        kind: declaration.kind,
+        node_kind: None,
+        facets: declaration.facets,
+        visibility: declaration.visibility,
+        range: item_range,
+        item_range,
+        name_range: None,
+        body_range: Some(body_range),
+        signatures: std::sync::Arc::from([signatures]),
+        documentation: std::sync::Arc::from([]),
+        documentation_ranges: Vec::new(),
+        module_path: None,
+        python_overload: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use rift_core::ProjectPath;
@@ -695,6 +751,116 @@ mod tests {
         let load = text.find("load").expect("fixture contains method") as u64;
         assert!(document.nodes_at(load).len() >= 3);
         assert!(!document.has_errors());
+    }
+
+    #[test]
+    fn test_module_path_absence_is_recorded_only_for_module_declarations() {
+        let document = analyze("mod ordinary; pub fn run() {} mod inline {} ");
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Absent)
+        );
+        assert_eq!(document.symbols()[1].module_path, None);
+        assert_eq!(
+            document.symbols()[2].module_path,
+            Some(crate::RustModulePath::Absent)
+        );
+    }
+
+    #[test]
+    fn test_module_path_literal_keeps_original_content_across_blank_lines() {
+        for attribute in ["#[path = \"mapped.rs\"]", "#[path = r#\"mapped.rs\"#]"] {
+            let text = format!("{attribute}\n\n// ordinary comment\npub mod child;");
+            let document = analyze(&text);
+            let symbol = &document.symbols()[0];
+            let Some(crate::RustModulePath::Literal { path, range }) = &symbol.module_path else {
+                panic!("actual module path literal must be captured");
+            };
+            assert_eq!(path.as_str(), "mapped.rs");
+            assert_eq!(text_at(&text, *range), "mapped.rs");
+            assert!(range.end <= symbol.item_range.start);
+            assert!(range.end <= symbol.range.start);
+            assert_eq!(text_at(&text, symbol.item_range), "pub mod child;");
+            assert_eq!(document.path(), &self::path());
+        }
+    }
+
+    #[test]
+    fn test_module_path_unsupported_or_conflicting_attributes_stay_unknown() {
+        for attribute in [
+            "#[path = \"../shared.rs\"]",
+            "#[path = \"\"]",
+            "#[path = \"/shared.rs\"]",
+            "#[path = \"mapped\\u{2e}rs\"]",
+            "#[cfg_attr(feature = \"alternate\", path = \"other.rs\")]",
+            "#[path = \"one.rs\"]\n#[path = \"two.rs\"]",
+            "#[path = \"same.rs\"]\n#[path = \"same.rs\"]",
+            "#[custom_module]",
+        ] {
+            let text = format!("{attribute}\n\nmod child;");
+            let document = analyze(&text);
+            assert!(!document.has_errors(), "{attribute}");
+            let symbol = &document.symbols()[0];
+            assert_eq!(
+                symbol.module_path,
+                Some(crate::RustModulePath::Unknown),
+                "{attribute}"
+            );
+            assert_eq!(text_at(&text, symbol.item_range), "mod child;");
+            assert_eq!(document.path(), &self::path());
+        }
+    }
+
+    #[test]
+    fn test_module_path_known_builtin_attributes_do_not_create_a_path() {
+        let document = analyze("#[cfg(feature = \"present\")]\n\n#[allow(dead_code)]\nmod child;");
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Absent)
+        );
+    }
+
+    #[test]
+    fn test_module_path_inner_attributes_preserve_unknown_path_state() {
+        for text in [
+            "mod outer { #![path = \"custom\"] mod child; }",
+            "mod outer { #![cfg_attr(feature = \"other\", path = \"custom\")] mod child; }",
+            "mod outer { #![custom] mod child; }",
+        ] {
+            let document = analyze(text);
+            assert!(!document.has_errors(), "{text}");
+            let outer = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == "outer")
+                .expect("retained inline module");
+            assert_eq!(outer.module_path, Some(crate::RustModulePath::Unknown));
+            assert!(outer.body_range.is_some());
+            let start = usize::try_from(outer.item_range.start).expect("fixture start");
+            let end = usize::try_from(outer.item_range.end).expect("fixture end");
+            assert_eq!(&text[start..end], text);
+            assert!(
+                document
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.qualified_name == "outer::child")
+            );
+        }
+        let document = analyze("mod outer { #![allow(dead_code)] mod child; }");
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Absent)
+        );
+    }
+
+    #[test]
+    fn test_module_path_literal_refuses_owning_path_byte_bound() {
+        let path = "a".repeat(rift_core::constants::PROJECT_PATH_BYTES_MAX + 1);
+        let document = analyze(&format!("#[path = \"{path}\"]\nmod child;"));
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Unknown)
+        );
     }
 
     #[test]
@@ -1393,5 +1559,72 @@ mod tests {
             .find(|symbol| symbol.name == "main");
         let main = main.expect("fixture declares a trait default method named main");
         assert!(!main.facets.contains(&SymbolFacet::Entrypoint));
+    }
+
+    #[test]
+    fn test_documentation_cfg_attributes_keep_original_module_path_facts() {
+        for (prefix, body) in [
+            (
+                "#[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))]\n",
+                "pub mod task;",
+            ),
+            ("#[cfg_attr(docsrs, doc(hidden))]\r\n", "mod child;"),
+            (
+                "",
+                "mod inline { #![cfg_attr(docsrs, doc(hidden))] mod child; }",
+            ),
+        ] {
+            let text = format!("{prefix}{body}");
+            let document = analyze(&text);
+            assert!(!document.has_errors());
+            let symbol = &document.symbols()[0];
+            assert_eq!(symbol.module_path, Some(crate::RustModulePath::Absent));
+            assert_eq!(text_at(&text, symbol.item_range), body);
+        }
+        let text = "#[path = \"mapped.rs\"]\n#[cfg_attr(docsrs, doc(hidden))]\nmod child;";
+        let document = analyze(text);
+        let Some(crate::RustModulePath::Literal { path, range }) =
+            &document.symbols()[0].module_path
+        else {
+            panic!("original literal path survives documentation attribute");
+        };
+        assert_eq!(path.as_str(), "mapped.rs");
+        assert_eq!(text_at(text, *range), "mapped.rs");
+    }
+
+    #[test]
+    fn test_documentation_cfg_attributes_refuse_unknown_or_mixed_effects() {
+        for attribute in [
+            "cfg_attr(docsrs, doc(hidden), path = \"other.rs\")",
+            "cfg_attr(docsrs, doc(hidden), macro_use)",
+            "cfg_attr(docsrs, doc(hidden), custom)",
+            "cfg_attr(docsrs, path = \"other.rs\")",
+            "cfg_attr(feature = \"rt\", doc(hidden))",
+            "cfg_attr(docsrs, doc(include_str!(\"other.rs\")))",
+            "cfg_attr(docsrs, doc[hidden])",
+            "cfg_attr(docsrs, doc(hidden);)",
+            "cfg_attr(docsrs, doc(hidden),)",
+        ] {
+            for text in [
+                format!("#[{attribute}]\nmod child;"),
+                format!("mod inline {{ #![{attribute}] mod child; }}"),
+            ] {
+                let document = analyze(&text);
+                assert_eq!(
+                    document.symbols()[0].module_path,
+                    Some(crate::RustModulePath::Unknown),
+                    "{text}"
+                );
+            }
+        }
+        let attribute = format!(
+            "#[cfg_attr(docsrs, doc({}))]",
+            "hidden,".repeat(rift_core::constants::PROJECT_PATH_BYTES_MAX)
+        );
+        let document = analyze(&format!("{attribute}\nmod child;"));
+        assert_eq!(
+            document.symbols()[0].module_path,
+            Some(crate::RustModulePath::Unknown)
+        );
     }
 }

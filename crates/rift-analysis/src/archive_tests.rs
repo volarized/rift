@@ -3,6 +3,54 @@ use std::io::Write;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
+#[test]
+fn verified_archive_digest_is_retained_for_both_algorithms() -> TestResult {
+    let members = [(
+        "release/src/lib.rs",
+        b"pub fn beacon() {}\n".as_slice(),
+        tar::EntryType::Regular,
+    )];
+    for (format, bytes) in [
+        (ArchiveFormat::TarGzip, tar_bytes(&members)?),
+        (ArchiveFormat::Zip, zip_members_bytes(&members)?),
+    ] {
+        let expected_digest = FileDigest::of(&bytes);
+        for expected in [
+            ArchiveDigest::Sha256(Sha256::digest(&bytes).into()),
+            ArchiveDigest::Sha512(Sha512::digest(&bytes).into()),
+        ] {
+            let files = read_archive(
+                &bytes,
+                format,
+                &expected,
+                Some("release"),
+                ArchiveLimits::default(),
+            )?;
+            assert_eq!(files.digest(), expected_digest);
+            assert_eq!(
+                files.files()[&ProjectPath::new("src/lib.rs")?],
+                members[0].1
+            );
+        }
+        for expected in [
+            ArchiveDigest::Sha256([0; 32]),
+            ArchiveDigest::Sha512([0; 64]),
+        ] {
+            assert!(matches!(
+                read_archive(
+                    &bytes,
+                    format,
+                    &expected,
+                    Some("release"),
+                    ArchiveLimits::default()
+                ),
+                Err(ArchiveError::DigestMismatch)
+            ));
+        }
+    }
+    Ok(())
+}
+
 // Issue #600: compare every repeated member before retaining one normalized file.
 #[test]
 fn identical_tar_members_retain_one_file_after_normalization() -> TestResult {
@@ -1364,5 +1412,103 @@ fn zip_metadata_retry_work_is_bounded() -> TestResult {
             .expect_err("footer retry work must be bounded"),
         ArchiveError::WorkLimit
     );
+    Ok(())
+}
+
+#[test]
+fn complete_member_inventory_preserves_original_paths_and_implicit_parents() -> TestResult {
+    let entries = [
+        ("./release/", b"".as_slice(), tar::EntryType::Directory),
+        (
+            "./release//src/package/__init__.py",
+            b"text",
+            tar::EntryType::Regular,
+        ),
+        ("release/empty/", b"", tar::EntryType::Directory),
+        ("release/hook.py", b"", tar::EntryType::Symlink),
+    ];
+    for (bytes, format) in [
+        (tar_bytes(&entries)?, ArchiveFormat::TarGzip),
+        (zip_members_bytes(&entries)?, ArchiveFormat::Zip),
+    ] {
+        let digest = ArchiveDigest::Sha256(Sha256::digest(&bytes).into());
+        let exact = ArchiveLimits::new(bytes.len(), 16_384, 16, 4, 200)?;
+        let archive = read_archive(&bytes, format, &digest, Some("release"), exact)?;
+        let members = archive.members();
+        assert_eq!(members.len(), 4);
+        assert_eq!(members.get("release"), Some(&ArchiveMemberKind::Directory));
+        assert_eq!(
+            members.get("release/empty"),
+            Some(&ArchiveMemberKind::Directory)
+        );
+        assert_eq!(
+            members.get("release/hook.py"),
+            Some(&ArchiveMemberKind::Link)
+        );
+        assert_eq!(
+            members.get("release/src/package/__init__.py"),
+            Some(&ArchiveMemberKind::File)
+        );
+        assert!(!members.contains_key("release/src"));
+        assert!(
+            members
+                .range("release/src/".to_owned()..)
+                .next()
+                .is_some_and(|(path, _)| path.starts_with("release/src/"))
+        );
+        assert!(!members.contains_key("release/setup.py"));
+        assert_eq!(
+            archive.files()[&ProjectPath::new("src/package/__init__.py")?],
+            b"text"
+        );
+        assert_eq!(archive.skipped_links(), &[ProjectPath::new("hook.py")?]);
+        assert_eq!(
+            read_archive(
+                &bytes,
+                format,
+                &digest,
+                Some("release"),
+                ArchiveLimits::new(bytes.len(), 16_384, 16, 3, 200)?
+            )
+            .expect_err("complete inventory spends every admitted member"),
+            ArchiveError::MemberLimit
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn complete_member_inventory_refuses_file_and_link_parents_in_both_orders() -> TestResult {
+    for kind in [tar::EntryType::Regular, tar::EntryType::Symlink] {
+        for parent_first in [true, false] {
+            let parent = ("release/parent", b"".as_slice(), kind);
+            let child = (
+                "release/parent/child.py",
+                b"text".as_slice(),
+                tar::EntryType::Regular,
+            );
+            let entries = if parent_first {
+                [parent, child]
+            } else {
+                [child, parent]
+            };
+            for (bytes, format) in [
+                (tar_bytes(&entries)?, ArchiveFormat::TarGzip),
+                (zip_members_bytes(&entries)?, ArchiveFormat::Zip),
+            ] {
+                assert_eq!(
+                    read_archive(
+                        &bytes,
+                        format,
+                        &ArchiveDigest::Sha256(Sha256::digest(&bytes).into()),
+                        Some("release"),
+                        ArchiveLimits::default()
+                    )
+                    .expect_err("file or link cannot establish a directory parent"),
+                    ArchiveError::DuplicatePath
+                );
+            }
+        }
+    }
     Ok(())
 }

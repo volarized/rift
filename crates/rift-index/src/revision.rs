@@ -142,6 +142,34 @@ impl WorkspaceIndex {
         selection: &dyn Fn(&str) -> bool,
         read: &mut CommittedBytes<'_>,
     ) -> Result<Self, RiftError> {
+        Self::at_revision_with_owner(
+            (repository, rift_protocol::identity::SymbolOwner::Local),
+            revision,
+            limits,
+            visibility,
+            (text_inclusion, languages),
+            selection,
+            read,
+        )
+    }
+
+    /// Builds a committed-tree index under one fixed local owner.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for invalid owner, paths, configuration, bounds, or history reads.
+    pub fn at_revision_with_owner(
+        (repository, owner): (&Repository, rift_protocol::identity::SymbolOwner),
+        revision: &ResolvedRevision,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        (text_inclusion, languages): (
+            &rift_core::TextFileInclusion,
+            &rift_core::LanguageFileSelections,
+        ),
+        selection: &dyn Fn(&str) -> bool,
+        read: &mut CommittedBytes<'_>,
+    ) -> Result<Self, RiftError> {
+        super::workspace::validate_project_owner(&owner)?;
         let root = repository.root().to_path_buf();
         let composition = revision_composition()?;
         let language = std::sync::Arc::new(crate::WorkspaceLanguagePolicy::build(
@@ -150,73 +178,79 @@ impl WorkspaceIndex {
             text_inclusion,
         )?);
         let visible = RevisionPaths::build(&root, visibility)?;
-        let includes = |path: &str| visible.includes(path) && selection(path);
-        let listed =
-            repository.tree_files(revision, &includes, limits.revision_tree_entries_max())?;
+        let listed = repository.tree_files(
+            revision,
+            &|path| visible.includes(path),
+            limits.revision_tree_entries_max(),
+        )?;
+        let inventory = listed
+            .iter()
+            .map(|file| (file.path(), file))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let selected = listed
+            .iter()
+            .filter(|file| selection(file.path()))
+            .map(|file| {
+                ProjectPath::new(file.path().to_owned()).map_err(|error| {
+                    errors::index::workspace_invalid_path()
+                        .path(PathBuf::from(file.path()))
+                        .cause(error)
+                        .error()
+                })
+            })
+            .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+        let selected_names = selected
+            .iter()
+            .map(ProjectPath::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut pending = listed
+            .iter()
+            .filter(|file| {
+                selected_names.contains(file.path())
+                    || file.path() == "Cargo.toml"
+                    || file.path().ends_with("/Cargo.toml")
+            })
+            .collect::<Vec<_>>();
+        let mut attempted = std::collections::BTreeSet::new();
         let mut catalog_bytes = 0_usize;
         let mut contents = IndexContents::default();
-        for tree_file in &listed {
-            let context_path = PathBuf::from(tree_file.path());
-            if directory_depth(tree_file.path()) > limits.directory_depth_max() {
-                return errors::index::workspace_too_deep()
-                    .path(&context_path)
-                    .field("source.directory_depth")
-                    .observed(directory_depth(tree_file.path()))
-                    .maximum(limits.directory_depth_max())
-                    .fail();
-            }
-            let bytes = match read(tree_file, limits.file_bytes_max()) {
-                Ok(Some(bytes)) => bytes,
-                Ok(None) => continue,
-                Err(error) if error.slug() == rift_error::errors::history::blob_too_large::SLUG => {
+        loop {
+            for tree_file in pending.drain(..) {
+                if !attempted.insert(tree_file.path().to_owned()) {
                     continue;
                 }
-                Err(error) => return error.fail(),
-            };
-            if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-                continue;
+                hold_revision_file(
+                    &mut contents,
+                    &mut catalog_bytes,
+                    tree_file,
+                    &language,
+                    limits,
+                    &mut |file, bytes_max| {
+                        if selected_names.contains(file.path()) {
+                            read(file, bytes_max)
+                        } else {
+                            repository.blob_bytes(file, bytes_max).map(Some)
+                        }
+                    },
+                )?;
             }
-            let Some(class) = language.classifies(&context_path)? else {
-                continue;
-            };
-            if language.excludes_lockfile(&context_path) {
-                continue;
-            }
-            if contents.held_count() >= limits.files_max() {
-                return errors::index::workspace_too_many_files()
-                    .path(&context_path)
-                    .field(SOURCE_FILES_FIELD)
-                    .observed(contents.held_count().saturating_add(1))
-                    .maximum(limits.files_max())
-                    .fail();
-            }
-            let project_path = ProjectPath::new(tree_file.path().to_owned()).map_err(|error| {
-                errors::index::workspace_invalid_path()
-                    .path(&context_path)
-                    .cause(error)
-                    .error()
-            })?;
-            let text_file = super::workspace::included_text_file(
-                project_path,
-                bytes,
-                &context_path,
+            let requested = contents.namespace_paths(
+                &owner,
                 limits,
-                &mut catalog_bytes,
+                &|path| inventory.contains_key(path),
+                &selected,
             )?;
-            match class {
-                ClassifiedPath::Source(provider) => {
-                    contents.hold_source_file(
-                        text_file,
-                        &context_path,
-                        provider,
-                        limits.syntax(),
-                    )?;
-                }
-                ClassifiedPath::Text => contents.hold_text_file(text_file),
+            pending.extend(requested.iter().filter_map(|path| {
+                (!attempted.contains(path.as_str()))
+                    .then(|| inventory.get(path.as_str()).copied())
+                    .flatten()
+            }));
+            if pending.is_empty() {
+                break;
             }
         }
-        Self::from_parts(
-            root,
+        Self::from_parts_with_owner(
+            (root, owner),
             contents,
             composition,
             limits,
@@ -294,6 +328,73 @@ fn revision_composition() -> Result<ProviderComposition, RiftError> {
         .map_err(|source| errors::index::workspace_composition().cause(source).error())
 }
 
+fn hold_revision_file(
+    contents: &mut IndexContents,
+    catalog_bytes: &mut usize,
+    tree_file: &TreeFile,
+    language: &crate::WorkspaceLanguagePolicy,
+    limits: WorkspaceIndexLimits,
+    read: &mut CommittedBytes<'_>,
+) -> Result<(), RiftError> {
+    let context_path = PathBuf::from(tree_file.path());
+    if directory_depth(tree_file.path()) > limits.directory_depth_max() {
+        return errors::index::workspace_too_deep()
+            .path(&context_path)
+            .field("source.directory_depth")
+            .observed(directory_depth(tree_file.path()))
+            .maximum(limits.directory_depth_max())
+            .fail();
+    }
+    let bytes = match read(tree_file, limits.file_bytes_max()) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return Ok(()),
+        Err(error) if error.slug() == rift_error::errors::history::blob_too_large::SLUG => {
+            return Ok(());
+        }
+        Err(error) => return error.fail(),
+    };
+    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        return Ok(());
+    }
+    let Some(class) = language.classifies(&context_path)?.or_else(|| {
+        (tree_file.path() == "Cargo.toml" || tree_file.path().ends_with("/Cargo.toml"))
+            .then_some(ClassifiedPath::Text)
+    }) else {
+        return Ok(());
+    };
+    if language.excludes_lockfile(&context_path) {
+        return Ok(());
+    }
+    if contents.held_count() >= limits.files_max() {
+        return errors::index::workspace_too_many_files()
+            .path(&context_path)
+            .field(SOURCE_FILES_FIELD)
+            .observed(contents.held_count().saturating_add(1))
+            .maximum(limits.files_max())
+            .fail();
+    }
+    let project_path = ProjectPath::new(tree_file.path().to_owned()).map_err(|error| {
+        errors::index::workspace_invalid_path()
+            .path(&context_path)
+            .cause(error)
+            .error()
+    })?;
+    let text_file = super::workspace::included_text_file(
+        project_path,
+        bytes,
+        &context_path,
+        limits,
+        catalog_bytes,
+    )?;
+    match class {
+        ClassifiedPath::Source(provider) => {
+            contents.hold_source_file(text_file, &context_path, provider, limits.syntax())?;
+        }
+        ClassifiedPath::Text => contents.hold_text_file(text_file),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +431,124 @@ mod tests {
             "a force_include match needs no include match at a revision either"
         );
         assert!(!visible.includes("other.txt"));
+    }
+
+    fn committed_module_workspace() -> tempfile::TempDir {
+        let directory = committed_workspace();
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            r#"[package]
+name = "fixture"
+version = "1.0.0"
+[lib]
+path = "src/lib.rs"
+"#,
+        )
+        .expect("captured Cargo metadata");
+        fs::write(directory.path().join("src/lib.rs"), "mod from;\n")
+            .expect("committed module declaration");
+        fs::write(directory.path().join("src/from.rs"), "pub fn beacon() {}\n")
+            .expect("selected declaration");
+        commit_all(
+            directory.path(),
+            "capture selected declaration and module context",
+        );
+        directory
+    }
+
+    #[test]
+    fn selected_revision_keeps_committed_namespace_witnesses() {
+        let directory = committed_module_workspace();
+        let (repository, head) = open_head(directory.path());
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "invalid current metadata",
+        )
+        .expect("change current metadata");
+        fs::write(directory.path().join("src/lib.rs"), "mod other;\n")
+            .expect("change current module declaration");
+        let mut requested = Vec::new();
+        let index = WorkspaceIndex::at_revision_with_blob_reader(
+            &repository,
+            &head,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            (
+                &rift_core::TextFileInclusion::default(),
+                &rift_core::LanguageFileSelections::default(),
+            ),
+            &|path| path == "src/from.rs",
+            &mut |file, bytes_max| {
+                requested.push(file.path().to_owned());
+                repository.blob_bytes(file, bytes_max).map(Some)
+            },
+        )
+        .expect("selected committed index");
+        assert_eq!(requested, ["src/from.rs"]);
+        let matches = index.symbols("beacon", 1).expect("selected declaration");
+        let identity = index.assembled_symbol(matches[0]).expect("captured object");
+        assert_eq!(
+            identity.identity().expect("established identity").as_str(),
+            "rift://symbol/local/rust/fixture/from/beacon",
+        );
+        assert_eq!(matches[0].file.source(), "pub fn beacon() {}\n");
+        assert!(!has_symbol(&index, "other"));
+    }
+
+    #[test]
+    fn selected_revision_refuses_missing_or_corrupt_namespace_witnesses() {
+        for corrupt in [false, true] {
+            let directory = committed_module_workspace();
+            if corrupt {
+                fs::write(directory.path().join("Cargo.toml"), "[package")
+                    .expect("corrupt committed metadata");
+            } else {
+                fs::remove_file(directory.path().join("src/lib.rs"))
+                    .expect("remove committed module witness");
+            }
+            commit_all(
+                directory.path(),
+                "refuse incomplete committed namespace context",
+            );
+            let (repository, head) = open_head(directory.path());
+            let index = WorkspaceIndex::at_revision_with_selection(
+                &repository,
+                &head,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &rift_core::TextFileInclusion::default(),
+                &rift_core::LanguageFileSelections::default(),
+                &|path| path == "src/from.rs",
+            )
+            .expect("raw selected declaration remains available");
+            let matches = index.symbols("beacon", 1).expect("raw declaration");
+            assert_eq!(matches.len(), 1);
+            assert!(
+                index
+                    .assembled_symbol(matches[0])
+                    .expect("raw facts")
+                    .identity()
+                    .is_none()
+            );
+            assert_eq!(matches[0].file.source(), "pub fn beacon() {}\n");
+        }
+    }
+
+    #[test]
+    fn selected_revision_counts_namespace_witnesses_against_source_bounds() {
+        let directory = committed_module_workspace();
+        let (repository, head) = open_head(directory.path());
+        let error = WorkspaceIndex::at_revision_with_selection(
+            &repository,
+            &head,
+            WorkspaceIndexLimits::new(2, 1024, 4096, 8, 5).expect("bounded sources"),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            &rift_core::LanguageFileSelections::default(),
+            &|path| path == "src/from.rs",
+        )
+        .expect_err("selected source, metadata and module witness exceed two files");
+        assert_eq!(error.slug(), errors::index::workspace_too_many_files::SLUG);
     }
 
     fn open_head(root: &Path) -> (Repository, ResolvedRevision) {

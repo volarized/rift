@@ -114,6 +114,15 @@ impl<'tree> Visited<'_, 'tree> {
 
 /// Per-grammar decisions the shared walk delegates.
 pub(crate) trait GrammarRules {
+    /// Export binding recorded at this visited node, when the grammar supplies one.
+    fn export_binding(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+        _qualification: &str,
+    ) -> Result<Option<crate::SyntaxExportBinding>, RiftError> {
+        Ok(None)
+    }
     /// The declaration facts behind the visited node; `None` for a node that
     /// declares nothing.
     ///
@@ -131,6 +140,14 @@ pub(crate) trait GrammarRules {
     /// scope.
     fn container_name(&self, node: Node<'_>, text: &str) -> Option<String>;
 
+    /// The qualification declarations under this node take.
+    fn child_qualification(&self, node: Node<'_>, text: &str, parent: &str) -> String {
+        self.container_name(node, text).map_or_else(
+            || parent.to_owned(),
+            |name| qualify(self.qualification_separator(), parent, &name),
+        )
+    }
+
     /// Byte offset where the visited node's whole declaration starts,
     /// attached attributes and doc comments included.
     fn declaration_start(&self, visited: Visited<'_, '_>, text: &str) -> usize;
@@ -140,8 +157,31 @@ pub(crate) trait GrammarRules {
         visited.node()
     }
 
+    /// Whether the declaration renders a callable signature.
+    fn renders_signature(&self, _visited: Visited<'_, '_>) -> bool {
+        true
+    }
+
     /// The grammar's exact declaration name field, absent for providers without one.
     fn name_range(&self, _node: Node<'_>) -> Result<Option<ByteRange>, RiftError> {
+        Ok(None)
+    }
+
+    /// Captured Rust module path state; unsupported grammars leave it unknown.
+    fn module_path(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+    ) -> Result<Option<crate::RustModulePath>, RiftError> {
+        Ok(None)
+    }
+
+    /// Captured Python import and overload decorator association.
+    fn python_overload(
+        &self,
+        _visited: Visited<'_, '_>,
+        _text: &str,
+    ) -> Result<Option<crate::PythonOverload>, RiftError> {
         Ok(None)
     }
 
@@ -193,6 +233,24 @@ pub(crate) fn extract(
     language: &Language,
     rules: &dyn GrammarRules,
 ) -> Result<(Vec<SyntaxNode>, Vec<SyntaxSymbol>), RiftError> {
+    let (nodes, symbols, _) = extract_with_export_bindings(root, source, limits, language, rules)?;
+    Ok((nodes, symbols))
+}
+
+pub(crate) type Extraction = (
+    Vec<SyntaxNode>,
+    Vec<SyntaxSymbol>,
+    Vec<crate::SyntaxExportBinding>,
+);
+
+/// Records export bindings in the same bounded tree walk as nodes and declarations.
+pub(crate) fn extract_with_export_bindings(
+    root: Node<'_>,
+    source: SyntaxSource<'_>,
+    limits: SyntaxLimits,
+    language: &Language,
+    rules: &dyn GrammarRules,
+) -> Result<Extraction, RiftError> {
     let text = source.text;
     let names = SyntaxNames::new(language).expect("a syntax provider uses a shipped grammar");
     let grammar = names.grammar();
@@ -203,6 +261,7 @@ pub(crate) fn extract(
     );
     let mut nodes = Vec::new();
     let mut symbols = Vec::new();
+    let mut export_bindings = Vec::new();
     let mut visits = Visits::default();
     let mut pending = vec![Queued {
         node: root,
@@ -246,6 +305,9 @@ pub(crate) fn extract(
         });
 
         let visited = visits.visited(node_index);
+        if let Some(binding) = rules.export_binding(visited, text, &qualification)? {
+            export_bindings.push(binding);
+        }
         if let Some(declaration) = rules.declaration(visited, text)? {
             symbols.push(qualified_symbol(
                 declaration,
@@ -254,12 +316,10 @@ pub(crate) fn extract(
                 &qualification,
                 language,
                 rules,
+                grammar,
             )?);
         }
-        let child_qualification = rules.container_name(node, text).map_or_else(
-            || qualification.clone(),
-            |name| qualify(rules.qualification_separator(), &qualification, &name),
-        );
+        let child_qualification = rules.child_qualification(node, text, &qualification);
 
         if pending.len() + nodes.len() + node.named_child_count() > limits.syntax_nodes_max() {
             return errors::syntax::too_many_nodes()
@@ -276,7 +336,7 @@ pub(crate) fn extract(
             depth + 1,
         );
     }
-    Ok((nodes, symbols))
+    Ok((nodes, symbols, export_bindings))
 }
 
 /// One node the walk has queued, with what its visit needs from its parent.
@@ -329,13 +389,17 @@ fn qualified_symbol(
     qualification: &str,
     language: &Language,
     rules: &dyn GrammarRules,
+    grammar: &'static tree_sitter::Language,
 ) -> Result<SyntaxSymbol, RiftError> {
     let visited_node = visited.node();
     let node = rules.declaration_node(visited);
     let item_range = byte_range(node)?;
     let start = rules.declaration_start(visited, text);
     let start = u64::try_from(start).map_err(|source| position_overflow(node, source))?;
-    let signatures: Vec<Signature> = callable_signature(&declaration, node, text, language)
+    let signatures: Vec<Signature> = rules
+        .renders_signature(visited)
+        .then(|| callable_signature(&declaration, item_range, text, language))
+        .flatten()
         .into_iter()
         .collect();
     Ok(SyntaxSymbol {
@@ -347,7 +411,7 @@ fn qualified_symbol(
         container: (!qualification.is_empty()).then(|| qualification.to_owned()),
         name: declaration.name,
         kind: declaration.kind,
-        node_kind: None,
+        node_kind: grammar.node_kind_for_id(node.kind_id()),
         facets: declaration.facets,
         visibility: declaration.visibility,
         range: ByteRange {
@@ -360,6 +424,8 @@ fn qualified_symbol(
         signatures: Arc::from(signatures),
         documentation: Arc::from(declaration.documentation),
         documentation_ranges: declaration.documentation_ranges,
+        module_path: rules.module_path(visited, text)?,
+        python_overload: rules.python_overload(visited, text)?,
     })
 }
 
@@ -389,16 +455,16 @@ fn bodyless_display(item: &str) -> &str {
 /// already states whether a kind is callable (`Declaration::facets`) and
 /// where its implementation starts (`Declaration::body_range`), so deriving
 /// the header here, once, keeps a match on language out of this walk.
-fn callable_signature(
+pub(crate) fn callable_signature(
     declaration: &Declaration,
-    node: Node<'_>,
+    item_range: ByteRange,
     text: &str,
     language: &Language,
 ) -> Option<Signature> {
     if !declaration.facets.contains(&SymbolFacet::Callable) {
         return None;
     }
-    let start = node.start_byte();
+    let start = usize::try_from(item_range.start).ok()?;
     let display = match declaration.body_range {
         Some(body_range) => {
             let end = usize::try_from(body_range.start)
@@ -406,7 +472,7 @@ fn callable_signature(
                 .min(text.len());
             text.get(start..end)?.trim_end()
         }
-        None => bodyless_display(text.get(start..node.end_byte())?),
+        None => bodyless_display(text.get(start..usize::try_from(item_range.end).ok()?)?),
     };
     Some(Signature {
         display: display.to_owned(),
@@ -422,7 +488,7 @@ fn callable_signature(
     })
 }
 
-fn qualify(separator: &str, parent: &str, name: &str) -> String {
+pub(crate) fn qualify(separator: &str, parent: &str, name: &str) -> String {
     if parent.is_empty() {
         name.into()
     } else {
@@ -551,12 +617,12 @@ mod tests {
                 "# Beacon\n\nText.\n\nLoose\n---\n\n- item\n- item\n",
             ),
             (
-                tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+                tree_sitter_typescript::language_typescript(),
                 ShippedLanguage::TypeScript,
                 "export interface Beacon { beam<T>(value: T): T; }\nconst light = { beam: 1 };\n",
             ),
             (
-                tree_sitter_typescript::LANGUAGE_TSX.into(),
+                tree_sitter_typescript::language_tsx(),
                 ShippedLanguage::TypeScriptTsx,
                 "export const Beacon = () => <section light={1}><span>beam</span></section>;\n",
             ),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import math
 import os
 import platform
@@ -10,6 +11,7 @@ import re
 import threading
 import time
 import uuid
+import zlib
 from collections.abc import Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,11 +20,11 @@ from typing import Annotated, Literal
 
 import tomllib
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
-
 from rift_dev.commands import REPOSITORY, CargoCommand, Command, CommandFailed
 from rift_dev.progress import start
 from rift_dev.trace import (
     EXPORT_REQUEST_REPORT_MAX,
+    GZIP_WINDOW,
     PID_KEY,
     SPAN_REQUEST_KEY,
     Attributes,
@@ -238,7 +240,7 @@ class RunSummary(CollectionSummary):
 def retained_collector(directory: Path) -> Iterator[Collector]:
     """Keep scenario telemetry through server cleanup and collector shutdown."""
     directory.mkdir(parents=True, exist_ok=True)
-    artifact = ArtifactStore(directory / "telemetry.jsonl", {})
+    artifact = ArtifactStore(directory / "telemetry.jsonl.gz", {})
     served = Collector()
     try:
         with collector(
@@ -304,11 +306,48 @@ class ArtifactStore:
     def write(
         self, evidence: LogEvidence | SpanEvidence | MetricEvidence | RequestEvidence
     ) -> None:
-        data = EVIDENCE.dump_json(evidence) + b"\n"
+        excluded = None
+        if (
+            isinstance(evidence, MetricEvidence)
+            and evidence.record.count is None
+            and not evidence.record.bounds
+            and not evidence.record.bucket_counts
+        ):
+            excluded = {"record": {"count", "bounds", "bucket_counts"}}
+        elif isinstance(evidence, LogEvidence):
+            excluded = {
+                "record": {
+                    name
+                    for name in ("trace_id", "span_id")
+                    if getattr(evidence.record, name) == ""
+                }
+            }
+        elif isinstance(evidence, SpanEvidence):
+            excluded = {
+                "record": {
+                    name
+                    for name, default in (
+                        ("instance", ""),
+                        ("resource", ()),
+                        ("parent_span_id", ""),
+                        ("status_code", 0),
+                        ("status_message", ""),
+                        ("kind", 0),
+                    )
+                    if getattr(evidence.record, name) == default
+                }
+            }
+        data = EVIDENCE.dump_json(evidence, exclude=excluded) + b"\n"
+        decoded_bytes = len(data)
+        if self.path.suffix == ".gz":
+            data = zlib.compress(data, level=zlib.Z_BEST_SPEED, wbits=GZIP_WINDOW)
         with self.lock:
             self.received += 1
             self.received_bytes += len(data)
-            if self.written + len(data) > RUN_TELEMETRY_BYTES_MAX:
+            if (
+                decoded_bytes > RUN_TELEMETRY_BYTES_MAX
+                or self.written + len(data) > RUN_TELEMETRY_BYTES_MAX
+            ):
                 self.omitted += 1
                 return
             try:
@@ -368,6 +407,19 @@ class ArtifactStore:
             with self.lock:
                 self.request_errors += 1
 
+    @staticmethod
+    def read(path: Path) -> Iterator[bytes]:
+        """Read original JSONL records with a bounded decoded row."""
+        with (
+            gzip.open(path, "rb") if path.suffix == ".gz" else path.open("rb") as source
+        ):
+            while line := source.readline(RUN_TELEMETRY_BYTES_MAX + 1):
+                if len(line) > RUN_TELEMETRY_BYTES_MAX:
+                    raise ValueError(
+                        f"telemetry record exceeded {RUN_TELEMETRY_BYTES_MAX} bytes"
+                    )
+                yield line
+
     def telemetry(self, outcomes: Sequence[Outcome]) -> dict[str, CaseTelemetry]:
         selected = {(o.case.binary, o.case.test): o.case.full_name for o in outcomes}
         attempts = {
@@ -376,28 +428,27 @@ class ArtifactStore:
             if (identity.binary, identity.test) in selected
         }
         held = {o.case.full_name: CaseTelemetry() for o in outcomes}
-        with self.path.open("rb") as source:
-            for line in source:
-                row = EVIDENCE.validate_json(line)
-                if isinstance(row, RequestEvidence):
-                    continue
-                attempt = dict(row.record.resource).get("test.case.name", "")
-                full_name = attempts.get(attempt)
-                if full_name is None:
-                    continue
-                telemetry = held[full_name]
-                if isinstance(row, LogEvidence):
-                    if len(telemetry.logs) == telemetry.logs.maxlen:
-                        telemetry.dropped.logs += 1
-                    telemetry.logs.append(row.record)
-                elif isinstance(row, SpanEvidence):
-                    if len(telemetry.spans) == telemetry.spans.maxlen:
-                        telemetry.dropped.spans += 1
-                    telemetry.spans.append(row.record)
-                else:
-                    if len(telemetry.points) == telemetry.points.maxlen:
-                        telemetry.dropped.points += 1
-                    telemetry.points.append(row.record)
+        for line in self.read(self.path):
+            row = EVIDENCE.validate_json(line)
+            if isinstance(row, RequestEvidence):
+                continue
+            attempt = dict(row.record.resource).get("test.case.name", "")
+            full_name = attempts.get(attempt)
+            if full_name is None:
+                continue
+            telemetry = held[full_name]
+            if isinstance(row, LogEvidence):
+                if len(telemetry.logs) == telemetry.logs.maxlen:
+                    telemetry.dropped.logs += 1
+                telemetry.logs.append(row.record)
+            elif isinstance(row, SpanEvidence):
+                if len(telemetry.spans) == telemetry.spans.maxlen:
+                    telemetry.dropped.spans += 1
+                telemetry.spans.append(row.record)
+            else:
+                if len(telemetry.points) == telemetry.points.maxlen:
+                    telemetry.dropped.points += 1
+                telemetry.points.append(row.record)
         return held
 
 
@@ -696,6 +747,59 @@ def controlled_arguments(arguments: Sequence[str]) -> list[str]:
     return retained
 
 
+def reuse_archive(
+    command: Command, arguments: Sequence[str], directory: Path, *, llvm_cov: bool
+) -> None:
+    """Run from discovery's extracted archive and original environment."""
+
+    retained: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--":
+            retained.extend(arguments[index:])
+            break
+        name, separator, _ = argument.partition("=")
+        if name in {"--archive-file", "--archive-format", "--extract-to"}:
+            index += 1 if separator else 2
+            continue
+        if name not in {
+            "--extract-overwrite",
+            "--persist-extract-tempdir",
+            "--no-report",
+        }:
+            retained.append(argument)
+        index += 1
+
+    metadata = directory / "target/nextest"
+    cargo_metadata = metadata / "cargo-metadata.json"
+    binaries_metadata = metadata / "binaries-metadata.json"
+    if not cargo_metadata.is_file() or not binaries_metadata.is_file():
+        raise ValueError("Nextest archive metadata is missing after discovery")
+    if llvm_cov:
+        from rift_dev.suites import parse_coverage_environment
+
+        coverage = (
+            CargoCommand("llvm-cov", "show-env", "--sh")
+            .with_environment(command.environment() or os.environ)
+            .with_env(CARGO_TARGET_DIR=str(directory))
+        )
+        command.with_env(
+            **parse_coverage_environment(coverage.output()),
+            CARGO_TARGET_DIR=str(directory),
+        )
+    command.arguments = ["nextest", "run", *retained]
+    append_options(
+        command,
+        "--cargo-metadata",
+        str(cargo_metadata),
+        "--binaries-metadata",
+        str(binaries_metadata),
+        "--target-dir-remap",
+        str(directory / "target"),
+    )
+
+
 def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path]:
     """Discover exact identities using the same instrumented build as execution."""
     arguments = controlled_arguments(command.arguments[2:])
@@ -709,11 +813,15 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
     llvm_cov = command.arguments[:2] == ["llvm-cov", "nextest"]
     archived = any(a.partition("=")[0] == "--archive-file" for a in listing)
     archive_directory: Path | None = None
-    if llvm_cov and archived:
-        # cargo-llvm-cov injects --extract-to during execution. Discovery must
-        # use that same directory and must not forward a duplicate option.
-        target = source.get(
-            "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+    if archived:
+        # Discovery and execution use the same extracted archive. Coverage keeps
+        # its configured directory; plain Nextest keeps this invocation's archive.
+        target = (
+            source.get(
+                "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+            )
+            if llvm_cov
+            else str(directory / "archive")
         )
         retained: list[str] = []
         index = 0
@@ -737,7 +845,8 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         if not archive_directory.is_absolute():
             archive_directory = command.directory / archive_directory
         archive_directory.mkdir(parents=True, exist_ok=True)
-        command.with_env(CARGO_LLVM_COV_TARGET_DIR=str(archive_directory))
+        if llvm_cov:
+            command.with_env(CARGO_LLVM_COV_TARGET_DIR=str(archive_directory))
         arguments = retained
         command.arguments = [*command.arguments[:2], *arguments]
         listing = list_arguments(arguments)
@@ -772,7 +881,11 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         command.directory
     )
     discovery.with_timeout(RUN_SECONDS_MAX).with_output_limit(RUN_LOG_BYTES_MAX)
-    discovered = TestList.model_validate_json(discovery.output_bytes(echo_stderr=False))
+    discovered_bytes = discovery.output_bytes(echo_stderr=False)
+    (directory / "discovery.json").write_bytes(discovered_bytes)
+    discovered = TestList.model_validate_json(discovered_bytes)
+    if archive_directory is not None:
+        reuse_archive(command, arguments, archive_directory, llvm_cov=llvm_cov)
     outcomes: dict[str, Outcome] = {}
     for suite in discovered.rust_suites.values():
         for name, test in suite.testcases.items():
@@ -981,14 +1094,13 @@ def collection_report(
     from collections import deque
 
     requests: deque[RequestEvidence] = deque(maxlen=EXPORT_REQUEST_REPORT_MAX)
-    with artifact.path.open("rb") as source:
-        for line in source:
-            try:
-                evidence = EVIDENCE.validate_json(line)
-            except ValidationError:
-                continue
-            if isinstance(evidence, RequestEvidence):
-                requests.append(evidence)
+    for line in ArtifactStore.read(artifact.path):
+        try:
+            evidence = EVIDENCE.validate_json(line)
+        except ValidationError:
+            continue
+        if isinstance(evidence, RequestEvidence):
+            requests.append(evidence)
     lines = [
         "==== collection errors ====",
         *errors,
@@ -1074,7 +1186,7 @@ def run(command: Command, arguments: Sequence[str] | None = None) -> None:
     config: Path | None = None
     stdout_path = directory / "stdout.jsonl"
     stderr_path = directory / "stderr.log"
-    raw_path = directory / "telemetry.jsonl"
+    raw_path = directory / "telemetry.jsonl.gz"
     omitted_log = 0
     served = Collector()
     artifact = ArtifactStore(raw_path, outcomes)

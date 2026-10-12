@@ -7,12 +7,15 @@ use ignore::overrides::{Override, OverrideBuilder};
 use rift_protocol::dependencies::{
     PackageAvailability, PackageContextEntry, PackageSelector, REQUIREMENT_ANY,
 };
-use rift_protocol::read::PackageIdentity;
+use rift_protocol::read::{PackageIdentity, SourceLocation};
 use serde::Deserialize;
 
 use crate::context::{InstallFolder, InstallLocation, is_whole_version};
 use crate::manifest::{StaticFileFailure, WorkspacePaths};
 use crate::resolver::StaticInputs;
+
+mod registry;
+pub(crate) use registry::{RegistryConfig, RegistryDegradations, npm_registry};
 
 /// The package namespace every npm and Bun entry belongs to: both install from the npm
 /// registry, so one package has one identity whichever tool pinned it.
@@ -36,23 +39,20 @@ pub(crate) const NODE_MODULES_DIRECTORY_NAME: &str = "node_modules";
 pub(crate) fn installed_folder(
     directory: &Path,
     install_path: &str,
-    (name, version): (&str, &str),
+    package: PackageIdentity,
     inputs: &mut dyn StaticInputs,
-) -> InstallFolder {
+) -> Option<InstallFolder> {
+    package.owner().ok()?;
     let folder: PathBuf = install_path
         .split('/')
         .fold(directory.to_path_buf(), |folder, segment| {
             folder.join(segment)
         });
     let folder = inputs.canonical_path(&folder).unwrap_or(folder);
-    InstallFolder {
-        package: PackageIdentity {
-            manager: NPM_MANAGER.to_owned(),
-            name: name.to_owned(),
-            version: version.to_owned(),
-        },
+    Some(InstallFolder {
+        origin: SourceLocation::Dependency { package },
         location: InstallLocation::Path(folder),
-    }
+    })
 }
 
 /// The character opening a scoped package name, `@scope/name`.

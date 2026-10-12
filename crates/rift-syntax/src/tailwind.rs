@@ -586,6 +586,8 @@ fn symbol(name: &str, kind: &'static str, range: ByteRange) -> SyntaxSymbol {
         signatures: Arc::from([]),
         documentation: Arc::from([]),
         documentation_ranges: Vec::new(),
+        module_path: None,
+        python_overload: None,
     }
 }
 
@@ -642,9 +644,10 @@ pub fn append_framework_symbols(
             .fail();
     }
     let mut combined = document.symbols().to_vec();
+    combined.extend_from_slice(document.facts().left_out_symbols());
     combined.extend(symbols);
     combined.sort_by_key(|symbol| symbol.range.start);
-    let result = SyntaxDocument::new(
+    let mut result = SyntaxDocument::new(
         document.language().clone(),
         source.path.clone(),
         document.nodes().to_vec(),
@@ -653,15 +656,22 @@ pub fn append_framework_symbols(
     )
     .with_source_witness(source.text)
     .with_syntax_limits(limits)
-    .with_left_out_declarations(omitted)
+    .with_left_out_declarations(omitted - document.facts().left_out_symbols().len())
     .with_framework_context();
+    if let Some(bindings) = document.facts().export_bindings() {
+        result = result.with_export_bindings(bindings.to_vec());
+    }
     let parts = SyntaxFactsParts {
         origin: result.facts().origin(),
         language: result.language().clone(),
         symbols: result.symbols().to_vec(),
+        left_out_symbols: result.facts().left_out_symbols().to_vec(),
         has_errors: result.has_errors(),
         left_out_declarations: result.left_out_declaration_count(),
         markdown_facts: None,
+        export_bindings: result.facts().export_bindings().map(<[_]>::to_vec),
+        macro_invocations: result.facts().macro_invocations().map(<[_]>::to_vec),
+        scope: result.facts().scope().map(<[_]>::to_vec),
         source_digest: FileDigest::of(source.text.as_bytes()),
     };
     SyntaxFacts::from_parts(source.text, limits, parts)?;

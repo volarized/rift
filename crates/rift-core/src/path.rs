@@ -49,6 +49,25 @@ pub enum PathViolation {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProjectPath(Arc<str>);
 
+impl get_size2::GetSize for ProjectPath {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (bytes, tracker) = get_size2::GetSize::get_heap_size_with_tracker(&self.0, tracker);
+        (
+            bytes.saturating_add(2 * std::mem::size_of::<usize>()),
+            tracker,
+        )
+    }
+}
+
 impl ProjectPath {
     /// Validates one project-relative path.
     ///
@@ -107,6 +126,21 @@ impl Borrow<str> for ProjectPath {
 /// Validated path relative to one source location.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SourcePath(Arc<str>);
+
+impl get_size2::GetSize for SourcePath {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        rift_protocol::retained_arc_material(&self.0, tracker, |_, tracker| (0, tracker))
+    }
+}
 
 impl SourcePath {
     /// Validates one catalog-relative source path.
@@ -338,5 +372,23 @@ mod tests {
             "source path is empty; \
              use a workspace-relative path with `/` separators and no `.` or `..` components"
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_path_material_tests {
+    use super::SourcePath;
+    use get_size2::{GetSize, StandardTracker};
+
+    #[test]
+    fn retained_source_paths_charge_shared_allocation_once() {
+        let value = SourcePath::new("src/lib.rs").expect("validated source value");
+        let cloned = value.clone();
+        let (first, tracker) = value.get_heap_size_with_tracker(StandardTracker::new());
+        assert_eq!(first, value.0.len() + 2 * std::mem::size_of::<usize>());
+        let (second, tracker) = cloned.get_heap_size_with_tracker(tracker);
+        assert_eq!(second, 0, "one shared allocation is counted once");
+        let (total, _) = cloned.get_size_with_tracker(tracker);
+        assert_eq!(total, std::mem::size_of::<SourcePath>());
     }
 }

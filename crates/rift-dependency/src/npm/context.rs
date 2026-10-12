@@ -19,7 +19,9 @@ use crate::node::{
     NPM_MANAGER, PACKAGE_MANIFEST_FILE_NAME, PackageManifest, installed_folder,
     is_workspace_version, parse_package_manifest, path_availability, version_availability,
 };
+use crate::node::{RegistryConfig, npm_registry};
 use crate::resolver::{ContextRequest, StaticInputs};
+use rift_protocol::read::PackageIdentity;
 
 /// The registry URL prefix a package fetched from the public npm registry resolves from.
 const NPM_REGISTRY_URL: &str = "https://registry.npmjs.org/";
@@ -54,29 +56,36 @@ pub(super) fn npm_context(
     let workspace = WorkspacePaths::new(request.root, inputs);
     let mut links = BTreeMap::new();
     let mut parsed = Vec::new();
+    let mut registry_degradations = crate::node::RegistryDegradations::default();
     for manifest in request.manifests {
         answer.inputs.push(manifest.clone());
+        let directory = manifest_directory_path(request.root, manifest);
+        let registries = RegistryConfig::read(&directory, manifest, false, inputs, &mut answer);
         pin_lockfile(
             request.root,
             manifest,
             &workspace,
+            (&registries, &mut registry_degradations),
             inputs,
             &mut links,
             &mut answer,
         );
-        let directory = manifest_directory_path(request.root, manifest);
         let observed = read_static_file(&directory, PACKAGE_MANIFEST_FILE_NAME, inputs);
         match observed.and_then(|bytes| parse_package_manifest(&bytes)) {
-            Ok(package) => parsed.push((manifest, package)),
+            Ok(package) => parsed.push((manifest, package, registries)),
             Err(failure) => report(&mut answer, manifest, &failure),
         }
     }
-    link_members(request.root, &parsed, &mut links, &mut answer);
+    let members: Vec<_> = parsed
+        .iter()
+        .map(|(manifest, package, _)| (*manifest, package))
+        .collect();
+    link_members(request.root, &members, &mut links, &mut answer);
     let claimed_names: BTreeSet<&str> = parsed
         .iter()
-        .filter_map(|(_, package)| package.name())
+        .filter_map(|(_, package, _)| package.name())
         .collect();
-    for (manifest, package) in &parsed {
+    for (manifest, package, registries) in &parsed {
         let directory = manifest_directory_path(request.root, manifest);
         let declared = package.declared(|name, version| match links.get(name) {
             Some(true) => None,
@@ -84,8 +93,23 @@ pub(super) fn npm_context(
             None if is_workspace_version(version) && claimed_names.contains(name) => None,
             None => version_availability(version, &directory, &workspace, inputs),
         });
-        answer.entries.extend(declared);
+        for mut entry in declared {
+            if matches!(
+                entry.availability,
+                PackageAvailability::Canonical | PackageAvailability::PrivateRegistry
+            ) {
+                entry.registry = registries.registry(&entry.name).map(str::to_owned);
+                if entry.registry.is_none() {
+                    registry_degradations.unresolved(manifest, &entry.name);
+                    entry.availability = PackageAvailability::RegistryUnresolved;
+                } else {
+                    entry.availability = registry_availability(entry.registry.as_deref());
+                }
+            }
+            answer.entries.push(entry);
+        }
     }
+    registry_degradations.report(&mut answer);
     answer
 }
 
@@ -96,7 +120,7 @@ pub(super) fn npm_context(
 /// quadratic in the manifest count, which `MANIFESTS_MAX` bounds.
 fn link_members(
     root: &Path,
-    parsed: &[(&ProjectPath, PackageManifest)],
+    parsed: &[(&ProjectPath, &PackageManifest)],
     links: &mut BTreeMap<String, bool>,
     answer: &mut ContextAnswer,
 ) {
@@ -135,6 +159,7 @@ fn pin_lockfile(
     root: &Path,
     manifest: &ProjectPath,
     workspace: &WorkspacePaths,
+    (registries, registry_degradations): (&RegistryConfig, &mut crate::node::RegistryDegradations),
     inputs: &mut dyn StaticInputs,
     links: &mut BTreeMap<String, bool>,
     answer: &mut ContextAnswer,
@@ -175,19 +200,88 @@ fn pin_lockfile(
         ) else {
             continue;
         };
-        answer.install_folders.push(installed_folder(
-            &directory,
-            key,
-            (installed.name, installed.version),
-            inputs,
-        ));
-        answer.entries.push(PackageContextEntry::new(
+        let registry = if matches!(
+            availability,
+            PackageAvailability::Canonical
+                | PackageAvailability::PrivateRegistry
+                | PackageAvailability::RegistryUnresolved
+        ) {
+            resolved_registry(package.resolved.as_deref(), installed.name, registries)
+        } else {
+            None
+        };
+        if matches!(
+            availability,
+            PackageAvailability::Canonical
+                | PackageAvailability::PrivateRegistry
+                | PackageAvailability::RegistryUnresolved
+        ) && registry.is_none()
+        {
+            registry_degradations.unresolved(manifest, installed.name);
+        }
+        if let Some(registry) = &registry {
+            let package = PackageIdentity {
+                manager: NPM_MANAGER.to_owned(),
+                registry: registry.clone(),
+                name: installed.name.to_owned(),
+                version: installed.version.to_owned(),
+            };
+            if let Some(folder) = installed_folder(&directory, key, package, inputs) {
+                answer.install_folders.push(folder);
+            }
+        }
+        let mut entry = PackageContextEntry::new(
             NPM_MANAGER,
             installed.name,
             PackageSelector::Version(installed.version.to_owned()),
-            availability,
-        ));
+            if registry.is_some() {
+                registry_availability(registry.as_deref())
+            } else if matches!(
+                availability,
+                PackageAvailability::Canonical
+                    | PackageAvailability::PrivateRegistry
+                    | PackageAvailability::RegistryUnresolved
+            ) {
+                PackageAvailability::RegistryUnresolved
+            } else {
+                availability
+            },
+        );
+        entry.registry = registry;
+        answer.entries.push(entry);
     }
+}
+
+fn registry_availability(registry: Option<&str>) -> PackageAvailability {
+    if registry == Some("npmjs.org") {
+        PackageAvailability::Canonical
+    } else {
+        PackageAvailability::PrivateRegistry
+    }
+}
+
+fn resolved_registry(
+    resolved: Option<&str>,
+    name: &str,
+    config: &RegistryConfig,
+) -> Option<String> {
+    let configured = config.registry(name)?;
+    let Some(locator) = resolved else {
+        return Some(configured.to_owned());
+    };
+    if !locator.contains("://") {
+        return Some(configured.to_owned());
+    }
+    let endpoint = npm_registry(locator)?;
+    // npm's official host is a configured-registry selector in a lockfile.
+    if endpoint.starts_with("registry.npmjs.org/") || endpoint == "npmjs.org" {
+        return Some(configured.to_owned());
+    }
+    (endpoint == configured
+        || endpoint
+            .strip_prefix(configured)
+            .is_some_and(|rest| rest.starts_with('/')))
+    .then(|| configured.to_owned())
 }
 
 /// The package name and link target of a hoisted `link` entry: npm links a workspace
@@ -237,7 +331,7 @@ fn report(answer: &mut ContextAnswer, manifest: &ProjectPath, failure: &StaticFi
 /// An entry with no `resolved` came from the default registry. A `file:` locator is a
 /// path relative to the lockfile, and a `git+` or `git:` locator a git repository. Any
 /// other `http:` or `https:` host is a `url` entry when the root package declares the
-/// package by URL, and a private registry otherwise: the two lock the same shape.
+/// package by URL. Otherwise the defining registry needs an observed configuration.
 fn resolved_availability(
     resolved: Option<&str>,
     declared_by_url: bool,
@@ -263,7 +357,7 @@ fn resolved_availability(
     if declared_by_url && is_url_version(locator) {
         return Some(PackageAvailability::Url);
     }
-    Some(PackageAvailability::PrivateRegistry)
+    Some(PackageAvailability::RegistryUnresolved)
 }
 
 #[cfg(test)]
@@ -275,6 +369,65 @@ mod tests {
     use crate::resolver::{DependencyResolver, LOCKFILE_BYTES_MAX};
 
     const ROOT: &str = "/workspace";
+
+    #[test]
+    fn magic_npm_registry_uses_observed_scope_and_preserves_endpoint_path() {
+        let mut inspector = RecordedInspector::default()
+            .with_file(format!("{ROOT}/.npmrc"), "registry=https://registry.npmjs.org/\n@org:registry=https://registry.example/releases\n//registry.example/:_authToken=secret\n")
+            .with_file(format!("{ROOT}/package-lock.json"), r#"{"packages":{"node_modules/@org/demo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/@org/demo/-/demo-1.0.0.tgz"},"node_modules/demo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"}}}"#);
+        let answer = context(&["package.json"], &mut inspector);
+        assert!(answer.degradations.is_empty());
+        assert_eq!(
+            answer
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.registry.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("@org/demo", Some("registry.example/releases")),
+                ("demo", Some("npmjs.org"))
+            ]
+        );
+        assert_eq!(answer.install_folders.len(), 2);
+        assert!(
+            inspector
+                .asked
+                .iter()
+                .all(|question| !question.starts_with("command "))
+        );
+    }
+
+    #[test]
+    fn unobserved_npm_registry_and_unknown_cdn_cannot_mint_owners() {
+        let lock = r#"{"packages":{"node_modules/demo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/demo/-/demo-1.0.0.tgz"},"node_modules/cdn":{"version":"1.0.0","resolved":"https://cdn.example/demo-1.0.0.tgz"}}}"#;
+        for observed in [false, true] {
+            let mut inspector =
+                RecordedInspector::default().with_file(format!("{ROOT}/package-lock.json"), lock);
+            if observed {
+                inspector = inspector.with_file(
+                    format!("{ROOT}/.npmrc"),
+                    "registry=https://registry.npmjs.org/\n",
+                );
+            }
+            let answer = context(&["package.json"], &mut inspector);
+            assert_eq!(answer.install_folders.len(), usize::from(observed));
+            assert_eq!(answer.entries.len(), 2);
+            assert!(
+                answer
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.registry.is_none())
+                    .all(|entry| entry.availability == PackageAvailability::RegistryUnresolved)
+            );
+            assert!(!answer.degradations.is_empty());
+            assert!(
+                answer
+                    .degradations
+                    .iter()
+                    .all(|message| !message.contains("https://"))
+            );
+        }
+    }
 
     /// A lockfile pinning one registry package, one private-registry package, one git
     /// package, one bundled package, one nested copy at another version than the top-level
@@ -354,6 +507,10 @@ mod tests {
     #[test]
     fn test_a_lockfile_pins_exact_versions_and_sorts_every_locator_by_kind() {
         let mut inspector = RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/.npmrc"),
+                "registry=https://registry.npmjs.org/\n",
+            )
             .with_file(format!("{ROOT}/package-lock.json"), LOCKFILE)
             .with_canonical(
                 format!("{ROOT}/node_modules/left-pad"),
@@ -371,7 +528,7 @@ mod tests {
                 ),
                 (
                     "internal-tool: version 2.0.0".to_owned(),
-                    PackageAvailability::PrivateRegistry
+                    PackageAvailability::RegistryUnresolved
                 ),
                 (
                     "left-pad: version 1.3.0".to_owned(),
@@ -393,7 +550,10 @@ mod tests {
             .install_folders
             .iter()
             .map(|folder| {
-                let package = &folder.package;
+                let rift_protocol::read::SourceLocation::Dependency { package } = &folder.origin
+                else {
+                    panic!("dependency fixture");
+                };
                 (
                     format!("{}/{}@{}", package.manager, package.name, package.version),
                     &folder.location,
@@ -406,10 +566,6 @@ mod tests {
             [
                 ("npm/bundled@0.1.0".to_owned(), &at("node_modules/bundled")),
                 (
-                    "npm/internal-tool@2.0.0".to_owned(),
-                    &at("node_modules/internal-tool")
-                ),
-                (
                     "npm/left-pad@1.3.0".to_owned(),
                     &at("node_modules/.pnpm/left-pad@1.3.0/node_modules/left-pad")
                 ),
@@ -417,7 +573,6 @@ mod tests {
                     "npm/zod@3.25.76".to_owned(),
                     &at("node_modules/left-pad/node_modules/zod")
                 ),
-                ("npm/tool@3.0.0".to_owned(), &at("node_modules/tool")),
                 ("npm/zod@4.0.0".to_owned(), &at("node_modules/zod")),
             ],
             "a nested copy at another version gets a folder of its own, and a linked \
@@ -431,9 +586,41 @@ mod tests {
         );
         assert_eq!(
             answer.inputs,
-            [project("package.json"), project("package-lock.json")]
+            [
+                project("package.json"),
+                project(".npmrc"),
+                project("package-lock.json")
+            ]
         );
-        assert!(answer.degradations.is_empty());
+        assert_eq!(answer.degradations.len(), 1);
+        assert!(answer.degradations[0].contains("internal-tool"));
+    }
+
+    #[test]
+    fn registry_degradation_keeps_all_unresolved_npm_observations_with_one_count() {
+        let packages: BTreeMap<_, _> = (0..3000)
+            .map(|index| {
+                (
+                    format!("node_modules/package-{index}"),
+                    serde_json::json!({"version": "1.0.0"}),
+                )
+            })
+            .collect();
+        let lockfile = serde_json::to_vec(&serde_json::json!({"packages": packages}))
+            .expect("bounded lockfile fixture");
+        let mut inspector =
+            RecordedInspector::default().with_file(format!("{ROOT}/package-lock.json"), lockfile);
+        let answer = context(&["package.json"], &mut inspector);
+        assert_eq!(answer.entries.len(), 3000);
+        assert!(answer.entries.iter().all(|entry| {
+            entry.registry.is_none()
+                && entry.availability == PackageAvailability::RegistryUnresolved
+        }));
+        assert!(answer.install_folders.is_empty());
+        assert_eq!(answer.degradations.len(), 1);
+        assert!(answer.degradations[0].contains("3000 packages"));
+        assert!(answer.degradations[0].contains("environment variables"));
+        assert!(answer.degradations[0].len() < 1024);
     }
 
     #[test]
@@ -453,8 +640,12 @@ mod tests {
   "optionalDependencies": { "fsevents": "~2.3.0" }
 }
 "#;
-        let mut inspector =
-            RecordedInspector::default().with_file(format!("{ROOT}/package.json"), manifest);
+        let mut inspector = RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/.npmrc"),
+                "registry=https://registry.npmjs.org/\n",
+            )
+            .with_file(format!("{ROOT}/package.json"), manifest);
 
         let answer = context(&["package.json"], &mut inspector);
 
@@ -764,7 +955,7 @@ mod tests {
             [
                 (
                     "internal-tool: version 2.0.0".to_owned(),
-                    PackageAvailability::PrivateRegistry
+                    PackageAvailability::RegistryUnresolved
                 ),
                 (
                     "tarball: version 1.0.0".to_owned(),
@@ -775,7 +966,7 @@ mod tests {
                     PackageAvailability::Url
                 ),
             ],
-            "a host the root declares no URL for locks like a private registry"
+            "a tarball host alone does not establish a defining registry"
         );
     }
 
@@ -785,6 +976,10 @@ mod tests {
         // carries `workspaces`. `plugin` stands below `packages/app`; `shared` beside it.
         let app = r#"{"name":"app","dependencies":{"shared":"workspace:*","plugin":"workspace:^","left-pad":"^1.3.0"}}"#;
         let files = [
+            (
+                "/mono/packages/app/.npmrc",
+                "registry=https://registry.npmjs.org/\n",
+            ),
             ("/mono/package.json", r#"{"name":"mono","private":true}"#),
             (
                 "/mono/pnpm-workspace.yaml",
@@ -874,6 +1069,10 @@ mod tests {
     /// The table-form workspace's files below `ROOT`, the root manifest given.
     fn table_workspace(root_manifest: &str) -> RecordedInspector {
         RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/.npmrc"),
+                "registry=https://registry.npmjs.org/\n",
+            )
             .with_file(format!("{ROOT}/package.json"), root_manifest)
             .with_file(
                 format!("{ROOT}/packages/api/package.json"),
@@ -962,6 +1161,10 @@ mod tests {
     fn test_an_empty_workspaces_list_names_no_member() {
         let manifest = r#"{"name":"probe","workspaces":[],"dependencies":{"api":"*"}}"#;
         let mut inspector = RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/.npmrc"),
+                "registry=https://registry.npmjs.org/\n",
+            )
             .with_file(format!("{ROOT}/package.json"), manifest)
             .with_file(
                 format!("{ROOT}/packages/api/package.json"),
@@ -987,6 +1190,10 @@ mod tests {
     fn test_an_invalid_workspaces_glob_is_a_degradation_and_the_declarations_stand() {
         let manifest = r#"{"name":"probe","workspaces":["packages/["],"dependencies":{"api":"*"}}"#;
         let mut inspector = RecordedInspector::default()
+            .with_file(
+                format!("{ROOT}/.npmrc"),
+                "registry=https://registry.npmjs.org/\n",
+            )
             .with_file(format!("{ROOT}/package.json"), manifest)
             .with_file(
                 format!("{ROOT}/packages/api/package.json"),

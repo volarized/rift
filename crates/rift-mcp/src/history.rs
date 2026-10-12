@@ -15,7 +15,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rift_core::constants::RIFT_STATE_DIRECTORY;
 use rift_error::errors;
 use rift_history_store::{HistoryStore, StoreFiller, StoreLocation};
 use rift_protocol::configuration::HistoryConfiguration;
@@ -109,6 +108,24 @@ pub(crate) fn store_revision(
     format!("{:x}", hasher.finalize())
 }
 
+fn owner_store_revision(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+    analyzer_revision: &str,
+    configuration: &ConfigurationState,
+) -> Result<String, RiftError> {
+    let identity = crate::storage::owner::workspace_identity(root, owner)?;
+    let revision = store_revision(analyzer_revision, configuration);
+    if matches!(owner, rift_protocol::identity::SymbolOwner::Local) {
+        return Ok(revision);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(revision.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// One server's history lane: the store handle every snapshot attaches.
 #[derive(Clone, Debug)]
 pub(crate) struct HistoryLane {
@@ -129,8 +146,25 @@ impl HistoryLane {
     /// request, and each case other than an unversioned workspace is logged.
     /// When the common git directory refuses the store and the worktree's
     /// state directory takes it, the refusal is logged once, here.
+    #[cfg(test)]
     pub(crate) async fn start(
         root: &Path,
+        configuration: &ConfigurationState,
+        analyzer_revision: &str,
+        (activity, cancellation, gate): (Arc<IdleTracker>, CancellationToken, Option<AnalysisGate>),
+    ) -> Option<Self> {
+        Self::start_with_owner(
+            (root, &rift_protocol::identity::SymbolOwner::Local),
+            configuration,
+            analyzer_revision,
+            (activity, cancellation, gate),
+        )
+        .await
+    }
+
+    /// Opens one history lane bound to a fixed root and local owner.
+    pub(crate) async fn start_with_owner(
+        (root, owner): (&Path, &rift_protocol::identity::SymbolOwner),
         configuration: &ConfigurationState,
         analyzer_revision: &str,
         (activity, cancellation, gate): (Arc<IdleTracker>, CancellationToken, Option<AnalysisGate>),
@@ -139,7 +173,8 @@ impl HistoryLane {
         if !history.enabled || !configuration.is_accepted() {
             return None;
         }
-        let opening = OpenedStore::open(root, configuration, &history, analyzer_revision);
+        let opening =
+            OpenedStore::open_with_owner((root, owner), configuration, &history, analyzer_revision);
         let opened = tokio::task::spawn_blocking(opening).await.ok()??;
         let wake = Arc::new(Notify::new());
         let signal = Arc::clone(&wake);
@@ -179,15 +214,16 @@ impl OpenedStore {
     /// The blocking open: the repository, the policy, the store, a sweep of
     /// the store files no live server holds, and a first plan against what the
     /// store holds, so the first read already knows how far the fill has got.
-    fn open(
-        root: &Path,
+    fn open_with_owner(
+        (root, owner): (&Path, &rift_protocol::identity::SymbolOwner),
         configuration: &ConfigurationState,
         history: &HistoryConfiguration,
         analyzer_revision: &str,
     ) -> impl FnOnce() -> Option<Self> + Send + 'static {
         let root = root.to_path_buf();
         let history = history.clone();
-        let revision = store_revision(analyzer_revision, configuration);
+        let revision = owner_store_revision(&root, owner, analyzer_revision, configuration);
+        let state_directory = crate::storage::workspace_state_directory(&root, owner);
         let policy = (
             configuration.source_visibility(),
             configuration.text_inclusion(),
@@ -197,6 +233,12 @@ impl OpenedStore {
             .index_limits(rift_index::WorkspaceIndexLimits::default())
             .map(rift_index::WorkspaceIndexLimits::syntax);
         move || {
+            let revision = revision
+                .map_err(|error| open_failed("history.open", &error))
+                .ok()?;
+            let state_directory = state_directory
+                .map_err(|error| open_failed("history.open", &error))
+                .ok()?;
             let syntax = syntax
                 .map_err(|error| open_failed("history.open", &error))
                 .ok()?;
@@ -205,7 +247,7 @@ impl OpenedStore {
                     .map_err(|error| open_failed("history.open", &error))
                     .ok()?;
             let location = StoreLocation::new(&analysis.common_directory(), &revision)
-                .or_worktree(&root.join(RIFT_STATE_DIRECTORY));
+                .or_worktree(&state_directory);
             let store = HistoryStore::open(&location)
                 .map_err(|error| {
                     rift_tracing::warn!(
@@ -710,6 +752,47 @@ mod collection_tests {
     use crate::validation::ConfigurationState;
     use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
     use rift_protocol::configuration::WorkspaceConfiguration;
+
+    #[test]
+    fn named_history_revision_keeps_root_and_owner_separate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use rift_protocol::identity::SymbolOwner;
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let configuration = ConfigurationState::accept(first.path());
+        let cloud = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let other = SymbolOwner::NamedLocal {
+            name: "other".to_owned(),
+        };
+        let local = super::owner_store_revision(
+            first.path(),
+            &SymbolOwner::Local,
+            "analyzer",
+            &configuration,
+        )?;
+        assert_eq!(
+            local,
+            store_revision("analyzer", &configuration),
+            "primary history keeps its existing key"
+        );
+        let named = super::owner_store_revision(first.path(), &cloud, "analyzer", &configuration)?;
+        assert_ne!(local, named);
+        assert_ne!(
+            named,
+            super::owner_store_revision(first.path(), &other, "analyzer", &configuration)?
+        );
+        assert_ne!(
+            named,
+            super::owner_store_revision(second.path(), &cloud, "analyzer", &configuration)?
+        );
+        assert!(
+            !first.path().join(".rift").exists(),
+            "key selection allocates no history store"
+        );
+        Ok(())
+    }
 
     #[test]
     fn changed_history_collection_bounds_key_distinct_store_files()

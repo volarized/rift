@@ -941,28 +941,47 @@ mod tests {
         );
         let service = ().serve(StreamableHttpClientTransport::from_config(config)).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let response = loop {
+        let selected = loop {
             let response = service
                 .call_tool(
-                    CallToolRequestParams::new("get_symbol").with_arguments(
-                        serde_json::json!({"name": name})
+                    CallToolRequestParams::new("search").with_arguments(
+                        serde_json::json!({"pattern": name, "target": "symbol", "scope": "local"})
                             .as_object()
                             .cloned()
                             .ok_or("tool arguments must be an object")?,
                     ),
                 )
                 .await?;
-            if response
+            let ids = response
                 .structured_content
                 .as_ref()
-                .and_then(|content| content["hits"].as_array())
-                .is_some_and(|hits| !hits.is_empty())
-                || tokio::time::Instant::now() >= deadline
-            {
-                break response;
+                .and_then(|content| content["results"].as_array())
+                .into_iter()
+                .flatten()
+                .filter(|hit| hit["hit"]["symbol"]["name"] == name)
+                .filter_map(|hit| hit["hit"]["symbol"]["id"].as_str())
+                .collect::<Vec<_>>();
+            if let [id] = ids.as_slice() {
+                break rift_protocol::read::SymbolId::parse(id)?;
+            }
+            if ids.len() > 1 || tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "one captured declaration identity must match {name}: {response:?}"
+                )
+                .into());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
+        let response = service
+            .call_tool(
+                CallToolRequestParams::new("get_symbol").with_arguments(
+                    serde_json::json!({"id": selected})
+                        .as_object()
+                        .cloned()
+                        .ok_or("tool arguments must be an object")?,
+                ),
+            )
+            .await?;
         service.cancel().await?;
         response
             .structured_content
@@ -1082,6 +1101,10 @@ mod tests {
             std::fs::create_dir_all(&root)?;
             crate::server::hermetic_workspace(&root, idle_configuration)?;
             std::fs::write(root.join("lib.rs"), format!("pub fn {symbol}() {{}}\n"))?;
+            std::fs::write(
+                root.join("Cargo.toml"),
+                "[package]\nname='workspace_fixture'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+            )?;
             roots.push(root);
         }
         rift_history::fixture::init(authority);
@@ -1109,10 +1132,18 @@ mod tests {
         let indigo = repository_symbol(&server, &roots[2], "indigo").await?;
         let others_answered = tokio::time::Instant::now();
         let quartz = repository_symbol(&server, &roots[3], "quartz").await?;
-        assert_eq!(amber["hits"][0]["symbol"]["name"], "amber", "{amber}");
-        assert_eq!(cedar["hits"][0]["symbol"]["name"], "cedar", "{cedar}");
-        assert_eq!(indigo["hits"][0]["symbol"]["name"], "indigo", "{indigo}");
-        assert_eq!(quartz["hits"][0]["symbol"]["name"], "quartz", "{quartz}");
+        assert_eq!(amber["symbol"]["name"], "amber", "{amber}");
+        assert_eq!(cedar["symbol"]["name"], "cedar", "{cedar}");
+        assert_eq!(indigo["symbol"]["name"], "indigo", "{indigo}");
+        assert_eq!(quartz["symbol"]["name"], "quartz", "{quartz}");
+        for (answer, (_, name)) in [&amber, &cedar, &indigo, &quartz].into_iter().zip(fixtures) {
+            assert_eq!(answer["outcome"], "found");
+            assert_eq!(answer["declarations"][0]["path"], "lib.rs");
+            assert_eq!(
+                answer["declarations"][0]["source"],
+                format!("pub fn {name}() {{}}")
+            );
+        }
         let expired_roots = u32::try_from(roots.len() - 1)?;
         keep_one_until_others_release(&server, &roots[3], "quartz", expired_roots, others_answered)
             .await?;
@@ -1133,6 +1164,8 @@ mod tests {
             pid: std::process::id(),
             identity: server.identity.clone(),
             server: None,
+            root: None,
+            owner: None,
         };
         crate::http::request_stop(&lock)
             .await

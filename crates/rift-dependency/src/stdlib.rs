@@ -18,8 +18,6 @@ use rift_protocol::dependencies::{
 };
 use rift_protocol::read::ProjectPath;
 
-use rift_protocol::read::PackageIdentity;
-
 use crate::context::{InstallFolder, InstallLocation, is_whole_version};
 use crate::resolver::{
     CommandOutput, ContextInputs, FileObservation, ResolverName, StaticInputs, ToolchainCommand,
@@ -166,10 +164,16 @@ pub fn standard_library_answer(
             (&outcome.selector, outcome.install_folder)
         {
             answer.install_folders.push(InstallFolder {
-                package: PackageIdentity {
-                    manager: STANDARD_LIBRARY_MANAGER.to_owned(),
-                    name: library.name().to_owned(),
-                    version: version.clone(),
+                origin: rift_protocol::read::SourceLocation::Stdlib {
+                    runtime: Some(rift_protocol::read::RuntimeIdentity {
+                        runtime: match library {
+                            StandardLibrary::Rust => "rustc",
+                            StandardLibrary::Node => "node",
+                            StandardLibrary::Python => "cpython",
+                        }
+                        .to_owned(),
+                        version: version.clone(),
+                    }),
                 },
                 location: InstallLocation::Path(folder),
             });
@@ -571,6 +575,42 @@ pub(crate) fn pyvenv_version(text: &str) -> Option<Pin> {
     })
 }
 
+/// Reads an exact `CPython` version from one selected environment's marker.
+/// Partial versions and other implementations establish no runtime owner.
+#[must_use]
+pub fn python_environment_runtime(
+    path: &Path,
+    inputs: &mut dyn StaticInputs,
+) -> Option<rift_protocol::read::RuntimeIdentity> {
+    let text = pin_text(inputs, &path.join(crate::PROJECT_ENVIRONMENT_MARKER))?;
+    let mut implementations = lines_inclusive(&text).filter_map(|line| {
+        let (key, value) = without_ending(line).split_once('=')?;
+        (key.trim() == "implementation").then_some(value.trim())
+    });
+    if implementations.next()? != "CPython" || implementations.next().is_some() {
+        return None;
+    }
+    let Pin::Exact(version) = pyvenv_version(&text)? else {
+        return None;
+    };
+    for key in PYVENV_VERSION_KEYS {
+        let mut values = lines_inclusive(&text).filter_map(|line| {
+            let (name, value) = without_ending(line).split_once('=')?;
+            (name.trim() == key).then_some(value.trim())
+        });
+        if let Some(value) = values.next()
+            && (values.next().is_some()
+                || python_version_word(value) != Pin::Exact(version.clone()))
+        {
+            return None;
+        }
+    }
+    Some(rift_protocol::read::RuntimeIdentity {
+        runtime: "cpython".to_owned(),
+        version,
+    })
+}
+
 /// The version `.python-version` names: its first line that is not blank or a comment.
 #[must_use]
 pub(crate) fn python_pin_line(text: &str) -> Option<Pin> {
@@ -841,10 +881,11 @@ mod tests {
         assert_eq!(
             answer.install_folders,
             [InstallFolder {
-                package: PackageIdentity {
-                    manager: "stdlib".to_owned(),
-                    name: "rust".to_owned(),
-                    version: "1.98.1".to_owned(),
+                origin: rift_protocol::read::SourceLocation::Stdlib {
+                    runtime: Some(rift_protocol::read::RuntimeIdentity {
+                        runtime: "rustc".to_owned(),
+                        version: "1.98.1".to_owned(),
+                    })
                 },
                 location: InstallLocation::Path(PathBuf::from(
                     "/toolchains/1.98-aarch64-apple-darwin/lib/rustlib/src/rust/library"
@@ -903,10 +944,27 @@ source = \"registry+https://github.com/rust-lang/crates.io-index\"
 
     fn folder(manager: &str, name: &str, version: &str, path: &str) -> InstallFolder {
         InstallFolder {
-            package: PackageIdentity {
-                manager: manager.to_owned(),
-                name: name.to_owned(),
-                version: version.to_owned(),
+            origin: if manager == "stdlib" {
+                rift_protocol::read::SourceLocation::Stdlib {
+                    runtime: Some(rift_protocol::read::RuntimeIdentity {
+                        runtime: match name {
+                            "rust" => "rustc",
+                            "python" => "cpython",
+                            other => other,
+                        }
+                        .to_owned(),
+                        version: version.to_owned(),
+                    }),
+                }
+            } else {
+                rift_protocol::read::SourceLocation::Dependency {
+                    package: rift_protocol::read::PackageIdentity {
+                        manager: manager.to_owned(),
+                        registry: "crates.io".to_owned(),
+                        name: name.to_owned(),
+                        version: version.to_owned(),
+                    },
+                }
             },
             location: InstallLocation::Path(PathBuf::from(path)),
         }

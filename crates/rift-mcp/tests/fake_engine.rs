@@ -36,7 +36,7 @@ done
 /// `CALLEE_LINE` as the one callee, and answers references with `beacon`'s own occurrence
 /// on line 0 beside a call at line `CALLER_LINE`. `PROGRESS` runs once `initialize` is
 /// answered.
-const SCRIPTED_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
+pub(crate) const SCRIPTED_CALLS_ENGINE: &str = r#"frame() { printf 'Content-Length: %d\r\n\r\n%s' "${#1}" "$1"; }
 while IFS= read -r header; do
   IFS= read -r blank
   length=$(printf '%s' "$header" | tr -dc 0-9)
@@ -67,10 +67,16 @@ pub(crate) const UNANNOUNCED_WORK: &str = ":";
 
 /// The `lib.rs` a scripted calls engine answers about: `beacon` on line 0, and `caller` on
 /// lines 2 to 4, calling it on line 3.
-const SCRIPTED_CALLS_FILES: &[(&str, &str)] = &[(
-    "lib.rs",
-    "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
-)];
+const SCRIPTED_CALLS_FILES: &[(&str, &str)] = &[
+    (
+        "Cargo.toml",
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    ),
+    (
+        "lib.rs",
+        "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n",
+    ),
+];
 
 /// The lines a scripted calls engine names: the callee's on an outgoing answer, and the
 /// call's on an incoming one.
@@ -92,10 +98,8 @@ pub(crate) fn rust_engine(script: &str) -> TestResult<(tempfile::TempDir, String
     let engine = tempfile::tempdir()?;
     let path = engine.path().join("engine.sh");
     std::fs::write(&path, script)?;
-    let table = format!(
-        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
-        path.display()
-    );
+    let command = serde_json::to_string(&path)?;
+    let table = format!("[languages.rust.lsp]\ncommand = [\"sh\", {command}]\n");
     Ok((engine, table))
 }
 

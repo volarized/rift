@@ -33,7 +33,13 @@ impl RiftMcp {
             let tool = &mut route.attr;
             rift_protocol::schema::strip_optional_null_arms(Arc::make_mut(&mut tool.input_schema));
             if let Some(output) = tool.output_schema.as_mut() {
-                rift_protocol::schema::strip_optional_null_arms(Arc::make_mut(output));
+                let output = Arc::make_mut(output);
+                rift_protocol::schema::strip_optional_null_arms(output);
+                if matches!(tool.name.as_ref(), "get_source" | "get_symbol" | "search") {
+                    // These result unions contain only objects. Keep their union constraints
+                    // while declaring the root type required by earlier MCP clients.
+                    output.insert("type".to_owned(), json!("object"));
+                }
             }
         }
         router
@@ -80,4 +86,42 @@ pub fn schema_document() -> String {
 #[must_use]
 pub fn tool_listing() -> Vec<rmcp::model::Tool> {
     RiftMcp::tool_router().list_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_output_unions_keep_their_original_constraints() {
+        let declared = RiftMcp::declared_tool_router().list_all();
+        let served = tool_listing();
+        for name in ["get_source", "get_symbol", "search"] {
+            let original = declared
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("declared tool");
+            let current = served
+                .iter()
+                .find(|tool| tool.name == name)
+                .expect("served tool");
+            let mut expected = original
+                .output_schema
+                .as_deref()
+                .expect("declared output")
+                .clone();
+            rift_protocol::schema::strip_optional_null_arms(&mut expected);
+            assert!(!expected.contains_key("type"));
+            let mut actual = current
+                .output_schema
+                .as_deref()
+                .expect("served output")
+                .clone();
+            assert_eq!(actual.remove("type"), Some(json!("object")));
+            assert_eq!(
+                actual, expected,
+                "{name} keeps every original union constraint"
+            );
+        }
+    }
 }

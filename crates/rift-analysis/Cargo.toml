@@ -17,6 +17,7 @@ archive = ["dep:flate2", "dep:rawzip", "dep:tar", "dep:zip"]
 parallel = ["dep:rayon"]
 
 [dependencies]
+get-size2.workspace = true
 ignore = { workspace = true, optional = true }
 rift-core.workspace = true
 rift-dependency = { workspace = true, optional = true }
@@ -27,6 +28,8 @@ rift-ranking.workspace = true
 rift-syntax = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
+unicode-normalization.workspace = true
 semver = { workspace = true, optional = true }
 sha2.workspace = true
 tree-sitter = { workspace = true, optional = true }

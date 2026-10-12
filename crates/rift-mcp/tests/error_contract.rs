@@ -109,6 +109,47 @@ async fn failing_tool_error(
     failed_call(outcome)
 }
 
+/// Learns the original fixture declaration before requesting its refused history read.
+async fn failing_observed_symbol_error(
+    root: &std::path::Path,
+    mut request: serde_json::Value,
+) -> TestResult<ToolFailure> {
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"history-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+    )?;
+    let (client, server_task) = workspace_client::served_root(root).await?;
+    let answer = workspace_client::search_after_population(
+        &client,
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await?;
+    let results = answer["results"]
+        .as_array()
+        .ok_or("fixture symbol results")?;
+    let mut exact = results.iter().filter(|row| {
+        row["hit"]["symbol"]["name"] == "beacon"
+            && row["hit"]["symbol"]["language"] == "rust"
+            && row["path"] == "lib.rs"
+    });
+    let declaration = exact.next().ok_or("original beacon declaration")?;
+    assert!(exact.next().is_none(), "one fixture declaration: {answer}");
+    assert_eq!(declaration["hit"]["symbol"]["kind"], "function");
+    let identity = declaration["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("original beacon identity")?;
+    let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
+    assert_eq!(parsed.owner(), &rift_protocol::identity::SymbolOwner::Local);
+    assert_eq!(parsed.wire_identity(), identity);
+    request["id"] = identity.into();
+    let outcome = client
+        .call_tool(workspace_client::tool_request("get_symbol", &request))
+        .await;
+    client.cancel().await?;
+    server_task.await?;
+    failed_call(outcome)
+}
+
 #[tokio::test]
 async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
     let directory = tempfile::tempdir()?;
@@ -117,12 +158,7 @@ async fn revision_read_without_a_repository_names_the_remedy() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure = failing_tool_error(
-        directory.path(),
-        "get_symbol",
-        json!({ "name": "beacon", "rev": "main" }),
-    )
-    .await?;
+    let failure = failing_observed_symbol_error(directory.path(), json!({ "rev": "main" })).await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     assert_eq!(failure.retry, RetryDirective::OperatorAction);
     let message = &failure.message;
@@ -141,12 +177,8 @@ async fn symbol_history_without_a_repository_names_the_remedy() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure = failing_tool_error(
-        directory.path(),
-        "get_symbol",
-        json!({ "name": "beacon", "include": ["history"] }),
-    )
-    .await?;
+    let failure =
+        failing_observed_symbol_error(directory.path(), json!({ "include": ["history"] })).await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     assert_eq!(failure.retry, RetryDirective::OperatorAction);
     let message = &failure.message;
@@ -168,12 +200,8 @@ async fn symbol_history_with_history_disabled_is_refused() -> TestResult {
             hermetic_search::HERMETIC_TABLES
         ),
     )?;
-    let failure = failing_tool_error(
-        directory.path(),
-        "get_symbol",
-        json!({ "name": "beacon", "include": ["history"] }),
-    )
-    .await?;
+    let failure =
+        failing_observed_symbol_error(directory.path(), json!({ "include": ["history"] })).await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     let message = &failure.message;
     assert!(
@@ -194,12 +222,7 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
             hermetic_search::HERMETIC_TABLES
         ),
     )?;
-    let failure = failing_tool_error(
-        directory.path(),
-        "get_symbol",
-        json!({ "name": "beacon", "rev": "main" }),
-    )
-    .await?;
+    let failure = failing_observed_symbol_error(directory.path(), json!({ "rev": "main" })).await?;
     assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
     let message = &failure.message;
     assert!(

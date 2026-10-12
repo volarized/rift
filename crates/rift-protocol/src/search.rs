@@ -70,7 +70,7 @@ pub enum MatchedField {
 pub struct PathPattern(
     #[schemars(example = &"src/**")]
     #[schemars(regex(
-        pattern = r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$"
+        pattern = r"^(?:\.*[^\\\u0000-\u001F\u007F/.][^\\\u0000-\u001F\u007F/]*|\.{3,})(?:/(?:\.*[^\\\u0000-\u001F\u007F/.][^\\\u0000-\u001F\u007F/]*|\.{3,})?)*$"
     ))]
     pub String,
 );
@@ -186,6 +186,11 @@ pub enum ResultOrder {
 #[schemars(transform = schema::pair_range_with_line)]
 #[schemars(transform = schema::declare_search_hit_empty_defaults)]
 pub struct SearchHit {
+    /// The immutable view that supplied this hit. The caller passes its `id` to later
+    /// exact, source, declaration, and relationship reads to retain the same context.
+    /// Absent when the caller selected latest facts without retained serving context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedView>,
     /// What was found. A symbol, a node, a file, a documentation block, or a commit -
     /// whichever `target` allowed.
     pub hit: SearchHitTarget,
@@ -458,7 +463,7 @@ pub enum SearchInclude {
     {
         "target": "symbol",
         "traversal": {
-            "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+            "seed": "rift://symbol/local/rust/rift_server/read/ReadService",
             "direction": "incoming",
             "depth": 2,
             "facets": [
@@ -470,7 +475,7 @@ pub enum SearchInclude {
     {
         "target": "symbol",
         "traversal": {
-            "seed": "rift://symbol/rust/crates/rift-server/src/engine_read.rs/resolve_symbol_callees",
+            "seed": "rift://symbol/local/rust/rift_server/engine_read/resolve_symbol_callees",
             "direction": "outgoing",
             "facets": [
                 "calls"
@@ -525,6 +530,11 @@ pub enum SearchInclude {
     }
 ]))]
 pub struct SearchParams {
+    /// The captured serving context returned by an earlier search. The server retains
+    /// query, filters, ranking policy, selected projects and releases under this view.
+    /// An expired or mismatched view is unavailable; the server never substitutes latest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedViewId>,
     /// Which entity kinds may be returned - a kind selector, never the text to search for;
     /// that is `query`. Omitted, `all`: declarations, tree entries, and documentation
     /// blocks. `commit` matches `query` against the messages of the commits the history
@@ -675,7 +685,7 @@ pub enum SearchParamsTarget {
                 "hit": {
                     "target": "symbol",
                     "symbol": {
-                        "id": "rift://symbol/rust/src/config.rs/load_config",
+                        "id": "rift://symbol/local/rust/app/config/load_config",
                         "language": "rust",
                         "name": "load_config",
                         "kind": "function",
@@ -704,7 +714,7 @@ pub enum SearchParamsTarget {
                                             "start": 42,
                                             "end": 48
                                         },
-                                        "symbol": "rift://symbol/rust/src/config.rs/Config"
+                                        "symbol": "rift://symbol/local/rust/app/config/Config"
                                     }
                                 ],
                                 "language": "rust",
@@ -811,6 +821,11 @@ pub enum SearchParamsTarget {
     }
 ]))]
 pub struct SearchResult {
+    /// The captured serving context for this result, including an empty page. Each hit
+    /// carries the original view of its selected project or released owner.
+    /// Absent when the caller selected latest facts without retained serving context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedView>,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
     /// Where this page sits in the full result set under the request's `limit`.
@@ -843,7 +858,7 @@ pub const SEARCH_TRAVERSAL_FACETS_MAX: usize = RelationshipFacet::VARIANTS.len()
 #[serde(deny_unknown_fields)]
 #[schemars(extend("examples" = [
     {
-        "seed": "rift://symbol/rust/crates/rift-server/src/read.rs/ReadService",
+        "seed": "rift://symbol/local/rust/rift_server/read/ReadService",
         "direction": "incoming",
         "depth": 1
     }
@@ -980,6 +995,57 @@ mod tests {
                 expected,
                 "value={value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn path_pattern_schema_preserves_relative_glob_rules_without_lookahead() {
+        let schema = serde_json::to_value(schemars::schema_for!(PathPattern)).expect("schema");
+        let pattern = schema["pattern"].as_str().expect("pattern");
+        assert!(!pattern.contains("(?!"), "no lookahead: {pattern}");
+        let validator = jsonschema::validator_for(&schema).expect("path pattern schema");
+        for value in [
+            "src/**/*.rs",
+            "README.md",
+            ".rift",
+            ".github/**",
+            "src/",
+            "src//lib.rs",
+            "src///",
+            "...",
+            "..a/b",
+            "a./.b",
+            "[ab]/**",
+            "**/日本語?.rs",
+        ] {
+            assert!(
+                validator.is_valid(&json!(value)),
+                "accepted pattern {value:?}"
+            );
+            assert_eq!(PathPattern(value.to_owned()).violation(), None);
+        }
+        for value in [
+            "",
+            "/src/lib.rs",
+            ".",
+            "..",
+            "./src",
+            "../src",
+            "src/./lib.rs",
+            "src/../lib.rs",
+            "src//../lib.rs",
+            "src/..",
+            "src/.",
+            "src\\lib.rs",
+            "src/line\n.rs",
+            "src/\u{1}.rs",
+            "src/\u{7f}.rs",
+        ] {
+            assert!(
+                !validator.is_valid(&json!(value)),
+                "refused pattern {value:?}"
+            );
+            assert!(PathPattern(value.to_owned()).violation().is_some());
         }
     }
 
@@ -1205,7 +1271,7 @@ mod tests {
     #[test]
     fn search_traversal_rejects_an_unknown_field() {
         let result: Result<SearchTraversal, _> = serde_json::from_value(json!({
-            "seed": "rift://symbol/rust/src/lib.rs/beacon",
+            "seed": "rift://symbol/local/rust/app/beacon",
             "intent": "trace"
         }));
         assert!(
@@ -1218,7 +1284,7 @@ mod tests {
     fn search_params_with_traversal_and_no_query_parses() {
         let params: SearchParams = serde_json::from_value(json!({
             "traversal": {
-                "seed": "rift://symbol/rust/src/lib.rs/beacon"
+                "seed": "rift://symbol/local/rust/app/beacon"
             }
         }))
         .expect("a traversal-only request must parse");

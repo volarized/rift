@@ -131,14 +131,16 @@ mod tests {
     fn regular_content_owner_keeps_existing_identity() {
         let identity = DocumentationContentIdentity {
             source: DocumentationSourceIdentity::Package {
-                unit: SourceUnitId("rift://source/cargo/beacon@1.0.0/README.md".to_owned()),
+                unit: SourceUnitId(
+                    "rift://source/cargo/crates.io/beacon@1.0.0/README.md".to_owned(),
+                ),
             },
             cell: None,
         };
 
         assert_eq!(
             content_owner_identity(&identity).expect("owner identity"),
-            "rift://source/cargo/beacon@1.0.0/README.md"
+            "rift://source/cargo/crates.io/beacon@1.0.0/README.md"
         );
     }
 

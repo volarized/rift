@@ -60,9 +60,11 @@ fn test_package_source_extensions_accept_ascii_case_without_changing_source() {
             );
             let package = PackageIdentity {
                 manager: "npm".to_owned(),
+                registry: "npmjs.org".to_owned(),
                 name: "beacon".to_owned(),
                 version: "1.0.0".to_owned(),
             };
+            let owner = package.owner().expect("fixture owner");
             let origin = ContributionOrigin::new(
                 Some(SourceLocation::Dependency {
                     package: package.clone(),
@@ -72,7 +74,7 @@ fn test_package_source_extensions_accept_ascii_case_without_changing_source() {
             .expect("package origin");
             let files = [PackageSource::new(&path, text)];
             let input = ExactPackageInput::new(
-                &package,
+                &owner,
                 &language,
                 &origin,
                 &files,
@@ -94,9 +96,11 @@ fn test_unknown_package_extension_is_unselected_and_refused() {
     assert!(selection.select([&path]).source().is_empty());
     let package = PackageIdentity {
         manager: "npm".to_owned(),
+        registry: "npmjs.org".to_owned(),
         name: "beacon".to_owned(),
         version: "1.0.0".to_owned(),
     };
+    let owner = package.owner().expect("fixture owner");
     let language = ShippedLanguage::TypeScript.language();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
@@ -107,7 +111,7 @@ fn test_unknown_package_extension_is_unselected_and_refused() {
     .expect("package origin");
     let files = [PackageSource::new(&path, "export function open() {}\n")];
     let input = ExactPackageInput::new(
-        &package,
+        &owner,
         &language,
         &origin,
         &files,
@@ -163,7 +167,7 @@ fn assert_package_syntax(
     assert!(
         fresh
             .publication()
-            .symbols
+            .objects
             .iter()
             .any(|symbol| symbol.name == "open")
     );

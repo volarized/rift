@@ -36,6 +36,12 @@ RESOURCE_URIS = {"rift://map", "rift://workspace"}
 
 
 PYTHON_SOURCE = "def serve(port: int) -> int:\n    return port\n\n\ndef caller() -> int:\n    return serve(8080)\n"
+PYTHON_METADATA = """[build-system]
+requires=['setuptools==80.9.0']
+build-backend='setuptools.build_meta'
+[tool.setuptools]
+py-modules=['service']
+"""
 PYTHON_CONFIGURATION = """
 [languages.python.lsp]
 embedded = "ty"
@@ -111,19 +117,78 @@ async def check_resources(client: Client) -> None:
 
 
 async def declaration_node(client: Client, name: str) -> str:
-    """Prove nodes returns the declaration emitted by get_symbol."""
-    hit = await symbol_hit(client, name)
-    node = string_value(hit.get("node"), "hit.node")
-    span = object_value(hit.get("range"), "hit.range")
-    position = span.get("start")
-    require(type(position) is int, f"range.start is not an integer: {span}")
-    listing = await client.call("nodes", {"path": "lib.rs", "position": position})
-    nodes = array_value(listing.get("nodes"), "nodes.nodes")
-    require(
-        any(object_value(entry, "node").get("id") == node for entry in nodes),
-        f"nodes omitted the declaration address {node}: {listing}",
+    """Prove nodes retains the captured declaration and original source."""
+    search = await client.call(
+        "search",
+        {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
     )
-    return node
+    matches = []
+    for value in array_value(search.get("results"), "search.results"):
+        row = object_value(value, "hit")
+        target = object_value(row.get("hit"), "hit")
+        if target.get("target") != "symbol":
+            continue
+        symbol = object_value(target.get("symbol"), "symbol")
+        if symbol.get("name") == name and symbol.get("language") == "rust":
+            matches.append(row)
+    require(len(matches) == 1, f"expected one {name} declaration: {search}")
+    hit = matches[0]
+    selected_view = hit.get("view")
+    if selected_view is None:
+        selected_view = search.get("view")
+    captured = object_value(selected_view, "search.view")
+    identity = symbol_id(hit)
+    answer = await client.call(
+        "get_symbol",
+        {
+            "id": identity,
+            "include": ["source"],
+            "view": string_value(captured.get("id"), "view.id"),
+        },
+    )
+    require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
+    require(
+        object_value(answer.get("symbol"), "symbol").get("id") == identity,
+        f"symbol identity changed: {answer}",
+    )
+    declarations = array_value(answer.get("declarations"), "symbol declarations")
+    require(len(declarations) == 1, f"expected one declaration: {answer}")
+    declaration = object_value(declarations[0], "declaration")
+    for field in ("path", "range", "source"):
+        require(
+            declaration.get(field) == hit.get(field),
+            f"symbol declaration changed {field}: {answer}",
+        )
+    span = object_value(declaration.get("range"), "declaration.range")
+    start, end = span.get("start"), span.get("end")
+    require(
+        type(start) is int and type(end) is int and 0 <= start < end,
+        f"declaration range is invalid: {span}",
+    )
+    view = object_value(answer.get("view"), "symbol.view")
+    require(view == captured, f"symbol changed captured view: {answer}")
+    listing = await client.call(
+        "nodes",
+        {
+            "path": string_value(declaration.get("path"), "declaration.path"),
+            "position": end - 1,
+            "view": string_value(view.get("id"), "view.id"),
+        },
+    )
+    require(listing.get("view") == view, f"nodes changed captured view: {listing}")
+    nodes = array_value(listing.get("nodes"), "nodes.nodes")
+    sources = array_value(listing.get("source"), "nodes.source")
+    require(len(nodes) == len(sources), f"nodes lost source excerpts: {listing}")
+    matches = [
+        (object_value(entry, "node"), excerpt)
+        for entry, excerpt in zip(nodes, sources, strict=True)
+        if object_value(entry, "node").get("symbol") == identity
+        and object_value(entry, "node").get("range") == span
+    ]
+    require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
+    node, excerpt = matches[0]
+    require(excerpt == declaration.get("source"), f"nodes changed source: {listing}")
+    return string_value(node.get("id"), "node.id")
 
 
 async def check_agent(binary: Path, version: str | None = None) -> None:
@@ -142,6 +207,9 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
             newline="",
         )
         (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
+        (root / "pyproject.toml").write_text(
+            PYTHON_METADATA, encoding="utf-8", newline=""
+        )
         with (
             retained_collector(base) as telemetry,
             Server(

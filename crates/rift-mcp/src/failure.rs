@@ -202,6 +202,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Code::Cancelled,
             Retry::SameRequest,
             &[
+                "rift.client.request_cancelled",
                 "rift.index.workspace_cancelled",
                 "rift.server.read_cancelled",
                 "rift.syntax.parse_cancelled",
@@ -221,6 +222,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Code::ConfigurationInvalid,
             Retry::OperatorAction,
             &[
+                "rift.client.configuration_invalid",
                 "rift.analysis.package_retained_source_limits_invalid",
                 "rift.analysis.source_pattern_invalid",
                 "rift.index.workspace_composition",
@@ -263,9 +265,17 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             ],
         ),
         (
+            Code::ContentUnavailable,
+            Retry::OperatorAction,
+            &["rift.server.search_coverage_unavailable"],
+        ),
+        (
             Code::InternalError,
             Retry::OperatorAction,
             &[
+                "rift.client.remote_failed",
+                "rift.client.response_invalid",
+                "rift.analysis.package_artifact_invalid",
                 "rift.cli.update_binary_invalid",
                 "rift.cli.update_publish_copy_failed",
                 "rift.cli.update_publish_failed",
@@ -274,6 +284,9 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.cli.update_rollback_cleanup_failed",
                 "rift.cli.update_rollback_failed",
                 "rift.cli.update_staging_failed",
+                "rift.mcp.forward_failed",
+                "rift.mcp.server_identity_mismatch",
+                "rift.mcp.start_unreachable",
             ],
         ),
         (
@@ -352,6 +365,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Code::InvalidRequest,
             Retry::Never,
             &[
+                "rift.client.request_invalid",
                 "rift.analysis.documentation_digest_mismatch",
                 "rift.analysis.documentation_duplicate_source",
                 "rift.analysis.documentation_encoding_failed",
@@ -383,6 +397,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.core.contribution_too_much_evidence",
                 "rift.core.contribution_unbound_identity",
                 "rift.core.identity_invalid",
+                "rift.core.symbol_identity_invalid",
                 "rift.core.resolver_id_empty",
                 "rift.core.resolver_id_invalid_character",
                 "rift.core.resolver_id_too_long",
@@ -411,12 +426,15 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.ranking.query_quote_unterminated",
                 "rift.ranking.query_term_length",
                 "rift.server.read_invalid",
+                "rift.server.search_view_expired",
+                "rift.server.search_view_context",
             ],
         ),
         (
             Code::LimitExceeded,
             Retry::Never,
             &[
+                "rift.client.body_limit",
                 "rift.analysis.context7_oversized",
                 "rift.analysis.context7_too_many_entries",
                 "rift.analysis.documentation_limit_exceeded",
@@ -462,6 +480,11 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
         ),
         (
             Code::PermissionDenied,
+            Retry::OperatorAction,
+            &["rift.client.remote_permission_denied"],
+        ),
+        (
+            Code::PermissionDenied,
             Retry::Never,
             &["rift.lsp.uri_outside_root"],
         ),
@@ -478,6 +501,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.history.revision_not_commit",
                 "rift.history.revision_unknown",
                 "rift.search.model_file_missing",
+                "rift.server.search_exact_release_unavailable",
             ],
         ),
         (
@@ -501,6 +525,8 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Code::TemporarilyUnavailable,
             Retry::SameRequest,
             &[
+                "rift.client.remote_unavailable",
+                "rift.client.request_failed",
                 "rift.history_store.lock_unstable",
                 "rift.index.workspace_changed_during_capture",
                 "rift.lsp.engine_analyzing",
@@ -613,6 +639,142 @@ mod tests {
             assert!(
                 super::wire_guidance(slug).is_some(),
                 "unmapped error slug: {slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_failures_keep_distinct_wire_guidance() {
+        use wire::{ErrorCode as Code, RetryDirective as Retry};
+        for (slug, code, retry) in [
+            (
+                "rift.client.request_invalid",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+            ("rift.client.body_limit", Code::LimitExceeded, Retry::Never),
+            (
+                "rift.client.request_failed",
+                Code::TemporarilyUnavailable,
+                Retry::SameRequest,
+            ),
+            (
+                "rift.client.request_cancelled",
+                Code::Cancelled,
+                Retry::SameRequest,
+            ),
+            (
+                "rift.client.configuration_invalid",
+                Code::ConfigurationInvalid,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.client.response_invalid",
+                Code::InternalError,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.client.remote_permission_denied",
+                Code::PermissionDenied,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.client.remote_unavailable",
+                Code::TemporarilyUnavailable,
+                Retry::SameRequest,
+            ),
+            (
+                "rift.client.remote_failed",
+                Code::InternalError,
+                Retry::OperatorAction,
+            ),
+        ] {
+            assert_eq!(super::wire_guidance(slug), Some((code, retry)), "{slug}");
+            assert!(errors::REGISTERED_SLUGS.contains(&slug), "{slug}");
+            assert_eq!(
+                super::WIRE_GUIDANCE
+                    .iter()
+                    .flat_map(|(_, _, slugs)| slugs.iter())
+                    .filter(|mapped| **mapped == slug)
+                    .count(),
+                1,
+                "{slug}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_artifact_and_search_failures_keep_distinct_wire_guidance() {
+        use wire::{ErrorCode as Code, RetryDirective as Retry};
+        for (slug, code, retry) in [
+            (
+                "rift.core.symbol_identity_invalid",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+            (
+                "rift.analysis.package_artifact_invalid",
+                Code::InternalError,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_exact_release_unavailable",
+                Code::ResourceNotFound,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_coverage_unavailable",
+                Code::ContentUnavailable,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_view_expired",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+            (
+                "rift.server.search_view_context",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+        ] {
+            assert_eq!(super::wire_guidance(slug), Some((code, retry)), "{slug}");
+            assert!(errors::REGISTERED_SLUGS.contains(&slug), "{slug}");
+            assert_eq!(
+                super::WIRE_GUIDANCE
+                    .iter()
+                    .flat_map(|(_, _, slugs)| slugs.iter())
+                    .filter(|mapped| **mapped == slug)
+                    .count(),
+                1,
+                "{slug}",
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_operator_failures_keep_exact_wire_guidance() {
+        use wire::{ErrorCode as Code, RetryDirective as Retry};
+
+        for slug in [
+            "rift.mcp.start_unreachable",
+            "rift.mcp.server_identity_mismatch",
+            "rift.mcp.forward_failed",
+        ] {
+            assert_eq!(
+                super::wire_guidance(slug),
+                Some((Code::InternalError, Retry::OperatorAction)),
+                "{slug}",
+            );
+            assert!(errors::REGISTERED_SLUGS.contains(&slug), "{slug}");
+            assert_eq!(
+                super::WIRE_GUIDANCE
+                    .iter()
+                    .flat_map(|(_, _, slugs)| slugs.iter())
+                    .filter(|mapped| **mapped == slug)
+                    .count(),
+                1,
+                "{slug}",
             );
         }
     }

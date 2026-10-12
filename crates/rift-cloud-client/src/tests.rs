@@ -1,4 +1,48 @@
 use super::*;
+use rift_protocol::{
+    read::GetSymbolInclude,
+    symbol_read::{GetSymbolParams, GetSymbolResult},
+};
+use serde_json::json;
+
+fn assert_registered_field(error: &rift_error::RiftError, slug: &str, field: &str) {
+    assert_eq!(error.slug().as_str(), slug, "{error}");
+    assert!(
+        error
+            .context()
+            .any(|(key, value)| key == "field" && value == field),
+        "{error}"
+    );
+}
+
+fn remote_metadata(error: &RiftError) -> serde_json::Value {
+    serde_json::from_str(error_text_field(error, "metadata")).expect("retained response metadata")
+}
+
+fn assert_remote_error(actual: &RiftError, expected: &RiftError) {
+    assert_eq!(actual.slug(), expected.slug());
+    assert_eq!(remote_metadata(actual), remote_metadata(expected));
+    let problem = |error: &RiftError| {
+        error.fields().iter().find_map(|field| match field.value() {
+            rift_error::ErrorValue::Display(value) if field.key() == "problem" => {
+                Some(serde_json::from_str::<serde_json::Value>(value).expect("retained problem"))
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(problem(actual), problem(expected));
+}
+
+fn error_text_field<'error>(error: &'error rift_error::RiftError, key: &str) -> &'error str {
+    error
+        .fields()
+        .iter()
+        .find_map(|field| match field.value() {
+            rift_error::ErrorValue::Display(value) if field.key() == key => Some(value.as_str()),
+            _ => None,
+        })
+        .expect("registered error field")
+}
 
 mod cache;
 mod collection;
@@ -40,9 +84,17 @@ enum FixtureMode {
 #[derive(Clone)]
 enum OperationFixture {
     Valid,
+    ExactSymbol(serde_json::Value),
+    ExactSource(serde_json::Value, StatusCode),
+    SourceDeclarations(serde_json::Value, StatusCode),
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
+    },
+    DocumentationBounds {
+        search: serde_json::Value,
+        symbols: serde_json::Value,
+        source_bytes_max: usize,
     },
     EchoResolution,
     InvalidResolutionAccounting,
@@ -344,10 +396,31 @@ fn operation_response(
         return operation_search_response(mode, query, request_number);
     }
     if path.ends_with("/symbols") {
+        if let OperationFixture::ExactSymbol(value) = mode {
+            let mut response = json_response(value, None);
+            *response.status_mut() = match value["outcome"].as_str() {
+                Some("missing") => StatusCode::NOT_FOUND,
+                Some("unavailable") => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::OK,
+            };
+            return response;
+        }
         return operation_symbol_response(mode, query);
     }
     if path.ends_with("/declarations") {
+        if let OperationFixture::SourceDeclarations(value, status) = mode {
+            let mut response = json_response(value, None);
+            *response.status_mut() = *status;
+            return response;
+        }
         return json_response(&declaration::declaration_response_json(), None);
+    }
+    if path.ends_with("/source")
+        && let OperationFixture::ExactSource(value, status) = mode
+    {
+        let mut response = json_response(value, None);
+        *response.status_mut() = *status;
+        return response;
     }
     if path.ends_with("/patterns") {
         let mut page = pattern::pattern_page_json(query_cursor(query));
@@ -366,7 +439,7 @@ const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
-        OperationFixture::Documentation { .. } => {
+        OperationFixture::Documentation { .. } | OperationFixture::DocumentationBounds { .. } => {
             value["supported_features"] = serde_json::json!([
                 "resolutions",
                 "search",
@@ -375,6 +448,12 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
                 "symbol_documentation"
             ]);
             value["documentation_revision"] = serde_json::json!("0123abcd");
+            if let OperationFixture::DocumentationBounds {
+                source_bytes_max, ..
+            } = mode
+            {
+                value["bounds"]["source_bytes_max"] = serde_json::json!(source_bytes_max);
+            }
         }
         OperationFixture::InvalidPublication => {
             value["publication_format"] = serde_json::json!("other");
@@ -414,7 +493,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
         }
-        OperationFixture::Declarations => {
+        OperationFixture::Declarations | OperationFixture::SourceDeclarations(_, _) => {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "declarations"]);
         }
@@ -449,6 +528,7 @@ fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -
             if let Some(version) = entry["version"].as_str() {
                 available_exact.push(serde_json::json!({
                     "manager": entry["manager"],
+                    "registry": entry["registry"],
                     "name": entry["name"],
                     "version": version,
                 }));
@@ -479,8 +559,8 @@ fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -
         _ => serde_json::json!({
             "available_exact": [],
             "resolved_requirements": [{
-                "entry": {"availability":"canonical","manager":"cargo","name":"demo","requirement":"^1","version":null},
-                "package": {"manager":"cargo","name":"demo","version":"1.0.0"}
+                "entry": {"availability":"canonical","manager":"cargo","registry":"crates.io","name":"demo","requirement":"^1","version":null},
+                "package": {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}
             }],
             "missing_exact": [],
             "missing_requirements": []
@@ -502,7 +582,8 @@ fn operation_search_response(
     }
     let cursor = query_cursor(query);
     let body = match mode {
-        OperationFixture::Documentation { search, .. } => search.clone(),
+        OperationFixture::Documentation { search, .. }
+        | OperationFixture::DocumentationBounds { search, .. } => search.clone(),
         OperationFixture::UnrequestedPackage => {
             search_page_json("other", None, "analyzer-v1", "first")
         }
@@ -566,47 +647,18 @@ fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde
     }
 }
 
-fn operation_symbol_response(mode: &OperationFixture, query: Option<&str>) -> Response {
-    let cursor = query_cursor(query);
-    let followed = cursor.is_some();
-    let body = match mode {
-        OperationFixture::Documentation { symbols, .. } => symbols.clone(),
-        OperationFixture::CollectionBounds { source_bytes, .. } => {
-            let mut page = symbol_page_json("demo", None, "analyzer-v1", "first");
-            page["items"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
-            page
-        }
-        OperationFixture::BodyBoundStop => pages::body_bound_page(
-            symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
-            symbol_page_json("demo", None, "analyzer-v2", "second"),
-            cursor,
-        ),
-        OperationFixture::PageRevisionChange => symbol_page_json(
-            "demo",
-            Some("next"),
-            if followed {
-                "analyzer-v2"
-            } else {
-                "analyzer-v1"
-            },
-            if followed { "second" } else { "first" },
-        ),
-        OperationFixture::MismatchedCursor => symbol_page_json(
-            "demo",
-            (!followed).then_some("next"),
-            "analyzer-v2",
-            "first",
-        ),
-        OperationFixture::RepeatedCursor => symbol_page_json(
-            "demo",
-            Some("next"),
-            "analyzer-v2",
-            if followed { "second" } else { "first" },
-        ),
-        _ if followed => symbol_page_json("demo", None, "analyzer-v2", "second"),
-        _ => symbol_page_json("demo", Some("next"), "analyzer-v2", "first"),
+fn operation_symbol_response(mode: &OperationFixture, _query: Option<&str>) -> Response {
+    let mut value = match mode {
+        OperationFixture::Documentation { symbols, .. }
+        | OperationFixture::DocumentationBounds { symbols, .. } => symbols.clone(),
+        _ => symbol_result_json("demo", "first"),
     };
-    json_response(&body, None)
+    if let OperationFixture::CollectionBounds { source_bytes, .. } = mode {
+        value["declarations"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
+        value["declarations"][0]["range"]["end"] = serde_json::json!(*source_bytes);
+        value["declarations"][0]["source_complete"] = serde_json::json!(true);
+    }
+    json_response(&value, None)
 }
 
 fn query_cursor(query: Option<&str>) -> Option<&str> {
@@ -681,7 +733,7 @@ fn problem_response(status: StatusCode) -> Response {
 }
 
 fn package_json(name: &str) -> serde_json::Value {
-    serde_json::json!({"manager":"cargo","name":name,"version":"1.0.0"})
+    serde_json::json!({"manager":"cargo","registry":"crates.io","name":name,"version":"1.0.0"})
 }
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
@@ -697,7 +749,7 @@ fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
 fn search_hit_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
         "package":package_json(package), "symbol":symbol_json(package, suffix),
-        "unit":format!("rift://source/cargo/{package}@1.0.0/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
+        "unit":format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
         "contributing_fields":["qualified_name"], "match_class":"qualified_exact"
     })
 }
@@ -711,7 +763,8 @@ fn search_page_json(
     serde_json::json!({
         "items":[search_hit_json(package, suffix)], "next_cursor":next,
         "warnings":[], "publication_format":"rift-package-index-v2",
-        "analyzer_revision":analyzer, "corpus_revision":"corpus-v1"
+        "analyzer_revision":analyzer, "corpus_revision":"corpus-v1",
+        "view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}
     })
 }
 
@@ -723,24 +776,11 @@ fn invalid_search_page(mode: &OperationFixture) -> serde_json::Value {
         page["items"][0]["source"] = serde_json::json!("unexpected source");
     } else if matches!(mode, OperationFixture::InvalidSourceIdentity) {
         page["items"][0]["unit"] =
-            serde_json::json!("rift://source/cargo/other@1.0.0/src/first.rs");
+            serde_json::json!("rift://source/cargo/crates.io/other@1.0.0/src/first.rs");
     } else {
         page["items"][0]["match_class"] = serde_json::json!("substring");
     }
     page
-}
-
-fn symbol_page_json(
-    package: &str,
-    next: Option<&str>,
-    analyzer: &str,
-    suffix: &str,
-) -> serde_json::Value {
-    serde_json::json!({
-        "items":[{"package":package_json(package),"symbol":symbol_json(package, suffix),"unit":format!("rift://source/cargo/{package}@1.0.0/src/{suffix}.rs"),"range":{"start":0,"end":4},"line":1,"match_class":"qualified_exact"}],
-        "next_cursor":next, "warnings":[], "publication_format":"rift-package-index-v2",
-        "analyzer_revision":analyzer, "corpus_revision":"corpus-v1"
-    })
 }
 
 fn capabilities_response() -> Response {
@@ -797,10 +837,8 @@ fn test_config_rejects_non_loopback_http() {
         endpoint: "http://example.test/rift".to_owned(),
         ..Config::default()
     };
-    assert_eq!(
-        GlobalClient::new(config).err(),
-        Some(ConfigError::InvalidEndpointScheme)
-    );
+    let error = GlobalClient::new(config).err().expect("endpoint refusal");
+    assert_registered_field(&error, "rift.client.configuration_invalid", "endpoint");
 }
 
 #[test]
@@ -827,11 +865,8 @@ fn test_config_rejects_invalid_endpoint_shapes() {
             endpoint: endpoint.to_owned(),
             ..Config::default()
         };
-        assert_eq!(
-            GlobalClient::new(config).err(),
-            Some(ConfigError::InvalidEndpoint),
-            "{endpoint}"
-        );
+        let error = GlobalClient::new(config).err().expect("endpoint refusal");
+        assert_registered_field(&error, "rift.client.configuration_invalid", "endpoint");
     }
 }
 
@@ -839,7 +874,10 @@ fn test_config_rejects_invalid_endpoint_shapes() {
 fn test_protocol_configuration_converts_without_drift() {
     let source = rift_protocol::configuration::GlobalConfiguration::default();
     let converted = Config::try_from(&source);
-    assert_eq!(converted, Ok(Config::default()));
+    assert_eq!(
+        converted.expect("protocol configuration"),
+        Config::default()
+    );
 }
 
 #[test]
@@ -870,10 +908,10 @@ fn test_config_rejects_every_out_of_range_setting_and_token_name() {
     for (field, change) in cases {
         let mut config = Config::default();
         change(&mut config);
-        assert_eq!(
-            GlobalClient::new(config).err(),
-            Some(ConfigError::OutOfRange(field))
-        );
+        let error = GlobalClient::new(config)
+            .err()
+            .expect("configuration bound");
+        assert_registered_field(&error, "rift.client.configuration_invalid", field);
     }
 
     for token_env in ["", "RIFT-TOKEN"] {
@@ -881,15 +919,68 @@ fn test_config_rejects_every_out_of_range_setting_and_token_name() {
             token_env: token_env.to_owned(),
             ..Config::default()
         };
-        assert_eq!(
-            GlobalClient::new(config).err(),
-            Some(ConfigError::InvalidTokenEnvironment)
-        );
+        let error = GlobalClient::new(config)
+            .err()
+            .expect("token configuration");
+        assert_registered_field(&error, "rift.client.configuration_invalid", "token_env");
     }
 }
 
 #[test]
 fn test_client_errors_use_bounded_messages() {
+    let cases = [
+        (
+            failure::configuration_invalid("enabled", "global client disabled"),
+            "configuration_invalid",
+            "violation",
+            "global client disabled",
+        ),
+        (
+            failure::configuration_invalid("token", "global credential configuration invalid"),
+            "configuration_invalid",
+            "violation",
+            "global credential configuration invalid",
+        ),
+        (
+            failure::body_limit("fixture", "request", 5, 4),
+            "body_limit",
+            "bytes",
+            "5",
+        ),
+        (
+            failure::body_limit("fixture", "response", 6, 5),
+            "body_limit",
+            "bytes",
+            "6",
+        ),
+        (
+            failure::request_failed("fixture", "global request deadline elapsed"),
+            "request_failed",
+            "reason",
+            "global request deadline elapsed",
+        ),
+        (
+            failure::request_cancelled("fixture"),
+            "request_cancelled",
+            "operation",
+            "fixture",
+        ),
+        (
+            failure::request_failed("fixture", "global endpoint connection failed"),
+            "request_failed",
+            "reason",
+            "global endpoint connection failed",
+        ),
+    ];
+    for (error, slug, field, expected) in cases {
+        assert_eq!(error.slug().as_str(), format!("rift.client.{slug}"));
+        assert_eq!(error_text_field(&error, field), expected);
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn test_client_response_errors_use_bounded_messages() {
     let meta = ResponseMeta {
         status: 503,
         content_type: None,
@@ -901,62 +992,79 @@ fn test_client_errors_use_bounded_messages() {
         rate_limit_remaining: None,
         rate_limit_reset: None,
     };
+    let decode = serde_json::from_str::<serde_json::Value>("{").expect_err("invalid JSON");
     let cases = [
-        (ClientError::Disabled, "global client disabled"),
         (
-            ClientError::CredentialConfiguration,
-            "global credential configuration invalid",
+            failure::response_invalid(
+                "fixture",
+                "content_type",
+                "invalid response media type: Some(\"text/plain\")",
+                Some(200),
+            ),
+            "response_invalid",
+            "violation",
+            "invalid response media type: Some(\"text/plain\")",
         ),
         (
-            ClientError::RequestBodyTooLarge { bytes: 5 },
-            "request body exceeds bound: 5 bytes",
+            failure::response_invalid(
+                "fixture",
+                "status",
+                "unsupported global response status",
+                Some(418),
+            ),
+            "response_invalid",
+            "status",
+            "418",
         ),
         (
-            ClientError::ResponseBodyTooLarge { bytes: 6 },
-            "response body exceeds bound: 6 bytes",
-        ),
-        (ClientError::Deadline, "global request deadline elapsed"),
-        (ClientError::Cancelled, "global request cancelled"),
-        (ClientError::Connection, "global endpoint connection failed"),
-        (
-            ClientError::InvalidMediaType {
-                status: 200,
-                content_type: Some("text/plain".to_owned()),
-            },
-            "invalid response media type for status 200: Some(\"text/plain\")",
+            failure::response_source(
+                "fixture",
+                "body",
+                "global response decode failed",
+                Some(200),
+                decode,
+            ),
+            "response_invalid",
+            "violation",
+            "global response decode failed",
         ),
         (
-            ClientError::InvalidResponse { status: 418 },
-            "unsupported global response status: 418",
+            failure::request_invalid("fixture", "query", "global request violates bound"),
+            "request_invalid",
+            "field",
+            "query",
         ),
         (
-            ClientError::Decode { status: 200 },
-            "global response decode failed for status 200",
+            failure::response_invalid(
+                "fixture",
+                "query",
+                "global response violates contract",
+                None,
+            ),
+            "response_invalid",
+            "field",
+            "query",
         ),
         (
-            ClientError::InvalidRequest { field: "query" },
-            "global request violates bound: query",
-        ),
-        (
-            ClientError::InvalidResponseField { field: "query" },
-            "global response violates contract: query",
-        ),
-        (
-            ClientError::FeatureUnavailable {
-                feature: "patterns",
-            },
+            failure::configuration_invalid(
+                "feature",
+                "global API does not advertise feature: patterns",
+            ),
+            "configuration_invalid",
+            "violation",
             "global API does not advertise feature: patterns",
         ),
         (
-            ClientError::Http {
-                meta: Box::new(meta),
-                problem: None,
-            },
-            "global endpoint returned HTTP 503",
+            failure::remote("fixture", &meta, None),
+            "remote_unavailable",
+            "status",
+            "503",
         ),
     ];
-    for (error, expected) in cases {
-        assert_eq!(error.to_string(), expected);
+    for (error, slug, field, expected) in cases {
+        assert_eq!(error.slug().as_str(), format!("rift.client.{slug}"));
+        assert_eq!(error_text_field(&error, field), expected);
+        assert!(error.to_string().contains(expected), "{error}");
     }
 }
 
@@ -964,74 +1072,72 @@ fn test_client_errors_use_bounded_messages() {
 fn test_request_relationships_are_validated_before_transport() {
     let mut resolution = resolution_request();
     resolution.entries[0].availability = PackageAvailability::Path;
-    assert_eq!(
-        validate_resolution_request(&resolution),
-        Err(ClientError::InvalidRequest {
-            field: "availability"
-        })
+    assert_registered_field(
+        &(validate_resolution_request(&resolution)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "availability",
     );
     let mut resolution = resolution_request();
     resolution.entries[0].version = Some("1.0.0".to_owned());
-    assert_eq!(
-        validate_resolution_request(&resolution),
-        Err(ClientError::InvalidRequest {
-            field: "version_or_requirement"
-        })
+    assert_registered_field(
+        &(validate_resolution_request(&resolution)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "version_or_requirement",
     );
     let mut resolution = resolution_request();
     resolution.entries.push(resolution.entries[0].clone());
-    assert_eq!(
-        validate_resolution_request(&resolution),
-        Err(ClientError::InvalidRequest {
-            field: "duplicate_entry"
-        })
+    assert_registered_field(
+        &(validate_resolution_request(&resolution)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "duplicate_entry",
     );
 
     let mut search = search_request();
-    search.terms[0].phrase = true;
-    search.terms[0].prefix = true;
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest {
-            field: "phrase_prefix"
-        })
+    search.terms.as_mut().expect("lexical terms")[0].phrase = true;
+    search.terms.as_mut().expect("lexical terms")[0].prefix = true;
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "phrase_prefix",
     );
     let mut search = search_request();
-    search.terms[0].text = "ab".to_owned();
-    search.terms[0].prefix = true;
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest { field: "prefix" })
+    search.terms.as_mut().expect("lexical terms")[0].text = "ab".to_owned();
+    search.terms.as_mut().expect("lexical terms")[0].prefix = true;
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "prefix",
     );
     let mut search = search_request();
     search.include = Some(vec!["score".to_owned()]);
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest { field: "include" })
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "include",
     );
     let mut search = search_request();
-    search.phase = PackageSearchRequestPhase::Broad;
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest {
-            field: "broad_phase"
-        })
+    search.phase = Some(PackageSearchRequestPhase::Broad);
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "broad_phase",
     );
     let mut search = search_request();
-    search.packages.push(search.packages[0].clone());
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest {
-            field: "duplicate_package"
-        })
+    search.packages = Some(vec![package_request(), package_request()]);
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "duplicate_package",
     );
-    assert_eq!(
-        validate_page(0, None),
-        Err(ClientError::InvalidRequest { field: "limit" })
+    assert_registered_field(
+        &(validate_page(0, None)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "limit",
     );
-    assert_eq!(
-        validate_page(1, Some("")),
-        Err(ClientError::InvalidRequest { field: "cursor" })
+    assert_registered_field(
+        &(validate_page(1, Some(""))).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "cursor",
     );
 }
 
@@ -1044,7 +1150,12 @@ fn test_disabled_client_makes_no_request() {
     let client = GlobalClient::new(config).expect("disabled client construction");
     let runtime = tokio::runtime::Runtime::new().expect("test runtime construction");
     let result = runtime.block_on(client.get_capabilities());
-    assert_eq!(result, Err(ClientError::Disabled));
+    let error = result.expect_err("disabled global access");
+    assert_registered_field(&error, "rift.client.configuration_invalid", "enabled");
+    assert_eq!(
+        error_text_field(&error, "violation"),
+        "global client disabled"
+    );
 }
 
 #[test]
@@ -1055,18 +1166,16 @@ fn test_generated_requests_serialize_only_declared_fields() {
     assert!(value.get("unknown").is_none());
 }
 
-#[test]
-fn test_documentation_request_requires_advertised_capability() {
+#[tokio::test]
+async fn test_documentation_request_requires_advertised_capability() {
     let mut capabilities: Capabilities =
         serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
     let mut request = search_request();
     request.target = Some(PackageSearchRequestTarget::Documentation);
-    assert_eq!(
-        validate_search_request_for_capabilities(&request, 20, None, &capabilities),
-        Err(ClientError::FeatureUnavailable {
-            feature: "documentation_search"
-        })
-    );
+    let error = validate_search_request_for_capabilities(&request, 20, None, &capabilities)
+        .expect_err("documentation capability");
+    assert_registered_field(&error, "rift.client.configuration_invalid", "feature");
+    assert!(error_text_field(&error, "violation").contains("documentation_search"));
 
     capabilities
         .supported_features
@@ -1076,17 +1185,33 @@ fn test_documentation_request_requires_advertised_capability() {
     assert!(validate_search_request_for_capabilities(&request, 20, None, &capabilities).is_ok());
 
     let mut symbol = symbol_request();
-    symbol.include = Some(vec![PackageSymbolRequestInclude::Documentation]);
-    assert_eq!(
-        validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities),
-        Err(ClientError::FeatureUnavailable {
-            feature: "symbol_documentation"
-        })
+    symbol.include = vec![GetSymbolInclude::Documentation];
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let error = client
+        .get_symbol(&symbol)
+        .await
+        .expect_err("documentation capability");
+    assert_registered_field(&error, "rift.client.configuration_invalid", "feature");
+    assert!(error_text_field(&error, "violation").contains("symbol_documentation"));
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
+    assert!(
+        server
+            .state
+            .request_log
+            .lock()
+            .await
+            .iter()
+            .all(|sent| sent.method != Method::POST)
     );
-    capabilities
-        .supported_features
-        .push("symbol_documentation".to_owned());
-    assert!(validate_symbol_request_for_capabilities(&symbol, 20, None, &capabilities).is_ok());
+    assert!(
+        canonical_symbol_response(
+            symbol_result_json("demo", "first"),
+            &symbol,
+            SOURCE_BYTES_MAX
+        )
+        .await
+        .is_ok()
+    );
 }
 
 #[test]
@@ -1133,6 +1258,7 @@ fn test_generated_values_allow_response_additions_and_reject_request_additions()
     let mut request = serde_json::json!({
         "availability": "canonical",
         "manager": "cargo",
+        "registry": "crates.io",
         "name": "demo",
         "requirement": "^1",
         "version": null,
@@ -1174,10 +1300,21 @@ async fn test_fixture_accepts_additive_nested_symbol_field() {
 #[test]
 fn test_serialize_body_rejects_oversized_request() {
     let value = "x".repeat(REQUEST_BODY_BYTES_MAX + 1);
-    assert!(matches!(
-        serialize_body(&value, REQUEST_BODY_BYTES_MAX),
-        Err(ClientError::RequestBodyTooLarge { bytes }) if bytes > REQUEST_BODY_BYTES_MAX
-    ));
+    let error = serialize_body(&value, REQUEST_BODY_BYTES_MAX).expect_err("request body bound");
+    assert_eq!(error.slug().as_str(), "rift.client.body_limit");
+    assert_eq!(error_text_field(&error, "direction"), "request");
+    assert_eq!(
+        error_text_field(&error, "maximum")
+            .parse::<usize>()
+            .expect("body maximum"),
+        REQUEST_BODY_BYTES_MAX
+    );
+    assert!(
+        error_text_field(&error, "bytes")
+            .parse::<usize>()
+            .expect("body bytes")
+            > REQUEST_BODY_BYTES_MAX
+    );
 }
 
 #[test]
@@ -1206,15 +1343,12 @@ fn test_url_join_preserves_endpoint_path_and_encodes_query() {
 
 #[test]
 fn test_token_never_enters_error_text() {
-    assert_eq!(
-        validate_token(String::new()),
-        Err(ConfigError::InvalidToken)
-    );
-    assert_eq!(
-        validate_token("two words".to_owned()),
-        Err(ConfigError::InvalidToken)
-    );
-    let error = ClientError::CredentialConfiguration;
+    for token in [String::new(), "two words".to_owned()] {
+        let error = validate_token(token).expect_err("invalid authorization token");
+        assert_registered_field(&error, "rift.client.configuration_invalid", "token");
+    }
+    let error = validate_token("secret token".to_owned()).expect_err("invalid authorization token");
+    assert_registered_field(&error, "rift.client.configuration_invalid", "token");
     assert!(!error.to_string().contains("secret"));
 }
 
@@ -1224,18 +1358,13 @@ fn test_token_construction_cases_do_not_touch_environment() {
         token_env: "RIFT_CLOUD_CLIENT_TEST_TOKEN_CASES".to_owned(),
         ..Config::default()
     };
-    assert_eq!(
-        GlobalClient::new_with_token(config.clone(), None).map(|_| ()),
-        Ok(())
-    );
-    assert_eq!(
-        GlobalClient::new_with_token(config.clone(), Some(String::new())).err(),
-        Some(ConfigError::InvalidToken)
-    );
-    assert_eq!(
-        GlobalClient::new_with_token(config, Some("token with spaces".to_owned())).err(),
-        Some(ConfigError::InvalidToken)
-    );
+    assert!(GlobalClient::new_with_token(config.clone(), None).is_ok());
+    for token in [String::new(), "token with spaces".to_owned()] {
+        let error = GlobalClient::new_with_token(config.clone(), Some(token))
+            .err()
+            .expect("invalid authorization token");
+        assert_registered_field(&error, "rift.client.configuration_invalid", "token");
+    }
 }
 
 #[tokio::test]
@@ -1334,10 +1463,9 @@ async fn test_fixture_redirect_refused() {
         .expect("fixture server");
     let client = GlobalClient::new(server.config()).expect("fixture client");
     let result = client.get_capabilities().await;
-    assert!(matches!(
-        result,
-        Err(ClientError::Http { ref meta, .. }) if meta.status == 307
-    ));
+    let error = result.expect_err("redirect refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.remote_failed");
+    assert_eq!(error_text_field(&error, "status"), "307");
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
 }
 
@@ -1347,22 +1475,24 @@ async fn test_fixture_media_and_json_errors() {
         .await
         .expect("fixture server");
     let client = GlobalClient::new(server.config()).expect("fixture client");
-    assert!(matches!(
-        client.get_capabilities().await,
-        Err(ClientError::InvalidMediaType {
-            status: 200,
-            content_type: Some(_)
-        })
-    ));
+    let error = client.get_capabilities().await.expect_err("media refusal");
+    assert_registered_field(&error, "rift.client.response_invalid", "content_type");
+    assert_eq!(error_text_field(&error, "status"), "200");
+    assert!(error_text_field(&error, "violation").contains("text/plain"));
     drop(client);
 
     let server = FixtureServer::start(FixtureMode::MalformedJson)
         .await
         .expect("fixture server");
     let client = GlobalClient::new(server.config()).expect("fixture client");
-    assert_eq!(
-        client.get_capabilities().await,
-        Err(ClientError::Decode { status: 200 })
+    let error = client.get_capabilities().await.expect_err("JSON refusal");
+    assert_registered_field(&error, "rift.client.response_invalid", "body");
+    assert_eq!(error_text_field(&error, "status"), "200");
+    assert!(
+        error
+            .fields()
+            .iter()
+            .any(|field| matches!(field.value(), rift_error::ErrorValue::Source(_)))
     );
 }
 
@@ -1373,11 +1503,14 @@ async fn test_fixture_unauthorized_retains_challenge() {
         .expect("fixture server");
     let client = GlobalClient::new(server.config()).expect("fixture client");
     let result = client.get_capabilities().await;
-    let Err(ClientError::Http { meta, .. }) = result else {
-        panic!("expected unauthorized HTTP error");
-    };
-    assert_eq!(meta.status, 401);
-    assert_eq!(meta.www_authenticate.as_deref(), Some("Bearer realm=rift"));
+    let error = result.expect_err("unauthorized HTTP refusal");
+    assert_eq!(
+        error.slug().as_str(),
+        "rift.client.remote_permission_denied"
+    );
+    let meta = remote_metadata(&error);
+    assert_eq!(meta["status"], 401);
+    assert_eq!(meta["www_authenticate"], "Bearer realm=rift");
 }
 
 #[tokio::test]
@@ -1393,15 +1526,15 @@ async fn test_fixture_retry_statuses_and_headers() {
     })
     .expect("fixture client");
     let result = client.get_capabilities().await;
-    let Err(ClientError::Http { meta, .. }) = result else {
-        panic!("expected rate limit HTTP error");
-    };
+    let error = result.expect_err("rate limit HTTP refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.remote_unavailable");
+    let meta = remote_metadata(&error);
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
-    assert_eq!(meta.status, 429);
-    assert_eq!(meta.retry_after.as_deref(), Some("0"));
-    assert_eq!(meta.rate_limit_limit.as_deref(), Some("10"));
-    assert_eq!(meta.rate_limit_remaining.as_deref(), Some("0"));
-    assert_eq!(meta.rate_limit_reset.as_deref(), Some("60"));
+    assert_eq!(meta["status"], 429);
+    assert_eq!(meta["retry_after"], "0");
+    assert_eq!(meta["rate_limit_limit"], "10");
+    assert_eq!(meta["rate_limit_remaining"], "0");
+    assert_eq!(meta["rate_limit_reset"], "60");
     drop(client);
 
     let server = FixtureServer::start(FixtureMode::StatusSequence(vec![
@@ -1425,7 +1558,8 @@ async fn test_fixture_retry_statuses_and_headers() {
     let client = GlobalClient::new(server.config()).expect("fixture client");
     assert!(matches!(
         client.get_capabilities().await,
-        Err(ClientError::Http { ref meta, .. }) if meta.status == 504
+        Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
+            && error_text_field(error, "status") == "504"
     ));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }
@@ -1473,14 +1607,17 @@ async fn test_fixture_documented_problem_statuses_decode() {
     ] {
         let (server, client) = operation_client(OperationFixture::Problem(status)).await;
         let result = client.search_packages(&search_request(), 20, None).await;
-        let Err(ClientError::Http { meta, problem }) = result else {
-            panic!("expected HTTP {status} error");
+        let error = result.expect_err("documented HTTP refusal");
+        let expected_slug = if status == StatusCode::FORBIDDEN {
+            "rift.client.remote_permission_denied"
+        } else {
+            "rift.client.remote_failed"
         };
-        assert_eq!(meta.status, status.as_u16());
-        assert_eq!(
-            problem.expect("valid problem details").status,
-            i64::from(status.as_u16())
-        );
+        assert_eq!(error.slug().as_str(), expected_slug);
+        assert_eq!(remote_metadata(&error)["status"], status.as_u16());
+        let problem: serde_json::Value = serde_json::from_str(error_text_field(&error, "problem"))
+            .expect("valid retained problem details");
+        assert_eq!(problem["status"], i64::from(status.as_u16()));
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
     }
 }
@@ -1492,7 +1629,7 @@ const OPERATION_PAGE_LIMIT: i64 = 2;
 async fn operation_failure(
     client: &GlobalClient,
     endpoint: crate::contract::Endpoint,
-) -> Option<ClientError> {
+) -> Option<RiftError> {
     use crate::contract::Endpoint;
     match endpoint {
         Endpoint::Capabilities => client.get_capabilities().await.err(),
@@ -1504,27 +1641,33 @@ async fn operation_failure(
             .search_packages(&search_request(), OPERATION_PAGE_LIMIT, None)
             .await
             .err(),
-        Endpoint::Symbols => client
-            .list_package_symbols(&symbol_request(), OPERATION_PAGE_LIMIT, None)
-            .await
-            .err(),
+        Endpoint::Symbols => client.get_symbol(&symbol_request()).await.err(),
         Endpoint::Patterns => client
             .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
             .await
             .err(),
         Endpoint::Declarations => client
-            .find_package_declarations(&declaration::declaration_request())
+            .find_declarations(&declaration::declaration_request())
+            .await
+            .err(),
+        Endpoint::Source => client
+            .get_source(
+                &serde_json::from_value(serde_json::json!({
+                    "unit": "rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py"
+                }))
+                .expect("runtime source request"),
+            )
             .await
             .err(),
     }
 }
 
-/// The failure the client answers for the fixture's `status` problem: `Http` carrying the
-/// problem details when the contract documents `status`, and none when it does not.
-fn fixture_problem(status: StatusCode, documented: bool) -> ClientError {
+/// The registered failure retains problem details only for a documented status.
+fn fixture_problem(status: StatusCode, documented: bool) -> RiftError {
     let problem = serde_json::from_str::<ProblemDetails>(&problem_json(status)).ok();
-    ClientError::Http {
-        meta: Box::new(ResponseMeta {
+    failure::remote(
+        "fixture_problem",
+        &ResponseMeta {
             status: status.as_u16(),
             content_type: Some("application/problem+json".to_owned()),
             etag: None,
@@ -1534,9 +1677,9 @@ fn fixture_problem(status: StatusCode, documented: bool) -> ClientError {
             rate_limit_limit: None,
             rate_limit_remaining: None,
             rate_limit_reset: None,
-        }),
-        problem: problem.filter(|_| documented).map(Box::new),
-    }
+        },
+        problem.filter(|_| documented).as_ref(),
+    )
 }
 
 /// Every problem status an operation's contract documents, each decoded into its own
@@ -1582,18 +1725,17 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
                 ..server.config()
             };
             let client = GlobalClient::new(config).expect("fixture client");
-            let expected = Some(fixture_problem(status, documented));
-            assert_eq!(
-                operation_failure(&client, endpoint).await,
-                expected,
-                "{endpoint:?} answers HTTP {status}"
-            );
+            let expected = fixture_problem(status, documented);
+            let actual = operation_failure(&client, endpoint)
+                .await
+                .expect("HTTP refusal");
+            assert_remote_error(&actual, &expected);
             assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
-            assert_eq!(
-                operation_failure(&client, Endpoint::Capabilities).await,
-                expected,
-                "{endpoint:?} records its failure"
-            );
+            let cached = operation_failure(&client, Endpoint::Capabilities)
+                .await
+                .expect("recorded HTTP refusal");
+            assert_remote_error(&cached, &expected);
+            assert_eq!(cached.to_string(), actual.to_string());
             assert_eq!(
                 server.state.requests.load(Ordering::SeqCst),
                 2,
@@ -1618,11 +1760,11 @@ async fn test_fixture_retry_after_beyond_deadline_does_not_repeat() {
     })
     .expect("fixture client");
     let result = client.get_capabilities().await;
-    let Err(ClientError::Http { meta, .. }) = result else {
-        panic!("expected rate limit HTTP error");
-    };
-    assert_eq!(meta.status, 429);
-    assert_eq!(meta.retry_after.as_deref(), Some("3600"));
+    let error = result.expect_err("rate limit HTTP refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.remote_unavailable");
+    let meta = remote_metadata(&error);
+    assert_eq!(meta["status"], 429);
+    assert_eq!(meta["retry_after"], "3600");
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
 }
 
@@ -1649,9 +1791,20 @@ async fn test_fixture_connection_refusal_is_bounded() {
         ..Config::default()
     })
     .expect("fixture client");
+    let error = client
+        .get_capabilities()
+        .await
+        .expect_err("connection refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.request_failed");
     assert_eq!(
-        client.get_capabilities().await,
-        Err(ClientError::Connection)
+        error_text_field(&error, "reason"),
+        "global endpoint connection failed"
+    );
+    assert!(
+        error
+            .fields()
+            .iter()
+            .any(|field| matches!(field.value(), rift_error::ErrorValue::Source(_)))
     );
 }
 
@@ -1673,7 +1826,21 @@ async fn test_fixture_tls_handshake_timeout_is_deadline() {
         ..Config::default()
     })
     .expect("TLS stall client");
-    assert_eq!(client.get_capabilities().await, Err(ClientError::Deadline));
+    let error = client
+        .get_capabilities()
+        .await
+        .expect_err("deadline refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.request_failed");
+    assert_eq!(
+        error_text_field(&error, "reason"),
+        "global request deadline elapsed"
+    );
+    assert!(
+        error
+            .fields()
+            .iter()
+            .any(|field| matches!(field.value(), rift_error::ErrorValue::Source(_)))
+    );
     task.abort();
 }
 
@@ -1685,8 +1852,9 @@ async fn test_fixture_content_length_bound() {
     let client = GlobalClient::new(server.config()).expect("fixture client");
     assert!(matches!(
         client.get_capabilities().await,
-        Err(ClientError::ResponseBodyTooLarge { bytes })
-            if bytes > RESPONSE_BODY_BYTES_MAX
+        Err(ref error) if error.slug().as_str() == "rift.client.body_limit"
+            && error_text_field(error, "direction") == "response"
+            && error_text_field(error, "bytes").parse::<usize>().expect("body bytes") > RESPONSE_BODY_BYTES_MAX
     ));
 }
 
@@ -1700,7 +1868,21 @@ async fn test_fixture_total_deadline_and_cancellation() {
         ..server.config()
     })
     .expect("fixture client");
-    assert_eq!(client.get_capabilities().await, Err(ClientError::Deadline));
+    let error = client
+        .get_capabilities()
+        .await
+        .expect_err("deadline refusal");
+    assert_eq!(error.slug().as_str(), "rift.client.request_failed");
+    assert_eq!(
+        error_text_field(&error, "reason"),
+        "global request deadline elapsed"
+    );
+    assert!(
+        error
+            .fields()
+            .iter()
+            .any(|field| matches!(field.value(), rift_error::ErrorValue::Source(_)))
+    );
     drop(client);
 
     let server = FixtureServer::start(FixtureMode::Delay(Duration::from_secs(2)))
@@ -1838,6 +2020,7 @@ fn resolution_request() -> PackageResolutionRequest {
         entries: vec![PackageContextEntry {
             availability: PackageAvailability::Canonical,
             manager: "cargo".to_owned(),
+            registry: Some("crates.io".to_owned()),
             name: "demo".to_owned(),
             requirement: Some("^1".to_owned()),
             version: None,
@@ -1848,6 +2031,7 @@ fn resolution_request() -> PackageResolutionRequest {
 fn package_request() -> PackageIdentity {
     PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: "demo".to_owned(),
         version: "1.0.0".to_owned(),
     }
@@ -1863,56 +2047,192 @@ fn test_query_term_and_name_bounds_count_characters() {
     assert_eq!(at_bound(QUERY_BYTES_MAX).len(), 2 * QUERY_BYTES_MAX);
 
     let mut search = search_request();
-    search.query = at_bound(QUERY_BYTES_MAX);
-    assert_eq!(validate_search_request(&search), Ok(()));
-    search.query = past_bound(QUERY_BYTES_MAX);
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest { field: "query" })
+    search.query = Some(at_bound(QUERY_BYTES_MAX));
+    assert!((validate_search_request(&search)).is_ok());
+    search.query = Some(past_bound(QUERY_BYTES_MAX));
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "query",
     );
 
     let mut search = search_request();
-    search.terms[0].text = at_bound(QUERY_TERM_BYTES_MAX);
-    assert_eq!(validate_search_request(&search), Ok(()));
-    search.terms[0].text = past_bound(QUERY_TERM_BYTES_MAX);
-    assert_eq!(
-        validate_search_request(&search),
-        Err(ClientError::InvalidRequest { field: "term" })
+    search.terms.as_mut().expect("lexical terms")[0].text = at_bound(QUERY_TERM_BYTES_MAX);
+    assert!((validate_search_request(&search)).is_ok());
+    search.terms.as_mut().expect("lexical terms")[0].text = past_bound(QUERY_TERM_BYTES_MAX);
+    assert_registered_field(
+        &(validate_search_request(&search)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "term",
     );
 
-    let mut symbol = symbol_request();
-    symbol.name = at_bound(QUERY_BYTES_MAX);
-    assert_eq!(validate_symbol_request(&symbol), Ok(()));
-    symbol.name = past_bound(QUERY_BYTES_MAX);
-    assert_eq!(
-        validate_symbol_request(&symbol),
-        Err(ClientError::InvalidRequest { field: "name" })
+    let mut search = search_request();
+    search.identifiers = Some(vec!["x".repeat(IDENTIFIER_BYTES_MAX)]);
+    assert!(validate_search_request(&search).is_ok());
+    search.identifiers = Some(vec!["x".repeat(IDENTIFIER_BYTES_MAX + 1)]);
+    assert_registered_field(
+        &validate_search_request(&search).expect_err("identifier bound"),
+        "rift.client.request_invalid",
+        "identifiers",
     );
+}
+
+fn traversal_request() -> PackageSearchRequest {
+    PackageSearchRequest {
+        query: None,
+        terms: None,
+        identifiers: None,
+        phase: None,
+        include: None,
+        packages: None,
+        target: None,
+        view: None,
+        traversal: Some(SearchTraversal {
+            seed: Some("rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile".to_owned()),
+            to: None,
+            depth: Some(1),
+            direction: None,
+            facets: None,
+        }),
+    }
+}
+
+#[test]
+fn traversal_request_preserves_runtime_seed_without_lexical_fields() {
+    let request = traversal_request();
+    validate_search_request(&request).expect("runtime traversal request");
+    let value = serde_json::to_value(&request).expect("request serialization");
+    for field in ["query", "terms", "identifiers", "phase", "packages"] {
+        assert!(value.get(field).is_none(), "unexpected field: {field}");
+    }
+    assert_eq!(
+        value["traversal"]["seed"],
+        "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
+    );
+}
+
+#[test]
+fn traversal_request_refuses_missing_seed_local_owner_and_excess_depth() {
+    for (seed, depth, field) in [
+        (None, 1, "traversal.seed"),
+        (
+            Some("rift://symbol/local/rust/demo/beacon"),
+            1,
+            "traversal.seed",
+        ),
+        (
+            Some("rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"),
+            3,
+            "traversal",
+        ),
+    ] {
+        let mut request = traversal_request();
+        let traversal = request.traversal.as_mut().expect("traversal");
+        traversal.seed = seed.map(str::to_owned);
+        traversal.depth = Some(depth);
+        let error = validate_search_request(&request).expect_err("invalid traversal request");
+        assert_registered_field(&error, "rift.client.request_invalid", field);
+    }
+}
+
+#[test]
+fn traversal_only_request_refuses_lexical_members_and_documentation_target() {
+    let mut request = traversal_request();
+    request.terms = Some(Vec::new());
+    let error = validate_search_request(&request).expect_err("lexical member without query");
+    assert_registered_field(&error, "rift.client.request_invalid", "query");
+    request.terms = None;
+    request.target = Some(PackageSearchRequestTarget::Documentation);
+    let error = validate_search_request(&request).expect_err("traversal documentation target");
+    assert_registered_field(&error, "rift.client.request_invalid", "traversal");
+}
+
+#[test]
+fn empty_search_page_requires_original_captured_view() {
+    let mut value = search_page_json("demo", None, "analyzer-v1", "demo");
+    value["items"] = serde_json::json!([]);
+    let capabilities: Capabilities =
+        serde_json::from_str(&capabilities_json()).expect("capabilities");
+    let mut request = traversal_request();
+    request.view = Some("a".repeat(64));
+    let page: PackageSearchPage =
+        serde_json::from_value(value.clone()).expect("empty captured page");
+    validate_search_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX)
+        .expect("empty page retains requested view");
+    request.view = Some("b".repeat(64));
+    let error = validate_search_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX)
+        .expect_err("different captured view");
+    assert_registered_field(&error, "rift.client.response_invalid", "view");
+    value.as_object_mut().expect("page").remove("view");
+    assert!(serde_json::from_value::<PackageSearchPage>(value).is_err());
 }
 
 fn search_request() -> PackageSearchRequest {
     PackageSearchRequest {
-        query: "demo".to_owned(),
-        terms: vec![QueryTerm {
+        query: Some("demo".to_owned()),
+        terms: Some(vec![QueryTerm {
             text: "demo".to_owned(),
             phrase: false,
             prefix: false,
-        }],
-        identifiers: vec!["demo".to_owned()],
+        }]),
+        identifiers: Some(vec!["demo".to_owned()]),
         include: None,
-        packages: vec![package_request()],
-        phase: PackageSearchRequestPhase::Precise,
+        packages: Some(vec![package_request()]),
+        phase: Some(PackageSearchRequestPhase::Precise),
         target: None,
+        traversal: None,
+        view: None,
     }
 }
 
-fn symbol_request() -> PackageSymbolRequest {
-    PackageSymbolRequest {
-        name: "demo".to_owned(),
-        language: Some("rust".to_owned()),
-        include: None,
-        packages: vec![package_request()],
-    }
+fn symbol_request() -> GetSymbolParams {
+    serde_json::from_value(serde_json::json!({
+        "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo"
+    }))
+    .expect("canonical symbol request")
+}
+
+fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
+    serde_json::json!({
+        "outcome": "found", "symbol": {
+            "id": format!("rift://symbol/cargo/crates.io/{package}@1.0.0/rust/{package}"),
+            "language": "rust", "name": package, "kind": "function",
+            "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"}
+        },
+        "view": {"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"},
+        "declarations": [{
+            "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"},
+            "unit": format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"),
+            "range": {"start": 0, "end": 4}, "line": 1, "source_complete": false,
+            "signature_indices": [], "type_indices": [], "documentation_indices": []
+        }]
+    })
+}
+
+async fn canonical_symbol_response(
+    value: serde_json::Value,
+    request: &GetSymbolParams,
+    source_bytes_max: usize,
+) -> Result<GetSymbolResult, RiftError> {
+    canonical_symbol_response_with_bounds(value, request, source_bytes_max, SOURCE_BYTES_MAX).await
+}
+
+async fn canonical_symbol_response_with_bounds(
+    value: serde_json::Value,
+    request: &GetSymbolParams,
+    configured_source_bytes_max: usize,
+    advertised_source_bytes_max: usize,
+) -> Result<GetSymbolResult, RiftError> {
+    let (server, _) = operation_client(OperationFixture::DocumentationBounds {
+        search: documentation::page(),
+        symbols: value,
+        source_bytes_max: advertised_source_bytes_max,
+    })
+    .await;
+    let mut config = server.config();
+    config.max_source = configured_source_bytes_max;
+    let client = GlobalClient::new(config).expect("canonical client");
+    client.get_symbol(request).await
 }
 
 async fn operation_client(mode: OperationFixture) -> (FixtureServer, GlobalClient) {
@@ -1922,6 +2242,404 @@ async fn operation_client(mode: OperationFixture) -> (FixtureServer, GlobalClien
     let client = GlobalClient::new(server.config())
         .unwrap_or_else(|error| panic!("fixture client: {error:?}"));
     (server, client)
+}
+
+#[tokio::test]
+async fn exact_source_preserves_runtime_owner_view_and_typed_http_outcomes() {
+    use rift_protocol::source_read::GetSourceParams;
+    let unit = "rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py";
+    let request: GetSourceParams =
+        serde_json::from_value(serde_json::json!({"unit":unit,"view":"a".repeat(64)}))
+            .expect("source request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    for (status, value) in [
+        (
+            StatusCode::OK,
+            serde_json::json!({"outcome":"found","source":{"span":{"unit":unit,"range":{"start":0,"end":2}},"text":"é"},"source_complete":true,"view":view,"warnings":[]}),
+        ),
+        (
+            StatusCode::NOT_FOUND,
+            serde_json::json!({"outcome":"missing","unit":unit,"view":view,"warnings":[]}),
+        ),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({"outcome":"unavailable","unit":unit,"view":view,"reason":"insufficient_coverage","warnings":[]}),
+        ),
+    ] {
+        let (server, client) =
+            operation_client(OperationFixture::ExactSource(value.clone(), status)).await;
+        let answer = client
+            .get_source(&request)
+            .await
+            .expect("typed source outcome");
+        assert_eq!(
+            answer,
+            serde_json::from_value(value).expect("source outcome")
+        );
+        let requests = server.state.request_log.lock().await;
+        let sent = requests
+            .iter()
+            .find(|sent| sent.path.ends_with("/source"))
+            .expect("source request");
+        assert_eq!(sent.path, "/rift/rest/v1/source");
+        assert_eq!(sent.method, reqwest::Method::POST);
+        assert_eq!(sent.query, None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&sent.body).expect("request JSON"),
+            serde_json::to_value(&request).expect("request")
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|sent| sent.path.ends_with("/resolutions"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn exact_source_refuses_wrong_http_outcomes_foreign_views_and_utf8_ranges() {
+    use rift_protocol::source_read::GetSourceParams;
+    let unit = "rift://source/npm/npmjs.org/demo@1.0.0/index.js";
+    let request: GetSourceParams = serde_json::from_value(
+        serde_json::json!({"unit":unit,"range":{"start":0,"end":2},"view":"a".repeat(64)}),
+    )
+    .expect("source request");
+    let found = serde_json::json!({"outcome":"found","source":{"span":{"unit":unit,"range":{"start":0,"end":2}},"text":"é"},"source_complete":true,"view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"},"warnings":[]});
+    let mut cases = vec![
+        (found.clone(), StatusCode::NOT_FOUND),
+        (found.clone(), StatusCode::SERVICE_UNAVAILABLE),
+    ];
+    let mut foreign_view = found.clone();
+    foreign_view["view"]["id"] = serde_json::json!("b".repeat(64));
+    cases.push((foreign_view, StatusCode::OK));
+    let mut foreign_unit = found.clone();
+    foreign_unit["source"]["span"]["unit"] =
+        serde_json::json!("rift://source/npm/registry.example/demo@1.0.0/index.js");
+    cases.push((foreign_unit, StatusCode::OK));
+    let mut wrong_bytes = found.clone();
+    wrong_bytes["source"]["span"]["range"]["end"] = serde_json::json!(1);
+    cases.push((wrong_bytes, StatusCode::OK));
+    let mut outside_range = found;
+    outside_range["source"]["span"]["range"]["start"] = serde_json::json!(1);
+    outside_range["source"]["span"]["range"]["end"] = serde_json::json!(3);
+    cases.push((outside_range, StatusCode::OK));
+    for (value, status) in cases {
+        let (_server, client) =
+            operation_client(OperationFixture::ExactSource(value, status)).await;
+        assert!(matches!(
+            client.get_source(&request).await,
+            Err(ref error) if error.slug().as_str() == "rift.client.response_invalid"
+        ));
+    }
+}
+
+#[test]
+fn generated_source_range_preserves_exact_integer_bound() {
+    use validator::Validate;
+    let bound = 9_007_199_254_740_991;
+    assert!(
+        crate::generated::TextRange {
+            start: bound,
+            end: bound
+        }
+        .validate()
+        .is_ok()
+    );
+    assert!(
+        crate::generated::TextRange {
+            start: 0,
+            end: bound + 1
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        crate::generated::TextRange {
+            start: bound + 1,
+            end: bound + 1
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn exact_source_refuses_legacy_and_noncanonical_units_after_http() {
+    use rift_protocol::source_read::GetSourceParams;
+    let request: GetSourceParams = serde_json::from_value(serde_json::json!({
+        "unit":"rift://source/npm/npmjs.org/demo@1.0.0/index.js"
+    }))
+    .expect("canonical source request");
+    for unit in [
+        "rift://source/npm/demo@1.0.0/index.js",
+        "rift://source/npm/npmjs.org/demo@1.0.0/../index.js",
+        "rift://source/npm/npmjs.org/demo@1.0.0/src%2Findex.js",
+        "rift://source/stdlib/cpython@3.12.9/C:/Lib/pathlib.py",
+    ] {
+        let value = serde_json::json!({"outcome":"found","source":{
+            "span":{"unit":unit,"range":{"start":0,"end":0}},"text":""
+        },"source_complete":true,"view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}});
+        let missing = serde_json::json!({"outcome":"missing","unit":unit,
+            "view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}});
+        for (value, status) in [(value, StatusCode::OK), (missing, StatusCode::NOT_FOUND)] {
+            let (_server, client) =
+                operation_client(OperationFixture::ExactSource(value, status)).await;
+            let error = client
+                .get_source(&request)
+                .await
+                .expect_err("canonical source refusal");
+            assert_registered_field(&error, "rift.client.response_invalid", "body");
+            assert_eq!(
+                error_text_field(&error, "status"),
+                status.as_u16().to_string()
+            );
+            assert!(
+                error
+                    .fields()
+                    .iter()
+                    .any(|field| matches!(field.value(), rift_error::ErrorValue::Source(_)))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn captured_custom_sources_retain_the_requested_view_and_coverage_refusal() {
+    use rift_protocol::source_read::{FindDeclarationsParams, GetSourceParams};
+    let unit = "rift://source/custom/src/lib.rs";
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let value = serde_json::json!({"outcome":"unavailable","unit":unit,"view":view,"reason":"insufficient_coverage"});
+    let request: GetSourceParams =
+        serde_json::from_value(serde_json::json!({"unit":unit,"view":view["id"]}))
+            .expect("captured custom source");
+    let (server, client) = operation_client(OperationFixture::ExactSource(
+        value.clone(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    ))
+    .await;
+    assert_eq!(
+        client.get_source(&request).await.expect("coverage refusal"),
+        serde_json::from_value(value).expect("source result")
+    );
+    assert!(
+        server
+            .state
+            .request_log
+            .lock()
+            .await
+            .iter()
+            .any(|request| request.path.ends_with("/source"))
+    );
+
+    let position = serde_json::json!({"unit":unit,"line":0,"character":0});
+    let request: FindDeclarationsParams = serde_json::from_value(
+        serde_json::json!({"position_encoding":"utf-16","positions":[position],"view":view["id"]}),
+    )
+    .expect("captured custom position");
+    let value = serde_json::json!({"results":[{"outcome":"unavailable","position":position,"view":view,"reason":"insufficient_coverage"}]});
+    let (server, client) = operation_client(OperationFixture::SourceDeclarations(
+        value.clone(),
+        StatusCode::OK,
+    ))
+    .await;
+    assert_eq!(
+        client
+            .find_declarations(&request)
+            .await
+            .expect("coverage refusal"),
+        serde_json::from_value(value).expect("position result")
+    );
+    let requests = server.state.request_log.lock().await;
+    let sent = requests
+        .iter()
+        .find(|request| request.path.ends_with("/declarations"))
+        .expect("custom position request");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sent.body).expect("body")["view"],
+        view["id"]
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.path.ends_with("/resolutions"))
+    );
+}
+
+#[tokio::test]
+async fn captured_view_does_not_admit_project_sources_to_global_reads() {
+    use rift_protocol::source_read::{FindDeclarationsParams, GetSourceParams};
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let unit = "rift://source/project/src/lib.rs";
+    let source: GetSourceParams =
+        serde_json::from_value(serde_json::json!({"unit":unit,"view":"a".repeat(64)}))
+            .expect("project source");
+    assert_registered_field(
+        &(client.get_source(&source).await).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "unit",
+    );
+    let declarations: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-8","positions":[{"unit":unit,"line":0,"character":0}],"view":"a".repeat(64)})).expect("project position");
+    assert_registered_field(
+        &(client.find_declarations(&declarations).await).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "unit",
+    );
+    assert!(server.state.request_log.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn exact_source_refuses_unproved_global_owners_before_http() {
+    use rift_protocol::source_read::GetSourceParams;
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    for unit in [
+        "rift://source/project/src/lib.rs",
+        "rift://source/custom/src/lib.rs",
+    ] {
+        let request: GetSourceParams =
+            serde_json::from_value(serde_json::json!({"unit":unit})).expect("valid local source");
+        assert!(matches!(
+            client.get_source(&request).await,
+            Err(ref error) if error.slug().as_str() == "rift.client.request_invalid"
+                && error_text_field(error, "field") == "unit"
+        ));
+    }
+    assert!(server.state.request_log.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn source_declaration_batch_preserves_runtime_and_stub_owners_with_one_view() {
+    use rift_protocol::source_read::FindDeclarationsParams;
+    let positions = serde_json::json!([
+        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":0,"character":0},
+        {"unit":"rift://source/pypi/pypi.org/types-pathlib@0.1.0/pathlib.pyi","line":2,"character":3}
+    ]);
+    let request: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-16","positions":positions,"view":"a".repeat(64)})).expect("position request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let value = serde_json::json!({"results":[
+        {"outcome":"found","position":positions[0],"id":"rift://symbol/stdlib/cpython@3.12.9/python/pathlib/Path","kind":"class","view":view},
+        {"outcome":"unavailable","position":positions[1],"reason":"insufficient_coverage","view":view}
+    ],"warnings":[]});
+    let (server, client) = operation_client(OperationFixture::SourceDeclarations(
+        value.clone(),
+        StatusCode::OK,
+    ))
+    .await;
+    assert_eq!(
+        client
+            .find_declarations(&request)
+            .await
+            .expect("ordered outcomes"),
+        serde_json::from_value(value).expect("batch outcome")
+    );
+    let requests = server.state.request_log.lock().await;
+    let sent = requests
+        .iter()
+        .find(|sent| sent.path.ends_with("/declarations"))
+        .expect("position request");
+    assert_eq!(sent.query, None);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&sent.body).expect("request JSON"),
+        serde_json::to_value(request).expect("request")
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|sent| sent.path.ends_with("/resolutions"))
+    );
+}
+
+#[tokio::test]
+async fn source_declaration_batch_refuses_reordering_foreign_views_and_whole_batch_missing() {
+    use rift_protocol::source_read::FindDeclarationsParams;
+    let positions = serde_json::json!([
+        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":0,"character":0},
+        {"unit":"rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py","line":1,"character":0}
+    ]);
+    let request: FindDeclarationsParams = serde_json::from_value(
+        serde_json::json!({"position_encoding":"utf-8","positions":positions}),
+    )
+    .expect("position request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let value = serde_json::json!({"results":[{"outcome":"missing","position":positions[0],"view":view},{"outcome":"missing","position":positions[1],"view":view}],"warnings":[]});
+    let mut reordered = value.clone();
+    reordered["results"]
+        .as_array_mut()
+        .expect("results")
+        .swap(0, 1);
+    let mut foreign_view = value.clone();
+    foreign_view["results"][1]["view"]["id"] = serde_json::json!("b".repeat(64));
+    for (value, status) in [
+        (reordered, StatusCode::OK),
+        (foreign_view, StatusCode::OK),
+        (value, StatusCode::NOT_FOUND),
+    ] {
+        let (_server, client) =
+            operation_client(OperationFixture::SourceDeclarations(value, status)).await;
+        assert!(client.find_declarations(&request).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() {
+    use rift_protocol::read::SymbolId;
+    use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+    let id = SymbolId::parse("rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/Thing")
+        .expect("canonical fixture");
+    let request: GetSymbolParams =
+        serde_json::from_value(serde_json::json!({"id":id})).expect("request");
+    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    for answer in [
+        serde_json::json!({"outcome":"found","symbol":{"id":id,"language":"rust","name":"Thing","kind":"struct","origin":{"source_kind":"synthetic"}},"view":view,"declarations":[],"warnings":[]}),
+        serde_json::json!({"outcome":"missing","symbol_not_found":{"id":id,"alternatives":[]},"view":view,"warnings":[]}),
+        serde_json::json!({"outcome":"unavailable","id":id,"reason":"exact_release","warnings":[]}),
+    ] {
+        let (server, client) = operation_client(OperationFixture::ExactSymbol(answer)).await;
+        assert!(matches!(
+            client
+                .get_symbol(&request)
+                .await
+                .expect("typed exact outcome"),
+            GetSymbolResult::Found { .. }
+                | GetSymbolResult::Missing { .. }
+                | GetSymbolResult::Unavailable { .. }
+        ));
+        let requests = server.state.request_log.lock().await;
+        let sent = requests
+            .iter()
+            .find(|sent| sent.path.ends_with("/symbols"))
+            .expect("symbol request");
+        assert_eq!(sent.method, reqwest::Method::POST);
+        assert_eq!(sent.path, "/rift/rest/v1/symbols");
+        assert_eq!(sent.query, None);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|sent| sent.path.ends_with("/symbols"))
+                .count(),
+            1
+        );
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("JSON request");
+        assert_eq!(body["id"], serde_json::to_value(&id).expect("ID"));
+        assert_eq!(body["declaration_limit"], 5);
+        assert_eq!(body["include"], serde_json::json!(["source"]));
+        for removed in [
+            "name",
+            "packages",
+            "language",
+            "scope",
+            "limit",
+            "page_index",
+        ] {
+            assert!(body.get(removed).is_none());
+        }
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|sent| sent.path.ends_with("/resolutions"))
+                .count(),
+            0
+        );
+    }
 }
 
 #[tokio::test]
@@ -1981,11 +2699,10 @@ async fn test_fixture_new_client_does_not_reuse_resolution_cache() {
 async fn test_fixture_resolution_rejects_bad_accounting() {
     let (server, client) = operation_client(OperationFixture::InvalidResolutionAccounting).await;
     let result = client.resolve_package_context(&resolution_request()).await;
-    assert_eq!(
-        result,
-        Err(ClientError::InvalidResponseField {
-            field: "resolution_accounting"
-        })
+    assert_registered_field(
+        &(result).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "resolution_accounting",
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }
@@ -1999,15 +2716,39 @@ async fn test_fixture_search_and_symbol_pages() {
             .await
             .is_ok()
     );
-    assert!(
-        client
-            .list_package_symbols(&symbol_request(), 20, None)
-            .await
-            .is_ok()
-    );
+    assert!(client.get_symbol(&symbol_request()).await.is_ok());
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
         Some("/rift/rest/v1/symbols")
+    );
+}
+
+#[tokio::test]
+async fn test_discovery_search_accepts_omitted_or_empty_package_selection() {
+    for packages in [None, Some(Vec::new())] {
+        let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
+        let mut request = search_request();
+        request.packages = packages;
+        let serialized = serde_json::to_value(&request).expect("search request");
+        if request.packages.is_none() {
+            assert!(serialized.get("packages").is_none());
+        }
+        let page = client
+            .search_packages(&request, 20, None)
+            .await
+            .expect("discovery page");
+        assert_eq!(page.items.len(), 1);
+        let PackageSearchItem::Search(hit) = &page.items[0] else {
+            panic!("symbol search hit")
+        };
+        assert_eq!(hit.package.name, "other");
+    }
+    let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
+    assert_registered_field(
+        &(client.search_packages(&search_request(), 20, None).await)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "package",
     );
 }
 
@@ -2019,17 +2760,26 @@ async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
     assert_eq!(pages.ok().map(|value| value.items.len()), Some(2));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 3);
 
-    let (_server, client) = operation_client(OperationFixture::SearchPages).await;
-    let pages = client
-        .list_package_symbols_pages(&symbol_request(), 20)
-        .await;
-    assert!(pages.is_ok());
-    assert_eq!(pages.ok().map(|value| value.items.len()), Some(2));
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let result = client
+        .get_symbol(&symbol_request())
+        .await
+        .expect("canonical result");
+    assert!(
+        matches!(result, GetSymbolResult::Found { ref declarations, .. } if declarations.len() == 1)
+    );
+    assert_eq!(
+        server.state.requests.load(Ordering::SeqCst),
+        2,
+        "exact reads issue no implicit continuation"
+    );
 
     let (_server, client) = operation_client(OperationFixture::PageRevisionChange).await;
-    assert_eq!(
-        client.search_packages_pages(&search_request(), 20).await,
-        Err(ClientError::InvalidResponseField { field: "revision" })
+    assert_registered_field(
+        &(client.search_packages_pages(&search_request(), 20).await)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "revision",
     );
 
     let (server, client) = operation_client(OperationFixture::CandidateBound).await;
@@ -2041,23 +2791,25 @@ async fn test_fixture_page_assembly_handles_cursor_and_revisions() {
 #[tokio::test]
 async fn test_fixture_page_rejects_repeated_cursor_and_partial_failure() {
     let (_server, client) = operation_client(OperationFixture::RepeatedCursor).await;
-    assert_eq!(
-        client.search_packages_pages(&search_request(), 20).await,
-        Err(ClientError::InvalidResponseField {
-            field: "cursor_progress"
-        })
+    assert_registered_field(
+        &(client.search_packages_pages(&search_request(), 20).await)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "cursor_progress",
     );
 
     let (server, client) = operation_client(OperationFixture::PartialFailure).await;
     assert!(matches!(
         client.search_packages_pages(&search_request(), 20).await,
-        Err(ClientError::Http { meta, .. }) if meta.status == 503
+        Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
+            && error_text_field(error, "status") == "503"
     ));
     let requests = server.state.requests.load(Ordering::SeqCst);
     assert!(
         matches!(
             client.search_packages_pages(&search_request(), 20).await,
-            Err(ClientError::Http { meta, .. }) if meta.status == 503
+        Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
+            && error_text_field(error, "status") == "503"
         ),
         "a later request answers the failure that marked the endpoint unavailable"
     );
@@ -2076,7 +2828,8 @@ async fn test_fixture_new_endpoint_replaces_failure_cache() {
         failed_client
             .search_packages(&search_request(), 20, None)
             .await,
-        Err(ClientError::Http { meta, .. }) if meta.status == 503
+        Err(ref error) if error.slug().as_str() == "rift.client.remote_unavailable"
+            && error_text_field(error, "status") == "503"
     ));
     assert_eq!(failed_server.state.requests.load(Ordering::SeqCst), 4);
 
@@ -2097,11 +2850,11 @@ async fn test_fixture_new_endpoint_replaces_failure_cache() {
 #[tokio::test]
 async fn test_fixture_rejects_query_mismatched_cursor_page() {
     let (server, client) = operation_client(OperationFixture::MismatchedCursor).await;
-    assert_eq!(
-        client.search_packages_pages(&search_request(), 20).await,
-        Err(ClientError::InvalidResponseField {
-            field: "duplicate_item"
-        })
+    assert_registered_field(
+        &(client.search_packages_pages(&search_request(), 20).await)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "duplicate_item",
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 3);
     assert_eq!(
@@ -2113,9 +2866,11 @@ async fn test_fixture_rejects_query_mismatched_cursor_page() {
 #[tokio::test]
 async fn test_fixture_rejects_unrequested_package() {
     let (_server, client) = operation_client(OperationFixture::UnrequestedPackage).await;
-    assert_eq!(
-        client.search_packages(&search_request(), 20, None).await,
-        Err(ClientError::InvalidResponseField { field: "package" })
+    assert_registered_field(
+        &(client.search_packages(&search_request(), 20, None).await)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "package",
     );
 }
 
@@ -2129,9 +2884,11 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
     ];
     for (mode, field) in cases {
         let (_server, client) = operation_client(mode).await;
-        assert_eq!(
-            client.search_packages(&search_request(), 20, None).await,
-            Err(ClientError::InvalidResponseField { field })
+        assert_registered_field(
+            &(client.search_packages(&search_request(), 20, None).await)
+                .expect_err("registered refusal"),
+            "rift.client.response_invalid",
+            field,
         );
     }
 }
@@ -2140,22 +2897,19 @@ async fn test_fixture_rejects_invalid_origin_source_and_match_class() {
 #[test]
 fn test_search_match_class_uses_original_spelling_before_class() {
     let mut request = search_request();
-    request.query = "module::searchhit SearchHit".to_owned();
+    request.query = Some("module::searchhit SearchHit".to_owned());
     let mut value = search_hit_json("demo", "first");
     value["symbol"]["name"] = serde_json::json!("SearchHit");
     value["match_class"] = serde_json::json!("name_exact");
     let hit: PackageSearchHit = serde_json::from_value(value).expect("search hit fixture");
-    request.identifiers = vec!["module::searchhit".to_owned(), "SearchHit".to_owned()];
-    assert_eq!(
-        super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
-        Ok(())
-    );
-    request.identifiers.clear();
-    assert_eq!(
-        super::validate_search_match_class(&request, &hit, "Module::SearchHit"),
-        Err(ClientError::InvalidResponseField {
-            field: "match_class"
-        })
+    request.identifiers = Some(vec!["module::searchhit".to_owned(), "SearchHit".to_owned()]);
+    assert!((super::validate_search_match_class(&request, &hit, "Module::SearchHit")).is_ok());
+    request.identifiers = Some(Vec::new());
+    assert_registered_field(
+        &(super::validate_search_match_class(&request, &hit, "Module::SearchHit"))
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "match_class",
     );
 }
 
@@ -2167,7 +2921,7 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
     for identifiers in [Vec::new(), vec!["absent".to_owned()]] {
         let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
         let mut request = search_request();
-        request.identifiers = identifiers;
+        request.identifiers = Some(identifiers);
         let page = client
             .search_packages(&request, 20, None)
             .await
@@ -2176,65 +2930,64 @@ async fn test_fixture_accepts_unknown_match_class_on_a_hit_matching_no_identifie
     }
 
     let (_server, client) = operation_client(OperationFixture::UnknownMatchClass).await;
-    assert_eq!(
-        client.search_packages(&search_request(), 20, None).await,
-        Err(ClientError::InvalidResponseField {
-            field: "match_class"
-        })
+    assert_registered_field(
+        &(client.search_packages(&search_request(), 20, None).await)
+            .expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "match_class",
     );
 }
 
-/// A padded name keeps its original spelling when the admitted request validates a page.
-#[test]
-fn test_symbol_lookup_accepts_padded_original_names() {
-    let capabilities: Capabilities =
-        serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
+/// Exact identity selection preserves the declaration's original displayed spelling.
+#[tokio::test]
+async fn test_symbol_lookup_keeps_original_names() {
     for name in ["SearchHit", "searchHit"] {
-        let mut request = symbol_request();
-        request.name = format!(" \t{name}\n ");
-        assert_eq!(validate_symbol_request(&request), Ok(()));
-        let mut value = symbol_page_json("demo", None, "analyzer-v1", "first");
-        value["items"][0]["symbol"]["name"] = serde_json::json!(name);
-        let qualified_name = format!("Module::{name}");
-        value["items"][0]["symbol"]["id"] = serde_json::json!(rift_core::symbol_identity(
-            "rust",
-            "cargo/demo@1.0.0/src/first.rs",
-            &qualified_name,
-        ));
-        value["items"][0]["match_class"] = serde_json::json!("name_exact");
-        let page: PackageSymbolPage = serde_json::from_value(value).expect("symbol page fixture");
+        let mut value = symbol_result_json("demo", "first");
+        value["symbol"]["name"] = serde_json::json!(name);
+        let result = canonical_symbol_response(value, &symbol_request(), SOURCE_BYTES_MAX)
+            .await
+            .expect("canonical symbol");
+        let GetSymbolResult::Found {
+            symbol,
+            declarations,
+            ..
+        } = result
+        else {
+            panic!("found symbol")
+        };
+        assert_eq!(symbol.name, name);
+        assert_eq!(declarations.len(), 1);
         assert_eq!(
-            validate_symbol_page(&request, &capabilities, &page, None, SOURCE_BYTES_MAX),
-            Ok(())
+            declarations[0].unit.as_ref().map(|unit| unit.0.as_str()),
+            Some("rift://source/cargo/crates.io/demo@1.0.0/src/first.rs")
         );
-        assert_eq!(page.items[0].symbol.name, name);
     }
+    let mut request = symbol_request();
+    request.id.0 = format!(" \t{}\n ", request.id.0);
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    assert!(client.get_symbol(&request).await.is_err());
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 0);
 }
 
-#[test]
-fn test_symbol_lookup_refuses_unknown_match_class() {
-    let hit: PackageSymbol = serde_json::from_value(serde_json::json!({
-        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
-        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
-        "line": 1, "match_class": "unknown"
-    }))
-    .expect("symbol hit fixture");
-    let mut request = symbol_request();
-    request.name = "absent".to_owned();
-    assert_eq!(
-        validate_symbol_match_class(&request, &hit, "demo"),
-        Err(ClientError::InvalidResponseField {
-            field: "match_class"
-        })
+#[tokio::test]
+async fn test_symbol_lookup_refuses_discovery_match_class() {
+    let mut value = symbol_result_json("demo", "first");
+    value["match_class"] = serde_json::json!("unknown");
+    assert_registered_field(
+        &canonical_symbol_response(value, &symbol_request(), SOURCE_BYTES_MAX)
+            .await
+            .expect_err("unknown exact-result field"),
+        "rift.client.response_invalid",
+        "body",
     );
 }
 
 /// Package analysis mints a package declaration's identity over its unit's resolver and key, so
 /// a hit carries `rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo` beside the unit
-/// `rift://source/cargo/demo@1.0.0/src/first.rs`. The package-relative spelling names a
+/// `rift://source/cargo/crates.io/demo@1.0.0/src/first.rs`. The package-relative spelling names a
 /// project file, and no producer mints it for a package declaration, so it is refused.
-#[test]
-fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
+#[tokio::test]
+async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     let hit = |id: &str| {
         let mut value = search_hit_json("demo", "first");
         value["symbol"]["id"] = serde_json::json!(id);
@@ -2251,45 +3004,94 @@ fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
         "rift://symbol/rust/cargo/demo@1.0.0/demo",
     ];
     for id in refused {
-        assert_eq!(
-            PackageSearchCandidate::try_from(&hit(id)).err(),
-            Some(ClientError::InvalidResponseField {
-                field: "symbol_identity"
-            }),
-            "{id}"
-        );
+        let error = PackageSearchCandidate::try_from(&hit(id)).expect_err("identity refusal");
+        assert_registered_field(&error, "rift.client.response_invalid", "symbol_identity");
     }
 
-    let symbol: PackageSymbol = serde_json::from_value(serde_json::json!({
-        "package": package_json("demo"), "symbol": symbol_json("demo", "first"),
-        "unit": "rift://source/cargo/demo@1.0.0/src/first.rs", "range": {"start": 0, "end": 4},
-        "line": 1, "match_class": "qualified_exact"
-    }))
-    .expect("symbol hit fixture");
-    let candidate = PackageSymbolCandidate::try_from(&symbol)
-        .unwrap_or_else(|error| panic!("package symbol identity: {error:?}"));
+    let result = canonical_symbol_response(
+        symbol_result_json("demo", "first"),
+        &symbol_request(),
+        SOURCE_BYTES_MAX,
+    )
+    .await
+    .expect("canonical owner and source unit");
+    let GetSymbolResult::Found {
+        symbol,
+        declarations,
+        ..
+    } = result
+    else {
+        panic!("found symbol")
+    };
+    assert_eq!(symbol.id.as_ref(), Some(&symbol_request().id));
     assert_eq!(
-        candidate.symbol_identity.0,
-        "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo"
+        declarations[0].unit.as_ref().map(|unit| unit.0.as_str()),
+        Some("rift://source/cargo/crates.io/demo@1.0.0/src/first.rs")
+    );
+    for unit in [
+        "rift://source/cargo/crates.io/demo@2.0.0/src/first.rs",
+        "rift://source/npm/npmjs.org/demo@1.0.0/src/first.rs",
+    ] {
+        let mut value = symbol_result_json("demo", "first");
+        value["declarations"][0]["unit"] = serde_json::json!(unit);
+        assert_registered_field(
+            &canonical_symbol_response(value, &symbol_request(), SOURCE_BYTES_MAX)
+                .await
+                .expect_err("foreign source owner"),
+            "rift.client.response_invalid",
+            "body",
+        );
+    }
+}
+
+#[test]
+fn test_released_source_preserves_registry_owner_and_relative_path() {
+    let mut package: PackageIdentity =
+        serde_json::from_value(package_json("demo")).expect("package");
+    package.registry = "registry.example/releases".to_owned();
+    let owner = domain::package_identity(&package).owner().expect("owner");
+    let unit = rift_protocol::identity::released_source_identity(&owner, "src/first.rs")
+        .expect("source unit");
+    assert!(unit.contains("registry.example%2Freleases/"));
+    assert_eq!(
+        package_source_path(&package, &unit).expect("same owner"),
+        "src/first.rs"
+    );
+    package.registry = "crates.io".to_owned();
+    assert_registered_field(
+        &(package_source_path(&package, &unit)).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "source_identity",
+    );
+}
+
+#[test]
+fn test_package_selection_distinguishes_exact_registry_owners() {
+    let package: PackageIdentity = serde_json::from_value(package_json("demo")).expect("package");
+    let mut other = package.clone();
+    other.registry = "registry.example/releases".to_owned();
+    assert!((validate_packages(&[package.clone(), other])).is_ok());
+    assert_registered_field(
+        &(validate_packages(&[package.clone(), package])).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "duplicate_package",
     );
 }
 
 #[tokio::test]
 async fn test_fixture_rejects_invalid_capabilities() {
     let (_server, client) = operation_client(OperationFixture::InvalidPublication).await;
-    assert_eq!(
-        client.get_capabilities().await,
-        Err(ClientError::InvalidResponseField {
-            field: "publication_format"
-        })
+    assert_registered_field(
+        &(client.get_capabilities().await).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "publication_format",
     );
 
     let (_server, client) = operation_client(OperationFixture::MissingRequiredField).await;
-    assert_eq!(
-        client.get_capabilities().await,
-        Err(ClientError::InvalidResponseField {
-            field: "required_search_fields"
-        })
+    assert_registered_field(
+        &(client.get_capabilities().await).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "required_search_fields",
     );
 }
 
@@ -2301,61 +3103,217 @@ fn test_capabilities_still_searching_declaration_source_are_refused() {
         serde_json::from_str(&capabilities_json()).expect("capabilities fixture");
     let current: Capabilities =
         serde_json::from_value(value.clone()).expect("current capabilities");
-    assert_eq!(validate_capabilities(&current), Ok(()));
+    assert!((validate_capabilities(&current)).is_ok());
     value["required_search_fields"]
         .as_array_mut()
         .expect("required_search_fields is an array")
         .push(serde_json::json!("declaration_source"));
     let previous: Capabilities = serde_json::from_value(value).expect("previous capabilities");
-    assert_eq!(
-        validate_capabilities(&previous),
-        Err(ClientError::InvalidResponseField {
-            field: "required_search_fields"
-        })
+    assert_registered_field(
+        &(validate_capabilities(&previous)).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "required_search_fields",
     );
 }
 
 #[tokio::test]
 async fn test_fixture_enforces_active_server_bounds() {
     let (_server, client) = operation_client(OperationFixture::TightBounds).await;
-    assert_eq!(
-        client.search_packages(&search_request(), 3, None).await,
-        Err(ClientError::InvalidRequest { field: "limit" })
+    assert_registered_field(
+        &(client.search_packages(&search_request(), 3, None).await)
+            .expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "limit",
     );
     assert!(matches!(
         client.resolve_package_context(&resolution_request()).await,
-        Err(ClientError::ResponseBodyTooLarge { .. })
+        Err(ref error) if error.slug().as_str() == "rift.client.body_limit"
+            && error_text_field(error, "direction") == "response"
     ));
 
     // Each page read meets the advertised response body bound on its own request, refusing
     // the page by its declared length, and records the failure a later request answers.
     let search_page = search_page_json("demo", None, "analyzer-v2", "first").to_string();
-    let symbol_page = symbol_page_json("demo", Some("next"), "analyzer-v2", "first").to_string();
+    let symbol_page = symbol_result_json("demo", "first").to_string();
     for (endpoint, page) in [
         (crate::contract::Endpoint::Search, search_page),
         (crate::contract::Endpoint::Symbols, symbol_page),
     ] {
         let (server, client) = operation_client(OperationFixture::TightBounds).await;
-        let expected = Some(ClientError::ResponseBodyTooLarge { bytes: page.len() });
-        assert_eq!(operation_failure(&client, endpoint).await, expected);
+        let error = operation_failure(&client, endpoint)
+            .await
+            .expect("body bound refusal");
+        assert_eq!(error.slug().as_str(), "rift.client.body_limit");
+        assert_eq!(error_text_field(&error, "direction"), "response");
+        assert_eq!(error_text_field(&error, "bytes"), page.len().to_string());
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
-        assert_eq!(client.get_capabilities().await.err(), expected);
+        let cached = client
+            .get_capabilities()
+            .await
+            .expect_err("recorded body refusal");
+        assert_eq!(cached.to_string(), error.to_string());
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
     }
 
     let (server, client) = operation_client(OperationFixture::TightRequestBound).await;
     assert!(matches!(
         client.resolve_package_context(&resolution_request()).await,
-        Err(ClientError::RequestBodyTooLarge { .. })
+        Err(ref error) if error.slug().as_str() == "rift.client.body_limit"
+            && error_text_field(error, "direction") == "request"
     ));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 1);
 
     let (server, client) = operation_client(OperationFixture::TightSourceBound).await;
     let mut request = search_request();
     request.include = Some(vec!["source".to_owned()]);
-    assert_eq!(
-        client.search_packages(&request, 20, None).await,
-        Err(ClientError::InvalidResponseField { field: "source" })
+    assert_registered_field(
+        &(client.search_packages(&request, 20, None).await).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "source",
     );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn generated_read_warning_preserves_bound_and_source_evidence() {
+    let unit = "rift://source/stdlib/node@22.14.0/lib/fs.js";
+    let value = serde_json::json!({
+        "code": "object_unavailable", "unit": unit,
+        "range": {"start": 4, "end": 12}, "qualified_name": "fs::wide",
+        "field": "name", "bound": 4096
+    });
+    let shared: rift_protocol::read::ReadWarning =
+        serde_json::from_value(value.clone()).expect("strict shared warning");
+    assert_eq!(serde_json::to_value(shared).expect("warning wire"), value);
+    let warning: crate::generated::ReadWarning =
+        serde_json::from_value(value).expect("generated warning");
+    assert_eq!(warning.code.as_deref(), Some("object_unavailable"));
+    assert_eq!(warning.unit.as_deref(), Some(unit));
+    assert_eq!(warning.range.expect("physical range").start, 4);
+    assert_eq!(warning.qualified_name.as_deref(), Some("fs::wide"));
+    assert_eq!(warning.field.as_deref(), Some("name"));
+    assert_eq!(warning.bound, Some(4096));
+}
+
+#[tokio::test]
+async fn exact_source_preserves_warning_bound_and_source_evidence() {
+    let unit = "rift://source/stdlib/node@22.14.0/lib/fs.js";
+    let request = serde_json::from_value(serde_json::json!({
+        "unit": unit, "view": "a".repeat(64)
+    }))
+    .expect("source request");
+    let value = serde_json::json!({
+        "outcome": "found", "source": {
+            "span": {"unit": unit, "range": {"start": 0, "end": 2}}, "text": "é"
+        }, "source_complete": true,
+        "view": {"id": "a".repeat(64), "expires_at": "2026-10-10T10:05:00Z"},
+        "warnings": [{
+            "code": "object_unavailable", "unit": unit,
+            "range": {"start": 4, "end": 12}, "qualified_name": "fs::wide",
+            "field": "name", "bound": 4096
+        }]
+    });
+    let (_server, client) =
+        operation_client(OperationFixture::ExactSource(value.clone(), StatusCode::OK)).await;
+    let answer = client
+        .get_source(&request)
+        .await
+        .expect("typed source outcome");
+    assert_eq!(serde_json::to_value(answer).expect("source wire"), value);
+}
+
+#[test]
+fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
+    use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+    const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+    let request: GetSymbolParams = serde_json::from_value(json!({
+        "id": ID, "include": ["source", "documentation"], "declaration_limit": 5,
+        "view": "a".repeat(64),
+    }))
+    .expect("shared request");
+    let wire = serde_json::to_value(&request).expect("shared request encoding");
+    let generated = crate::generated::GetSymbolParams {
+        id: request.id.as_str().to_owned(),
+        include: Some(vec![
+            crate::generated::GetSymbolInclude::Source,
+            crate::generated::GetSymbolInclude::Documentation,
+        ]),
+        declaration_limit: Some(request.declaration_limit),
+        declaration_cursor: request.declaration_cursor.clone(),
+        rev: request.rev.as_ref().map(|revision| revision.0.clone()),
+        view: request.view.as_ref().map(|view| view.as_str().to_owned()),
+    };
+    assert_eq!(
+        serde_json::to_value(&generated).expect("generated request wire"),
+        wire
+    );
+    assert_eq!(generated.id, request.id.as_str());
+    assert_eq!(generated.declaration_limit, Some(5));
+    assert_eq!(
+        generated.view.as_deref(),
+        request
+            .view
+            .as_ref()
+            .map(rift_protocol::symbol_read::CapturedViewId::as_str)
+    );
+    assert_eq!(generated.include.expect("requested includes").len(), 2);
+    let view = json!({"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"});
+    for value in [
+        json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "view": view, "declarations": []}),
+        json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "view": view}),
+        json!({"outcome": "unavailable", "id": ID, "reason": "exact_release"}),
+    ] {
+        let shared: GetSymbolResult =
+            serde_json::from_value(value.clone()).expect("shared outcome");
+        assert!(shared.is_valid_for(&request.id));
+        let generated: crate::generated::GetSymbolResult =
+            serde_json::from_value(value).expect("generated outcome shape");
+        match (shared, generated) {
+            (
+                GetSymbolResult::Found { symbol, view, .. },
+                crate::generated::GetSymbolResult::Object(result),
+            ) => {
+                assert_eq!(result.outcome, "found");
+                assert_eq!(
+                    result.symbol.id.as_deref(),
+                    symbol
+                        .id
+                        .as_ref()
+                        .map(rift_protocol::read::SymbolId::as_str)
+                );
+                assert_eq!(result.view.id, view.id.as_str());
+                assert!(result.declarations.is_empty());
+            }
+            (
+                GetSymbolResult::Missing {
+                    symbol_not_found,
+                    view,
+                    ..
+                },
+                crate::generated::GetSymbolResult::Object2(result),
+            ) => {
+                assert_eq!(result.outcome, "missing");
+                assert_eq!(result.symbol_not_found.id, symbol_not_found.id.as_str());
+                assert_eq!(result.view.id, view.id.as_str());
+            }
+            (
+                GetSymbolResult::Unavailable { id, .. },
+                crate::generated::GetSymbolResult::Object3(result),
+            ) => {
+                assert_eq!(result.outcome, "unavailable");
+                assert_eq!(result.id, id.as_str());
+                assert!(result.view.is_none());
+            }
+            _ => panic!("generated outcome must keep the shared branch"),
+        }
+    }
+    assert!(
+        serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "name": "Beacon"})).is_err()
+    );
+    assert!(
+        serde_json::from_value::<GetSymbolResult>(
+            json!({"outcome": "unavailable", "reason": "exact_release"})
+        )
+        .is_err()
+    );
 }

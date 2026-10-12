@@ -12,8 +12,25 @@ use serde_json::{Value, json};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
+fn identity(names: &[&str]) -> String {
+    rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Local,
+        rift_protocol::read::Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        },
+        names.iter().map(|name| (*name).to_owned()).collect(),
+    )
+    .expect("canonical fixture identity")
+    .wire_identity()
+}
+
 fn fixture(source: &str) -> TestResult<(tempfile::TempDir, ReadService)> {
     let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+    )?;
     fs::write(directory.path().join("lib.rs"), source)?;
     fs::write(
         directory.path().join("other.ts"),
@@ -62,9 +79,9 @@ fn miss_orders_three_alternatives_by_distance_and_qualified_name() -> TestResult
     assert_eq!(
         alternatives(&result)?,
         [
-            "rift://symbol/rust/lib.rs/beacon",
-            "rift://symbol/rust/lib.rs/beacon_a",
-            "rift://symbol/rust/lib.rs/beacon_b",
+            identity(&["beacon", "beacon"]),
+            identity(&["beacon", "beacon_a"]),
+            identity(&["beacon", "beacon_b"]),
         ]
     );
     assert_eq!(alternatives(&result)?.len(), SYMBOL_ALTERNATIVES_MAX);
@@ -89,9 +106,9 @@ fn miss_uses_unicode_characters_and_case_insensitive_names() -> TestResult {
     assert_eq!(
         alternatives(&result)?,
         [
-            "rift://symbol/rust/lib.rs/caf%C3%A8",
-            "rift://symbol/rust/lib.rs/caf%C3%A9",
-            "rift://symbol/rust/lib.rs/cafaa",
+            identity(&["beacon", "cafè"]),
+            identity(&["beacon", "café"]),
+            identity(&["beacon", "cafaa"]),
         ]
     );
     Ok(())
@@ -100,11 +117,15 @@ fn miss_uses_unicode_characters_and_case_insensitive_names() -> TestResult {
 #[test]
 fn miss_compares_qualified_names_and_orders_equal_names_by_path() -> TestResult {
     let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+    )?;
     fs::write(directory.path().join("z.rs"), "pub fn beacon() {}\n")?;
     fs::write(directory.path().join("a.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("lib.rs"),
-        "pub struct Tower;\nimpl Tower { pub fn load() {} }\npub fn load() {}\n",
+        "mod a;\nmod z;\npub struct Tower;\nimpl Tower { pub fn load() {} }\npub fn load() {}\n",
     )?;
     let service = ReadService::build(
         directory.path(),
@@ -117,8 +138,8 @@ fn miss_compares_qualified_names_and_orders_equal_names_by_path() -> TestResult 
     assert_eq!(
         &alternatives(&tied)?[..2],
         [
-            "rift://symbol/rust/a.rs/beacon",
-            "rift://symbol/rust/z.rs/beacon",
+            identity(&["beacon", "a", "beacon"]),
+            identity(&["beacon", "z", "beacon"]),
         ]
     );
     let qualified = lookup(&service, json!({"name": "Tower::lpad"}))?;

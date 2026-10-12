@@ -2364,12 +2364,13 @@ mod tests {
 
     #[test]
     fn test_a_package_document_is_refused_by_the_project_store() {
-        let unit = SourceUnitId::parse("rift://source/cargo/helper@0.1.0/src/lib.rs")
-            .expect("fixture unit must parse");
+        let unit =
+            SourceUnitId::parse("rift://source/cargo/registry.example/helper@0.1.0/src/lib.rs")
+                .expect("fixture unit must parse");
         let fields = DocumentFields::empty().with(SearchableField::Name, "helper");
         let digest = fields.digest();
         let document = IndexDocument::new(
-            identity("rift://source/cargo/helper@0.1.0/src/lib.rs"),
+            identity("rift://source/cargo/registry.example/helper@0.1.0/src/lib.rs"),
             DocumentLocation::Unit(unit),
             DocumentKind::Symbol,
             digest,

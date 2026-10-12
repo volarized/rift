@@ -53,6 +53,23 @@ impl ParameterFailure {
 /// The arguments one tool call carries, deserialized into its parameter model.
 pub(crate) struct Parameters<P>(pub P);
 
+/// Established project identities captured before parameter decoding.
+#[derive(Clone, Debug)]
+pub(crate) struct SymbolExamples(pub(crate) Vec<rift_core::SymbolId>);
+
+impl SymbolExamples {
+    fn requests(&self) -> Option<String> {
+        (!self.0.is_empty()).then(|| {
+            self.0
+                .iter()
+                .take(2)
+                .map(|id| serde_json::json!({"id": id.as_str()}).to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    }
+}
+
 impl<P: JsonSchema> JsonSchema for Parameters<P> {
     fn schema_name() -> Cow<'static, str> {
         P::schema_name()
@@ -80,11 +97,29 @@ where
             |schema| expected_shape(&Value::Object(schema.as_ref().clone()), &steps),
         );
         let field = named_member(&steps[..shape.followed()]);
+        let canonical = tool == "get_symbol" && field.as_deref() == Some("id");
+        let accepted = if canonical {
+            Some(
+                "rift://symbol/<owner>/<language>/<qualified_path>; an occurrence uses ~2?rev=<revision>"
+                    .to_owned(),
+            )
+        } else {
+            (!shape.accepted().is_empty()).then(|| shape.accepted().join(", "))
+        };
+        let example = if canonical {
+            context
+                .request_context()
+                .extensions
+                .get::<SymbolExamples>()
+                .and_then(SymbolExamples::requests)
+        } else {
+            shape.example().map(ToString::to_string)
+        };
         let failure = errors::mcp::parameter_invalid()
             .tool(tool)
             .maybe_field(field)
-            .maybe_accepted((!shape.accepted().is_empty()).then(|| shape.accepted().join(", ")))
-            .maybe_example(shape.example().map(ToString::to_string))
+            .maybe_accepted(accepted)
+            .maybe_example(example)
             .mcp();
         let error = failure.tool_error(wire::ErrorPhase::Read);
         if let Some(parameter_failure) = context

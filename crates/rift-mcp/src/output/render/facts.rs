@@ -406,13 +406,14 @@ fn starts_with_word(text: &str, word: &str) -> bool {
     })
 }
 
-/// The location kind and package of an origin that is not the project default.
+/// The location kind and package or runtime of an origin that is not the project default.
 ///
 /// The default is a project declaration without a package; its facts are not written.
 fn origin_fact(origin: &SymbolOrigin) -> Result<String, TextError> {
     let SymbolOrigin {
         location,
         package,
+        runtime,
         source_kind: _,
     } = origin;
     let shown_location = match location {
@@ -425,11 +426,15 @@ fn origin_fact(origin: &SymbolOrigin) -> Result<String, TextError> {
     }
     if let Some(PackageIdentity {
         manager: _,
+        registry: _,
         name,
         version,
     }) = package
     {
         parts.push(quoted_value(&format!("{name}@{version}")).into_owned());
+    }
+    if let Some(runtime) = runtime {
+        parts.push(quoted_value(&format!("{}@{}", runtime.runtime, runtime.version)).into_owned());
     }
     Ok(parts.join(" "))
 }

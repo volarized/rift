@@ -116,6 +116,27 @@ fn nearest_open_container<T>(
     (None, true)
 }
 
+impl<T: get_size2::GetSize> get_size2::GetSize for EnclosingDefinitions<T> {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<Tracker: get_size2::GetSizeTracker>(
+        &self,
+        tracker: Tracker,
+    ) -> (usize, Tracker) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<S: get_size2::GetSizeTracker>(&self, tracker: S) -> (usize, S) {
+        let (spans, tracker) = get_size2::GetSize::get_heap_size_with_tracker(&self.spans, tracker);
+        let (parents, tracker) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.parents, tracker);
+        (spans.saturating_add(parents), tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::EnclosingDefinitions;

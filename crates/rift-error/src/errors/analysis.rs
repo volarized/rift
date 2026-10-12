@@ -182,6 +182,18 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    package_artifact_invalid,
+    slug = "rift.analysis.package_artifact_invalid",
+    message = "selected artifact field {field} is invalid: {violation}",
+    action = "replace or rebuild the invalid publication, then retry",
+    fields = {
+        cause: optional(cause),
+        field: required(string),
+        violation: required(string),
+    },
+);
+
+__rift_error_definition!(
     package_declarations_exceeded,
     slug = "rift.analysis.package_declarations_exceeded",
     message = "package declaration count exceeds its accepted limit",

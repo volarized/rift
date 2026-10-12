@@ -106,6 +106,190 @@ pub(super) fn has_attached_attribute(visited: Visited<'_, '_>, text: &str, name:
         })
 }
 
+/// Captures semantic module attributes independently of documentation attachment gaps.
+pub(super) fn module_path(
+    visited: Visited<'_, '_>,
+    text: &str,
+) -> Result<crate::RustModulePath, RiftError> {
+    let kinds = attachment_kinds();
+    if let Some(body) = visited.node().child_by_field_name("body") {
+        let mut cursor = body.walk();
+        for node in body.named_children(&mut cursor) {
+            if node.kind() != "inner_attribute_item" {
+                continue;
+            }
+            let Some(attribute) = node
+                .named_child(0)
+                .filter(|node| node.kind() == "attribute")
+            else {
+                return Ok(crate::RustModulePath::Unknown);
+            };
+            match semantic_attribute_name(attribute, text) {
+                Some(
+                    "cfg"
+                    | "doc"
+                    | "allow"
+                    | "warn"
+                    | "deny"
+                    | "forbid"
+                    | "deprecated"
+                    | "no_implicit_prelude",
+                ) => {}
+                Some("cfg_attr") if documentation_cfg_attribute(attribute, text) => {}
+                _ => return Ok(crate::RustModulePath::Unknown),
+            }
+        }
+    }
+    let mut state = crate::RustModulePath::Absent;
+    let mut previous = visited.previous_sibling();
+    while let Some(sibling) = previous {
+        let node = sibling.node();
+        if node.kind_id() == kinds.line_comment || node.kind_id() == kinds.block_comment {
+            previous = sibling.previous_sibling();
+            continue;
+        }
+        if node.kind_id() != kinds.attribute_item {
+            break;
+        }
+        let Some(attribute) = node
+            .named_child(0)
+            .filter(|node| node.kind() == "attribute")
+        else {
+            return Ok(crate::RustModulePath::Unknown);
+        };
+        let Some(name) = semantic_attribute_name(attribute, text) else {
+            return Ok(crate::RustModulePath::Unknown);
+        };
+        match name {
+            "path" if state == crate::RustModulePath::Absent => {
+                state = literal_path(attribute, text)?;
+                if state == crate::RustModulePath::Unknown {
+                    return Ok(state);
+                }
+            }
+            "cfg"
+            | "macro_use"
+            | "doc"
+            | "allow"
+            | "warn"
+            | "deny"
+            | "forbid"
+            | "deprecated"
+            | "no_implicit_prelude" => {}
+            "cfg_attr" if documentation_cfg_attribute(attribute, text) => {}
+            _ => return Ok(crate::RustModulePath::Unknown),
+        }
+        previous = sibling.previous_sibling();
+    }
+    Ok(state)
+}
+
+fn semantic_attribute_name<'source>(
+    attribute: Node<'_>,
+    text: &'source str,
+) -> Option<&'source str> {
+    attribute
+        .named_child(0)
+        .filter(|node| node.kind() == "identifier")
+        .and_then(|node| text.get(node.byte_range()))
+}
+
+fn documentation_cfg_attribute(attribute: Node<'_>, text: &str) -> bool {
+    let Some(arguments) = attribute.child_by_field_name("arguments") else {
+        return false;
+    };
+    if attribute.has_error()
+        || attribute.named_child_count() != 2
+        || arguments.kind() != "token_tree"
+        || arguments.child_count() != 6
+        || arguments.end_byte() - arguments.start_byte()
+            > rift_core::constants::PROJECT_PATH_BYTES_MAX
+    {
+        return false;
+    }
+    for (index, expected) in [(0, "("), (1, "docsrs"), (2, ","), (3, "doc"), (5, ")")] {
+        if arguments
+            .child(index)
+            .and_then(|node| text.get(node.byte_range()))
+            != Some(expected)
+        {
+            return false;
+        }
+    }
+    let Some(documentation) = arguments
+        .child(4)
+        .filter(|node| node.kind() == "token_tree")
+    else {
+        return false;
+    };
+    documentation_tokens(documentation, text)
+}
+
+fn documentation_tokens(documentation: Node<'_>, text: &str) -> bool {
+    if documentation.child(0).is_none_or(|node| node.kind() != "(")
+        || documentation
+            .child(documentation.child_count() - 1)
+            .is_none_or(|node| node.kind() != ")")
+    {
+        return false;
+    }
+    let mut cursor = documentation.walk();
+    for _ in 0..rift_core::constants::PROJECT_PATH_BYTES_MAX {
+        let node = cursor.node();
+        if matches!(node.kind(), "metavariable" | "token_repetition")
+            || (!node.is_named()
+                && text.get(node.byte_range()).is_none_or(|token| {
+                    token
+                        .chars()
+                        .any(|value| ['$', '!', '{', '}', '[', ']', ';'].contains(&value))
+                }))
+            || node.is_missing()
+            || node.is_error()
+        {
+            return false;
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        while !cursor.goto_next_sibling() {
+            if !cursor.goto_parent() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn literal_path(attribute: Node<'_>, text: &str) -> Result<crate::RustModulePath, RiftError> {
+    let Some(value) = attribute.child_by_field_name("value") else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    if !matches!(value.kind(), "string_literal" | "raw_string_literal")
+        || value.named_child_count() != 1
+    {
+        return Ok(crate::RustModulePath::Unknown);
+    }
+    let Some(content) = value
+        .named_child(0)
+        .filter(|node| node.kind() == "string_content")
+    else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    let Some(path) = text.get(content.byte_range()) else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    if path.is_empty() || path.len() > rift_core::constants::PROJECT_PATH_BYTES_MAX {
+        return Ok(crate::RustModulePath::Unknown);
+    }
+    let Ok(path) = rift_core::ProjectPath::new(path) else {
+        return Ok(crate::RustModulePath::Unknown);
+    };
+    Ok(crate::RustModulePath::Literal {
+        path,
+        range: extract::byte_range(content)?,
+    })
+}
+
 /// The name inside `#[...]`, trimmed; `None` for text that is not an attribute item.
 fn attribute_name(attribute_text: &str) -> Option<&str> {
     attribute_text

@@ -7,6 +7,7 @@ fn exact_entry(version: &str) -> PackageContextEntry {
     PackageContextEntry {
         availability: PackageAvailability::Canonical,
         manager: "cargo".to_owned(),
+        registry: Some("crates.io".to_owned()),
         name: "demo".to_owned(),
         requirement: None,
         version: Some(version.to_owned()),
@@ -17,6 +18,7 @@ fn requirement_entry() -> PackageContextEntry {
     PackageContextEntry {
         availability: PackageAvailability::Canonical,
         manager: "cargo".to_owned(),
+        registry: Some("crates.io".to_owned()),
         name: "demo".to_owned(),
         requirement: Some(RANGE.to_owned()),
         version: None,
@@ -26,6 +28,7 @@ fn requirement_entry() -> PackageContextEntry {
 fn served(version: &str) -> PackageIdentity {
     PackageIdentity {
         manager: "cargo".to_owned(),
+        registry: "crates.io".to_owned(),
         name: "demo".to_owned(),
         version: version.to_owned(),
     }
@@ -126,9 +129,13 @@ async fn test_fixture_resolution_refuses_an_unnamed_substitution() {
     ];
     for (mode, field) in cases {
         let (_server, client) = operation_client(mode).await;
-        assert_eq!(
-            client.resolve_package_context(&request).await,
-            Err(ClientError::InvalidResponseField { field })
+        assert_registered_field(
+            &client
+                .resolve_package_context(&request)
+                .await
+                .expect_err("registered refusal"),
+            "rift.client.response_invalid",
+            field,
         );
     }
 }
@@ -163,7 +170,7 @@ fn test_a_requirement_resolved_in_its_range_names_no_substitution() {
         entries: vec![requirement],
     };
     let response = decoded(body);
-    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
+    validate_resolution_response(&request, &response).expect("validation accepted");
     assert!(response.substitutions().is_empty());
 }
 
@@ -192,18 +199,16 @@ fn test_resolution_refuses_a_warning_naming_no_answered_requirement() {
     ];
     for (case, warnings) in cases {
         let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
-        assert_eq!(
-            validate_resolution_response(&request, &response),
-            Err(ClientError::InvalidResponseField {
-                field: "resolution_warning"
-            }),
-            "{case}"
+        assert_registered_field(
+            &validate_resolution_response(&request, &response).expect_err(case),
+            "rift.client.response_invalid",
+            "resolution_warning",
         );
     }
 
     let future = json!([{"code": "future_code", "detail": "cargo/demo 1.0.3 answered by 1.0.2"}]);
     let response = decoded(resolution(&resolved, &json!([]), Some(future)));
-    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
+    validate_resolution_response(&request, &response).expect("validation accepted");
     assert_eq!(
         response
             .warnings
@@ -236,14 +241,15 @@ fn test_resolution_refuses_warnings_past_the_entry_bound() {
     ];
     for warnings in past_the_bound {
         let response = decoded(resolution(&resolved, &json!([]), Some(warnings)));
-        assert_eq!(
-            validate_resolution_response(&request, &response),
-            Err(ClientError::InvalidResponseField { field: "warnings" })
+        assert_registered_field(
+            &validate_resolution_response(&request, &response).expect_err("registered refusal"),
+            "rift.client.response_invalid",
+            "warnings",
         );
     }
     let at_the_bound = json!([{"code": "unknown", "detail": "x".repeat(WARNING_DETAIL_CHARS_MAX)}]);
     let response = decoded(resolution(&resolved, &json!([]), Some(at_the_bound)));
-    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
+    validate_resolution_response(&request, &response).expect("validation accepted");
 }
 
 /// A resolved entry names one selector, as a requested entry does: an answer whose entry
@@ -265,31 +271,28 @@ fn test_resolution_refuses_a_resolved_entry_with_both_selectors_or_neither() {
     for entry in [both, neither] {
         let resolved = json!([{"entry": entry_json(&entry), "package": served("5.7.2")}]);
         let response = decoded(resolution(&resolved, &json!([]), None));
-        assert_eq!(
-            validate_resolution_response(&request, &response),
-            Err(ClientError::InvalidResponseField {
-                field: "resolved_requirement"
-            }),
-            "{entry:?}"
+        assert_registered_field(
+            &validate_resolution_response(&request, &response).expect_err("registered refusal"),
+            "rift.client.response_invalid",
+            "resolved_requirement",
         );
     }
 }
 
-/// A `requirement_unsatisfied` detail for an entry at every package field's bound fills the
-/// warning detail bound exactly, and the resolution naming it is accepted. The bounds count
-/// characters, as the contract's `maxLength` does, so a name in a multi-byte script at its
-/// bound passes the request check too, at twice the bytes.
+/// A warning detail meets its character bound while the exact package owner is refused.
 #[test]
-fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
+fn test_warning_detail_bound_does_not_admit_invalid_package_owner() {
     let requirement = PackageContextEntry {
         availability: PackageAvailability::Canonical,
         manager: "m".repeat(PACKAGE_MANAGER_CHARS_MAX),
+        registry: Some("registry.example".to_owned()),
         name: "\u{e9}".repeat(PACKAGE_NAME_CHARS_MAX),
         requirement: Some("r".repeat(PACKAGE_VERSION_CHARS_MAX)),
         version: None,
     };
     let package = PackageIdentity {
         manager: requirement.manager.clone(),
+        registry: "registry.example".to_owned(),
         name: requirement.name.clone(),
         version: "v".repeat(PACKAGE_VERSION_CHARS_MAX),
     };
@@ -311,15 +314,17 @@ fn test_resolution_accepts_the_longest_requirement_unsatisfied_detail() {
     let request = PackageResolutionRequest {
         entries: vec![requirement.clone()],
     };
-    assert_eq!(validate_resolution_request(&request), Ok(()));
-    assert_eq!(validate_packages(std::slice::from_ref(&package)), Ok(()));
-    assert_eq!(validate_resolution_response(&request, &response), Ok(()));
-    assert_eq!(
-        response.substitutions(),
-        [Substitution {
-            requested: requirement,
-            served: package,
-        }]
+    validate_resolution_request(&request).expect("validation accepted");
+    assert_registered_field(
+        &validate_packages(std::slice::from_ref(&package)).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "package",
+    );
+    validate_resolution_warnings(&response).expect("validation accepted");
+    assert_registered_field(
+        &validate_resolution_response(&request, &response).expect_err("registered refusal"),
+        "rift.client.response_invalid",
+        "package",
     );
 }
 
@@ -343,6 +348,7 @@ impl PackageFields {
         PackageContextEntry {
             availability: PackageAvailability::Canonical,
             manager: self.manager.clone(),
+            registry: Some("registry.example".to_owned()),
             name: self.name.clone(),
             requirement: None,
             version: Some(self.version.clone()),
@@ -352,6 +358,7 @@ impl PackageFields {
     fn identity(&self) -> PackageIdentity {
         PackageIdentity {
             manager: self.manager.clone(),
+            registry: "registry.example".to_owned(),
             name: self.name.clone(),
             version: self.version.clone(),
         }
@@ -370,8 +377,12 @@ fn test_package_fields_past_their_character_bound_are_refused() {
     let request = PackageResolutionRequest {
         entries: vec![at_bound.entry()],
     };
-    assert_eq!(validate_resolution_request(&request), Ok(()));
-    assert_eq!(validate_packages(&[at_bound.identity()]), Ok(()));
+    validate_resolution_request(&request).expect("validation accepted");
+    assert_registered_field(
+        &validate_packages(&[at_bound.identity()]).expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "package",
+    );
 
     let past: [FieldPastItsBound; 3] = [
         ("manager", "package_manager", |fields| {
@@ -390,17 +401,15 @@ fn test_package_fields_past_their_character_bound_are_refused() {
         let request = PackageResolutionRequest {
             entries: vec![fields.entry()],
         };
-        assert_eq!(
-            validate_resolution_request(&request),
-            Err(ClientError::InvalidRequest { field: entry_field }),
-            "{entry_field}"
+        assert_registered_field(
+            &validate_resolution_request(&request).expect_err("registered refusal"),
+            "rift.client.request_invalid",
+            entry_field,
         );
-        assert_eq!(
-            validate_packages(&[fields.identity()]),
-            Err(ClientError::InvalidRequest {
-                field: package_field
-            }),
-            "{package_field}"
+        assert_registered_field(
+            &validate_packages(&[fields.identity()]).expect_err("registered refusal"),
+            "rift.client.request_invalid",
+            package_field,
         );
     }
 }
@@ -422,14 +431,14 @@ fn test_resolution_entries_stop_at_the_smaller_advertised_bound() {
     let mut request = PackageResolutionRequest {
         entries: vec![exact_entry("1.0.0"), exact_entry("1.0.1")],
     };
-    assert_eq!(
-        validate_resolution_request_for_capabilities(&request, &capabilities),
-        Ok(())
-    );
+    validate_resolution_request_for_capabilities(&request, &capabilities)
+        .expect("validation accepted");
     request.entries.push(exact_entry("1.0.2"));
-    assert_eq!(
-        validate_resolution_request_for_capabilities(&request, &capabilities),
-        Err(ClientError::InvalidRequest { field: "entries" })
+    assert_registered_field(
+        &validate_resolution_request_for_capabilities(&request, &capabilities)
+            .expect_err("registered refusal"),
+        "rift.client.request_invalid",
+        "entries",
     );
 }
 

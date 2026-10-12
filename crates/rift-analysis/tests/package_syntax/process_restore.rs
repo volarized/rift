@@ -5,12 +5,45 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
-use rift_syntax::{ByteRange, SyntaxFacts, SyntaxFactsParts, SyntaxNames, SyntaxSymbol};
+use rift_syntax::{
+    ByteRange, RustModulePath, SyntaxFacts, SyntaxFactsParts, SyntaxNames, SyntaxSymbol,
+};
 use serde::{Deserialize, Serialize};
 
-use super::{PackageSyntax, ShippedLanguage, SyntaxLimits, analyze, canonical};
+use super::{PackageSyntax, ShippedLanguage, SyntaxLimits, analyze_with_library, canonical};
 
 const SOURCE: &str = "/// Opens a file.\npub mod client { pub fn open() {} pub fn open() {} }\n";
+
+#[derive(Serialize, Deserialize)]
+enum CapturedModulePath {
+    Absent,
+    Literal { path: String, range: [u64; 2] },
+    Unknown,
+}
+
+impl CapturedModulePath {
+    fn capture(value: &RustModulePath) -> Self {
+        match value {
+            RustModulePath::Absent => Self::Absent,
+            RustModulePath::Literal { path, range } => Self::Literal {
+                path: path.as_str().to_owned(),
+                range: captured_range(*range),
+            },
+            RustModulePath::Unknown => Self::Unknown,
+        }
+    }
+
+    fn restore(self) -> RustModulePath {
+        match self {
+            Self::Absent => RustModulePath::Absent,
+            Self::Literal { path, range } => RustModulePath::Literal {
+                path: rift_core::ProjectPath::new(path).expect("recorded module path"),
+                range: restored_range(range),
+            },
+            Self::Unknown => RustModulePath::Unknown,
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct CapturedSymbol {
@@ -28,6 +61,7 @@ struct CapturedSymbol {
     signatures: Vec<Signature>,
     documentation: Vec<Documentation>,
     documentation_ranges: Vec<[u64; 2]>,
+    module_path: Option<CapturedModulePath>,
 }
 
 fn captured_range(range: ByteRange) -> [u64; 2] {
@@ -62,6 +96,7 @@ impl CapturedSymbol {
                 .copied()
                 .map(captured_range)
                 .collect(),
+            module_path: symbol.module_path.as_ref().map(CapturedModulePath::capture),
         }
     }
 
@@ -89,9 +124,15 @@ impl CapturedSymbol {
                 .into_iter()
                 .map(restored_range)
                 .collect(),
+            module_path: self.module_path.map(CapturedModulePath::restore),
+            python_overload: None,
         }
     }
 }
+
+type MacroInvocation = ([u64; 2], Vec<[u64; 2]>, Option<Vec<[u64; 2]>>);
+
+type Scope = ([u64; 2], Option<Vec<[u64; 2]>>);
 
 #[derive(Serialize, Deserialize)]
 struct CapturedFacts {
@@ -100,6 +141,8 @@ struct CapturedFacts {
     analyzer_digest: String,
     limits: [u64; 3],
     symbols: Vec<CapturedSymbol>,
+    macro_invocations: Option<Vec<MacroInvocation>>,
+    scope: Option<Vec<Scope>>,
     has_errors: bool,
     left_out_declarations: u64,
 }
@@ -123,6 +166,41 @@ impl CapturedFacts {
                 .iter()
                 .map(CapturedSymbol::capture)
                 .collect(),
+            macro_invocations: syntax.facts().macro_invocations().map(|ranges| {
+                ranges
+                    .iter()
+                    .map(|(range, modules, direct)| {
+                        (
+                            [range.start, range.end],
+                            modules
+                                .iter()
+                                .map(|range| [range.start, range.end])
+                                .collect(),
+                            direct.as_ref().map(|ranges| {
+                                ranges
+                                    .iter()
+                                    .map(|range| [range.start, range.end])
+                                    .collect()
+                            }),
+                        )
+                    })
+                    .collect()
+            }),
+            scope: syntax.facts().scope().map(|rows| {
+                rows.iter()
+                    .map(|(range, children)| {
+                        (
+                            [range.start, range.end],
+                            children.as_ref().map(|children| {
+                                children
+                                    .iter()
+                                    .map(|range| [range.start, range.end])
+                                    .collect()
+                            }),
+                        )
+                    })
+                    .collect()
+            }),
             has_errors: syntax.facts().has_errors(),
             left_out_declarations: u64::try_from(syntax.facts().left_out_declaration_count())
                 .expect("omission width"),
@@ -147,10 +225,47 @@ impl CapturedFacts {
                     .into_iter()
                     .map(|symbol| symbol.restore(&names))
                     .collect(),
+                left_out_symbols: Vec::new(),
                 has_errors: self.has_errors,
                 left_out_declarations: usize::try_from(self.left_out_declarations)
                     .expect("bounded omissions"),
                 markdown_facts: None,
+                export_bindings: None,
+                macro_invocations: self.macro_invocations.map(|ranges| {
+                    ranges
+                        .into_iter()
+                        .map(|([start, end], modules, direct)| {
+                            (
+                                ByteRange { start, end },
+                                modules
+                                    .into_iter()
+                                    .map(|[start, end]| ByteRange { start, end })
+                                    .collect(),
+                                direct.map(|ranges| {
+                                    ranges
+                                        .into_iter()
+                                        .map(|[start, end]| ByteRange { start, end })
+                                        .collect()
+                                }),
+                            )
+                        })
+                        .collect()
+                }),
+                scope: self.scope.map(|rows| {
+                    rows.into_iter()
+                        .map(|([start, end], children)| {
+                            (
+                                ByteRange { start, end },
+                                children.map(|children| {
+                                    children
+                                        .into_iter()
+                                        .map(|[start, end]| ByteRange { start, end })
+                                        .collect()
+                                }),
+                            )
+                        })
+                        .collect()
+                }),
                 source_digest: digest,
             },
         )
@@ -179,38 +294,48 @@ fn restored_facts_in_child() {
     assert!(captured.symbols.len() <= 16, "fixture declaration bound");
     let syntax = captured.restore();
     let files = [("src/moved.rs", SOURCE)];
-    let restored = analyze(
+    let restored = analyze_with_library(
         "2.0.0",
         ShippedLanguage::Rust,
         &files,
         SyntaxLimits::default(),
         |_| Some(syntax.clone()),
+        Some("src/moved.rs"),
     )
     .expect("restored package");
-    let fresh = analyze(
+    let fresh = analyze_with_library(
         "2.0.0",
         ShippedLanguage::Rust,
         &files,
         SyntaxLimits::default(),
         |_| None,
+        Some("src/moved.rs"),
     )
     .expect("fresh package");
     assert_eq!(canonical(&restored), canonical(&fresh));
     assert_eq!(restored.syntax_work().provider_calls, 0);
     assert_eq!(restored.syntax_work().reused_files, 1);
-    assert!(
-        restored
-            .publication()
-            .symbols
-            .iter()
-            .all(|symbol| symbol.symbol.0.contains("beacon@2.0.0/src/moved.rs"))
-    );
+    assert!(!restored.publication().declarations.is_empty());
+    for declaration in &restored.publication().declarations {
+        let identity = rift_protocol::identity::SymbolIdentity::parse(&declaration.symbol.0)
+            .expect("current canonical identity");
+        assert_eq!(
+            identity.owner(),
+            &rift_protocol::identity::SymbolOwner::Package {
+                manager: "cargo".into(),
+                registry: "crates.io".into(),
+                name: "beacon".into(),
+                version: "2.0.0".into(),
+            }
+        );
+        assert!(declaration.unit.0.ends_with("/src/moved.rs"));
+    }
 }
 
 #[test]
 fn facts_restore_in_another_process_with_current_placement() {
     let mut retained = None;
-    analyze(
+    analyze_with_library(
         "1.0.0",
         ShippedLanguage::Rust,
         &[("src/first.rs", SOURCE)],
@@ -220,6 +345,7 @@ fn facts_restore_in_another_process_with_current_placement() {
             retained = Some(parsed.clone());
             Some(parsed)
         },
+        Some("src/first.rs"),
     )
     .expect("original package");
     let captured = CapturedFacts::capture(&retained.expect("captured facts"));

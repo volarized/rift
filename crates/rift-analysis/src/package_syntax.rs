@@ -11,7 +11,7 @@ use rift_protocol::read::Language;
 use rift_syntax::{SyntaxDocument, SyntaxFacts, SyntaxLimits, SyntaxProvider, SyntaxSource};
 
 use crate::{PackageSource, analyzer_digest};
-use rift_protocol::read::PackageIdentity;
+use rift_protocol::identity::SymbolOwner;
 
 /// The inputs that decide one shipped provider's syntax facts.
 ///
@@ -71,7 +71,7 @@ impl PackageSyntax {
 #[derive(Debug)]
 pub struct PackageSyntaxSource<'source> {
     file: PackageSource<'source>,
-    package: &'source PackageIdentity,
+    owner: &'source SymbolOwner,
     identity: PackageSyntaxIdentity,
     provider: Option<&'static dyn SyntaxProvider>,
     documentation: bool,
@@ -81,7 +81,7 @@ pub struct PackageSyntaxSource<'source> {
 impl<'source> PackageSyntaxSource<'source> {
     pub(crate) fn new(
         file: PackageSource<'source>,
-        package: &'source PackageIdentity,
+        owner: &'source SymbolOwner,
         package_language: &'source Language,
         limits: SyntaxLimits,
     ) -> Self {
@@ -112,9 +112,9 @@ impl<'source> PackageSyntaxSource<'source> {
         );
         Self {
             file,
-            package,
+            owner,
             identity: PackageSyntaxIdentity {
-                source_digest: FileDigest::of(file.text().as_bytes()),
+                source_digest: file.source_digest(),
                 language,
                 limits,
                 analyzer_digest: analyzer_digest(),
@@ -170,7 +170,7 @@ impl<'source> PackageSyntaxSource<'source> {
             }
             None => {
                 return errors::analysis::package_syntax_unavailable()
-                    .package(crate::analyzer::package_label(self.package))
+                    .package(crate::analyzer::package_label(self.owner))
                     .path(self.file.path().as_str())
                     .fail();
             }
@@ -199,7 +199,7 @@ impl<'source> PackageSyntaxSource<'source> {
                         error
                             .with(ErrorContext::new(
                                 "package",
-                                ErrorValue::formatted(crate::analyzer::package_label(self.package)),
+                                ErrorValue::formatted(crate::analyzer::package_label(self.owner)),
                             ))
                             .with(ErrorContext::new(
                                 "path",
@@ -208,7 +208,7 @@ impl<'source> PackageSyntaxSource<'source> {
                     })
             }
             None => errors::analysis::package_syntax_unavailable()
-                .package(crate::analyzer::package_label(self.package))
+                .package(crate::analyzer::package_label(self.owner))
                 .path(self.file.path().as_str())
                 .fail(),
         }

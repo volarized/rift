@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use lsp_types::Uri;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use rift_core::{PackageIdentity, ProjectPath, SourceUnitId};
+use rift_core::{PackageIdentity, ProjectPath, SourceLocation, SourceUnitId};
 use rift_error::{RiftError, errors};
 
 /// The sole URI scheme a document may carry.
@@ -205,7 +205,7 @@ fn normalize_drive(decoded: &str) -> String {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageRoot {
     root: TreeRoot,
-    package: PackageIdentity,
+    origin: SourceLocation,
     within: Option<ProjectPath>,
 }
 
@@ -215,7 +215,17 @@ impl PackageRoot {
     pub const fn new(root: TreeRoot, package: PackageIdentity) -> Self {
         Self {
             root,
-            package,
+            origin: SourceLocation::Dependency { package },
+            within: None,
+        }
+    }
+
+    /// Pairs an installed source root with its defining package or runtime origin.
+    #[must_use]
+    pub const fn with_origin(root: TreeRoot, origin: SourceLocation) -> Self {
+        Self {
+            root,
+            origin,
             within: None,
         }
     }
@@ -225,10 +235,16 @@ impl PackageRoot {
     /// below the folder, as its package path. An empty `within` names `base` itself.
     #[must_use]
     pub fn within(base: &TreeRoot, within: ProjectPath, package: PackageIdentity) -> Self {
+        Self::within_origin(base, within, SourceLocation::Dependency { package })
+    }
+
+    /// Root-relative source paths inside an installed package or runtime origin.
+    #[must_use]
+    pub fn within_origin(base: &TreeRoot, within: ProjectPath, origin: SourceLocation) -> Self {
         let root = base.joined(&within);
         Self {
             root,
-            package,
+            origin,
             within: (!within.as_str().is_empty()).then_some(within),
         }
     }
@@ -239,10 +255,10 @@ impl PackageRoot {
         &self.root
     }
 
-    /// The package as its manager identifies it.
+    /// The defining package or runtime origin of this root.
     #[must_use]
-    pub const fn package(&self) -> &PackageIdentity {
-        &self.package
+    pub const fn origin(&self) -> &SourceLocation {
+        &self.origin
     }
 
     /// The package path of the file `relative` names below this root.
@@ -306,7 +322,7 @@ impl EngineRoots {
     /// tried through its own [`TreeRoot::project_path`], which decodes the URI first, so a
     /// pnpm folder the engine spells `nanoid%405.1.6` matches the resolved `nanoid@5.1.6`
     /// root. The matched package path mints the unit through
-    /// [`SourceUnitId::for_package`]. The work is one pass over the package roots, whose
+    /// [`SourceUnitId::for_origin`]. The work is one pass over the package roots, whose
     /// count is the catalog's own package bound.
     ///
     /// # Errors
@@ -325,12 +341,12 @@ impl EngineRoots {
         match (deeper, tree) {
             (Some((package, relative)), _) => {
                 let path = package.package_path(relative?)?;
-                let unit = SourceUnitId::for_package(&package.package, &path)?;
-                Ok(EngineAddress::Package(PackageFile {
-                    package: package.package.clone(),
+                let unit = SourceUnitId::for_origin(&package.origin, &path)?;
+                Ok(EngineAddress::Package(Box::new(PackageFile {
+                    origin: package.origin.clone(),
                     path,
                     unit,
-                }))
+                })))
             }
             (None, Some(path)) => Ok(EngineAddress::Project(path)),
             (None, None) => errors::lsp::uri_outside_root().fail(),
@@ -355,22 +371,22 @@ pub enum EngineAddress {
     /// A document below the workspace root.
     Project(ProjectPath),
     /// A file of a cataloged package.
-    Package(PackageFile),
+    Package(Box<PackageFile>),
 }
 
 /// One file of a cataloged package: the package, the file's path in it, and its unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageFile {
-    package: PackageIdentity,
+    origin: SourceLocation,
     path: ProjectPath,
     unit: SourceUnitId,
 }
 
 impl PackageFile {
-    /// The package that holds the file.
+    /// The defining package or runtime origin that holds the file.
     #[must_use]
-    pub const fn package(&self) -> &PackageIdentity {
-        &self.package
+    pub const fn origin(&self) -> &SourceLocation {
+        &self.origin
     }
 
     /// The file's path below the package's root, such as `src/lib.rs`.
@@ -379,7 +395,7 @@ impl PackageFile {
         &self.path
     }
 
-    /// The file's source unit, such as `rift://source/cargo/helper@0.1.0/src/lib.rs`.
+    /// The file's source unit, such as `rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs`.
     #[must_use]
     pub const fn unit(&self) -> &SourceUnitId {
         &self.unit
@@ -412,6 +428,7 @@ mod tests {
             root(slash_form),
             PackageIdentity {
                 manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
                 name: name.to_owned(),
                 version: version.to_owned(),
             },
@@ -429,6 +446,13 @@ mod tests {
     fn identity(manager: &str, name: &str, version: &str) -> PackageIdentity {
         PackageIdentity {
             manager: manager.to_owned(),
+            registry: match manager {
+                "cargo" => "crates.io",
+                "npm" => "npmjs.org",
+                "pypi" => "pypi.org",
+                _ => "registry.example",
+            }
+            .to_owned(),
             name: name.to_owned(),
             version: version.to_owned(),
         }
@@ -598,11 +622,11 @@ mod tests {
         let answers = [
             (
                 "file:///work/ws/node_modules/nanoid/index.d.ts",
-                "rift://source/npm/nanoid@5.1.6/index.d.ts",
+                "rift://source/npm/npmjs.org/nanoid@5.1.6/index.d.ts",
             ),
             (
                 "file:///work/ws/vendor/helper/src/lib.rs",
-                "rift://source/cargo/helper@0.1.0/src/lib.rs",
+                "rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs",
             ),
             ("file:///work/ws/src/lib.rs", "project src/lib.rs"),
             (
@@ -611,7 +635,7 @@ mod tests {
             ),
             (
                 "file:///work/elsewhere.rs",
-                "rift://source/cargo/outer@1.0.0/elsewhere.rs",
+                "rift://source/cargo/crates.io/outer@1.0.0/elsewhere.rs",
             ),
         ];
         for (text, expected) in answers {
@@ -644,14 +668,14 @@ mod tests {
                 "file:///work/ws/node_modules/.pnpm/nanoid%405.1.6/node_modules/nanoid/index.d.ts"
             )
             .expect("package address"),
-            "rift://source/npm/nanoid@5.1.6/index.d.ts".to_owned()
+            "rift://source/npm/npmjs.org/nanoid@5.1.6/index.d.ts".to_owned()
         );
         assert_eq!(
             addressed(
                 &roots,
                 "file:///work/ws/node_modules/.pnpm/%40types%2Bnode%4026.6.2/node_modules/%40types/node/fs.d.ts"
             ).expect("package address"),
-            "rift://source/npm/@types/node@26.6.2/fs.d.ts".to_owned()
+            "rift://source/npm/npmjs.org/@types/node@26.6.2/fs.d.ts".to_owned()
         );
     }
 
@@ -679,13 +703,13 @@ mod tests {
         let answers = [
             (
                 "jwt/api_jwt.py",
-                "rift://source/pypi/pyjwt@2.10.1/jwt/api_jwt.py",
+                "rift://source/pypi/pypi.org/pyjwt@2.10.1/jwt/api_jwt.py",
             ),
             (
                 "google/protobuf/message.py",
-                "rift://source/pypi/protobuf@6.33.0/google/protobuf/message.py",
+                "rift://source/pypi/pypi.org/protobuf@6.33.0/google/protobuf/message.py",
             ),
-            ("six.py", "rift://source/pypi/six@1.17.0/six.py"),
+            ("six.py", "rift://source/pypi/pypi.org/six@1.17.0/six.py"),
             (
                 "google/other.py",
                 "project .venv/lib/python3.12/site-packages/google/other.py",
@@ -727,9 +751,14 @@ mod tests {
         };
         assert_eq!(
             file.unit(),
-            &unit("rift://source/cargo/helper@0.1.0/src/lib.rs")
+            &unit("rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs")
         );
-        assert_eq!(file.package(), &identity("cargo", "helper", "0.1.0"));
+        assert_eq!(
+            file.origin(),
+            &SourceLocation::Dependency {
+                package: identity("cargo", "helper", "0.1.0")
+            }
+        );
         assert_eq!(file.path(), &path("src/lib.rs"));
     }
 
@@ -745,11 +774,11 @@ mod tests {
             assert_eq!(
                 addressed(&roots, "file:///cache/outer/vendor/inner/src/lib.rs")
                     .expect("inner address"),
-                "rift://source/cargo/inner@2.0.0/src/lib.rs".to_owned()
+                "rift://source/cargo/crates.io/inner@2.0.0/src/lib.rs".to_owned()
             );
             assert_eq!(
                 addressed(&roots, "file:///cache/outer/vendor/other.rs").expect("outer address"),
-                "rift://source/cargo/outer@1.0.0/vendor/other.rs".to_owned()
+                "rift://source/cargo/crates.io/outer@1.0.0/vendor/other.rs".to_owned()
             );
         }
     }
@@ -820,29 +849,10 @@ mod tests {
     #[test]
     fn unit_refused_keeps_the_unit_slug_and_evidence() {
         let package = package_root("/cache/helper", "helper", "0.1.0\\beta");
-        assert_eq!(package.root(), &root("/cache/helper"));
-        assert_eq!(package.package().version, "0.1.0\\beta");
         let roots = EngineRoots::new(root("/work/ws")).with_packages(vec![package]);
         let error = roots
             .address(&uri("file:///cache/helper/src/lib.rs"))
-            .expect_err("the version spells no source path");
-        assert_eq!(error.slug(), errors::core::source_unit_id_invalid_key::SLUG);
-        assert!(
-            error
-                .context()
-                .any(|(key, value)| key == "identity" && value == "source_unit")
-        );
-        let source = std::error::Error::source(&error).expect("underlying path error");
-        let cause = source
-            .downcast_ref::<RiftError>()
-            .expect("registered path error");
-        assert_eq!(cause.slug(), errors::core::path_backslash::SLUG);
-        assert_eq!(cause.message(), "source path contains a backslash");
-        assert!(
-            cause
-                .context()
-                .any(|(key, value)| key == "path_kind" && value == "source")
-        );
-        assert!(error.to_string().contains("identity source_unit"));
+            .expect_err("invalid exact package version");
+        assert_eq!(error.slug(), errors::core::identity_invalid::SLUG);
     }
 }

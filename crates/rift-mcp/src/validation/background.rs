@@ -204,6 +204,9 @@ impl BackgroundValidation {
                             .map(|(path, _)| path.clone())
                             .collect();
                     let full = (current.preparation.is_some() && !changes.is_empty())
+                        || !super::captured_build_paths_match(&root, &current.reads, &|| {
+                            cancellation.is_cancelled()
+                        })?
                         || known_path_removed
                         || configuration_fingerprint(&root) != current.configuration.fingerprint
                         || (!added_or_removed.is_empty()

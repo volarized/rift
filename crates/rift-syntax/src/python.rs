@@ -30,6 +30,8 @@ use crate::extract::{self, Declaration, GrammarRules, Visited};
 use crate::failure::RiftError;
 use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
 
+mod overload;
+
 /// Grammar spelling of a function definition, `async def` included.
 const FUNCTION_KIND: &str = "function_definition";
 /// Grammar spelling of a class definition.
@@ -138,6 +140,7 @@ fn field_id(language: &tree_sitter::Language, field: &str) -> NonZeroU16 {
 #[derive(Debug)]
 struct PythonRules {
     kinds: &'static PythonKinds,
+    overloads: overload::OverloadContext,
 }
 
 impl PythonRules {
@@ -268,6 +271,16 @@ impl PythonRules {
 }
 
 impl GrammarRules for PythonRules {
+    fn python_overload(
+        &self,
+        visited: Visited<'_, '_>,
+        text: &str,
+    ) -> Result<Option<crate::PythonOverload>, RiftError> {
+        if visited.node().kind_id() != self.kinds.function {
+            return Ok(None);
+        }
+        self.overloads.state(visited.node(), text).map(Some)
+    }
     fn name_range(&self, node: Node<'_>) -> Result<Option<crate::ByteRange>, RiftError> {
         node.child_by_field_id(self.kinds.name.get())
             .map(extract::byte_range)
@@ -377,6 +390,7 @@ impl SyntaxProvider for PythonSyntaxProvider {
             .ok_or_else(|| errors::syntax::parse_cancelled().path(source.path).error())?;
         let rules = PythonRules {
             kinds: python_kinds(),
+            overloads: overload::OverloadContext::new(tree.root_node(), source.text, limits)?,
         };
         let (nodes, symbols) =
             extract::extract(tree.root_node(), source, limits, &self.language, &rules)?;
@@ -465,6 +479,73 @@ mod tests {
         let class = symbol(&document, "Widget");
         assert_eq!(class.kind, "class");
         assert_eq!(class.facets, [SymbolFacet::Type]);
+    }
+
+    #[test]
+    fn overload_alias_and_qualified_imports_keep_original_ranges() {
+        for text in [
+            "from typing import overload as ov\n@ov\ndef call(value: int): ...\ndef call(value): return value\n",
+            "import typing as types\n@types.overload\ndef call(value: int): ...\ndef call(value): return value\n",
+            "from typing_extensions import overload\nclass Target:\n    @overload\n    def call(self, value: int): ...\n",
+        ] {
+            let document = analyze(text);
+            let function = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == "call")
+                .expect("overload declaration");
+            let Some(crate::PythonOverload::Overload {
+                import_statement,
+                module,
+                imported,
+                binding,
+                decorator,
+            }) = function.python_overload.as_ref()
+            else {
+                panic!("captured overload import and decorator");
+            };
+            assert!(import_statement.end <= decorator.start);
+            let slice = |range: crate::ByteRange| {
+                &text[usize::try_from(range.start).expect("start")
+                    ..usize::try_from(range.end).expect("end")]
+            };
+            assert!(matches!(slice(*module), "typing" | "typing_extensions"));
+            if let Some(imported) = imported {
+                assert_eq!(slice(*imported), "overload");
+            }
+            assert!(!slice(*binding).is_empty());
+            assert!(
+                slice(*decorator).ends_with(slice(*binding))
+                    || slice(*decorator).ends_with(".overload")
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_shadowed_conditional_and_nested_overload_decorators_stay_unknown() {
+        for text in [
+            "from unrelated import overload\n@overload\ndef call(): ...\n",
+            "from typing import overload\noverload = other\n@overload\ndef call(): ...\n",
+            "if enabled:\n    from typing import overload\n@overload\ndef call(): ...\n",
+            "from typing import overload\ndef outer():\n    @overload\n    def call(): ...\n",
+            "from typing import overload\n@unrelated\n@overload\ndef call(): ...\n",
+        ] {
+            let document = analyze(text);
+            let function = document
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.name == "call")
+                .expect("retained function");
+            assert_eq!(
+                function.python_overload,
+                Some(crate::PythonOverload::Unknown)
+            );
+        }
+        let document = analyze("def call(): return 1\n");
+        assert_eq!(
+            symbol(&document, "call").python_overload,
+            Some(crate::PythonOverload::Ordinary)
+        );
     }
 
     #[test]
