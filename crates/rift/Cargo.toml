@@ -67,6 +67,7 @@ rusqlite.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["net", "test-util"] }
 unicode-width.workspace = true
+ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
 
 [[test]]
 name = "corpus_bun"
