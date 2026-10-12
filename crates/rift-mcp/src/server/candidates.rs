@@ -419,11 +419,13 @@ impl RiftMcp {
         ),
         ToolFailure,
     > {
-        if matches!(
-            params.scope,
-            rift_protocol::read::SearchScope::Local
-                | rift_protocol::read::SearchScope::NamedLocal { .. }
-        ) {
+        if params.target == rift_protocol::read::SearchParamsTarget::File
+            || matches!(
+                params.scope,
+                rift_protocol::read::SearchScope::Local
+                    | rift_protocol::read::SearchScope::NamedLocal { .. }
+            )
+        {
             return Ok((None, Vec::new()));
         }
         let query = params
