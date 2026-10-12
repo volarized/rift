@@ -704,9 +704,10 @@ def controlled_arguments(arguments: Sequence[str]) -> list[str]:
     return retained
 
 
-def reuse_archive(command: Command, arguments: Sequence[str], directory: Path) -> None:
-    """Run from discovery's extracted archive and coverage environment."""
-    from rift_dev.suites import parse_coverage_environment
+def reuse_archive(
+    command: Command, arguments: Sequence[str], directory: Path, *, llvm_cov: bool
+) -> None:
+    """Run from discovery's extracted archive and original environment."""
 
     retained: list[str] = []
     index = 0
@@ -732,14 +733,18 @@ def reuse_archive(command: Command, arguments: Sequence[str], directory: Path) -
     binaries_metadata = metadata / "binaries-metadata.json"
     if not cargo_metadata.is_file() or not binaries_metadata.is_file():
         raise ValueError("Nextest archive metadata is missing after discovery")
-    coverage = (
-        CargoCommand("llvm-cov", "show-env", "--sh")
-        .with_environment(command.environment() or os.environ)
-        .with_env(CARGO_TARGET_DIR=str(directory))
-    )
-    command.with_env(
-        **parse_coverage_environment(coverage.output()), CARGO_TARGET_DIR=str(directory)
-    )
+    if llvm_cov:
+        from rift_dev.suites import parse_coverage_environment
+
+        coverage = (
+            CargoCommand("llvm-cov", "show-env", "--sh")
+            .with_environment(command.environment() or os.environ)
+            .with_env(CARGO_TARGET_DIR=str(directory))
+        )
+        command.with_env(
+            **parse_coverage_environment(coverage.output()),
+            CARGO_TARGET_DIR=str(directory),
+        )
     command.arguments = ["nextest", "run", *retained]
     append_options(
         command,
@@ -765,11 +770,15 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
     llvm_cov = command.arguments[:2] == ["llvm-cov", "nextest"]
     archived = any(a.partition("=")[0] == "--archive-file" for a in listing)
     archive_directory: Path | None = None
-    if llvm_cov and archived:
-        # cargo-llvm-cov injects --extract-to during execution. Discovery must
-        # use that same directory and must not forward a duplicate option.
-        target = source.get(
-            "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+    if archived:
+        # Discovery and execution use the same extracted archive. Coverage keeps
+        # its configured directory; plain Nextest keeps this invocation's archive.
+        target = (
+            source.get(
+                "CARGO_LLVM_COV_TARGET_DIR", str(REPOSITORY / "target/llvm-cov-target")
+            )
+            if llvm_cov
+            else str(directory / "archive")
         )
         retained: list[str] = []
         index = 0
@@ -793,7 +802,8 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         if not archive_directory.is_absolute():
             archive_directory = command.directory / archive_directory
         archive_directory.mkdir(parents=True, exist_ok=True)
-        command.with_env(CARGO_LLVM_COV_TARGET_DIR=str(archive_directory))
+        if llvm_cov:
+            command.with_env(CARGO_LLVM_COV_TARGET_DIR=str(archive_directory))
         arguments = retained
         command.arguments = [*command.arguments[:2], *arguments]
         listing = list_arguments(arguments)
@@ -828,9 +838,11 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         command.directory
     )
     discovery.with_timeout(RUN_SECONDS_MAX).with_output_limit(RUN_LOG_BYTES_MAX)
-    discovered = TestList.model_validate_json(discovery.output_bytes(echo_stderr=False))
+    discovered_bytes = discovery.output_bytes(echo_stderr=False)
+    (directory / "discovery.json").write_bytes(discovered_bytes)
+    discovered = TestList.model_validate_json(discovered_bytes)
     if archive_directory is not None:
-        reuse_archive(command, arguments, archive_directory)
+        reuse_archive(command, arguments, archive_directory, llvm_cov=llvm_cov)
     outcomes: dict[str, Outcome] = {}
     for suite in discovered.rust_suites.values():
         for name, test in suite.testcases.items():
