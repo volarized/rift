@@ -205,6 +205,7 @@ jobs:
         run: >-
           gh release create "$RIFT_TAG" dist/*
           --verify-tag
+          --draft
           --title "Rift $RIFT_TAG"
           --generate-notes
 
