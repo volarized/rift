@@ -145,6 +145,7 @@ toasty-driver-sqlite = "=0.10.0"
 # every non-wasm target, so the version is pinned to match it: a second tokenizers would
 # be a duplicate the dependency policy refuses, and could not avoid onig either.
 tokenizers = { version = "0.22.2", default-features = false }
+toml_edit = { version = "=0.25.13", default-features = false, features = ["parse", "display"] }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 syn = { version = "2.0.119", features = ["full"] }
 # The process sampler reads one process: its resident and virtual memory, CPU time and usage,

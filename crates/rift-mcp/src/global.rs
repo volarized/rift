@@ -36,6 +36,7 @@ use tokio::sync::Mutex;
 
 /// One client shared by reads under the same accepted configuration and credential value.
 pub(crate) struct GlobalState {
+    telemetry: rift_cloud_client::telemetry::Policy,
     client: Mutex<Option<ClientSlot>>,
     prepared_resolution: Mutex<Option<CachedResolutionRequest>>,
     prepared_resolution_entries: Arc<AtomicU64>,
@@ -55,6 +56,7 @@ impl Default for GlobalState {
             })
             .map(Arc::new);
         Self {
+            telemetry: rift_cloud_client::telemetry::Policy::of_process(std::path::Path::new(".")),
             client: Mutex::default(),
             prepared_resolution: Mutex::default(),
             prepared_resolution_entries,
@@ -194,6 +196,13 @@ enum ServiceState {
 }
 
 impl GlobalState {
+    pub(crate) fn for_root(root: &std::path::Path) -> Self {
+        Self {
+            telemetry: rift_cloud_client::telemetry::Policy::of_process(root),
+            ..Self::default()
+        }
+    }
+
     /// Resolves the read's canonical entries through the global API, within the entry
     /// bound its capabilities advertise.
     pub(crate) async fn route(
@@ -412,7 +421,8 @@ impl GlobalState {
     }
 
     async fn client(&self, configuration: &GlobalConfiguration) -> Result<GlobalClient, RiftError> {
-        let config = Config::try_from(configuration)?;
+        let mut config = Config::try_from(configuration)?;
+        config.telemetry = self.telemetry.clone();
         let credential = std::env::var_os(&config.token_env);
         let mut held = self.client.lock().await;
         if let Some(slot) = held.as_ref()

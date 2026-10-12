@@ -232,6 +232,7 @@ trait Publisher {
 
 struct ReqwestTransport {
     client: reqwest::Client,
+    telemetry: rift_mcp::telemetry::Policy,
 }
 struct GitHubReleaseSource<T> {
     transport: T,
@@ -343,8 +344,8 @@ async fn update_with(
 /// Runs one synchronous updater stage on the runtime's blocking pool.
 ///
 /// A panic inside the stage resumes on the caller; the cancelled arm is
-/// unreachable because the runtime lives until `update` returns.
-async fn run_blocking<T: Send + 'static>(
+/// unreachable because the runtime lives until the command returns.
+pub(super) async fn run_blocking<T: Send + 'static>(
     stage: impl FnOnce() -> Result<T, RiftError> + Send + 'static,
 ) -> Result<T, RiftError> {
     match tokio::task::spawn_blocking(stage).await {
@@ -353,7 +354,7 @@ async fn run_blocking<T: Send + 'static>(
             std::panic::resume_unwind(join_error.into_panic())
         }
         Err(join_error) => unreachable!(
-            "the updater's blocking stage is never cancelled: the runtime lives until update \
+            "the command's blocking stage is never cancelled: the runtime lives until the command \
              returns, join_error={join_error}"
         ),
     }
@@ -377,7 +378,10 @@ impl ReqwestTransport {
             .user_agent(UPDATE_USER_AGENT)
             .build()
             .map_err(|source| errors::cli::update_download_failed().source(source).error())?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            telemetry: rift_mcp::telemetry::Policy::of_process(Path::new(".")),
+        })
     }
 }
 
@@ -389,10 +393,17 @@ impl DownloadTransport for ReqwestTransport {
         bytes_max: u64,
         progress: &dyn Fn(u64, Option<u64>),
     ) -> Result<(), RiftError> {
-        let mut response = self
+        let mut request = self
             .client
             .get(url)
-            .header(reqwest::header::ACCEPT, GITHUB_JSON_ACCEPT)
+            .header(reqwest::header::ACCEPT, GITHUB_JSON_ACCEPT);
+        let disabled = self.telemetry.disabled().await;
+        if disabled {
+            request = request.header(reqwest::header::DNT, "1");
+        } else if url.starts_with(RELEASE_DOWNLOAD_BASE_URL) && !url.ends_with("checksums.sha256") {
+            eprintln!("{}", rift_mcp::telemetry::REQUEST_STATISTICS_NOTICE);
+        }
+        let mut response = request
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -1195,7 +1206,7 @@ mod tests {
         assert!(
             artifact
                 .download_url(&artifact.archive_name)
-                .starts_with("https://")
+                .starts_with("https://api.volar.sh/rift/releases/download/v0.0.2/")
         );
     }
 
@@ -2329,6 +2340,43 @@ mod tests {
             .await
             .expect_err("rootless current path must fail");
         assert!(error.to_string().contains("has no parent directory"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_download_honors_project_opt_out() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[telemetry]\ndisabled = true\n",
+        )?;
+        let service = axum::Router::new().route(
+            "/archive",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(
+                    headers.get(reqwest::header::DNT).expect("opt-out header"),
+                    "1"
+                );
+                "payload"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, service).await });
+        let mut transport = super::ReqwestTransport::new()?;
+        transport.telemetry = rift_mcp::telemetry::Policy::of_process(directory.path());
+        let destination = directory.path().join("archive");
+        super::DownloadTransport::download(
+            &transport,
+            &format!("http://{address}/archive"),
+            &destination,
+            64,
+            &super::unwatched,
+        )
+        .await?;
+        assert_eq!(fs::read(destination)?, b"payload");
+        server.abort();
+        assert!(server.await.expect_err("fixture aborted").is_cancelled());
         Ok(())
     }
 

@@ -1,6 +1,27 @@
 use rift_error::__rift_error_definition;
 
 __rift_error_definition!(
+    config_home_unresolved,
+    slug = "rift.cli.config_home_unresolved",
+    message = "the operator's home directory could not be resolved",
+    action = "set HOME (or USERPROFILE on Windows), then retry the config command",
+    fields = {
+        checked: required(string),
+    },
+);
+
+__rift_error_definition!(
+    config_write_failed,
+    slug = "rift.cli.config_write_failed",
+    message = "configuration could not be written: {path}",
+    action = "check the file and directory permissions, then retry the config command",
+    fields = {
+        path: required(path),
+        source: required(source),
+    },
+);
+
+__rift_error_definition!(
     install_home_unresolved,
     slug = "rift.cli.install_home_unresolved",
     message = "the operator's home directory could not be resolved",

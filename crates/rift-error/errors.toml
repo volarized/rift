@@ -1384,6 +1384,16 @@ fields = { operation = { type = "string" }, timeout_ms = { type = "unsigned" } }
 message = "workspace read was cancelled"
 action = "resend the request if the result is still needed"
 
+[error.cli.config_home_unresolved]
+message = "the operator's home directory could not be resolved"
+action = "set HOME (or USERPROFILE on Windows), then retry the config command"
+fields = { checked = { type = "string" } }
+
+[error.cli.config_write_failed]
+message = "configuration could not be written: {path}"
+action = "check the file and directory permissions, then retry the config command"
+fields = { path = { type = "path", format = "display" }, source = { type = "error", role = "source" } }
+
 [error.cli.install_home_unresolved]
 message = "the operator's home directory could not be resolved"
 action = "set HOME (or USERPROFILE on Windows) and retry `rift install claude --user`"

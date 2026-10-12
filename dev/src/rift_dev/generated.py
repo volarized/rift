@@ -23,6 +23,8 @@ BUILD_SECONDS_MAX = 1800.0
 # The commands whose help `docs/public/cli-help.txt` transcribes, in page order.
 HELP_COMMANDS = (
     ("--help",),
+    ("config", "--help"),
+    ("config", "set", "--help"),
     ("mcp", "--help"),
     ("server", "--help"),
     ("server", "logs", "--help"),

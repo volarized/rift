@@ -2121,7 +2121,7 @@ impl RiftMcp {
             search_index,
             ranking_weights,
             pattern_bounds,
-            global: Arc::new(GlobalState::default()),
+            global: Arc::new(GlobalState::for_root(&root)),
             lexical,
             engines,
             last_capture: Arc::default(),

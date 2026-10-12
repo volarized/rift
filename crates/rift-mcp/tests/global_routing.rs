@@ -2522,3 +2522,36 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
     server_task.await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn test_served_package_reads_apply_workspace_request_opt_out() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[telemetry]\ndisabled = true\n[global]\nendpoint = \"{}\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (_directory, client, server_task) = workspace.served;
+    let answer = search_symbols(
+        &client,
+        json!({"query": "beacon", "target": "symbol", "scope": "global"}),
+    )
+    .await?;
+    assert!(
+        !answer["results"]
+            .as_array()
+            .ok_or("results list")?
+            .is_empty()
+    );
+    let requests = fixture.requests().await;
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|request| request.telemetry_disabled));
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.uri.starts_with("/rift/rest/v1/"))
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
