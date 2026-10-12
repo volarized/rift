@@ -163,7 +163,7 @@ jobs:
       # lines to cover, so skipping the upload loses no report.
       - name: Upload release test results
         if: ${{ !cancelled() && steps.release_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
-        uses: codecov/codecov-action@v5.5.5
+        uses: codecov/codecov-action@v7.1.1
         with:
           disable_search: true
           fail_ci_if_error: true
@@ -174,7 +174,7 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
       - name: Upload installer test results
         if: ${{ !cancelled() && steps.installer_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
-        uses: codecov/codecov-action@v5.5.5
+        uses: codecov/codecov-action@v7.1.1
         with:
           disable_search: true
           fail_ci_if_error: true
@@ -315,7 +315,7 @@ jobs:
       # Dependabot runs skip the uploads; see the note in `checks`.
       - name: Upload CLI coverage
         if: ${{ github.actor != 'dependabot[bot]' }}
-        uses: codecov/codecov-action@v5.5.5
+        uses: codecov/codecov-action@v7.1.1
         with:
           disable_search: true
           fail_ci_if_error: true
@@ -326,7 +326,7 @@ jobs:
 
       - name: Upload Rust test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
-        uses: codecov/codecov-action@v5.5.5
+        uses: codecov/codecov-action@v7.1.1
         with:
           disable_search: true
           fail_ci_if_error: true
@@ -816,7 +816,7 @@ jobs:
       # Actions scope that holds `CODECOV_TOKEN` - see the `rust` job's own
       # coverage uploads above. Skip both uploads so the missing token fails
       # only the upload, never the corpus suite that already ran.
-      - uses: codecov/codecov-action@v5.5.5
+      - uses: codecov/codecov-action@v7.1.1
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
         with:
           disable_search: true
@@ -825,7 +825,7 @@ jobs:
           flags: corpus
           name: corpus-${{ matrix.repository }}-${{ matrix.case }}
           token: ${{ secrets.CODECOV_TOKEN }}
-      - uses: codecov/codecov-action@v5.5.5
+      - uses: codecov/codecov-action@v7.1.1
         if: ${{ !cancelled() && steps.corpus.outcome != 'skipped' && github.actor != 'dependabot[bot]' }}
         with:
           disable_search: true
