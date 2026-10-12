@@ -4381,13 +4381,13 @@ impl WorkspaceIndex {
         &self,
         force_include: &[String],
         files_max: usize,
-    ) -> Result<Vec<TextSourceFile>, RiftError> {
+    ) -> Result<IndexContents, RiftError> {
         if force_include.is_empty() {
-            return Ok(Vec::new());
+            return Ok(IndexContents::default());
         }
         let matcher = PathMatcher::build(&self.root, force_include, &[])?;
         let mut extra_bytes = 0_usize;
-        let mut files = Vec::new();
+        let mut contents = IndexContents::default();
         let mut match_count = 0_usize;
         let mut first_excess: Option<PathBuf> = None;
         let walker = source_walk(
@@ -4421,14 +4421,13 @@ impl WorkspaceIndex {
                 continue;
             }
             match_count += 1;
-            if files.len() >= files_max {
+            if match_count > files_max {
                 first_excess.get_or_insert_with(|| path.to_path_buf());
                 continue;
             }
-            if let IndexRead::Included(file) =
-                read_catalog_file(&self.root, path, self.limits, &mut extra_bytes)?
-            {
-                files.push(file);
+            match read_catalog_file(&self.root, path, self.limits, &mut extra_bytes)? {
+                IndexRead::Included(file) => contents.hold_text_file(file),
+                IndexRead::Skipped(warning) => contents.leave_out(warning),
             }
         }
         match first_excess {
@@ -4438,7 +4437,7 @@ impl WorkspaceIndex {
                 .observed(match_count)
                 .maximum(files_max)
                 .fail(),
-            None => Ok(files),
+            None => Ok(contents),
         }
     }
 
@@ -4455,25 +4454,25 @@ impl WorkspaceIndex {
         force_include: &[String],
         files_max: usize,
     ) -> Result<Self, RiftError> {
-        let text_files = self.force_include_text_files(force_include, files_max)?;
-        let mut files = Vec::new();
-        for file in &text_files {
+        let mut contents = self.force_include_text_files(force_include, files_max)?;
+        for (path, file) in std::mem::take(&mut contents.text_files) {
             let context_path = self.root.join(file.path().as_str());
             if let Some(ClassifiedPath::Source(provider)) =
                 self.language.classifies(&context_path)?
-                && let IndexRead::Included(indexed) =
-                    syntax_read(file, &context_path, provider, self.limits.syntax())?
             {
-                files.push(indexed);
+                let parsed =
+                    match syntax_read(&file, &context_path, provider, self.limits.syntax())? {
+                        IndexRead::Included(indexed) => IndexRead::Included(Arc::new(indexed)),
+                        IndexRead::Skipped(warning) => IndexRead::Skipped(warning),
+                    };
+                contents.hold_parsed_source((*file).clone(), parsed);
+            } else {
+                contents.text_files.insert(path, file);
             }
         }
         Self::from_parts_with_owner(
             (self.root.clone(), self.owner.clone()),
-            IndexContents {
-                files: keyed_by_path(files, IndexedFile::path),
-                text_files: keyed_by_path(text_files, TextSourceFile::path),
-                ..IndexContents::default()
-            },
+            contents,
             self.composition.clone(),
             self.limits,
             Arc::clone(&self.language),
@@ -5778,20 +5777,6 @@ fn holds_path_below<Value>(keyed: &BTreeMap<ProjectPath, Value>, prefix: &str) -
         .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
         .next()
         .is_some_and(|(path, _)| path.as_str().starts_with(prefix))
-}
-
-/// Keys an accepted file list by project path, sharing each file behind one `Arc`.
-///
-/// Two entries spelling one path cannot both be indexed: the later one wins, which is the
-/// order a directory walk would have left behind anyway.
-fn keyed_by_path<File>(
-    files: Vec<File>,
-    path_of: impl Fn(&File) -> &ProjectPath,
-) -> BTreeMap<ProjectPath, Arc<File>> {
-    files
-        .into_iter()
-        .map(|file| (path_of(&file).clone(), Arc::new(file)))
-        .collect()
 }
 
 /// Adds one unambiguous project-path and content-digest pair to workspace identity.
@@ -10700,6 +10685,75 @@ mod tests {
             "pub struct {};\n",
             "S".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX)
         )
+    }
+
+    #[test]
+    fn test_force_include_preserves_read_warnings_and_complete_source() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::write(root.join("kept.rs"), "pub fn kept() {}\n").expect("baseline source");
+        let limits = WorkspaceIndexLimits::new(16, 16_384, 131_072, 8, 8).expect("bounds");
+        let index = WorkspaceIndex::build(
+            root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("baseline index");
+        fs::create_dir(root.join("forced")).expect("request directory");
+        fs::write(root.join("forced/invalid.rs"), [0xff]).expect("invalid UTF-8 source");
+        fs::write(root.join("forced/binary.rs"), [0]).expect("binary source");
+        fs::write(root.join("forced/large.rs"), "x".repeat(16_385)).expect("oversized source");
+        fs::write(root.join("forced/wide.rs"), wide_source()).expect("complete wide source");
+        fs::write(root.join("forced/normal.rs"), "pub fn normal() {}\n").expect("normal source");
+        let selected = index
+            .force_include_index(&["forced/**".to_owned()], 16)
+            .expect("one refused file does not stop selected source");
+        assert_eq!(selected.warnings().len(), 3);
+        assert!(selected.warnings().iter().any(|warning| matches!(warning,
+            WorkspaceIndexWarning::InvalidUtf8Source { path, .. } if path.as_str() == "forced/invalid.rs")));
+        assert!(selected.warnings().iter().any(|warning| matches!(warning,
+            WorkspaceIndexWarning::BinarySource(path) if path.as_str() == "forced/binary.rs")));
+        assert!(selected.warnings().iter().any(|warning| matches!(warning,
+            WorkspaceIndexWarning::FileTooLarge { path, .. } if path.as_str() == "forced/large.rs")));
+        let wide = ProjectPath::new("forced/wide.rs").expect("selected path");
+        assert_eq!(
+            selected.file(&wide).expect("wide source retained").source(),
+            wide_source()
+        );
+        assert_eq!(
+            selected
+                .text_file(&wide)
+                .expect("wide text retained")
+                .content(),
+            wide_source()
+        );
+        assert!(
+            has_symbol(&selected, "normal"),
+            "other selected files still serve"
+        );
+        assert!(has_symbol(&index, "kept"), "baseline file still serves");
+        let refused_bound = index
+            .force_include_index(&["forced/**".to_owned()], 2)
+            .expect_err("refused matches still spend the selected file bound");
+        assert_eq!(
+            refused_bound.slug(),
+            errors::index::workspace_too_many_files::SLUG
+        );
+
+        assert!(selected.semantics.graph().records().iter().any(
+            |record| record.identity().is_none()
+                && record.contributions().iter().any(|key| {
+                    selected
+                        .semantics
+                        .graph()
+                        .contribution(key)
+                        .and_then(rift_core::Contribution::facts)
+                        .is_some_and(|facts| {
+                            facts.name().len() == rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX
+                        })
+                })
+        ));
     }
 
     #[test]
