@@ -386,8 +386,13 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
             .any(|request| request.uri.ends_with(held_route)),
         "the deadline ends an actual held {held_route} request"
     );
+    rift_tracing::info!(stage = "client.cancel", "stop stage started");
     client.cancel().await?;
+    rift_tracing::info!(stage = "client.cancel", "stop stage ended");
+    rift_tracing::info!(stage = "server_task", "stop stage started");
     server_task.await?;
+    rift_tracing::info!(stage = "server_task", "stop stage ended");
+    rift_tracing::info!(stage = "return", "stop stage ended");
     Ok(())
 }
 
