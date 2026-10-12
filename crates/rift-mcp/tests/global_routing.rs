@@ -345,13 +345,7 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     let (_directory, client, server_task) =
         workspace_client::served_prepared_workspace(&files, Some(configuration), |root| {
             if runtime {
-                let path = root.join("rift.toml");
-                let text = fs::read_to_string(&path).expect("the fixture configuration reads");
-                fs::write(
-                    path,
-                    text.replace("resolution = \"static\"", "resolution = \"auto\""),
-                )
-                .expect("the fixture enables the existing runtime resolver");
+                enable_runtime_resolution(root);
             }
         })
         .await?;
@@ -394,6 +388,16 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     rift_tracing::info!(stage = "server_task", "stop stage ended");
     rift_tracing::info!(stage = "return", "stop stage ended");
     Ok(())
+}
+
+fn enable_runtime_resolution(root: &std::path::Path) {
+    let path = root.join("rift.toml");
+    let text = fs::read_to_string(&path).expect("the fixture configuration reads");
+    fs::write(
+        path,
+        text.replace("resolution = \"static\"", "resolution = \"auto\""),
+    )
+    .expect("the fixture enables the existing runtime resolver");
 }
 
 fn runtime_callee_position() -> Result<(String, usize), Box<dyn std::error::Error>> {
