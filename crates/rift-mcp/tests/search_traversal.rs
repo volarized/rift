@@ -1788,7 +1788,10 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     assert_eq!(len["hit"]["symbol"]["kind"], json!("function"), "{len}");
     assert_eq!(
         len["hit"]["symbol"]["origin"],
-        json!({"location": "stdlib", "source_kind": "authored"}),
+        json!({
+            "location": "stdlib", "source_kind": "authored",
+            "runtime": {"runtime": "cpython", "version": global_api::python_runtime::VERSION}
+        }),
         "{len}"
     );
     assert_eq!(

@@ -3001,7 +3001,7 @@ mod captured_runtime_tests {
     #[test]
     fn runtime_stub_source_requires_complete_exact_bytes_and_view() {
         let view: CapturedView = serde_json::from_value(serde_json::json!({
-            "id": "cv:runtime", "expires_at": "2099-01-01T00:00:00Z"
+            "id": "claims.signature", "expires_at": "2099-01-01T00:00:00Z"
         }))
         .expect("captured view");
         let unit = serde_json::from_value(serde_json::json!(
@@ -3028,7 +3028,7 @@ mod captured_runtime_tests {
         let answer = serde_json::from_value(value.clone()).expect("partial source");
         assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
         value["source_complete"] = serde_json::json!(true);
-        value["view"]["id"] = serde_json::json!("cv:other");
+        value["view"]["id"] = serde_json::json!("a_B-9.z_Y-0");
         let answer = serde_json::from_value(value).expect("other view");
         assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
         for reason in [
