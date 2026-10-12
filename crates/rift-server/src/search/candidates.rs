@@ -59,6 +59,38 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchCandidateInputs, RiftError> {
+        self.selected_candidate_inputs(params, store, references)
+            .map(|(inputs, _sources)| inputs)
+    }
+
+    /// Captures candidate inputs and original source from one bounded file selection.
+    ///
+    /// # Errors
+    /// Returns the existing search, source selection or captured material refusal.
+    pub fn search_candidate_view_input(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        ready: bool,
+    ) -> Result<(SearchCandidateInputs, crate::LocalSymbolViewInput), RiftError> {
+        let (inputs, sources) = self.selected_candidate_inputs(params, store, references)?;
+        let material = self.local_search_view_input(ready)?;
+        let material = match sources {
+            Some(sources) if params.scope != SearchScope::Global => {
+                material.with_sources(&sources)?
+            }
+            _ => material,
+        };
+        Ok((inputs, material))
+    }
+
+    fn selected_candidate_inputs(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+    ) -> Result<(SearchCandidateInputs, Option<rift_index::WorkspaceIndex>), RiftError> {
         let query = self.candidate_query(params, store, references)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
         let index = self.index();
@@ -129,7 +161,7 @@ impl ReadService {
             criteria,
             &mut answer.warnings,
         )?;
-        Ok(answer)
+        Ok((answer, selected.force_include))
     }
 
     fn candidate_query(

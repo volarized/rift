@@ -28,6 +28,20 @@ pub struct LocalSymbolViewInput {
 }
 
 impl LocalSymbolViewInput {
+    /// Retains source bytes from the same request's admitted file selection.
+    ///
+    /// # Errors
+    /// Refuses a different root, owner or captured file identity.
+    pub fn with_sources(self, sources: &rift_index::WorkspaceIndex) -> Result<Self, RiftError> {
+        Ok(local_view_input(
+            Arc::new(self.material.index.with_sources(sources)?),
+            self.material.metadata.to_vec(),
+            self.material.history.clone(),
+            self.material.traversal.clone(),
+            self.ready,
+        ))
+    }
+
     /// Returns the warnings retained by this immutable input.
     ///
     /// # Errors

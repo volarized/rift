@@ -122,6 +122,157 @@ fn search_view_input_retains_nonempty_material_and_truthful_history_coverage() {
 }
 
 #[test]
+fn force_included_search_retains_original_source_after_mutation_and_removal() {
+    let (directory, _reads, _) = fixture(true);
+    let original = "pub fn phantom_signal() {}\n";
+    std::fs::write(directory.path().join("hidden.rs"), original).expect("ignored source");
+    std::fs::write(directory.path().join(".gitignore"), "hidden.rs\n").expect("ignored path");
+    let reads = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        HistoryConfiguration::default(),
+    )
+    .expect("base publication");
+    let path = rift_core::ProjectPath::new("hidden.rs").expect("project path");
+    assert!(reads.index.text_file(&path).is_none());
+    let params = serde_json::from_value(serde_json::json!({
+        "query": "phantom", "scope": "local", "target": "symbol",
+        "paths": {"force_include": ["hidden.rs"]}
+    }))
+    .expect("forced search request");
+    let (inputs, material) = reads
+        .search_candidate_view_input(
+            &params,
+            &crate::StoreAnswer::identifier_only(),
+            &crate::EngineReferences::default(),
+            true,
+        )
+        .expect("same selected candidates and source");
+    let row = inputs
+        .precise
+        .iter()
+        .flat_map(|input| &input.order)
+        .find(|row| {
+            row.hit
+                .path
+                .as_ref()
+                .is_some_and(|path| path.0 == "hidden.rs")
+        })
+        .expect("forced declaration row");
+    assert_eq!(material.material.index.source(&path), Some(original));
+    let refused = local_view_input(
+        Arc::clone(&material.material.index),
+        material.material.metadata.to_vec(),
+        None,
+        None,
+        true,
+    );
+    assert!(
+        LocalSymbolViews::new(0, [25; 32])
+            .capture(refused)
+            .expect("bounded admission")
+            .is_none()
+    );
+    let store = LocalSymbolViews::new(1 << 20, [24; 32]);
+    let view = store.capture(material).expect("admission").expect("view");
+    let request = rift_protocol::source_read::GetSourceParams {
+        unit: row
+            .hit
+            .unit
+            .clone()
+            .unwrap_or_else(|| crate::read::source_unit_id(&path)),
+        range: row.hit.range.clone(),
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    let source = store
+        .get_source(&request, reads.index.root(), reads.index.owner())
+        .expect("captured row source");
+    let rift_protocol::source_read::GetSourceResult::Found {
+        source: excerpt,
+        view: answered,
+        source_complete,
+        ..
+    } = &source
+    else {
+        panic!("forced row source must remain available");
+    };
+    assert!(source_complete);
+    assert_eq!(answered, &view);
+    assert_eq!(excerpt.text, original);
+    std::fs::write(
+        directory.path().join("hidden.rs"),
+        "pub fn replacement() {}\n",
+    )
+    .expect("current source mutation");
+    assert_eq!(
+        store
+            .get_source(&request, reads.index.root(), reads.index.owner())
+            .expect("held source"),
+        source
+    );
+    std::fs::remove_file(directory.path().join("hidden.rs")).expect("current source removal");
+    assert_eq!(
+        store
+            .get_source(&request, reads.index.root(), reads.index.owner())
+            .expect("held source"),
+        source
+    );
+}
+
+#[test]
+fn captured_source_selection_refuses_different_root_owner_and_changed_file_identity() {
+    let (directory, reads, _) = fixture(true);
+    let input = reads.local_search_view_input(true).expect("base material");
+    let (_foreign_directory, foreign, _) = fixture(true);
+    assert!(input.with_sources(&foreign.index).is_err());
+    let named = rift_index::WorkspaceIndex::build_with_owner(
+        (
+            directory.path(),
+            SymbolOwner::NamedLocal {
+                name: "cloud".to_owned(),
+            },
+        ),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        &rift_core::LanguageFileSelections::default(),
+        None,
+        &|| false,
+    )
+    .expect("same root with a different accepted owner");
+    assert!(
+        reads
+            .local_search_view_input(true)
+            .expect("original material")
+            .with_sources(&named)
+            .is_err()
+    );
+    std::fs::write(
+        directory.path().join("index.js"),
+        "export function changed() {}\n",
+    )
+    .expect("current source mutation");
+    let changed = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        HistoryConfiguration::default(),
+    )
+    .expect("changed publication");
+    assert!(
+        reads
+            .local_search_view_input(true)
+            .expect("original material")
+            .with_sources(&changed.index)
+            .is_err()
+    );
+}
+
+#[test]
 fn captured_nonempty_material_refuses_uncaptured_history_without_live_lookup() {
     let (directory, reads, id) = fixture(true);
     let store = LocalSymbolViews::new(1 << 20, [9; 32]);
@@ -200,6 +351,7 @@ fn exact_local_view_keeps_original_bindings_sources_and_continuations() {
         params.declaration_cursor = declaration_cursor;
         assert_eq!(params.declaration_cursor.is_some(), page < 2);
     }
+
     std::fs::write(
         directory.path().join("index.js"),
         "export function replaced() {}\n",

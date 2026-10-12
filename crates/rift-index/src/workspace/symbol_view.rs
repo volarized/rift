@@ -14,7 +14,7 @@ mod tests;
 /// Immutable source, semantic and ranking material from one admitted workspace publication.
 ///
 /// Build-only path matchers, weak rebuild caches and operation observations are not retained.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceSymbolView {
     root: PathBuf,
     owner: SymbolOwner,
@@ -106,6 +106,34 @@ impl SymbolDeclarations {
 }
 
 impl WorkspaceSymbolView {
+    /// Retains already captured source bytes without adding semantic facts.
+    ///
+    /// # Errors
+    /// Refuses a different root, owner or captured file identity.
+    pub fn with_sources(&self, sources: &WorkspaceIndex) -> Result<Self, RiftError> {
+        if self.root != sources.root || self.owner != sources.owner {
+            return errors::analysis::package_input_identity_invalid().fail();
+        }
+        for (path, file) in &sources.text_files {
+            let conflict = self.text_files.get(path).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            }) || self.files.get(path).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            });
+            if conflict {
+                return errors::analysis::package_input_identity_invalid().fail();
+            }
+        }
+        let mut view = self.clone();
+        for (path, file) in &sources.text_files {
+            view.text_files
+                .entry(path.clone())
+                .or_insert_with(|| Arc::clone(file));
+        }
+        view.retained_bytes = retained_size::measure(&view);
+        Ok(view)
+    }
+
     /// Root of the captured workspace, independent of the caller's current directory.
     #[must_use]
     pub fn root(&self) -> &Path {

@@ -354,15 +354,10 @@ impl RiftMcp {
         let params = requested.params.clone();
         let (mut inputs, material) = self
             .current_captured_read(&resolved, true, move |reads, capture_warnings| {
-                let mut inputs = reads.search_candidate_inputs(&params, &answer, &references)?;
+                let (mut inputs, material) =
+                    reads.search_candidate_view_input(&params, &answer, &references, ready)?;
                 inputs.warnings.extend(capture_warnings.iter().cloned());
-                let material = match params.traversal.as_ref() {
-                    Some(traversal) => {
-                        reads.local_traversal_view_input(traversal, references, ready)?
-                    }
-                    None => reads.local_search_view_input(ready)?,
-                }
-                .with_warnings(capture_warnings)?;
+                let material = material.with_warnings(capture_warnings)?;
                 Ok((inputs, material))
             })
             .await?
