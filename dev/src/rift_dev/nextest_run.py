@@ -340,7 +340,7 @@ class ArtifactStore:
         data = EVIDENCE.dump_json(evidence, exclude=excluded) + b"\n"
         decoded_bytes = len(data)
         if self.path.suffix == ".gz":
-            data = zlib.compress(data, wbits=GZIP_WINDOW)
+            data = zlib.compress(data, level=zlib.Z_BEST_SPEED, wbits=GZIP_WINDOW)
         with self.lock:
             self.received += 1
             self.received_bytes += len(data)
