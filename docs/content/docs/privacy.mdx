@@ -22,7 +22,8 @@ request, so a proxy can change the country and a caller can change the agent cat
 
 The counters contain no IP addresses, installation identifiers, account identifiers, raw
 User-Agent headers, code, queries, request bodies, or project paths. The service deletes counters older than
-90 UTC days during its daily cleanup. Cleanup can take up to one further day. Download counts
+90 UTC days during its daily cleanup. Cleanup can take up to one further day. Recoverable database
+history can retain deleted counters for up to a further 30 days. Download counts
 include retries and updates. They do not confirm installations or unique users.
 
 Downloading a release directly from GitHub bypasses the download service.
@@ -63,22 +64,13 @@ settings control Rift's counters; Cloudflare and GitHub have separate processing
 
 ## Service providers
 
-Cloudflare hosts the services and stores their counters in an EU database. Cloudflare still
-processes incoming requests through its global network. The global API separately processes
-network addresses to enforce request limits. Those addresses do not enter these counters.
+- [Cloudflare](https://www.cloudflare.com/privacypolicy/) hosts the services and stores counters in an EU database. Incoming requests pass through its global network.
+- [GitHub](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) serves release downloads after a redirect from Rift's download service.
 
-The download service redirects archive requests to GitHub, which receives the resulting
-download request. Cloudflare and GitHub can process request data outside the European
-Economic Area, including in the United States. Their records and retention are separate from
-the counters described here. Recoverable database history can retain deleted counters for
-up to a further 30 days. The service removes expired counters before resuming collection
-after recovery.
-
-[Cloudflare's privacy policy](https://www.cloudflare.com/privacypolicy/) describes its
-international transfers. Its [data processing addendum](https://www.cloudflare.com/cloudflare-customer-dpa/)
-provides standard contractual clauses for applicable transfers. GitHub describes its request
-processing and transfer safeguards in its
-[privacy statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement).
+These providers can process request data outside the European Economic Area, including in the
+United States. Cloudflare's [data processing addendum](https://www.cloudflare.com/cloudflare-customer-dpa/)
+provides standard contractual clauses for applicable transfers. GitHub's privacy statement
+describes its transfer safeguards. Their processing and retention are separate from Rift's counters.
 
 ## Rights and contact
 

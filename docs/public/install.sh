@@ -189,7 +189,7 @@ main() {
   if [[ "${RIFT_TELEMETRY_DISABLED:-false}" == false && "$RIFT_DOWNLOAD_BASE" == https://api.volar.sh/rift/releases/download ]]; then
     cat >&2 <<'EOF'
 Rift collects aggregate download and cloud request statistics by default to measure adoption and improve the service.
-Disable cloud and update statistics: rift config set --telemetry.disabled=true --user
+You can disable cloud and update statistics: rift config set --telemetry.disabled=true --user
 For installation, set RIFT_TELEMETRY_DISABLED=true before running the installer.
 Details: https://volar.sh/rift/docs/privacy
 EOF
