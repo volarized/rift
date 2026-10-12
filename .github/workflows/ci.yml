@@ -289,10 +289,15 @@ jobs:
         run: |
           RIFT_RETAINED_MATERIAL_ROOT="$(uv run --locked --project dev rift-dev corpus sync bun)"
           export RIFT_RETAINED_MATERIAL_ROOT
+          uv run --locked --project dev rift-dev test nextest list \
+            --archive-file target/fast.tar.zst --workspace-remap . \
+            --profile corpus --run-ignored only --message-format json \
+            -E 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)' \
+            > target/retained-material-discovery.json
           uv run --locked --project dev rift-dev test nextest run \
             --archive-file target/fast.tar.zst --workspace-remap . \
             --profile corpus --no-tests fail --run-ignored all \
-            -E 'binary(=rift-server) & test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
+            -E 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
       - name: Preserve Rust coverage and test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
         uses: actions/upload-artifact@v7.0.1
@@ -302,6 +307,7 @@ jobs:
             lcov.info
             target/nextest/ci/junit.xml
             target/nextest/corpus/junit.xml
+            target/retained-material-discovery.json
             target/nextest/ci/failure-windows/
             target/integration/nextest/
           if-no-files-found: error
