@@ -40,14 +40,22 @@ impl Policy {
     /// Captures the project's root, home directory, and environment opt-out.
     #[must_use]
     pub fn of_process(root: &Path) -> Self {
-        let home = std::env::var_os("HOME")
+        Self::of_environment(root, &|name| std::env::var_os(name))
+    }
+
+    fn of_environment(
+        root: &Path,
+        environment: &impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Self {
+        let home = environment("HOME")
             .filter(|value| !value.is_empty())
-            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()));
-        let environment_disabled = match std::env::var("RIFT_TELEMETRY_DISABLED") {
-            Ok(value) => value.parse().unwrap_or(true),
-            Err(std::env::VarError::NotPresent) => false,
-            Err(_) => true,
-        };
+            .or_else(|| environment("USERPROFILE").filter(|value| !value.is_empty()));
+        let environment_disabled = environment("RIFT_TELEMETRY_DISABLED").is_some_and(|value| {
+            value
+                .to_str()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(true)
+        });
         Self {
             root: root.to_path_buf(),
             home: home.map(PathBuf::from),
