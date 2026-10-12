@@ -366,6 +366,38 @@ mod tests {
         }
         assert!(edit(Path::new("rift.toml"), &"x".repeat(256 * 1024 + 1), true).is_err());
     }
+
+    #[test]
+    fn test_config_insertion_preserves_headers_and_missing_final_newline() {
+        for ending in ["\n", "\r\n"] {
+            let header = format!("[telemetry] # retained{ending}");
+            assert_eq!(
+                edit(Path::new("rift.toml"), &header, true).expect("accepted table"),
+                format!("{header}disabled = true{ending}")
+            );
+            let original = format!("# retained{ending}[source]{ending}respect_gitignore = false");
+            assert_eq!(
+                edit(Path::new("rift.toml"), &original, true).expect("accepted document"),
+                format!("{original}{ending}[telemetry]{ending}disabled = true{ending}")
+            );
+        }
+    }
+
+    #[test]
+    fn test_config_write_refusals_preserve_existing_files() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("rift.toml");
+        let limit = usize::try_from(CONFIGURATION_FILE_BYTES_MAX)?;
+        let original = format!("#{}", "x".repeat(limit - 1));
+        fs::write(&path, &original)?;
+        assert!(set(&path, true).is_err());
+        assert_eq!(fs::read_to_string(&path)?, original);
+        assert!(set(&path.join("config.toml"), true).is_err());
+        assert_eq!(fs::read_to_string(&path)?, original);
+        Ok(())
+    }
+
     #[test]
     fn test_config_updates_preserve_every_unrelated_byte() {
         let cases = [
