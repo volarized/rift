@@ -1111,7 +1111,10 @@ async fn proxy_row_source(
             ..
         } = result
         else {
-            return Err("captured row source must remain available".into());
+            return Err(format!(
+                "captured row source must remain available: request {request}, response {response:?}"
+            )
+            .into());
         };
         assert!(source_complete, "captured row source must be complete");
         assert_eq!(
