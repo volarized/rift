@@ -1560,7 +1560,12 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
                 .source(file.path())
                 .expect("original captured source")
                 .to_owned();
-            held_source = Some((file.path().clone(), original, None));
+            held_source = Some((
+                file.path().clone(),
+                original,
+                Arc::clone(&input.material),
+                None,
+            ));
         }
         let started = std::time::Instant::now();
         let admitted = store
@@ -1568,19 +1573,20 @@ fn captured_preparation_views_measure_shared_accounting_cost() {
             .expect("material admission")
             .expect("original byte bound admits shared material");
         let capture_elapsed = started.elapsed();
-        if let Some((path, original, view)) = &mut held_source
+        if let Some((path, original, material, view)) = &mut held_source
             && view.is_none()
         {
-            assert_measured_held_source(&store, &reads, path, original, &admitted);
+            assert_measured_held_source(&store, &reads, path, original, material, &admitted);
             *view = Some(admitted);
         }
         if measured_shared_accounting(&store, budget, prepared, total, capture_elapsed) {
-            let (path, original, view) = held_source.expect("observed held source");
+            let (path, original, material, view) = held_source.expect("observed held source");
             assert_measured_held_source(
                 &store,
                 &reads,
                 &path,
                 &original,
+                &material,
                 &view.expect("advertised view"),
             );
             return;
@@ -1626,30 +1632,66 @@ fn assert_measured_held_source(
     reads: &ReadService,
     path: &rift_core::ProjectPath,
     original: &str,
+    material: &Arc<LocalSymbolMaterial>,
     view: &CapturedView,
 ) {
-    let result = store
-        .get_source(
-            &rift_protocol::source_read::GetSourceParams {
-                unit: crate::read::source_unit_id(path),
-                range: None,
-                view: Some(view.id.clone()),
-                rev: None,
-            },
-            reads.index.root(),
-            reads.index.owner(),
-        )
-        .expect("held original source");
+    let request = rift_protocol::source_read::GetSourceParams {
+        unit: crate::read::source_unit_id(path),
+        range: None,
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    let held = store
+        .state
+        .lock()
+        .unwrap()
+        .views
+        .get(view.id.as_str())
+        .expect("retained original material")
+        .clone();
+    assert_eq!(held.view, *view);
+    assert!(held.expires > SystemTime::now());
+    assert_eq!(held.material.index.root(), reads.index.root());
+    assert_eq!(held.material.index.owner(), reads.index.owner());
+    assert!(Arc::ptr_eq(&held.material, material));
+    let public = store
+        .get_source(&request, reads.index.root(), reads.index.owner())
+        .expect("held public source selection");
+    assert_eq!(
+        held.material
+            .index
+            .source(path)
+            .expect("held original source"),
+        original
+    );
+    if !held.ready {
+        assert_eq!(
+            public,
+            rift_protocol::source_read::GetSourceResult::Unavailable {
+                unit: request.unit.clone(),
+                view: None,
+                reason: SymbolUnavailableReason::IndexPreparing,
+                warnings: Vec::new(),
+            }
+        );
+        return;
+    }
     let rift_protocol::source_read::GetSourceResult::Found {
         source,
         source_complete,
         view: answered,
         ..
-    } = result
+    } = public
     else {
-        panic!("previously advertised original source remains available");
+        panic!("previously advertised original source remains available: {public:?}");
     };
     assert!(source_complete);
     assert_eq!(source.text, original);
     assert_eq!(answered, *view);
+    assert_eq!(source.span.unit, request.unit);
+    assert_eq!(source.span.range.start, 0);
+    assert_eq!(
+        source.span.range.end,
+        u64::try_from(original.len()).unwrap()
+    );
 }
