@@ -106,7 +106,21 @@ fn edit(path: &Path, raw: &str, disabled: bool) -> Result<String, RiftError> {
     if rendered.len() as u64 > CONFIGURATION_FILE_BYTES_MAX {
         return Err(invalid(path, "configuration exceeds the file byte limit"));
     }
-    Document::parse(rendered.as_str()).map_err(|error| invalid(path, &error.to_string()))?;
+    let accepted =
+        Document::parse(rendered.as_str()).map_err(|error| invalid(path, &error.to_string()))?;
+    if accepted
+        .as_table()
+        .get("telemetry")
+        .and_then(Item::as_table_like)
+        .and_then(|table| table.get("disabled"))
+        .and_then(Item::as_bool)
+        != Some(disabled)
+    {
+        return Err(invalid(
+            path,
+            "configuration edit did not set telemetry.disabled",
+        ));
+    }
     Ok(rendered)
 }
 
@@ -184,22 +198,36 @@ fn inline_replacement(
     document: &Document<&str>,
     disabled: bool,
 ) -> Result<(std::ops::Range<usize>, String), RiftError> {
-    let value = document
+    let table = document
         .as_table()
         .get("telemetry")
-        .and_then(Item::as_value)
+        .and_then(Item::as_inline_table)
         .ok_or_else(|| invalid(path, "telemetry must be a table"))?;
-    let range = value
+    let range = table
         .span()
         .ok_or_else(|| invalid(path, "configuration value has no parsed span"))?;
-    let mut mutable = document.clone().into_mut();
-    let table = mutable
-        .get_mut("telemetry")
-        .and_then(Item::as_inline_table_mut)
-        .ok_or_else(|| invalid(path, "telemetry must be a table"))?;
-    table.insert("disabled", Value::from(disabled));
-    table.decor_mut().clear();
-    Ok((range, table.to_string()))
+    let raw = document.raw();
+    if raw.as_bytes().get(range.start) != Some(&b'{') {
+        return Err(invalid(
+            path,
+            "configuration inline table has no opening brace",
+        ));
+    }
+    let position = range.start + 1;
+    let separator = if table.is_empty() { "" } else { "," };
+    let spacing = if raw
+        .as_bytes()
+        .get(position)
+        .is_some_and(u8::is_ascii_whitespace)
+    {
+        ""
+    } else {
+        " "
+    };
+    Ok((
+        position..position,
+        format!(" disabled = {disabled}{separator}{spacing}"),
+    ))
 }
 
 #[cfg(test)]
@@ -337,5 +365,65 @@ mod tests {
             assert!(edit(Path::new("rift.toml"), raw, true).is_err());
         }
         assert!(edit(Path::new("rift.toml"), &"x".repeat(256 * 1024 + 1), true).is_err());
+    }
+    #[test]
+    fn test_config_updates_preserve_every_unrelated_byte() {
+        let cases = [
+            "# disabled = false stays in this comment\ntelemetry.'disabled' = false # change only this value\nsource.excludes = ['# keep', 'disabled = false']\n",
+            "telemetry = { # table comment\n  disabled = false, # setting comment\n  keep = { x = 1_000, y = 'literal # text' },\n} # after table\n[source] # table order\nrespect_gitignore = true",
+            "# header\n[telemetry] # table comment\n\n'disabled'\t=\tfalse # setting comment\n[source]\nexcludes = [\n  'keep', # array comment\n]\n",
+        ];
+        for raw in cases {
+            for ending in ["\n", "\r\n"] {
+                let original = raw.replace('\n', ending);
+                let target = if original.contains("telemetry.'disabled' = false") {
+                    "telemetry.'disabled' = false"
+                } else if original.contains("'disabled'\t=\tfalse") {
+                    "'disabled'\t=\tfalse"
+                } else {
+                    "  disabled = false"
+                };
+                let expected = original.replacen(target, &target.replace("false", "true"), 1);
+                assert_eq!(
+                    edit(Path::new("rift.toml"), &original, true).expect("accepted document"),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_missing_inline_setting_keeps_comments_dotted_order_and_values() {
+        let cases = [
+            (
+                "telemetry={} # empty\n",
+                "telemetry={ disabled = true } # empty\n",
+            ),
+            (
+                "telemetry = { # empty table comment\n} # after\n",
+                "telemetry = { disabled = true # empty table comment\n} # after\n",
+            ),
+            (
+                "telemetry = { z.b = 1, keep = '# literal', z.a = [1, 2], } # after",
+                "telemetry = { disabled = true, z.b = 1, keep = '# literal', z.a = [1, 2], } # after",
+            ),
+            (
+                "telemetry = {\n  # existing key comment\n  keep = { x = 1_000, y = 'literal # text' },\n} # after table\n[source]\nrespect_gitignore = true\n",
+                "telemetry = { disabled = true,\n  # existing key comment\n  keep = { x = 1_000, y = 'literal # text' },\n} # after table\n[source]\nrespect_gitignore = true\n",
+            ),
+        ];
+        for (original, expected) in cases {
+            for ending in ["\n", "\r\n"] {
+                assert_eq!(
+                    edit(
+                        Path::new("rift.toml"),
+                        &original.replace('\n', ending),
+                        true
+                    )
+                    .expect("accepted document"),
+                    expected.replace('\n', ending)
+                );
+            }
+        }
     }
 }

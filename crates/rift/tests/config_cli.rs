@@ -80,3 +80,28 @@ fn test_config_cli_refuses_invalid_value_document_and_unknown_key() -> TestResul
     }
     Ok(())
 }
+
+#[test]
+fn test_config_cli_preserves_inline_comments_crlf_and_table_order() -> TestResult {
+    let root = tempfile::tempdir()?;
+    let home = tempfile::tempdir()?;
+    let path = root.path().join("rift.toml");
+    let original = "# header: café\r\nsource.respect_gitignore = false\r\ntelemetry = {\r\n  # setting comment\r\n  disabled = false,\r\n} # table comment\r\n";
+    fs::write(&path, original)?;
+    let output = run(
+        root.path(),
+        home.path(),
+        &["config", "set", "--telemetry.disabled=true"],
+    )?;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&path)?,
+        original.replacen("disabled = false", "disabled = true", 1)
+    );
+    assert!(
+        rift_server::load_configuration(root.path())?
+            .telemetry
+            .disabled
+    );
+    Ok(())
+}
