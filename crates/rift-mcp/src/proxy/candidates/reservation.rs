@@ -255,7 +255,7 @@ mod tests {
             .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
             .expect("reserve");
         let mut response = selected("claims.future");
-        response.view.expires_at = "2030-01-01T00:15:02.000000001+00:00".to_owned();
+        response.view.expires_at = "2030-01-01T00:15:02.000000100+00:00".to_owned();
         assert!(
             pending
                 .finalize(&response, clock() + Duration::from_secs(2))

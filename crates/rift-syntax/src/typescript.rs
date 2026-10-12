@@ -642,20 +642,25 @@ mod tests {
             .iter()
             .find(|symbol| symbol.name == "isUtf8")
             .expect("original isUtf8 declaration remains");
+        let statement = "function isUtf8(input: ArrayBuffer | NodeJS.TypedArray): boolean;";
+        let start = text.find(statement).expect("original callable source");
+        let end = start + statement.len();
+        let documentation = text.find("/**").expect("original documentation");
         assert_eq!(
             declaration.item_range,
             crate::ByteRange {
-                start: 391,
-                end: 456
+                start: u64::try_from(start).expect("fixture offset fits"),
+                end: u64::try_from(end).expect("fixture offset fits")
             }
         );
         assert_eq!(
             declaration.range,
             crate::ByteRange {
-                start: 89,
-                end: 456
+                start: u64::try_from(documentation).expect("fixture offset fits"),
+                end: u64::try_from(end).expect("fixture offset fits")
             }
         );
+        assert_eq!(text.get(start..end), Some(statement));
         assert_eq!(declaration.container.as_deref(), Some("\"node:buffer\""));
         assert!(
             document

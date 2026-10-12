@@ -803,10 +803,17 @@ fn package_ambient_original_buffer_keeps_owner_ranges_and_unknown_entry() {
         .iter()
         .find(|symbol| symbol.name == "isUtf8")
         .expect("original callable declaration");
+    let statement = "function isUtf8(input: ArrayBuffer | NodeJS.TypedArray): boolean;";
+    let start = source.find(statement).expect("original callable source");
+    let end = start + statement.len();
     assert_eq!(
         (declaration.item_range.start, declaration.item_range.end),
-        (391, 456)
+        (
+            u64::try_from(start).expect("fixture offset fits"),
+            u64::try_from(end).expect("fixture offset fits")
+        )
     );
+    assert_eq!(source.get(start..end), Some(statement));
     assert_eq!(declaration.container.as_deref(), Some("\"node:buffer\""));
     let identity = &found.anchors["buffer.d.ts"][&declaration.qualified_name];
     let parsed = SymbolIdentity::parse(identity.as_str()).expect("Package ambient identity");

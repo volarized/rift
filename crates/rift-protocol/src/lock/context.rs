@@ -123,27 +123,26 @@ mod tests {
 
     #[test]
     fn workspace_context_pair_matches_schema_and_serde() {
+        let root = std::env::current_dir().expect("current directory");
+        let root = std::fs::canonicalize(root).expect("canonical workspace root");
         let schema = serde_json::to_value(schemars::schema_for!(ServerLock)).expect("lock schema");
         let validator = jsonschema::validator_for(&schema).expect("lock validator");
         for (fields, accepted) in [
             (json!({}), true),
+            (json!({"root": root, "owner": {"kind": "local"}}), true),
             (
-                json!({"root": "/workspace", "owner": {"kind": "local"}}),
+                json!({"root": root, "owner": {"kind": "named_local", "name": "cloud"}}),
                 true,
             ),
-            (
-                json!({"root": "/workspace", "owner": {"kind": "named_local", "name": "cloud"}}),
-                true,
-            ),
-            (json!({"root": "/workspace"}), false),
+            (json!({"root": root}), false),
             (json!({"owner": {"kind": "local"}}), false),
             (json!({"root": null}), false),
             (json!({"owner": null}), false),
             (json!({"root": null, "owner": null}), false),
-            (json!({"root": "/workspace", "owner": null}), false),
+            (json!({"root": root, "owner": null}), false),
             (json!({"root": null, "owner": {"kind": "local"}}), false),
             (
-                json!({"root": "/workspace", "owner": {"kind": "runtime", "runtime": "node", "version": "26.11.1"}}),
+                json!({"root": root, "owner": {"kind": "runtime", "runtime": "node", "version": "26.11.1"}}),
                 false,
             ),
         ] {

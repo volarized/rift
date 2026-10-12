@@ -98,10 +98,8 @@ pub(crate) fn rust_engine(script: &str) -> TestResult<(tempfile::TempDir, String
     let engine = tempfile::tempdir()?;
     let path = engine.path().join("engine.sh");
     std::fs::write(&path, script)?;
-    let table = format!(
-        "[languages.rust.lsp]\ncommand = [\"sh\", \"{}\"]\n",
-        path.display()
-    );
+    let command = serde_json::to_string(&path)?;
+    let table = format!("[languages.rust.lsp]\ncommand = [\"sh\", {command}]\n");
     Ok((engine, table))
 }
 
