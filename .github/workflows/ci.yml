@@ -305,6 +305,7 @@ jobs:
             target/nextest/corpus/junit.xml
             target/nextest/ci/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
 
@@ -392,6 +393,7 @@ jobs:
             target/nextest/live/junit.xml
             target/nextest/live/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
 
@@ -447,6 +449,7 @@ jobs:
             target/nextest/live/junit.xml
             target/nextest/live/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
 
@@ -595,6 +598,7 @@ jobs:
             target/nextest/${{ matrix.profile || 'ci' }}/junit.xml
             target/nextest/${{ matrix.profile || 'ci' }}/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
       # The parent launches its ignored child probe with the fixture environment.
@@ -838,6 +842,7 @@ jobs:
             target/nextest/corpus/junit.xml
             target/nextest/corpus/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: warn
           retention-days: 7
 
