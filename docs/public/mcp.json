@@ -12383,6 +12383,12 @@
             "description": "The captured selection cannot serve this request."
           }
         ],
+        "examples": [
+          {
+            "outcome": "unavailable",
+            "reason": "insufficient_coverage"
+          }
+        ],
         "type": "object"
       }
     }

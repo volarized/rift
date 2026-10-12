@@ -277,7 +277,7 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "query": "helper_beacon",
                 "scope": "global",
-                "packages": [{ "manager": "cargo", "name": "helper", "version": "0.1.0" }]
+                "packages": [{ "manager": "cargo", "registry": "crates.io", "name": "helper", "version": "0.1.0" }]
             }),
         ),
         (
@@ -285,7 +285,7 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "query": "helper_beacon",
                 "scope": "all",
-                "packages": [{ "manager": "cargo", "name": "extra" }]
+                "packages": [{ "manager": "cargo", "registry": "crates.io", "name": "extra" }]
             }),
         ),
         (
@@ -293,7 +293,7 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "query": "beacon",
                 "scope": "global",
-                "packages": [{ "manager": "cargo", "name": "demo" }]
+                "packages": [{ "manager": "cargo", "registry": "crates.io", "name": "demo" }]
             }),
         ),
         (
@@ -301,7 +301,7 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
             json!({
                 "pattern": "helper_beacon",
                 "scope": "all",
-                "packages": [{ "manager": "cargo", "name": "demo" }]
+                "packages": [{ "manager": "cargo", "registry": "crates.io", "name": "demo" }]
             }),
         ),
     ]

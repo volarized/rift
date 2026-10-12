@@ -27,6 +27,10 @@ pub enum SearchUnavailable {
 /// One page of search hits, or the typed cause of selection unavailability.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
+#[schemars(extend("examples" = [{
+    "outcome": "unavailable",
+    "reason": "insufficient_coverage"
+}]))]
 pub enum SearchReadResult {
     /// Search hits and the captured serving context, including an empty page.
     Results(Box<crate::search::SearchResult>),
