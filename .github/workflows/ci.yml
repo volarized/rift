@@ -285,6 +285,7 @@ jobs:
         env:
           NEXTEST_PROFILE: ci
       - name: Measure retained material accounting
+        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
         timeout-minutes: 5
         run: |
           RIFT_RETAINED_MATERIAL_ROOT="$(uv run --locked --project dev rift-dev corpus sync bun)"
