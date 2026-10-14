@@ -91,8 +91,8 @@ pub const SHA256_HEX_LENGTH: usize = 64;
 pub const DIGEST_WIRE_CHARS: usize = 8;
 /// GitHub API endpoint naming the latest official Rift release.
 pub const RELEASE_API_URL: &str = "https://api.github.com/repos/volarized/rift/releases/latest";
-/// Base URL below which official Rift release assets are downloaded.
-pub const RELEASE_DOWNLOAD_BASE_URL: &str = "https://github.com/volarized/rift/releases/download";
+/// Download service redirecting official Rift release assets to GitHub.
+pub const RELEASE_DOWNLOAD_BASE_URL: &str = "https://api.volar.sh/rift/releases/download";
 /// Maximum bytes in one release-metadata response.
 pub const RELEASE_METADATA_BYTES_MAX: u64 = 1_024 * 1_024;
 /// Maximum bytes in one release checksum manifest.

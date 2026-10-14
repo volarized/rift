@@ -4,6 +4,7 @@ agentic development toolkit
 Usage: rift [COMMAND]
 
 Commands:
+  config   Set this project's or the user's configuration
   mcp      Serve agents over stdio MCP by proxying this workspace's rift server
   server   Manage this workspace's HTTP MCP server
   update   Replace current Rift binary with latest official release
@@ -14,6 +15,28 @@ Commands:
 Options:
   -h, --help     Print help
   -V, --version  Print version
+
+$ rift config --help
+Set this project's or the user's configuration
+
+Usage: rift config <COMMAND>
+
+Commands:
+  set   Set request statistics enablement in this project's rift.toml
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help  Print help
+
+$ rift config set --help
+Set request statistics enablement in this project's rift.toml
+
+Usage: rift config set [OPTIONS] --telemetry.disabled=<BOOL>
+
+Options:
+      --telemetry.disabled=<BOOL>  Disable request statistics with true, or enable them with false [possible values: true, false]
+      --user                       Write ~/.rift/config.toml; a user disable applies to every project
+  -h, --help                       Print help
 
 $ rift mcp --help
 Serve agents over stdio MCP by proxying this workspace's rift server

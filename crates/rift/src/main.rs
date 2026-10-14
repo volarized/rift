@@ -5,6 +5,7 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod config;
 mod install;
 mod mcp;
 mod progress;
@@ -40,6 +41,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// Set this project's or the user's configuration.
+    Config {
+        #[command(subcommand)]
+        command: config::ConfigCommand,
+    },
     /// Serve agents over stdio MCP by proxying this workspace's rift server.
     Mcp {
         /// Forwards text and structured tool answers with `all`, and text alone with `text`.
@@ -210,6 +216,7 @@ async fn main() -> ExitCode {
 
 #[derive(Debug)]
 enum CliError {
+    Config(rift_error::RiftError),
     Mcp(rift_mcp::McpFailure),
     Server(rift_error::RiftError),
     Update(rift_error::RiftError),
@@ -221,7 +228,10 @@ impl CliError {
     fn code(&self) -> String {
         match self {
             Self::Mcp(error) => error.wire_code(),
-            Self::Update(error) | Self::Server(error) | Self::Install(error) => cli_code(error),
+            Self::Config(error)
+            | Self::Update(error)
+            | Self::Server(error)
+            | Self::Install(error) => cli_code(error),
         }
     }
 
@@ -297,9 +307,10 @@ impl fmt::Display for CliError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mcp(error) => error.fmt(formatter),
-            Self::Server(error) | Self::Update(error) | Self::Install(error) => {
-                error.fmt(formatter)
-            }
+            Self::Config(error)
+            | Self::Server(error)
+            | Self::Update(error)
+            | Self::Install(error) => error.fmt(formatter),
         }
     }
 }
@@ -308,7 +319,10 @@ impl std::error::Error for CliError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Mcp(error) => Some(error),
-            Self::Server(error) | Self::Update(error) | Self::Install(error) => Some(error),
+            Self::Config(error)
+            | Self::Server(error)
+            | Self::Update(error)
+            | Self::Install(error) => Some(error),
         }
     }
 }
@@ -316,6 +330,7 @@ impl std::error::Error for CliError {
 /// What a completed command prints.
 #[derive(Debug)]
 enum CliOutcome {
+    Config(PathBuf),
     Server(server::ServerOutcome),
     Update(update::UpdateOutcome),
     Install(install::InstallOutcome),
@@ -325,6 +340,7 @@ enum CliOutcome {
 impl fmt::Display for CliOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Config(path) => write!(formatter, "configuration written: {}", path.display()),
             Self::Server(outcome) => outcome.fmt(formatter),
             Self::Update(outcome) => outcome.fmt(formatter),
             Self::Install(outcome) => outcome.fmt(formatter),
@@ -365,6 +381,17 @@ async fn run(
 ) -> Result<Option<CliOutcome>, CliError> {
     match cli.command {
         None => Ok(None),
+        Some(CliCommand::Config { command }) => {
+            let home = std::env::home_dir();
+            let result = update::run_blocking(move || {
+                config::run(&command, Path::new("."), home.as_deref())
+            })
+            .await;
+            result
+                .map(CliOutcome::Config)
+                .map(Some)
+                .map_err(CliError::Config)
+        }
         Some(CliCommand::Mcp { output, extra }) => {
             rift_mcp::serve_proxy(
                 Path::new("."),
@@ -625,7 +652,9 @@ mod tests {
                 .filter(|subcommand| !subcommand.is_hide_set())
                 .map(clap::Command::get_name)
                 .collect::<Vec<_>>(),
-            ["mcp", "server", "update", "install", "steer", "help"]
+            [
+                "config", "mcp", "server", "update", "install", "steer", "help"
+            ]
         );
     }
 

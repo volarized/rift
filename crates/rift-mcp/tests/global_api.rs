@@ -240,6 +240,7 @@ impl FixtureState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObservedRequest {
+    pub(crate) telemetry_disabled: bool,
     pub(crate) uri: String,
     pub(crate) body: Option<Value>,
 }
@@ -311,6 +312,10 @@ async fn global_handler(
     State(state): State<FixtureState>,
     request: axum::http::Request<Body>,
 ) -> Response {
+    let telemetry_disabled = request
+        .headers()
+        .get("dnt")
+        .is_some_and(|value| value == "1");
     let uri = request.uri().to_string();
     let path = request.uri().path().to_owned();
     let limit = request
@@ -337,6 +342,7 @@ async fn global_handler(
         }
     };
     state.requests.lock().await.push(ObservedRequest {
+        telemetry_disabled,
         uri,
         body: body.clone(),
     });

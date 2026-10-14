@@ -132,21 +132,31 @@ class BashInstallerFixture:
         version: str | None = VERSION,
         *,
         latest: str = VERSION,
-        download_base: str = "https://fixture.invalid/download",
+        download_base: str | None = "https://fixture.invalid/download",
+        repository: str | None = None,
+        telemetry_disabled: str = "false",
     ) -> subprocess.CompletedProcess[str]:
         """Run Bash installer with fixture environment."""
         environment = os.environ.copy()
         environment.update(
             {
                 "FAKE_CURL_LOG": str(self.log),
+                "RIFT_TELEMETRY_DISABLED": telemetry_disabled,
                 "FIXTURE_ROOT": str(self.archive.parent),
                 "FIXTURE_TAG": latest,
                 "PATH": f"{self.fake_bin}{os.pathsep}{environment['PATH']}",
-                "RIFT_DOWNLOAD_BASE": download_base,
                 "RIFT_GITHUB_API": "https://fixture.invalid/api",
                 "RIFT_INSTALL_DIR": str(self.install_dir),
             }
         )
+        if download_base is None:
+            environment.pop("RIFT_DOWNLOAD_BASE", None)
+        else:
+            environment["RIFT_DOWNLOAD_BASE"] = download_base
+        if repository is None:
+            environment.pop("RIFT_REPOSITORY", None)
+        else:
+            environment["RIFT_REPOSITORY"] = repository
         command = ["bash", str(REPOSITORY / "docs" / "public" / "install.sh")]
         if version is not None:
             command.extend(["--version", version])
@@ -177,6 +187,49 @@ def bash_installer(tmp_path: Path) -> BashInstallerFixture:
 
 @pytest.mark.skipif(os.name == "nt", reason="Bash installer targets Unix")
 class TestBashInstaller:
+    @pytest.mark.parametrize(
+        ("repository", "expected_base"),
+        [
+            (None, "https://api.volar.sh/rift/releases/download"),
+            ("owner/fork", "https://github.com/owner/fork/releases/download"),
+        ],
+    )
+    def test_default_download_url(
+        self,
+        bash_installer: BashInstallerFixture,
+        repository: str | None,
+        expected_base: str,
+    ) -> None:
+        result = bash_installer.run(download_base=None, repository=repository)
+        assert result.returncode == 0, result.stderr
+        requests = [
+            json.loads(line)[-1] for line in bash_installer.log.read_text().splitlines()
+        ]
+        assert requests == [
+            f"{expected_base}/{VERSION}/{bash_installer.archive.name}",
+            f"{expected_base}/{VERSION}/rift-{VERSION}-checksums.sha256",
+        ]
+
+    @pytest.mark.parametrize("disabled", ["true", "false", "invalid"])
+    def test_request_opt_out_and_notice_before_failed_download(
+        self,
+        bash_installer: BashInstallerFixture,
+        disabled: str,
+    ) -> None:
+        bash_installer.archive.unlink()
+        result = bash_installer.run(download_base=None, telemetry_disabled=disabled)
+        assert result.returncode != 0
+        requests = [
+            json.loads(line) for line in bash_installer.log.read_text().splitlines()
+        ]
+        assert len(requests) == 1
+        assert ("DNT: 1" in requests[0]) == (disabled != "false")
+        notice = "Rift collects aggregate download and cloud request statistics"
+        assert (notice in result.stderr) == (disabled == "false")
+        if disabled == "false":
+            assert result.stderr.index(notice) < result.stderr.index("fixture missing")
+        assert "Rift collects" not in result.stdout
+
     def test_explicit_and_latest_install(
         self,
         bash_installer: BashInstallerFixture,

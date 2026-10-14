@@ -20,6 +20,7 @@ mod server;
 pub mod skill;
 mod spawn;
 mod storage;
+pub mod telemetry;
 mod transport;
 mod validation;
 

@@ -505,6 +505,8 @@ fn split_magnitude<'text>(
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_workspace_contract)]
 pub struct WorkspaceConfiguration {
+    /// Opt-out settings for counters derived from existing cloud and download requests.
+    pub telemetry: TelemetryConfiguration,
     /// The server's own blocking-work bounds: worker count and queue wait.
     pub server: ServerConfiguration,
     /// Whether package reads use the configured global REST API and its request bounds.
@@ -536,6 +538,15 @@ pub struct WorkspaceConfiguration {
     pub languages: BTreeMap<String, LanguageConfiguration>,
     /// Shared LSP processes keyed by name. Language entries select them explicitly.
     pub lsp: BTreeMap<String, LspConfiguration>,
+}
+
+/// Request statistics. A user-level disable applies to every project.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryConfiguration {
+    /// Disables request statistics. Defaults to `false`; a user-level disable takes
+    /// precedence over this project's value.
+    pub disabled: bool,
 }
 
 impl WorkspaceConfiguration {

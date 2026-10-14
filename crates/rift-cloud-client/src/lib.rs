@@ -8,6 +8,12 @@ mod response;
 pub mod search;
 mod source;
 mod symbol;
+/// Opt-out controls for existing requests.
+pub mod telemetry;
+
+#[cfg(test)]
+#[path = "telemetry/request_tests.rs"]
+mod telemetry_requests_tests;
 
 use std::{
     collections::HashSet,
@@ -167,6 +173,8 @@ const RATE_LIMIT_RESET: &str = "ratelimit-reset";
 /// Accepted global client settings.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct Config {
+    /// Opt-out settings checked before each network request.
+    pub telemetry: telemetry::Policy,
     /// Whether global access is enabled.
     pub enabled: bool,
     /// Absolute base URL joined with generated operation paths.
@@ -198,6 +206,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            telemetry: telemetry::Policy::of_process(std::path::Path::new(".")),
             enabled: true,
             endpoint: DEFAULT_ENDPOINT.to_owned(),
             token_env: "RIFT_API_TOKEN".to_owned(),
@@ -228,6 +237,7 @@ impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
             failure::configuration_source("max_in_flight", "outside configured bounds", source)
         })?;
         let config = Self {
+            telemetry: telemetry::Policy::of_process(std::path::Path::new(".")),
             enabled: value.enabled,
             endpoint: value.endpoint.clone(),
             token_env: value.token_env.clone(),
@@ -991,6 +1001,9 @@ impl GlobalClient {
             .http
             .request(method, url)
             .header(ACCEPT, "application/json, application/problem+json");
+        if self.inner.config.telemetry.disabled().await {
+            request = request.header(reqwest::header::DNT, "1");
+        }
         if let Some(query) = query {
             request = request.query(query);
         }

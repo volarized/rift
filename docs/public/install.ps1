@@ -2,6 +2,7 @@
 <#
 .SYNOPSIS
     Installs Rift from checksummed GitHub Release archive.
+    Request opt-out uses RIFT_TELEMETRY_DISABLED, not project or user TOML.
 
 .PARAMETER Version
     Installs exact vX.Y.Z release. Defaults to RIFT_VERSION or latest.
@@ -33,6 +34,7 @@ Options:
 Environment:
   RIFT_VERSION      Exact release used when -Version is absent.
   RIFT_INSTALL_DIR  Destination directory for Rift binary.
+  RIFT_TELEMETRY_DISABLED  Set true to exclude requests from Rift's counters.
 '@
     return
 }
@@ -42,7 +44,7 @@ Set-StrictMode -Version Latest
 
 $Repository = if ($env:RIFT_REPOSITORY) { $env:RIFT_REPOSITORY } else { "volarized/rift" }
 $GitHubApi = if ($env:RIFT_GITHUB_API) { $env:RIFT_GITHUB_API } else { "https://api.github.com" }
-$DownloadBase = if ($env:RIFT_DOWNLOAD_BASE) { $env:RIFT_DOWNLOAD_BASE } else { "https://github.com/$Repository/releases/download" }
+$DownloadBase = if ($env:RIFT_DOWNLOAD_BASE) { $env:RIFT_DOWNLOAD_BASE } elseif ($Repository -eq "volarized/rift") { "https://api.volar.sh/rift/releases/download" } else { "https://github.com/$Repository/releases/download" }
 $RunningOnWindows = $PSVersionTable.PSEdition -eq "Desktop" -or [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
 $RunningOnMacOS = -not $RunningOnWindows -and [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)
 $RunningOnLinux = -not $RunningOnWindows -and [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)
@@ -79,6 +81,9 @@ function Invoke-Fetch {
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromSeconds(60)
     $client.DefaultRequestHeaders.UserAgent.ParseAdd("rift-installer")
+    if ($env:RIFT_TELEMETRY_DISABLED -and $env:RIFT_TELEMETRY_DISABLED -ne 'false') {
+        $client.DefaultRequestHeaders.Add('DNT', '1')
+    }
     $response = $null
     $input = $null
     $output = $null
@@ -232,6 +237,14 @@ function Main {
     try {
         $archive = Join-Path $workDir $archiveName
         $manifest = Join-Path $workDir $checksumName
+        if ((-not $env:RIFT_TELEMETRY_DISABLED -or $env:RIFT_TELEMETRY_DISABLED -eq 'false') -and $DownloadBase -eq 'https://api.volar.sh/rift/releases/download') {
+            [Console]::Error.WriteLine(@'
+Rift collects aggregate download and cloud request statistics by default to measure adoption and improve the service.
+You can disable cloud and update statistics: rift config set --telemetry.disabled=true --user
+For installation, set RIFT_TELEMETRY_DISABLED=true before running the installer.
+Details: https://volar.sh/rift/docs/privacy
+'@)
+        }
         Invoke-Fetch -Uri "$base/$archiveName" -OutFile $archive
         Invoke-Fetch -Uri "$base/$checksumName" -OutFile $manifest
         Confirm-Checksum -Archive $archive -Manifest $manifest
