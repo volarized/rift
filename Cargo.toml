@@ -3,6 +3,7 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 exclude = [
     "vendor/tree-sitter-angular",
+    "vendor/tree-sitter-typescript",
     "tools/tracing-fixtures/consumer",
     "tools/tracing-fixtures/facade",
 ]
@@ -52,6 +53,7 @@ candle-transformers = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.5", features = ["derive"] }
 data-encoding = "2.6.0"
 getrandom = { version = "0.4.3", features = ["std"] }
+get-size2 = "=0.10.3"
 flate2 = "1.1.9"
 fs4 = "1.1.0"
 gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1", "status"] }
@@ -143,6 +145,7 @@ toasty-driver-sqlite = "=0.10.0"
 # every non-wasm target, so the version is pinned to match it: a second tokenizers would
 # be a duplicate the dependency policy refuses, and could not avoid onig either.
 tokenizers = { version = "0.22.2", default-features = false }
+toml_edit = { version = "=0.25.13", default-features = false, features = ["parse", "display"] }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 syn = { version = "2.0.119", features = ["full"] }
 # The process sampler reads one process: its resident and virtual memory, CPU time and usage,
@@ -151,7 +154,7 @@ syn = { version = "2.0.119", features = ["full"] }
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
 tokio = { version = "=1.53.2", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "=0.7.19", features = ["rt"] }
+tokio-util = { version = "=0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -177,7 +180,7 @@ tree-sitter-md = { version = "=0.5.3", default-features = false }
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-toml-ng = "=0.7.0"
-tree-sitter-typescript = "=0.23.2"
+tree-sitter-typescript = { git = "https://github.com/tree-sitter/tree-sitter-typescript", rev = "35a3762218ca481cd85f14f4db11b563bc805c83" }
 tree-sitter-yaml = "=0.7.2"
 jsonschema = { version = "0.58.5", default-features = false }
 tempfile = "3.27.0"

@@ -32,11 +32,11 @@ impl<'a> SearchDocumentation<'a> {
     /// `documentation_unavailable` naming it; the search itself is answered.
     pub(super) fn new(
         index: &'a WorkspaceIndex,
-        scope: SearchScope,
+        scope: &SearchScope,
         resolution: Resolution<'a>,
     ) -> Self {
         let mut joined = JoinedLayers::default();
-        if scope != SearchScope::Global {
+        if scope != &SearchScope::Global {
             joined.join("project", index.documentation_layer());
         }
         if let Some(extra) = resolution.force_include {
@@ -133,6 +133,7 @@ impl<'a> SearchDocumentation<'a> {
             DocumentationSourceIdentity::Package { unit } => (None, Some(unit.clone())),
         };
         Some(SearchHit {
+            view: None,
             range: Some(documentation.block.range.clone()),
             line: Some(documentation.block.line),
             hit: SearchHitTarget::Documentation {
@@ -208,6 +209,15 @@ pub(super) fn populate_sources(
     index: &WorkspaceIndex,
     resolution: Resolution<'_>,
 ) -> Vec<ReadWarning> {
+    populate_sources_from(results, |identity| {
+        captured_content(index, resolution, identity)
+    })
+}
+
+pub(crate) fn populate_sources_from<'a>(
+    results: &mut [SearchHit],
+    mut content: impl FnMut(&DocumentationContentIdentity) -> Option<&'a str>,
+) -> Vec<ReadWarning> {
     rift_tracing::traced!(component = "search", operation = "search.sources", {
         let mut remaining = rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
         let mut warnings = Vec::new();
@@ -215,8 +225,7 @@ pub(super) fn populate_sources(
             let SearchHitTarget::Documentation { documentation } = &hit.hit else {
                 continue;
             };
-            let Some(content) = captured_content(index, resolution, &documentation.block.source)
-            else {
+            let Some(content) = content(&documentation.block.source) else {
                 warn(
                     &mut warnings,
                     &documentation.block.source,

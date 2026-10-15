@@ -14,6 +14,9 @@
 //! [`NAMED_POSITIONS`] lists at a position in their files, as the declaration endpoint does
 //! for the callees an outgoing walk meets.
 
+#[path = "python_runtime.rs"]
+pub(crate) mod python_runtime;
+
 use std::{sync::Arc, time::Duration};
 
 use axum::{
@@ -75,9 +78,10 @@ pub(crate) const BODY_MATCH_QUERY: &str = "handshake";
 /// The prose query the fixture answers only in the broad phase, in full-text order.
 pub(crate) const BROAD_BODY_MATCH_QUERY: &str = "network handshake";
 
-/// The Python standard library release a Python collection holds: every `stdlib/python`
+/// The Python standard library release a Python collection holds: every `stdlib/cpython`
 /// entry resolves to it, as the nearest release when it names another.
-pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) = ("stdlib", "python", "3.12.9");
+pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) =
+    ("stdlib", "cpython", python_runtime::VERSION);
 
 /// The `pypi` release a Python collection holds, whose `greeting/core.py` declares `greet`
 /// on its first line.
@@ -192,6 +196,23 @@ impl Default for FixtureOptions {
 struct FixtureState {
     options: FixtureOptions,
     requests: Arc<Mutex<Vec<ObservedRequest>>>,
+    view: Value,
+}
+
+impl FixtureState {
+    fn response(&self, mut value: Value) -> Response {
+        if let Some(view) = value.get_mut("view") {
+            view.clone_from(&self.view);
+        }
+        if let Some(results) = value.get_mut("results").and_then(Value::as_array_mut) {
+            for result in results {
+                if let Some(view) = result.get_mut("view") {
+                    view.clone_from(&self.view);
+                }
+            }
+        }
+        json_response(&value)
+    }
 }
 
 impl FixtureState {
@@ -219,6 +240,7 @@ impl FixtureState {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ObservedRequest {
+    pub(crate) telemetry_disabled: bool,
     pub(crate) uri: String,
     pub(crate) body: Option<Value>,
 }
@@ -248,9 +270,19 @@ impl GlobalFixture {
     pub(crate) async fn start_with(options: FixtureOptions) -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
+        let expires = std::time::SystemTime::now()
+            .checked_add(Duration::from_mins(15))
+            .expect("fixture view expiry fits the clock bound");
+        let view = json!({
+            "id": "a".repeat(64),
+            "expires_at": jiff::Timestamp::try_from(expires)
+                .expect("fixture view expiry fits the timestamp bound")
+                .to_string(),
+        });
         let state = FixtureState {
             options,
             requests: Arc::new(Mutex::new(Vec::new())),
+            view,
         };
         let app = Router::new()
             .fallback(global_handler)
@@ -280,6 +312,10 @@ async fn global_handler(
     State(state): State<FixtureState>,
     request: axum::http::Request<Body>,
 ) -> Response {
+    let telemetry_disabled = request
+        .headers()
+        .get("dnt")
+        .is_some_and(|value| value == "1");
     let uri = request.uri().to_string();
     let path = request.uri().path().to_owned();
     let limit = request
@@ -306,6 +342,7 @@ async fn global_handler(
         }
     };
     state.requests.lock().await.push(ObservedRequest {
+        telemetry_disabled,
         uri,
         body: body.clone(),
     });
@@ -323,24 +360,28 @@ async fn global_handler(
     }
     if path.ends_with("/declarations") {
         state.hold_declarations().await;
-        return json_response(&declarations(&body));
+        return state.response(declarations(&body));
     }
     if path.ends_with("/search") {
         state.hold_read().await;
         let mut page = search_page(options.symbol, &body, options.stopped_at_body_bound);
         bound_case_page(&mut page, options.symbol, limit);
-        return json_response(&page);
+        return state.response(page);
     }
     if path.ends_with("/symbols") {
         state.hold_read().await;
-        let mut page = symbols(options.symbol, &body);
-        bound_case_page(&mut page, options.symbol, limit);
-        return json_response(&page);
+        return state.response(symbols(options.symbol, &body));
+    }
+    if path.ends_with("/source") {
+        return source(options.symbol, &body, &state.view).map_or_else(
+            || StatusCode::BAD_REQUEST.into_response(),
+            |answer| state.response(answer),
+        );
     }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
-            |page| json_response(&page),
+            |page| state.response(page),
         );
     }
     StatusCode::NOT_FOUND.into_response()
@@ -499,6 +540,51 @@ fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
     json!({"manager": manager, "registry": registry, "name": name, "version": version})
 }
 
+fn named_owner(named: &NamedPosition) -> rift_protocol::identity::SymbolOwner {
+    use rift_protocol::identity::SymbolOwner;
+    let (manager, name, version) = named.package;
+    if manager == "stdlib" {
+        SymbolOwner::Runtime {
+            runtime: name.to_owned(),
+            version: version.to_owned(),
+        }
+    } else {
+        SymbolOwner::Package {
+            manager: manager.to_owned(),
+            registry: "pypi.org".to_owned(),
+            name: name.to_owned(),
+            version: version.to_owned(),
+        }
+    }
+}
+
+pub(crate) fn named_unit(named: &NamedPosition) -> String {
+    rift_core::SourceUnitId::for_owner(named_owner(named), named.path)
+        .expect("fixture released owner and original source path")
+        .to_string()
+}
+
+pub(crate) fn named_identity(named: &NamedPosition) -> String {
+    use rift_protocol::identity::SymbolIdentity;
+    let owner = named_owner(named);
+    let mut logical = named
+        .path
+        .trim_end_matches(".py")
+        .trim_end_matches(".pyi")
+        .split('/')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    logical.push(named.qualified_name.to_owned());
+    SymbolIdentity::new(
+        owner,
+        rift_protocol::read::Language::from_identity_segment("python")
+            .expect("fixture language is supported"),
+        logical,
+    )
+    .expect("fixture logical declaration")
+    .wire_identity()
+}
+
 /// The declaration answer for `request`: each position [`NAMED_POSITIONS`] lists names its
 /// declaration, by the identity package analysis mints, and its kind; every other position
 /// names neither.
@@ -508,25 +594,22 @@ fn declarations(request: &Value) -> Value {
         .into_iter()
         .flatten()
         .map(|position| {
-            let package = &position["package"];
             let named = NAMED_POSITIONS.iter().find(|named| {
-                package == &package_value(named.package)
-                    && position["path"] == named.path
+                position["unit"] == named_unit(named)
                     && named.line.is_none_or(|line| position["line"] == line)
             });
+            let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
             match named {
                 Some(named) => {
-                    let (manager, name, version) = named.package;
-                    let (path, qualified) = (named.path, named.qualified_name);
                     json!({
+                        "outcome": "found",
                         "position": position,
-                        "declaration": format!(
-                            "rift://symbol/python/{manager}/{name}@{version}/{path}/{qualified}"
-                        ),
-                        "kind": named.kind
+                        "id": named_identity(named),
+                        "kind": named.kind,
+                        "view": view
                     })
                 }
-                None => json!({"position": position}),
+                None => json!({"outcome": "missing", "position": position, "view": view}),
             }
         })
         .collect();
@@ -542,29 +625,72 @@ fn page(items: &[Value], warnings: &Value) -> Value {
         "publication_format": "rift-package-index-v2",
         "analyzer_revision": "analyzer-v1",
         "corpus_revision": "corpus-v1",
-        "documentation_revision": "0123abcd"
+        "documentation_revision": "0123abcd",
+        "view": {
+            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "expires_at": "2099-10-10T10:05:00Z"
+        }
     })
 }
 
-/// The symbol page for `request`: each collected declaration its `name` matches, at the
-/// class that match reaches, with a `source_truncated` page warning.
+/// The exact result for the canonical object named by `request`, retaining its original
+/// source and the collection's captured view.
 fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
-    let name = request["name"].as_str().unwrap_or_default().to_owned();
-    let with_source = includes_source(request);
-    let items: Vec<Value> = matched_declarations(fixture, &[name])
-        .map(|(declaration, class)| {
-            let mut hit = collected_hit(fixture, declaration, with_source);
-            hit["match_class"] = json!(class_wire(class).0);
-            hit
-        })
-        .collect();
-    page(
-        &items,
-        &json!([{
-            "code": "source_truncated",
-            "detail": "source exceeded the active bound"
-        }]),
-    )
+    let id = request["id"].as_str().unwrap_or_default();
+    let declaration = fixture_declarations(fixture)
+        .iter()
+        .copied()
+        .find(|name| collected_identity(fixture, name) == id);
+    let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
+    let Some(declaration) = declaration else {
+        return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view});
+    };
+    let hit = collected_hit(fixture, declaration, includes_source(request));
+    let mut binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"source_complete":hit.get("source").is_some(),"signature_indices":[],"type_indices":[],"documentation_indices":[]});
+    if let Some(source) = hit.get("source") {
+        binding["source"] = source.clone();
+    }
+    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
+}
+
+/// Reads the original collected source under its exact unit, range, and captured view.
+fn source(fixture: SymbolFixture, body: &Value, view: &Value) -> Option<Value> {
+    let request: rift_protocol::source_read::GetSourceParams =
+        serde_json::from_value(body.clone()).ok()?;
+    if !request.is_valid() {
+        return None;
+    }
+    if request
+        .view
+        .as_ref()
+        .is_some_and(|selected| Some(selected.as_str()) != view["id"].as_str())
+    {
+        return Some(json!({
+            "outcome": "unavailable", "unit": request.unit, "reason": "view_context"
+        }));
+    }
+    let runtime_unit = named_unit(&NAMED_POSITIONS[0]);
+    if request.unit.as_str() != COLLECTED_UNIT && request.unit.as_str() != runtime_unit {
+        return Some(json!({"outcome": "missing", "unit": request.unit, "view": view}));
+    }
+    let runtime_source = (request.unit.as_str() == runtime_unit).then(python_runtime::builtins);
+    let text = runtime_source.as_deref().unwrap_or(match fixture {
+        SymbolFixture::CasePairs => CASE_SOURCE,
+        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
+    });
+    let range = request.range.unwrap_or(rift_protocol::read::TextRange {
+        start: 0,
+        end: u64::try_from(text.len()).ok()?,
+    });
+    let start = usize::try_from(range.start).ok()?;
+    let end = usize::try_from(range.end).ok()?;
+    let selected = text.get(start..end)?;
+    Some(json!({
+        "outcome": "found",
+        "source": {"span": {"unit": request.unit, "range": range}, "text": selected},
+        "source_complete": true,
+        "view": view
+    }))
 }
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
@@ -601,12 +727,8 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
     let with_source = includes_source(request);
     let items: Vec<Value> = matched_declarations(fixture, &identifiers)
         .map(|(declaration, class)| {
-            let (match_class, field) = class_wire(class);
-            let mut hit = collected_hit(fixture, declaration, with_source);
-            hit["target"] = json!("symbol");
-            hit["match_class"] = json!(match_class);
-            hit["contributing_fields"] = json!([field]);
-            hit
+            let (_, field) = class_wire(class);
+            canonical_search_hit(fixture, declaration, with_source, field)
         })
         .collect();
     let narrowed = json!({
@@ -627,10 +749,32 @@ fn search_page(fixture: SymbolFixture, request: &Value, stopped_at_body_bound: b
 
 /// One body match retaining the declaration's original identity and source.
 fn body_match_hit(fixture: SymbolFixture, declaration: &str, request: &Value) -> Value {
-    let mut hit = collected_hit(fixture, declaration, includes_source(request));
-    hit["target"] = json!("symbol");
-    hit["match_class"] = json!("unknown");
-    hit["contributing_fields"] = json!(["file_content"]);
+    canonical_search_hit(fixture, declaration, includes_source(request), "content")
+}
+
+/// Projects the original package facts through the shared canonical search result.
+fn canonical_search_hit(
+    fixture: SymbolFixture,
+    declaration: &str,
+    with_source: bool,
+    field: &str,
+) -> Value {
+    let original = collected_hit(fixture, declaration, with_source);
+    let matched_by = if field == "qualified_name" {
+        "name"
+    } else {
+        field
+    };
+    let mut hit = json!({
+        "hit": {"target": "symbol", "symbol": original["symbol"]},
+        "unit": original["unit"],
+        "range": original["range"],
+        "line": original["line"],
+        "matched_by": [matched_by]
+    });
+    if let Some(source) = original.get("source") {
+        hit["source"] = source.clone();
+    }
     hit
 }
 
@@ -695,15 +839,20 @@ fn declaration_range(source: &str, declaration: &str) -> std::ops::Range<usize> 
     start..start + format!("pub fn {declaration}() {{}}").len()
 }
 
+/// Original declarations carried by the selected collection.
+fn fixture_declarations(fixture: SymbolFixture) -> &'static [&'static str] {
+    match fixture {
+        SymbolFixture::CasePairs => &CASE_DECLARATIONS,
+        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => &DECLARATIONS,
+    }
+}
+
 /// Collected declarations ordered by their best original or normalized identifier match.
 fn matched_declarations(
     fixture: SymbolFixture,
     candidates: &[String],
 ) -> impl Iterator<Item = (&'static str, IdentifierMatchClass)> {
-    let declarations = match fixture {
-        SymbolFixture::CasePairs => CASE_DECLARATIONS.as_slice(),
-        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => DECLARATIONS.as_slice(),
-    };
+    let declarations = fixture_declarations(fixture);
     let mut matched: Vec<_> = declarations
         .iter()
         .filter_map(|declaration| {
@@ -740,14 +889,34 @@ const fn class_wire(class: IdentifierMatchClass) -> (&'static str, &'static str)
     }
 }
 
-/// One collected declaration as a page item, located in [`COLLECTED_SOURCE`], before
-/// its match class. Its symbol identity is the one package analysis mints over the unit,
-/// `rift://symbol/rust/cargo/demo@1.0.0/<path>/<qualified name>`.
-fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -> Value {
-    let file = match fixture {
-        SymbolFixture::Valid | SymbolFixture::CasePairs => "src/lib.rs",
-        SymbolFixture::InvalidIdentity => "other.rs",
+pub(crate) fn collected_identity(fixture: SymbolFixture, declaration: &str) -> String {
+    let (manager, name, version) = COLLECTED;
+    let root = if matches!(fixture, SymbolFixture::InvalidIdentity) {
+        "other"
+    } else {
+        name
     };
+    rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Package {
+            manager: manager.to_owned(),
+            registry: "crates.io".to_owned(),
+            name: if matches!(fixture, SymbolFixture::InvalidIdentity) {
+                "other".to_owned()
+            } else {
+                name.to_owned()
+            },
+            version: version.to_owned(),
+        },
+        rift_protocol::read::Language::from_identity_segment("rust")
+            .expect("fixture language is supported"),
+        vec![root.to_owned(), declaration.to_owned()],
+    )
+    .expect("fixture package and literal public declaration are canonical")
+    .wire_identity()
+}
+
+/// One original declaration with its canonical package identity and physical source unit.
+fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -> Value {
     let source = match fixture {
         SymbolFixture::CasePairs => CASE_SOURCE,
         SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
@@ -759,7 +928,7 @@ fn collected_hit(fixture: SymbolFixture, declaration: &str, with_source: bool) -
     let mut hit = json!({
         "package": package,
         "symbol": {
-            "id": format!("rift://symbol/rust/{manager}/{name}@{version}/{file}/{declaration}"),
+            "id": collected_identity(fixture, declaration),
             "kind": "function",
             "language": "rust",
             "name": declaration,

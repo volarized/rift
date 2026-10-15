@@ -70,7 +70,7 @@ pub enum MatchedField {
 pub struct PathPattern(
     #[schemars(example = &"src/**")]
     #[schemars(regex(
-        pattern = r"^(?!/)(?!\.\.?(/|$))(?!.*(/\.\.?)(/|$))[^\\\u0000-\u001F\u007F]+$"
+        pattern = r"^(?:\.*[^\\\u0000-\u001F\u007F/.][^\\\u0000-\u001F\u007F/]*|\.{3,})(?:/(?:\.*[^\\\u0000-\u001F\u007F/.][^\\\u0000-\u001F\u007F/]*|\.{3,})?)*$"
     ))]
     pub String,
 );
@@ -186,6 +186,11 @@ pub enum ResultOrder {
 #[schemars(transform = schema::pair_range_with_line)]
 #[schemars(transform = schema::declare_search_hit_empty_defaults)]
 pub struct SearchHit {
+    /// The immutable view that supplied this hit. The caller passes its `id` to later
+    /// exact, source, declaration, and relationship reads to retain the same context.
+    /// Absent when the caller selected latest facts without retained serving context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedView>,
     /// What was found. A symbol, a node, a file, a documentation block, or a commit -
     /// whichever `target` allowed.
     pub hit: SearchHitTarget,
@@ -525,6 +530,11 @@ pub enum SearchInclude {
     }
 ]))]
 pub struct SearchParams {
+    /// The captured serving context returned by an earlier search. The server retains
+    /// query, filters, ranking policy, selected projects and releases under this view.
+    /// An expired or mismatched view is unavailable; the server never substitutes latest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedViewId>,
     /// Which entity kinds may be returned - a kind selector, never the text to search for;
     /// that is `query`. Omitted, `all`: declarations, tree entries, and documentation
     /// blocks. `commit` matches `query` against the messages of the commits the history
@@ -570,12 +580,13 @@ pub struct SearchParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = SEARCH_PATTERN_CHARS_MAX))]
     pub pattern: Option<String>,
-    /// Which sources `query` and `pattern` search: the project tree, the dependency
-    /// packages, or both. Omitted, `local`. A package contributes symbol hits alone to
-    /// `query`, and file and symbol hits to `pattern`. The server refuses a scope beyond
-    /// `local` together with `rev`, since package facts are served for the current tree
-    /// alone, and `global` together with `traversal`, since a walk runs over the project
-    /// alone.
+    /// Which corpus is selected. Omitted, `local`, the primary project. `local@name`
+    /// selects an extra project accepted by the connection. `global` reaches collected
+    /// package and runtime facts selected by the dependency context; `all` merges the primary
+    /// project, accepted extra projects, and global results. Explicit `packages` replaces
+    /// versions of named packages or adds packages the context lacks.
+    /// The server refuses a scope beyond `local` together with `rev`, and `global`
+    /// together with `traversal`, since a walk runs over local declarations.
     #[serde(default)]
     pub scope: SearchScope,
     /// Packages `query` and `pattern` search beside the ones the workspace's manifests and
@@ -811,6 +822,11 @@ pub enum SearchParamsTarget {
     }
 ]))]
 pub struct SearchResult {
+    /// The captured serving context for this result, including an empty page. Each hit
+    /// carries the original view of its selected project or released owner.
+    /// Absent when the caller selected latest facts without retained serving context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedView>,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
     /// Where this page sits in the full result set under the request's `limit`.
@@ -980,6 +996,57 @@ mod tests {
                 expected,
                 "value={value:?}"
             );
+        }
+    }
+
+    #[test]
+    fn path_pattern_schema_preserves_relative_glob_rules_without_lookahead() {
+        let schema = serde_json::to_value(schemars::schema_for!(PathPattern)).expect("schema");
+        let pattern = schema["pattern"].as_str().expect("pattern");
+        assert!(!pattern.contains("(?!"), "no lookahead: {pattern}");
+        let validator = jsonschema::validator_for(&schema).expect("path pattern schema");
+        for value in [
+            "src/**/*.rs",
+            "README.md",
+            ".rift",
+            ".github/**",
+            "src/",
+            "src//lib.rs",
+            "src///",
+            "...",
+            "..a/b",
+            "a./.b",
+            "[ab]/**",
+            "**/日本語?.rs",
+        ] {
+            assert!(
+                validator.is_valid(&json!(value)),
+                "accepted pattern {value:?}"
+            );
+            assert_eq!(PathPattern(value.to_owned()).violation(), None);
+        }
+        for value in [
+            "",
+            "/src/lib.rs",
+            ".",
+            "..",
+            "./src",
+            "../src",
+            "src/./lib.rs",
+            "src/../lib.rs",
+            "src//../lib.rs",
+            "src/..",
+            "src/.",
+            "src\\lib.rs",
+            "src/line\n.rs",
+            "src/\u{1}.rs",
+            "src/\u{7f}.rs",
+        ] {
+            assert!(
+                !validator.is_valid(&json!(value)),
+                "refused pattern {value:?}"
+            );
+            assert!(PathPattern(value.to_owned()).violation().is_some());
         }
     }
 

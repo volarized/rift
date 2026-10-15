@@ -121,7 +121,8 @@ export default function HomePage() {
             </h1>
 
             <Body className="max-w-115">
-              Rift is an agentic development toolkit for reading and discovering codebases.
+              Rift is an agentic development toolkit for reading, discovering, and editing
+              codebases.
             </Body>
           </div>
 

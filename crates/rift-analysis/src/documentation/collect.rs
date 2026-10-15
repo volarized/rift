@@ -294,6 +294,8 @@ pub(super) struct ExtractionCache {
     warning_count: usize,
 }
 
+mod retained_size;
+
 #[derive(Debug)]
 pub(super) struct CachedSource {
     pub(super) key: DocumentationDigest,

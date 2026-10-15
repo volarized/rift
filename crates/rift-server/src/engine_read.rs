@@ -184,11 +184,67 @@ impl EngineReferences {
         self.package_declarations.get(symbol)
     }
 
+    pub(crate) fn captured_for(&self, reads: &ReadService) -> bool {
+        reads.engine_index_current() && self.revision.as_deref() == Some(reads.engine_revision())
+    }
+
+    pub(crate) fn retained_material_bytes(&self) -> usize {
+        use get_size2::{GetSize, StandardTracker};
+        use rift_protocol::{
+            btree_material_bytes, retained_map_material, retained_sequence_material,
+            retained_vector_material,
+        };
+        if !self.package_callees.is_empty() {
+            return usize::MAX;
+        }
+        let tracker = StandardTracker::default();
+        let (revision, tracker) = self.revision.get_heap_size_with_tracker(tracker);
+        let (incoming, tracker) =
+            retained_map_material(&self.incoming, tracker, retained_vector_material);
+        let (outgoing, tracker) =
+            retained_map_material(&self.outgoing, tracker, retained_vector_material);
+        let (declarations, tracker) = retained_map_material(
+            &self.package_declarations,
+            tracker,
+            |declaration, tracker| {
+                let (symbol, tracker) = declaration.symbol.get_heap_size_with_tracker(tracker);
+                let (unit, tracker) = declaration.unit.get_heap_size_with_tracker(tracker);
+                (symbol.saturating_add(unit), tracker)
+            },
+        );
+        let (unconfirmed, _) = retained_sequence_material(
+            &self.unconfirmed,
+            btree_material_bytes::<String, ()>(self.unconfirmed.len()),
+            tracker,
+            GetSize::get_heap_size_with_tracker,
+        );
+        let warning = match &self.analysis_unavailable {
+            None => 0,
+            Some(ReadWarning::EngineAnalysisUnavailable { language, detail }) => detail
+                .capacity()
+                .saturating_add(language.as_ref().map_or(0, GetSize::get_heap_size)),
+            Some(_) => usize::MAX,
+        };
+        [
+            revision,
+            incoming,
+            outgoing,
+            declarations,
+            unconfirmed,
+            warning,
+            self.package_callees
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PackageCallee>()),
+        ]
+        .into_iter()
+        .fold(std::mem::size_of::<Self>(), usize::saturating_add)
+    }
+
     pub(crate) fn validate_revision(&self, reads: &ReadService) -> Result<(), RiftError> {
         if self
             .revision
             .as_deref()
-            .is_some_and(|revision| revision != reads.tree_revision())
+            .is_some_and(|revision| revision != reads.engine_revision())
         {
             return errors::server::read_unavailable()
                 .operation("engine references")
@@ -359,7 +415,7 @@ pub async fn resolve_engine_references(
             .error()
     })?;
     let mut references = EngineReferences {
-        revision: Some(reads.tree_revision().to_owned()),
+        revision: Some(reads.engine_revision().to_owned()),
         registry_unresolved: matches!(traversal.direction, TraversalDirection::Outgoing)
             && roots.registry_unresolved(),
         ..EngineReferences::default()
@@ -2134,6 +2190,172 @@ mod tests {
             "{detail}"
         );
         assert!(references.incoming(&target).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_traversal_pages_keep_legacy_order_payloads_and_warnings() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn root() { zulu(); alpha(); }\npub fn zulu() {}\npub fn alpha() {}\n",
+        )?;
+        let reads = reads(directory.path())?;
+        let root = symbol(&reads, "root");
+        let zulu = symbol(&reads, "zulu");
+        let alpha = symbol(&reads, "alpha");
+        let references = EngineReferences {
+            revision: Some(reads.engine_revision().to_owned()),
+            outgoing: BTreeMap::from([(
+                rift_core::SymbolId::new(root.as_str())?,
+                vec![
+                    super::call_hop(&root, zulu.clone()),
+                    super::call_hop(&root, alpha.clone()),
+                ],
+            )]),
+            ..EngineReferences::default()
+        };
+        let mut params: SearchParams = serde_json::from_value(json!({
+            "target":"symbol", "order":"identity", "include":["source", "score"],
+            "limit":1, "traversal":{"seed":root, "direction":"outgoing", "facets":["calls"]}
+        }))?;
+        let answer = StoreAnswer::identifier_only();
+        let (ordered, warnings) = reads.search_traversal_hits(&params, &answer, &references)?;
+        assert_eq!(ordered.len(), 2);
+        for (hit, id) in ordered.iter().zip([&alpha, &zulu]) {
+            assert!(
+                matches!(&hit.hit, rift_protocol::search::SearchHitTarget::Symbol { symbol }
+                if symbol.id.as_ref() == Some(id))
+            );
+            assert!(hit.source.is_some());
+            assert_eq!(hit.distance, Some(1));
+            assert_eq!(
+                hit.path.as_ref().map(|path| path.0.as_str()),
+                Some("lib.rs")
+            );
+        }
+        for page in 0..3 {
+            params.page_index = page;
+            let legacy = reads.search_with_references(&params, &answer, &references)?;
+            let start = usize::try_from(page)?;
+            let expected = ordered
+                .get(start..start.saturating_add(1))
+                .unwrap_or_default();
+            assert_eq!(legacy.results, expected);
+            assert_eq!(legacy.pagination.page_index, page);
+            assert_eq!(legacy.pagination.total_pages, 2);
+            assert_eq!(legacy.warnings, warnings);
+        }
+        params.paths = Some(serde_json::from_value(json!({"force_include":["lib.rs"]}))?);
+        let refused = reads
+            .search_traversal_hits(&params, &answer, &references)
+            .expect_err("request-only source cannot issue captured traversal context");
+        assert_eq!(refused.slug(), errors::server::read_unsupported::SLUG);
+        Ok(())
+    }
+
+    #[test]
+    fn captured_traversal_hits_keep_original_source_path_and_view_after_current_changes()
+    -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let original = "pub fn root() { leaf(); }\npub fn leaf() {}\n";
+        fs::write(directory.path().join("lib.rs"), original)?;
+        let reads = reads(directory.path())?;
+        let root = symbol(&reads, "root");
+        let leaf = symbol(&reads, "leaf");
+        let hop = super::call_hop(&root, leaf.clone());
+        let references = EngineReferences {
+            revision: Some(reads.engine_revision().to_owned()),
+            outgoing: BTreeMap::from([(
+                rift_core::SymbolId::new(root.as_str())?,
+                vec![hop.clone()],
+            )]),
+            ..EngineReferences::default()
+        };
+        let traversal: rift_protocol::search::SearchTraversal = serde_json::from_value(json!({
+            "seed": root,
+            "direction": "outgoing",
+            "facets": ["calls"],
+            "depth": 1
+        }))?;
+        let input = reads.local_traversal_view_input(&traversal, references, true)?;
+        let store = crate::LocalSymbolViews::new(64 << 20, [29; 32]);
+        let view = store.capture(input)?.expect("captured graph admission");
+        let captured = store
+            .traversal_hits(
+                &traversal,
+                &view.id,
+                reads.index().root(),
+                reads.index().owner(),
+                true,
+            )?
+            .expect("captured graph projection");
+        assert_eq!(captured.0.len(), 1);
+        assert_eq!(captured.1, view);
+        let hit = &captured.0[0];
+        assert_eq!(hit.view.as_ref(), Some(&view));
+        assert_eq!(
+            hit.path.as_ref().map(|path| path.0.as_str()),
+            Some("lib.rs")
+        );
+        assert_eq!(hit.distance, Some(1));
+        assert_eq!(hit.traversal_path.as_deref(), Some([hop].as_slice()));
+        assert!(
+            hit.source
+                .as_ref()
+                .is_some_and(|source| source.contains("pub fn leaf() {}"))
+        );
+        assert!(matches!(
+            &hit.hit,
+            rift_protocol::search::SearchHitTarget::Symbol { symbol }
+                if symbol.id.as_ref() == Some(&leaf)
+        ));
+        fs::write(directory.path().join("lib.rs"), "pub fn changed() {}\n")?;
+        let repeated = store
+            .traversal_hits(
+                &traversal,
+                &view.id,
+                reads.index().root(),
+                reads.index().owner(),
+                true,
+            )?
+            .expect("held original graph after source change");
+        assert_eq!(repeated, captured);
+        let mut changed = traversal.clone();
+        changed.depth = 2;
+        assert!(matches!(
+            store.traversal_hits(
+                &changed,
+                &view.id,
+                reads.index().root(),
+                reads.index().owner(),
+                true
+            )?,
+            Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn captured_traversal_hits_keep_uncaptured_engine_rows_unavailable() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        let reads = reads(directory.path())?;
+        let params = request(&symbol(&reads, "beacon"));
+        let store = crate::LocalSymbolViews::new(64 << 20, [31; 32]);
+        let view = store
+            .capture(reads.local_search_view_input(true)?)?
+            .expect("captured syntax publication");
+        assert!(matches!(
+            store.traversal_hits(
+                params.traversal.as_ref().expect("traversal request"),
+                &view.id,
+                reads.index().root(),
+                reads.index().owner(),
+                true,
+            )?,
+            Err(rift_protocol::symbol_read::SymbolUnavailableReason::InsufficientCoverage)
+        ));
         Ok(())
     }
 

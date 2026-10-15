@@ -18,7 +18,7 @@ use rift_protocol::error::ErrorCode;
 use rmcp::ServiceExt as _;
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, failed_call, served_root, tool_request,
+    TestResult, call_retrying_acceptance, captured_seed, failed_call, served_root, tool_request,
 };
 
 /// The baseline revision, tagged `baseline`: one declaration that stays, one that a later
@@ -46,6 +46,19 @@ async fn served_change_workspace() -> TestResult<(
     fs::write(
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
+    )?;
+    write_all(
+        directory.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub mod kept;\npub mod gone;\npub mod shifted;\npub mod added;\n",
+            ),
+        ],
     )?;
     write_all(directory.path(), BASELINE)?;
     init(directory.path());
@@ -252,6 +265,8 @@ async fn search_change_with_a_file_target_answers_an_empty_page() -> TestResult 
 async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
     let (_directory, client, _server_task) = served_change_workspace().await?;
 
+    let seed = captured_seed(&client, "kept", "src/kept.rs").await?;
+
     let refusals = [
         (
             json!({"change": {"base": "baseline"}, "rev": "main"}),
@@ -264,7 +279,7 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
         (
             json!({
                 "change": {"base": "baseline"},
-                "traversal": {"seed": "rift://symbol/rust/src/kept.rs/kept"}
+                "traversal": {"seed": seed}
             }),
             ErrorCode::CapabilityUnavailable,
         ),
@@ -374,7 +389,14 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
     )?;
     write_all(
         directory.path(),
-        &[("src/from.rs", "pub fn travelled() {}\n")],
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname='move_fixture'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='src/lib.rs'\n",
+            ),
+            ("src/lib.rs", "pub mod from;\npub mod to;\n"),
+            ("src/from.rs", "pub fn travelled() {}\n"),
+        ],
     )?;
     init(directory.path());
     commit_all(directory.path(), "baseline");
@@ -405,7 +427,7 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
     );
     assert_eq!(
         results(&structured)[0]["hit"]["symbol"]["id"],
-        json!("rift://symbol/rust/src/to.rs/travelled"),
+        json!(captured_seed(&client, "travelled", "src/to.rs").await?),
         "{structured}"
     );
 

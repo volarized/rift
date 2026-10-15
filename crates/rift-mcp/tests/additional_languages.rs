@@ -191,30 +191,36 @@ async fn assert_workspace_search(client: &Client, case: &SourceCase) -> TestResu
 }
 
 async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str) -> TestResult {
-    let output = call_retrying_acceptance(
+    let output = search_after_population(
         client,
-        tool_request("get_symbol", &json!({"name":name, "include":["source"]})),
+        &json!({
+            "query":name, "target":"symbol", "paths":{"include":[case.path]},
+            "include":["source"],
+        }),
     )
     .await?;
-    let hits = output["hits"].as_array().ok_or("symbol hits")?;
-    let hit = hits
+    let results = output["results"]
+        .as_array()
+        .ok_or("symbol search results")?;
+    let matching = results
         .iter()
-        .find(|hit| hit["path"] == case.path && hit["symbol"]["name"] == name)
-        .ok_or_else(|| format!("{name} missing from {}: {output}", case.path))?;
-    assert_eq!(hit["symbol"]["language"], case.language, "{hit}");
+        .filter(|hit| hit["path"] == case.path && hit["hit"]["symbol"]["name"] == name)
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1, "{name} physical declaration: {output}");
+    let hit = matching[0];
+    let symbol = &hit["hit"]["symbol"];
+    assert!(
+        symbol["id"].is_null(),
+        "fixture has no captured namespace context: {hit}"
+    );
+    assert_eq!(symbol["language"], case.language, "{hit}");
     if case.path == "default.h" {
-        assert_eq!(
-            hit["symbol"]["kind"], "function",
-            "C function prototype: {hit}"
-        );
+        assert_eq!(symbol["kind"], "function", "C function prototype: {hit}");
     }
     let start = usize::try_from(hit["range"]["start"].as_u64().ok_or("range start")?)?;
     let end = usize::try_from(hit["range"]["end"].as_u64().ok_or("range end")?)?;
     assert_eq!(hit["source"], Value::from(&case.text[start..end]));
-    assert!(
-        hit["node"].is_string(),
-        "source carries node address: {hit}"
-    );
+    assert_workspace_symbol_node(client, case, name, hit, start, end).await?;
     let search = search_after_population(
         client,
         &json!({
@@ -227,9 +233,64 @@ async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str)
         .ok_or("symbol search results")?;
     assert!(
         results.iter().any(|result| {
-            result["path"] == case.path && result["hit"]["symbol"]["id"] == hit["symbol"]["id"]
+            result["path"] == case.path
+                && result["hit"]["symbol"]["name"] == name
+                && result["hit"]["symbol"]["id"] == symbol["id"]
+                && result["range"] == hit["range"]
         }),
         "{name} declaration missing from search: {search}"
+    );
+    Ok(())
+}
+
+async fn assert_workspace_symbol_node(
+    client: &Client,
+    case: &SourceCase,
+    name: &str,
+    hit: &Value,
+    start: usize,
+    end: usize,
+) -> TestResult {
+    let source = &case.text[start..end];
+    let positions = source.match_indices(name).collect::<Vec<_>>();
+    assert_eq!(positions.len(), 1, "{name} has one original name span");
+    let position = u64::try_from(start.checked_add(positions[0].0).ok_or("name offset")?)?;
+    let view = hit["view"]["id"].as_str().ok_or("captured search view")?;
+    let output = call_retrying_acceptance(
+        client,
+        tool_request(
+            "nodes",
+            &json!({"path":case.path, "position":position, "view":view}),
+        ),
+    )
+    .await?;
+    assert_eq!(output["view"], hit["view"], "original captured view");
+    let nodes = output["nodes"].as_array().ok_or("nodes array")?;
+    let sources = output["source"].as_array().ok_or("node source array")?;
+    assert_eq!(nodes.len(), sources.len(), "one original source per node");
+    let start = u64::try_from(start)?;
+    let end = u64::try_from(end)?;
+    let (index, node) = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node["range"]["start"]
+                .as_u64()
+                .is_some_and(|node_start| node_start >= start && node_start <= position)
+                && node["range"]["end"] == end
+        })
+        .max_by_key(|(_, node)| node["range"]["start"].as_u64())
+        .ok_or_else(|| format!("{name} declaration node: {output}"))?;
+    assert!(
+        node["id"].is_string(),
+        "source carries node address: {node}"
+    );
+    assert_eq!(node["language"], case.language, "{node}");
+    let node_start = usize::try_from(node["range"]["start"].as_u64().ok_or("node start")?)?;
+    let node_end = usize::try_from(end)?;
+    assert_eq!(
+        sources[index],
+        Value::from(&case.text[node_start..node_end])
     );
     Ok(())
 }

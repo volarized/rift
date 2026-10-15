@@ -50,6 +50,8 @@ pub(super) struct ResolutionCache {
     recomputed_blocks: usize,
 }
 
+mod retained_size;
+
 #[derive(Debug)]
 struct CachedBlock {
     input: DocumentationDigest,

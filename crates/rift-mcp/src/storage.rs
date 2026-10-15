@@ -14,9 +14,13 @@ use rift_error::causes;
 use rift_index::{DatabaseName, DatabasePool, LazyDatabase, WorkspaceDatabase};
 use rift_tracing::{LogReader, LogStore};
 
+pub(crate) mod owner;
+pub use owner::workspace_state_directory;
+
 /// One serving process's storage handles for a workspace.
 #[derive(Clone, Debug)]
 pub struct WorkspaceStorage {
+    owner: rift_protocol::identity::SymbolOwner,
     database: Option<Arc<WorkspaceDatabase>>,
     vectors: Option<Arc<LazyDatabase>>,
     logs: Option<Arc<LogStore>>,
@@ -57,6 +61,21 @@ impl WorkspaceStorage {
         Ok(Self::open_with_owner(root, Some(guard)).await)
     }
 
+    /// Opens independent storage under the election for a fixed local owner.
+    ///
+    /// # Errors
+    /// Returns an election storage error before opening any database when the
+    /// root, owner, or held election does not match.
+    pub async fn open_elected_for_owner(
+        root: &Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+        guard: Arc<crate::ElectionGuard>,
+    ) -> Result<Self, rift_error::RiftError> {
+        guard.validate_workspace_owner(root, owner)?;
+        let directory = workspace_state_directory(root, owner)?;
+        Ok(Self::open_at(root, Some(directory), Some(guard), owner.clone()).await)
+    }
+
     /// Opens workspace storage with an owner held by each database thread until it ends.
     ///
     /// The metrics database opens first, so the index database's open lands as a record.
@@ -65,11 +84,26 @@ impl WorkspaceStorage {
         root: &Path,
         election: Option<Arc<crate::ElectionGuard>>,
     ) -> Self {
+        Self::open_at(
+            root,
+            state_directory(root).await,
+            election,
+            rift_protocol::identity::SymbolOwner::Local,
+        )
+        .await
+    }
+
+    async fn open_at(
+        root: &Path,
+        directory: Option<std::path::PathBuf>,
+        election: Option<Arc<crate::ElectionGuard>>,
+        owner_identity: rift_protocol::identity::SymbolOwner,
+    ) -> Self {
         let owner = election.as_ref().map(|guard| {
             let owner: Arc<dyn Send + Sync> = Arc::<crate::ElectionGuard>::clone(guard);
             owner
         });
-        let (logs, database, vectors) = match state_directory(root).await {
+        let (logs, database, vectors) = match directory {
             Some(state_directory) => {
                 let logs = open_log_store(&state_directory, owner.clone()).await;
                 let database = open_index_database(root, &state_directory, owner.clone()).await;
@@ -83,11 +117,33 @@ impl WorkspaceStorage {
             None => (None, None, None),
         };
         Self {
+            owner: owner_identity,
             database,
             vectors,
             logs,
             election,
         }
+    }
+
+    pub(crate) fn validate_owner(
+        &self,
+        root: &Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+    ) -> Result<(), rift_error::RiftError> {
+        if &self.owner != owner {
+            return rift_error::errors::mcp::election_storage_failed()
+                .operation("validate workspace storage")
+                .path(root)
+                .source(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "storage belongs to another owner",
+                ))
+                .fail();
+        }
+        if let Some(election) = &self.election {
+            election.validate_workspace_owner(root, owner)?;
+        }
+        Ok(())
     }
 
     /// Whether storage opened under this held election.
@@ -221,6 +277,82 @@ mod tests {
     use rift_core::constants::{INDEX_DATABASE_FILE_NAME, RIFT_STATE_DIRECTORY};
 
     use super::WorkspaceStorage;
+
+    #[tokio::test]
+    async fn named_storage_refuses_another_owner_before_database_open() {
+        use rift_protocol::identity::SymbolOwner;
+        let root = tempfile::tempdir().expect("workspace");
+        let cloud = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let other = SymbolOwner::NamedLocal {
+            name: "other".to_owned(),
+        };
+        let guard = Arc::new(
+            crate::election::claim_with_owner(root.path(), &cloud).expect("named election"),
+        );
+        let refused =
+            super::workspace_state_directory(root.path(), &other).expect("other directory");
+        assert!(
+            WorkspaceStorage::open_elected_for_owner(root.path(), &other, Arc::clone(&guard))
+                .await
+                .is_err()
+        );
+        assert!(
+            WorkspaceStorage::open_elected(root.path(), Arc::clone(&guard))
+                .await
+                .is_err()
+        );
+        assert!(!refused.exists(), "wrong owner opens no storage");
+        let other_root = tempfile::tempdir().expect("other workspace");
+        assert!(
+            WorkspaceStorage::open_elected_for_owner(other_root.path(), &cloud, guard)
+                .await
+                .is_err()
+        );
+        assert!(
+            !other_root.path().join(".rift").exists(),
+            "wrong root opens no storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn named_and_primary_storage_hold_independent_databases() {
+        use rift_protocol::identity::SymbolOwner;
+        let root = tempfile::tempdir().expect("workspace");
+        let cloud = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let primary_guard =
+            Arc::new(crate::election::claim(root.path()).expect("primary election"));
+        let named_guard = Arc::new(
+            crate::election::claim_with_owner(root.path(), &cloud).expect("named election"),
+        );
+        let primary = WorkspaceStorage::open_elected(root.path(), primary_guard)
+            .await
+            .expect("primary storage");
+        let named = WorkspaceStorage::open_elected_for_owner(root.path(), &cloud, named_guard)
+            .await
+            .expect("named storage");
+        assert!(!Arc::ptr_eq(
+            &primary.database().expect("primary database"),
+            &named.database().expect("named database")
+        ));
+        assert!(!Arc::ptr_eq(
+            &primary.vectors().expect("primary vectors"),
+            &named.vectors().expect("named vectors")
+        ));
+        assert!(!Arc::ptr_eq(
+            &primary.logs().expect("primary logs"),
+            &named.logs().expect("named logs")
+        ));
+        assert!(
+            named
+                .validate_owner(root.path(), &SymbolOwner::Local)
+                .is_err()
+        );
+        assert!(primary.validate_owner(root.path(), &cloud).is_err());
+    }
 
     #[tokio::test]
     async fn one_storage_owner_clones_the_same_database_handle() {

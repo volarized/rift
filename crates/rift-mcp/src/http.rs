@@ -142,6 +142,25 @@ pub(crate) async fn serve_http_with_storage(
     check: TokenCheck,
     checkout: BuildCheckout,
 ) -> Result<HttpServer, RiftError> {
+    serve_http_with_storage_for_owner(
+        (root, rift_protocol::identity::SymbolOwner::Local),
+        shutdown,
+        storage,
+        limits,
+        check,
+        checkout,
+    )
+    .await
+}
+
+pub(crate) async fn serve_http_with_storage_for_owner(
+    (root, owner): (&Path, rift_protocol::identity::SymbolOwner),
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+    limits: WorkspaceIndexLimits,
+    check: TokenCheck,
+    checkout: BuildCheckout,
+) -> Result<HttpServer, RiftError> {
     rift_tracing::info!(
         component = "mcp",
         transport = "http",
@@ -149,7 +168,8 @@ pub(crate) async fn serve_http_with_storage(
         "MCP server starting"
     );
     let logs = storage.logs();
-    let server = RiftMcp::build_with_storage(root, limits, storage, checkout).await?;
+    let server =
+        RiftMcp::build_with_storage_for_owner((root, owner), limits, storage, checkout).await?;
     let identity = server.product_identity().clone();
     let search_index = server.search_index_handle();
     let server_table = server.server_configuration().await;
@@ -758,14 +778,19 @@ fn stop_outcome_label(stopped_cleanly: bool) -> &'static str {
 /// spell exactly [`rift_protocol::lock::SERVER_TOKEN_LENGTH`] base64url
 /// characters.
 pub(crate) fn mint_token() -> Result<String, RiftError> {
+    Ok(BASE64URL_NOPAD.encode(&token_entropy("token mint")?))
+}
+
+/// Reads 32 entropy bytes from the operating system for the named operation.
+pub(crate) fn token_entropy(operation: &str) -> Result<[u8; TOKEN_ENTROPY_BYTES], RiftError> {
     let mut entropy = [0_u8; TOKEN_ENTROPY_BYTES];
     getrandom::fill(&mut entropy).map_err(|error| {
         errors::mcp::http_serve_failed()
-            .operation("token mint")
+            .operation(operation)
             .source(error)
             .error()
     })?;
-    Ok(BASE64URL_NOPAD.encode(&entropy))
+    Ok(entropy)
 }
 
 /// The first port in `ports` that `bind` accepts, with what it bound.
@@ -1220,6 +1245,8 @@ mod tests {
                 schema_digest: "b".repeat(64),
             },
             server: None,
+            root: None,
+            owner: None,
         };
         assert_eq!(lock.validate(), Ok(()));
     }

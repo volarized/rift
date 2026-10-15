@@ -619,3 +619,599 @@ fn local_owner_without_captured_entry_metadata_keeps_identity_unresolved() {
     assert!(result.exports.is_empty());
     assert!(result.mappings.is_empty());
 }
+
+#[test]
+fn explicit_export_subpaths_establish_independent_captured_modules() {
+    let found = prepared(
+        ShippedLanguage::TypeScript,
+        &[(
+            "package.json",
+            r#"{"name":"prettier","version":"3.8.5","exports":{".":"./index.ts","./hub":"./hub.ts","./walk":"./walk.ts"}}"#,
+        )],
+        &[
+            ("index.ts", "export function format() {}"),
+            ("hub.ts", "export function beacon() {}"),
+            (
+                "walk.ts",
+                "import { beacon } from './hub'; export function larger() { beacon(); }",
+            ),
+        ],
+    );
+    for (path, name, module) in [
+        ("index.ts", "format", "prettier"),
+        ("hub.ts", "beacon", "prettier/hub"),
+        ("walk.ts", "larger", "prettier/walk"),
+    ] {
+        let identity = SymbolIdentity::parse(found.anchors[path][name].as_str())
+            .expect("captured export identity");
+        assert_eq!(
+            identity.qualified_path(),
+            &[module.to_owned(), name.to_owned()]
+        );
+    }
+    assert!(!found.unresolved_exports);
+}
+
+#[test]
+fn missing_conditional_and_pattern_exports_leave_sources_unresolved() {
+    for target in [
+        r#"{"./hub":{"import":"./hub.ts"}}"#,
+        r#"{"./*":"./hub.ts"}"#,
+        r#"{"./hub":"./missing.ts"}"#,
+        r#"{"./hub":"../hub.ts"}"#,
+        r#"{"./hub":"./node_modules/hub.ts"}"#,
+    ] {
+        let metadata = format!(r#"{{"name":"prettier","version":"3.8.5","exports":{target}}}"#);
+        let found = prepared(
+            ShippedLanguage::TypeScript,
+            &[("package.json", metadata.as_str())],
+            &[("hub.ts", "export function beacon() {}")],
+        );
+        assert!(found.anchors.is_empty(), "{metadata}");
+        assert!(found.unresolved_exports, "{metadata}");
+    }
+}
+
+#[test]
+fn conflicting_export_subpaths_refuse_one_physical_module_assignment() {
+    let found = prepared(
+        ShippedLanguage::TypeScript,
+        &[(
+            "package.json",
+            r#"{"name":"prettier","version":"3.8.5","exports":{"./hub":"./hub.ts","./other":"./hub.ts"}}"#,
+        )],
+        &[("hub.ts", "export function beacon() {}")],
+    );
+    assert!(found.anchors.is_empty());
+    assert!(found.unresolved_exports);
+    let duplicate: Result<super::PackageMetadata, _> = serde_json::from_str(
+        r#"{"name":"prettier","version":"3.8.5","exports":{"./hub":"./hub.ts","./hub":"./other.ts"}}"#,
+    );
+    assert!(duplicate.is_err(), "duplicate captured export key refuses");
+}
+
+#[test]
+fn raw_anonymous_export_bindings_need_module_export_context_before_identity() {
+    let metadata = [(
+        "package.json",
+        r#"{"name":"prettier","version":"3.8.5","main":"./index.js"}"#,
+    )];
+    for source in [
+        "exports.open = function () {}; function kept() {}",
+        "function outer(exports) { exports.open = function () {}; } function kept() {}",
+        "(function (exports) { exports.open = function () {}; })(other); function kept() {}",
+    ] {
+        let prepared = prepared(
+            ShippedLanguage::JavaScript,
+            &metadata,
+            &[("index.js", source)],
+        );
+        let anchors = prepared.anchors.get("index.js").expect("captured module");
+        assert!(anchors.contains_key("kept"));
+        assert!(!anchors.contains_key("open"));
+    }
+}
+
+fn ambient_prepared(
+    owner: &rift_protocol::identity::SymbolOwner,
+    metadata: Option<&str>,
+    source: &str,
+) -> (
+    super::PreparedNamespace,
+    std::sync::Arc<rift_syntax::SyntaxFacts>,
+) {
+    use rift_protocol::{identity::SymbolOwner, read::RuntimeIdentity};
+    let path = ProjectPath::new("buffer.d.ts").expect("original path");
+    let metadata_path = ProjectPath::new("package.json").expect("metadata path");
+    let files = [PackageSource::new(&path, source)];
+    let context = metadata
+        .map(|text| PackageSource::new(&metadata_path, text))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let location = match owner {
+        SymbolOwner::Package {
+            manager,
+            registry,
+            name,
+            version,
+        } => SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: manager.clone(),
+                registry: registry.clone(),
+                name: name.clone(),
+                version: version.clone(),
+            },
+        },
+        SymbolOwner::Runtime { runtime, version } => SourceLocation::Stdlib {
+            runtime: Some(RuntimeIdentity {
+                runtime: runtime.clone(),
+                version: version.clone(),
+            }),
+        },
+        _ => SourceLocation::Project { package: None },
+    };
+    let origin = ContributionOrigin::new(Some(location), SourceKind::Authored)
+        .expect("captured owner origin");
+    let language = ShippedLanguage::TypeScript.language();
+    let limits = ExactPackageLimits::new(20, 16 * 1024 * 1024);
+    let input = if matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }) {
+        crate::NamespaceInput::project(owner, &language, &files, &context, &[], limits)
+            .expect("captured local input")
+    } else {
+        ExactPackageInput::new(owner, &language, &origin, &files, limits)
+            .expect("captured release input")
+            .with_framework_context(&context, &[])
+            .expect("original metadata")
+            .namespace_input()
+    };
+    let facts = TypeScriptSyntaxProvider::new(TypeScriptDialect::TypeScript)
+        .analyze(
+            SyntaxSource {
+                path: &path,
+                text: source,
+            },
+            input.syntax(),
+        )
+        .expect("original source parses")
+        .into_facts();
+    let selected = [super::SelectedFile {
+        path: &path,
+        source,
+        syntax: &facts,
+    }];
+    (super::prepare(&input, &selected), facts)
+}
+
+fn types_node_owner() -> rift_protocol::identity::SymbolOwner {
+    SymbolIdentity::parse(
+        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node:buffer/isUtf8",
+    )
+    .expect("exact declaration package owner")
+    .owner()
+    .clone()
+}
+
+#[test]
+fn package_ambient_original_buffer_keeps_owner_ranges_and_unknown_entry() {
+    let source = include_str!("../../../../tests/fixtures/types-node-buffer.d.ts");
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    let owner = types_node_owner();
+    let (found, facts) = ambient_prepared(&owner, Some(metadata), source);
+    assert!(!facts.has_errors());
+    let declaration = facts
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "isUtf8")
+        .expect("original callable declaration");
+    let statement = "function isUtf8(input: ArrayBuffer | NodeJS.TypedArray): boolean;";
+    let start = source.find(statement).expect("original callable source");
+    let end = start + statement.len();
+    assert_eq!(
+        (declaration.item_range.start, declaration.item_range.end),
+        (
+            u64::try_from(start).expect("fixture offset fits"),
+            u64::try_from(end).expect("fixture offset fits")
+        )
+    );
+    assert_eq!(source.get(start..end), Some(statement));
+    assert_eq!(declaration.container.as_deref(), Some("\"node:buffer\""));
+    let identity = &found.anchors["buffer.d.ts"][&declaration.qualified_name];
+    let parsed = SymbolIdentity::parse(identity.as_str()).expect("Package ambient identity");
+    assert_eq!(parsed.owner(), &owner);
+    assert_eq!(parsed.language().name, "typescript");
+    assert_eq!(parsed.qualified_path(), ["node:buffer", "isUtf8"]);
+    assert_eq!(
+        facts.source_digest(),
+        Some(&rift_core::FileDigest::of(source.as_bytes()))
+    );
+    assert!(
+        found.mappings.is_empty(),
+        "no Runtime or JavaScript association"
+    );
+    assert!(
+        !found.anchors["buffer.d.ts"]
+            .keys()
+            .any(|name| name.starts_with("global."))
+    );
+    let metadata: super::PackageMetadata =
+        serde_json::from_str(metadata).expect("original metadata");
+    assert!(
+        super::entry_path(&metadata, "typescript").is_none(),
+        "compiler applicability remains unknown"
+    );
+}
+
+#[test]
+fn package_ambient_missing_wrong_metadata_and_other_owners_remain_unknown() {
+    use rift_protocol::identity::SymbolOwner;
+    let source =
+        "declare module \"node:buffer\" { export function isUtf8(input: unknown): boolean; }";
+    let original = include_str!("../../../../tests/fixtures/types-node-package.json");
+    for metadata in [
+        None,
+        Some("not JSON"),
+        Some(r#"{"name":"other","version":"26.6.4"}"#),
+        Some(r#"{"name":"@types/node","version":"26.6.3"}"#),
+    ] {
+        let (found, facts) = ambient_prepared(&types_node_owner(), metadata, source);
+        assert!(facts.symbols().iter().any(|symbol| symbol.name == "isUtf8"));
+        assert!(found.anchors.is_empty(), "{metadata:?}");
+    }
+    for owner in [
+        SymbolOwner::Local,
+        SymbolOwner::NamedLocal {
+            name: "node".to_owned(),
+        },
+        SymbolOwner::Runtime {
+            runtime: "node".to_owned(),
+            version: "26.6.4".to_owned(),
+        },
+    ] {
+        let (found, facts) = ambient_prepared(&owner, Some(original), source);
+        assert!(facts.symbols().iter().any(|symbol| symbol.name == "isUtf8"));
+        assert!(found.anchors.is_empty(), "{owner:?}");
+        assert!(found.mappings.is_empty());
+    }
+}
+
+#[test]
+fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    for source in [
+        "declare namespace NodeJS { function isUtf8(): boolean; }",
+        "declare global { function isUtf8(): boolean; }",
+        "export function isUtf8(): boolean;",
+        "declare module \"node:buffer\" { export function isUtf8(input: ): boolean; }",
+        "declare module \"node:buffer\" { global { interface Broken { value: } } }",
+    ] {
+        let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+        assert!(found.anchors.is_empty(), "{source}");
+    }
+    let source = "export function outside(): boolean;\ndeclare module \"node:buffer\" { export function isUtf8(): boolean; global { interface GlobalMember {} } }\n";
+    let (found, facts) = ambient_prepared(&types_node_owner(), Some(metadata), source);
+    assert!(!facts.has_errors());
+    let anchors = &found.anchors["buffer.d.ts"];
+    assert!(anchors.contains_key("\"node:buffer\".isUtf8"));
+    assert!(!anchors.contains_key("outside"));
+    assert!(!anchors.keys().any(|name| name.starts_with("global.")));
+}
+
+#[test]
+fn package_ambient_reuses_overload_and_occurrence_identity() {
+    let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
+    let overloads = "declare module \"node:buffer\" { export function read(value: string): string; export function read(value: number): string; }";
+    let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), overloads);
+    let identities = found.anchors["buffer.d.ts"]
+        .iter()
+        .filter(|(name, _)| name.contains(".read"))
+        .map(|(_, identity)| identity)
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(identities[0], identities[1]);
+    let repeated =
+        "declare module \"node:buffer\" { export function read() {} export function read() {} }";
+    let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), repeated);
+    let identities = found.anchors["buffer.d.ts"]
+        .iter()
+        .filter(|(name, _)| name.contains(".read"))
+        .map(|(_, identity)| identity)
+        .collect::<Vec<_>>();
+    assert_eq!(identities.len(), 2);
+    assert_ne!(identities[0], identities[1]);
+    assert!(identities[1].as_str().contains("~2?rev="));
+    assert!(
+        identities[1]
+            .as_str()
+            .ends_with(&crate::documentation::content_digest(repeated.as_bytes()).0)
+    );
+}
+
+fn commonjs_prepared(
+    metadata: &str,
+    files: &[(&str, &str)],
+    entry: &str,
+    conditions: &[&str],
+) -> (
+    super::PreparedNamespace,
+    Vec<std::sync::Arc<rift_syntax::SyntaxFacts>>,
+) {
+    let owner =
+        SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react@19.3.0/javascript/react/open")
+            .expect("captured package owner")
+            .owner()
+            .clone();
+    let origin = ContributionOrigin::new(
+        Some(SourceLocation::Dependency {
+            package: PackageIdentity {
+                manager: "npm".to_owned(),
+                registry: "npmjs.org".to_owned(),
+                name: "react".to_owned(),
+                version: "19.3.0".to_owned(),
+            },
+        }),
+        SourceKind::Authored,
+    )
+    .expect("original package origin");
+    let paths = files
+        .iter()
+        .map(|(path, _)| ProjectPath::new(*path).expect("original path"))
+        .collect::<Vec<_>>();
+    let sources = paths
+        .iter()
+        .zip(files)
+        .map(|(path, (_, text))| PackageSource::new(path, text))
+        .collect::<Vec<_>>();
+    let metadata_path = ProjectPath::new("package.json").expect("metadata path");
+    let context = [PackageSource::new(&metadata_path, metadata)];
+    let implementation = sources
+        .iter()
+        .find(|source| source.path().as_str() == entry)
+        .copied()
+        .expect("selected original entry");
+    let observations = [crate::NamespaceModule::new(
+        "react",
+        implementation,
+        &[],
+        conditions,
+    )];
+    let language = ShippedLanguage::JavaScript.language();
+    let input = ExactPackageInput::new(
+        &owner,
+        &language,
+        &origin,
+        &sources,
+        ExactPackageLimits::new(20, 16 * 1024 * 1024),
+    )
+    .expect("bounded original sources")
+    .with_framework_context(&context, &[])
+    .expect("original metadata")
+    .with_modules(&observations)
+    .expect("captured resolver conditions");
+    let facts = sources
+        .iter()
+        .map(|source| {
+            JavaScriptSyntaxProvider::default()
+                .analyze(
+                    SyntaxSource {
+                        path: source.path(),
+                        text: source.text(),
+                    },
+                    input.limits().syntax(),
+                )
+                .expect("original JavaScript parses")
+                .into_facts()
+        })
+        .collect::<Vec<_>>();
+    let selected = sources
+        .iter()
+        .zip(&facts)
+        .map(|(source, syntax)| super::SelectedFile {
+            path: source.path(),
+            source: source.text(),
+            syntax,
+        })
+        .collect::<Vec<_>>();
+    (super::prepare(&input.namespace_input(), &selected), facts)
+}
+
+#[test]
+fn commonjs_original_react_builds_keep_distinct_modules_and_public_bindings() {
+    let files = [
+        (
+            "index.js",
+            include_str!("../../../../tests/fixtures/react/index.js"),
+        ),
+        (
+            "cjs/react.development.js",
+            include_str!("../../../../tests/fixtures/react/cjs/react.development.js"),
+        ),
+        (
+            "cjs/react.production.js",
+            include_str!("../../../../tests/fixtures/react/cjs/react.production.js"),
+        ),
+    ];
+    let (prepared, facts) = commonjs_prepared(
+        include_str!("../../../../tests/fixtures/react/package.json"),
+        &files,
+        "index.js",
+        &["node", "require"],
+    );
+    assert!(
+        prepared.unresolved_exports,
+        "conditional facade remains unknown"
+    );
+    let mut identities = Vec::new();
+    for (index, path) in ["cjs/react.development.js", "cjs/react.production.js"]
+        .iter()
+        .enumerate()
+    {
+        let declaration = facts[index + 1]
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == "useState")
+            .expect("original raw useState");
+        assert!(
+            !declaration
+                .facets
+                .contains(&rift_protocol::read::SymbolFacet::Public)
+        );
+        let anchors = prepared
+            .anchors
+            .get(*path)
+            .expect("resolved defining module");
+        identities.push(
+            anchors
+                .get(&declaration.qualified_name)
+                .expect("checked useState identity")
+                .clone(),
+        );
+        assert!(prepared.public_names[*path].contains(&declaration.qualified_name));
+        assert!(
+            facts[index + 1]
+                .export_bindings()
+                .expect("original bindings")
+                .iter()
+                .any(|binding| binding.range == declaration.item_range
+                    && binding.local == declaration.name_range)
+        );
+    }
+    assert_ne!(
+        identities[0], identities[1],
+        "different resolved CommonJS files stay distinct"
+    );
+    assert!(!prepared.anchors["index.js"].contains_key("useState"));
+}
+
+#[test]
+fn commonjs_receiver_shadow_reassignment_qualified_and_ordinary_functions_remain_unknown() {
+    let metadata = r#"{"name":"react","version":"19.3.0","main":"index.js"}"#;
+    for source in [
+        "const exports={}; exports.open=function(){};",
+        "exports={}; exports.open=function(){};",
+        "module={exports:{}}; module.exports.open=function(){};",
+        "module.exports={}; exports.open=function(){};",
+        "exports.open=function(){}; module.exports={};",
+        "module.exports=require('./other.js'); exports.open=function(){};",
+        "const {exports}=other; exports.open=function(){};",
+        "function outer(exports){exports.open=function(){};}",
+        "(function(exports){exports.open=function(){};})(other);",
+        "function outer(){exports.open=function(){};}",
+        "window.exports.open=function(){};",
+        "eval('exports = other'); exports.open=function(){};",
+    ] {
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[("index.js", source)],
+            "index.js",
+            &["node", "require"],
+        );
+        assert!(
+            !prepared
+                .anchors
+                .get("index.js")
+                .is_some_and(|anchors| anchors.contains_key("open")),
+            "{source}"
+        );
+        assert!(
+            !prepared
+                .public_names
+                .get("index.js")
+                .is_some_and(|names| names.contains("open")),
+            "{source}"
+        );
+    }
+    for source in [
+        "exports.open=function(){};",
+        "(function(){exports.open=function(){};})();",
+        "if(condition){exports.open=function(){};}",
+    ] {
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[("index.js", source)],
+            "index.js",
+            &["node", "require"],
+        );
+        assert!(
+            prepared.anchors["index.js"].contains_key("open"),
+            "{source}"
+        );
+        assert!(
+            prepared.public_names["index.js"].contains("open"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn commonjs_original_entry_conditions_owner_and_esm_context_are_required() {
+    let source = "exports.open=function(){};";
+    for (metadata, conditions) in [
+        (
+            r#"{"name":"wrong","version":"19.3.0","main":"index.js"}"#,
+            &["node", "require"][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"other.js"}"#,
+            &["node", "require"][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"index.js","type":"module"}"#,
+            &["node", "require"][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
+            &[][..],
+        ),
+        (
+            r#"{"name":"react","version":"19.3.0","main":"index.js"}"#,
+            &["import"][..],
+        ),
+    ] {
+        let (prepared, _) =
+            commonjs_prepared(metadata, &[("index.js", source)], "index.js", conditions);
+        assert!(
+            !prepared
+                .anchors
+                .get("index.js")
+                .is_some_and(|anchors| anchors.contains_key("open"))
+        );
+        assert!(prepared.public_names.is_empty());
+    }
+}
+
+#[test]
+fn commonjs_literal_forwarding_missing_dynamic_shadow_and_cycles_stay_bounded() {
+    let metadata = r#"{"name":"react","version":"19.3.0","main":"index.js"}"#;
+    for entry in [
+        "module.exports=require(target);",
+        "const require=other; module.exports=require('./child.js');",
+        "module.exports=require('../child.js');",
+        "module.exports=require('./missing.js');",
+    ] {
+        let (prepared, _) = commonjs_prepared(
+            metadata,
+            &[
+                ("index.js", entry),
+                ("child.js", "exports.open=function(){};"),
+            ],
+            "index.js",
+            &["node", "require"],
+        );
+        assert!(!prepared.anchors.contains_key("child.js"), "{entry}");
+    }
+    let (prepared, _) = commonjs_prepared(
+        metadata,
+        &[
+            (
+                "index.js",
+                "module.exports=require('./child.js'); if(condition){module.exports=require('./cycle.js');}",
+            ),
+            ("child.js", "exports.open=function(){};"),
+            ("cycle.js", "module.exports=require('./index.js');"),
+        ],
+        "index.js",
+        &["node", "require"],
+    );
+    assert!(prepared.anchors["child.js"].contains_key("open"));
+    assert!(prepared.unresolved_exports);
+}

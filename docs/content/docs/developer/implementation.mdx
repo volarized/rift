@@ -402,7 +402,7 @@ owns its map, source catalog, configuration, and preparation counts.
 
 `search` and `get_symbol` use the declarations already prepared. Their
 [`local_index_preparing`](/docs/developer/mcp#reads) warning remains until their selected
-local scope is complete, including a name lookup that already found a match. A `nodes` read can
+local scope is complete, including an exact symbol read that already found a declaration. A `nodes` read can
 prepare its supplied path within the request budget without changing published progress.
 
 The [`rift://workspace`](/docs/developer/mcp#resource-workspace) resource projects only

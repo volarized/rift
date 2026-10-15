@@ -259,11 +259,12 @@ installed, downloaded, or written.
 ### Global index
 
 A package's declarations come from the [Global Index](/global-index), which holds facts for
-collected OSS package versions. A `global` or `all` read sends the dependency context's
-`canonical` entries to the global API, and the answer carries the package hits the global index
-holds for them beside the project's. A package declaration is a
-[`Symbol`](https://volar.sh/rift/mcp.json) like any other, and answers a
-[`get_symbol`](/docs/mcp#get_symbol-scope) lookup whose `scope` reaches packages.
+collected OSS package versions. A `global` search reaches collected package and runtime facts selected by the dependency
+context. Explicit `packages` replaces versions of named packages or adds packages the context
+lacks; an omitted list keeps the snapshot context unchanged. An `all` search merges global results with the
+primary project and accepted extra projects. A package declaration is a
+[`Symbol`](https://volar.sh/rift/mcp.json) like any other, and its returned `id`
+selects one exact [`get_symbol`](/docs/mcp#get_symbol-scope) read.
 
 The local server requests package facts through the [Global Index API](/global-index).
 
@@ -559,7 +560,7 @@ hit. Under `target: "all"`, an attached comment keeps its symbol result when tha
 a file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
-`get_symbol` with `name: "Compass"` and `include: ["documentation"]`. The reference resolves only
+`get_symbol` with its established `id` and `include: ["documentation"]`. The reference resolves only
 when the selected declaration set establishes one exact target. Ambiguous names remain unresolved.
 The read returns at most 32 references per symbol and 16 KiB of documentation excerpts across the
 page, with typed warnings for missing bytes or reached bounds.
@@ -679,9 +680,10 @@ the other two inputs and says so, rather than waiting for a model to load.
 
 ### Retrieve symbol
 
-[`get_symbol`](/docs/mcp#tool-get_symbol) retrieves a declaration when its name is
-known. The answer carries the declaration's body inline, so reading a function takes one call
-rather than a search followed by a file read.
+[`get_symbol`](/docs/mcp#tool-get_symbol) reads one logical symbol by its canonical `id`.
+The answer separates the symbol from its declaration bindings and carries requested source
+inline. An immutable `view` keeps a later read and its declaration continuation on the same
+selection.
 
 A Symbol carries `id` when the index established one identity for the declaration; a symbol
 the providers could not settle answers without an `id`, and a retained provider disagreement

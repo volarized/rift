@@ -18,6 +18,8 @@ autotests = false
 workspace = true
 
 [dependencies]
+chrono.workspace = true
+get-size2.workspace = true
 lsp-types.workspace = true
 percent-encoding.workspace = true
 globset.workspace = true
@@ -50,6 +52,8 @@ ruff_db.workspace = true
 ruff_notebook.workspace = true
 ruff_text_size.workspace = true
 ty_python_core.workspace = true
+ty_site_packages = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
+serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
 

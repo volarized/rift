@@ -41,6 +41,8 @@ pub(crate) struct HeldNotebook {
     outcome: Arc<NotebookOutcome>,
 }
 
+mod retained_size;
+
 #[derive(Clone, Debug)]
 enum NotebookOutcome {
     Decoded(NotebookContent),
@@ -60,8 +62,10 @@ impl HeldNotebook {
 pub(crate) fn declarations(
     files: &BTreeMap<CoreProjectPath, Arc<IndexedFile>>,
     semantics: &WorkspaceSemantics,
-) -> Vec<DeclarationFacts> {
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> (Vec<DeclarationFacts>, Vec<rift_core::SymbolId>) {
     let mut declarations = Vec::new();
+    let mut examples = Vec::new();
     for file in files.values() {
         let language = file.syntax().language();
         for symbol in file.syntax().symbols() {
@@ -70,13 +74,18 @@ pub(crate) fn declarations(
                 file.path().as_str(),
                 &symbol.qualified_name,
             );
-            if let Some(identity) =
+            if let Some(canonical) =
                 crate::workspace::ReadableSymbol::assembled_by(semantics, &identity)
                     .and_then(|readable| readable.identity().cloned())
-                    .and_then(|identity| {
-                        rift_protocol::identity::SymbolIdentity::parse(identity.as_str()).ok()
-                    })
+                && let Ok(identity) =
+                    rift_protocol::identity::SymbolIdentity::parse(canonical.as_str())
             {
+                if identity.owner() == owner
+                    && examples.len() < crate::workspace::CANONICAL_EXAMPLES_MAX
+                    && !examples.contains(&canonical)
+                {
+                    examples.push(canonical);
+                }
                 let mut declaration =
                     DeclarationFacts::new(file, symbol, SymbolId(identity.wire_identity()));
                 declaration.language = identity.language().clone();
@@ -84,7 +93,8 @@ pub(crate) fn declarations(
             }
         }
     }
-    declarations
+    examples.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    (declarations, examples)
 }
 
 /// Builds a validated documentation collection and decoded notebook cells from the text

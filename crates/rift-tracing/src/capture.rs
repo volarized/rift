@@ -257,15 +257,20 @@ impl SpanContextLayer {
     pub(crate) fn with_clock(clock: Arc<dyn Fn() -> Duration + Send + Sync>) -> Self {
         Self { clock: Some(clock) }
     }
+}
 
-    /// Reads the layer's clock.
-    fn now(&self) -> Duration {
+/// Reads the layer's clock.
+fn now(
+    SpanContextLayer {
         #[cfg(any(test, feature = "fixtures"))]
-        if let Some(clock) = &self.clock {
-            return clock();
-        }
-        process_monotonic_now()
+        clock,
+    }: &SpanContextLayer,
+) -> Duration {
+    #[cfg(any(test, feature = "fixtures"))]
+    if let Some(clock) = clock {
+        return clock();
     }
+    process_monotonic_now()
 }
 
 /// The reading of the clock a scoped recorder named, when the thread's default subscriber
@@ -313,7 +318,7 @@ where
                 parent
             },
             node,
-            timings: Timings::opened(self.now()),
+            timings: Timings::opened(now(self)),
         });
     }
 
@@ -337,7 +342,7 @@ where
         if let Some(span) = context.span(id)
             && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
         {
-            entry.timings.entered(self.now());
+            entry.timings.entered(now(self));
         }
     }
 
@@ -345,7 +350,7 @@ where
         if let Some(span) = context.span(id)
             && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
         {
-            entry.timings.exited(self.now());
+            entry.timings.exited(now(self));
         }
     }
 
@@ -353,7 +358,7 @@ where
         if let Some(span) = context.span(&id)
             && let Some(entry) = span.extensions_mut().get_mut::<SpanEntry>()
         {
-            entry.timings.closed(self.now());
+            entry.timings.closed(now(self));
         }
     }
 
@@ -592,7 +597,7 @@ pub(crate) fn span_failure(id: &tracing::span::Id) -> Option<&'static str> {
 /// dispatcher keeps no entry for the span, or the clock reads before the opening.
 pub(crate) fn span_completed(id: &tracing::span::Id) -> Option<Duration> {
     tracing::dispatcher::get_default(|dispatch| {
-        let now = dispatch.downcast_ref::<SpanContextLayer>()?.now();
+        let now = now(dispatch.downcast_ref::<SpanContextLayer>()?);
         let span = dispatch.downcast_ref::<Registry>()?.span(id)?;
         let mut extensions = span.extensions_mut();
         extensions.get_mut::<SpanEntry>()?.timings.completed(now)

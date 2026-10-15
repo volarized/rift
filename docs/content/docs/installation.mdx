@@ -35,6 +35,15 @@ The installer downloads the latest verified release for your platform and instal
 current user. To install a specific version, set the `RIFT_VERSION` environment variable to its
 release tag.
 
+The download service counts archive requests by day, country, release, platform, and agent category.
+These counts measure download requests, including retries; they do not confirm successful
+installation. Set `RIFT_TELEMETRY_DISABLED=true` in the installer's environment to exclude
+its requests from counters. Standalone installers do not read project or user TOML files.
+After installation, run
+`rift config set --telemetry.disabled=true --user` to exclude Rift's cloud and update
+requests for every project. Rift sends no separate local activity reports.
+[Privacy](/docs/privacy) explains the counters and opt-out.
+
 If the installer asks you to add its installation directory to `PATH`, add that directory so your
 terminal and agent can find `rift`.
 

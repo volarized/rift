@@ -12,6 +12,7 @@ use serde::{Deserialize, Deserializer, de};
 use super::{ExportBinding, PreparedNamespace, SelectedFile};
 use crate::NamespaceInput;
 
+mod commonjs;
 mod observations;
 
 /// Establishes declarations in an entry module from captured owner and metadata.
@@ -23,14 +24,54 @@ pub(super) fn prepare(
     let metadata = captured_metadata(input);
     let mut prepared = PreparedNamespace::default();
     if let Some(metadata) = &metadata {
+        let entries = ["typescript", "javascript"].map(|language| {
+            let (modules, unresolved) = entry_modules(metadata, language);
+            prepared.unresolved_exports |= unresolved;
+            (language, modules)
+        });
+        let inventory = selected
+            .iter()
+            .map(|file| (file.path, file.syntax.language().name.as_str()))
+            .collect::<BTreeSet<_>>();
+        for (language, modules) in &entries {
+            if selected
+                .iter()
+                .any(|file| file.syntax.language().name == *language)
+            {
+                prepared.unresolved_exports |= modules
+                    .keys()
+                    .any(|path| !inventory.contains(&(path, *language)));
+            }
+        }
         for file in selected {
-            let Some(path) = entry_path(metadata, &file.syntax.language().name) else {
+            let Some(module) = entries
+                .iter()
+                .find(|(language, _)| *language == file.syntax.language().name.as_str())
+                .and_then(|(_, modules)| modules.get(file.path))
+                .and_then(Option::as_deref)
+            else {
                 continue;
             };
-            if file.path != &path || !selected_source_is_valid(input, file) {
+            if !selected_source_is_valid(input, file) {
                 continue;
             }
-            prepare_file(input, file, &metadata.name, &mut prepared);
+            prepare_file(input, file, module, &mut prepared);
+        }
+        if matches!(input.owner(), SymbolOwner::Package { .. }) {
+            for file in selected {
+                if file.syntax.language().name == "typescript"
+                    && selected_source_is_valid(input, file)
+                {
+                    let ambient = declaration_anchors(input, file.syntax, file.source, None);
+                    if !ambient.is_empty() {
+                        prepared
+                            .anchors
+                            .entry(file.path.as_str().to_owned())
+                            .or_default()
+                            .extend(ambient);
+                    }
+                }
+            }
         }
         map_declared_types(input, metadata, selected, &mut prepared);
     }
@@ -44,7 +85,7 @@ fn prepare_file(
     module: &str,
     prepared: &mut PreparedNamespace,
 ) -> bool {
-    let anchors = declaration_anchors(input, file.syntax, file.source, module);
+    let anchors = declaration_anchors(input, file.syntax, file.source, Some(module));
     if let Some(previous) = prepared.anchors.get(file.path.as_str()) {
         prepared.unresolved_exports |= previous != &anchors;
         return previous == &anchors;
@@ -148,7 +189,7 @@ fn export_bindings(
     (exports, unresolved)
 }
 
-fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
+pub(super) fn conflicting_export_identities(exports: &[ExportBinding]) -> BTreeSet<String> {
     let mut targets = BTreeMap::<&str, Option<&SymbolId>>::new();
     for export in exports {
         match targets.entry(export.identity.as_str()) {
@@ -249,6 +290,76 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
         SymbolOwner::Runtime { .. } => false,
     };
     accepted.then_some(metadata)
+}
+
+fn entry_modules(
+    metadata: &PackageMetadata,
+    language: &str,
+) -> (BTreeMap<ProjectPath, Option<String>>, bool) {
+    let Some(Exports::Subpaths(exports)) = &metadata.exports else {
+        return (
+            entry_path(metadata, language)
+                .map(|path| (path, Some(metadata.name.clone())))
+                .into_iter()
+                .collect(),
+            false,
+        );
+    };
+    let mut modules = BTreeMap::new();
+    let mut unresolved = false;
+    for (key, target) in &exports.0 {
+        let suffix = if key == "." {
+            ""
+        } else if let Some(suffix) = key.strip_prefix("./") {
+            if !export_subpath_is_valid(suffix) {
+                unresolved = true;
+                continue;
+            }
+            &key[1..]
+        } else {
+            unresolved = true;
+            continue;
+        };
+        let Some(target) = target.target(language) else {
+            unresolved = true;
+            continue;
+        };
+        let Some(relative) = target.strip_prefix("./") else {
+            unresolved = true;
+            continue;
+        };
+        if !export_subpath_is_valid(relative) {
+            unresolved = true;
+            continue;
+        }
+        let Ok(path) = ProjectPath::new(relative) else {
+            unresolved = true;
+            continue;
+        };
+        let module = format!("{}{suffix}", metadata.name);
+        match modules.entry(path) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Some(module));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().as_ref() != Some(&module) {
+                    entry.insert(None);
+                    unresolved = true;
+                }
+            }
+        }
+    }
+    (modules, unresolved)
+}
+
+fn export_subpath_is_valid(path: &str) -> bool {
+    !path.is_empty()
+        && !path.chars().any(|character| {
+            character.is_control() || matches!(character, '*' | '%' | '?' | '#' | '\\')
+        })
+        && path
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".." | "node_modules"))
 }
 
 fn entry_path(metadata: &PackageMetadata, language: &str) -> Option<ProjectPath> {
@@ -456,20 +567,27 @@ struct PackageMetadata {
     exports: Option<Exports>,
     #[serde(rename = "typesVersions")]
     types_versions: Option<serde_json::Value>,
+    #[serde(rename = "type")]
+    module_type: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum Exports {
     Direct(String),
-    Subpaths(ExportSubpaths),
+    Subpaths(OrderedConditions),
 }
 
 impl Exports {
     fn target(&self, language: &str) -> Option<&str> {
         match self {
             Self::Direct(path) => Some(path),
-            Self::Subpaths(paths) => paths.root.as_ref()?.target(language),
+            Self::Subpaths(paths) => paths
+                .0
+                .iter()
+                .find(|(key, _)| key == ".")?
+                .1
+                .target(language),
         }
     }
 
@@ -479,25 +597,26 @@ impl Exports {
         module: &str,
         conditions: &[&str],
     ) -> Option<(&str, &str)> {
-        if name != module {
-            return None;
-        }
+        let key = if name == module {
+            ".".to_owned()
+        } else {
+            let suffix = module.strip_prefix(name)?.strip_prefix('/')?;
+            if !export_subpath_is_valid(suffix) {
+                return None;
+            }
+            format!("./{suffix}")
+        };
         match self {
-            Self::Direct(path) => Some((path, path)),
+            Self::Direct(path) if name == module => Some((path, path)),
+            Self::Direct(_) => None,
             Self::Subpaths(paths) => {
-                let target = paths.root.as_ref()?;
+                let target = &paths.0.iter().find(|(subpath, _)| subpath == &key)?.1;
                 target
                     .selected_target(true, conditions)
                     .zip(target.selected_target(false, conditions))
             }
         }
     }
-}
-
-#[derive(Deserialize)]
-struct ExportSubpaths {
-    #[serde(rename = ".")]
-    root: Option<ExportTarget>,
 }
 
 #[derive(Deserialize)]
@@ -577,10 +696,24 @@ fn declaration_anchors(
     input: &NamespaceInput<'_>,
     syntax: &SyntaxFacts,
     source: &str,
-    module: &str,
+    module: Option<&str>,
+) -> BTreeMap<String, SymbolId> {
+    declaration_anchors_with_public(input, syntax, source, module, &BTreeSet::new())
+}
+
+fn declaration_anchors_with_public(
+    input: &NamespaceInput<'_>,
+    syntax: &SyntaxFacts,
+    source: &str,
+    module: Option<&str>,
+    public: &BTreeSet<String>,
 ) -> BTreeMap<String, SymbolId> {
     let mut groups: BTreeMap<String, Vec<&SyntaxSymbol>> = BTreeMap::new();
-    for symbol in syntax.symbols() {
+    for symbol in syntax.symbols().iter().filter(|symbol| {
+        symbol.node_kind != Some("assignment_expression")
+            || symbol.facets.contains(&SymbolFacet::Public)
+            || public.contains(&symbol.qualified_name)
+    }) {
         groups
             .entry(defining_name(symbol))
             .or_default()
@@ -589,11 +722,22 @@ fn declaration_anchors(
     let revision = crate::documentation::content_digest(source.as_bytes()).0;
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
-    for symbol in syntax.symbols() {
-        let Some(mut path) = container_path(symbol, &paths, module) else {
+    for symbol in syntax.symbols().iter().filter(|symbol| {
+        symbol.node_kind != Some("assignment_expression")
+            || symbol.facets.contains(&SymbolFacet::Public)
+            || public.contains(&symbol.qualified_name)
+    }) {
+        let literal = declared_module_name(symbol, source);
+        let Some(mut path) = literal
+            .as_ref()
+            .map(|name| vec![name.clone()])
+            .or_else(|| container_path(symbol, &paths, module))
+        else {
             continue;
         };
-        path.push(symbol.name.clone());
+        if literal.is_none() {
+            path.push(symbol.name.clone());
+        }
         let base = defining_name(symbol);
         let group = &groups[&base];
         let overload = syntax.language().name == "typescript" && is_function_overload(group);
@@ -645,14 +789,28 @@ fn defining_name(symbol: &SyntaxSymbol) -> String {
     }
 }
 
+fn declared_module_name(symbol: &SyntaxSymbol, source: &str) -> Option<String> {
+    if symbol.kind != "namespace" || symbol.container.is_some() {
+        return None;
+    }
+    let range = symbol.name_range?;
+    let start = usize::try_from(symbol.range.start).ok()?;
+    let end = usize::try_from(range.start).ok()?;
+    let prefix = source.get(start..end)?;
+    if !prefix.split_whitespace().eq(["declare", "module"]) {
+        return None;
+    }
+    observations::literal_module_name(source, range)
+}
+
 fn container_path(
     symbol: &SyntaxSymbol,
     paths: &BTreeMap<String, Vec<String>>,
-    module: &str,
+    module: Option<&str>,
 ) -> Option<Vec<String>> {
     match &symbol.container {
         Some(container) => paths.get(container).cloned(),
-        None => Some(vec![module.to_owned()]),
+        None => module.map(|module| vec![module.to_owned()]),
     }
 }
 

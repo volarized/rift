@@ -47,10 +47,11 @@ use rift_protocol::read::{
 };
 use rift_syntax::{DocumentPlacement, ShippedLanguage, SyntaxFacts, SyntaxSymbol};
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
 
 use rift_ranking::split_identifier_words;
 
+#[cfg(test)]
+mod coverage_tests;
 #[cfg(test)]
 mod fixture;
 mod join;
@@ -61,6 +62,7 @@ mod limits_tests;
 pub(crate) mod namespace;
 #[cfg(test)]
 mod publication_tests;
+
 #[cfg(test)]
 mod retained_tests;
 
@@ -244,6 +246,18 @@ fn analyzed_file(
     })
 }
 
+fn external_work_limits(input: &ExactPackageInput<'_>) -> (std::cell::Cell<usize>, usize) {
+    (
+        std::cell::Cell::new(0),
+        input
+            .limits()
+            .syntax()
+            .syntax_nodes_max()
+            .checked_mul(input.limits().syntax().syntax_depth_max())
+            .unwrap_or(0),
+    )
+}
+
 impl PackageAnalyzer {
     /// Analyzes one exact package's selected files.
     ///
@@ -321,7 +335,7 @@ impl PackageAnalyzer {
             )?);
         }
         analyzed.sort_by(|left, right| left.file.path().cmp(right.file.path()));
-        let unresolved_exports = place_namespace(&input, &mut analyzed)?;
+        let namespace = place_namespace(&input, &mut analyzed)?;
         join::join_modules(&mut analyzed);
         let placed = analyzed
             .iter()
@@ -331,12 +345,36 @@ impl PackageAnalyzer {
                 placement: held.placement.clone(),
             })
             .collect::<Vec<_>>();
-        let built = WorkspaceSemantics::build_facts_placed_with_relationships(
+        let (external_work, external_work_max) = external_work_limits(&input);
+        let built = WorkspaceSemantics::build_facts_placed_with_external(
             &placed,
             input.limits().declarations_max(),
             input.limits().relationships_max(),
             revision,
-            None,
+            &|reference| {
+                if reference.provider().as_str() != rift_syntax::SYNTAX_PROVIDER_ID {
+                    return None;
+                }
+                namespace.exports.iter().find_map(|export| {
+                    let work = external_work
+                        .get()
+                        .checked_add(1)?
+                        .checked_add(export.target.as_str().len())?;
+                    external_work.set(work);
+                    if work > external_work_max {
+                        return None;
+                    }
+                    let parsed =
+                        rift_protocol::identity::SymbolIdentity::parse(export.target.as_str())
+                            .ok()?;
+                    if parsed.owner() == input.owner() {
+                        return None;
+                    }
+                    let target =
+                        rift_core::ProviderSymbolId::for_symbol(export.target.as_str()).ok()?;
+                    (reference.symbol() == &target).then(|| export.target.clone())
+                })
+            },
         )
         .map_err(|error| {
             errors::analysis::package_provider_failed()
@@ -350,8 +388,12 @@ impl PackageAnalyzer {
                 .path(path.as_str())
                 .fail();
         }
-        let (publication, notebook_cells) =
-            publish(&input, &analyzed, &built.semantics, unresolved_exports)?;
+        let (publication, notebook_cells) = publish(
+            &input,
+            &analyzed,
+            &built.semantics,
+            namespace.unresolved_exports,
+        )?;
         Ok(PackageAnalysis {
             publication,
             files: analyzed,
@@ -382,7 +424,7 @@ fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read:
 fn place_namespace(
     input: &ExactPackageInput<'_>,
     analyzed: &mut [AnalyzedFile],
-) -> Result<bool, RiftError> {
+) -> Result<namespace::PreparedNamespace, RiftError> {
     let package = input.owner();
     let selected = analyzed
         .iter()
@@ -403,6 +445,12 @@ fn place_namespace(
             .error()
     })?;
     for held in analyzed {
+        held.public_names.extend(
+            namespace
+                .public_names
+                .remove(held.file.path().as_str())
+                .unwrap_or_default(),
+        );
         let assigned = namespace
             .anchors
             .remove(held.file.path().as_str())
@@ -424,7 +472,7 @@ fn place_namespace(
             );
     }
 
-    Ok(namespace.unresolved_exports)
+    Ok(namespace)
 }
 
 /// Renders the canonical publication over the analyzed files.
@@ -463,7 +511,7 @@ fn publish(
         records.file(package, held)?;
     }
     records.graph(package, &origin, semantics, analyzed)?;
-    records.retained_syntax(analyzed);
+    let retained_syntax_complete = records.retained_syntax(analyzed);
     records.relationships(package, semantics, analyzed, limits.relationships_max())?;
     let (documentation, notebook_cells) = package_documentation(
         package,
@@ -506,7 +554,12 @@ fn publish(
         },
         package,
     )?;
-    let coverage = publication_coverage(analyzed, &records, unresolved_exports);
+    let coverage = publication_coverage(
+        analyzed,
+        &records,
+        unresolved_exports,
+        retained_syntax_complete,
+    );
     Ok((
         PackagePublication {
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
@@ -551,10 +604,33 @@ fn stub_document_signature<'graph>(
         .map(|(_, _, signature)| signature)
 }
 
+fn retained_declaration_ranges(source: &str, symbol: &rift_syntax::SyntaxSymbol) -> bool {
+    let valid = |range: rift_syntax::ByteRange| {
+        usize::try_from(range.start)
+            .ok()
+            .zip(usize::try_from(range.end).ok())
+            .is_some_and(|(start, end)| {
+                start <= end
+                    && end <= source.len()
+                    && source.is_char_boundary(start)
+                    && source.is_char_boundary(end)
+            })
+    };
+    valid(symbol.range)
+        && std::iter::once(symbol.item_range)
+            .chain(symbol.name_range)
+            .chain(symbol.body_range)
+            .chain(symbol.documentation_ranges.iter().copied())
+            .all(|range| {
+                valid(range) && symbol.range.start <= range.start && range.end <= symbol.range.end
+            })
+}
+
 fn publication_coverage(
     analyzed: &[AnalyzedFile],
     records: &Records,
     unresolved_exports: bool,
+    retained_syntax_complete: bool,
 ) -> Vec<PackageCoverage> {
     let languages = analyzed
         .iter()
@@ -578,11 +654,13 @@ fn publication_coverage(
             let mut syntax_complete = true;
             for held in selected {
                 inventory_complete &= units.get(&held.placement.unit().to_string()) == Some(&true);
+                inventory_complete &= held.file.syntax().left_out_declaration_count() == 0
+                    || retained_syntax_complete;
                 syntax_complete &= !held.file.syntax().has_errors()
                     && held.file.syntax().left_out_declaration_count() == 0;
             }
             PackageCoverage {
-                inventory_complete: inventory_complete && syntax_complete,
+                inventory_complete,
                 identity_complete: !records.symbols_truncated
                     && !records.identity_incomplete
                     && records
@@ -1308,7 +1386,7 @@ impl Records {
             != Some(DocumentationSourceFormat::Notebook);
         let publishes_document = needs_document && self.document_capacity();
         let mut retained = self.retained(source, &path, if publishes_document { 2 } else { 1 })?;
-        let content_digest = text_digest(source);
+        let content_digest = file_digest(held.file.digest());
         let mut record = PackageSourceUnit {
             unit: unit.clone(),
             path: path.clone(),
@@ -1325,7 +1403,11 @@ impl Records {
         record.digest = digest_of(&record, package)?;
         self.units.push(record);
         if publishes_document {
-            let document_digest = text_digest(&retained.text);
+            let document_digest = if retained.complete {
+                content_digest
+            } else {
+                text_digest(&retained.text)
+            };
             self.file_document(package, &language, &unit, &path, retained, document_digest)?;
         } else if needs_document {
             self.warn_document_full();
@@ -1641,7 +1723,8 @@ impl Records {
         Ok(())
     }
 
-    fn retained_syntax(&mut self, analyzed: &[AnalyzedFile]) {
+    fn retained_syntax(&mut self, analyzed: &[AnalyzedFile]) -> bool {
+        let mut complete = true;
         let admitted = self
             .units
             .iter()
@@ -1649,14 +1732,18 @@ impl Records {
             .collect::<BTreeSet<_>>();
         for held in analyzed {
             let unit = wire_unit(held.placement.unit());
+            complete &= held.file.syntax().left_out_declaration_count()
+                == held.file.syntax().left_out_symbols().len();
             if !admitted.contains(&unit.0) {
+                complete = false;
                 continue;
             }
             for symbol in held.file.syntax().left_out_symbols() {
+                complete &= retained_declaration_ranges(held.file.source(), symbol);
                 if self.objects.len() >= bound(self.publication.symbols) {
                     self.symbols_truncated = true;
                     self.warn(truncation("objects", u64::from(self.publication.symbols)));
-                    return;
+                    return false;
                 }
                 let facts = symbol.facts(held.file.syntax().language());
                 let object =
@@ -1684,6 +1771,7 @@ impl Records {
                 self.objects.push(object);
             }
         }
+        complete
     }
 
     fn object_identity(&mut self, owner: &SymbolOwner, origin: &SymbolOrigin, object: &mut Symbol) {
@@ -1791,7 +1879,13 @@ impl Records {
         })?;
         let unit = wire_unit(binding.unit());
         let path = wire_path(held.file.path());
-        let public = held.is_public(facts.qualified_name());
+        let public = held.is_public(facts.qualified_name())
+            || (facts
+                .symbol_facets()
+                .contains(&rift_protocol::read::SymbolFacet::Alias)
+                && facts
+                    .symbol_facets()
+                    .contains(&rift_protocol::read::SymbolFacet::Public));
         let publishes_document = public
             && object.name_is_public()
             && self.document_capacity()
@@ -2069,8 +2163,18 @@ const fn bound(value: u32) -> usize {
 
 /// The wire digest of one text, in the eight-character form every wire digest takes.
 fn text_digest(text: &str) -> Digest {
-    let rendered = format!("{:x}", Sha256::digest(text.as_bytes()));
-    Digest(rendered[..DIGEST_WIRE_CHARS].to_owned())
+    file_digest(crate::FileDigest::of(text.as_bytes()))
+}
+
+fn file_digest(digest: crate::FileDigest) -> Digest {
+    use std::fmt::Write as _;
+
+    let mut rendered = String::with_capacity(DIGEST_WIRE_CHARS);
+    for byte in digest.as_bytes().iter().take(DIGEST_WIRE_CHARS.div_ceil(2)) {
+        write!(&mut rendered, "{byte:02x}").expect("String accepts formatted bytes");
+    }
+    rendered.truncate(DIGEST_WIRE_CHARS);
+    Digest(rendered)
 }
 
 fn wire_unit(unit: &CoreSourceUnitId) -> SourceUnitId {
@@ -2532,7 +2636,30 @@ mod tests {
         });
         let files = vec![("pkg/a.py", source.as_str()), ("pkg/b.py", source.as_str())];
         let raised = rift_syntax::SyntaxLimits::new(8 << 20, 4_000_000, 512).expect("bounds");
-        let Err(error) = package_result(ShippedLanguage::Python, files, Some(raised)) else {
+        let mut parsed: Option<crate::PackageSyntax> = None;
+        let mut provider_calls = 0;
+        let mut reused_files = 0;
+        let result = super::fixture::package_result_with_syntax(
+            ShippedLanguage::Python,
+            files,
+            Some(raised),
+            None,
+            |source| {
+                if let Some(syntax) = &parsed {
+                    assert!(source.accepts(syntax));
+                    reused_files += 1;
+                    return Some(syntax.clone());
+                }
+                let syntax = source.parse().expect("fixture syntax");
+                assert_eq!(syntax.facts().symbols().len(), per_file);
+                provider_calls += 1;
+                parsed = Some(syntax.clone());
+                Some(syntax)
+            },
+        );
+        assert_eq!(provider_calls, 1);
+        assert_eq!(reused_files, 1);
+        let Err(error) = result else {
             panic!("a package past the declaration bound must be refused");
         };
         assert_eq!(

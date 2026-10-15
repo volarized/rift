@@ -15,6 +15,20 @@ fn publication(
     prefix: Option<&str>,
     modules: &[&str],
 ) -> PackagePublication {
+    publication_with_configuration(
+        files,
+        prefix,
+        modules,
+        rift_protocol::configuration::PackageConfiguration::default(),
+    )
+}
+
+fn publication_with_configuration(
+    files: &[(&str, &str)],
+    prefix: Option<&str>,
+    modules: &[&str],
+    configuration: rift_protocol::configuration::PackageConfiguration,
+) -> PackagePublication {
     let package = rift_protocol::read::PackageIdentity {
         manager: "pypi".to_owned(),
         registry: "pypi.org".to_owned(),
@@ -67,7 +81,9 @@ fn publication(
                 .iter()
                 .map(|(_, text)| u64::try_from(text.len()).expect("source length"))
                 .sum(),
-        ),
+        )
+        .with_publication(configuration)
+        .expect("validated publication bounds"),
     )
     .expect("bounded input")
     .with_import_roots(&roots)
@@ -76,6 +92,72 @@ fn publication(
         .expect("normalized publication")
         .publication()
         .clone()
+}
+
+#[test]
+fn declaration_bound_keeps_original_units_and_reports_incomplete_coverage() {
+    let files = [
+        (
+            "src/click/core.py",
+            "def echo(value):\n    \"\"\"Return value.\"\"\"\n    return value\n",
+        ),
+        ("src/click/core.pyi", "def echo(value: int) -> int: ...\n"),
+    ];
+    let result = publication_with_configuration(
+        &files,
+        Some("src"),
+        &["click"],
+        rift_protocol::configuration::PackageConfiguration {
+            symbols: 1,
+            ..rift_protocol::configuration::PackageConfiguration::default()
+        },
+    );
+    let id = "rift://symbol/pypi/pypi.org/click@8.3.3/python/click/core/echo";
+    assert_eq!(result.objects.len(), 1);
+    assert_eq!(
+        result.objects[0].id.as_ref().map(SymbolId::as_str),
+        Some(id)
+    );
+    assert_eq!(result.declarations.len(), 1);
+    let binding = &result.declarations[0];
+    assert_eq!(binding.symbol.as_str(), id);
+    assert!(binding.unit.0.ends_with("/src/click/core.py"));
+    let start = usize::try_from(binding.range.start).expect("source start");
+    let end = usize::try_from(binding.range.end).expect("source end");
+    assert_eq!(binding.source, files[0].1[start..end]);
+    assert!(binding.source_complete);
+    assert!(!binding.digest.0.is_empty());
+    assert_eq!(
+        binding.origin.package,
+        Some(rift_protocol::read::PackageIdentity {
+            manager: "pypi".to_owned(),
+            registry: "pypi.org".to_owned(),
+            name: "click".to_owned(),
+            version: "8.3.3".to_owned(),
+        })
+    );
+    assert_eq!(result.units.len(), files.len());
+    for (path, source) in files {
+        let unit = result
+            .units
+            .iter()
+            .find(|unit| unit.path.0 == path)
+            .expect("original source unit");
+        assert_eq!(unit.source, source);
+        assert!(unit.source_complete);
+    }
+    assert_eq!(
+        result
+            .warnings
+            .iter()
+            .filter(|warning| matches!(warning,
+            PackageAnalysisWarning::PublicationTruncated { collection, bound }
+                if collection == "declarations" && *bound == 1))
+            .count(),
+        1
+    );
+    assert!(result.coverage[0].inventory_complete);
+    assert!(!result.coverage[0].identity_complete);
 }
 
 #[test]
@@ -170,19 +252,52 @@ fn unproved_namespace_keeps_object_facts_and_refuses_directory_binding() {
 
 #[test]
 fn malformed_and_omitted_declarations_cannot_prove_complete_coverage() {
-    let omitted = format!(
-        "def {}(): pass\n",
-        "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1)
-    );
-    for source in ["def echo(".to_owned(), omitted] {
+    let name = "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+    let refused = format!("def {name}(): pass\n");
+    for source in ["def echo(".to_owned(), refused] {
         let result = publication(&[("click/core.py", &source)], None, &["click"]);
         assert_eq!(result.units.len(), 1);
         assert_eq!(result.units[0].source, source);
         assert!(result.units[0].source_complete);
         let coverage = &result.coverage[0];
-        assert!(!coverage.inventory_complete);
+        assert!(coverage.inventory_complete);
         assert!(!coverage.identity_complete);
         assert!(!coverage.applicability_complete);
+        if source.contains(&name) {
+            let objects = result
+                .objects
+                .iter()
+                .filter(|object| object.name == name)
+                .collect::<Vec<_>>();
+            assert_eq!(objects.len(), 1);
+            assert!(objects[0].id.is_none());
+            assert!(result.declarations.is_empty());
+            let range = result
+                .warnings
+                .iter()
+                .find_map(|warning| match warning {
+                    rift_protocol::index::PackageAnalysisWarning::ObjectUnavailable {
+                        unit: Some(unit),
+                        range: Some(range),
+                        qualified_name,
+                        field,
+                        bound,
+                    } if unit == &result.units[0].unit && qualified_name == &name => {
+                        assert_eq!(field, "name");
+                        assert_eq!(
+                            *bound,
+                            u64::try_from(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+                                .expect("public name bound")
+                        );
+                        Some(range)
+                    }
+                    _ => None,
+                })
+                .expect("retained object public refusal");
+            let start = usize::try_from(range.start).expect("range start");
+            let end = usize::try_from(range.end).expect("range end");
+            assert_eq!(source.get(start..end), Some(source.trim_end()));
+        }
     }
 }
 

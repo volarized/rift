@@ -20,13 +20,15 @@ mod server;
 pub mod skill;
 mod spawn;
 mod storage;
+pub mod telemetry;
 mod transport;
 mod validation;
 
 pub use election::{
-    ElectedServer, ElectionGuard, ServerPresence, StaleReason, claim, document_path, probe,
-    probe_state_directory, read_serving, serve_elected, serve_elected_with_storage,
-    serve_repository_elected,
+    ElectedServer, ElectionGuard, ServerPresence, StaleReason, claim, claim_with_owner,
+    document_path, probe, probe_state_directory, probe_with_owner, read_serving, serve_elected,
+    serve_elected_with_storage, serve_elected_with_storage_for_owner, serve_repository_elected,
+    validate_workspace_lock,
 };
 pub use failure::{McpErrorExt, McpErrorFailExt, McpFailure};
 pub use http::{
@@ -41,9 +43,9 @@ pub use server::RiftMcp;
 pub use spawn::{
     PRESENCE_POLL_INTERVAL, SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT,
     START_SPAWN_COUNT_MAX, START_WAIT_MAX, SpawnPollOutcome, SpawnedServer, StartExit, StartSpawns,
-    StartedServer, spawn_detached_server, stderr_file_path,
+    StartedServer, spawn_detached_server, spawn_detached_server_with_owner, stderr_file_path,
 };
-pub use storage::WorkspaceStorage;
+pub use storage::{WorkspaceStorage, workspace_state_directory};
 
 /// Compile-time marker for MCP-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

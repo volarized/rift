@@ -32,6 +32,21 @@ impl JsonSchema for CapturedViewId {
     }
 }
 
+impl get_size2::GetSize for CapturedViewId {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        get_size2::GetSize::get_heap_size_with_tracker(&self.0, tracker)
+    }
+}
+
 impl CapturedViewId {
     /// Accepts a complete local digest or an opaque service-issued view key.
     ///
@@ -97,6 +112,10 @@ pub struct CapturedView {
 /// Reads one exact logical symbol obtained from discovery or another read.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.4"))]
+#[schemars(extend("examples" = [
+    {"id": "rift://symbol/local/rust/app/parser/parse", "include": ["source"]}
+]))]
 pub struct GetSymbolParams {
     /// Canonical identity. Ownership and language come from this address.
     #[serde(deserialize_with = "deserialize_symbol_id")]
@@ -267,6 +286,11 @@ pub enum SymbolUnavailableReason {
 /// Exactly one logical object, definite absence, or explicit selection unavailability.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(extend("examples" = [{
+    "outcome": "unavailable",
+    "id": "rift://symbol/local/rust/app/parser/parse",
+    "reason": "insufficient_coverage"
+}]))]
 pub enum GetSymbolResult {
     /// The exact identity was established, even when it has no source declarations.
     Found {

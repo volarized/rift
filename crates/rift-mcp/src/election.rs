@@ -25,10 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::http::serve_http;
-use crate::http::{
-    DeferredDatabaseShutdown, HttpServer, TokenCheck, serve_http_with_storage,
-    serve_repository_http,
-};
+use crate::http::{DeferredDatabaseShutdown, HttpServer, TokenCheck, serve_repository_http};
 use crate::identity::BuildCheckout;
 use crate::metrics::SCOPE;
 use crate::repository::repository_election_directory;
@@ -98,6 +95,22 @@ pub fn claim(root: &Path) -> Result<ElectionGuard, RiftError> {
     claim_state_directory(&root.join(RIFT_STATE_DIRECTORY))
 }
 
+/// Claims the independent election for a validated local owner and root.
+///
+/// # Errors
+/// Returns the existing election error for an invalid root or owner, or a held election.
+pub fn claim_with_owner(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Result<ElectionGuard, RiftError> {
+    let canonical = crate::storage::owner::validated_root(root, owner)?;
+    let mut guard = claim_state_directory(&crate::storage::workspace_state_directory(
+        &canonical, owner,
+    )?)?;
+    guard.workspace = Some((canonical, owner.clone()));
+    Ok(guard)
+}
+
 /// Claims an election whose files live in `state_directory`.
 pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGuard, RiftError> {
     let state_directory = state_directory.to_path_buf();
@@ -131,6 +144,7 @@ pub(crate) fn claim_state_directory(state_directory: &Path) -> Result<ElectionGu
                 election_file,
                 document_path: document_path_in(&state_directory),
                 state_directory,
+                workspace: None,
             };
             // The free election proves any leftover document stale. Scrub it
             // now, before serving starts, so a concurrent probe cannot pair
@@ -194,12 +208,21 @@ pub struct ElectionGuard {
     election_file: rift_tracing::Held<std::fs::File>,
     state_directory: PathBuf,
     document_path: PathBuf,
+    workspace: Option<(PathBuf, rift_protocol::identity::SymbolOwner)>,
 }
 
 impl ElectionGuard {
     /// Checks that this guard holds the requested workspace's election.
     pub(crate) fn validate_workspace(&self, root: &Path) -> Result<(), RiftError> {
-        let state = root.join(RIFT_STATE_DIRECTORY);
+        self.validate_workspace_owner(root, &rift_protocol::identity::SymbolOwner::Local)
+    }
+
+    pub(crate) fn validate_workspace_owner(
+        &self,
+        root: &Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+    ) -> Result<(), RiftError> {
+        let state = crate::storage::workspace_state_directory(root, owner)?;
         let requested = std::fs::canonicalize(&state).map_err(|source| {
             errors::mcp::election_storage_failed()
                 .operation("read election directory")
@@ -240,6 +263,9 @@ impl ElectionGuard {
     /// Returns a registered error when the document breaks the [`ServerLock`]
     /// contract or staging or renaming fails.
     pub fn publish(&self, lock: &ServerLock) -> Result<(), RiftError> {
+        if let Some((root, owner)) = &self.workspace {
+            validate_workspace_lock(root, owner, lock)?;
+        }
         lock.validate()
             .map_err(|violation| election_document_invalid(&violation))?;
         let bytes = serde_json::to_vec(lock).map_err(|error| {
@@ -371,7 +397,7 @@ pub enum ServerPresence {
     /// A live process holds the election, its published document
     /// validates, and the recorded port accepts a connect: the port and
     /// token reach a serving `rift server`.
-    Serving(ServerLock),
+    Serving(Box<ServerLock>),
     /// A live process holds the election but has published no document
     /// yet: the elected server is still building its first index.
     Starting,
@@ -447,7 +473,80 @@ enum ElectionState {
 /// records through [`rift_tracing::lock`] into `lock.held.duration`.
 #[must_use]
 pub fn probe(root: &Path) -> ServerPresence {
-    probe_state_directory(&root.join(RIFT_STATE_DIRECTORY))
+    let state = root.join(RIFT_STATE_DIRECTORY);
+    if let Ok(lock) = published_document_in(&state)
+        && validate_workspace_lock(root, &rift_protocol::identity::SymbolOwner::Local, &lock)
+            .is_err()
+    {
+        return ServerPresence::Stale(StaleReason::DocumentMalformed);
+    }
+    let presence = probe_state_directory(&state);
+    if let ServerPresence::Serving(lock) = &presence
+        && validate_workspace_lock(root, &rift_protocol::identity::SymbolOwner::Local, lock)
+            .is_err()
+    {
+        return ServerPresence::Stale(StaleReason::DocumentMalformed);
+    }
+    presence
+}
+
+/// Checks a lock against the fixed canonical root and accepted local owner.
+///
+/// # Errors
+/// Returns the existing election storage error for a different root or owner.
+pub fn validate_workspace_lock(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+    lock: &ServerLock,
+) -> Result<(), RiftError> {
+    let canonical = crate::storage::owner::validated_root(root, owner)?;
+    let accepted = match (&lock.root, &lock.owner) {
+        (None, None) => matches!(owner, rift_protocol::identity::SymbolOwner::Local),
+        (Some(recorded_root), Some(recorded_owner)) => {
+            lock.workspace_context_is_valid()
+                && recorded_root == &canonical
+                && recorded_owner == owner
+        }
+        _ => false,
+    };
+    if !accepted {
+        return errors::mcp::election_storage_failed()
+            .operation("validate workspace owner")
+            .path(root)
+            .source(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "server lock does not name this workspace root and owner",
+            ))
+            .fail();
+    }
+    Ok(())
+}
+
+/// Observes the independent election selected by a fixed local owner and root.
+///
+/// # Errors
+/// Returns the existing election storage error for an invalid or different context.
+pub fn probe_with_owner(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Result<ServerPresence, RiftError> {
+    Ok(observe_with_owner(root, owner)?.presence)
+}
+
+/// One owner-bound probe with the reads that decided its presence.
+pub(crate) fn observe_with_owner(
+    root: &Path,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Result<ElectionObservation, RiftError> {
+    let state = crate::storage::workspace_state_directory(root, owner)?;
+    if let Ok(lock) = published_document_in(&state) {
+        validate_workspace_lock(root, owner, &lock)?;
+    }
+    let observation = observe_state_directory(&state);
+    if let ServerPresence::Serving(lock) = &observation.presence {
+        validate_workspace_lock(root, owner, lock)?;
+    }
+    Ok(observation)
 }
 
 /// Observes an election whose files live in `state_directory`.
@@ -469,7 +568,7 @@ fn observe_state_directory(state_directory: &Path) -> ElectionObservation {
     let (election, election_failure) = election_state_in(state_directory);
     let (presence, document_failure) = match (election, published_document_in(state_directory)) {
         (ElectionState::Held, Ok(lock)) if port_answers(lock.port) => {
-            (ServerPresence::Serving(lock), None)
+            (ServerPresence::Serving(Box::new(lock)), None)
         }
         (ElectionState::Held, Ok(lock)) => (
             ServerPresence::Stale(StaleReason::PortUnreachable { pid: lock.pid }),
@@ -744,7 +843,7 @@ fn record_refused_probe(waited: Duration) {
 #[must_use]
 pub fn read_serving(root: &Path) -> Option<ServerLock> {
     match probe(root) {
-        ServerPresence::Serving(lock) => Some(lock),
+        ServerPresence::Serving(lock) => Some(*lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
@@ -762,6 +861,8 @@ fn served_document(
         pid: std::process::id(),
         identity,
         server,
+        root: None,
+        owner: None,
     }
 }
 
@@ -826,6 +927,30 @@ pub async fn serve_elected_with_storage(
 ) -> Result<ElectedServer, RiftError> {
     serve_elected_at(
         root,
+        guard,
+        shutdown,
+        storage,
+        WorkspaceIndexLimits::default(),
+        check,
+        checkout,
+    )
+    .await
+}
+
+/// Serves a fixed local owner through storage opened under its independent election.
+///
+/// # Errors
+/// Returns the existing election error for a different root, owner, or storage guard.
+pub async fn serve_elected_with_storage_for_owner(
+    workspace: (&Path, rift_protocol::identity::SymbolOwner),
+    guard: Arc<ElectionGuard>,
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+    check: TokenCheck,
+    checkout: BuildCheckout,
+) -> Result<ElectedServer, RiftError> {
+    elect_and_serve_with_owner(
+        workspace,
         guard,
         shutdown,
         storage,
@@ -950,7 +1075,30 @@ async fn elect_and_serve(
     check: TokenCheck,
     checkout: BuildCheckout,
 ) -> Result<ElectedServer, RiftError> {
-    guard.validate_workspace(root)?;
+    elect_and_serve_with_owner(
+        (root, rift_protocol::identity::SymbolOwner::Local),
+        guard,
+        shutdown,
+        storage,
+        limits,
+        check,
+        checkout,
+    )
+    .await
+}
+
+async fn elect_and_serve_with_owner(
+    (root, owner): (&Path, rift_protocol::identity::SymbolOwner),
+    guard: Arc<ElectionGuard>,
+    shutdown: CancellationToken,
+    storage: WorkspaceStorage,
+    limits: WorkspaceIndexLimits,
+    check: TokenCheck,
+    checkout: BuildCheckout,
+) -> Result<ElectedServer, RiftError> {
+    guard.validate_workspace_owner(root, &owner)?;
+    storage.validate_owner(root, &owner)?;
+    let canonical_root = crate::storage::owner::validated_root(root, &owner)?;
     if !storage.holds_election(&guard) {
         return errors::mcp::election_storage_failed()
             .operation("validate workspace storage")
@@ -962,15 +1110,23 @@ async fn elect_and_serve(
             .fail();
     }
     let serving_stop = shutdown.child_token();
-    let server =
-        serve_http_with_storage(root, serving_stop.clone(), storage, limits, check, checkout)
-            .await?;
-    let document = served_document(
+    let server = crate::http::serve_http_with_storage_for_owner(
+        (root, owner.clone()),
+        serving_stop.clone(),
+        storage,
+        limits,
+        check,
+        checkout,
+    )
+    .await?;
+    let mut document = served_document(
         server.port(),
         server.token(),
         server.product_identity().clone(),
         Some(server.server_configuration().clone()),
     );
+    document.root = Some(canonical_root);
+    document.owner = Some(owner);
     match guard.publish(&document) {
         Ok(()) => Ok(ElectedServer { server, guard }),
         Err(error) => shut_down_unpublished(server, &serving_stop, error)
@@ -1117,7 +1273,113 @@ mod tests {
                 schema_digest: "b".repeat(64),
             },
             server: None,
+            root: None,
+            owner: None,
         }
+    }
+
+    #[test]
+    fn lock_context_refuses_wrong_root_and_owner_without_allocation() -> TestResult {
+        use rift_protocol::identity::SymbolOwner;
+
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let owner = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let mut lock = valid_document();
+        assert!(super::validate_workspace_lock(first.path(), &SymbolOwner::Local, &lock).is_ok());
+        assert!(super::validate_workspace_lock(first.path(), &owner, &lock).is_err());
+        lock.root = Some(fs::canonicalize(first.path())?);
+        lock.owner = Some(owner.clone());
+        assert!(super::validate_workspace_lock(first.path(), &owner, &lock).is_ok());
+        for (root, candidate) in [
+            (first.path(), SymbolOwner::Local),
+            (
+                first.path(),
+                SymbolOwner::NamedLocal {
+                    name: "other".to_owned(),
+                },
+            ),
+            (second.path(), owner),
+        ] {
+            let error = super::validate_workspace_lock(root, &candidate, &lock)
+                .expect_err("a different root or owner must refuse adoption");
+            assert_eq!(error.slug(), errors::mcp::election_storage_failed::SLUG);
+        }
+        assert!(!first.path().join(".rift").exists());
+        assert!(!second.path().join(".rift").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn named_election_publishes_only_its_fixed_context() -> TestResult {
+        use rift_protocol::identity::SymbolOwner;
+
+        let directory = tempfile::tempdir()?;
+        let other_root = tempfile::tempdir()?;
+        let owner = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let guard = super::claim_with_owner(directory.path(), &owner)?;
+        let mut document = valid_document();
+        assert!(guard.publish(&document).is_err());
+        assert!(!guard.document_path.exists());
+        document.root = Some(fs::canonicalize(directory.path())?);
+        document.owner = Some(SymbolOwner::Local);
+        assert!(guard.publish(&document).is_err());
+        document.owner = Some(owner.clone());
+        document.root = Some(fs::canonicalize(other_root.path())?);
+        assert!(guard.publish(&document).is_err());
+        assert!(!guard.document_path.exists());
+        document.root = Some(fs::canonicalize(directory.path())?);
+        guard.publish(&document)?;
+        assert_eq!(
+            serde_json::from_slice::<ServerLock>(&fs::read(&guard.document_path)?)?,
+            document
+        );
+        document.owner = Some(SymbolOwner::NamedLocal {
+            name: "other".to_owned(),
+        });
+        fs::write(&guard.document_path, serde_json::to_vec(&document)?)?;
+        assert!(super::probe_with_owner(directory.path(), &owner).is_err());
+        assert!(super::observe_with_owner(directory.path(), &owner).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn named_observation_never_adopts_the_primary_election() -> TestResult {
+        use rift_protocol::identity::SymbolOwner;
+
+        let directory = tempfile::tempdir()?;
+        let (_listener, port) = answering_port()?;
+        let primary = super::claim(directory.path())?;
+        let mut document = valid_document();
+        document.port = port;
+        primary.publish(&document)?;
+        assert!(matches!(
+            super::observe(directory.path()).presence,
+            ServerPresence::Serving(_)
+        ));
+        let owner = SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        let state = crate::storage::workspace_state_directory(directory.path(), &owner)?;
+        let observed = super::observe_with_owner(directory.path(), &owner)?;
+        assert!(matches!(observed.presence, ServerPresence::Absent));
+        let election = observed
+            .reads
+            .election_failure
+            .ok_or("missing election read")?;
+        assert_eq!(election.call, "File::open");
+        assert_eq!(election.kind, std::io::ErrorKind::NotFound);
+        let document = observed
+            .reads
+            .document_failure
+            .ok_or("missing document read")?;
+        assert_eq!(document.kind, std::io::ErrorKind::NotFound);
+        assert!(!state.exists());
+        Ok(())
     }
 
     fn document_path(root: &std::path::Path) -> std::path::PathBuf {
@@ -1489,7 +1751,7 @@ mod tests {
         };
         guard.publish(&document)?;
         match probe(directory.path()) {
-            ServerPresence::Serving(lock) => assert_eq!(lock, document),
+            ServerPresence::Serving(lock) => assert_eq!(*lock, document),
             other => panic!("held election with an answering document must serve: {other:?}"),
         }
         let read = read_serving(directory.path()).ok_or("read_serving must see the server")?;
@@ -1969,7 +2231,7 @@ mod tests {
         assert!(
             error
                 .context()
-                .any(|(key, value)| key == "operation" && value == "validate workspace storage")
+                .any(|(key, value)| key == "operation" && value == "validate workspace election")
         );
         assert!(!document_path(requested.path()).exists());
         for name in ["index", "metrics", "vectors"] {

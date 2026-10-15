@@ -8,6 +8,7 @@
 //! away, so an agent session survives server restarts.
 
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -21,6 +22,7 @@ use rift_core::constants::{
 use rift_error::{RiftError, errors};
 use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
+use rift_protocol::identity::SymbolOwner;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, Extensions,
@@ -38,11 +40,13 @@ use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig
 use rmcp::{ErrorData, ServerHandler, ServiceError, ServiceExt as _};
 use semver::Version;
 
+#[cfg(test)]
+use crate::election::probe;
 use crate::election::{
-    ElectionObservation, ServerPresence, StaleReason, observe, presence_field, probe,
+    ElectionObservation, ServerPresence, StaleReason, observe, presence_field,
     probe_state_directory,
 };
-use crate::failure::{McpErrorExt as _, McpErrorFailExt as _, WireFailure as _};
+use crate::failure::{McpErrorExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
 use crate::identity::BuildCheckout;
 use crate::metrics::{
@@ -57,7 +61,16 @@ use crate::spawn::{
     PRESENCE_POLL_INTERVAL, START_POLL_ATTEMPT_COUNT, START_WAIT_MAX, SpawnPollOutcome,
     StartSpawns, StartupCapture,
 };
+#[cfg(test)]
 use crate::validation::ConfigurationState;
+
+mod candidates;
+mod identity;
+pub(crate) use candidates::normalized_params;
+mod extra;
+mod http_client;
+pub(crate) use candidates::captured_expiry;
+pub(crate) use http_client::encode_bounded;
 
 /// Bound on one upstream connect-and-initialize attempt.
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -90,6 +103,8 @@ pub async fn serve_proxy(
     root: &Path,
     checkout: BuildCheckout,
     output: OutputPolicy,
+    extra: &[String],
+    home: Option<&Path>,
 ) -> Result<(), RiftError> {
     rift_tracing::info!(
         component = "mcp",
@@ -97,10 +112,13 @@ pub async fn serve_proxy(
         phase = "start",
         "MCP proxy starting"
     );
+    let configuration = rift_server::load_configuration(root)?;
+    let registrations = extra::Registrations::accept(root, &configuration.mcp, extra, home)?;
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
-    let proxy = RiftProxy::new(root, identity, output);
+    let proxy =
+        RiftProxy::with_configuration(root, identity, output, &configuration.server, registrations);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
     let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
     warmup.abort();
@@ -170,7 +188,7 @@ async fn warm_up(proxy: RiftProxy) {
     if let Err(refusal) = proxy.leased_peer(None).await {
         rift_tracing::warn!(
             component = "mcp",
-            refusal = %refusal.message,
+            refusal = %refusal,
             "upstream warmup did not connect"
         );
     }
@@ -183,6 +201,8 @@ async fn warm_up(proxy: RiftProxy) {
 #[derive(Clone, Debug)]
 struct RiftProxy {
     root: Arc<Path>,
+    accepted_root: Option<Arc<Path>>,
+    owner: SymbolOwner,
     identity: Arc<ProductIdentity>,
     upstream: Arc<tokio::sync::Mutex<UpstreamSlot>>,
     advertised: Arc<std::sync::Mutex<Option<ServerConfig>>>,
@@ -191,6 +211,10 @@ struct RiftProxy {
     /// Which representations of tool answers this proxy forwards. It lives
     /// here, not on the upstream slot, so a reconnect keeps it.
     output: OutputPolicy,
+    /// Named roots retained for this connection, including reconnects.
+    extra: Arc<extra::Registrations>,
+    backends: Arc<BTreeMap<String, RiftProxy>>,
+    candidate_views: Arc<candidates::CandidateViews>,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -205,7 +229,7 @@ struct UpstreamSlot {
 /// One connection result shared by callers that arrived while it ran.
 #[derive(Debug)]
 struct ConnectAttempt {
-    result: std::sync::Mutex<Option<Result<(), ErrorData>>>,
+    result: std::sync::Mutex<Option<Result<(), RiftError>>>,
     finished: tokio::sync::Notify,
 }
 
@@ -217,12 +241,12 @@ impl ConnectAttempt {
         }
     }
 
-    fn complete(&self, result: Result<(), ErrorData>) {
+    fn complete(&self, result: Result<(), RiftError>) {
         *self.lock_result() = Some(result);
         self.finished.notify_waiters();
     }
 
-    async fn outcome(&self) -> Result<(), ErrorData> {
+    async fn outcome(&self) -> Result<(), RiftError> {
         loop {
             let notified = self.finished.notified();
             if let Some(result) = self.lock_result().clone() {
@@ -232,7 +256,7 @@ impl ConnectAttempt {
         }
     }
 
-    fn lock_result(&self) -> std::sync::MutexGuard<'_, Option<Result<(), ErrorData>>> {
+    fn lock_result(&self) -> std::sync::MutexGuard<'_, Option<Result<(), RiftError>>> {
         match self.result.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -281,15 +305,77 @@ impl RiftProxy {
     /// A proxy for the workspace at `root`, bounding its forwards by the
     /// `[server]` table the workspace accepts when the proxy starts, and
     /// forwarding tool answers as `output` selects.
+    #[cfg(test)]
     fn new(root: &Path, identity: ProductIdentity, output: OutputPolicy) -> Self {
         let server = ConfigurationState::accept(root).server_configuration();
+        Self::with_configuration(
+            root,
+            identity,
+            output,
+            &server,
+            extra::Registrations::accept(
+                root,
+                &rift_protocol::configuration::McpConfiguration::default(),
+                &[],
+                None,
+            )
+            .expect("the fixture has an accepted primary root"),
+        )
+    }
+
+    fn with_configuration(
+        root: &Path,
+        identity: ProductIdentity,
+        output: OutputPolicy,
+        server: &ServerConfiguration,
+        extra: extra::Registrations,
+    ) -> Self {
+        let backends = extra
+            .entries()
+            .map(|(name, root)| {
+                let mut backend = Self::for_owner(
+                    root,
+                    SymbolOwner::Local,
+                    identity.clone(),
+                    output,
+                    forward_budget(server),
+                );
+                backend.accepted_root = Some(Arc::from(root));
+                (name.to_owned(), backend)
+            })
+            .collect();
+        let mut proxy = Self::for_owner(
+            root,
+            SymbolOwner::Local,
+            identity,
+            output,
+            forward_budget(server),
+        );
+        proxy.accepted_root = extra.primary_root().map(Arc::from);
+        proxy.extra = Arc::new(extra);
+        proxy.backends = Arc::new(backends);
+        proxy
+    }
+
+    fn for_owner(
+        root: &Path,
+        owner: SymbolOwner,
+        identity: ProductIdentity,
+        output: OutputPolicy,
+        forward_budget: Duration,
+    ) -> Self {
         Self {
             root: Arc::from(root),
+            accepted_root: None,
+            owner,
             identity: Arc::new(identity),
             upstream: Arc::new(tokio::sync::Mutex::new(UpstreamSlot::empty())),
             advertised: Arc::new(std::sync::Mutex::new(None)),
-            forward_budget: forward_budget(&server),
+            forward_budget,
             output,
+            extra: Arc::new(extra::Registrations::default()),
+            backends: Arc::new(BTreeMap::new()),
+            candidate_views: Arc::new(candidates::CandidateViews::default()),
         }
     }
 
@@ -305,6 +391,74 @@ impl RiftProxy {
             }
             other => other,
         }
+    }
+
+    fn call_backend(&self, request: &CallToolRequestParams) -> Result<&Self, RiftError> {
+        let Some(arguments) = request.arguments.as_ref() else {
+            return Ok(self);
+        };
+        let traversal = arguments.get("traversal");
+        let identity_owner = arguments
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                traversal
+                    .and_then(|value| value.get("seed"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(rift_protocol::identity::SymbolIdentity::parse)
+            .transpose()?
+            .map(|identity| identity.owner().clone())
+            .filter(|owner| matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }));
+        let scope = arguments
+            .get("scope")
+            .map(|value| serde_json::from_value::<rift_protocol::read::SearchScope>(value.clone()))
+            .transpose()
+            .map_err(|_| Self::scope_refusal(request, "scope"))?;
+        let scope_owner = match &scope {
+            Some(rift_protocol::read::SearchScope::Local) => Some(SymbolOwner::Local),
+            Some(rift_protocol::read::SearchScope::NamedLocal { name }) => {
+                Some(SymbolOwner::NamedLocal { name: name.clone() })
+            }
+            _ => None,
+        };
+        if let (Some(identity), Some(scope)) = (&identity_owner, &scope_owner)
+            && identity != scope
+        {
+            return Err(Self::scope_refusal(request, "scope"));
+        }
+        if traversal.is_none()
+            && matches!(scope, Some(rift_protocol::read::SearchScope::All))
+            && self.extra.names().next().is_some()
+        {
+            return errors::server::read_unavailable()
+                .operation(request.name.as_ref())
+                .detail("registered project aggregation is unavailable")
+                .fail();
+        }
+        let selected = scope_owner.or(identity_owner);
+        match selected {
+            Some(SymbolOwner::NamedLocal { name }) => {
+                if matches!(scope, Some(rift_protocol::read::SearchScope::Global))
+                    || (traversal.is_none()
+                        && matches!(scope, Some(rift_protocol::read::SearchScope::All)))
+                {
+                    return Err(Self::scope_refusal(request, "scope"));
+                }
+                self.backends
+                    .get(&name)
+                    .ok_or_else(|| self.extra.refusal(&name, &request.name, "scope"))
+            }
+            _ => Ok(self),
+        }
+    }
+
+    fn scope_refusal(request: &CallToolRequestParams, field: &str) -> RiftError {
+        errors::mcp::parameter_invalid()
+            .tool(request.name.as_ref())
+            .field(field)
+            .accepted("local, global, all, or an accepted named project")
+            .error()
     }
 
     /// A forwarded `resources/read` answer, as this proxy's output policy
@@ -336,7 +490,7 @@ impl RiftProxy {
     async fn leased_peer(
         &self,
         observed: Option<u64>,
-    ) -> Result<(Peer<RoleClient>, u64), ErrorData> {
+    ) -> Result<(Peer<RoleClient>, u64), RiftError> {
         loop {
             let (attempt, starts) = {
                 let mut slot = self.upstream.lock().await;
@@ -362,7 +516,8 @@ impl RiftProxy {
     fn start_connection(&self, attempt: Arc<ConnectAttempt>) {
         let proxy = self.clone();
         tokio::spawn(async move {
-            let connected = connect_upstream(&proxy.root, &proxy.identity).await;
+            let connected =
+                connect_upstream_for_owner(&proxy.root, &proxy.owner, &proxy.identity).await;
             let result = match connected {
                 Ok(running) => {
                     proxy.mirror_advertised(&running);
@@ -405,11 +560,21 @@ impl RiftProxy {
         request: ClientRequest,
         answer: fn(ServerResult) -> Option<Value>,
     ) -> Result<Value, ErrorData> {
+        self.forward_registered(request, answer)
+            .await
+            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))?
+    }
+
+    async fn forward_registered<Value>(
+        &self,
+        request: ClientRequest,
+        answer: fn(ServerResult) -> Option<Value>,
+    ) -> Result<Result<Value, ErrorData>, RiftError> {
         let (peer, generation) = self.leased_peer(None).await?;
         let failure = match self.answered(&peer, request.clone()).await? {
-            Ok(result) => return answered_as(result, answer),
+            Ok(result) => return answered_as(result, answer).map(Ok),
             Err(error) if transport_failed(&error) => error,
-            Err(error) => return forwarded_error(error).fail(),
+            Err(error) => return forwarded_error(error).map(Err),
         };
         rift_tracing::info!(
             component = "mcp",
@@ -417,11 +582,10 @@ impl RiftProxy {
             "upstream connection lost; reconnecting"
         );
         let (peer, _generation) = self.leased_peer(Some(generation)).await?;
-        let result = self
-            .answered(&peer, request)
-            .await?
-            .map_err(forwarded_error)?;
-        answered_as(result, answer)
+        match self.answered(&peer, request).await? {
+            Ok(result) => answered_as(result, answer).map(Ok),
+            Err(error) => forwarded_error(error).map(Err),
+        }
     }
 
     /// What one send answered, or the refusal for a server that did not
@@ -441,7 +605,7 @@ impl RiftProxy {
         &self,
         peer: &Peer<RoleClient>,
         request: ClientRequest,
-    ) -> Result<Result<ServerResult, ServiceError>, ErrorData> {
+    ) -> Result<Result<ServerResult, ServiceError>, RiftError> {
         let budget = self.forward_budget;
         let answer = match peer
             .send_cancellable_request(request, PeerRequestOptions::with_timeout(budget))
@@ -474,11 +638,7 @@ impl RiftProxy {
                      the request is cancelled"
                 );
                 rift_tracing::publish_in_flight("forward budget");
-                errors::mcp::forward_unanswered()
-                    .waited(budget)
-                    .mcp()
-                    .tool_error(wire::ErrorPhase::Read)
-                    .fail()
+                errors::mcp::forward_unanswered().waited(budget).fail()
             }
             answered => Ok(answered),
         }
@@ -534,8 +694,12 @@ pub fn forward_budget(server: &ServerConfiguration) -> Duration {
 fn answered_as<Value>(
     result: ServerResult,
     answer: fn(ServerResult) -> Option<Value>,
-) -> Result<Value, ErrorData> {
-    answer(result).ok_or_else(|| forwarded_error(ServiceError::UnexpectedResponse))
+) -> Result<Value, RiftError> {
+    answer(result).ok_or_else(|| {
+        errors::mcp::forward_failed()
+            .source(ServiceError::UnexpectedResponse)
+            .error()
+    })
 }
 
 /// Whether a request may reuse the slot's current upstream instead of
@@ -593,8 +757,23 @@ fn reuse_current(current_generation: u64, observed: Option<u64>) -> bool {
 async fn connect_upstream(
     root: &Path,
     identity: &ProductIdentity,
-) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
     connect_upstream_with(root, identity, || connect_repository_server(root, identity)).await
+}
+
+async fn connect_upstream_for_owner(
+    root: &Path,
+    owner: &SymbolOwner,
+    identity: &ProductIdentity,
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
+    if matches!(owner, SymbolOwner::Local) {
+        return connect_upstream(root, identity).await;
+    }
+    crate::storage::workspace_state_directory(root, owner)?;
+    connect_upstream_for_owner_with(root, owner, identity, || async {
+        RepositoryAsk::Terminal(RepositoryMiss::NotRepository)
+    })
+    .await
 }
 
 /// [`connect_upstream`] over any ask of the repository server, so a test
@@ -602,8 +781,17 @@ async fn connect_upstream(
 async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
     root: &Path,
     identity: &ProductIdentity,
+    ask_repository: impl FnMut() -> Asking,
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
+    connect_upstream_for_owner_with(root, &SymbolOwner::Local, identity, ask_repository).await
+}
+
+async fn connect_upstream_for_owner_with<Asking: Future<Output = RepositoryAsk>>(
+    root: &Path,
+    owner: &SymbolOwner,
+    identity: &ProductIdentity,
     mut ask_repository: impl FnMut() -> Asking,
-) -> Result<RunningService<RoleClient, ()>, ErrorData> {
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
     let started = tokio::time::Instant::now();
     let mut reported = None;
     let mut closing = StartWindowClose::default();
@@ -621,7 +809,10 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
         }
     };
     let mut replacement = Replacement::default();
-    if let Some(running) = adopt_serving(root, identity, &mut replacement).await? {
+    let presence = observed_for_owner(root, owner).await?.presence;
+    if let Some(running) =
+        adopt_presence_for_owner(root, owner, presence, identity, &mut replacement).await?
+    {
         return Ok(running);
     }
     // A server another starter elected is still building: a spawn now would
@@ -633,16 +824,21 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
     // a concurrently started server its chance.
     let mut spawns = StartSpawns::<StartupCapture>::default();
     let mut awaiting_release = replacement.is_asked();
-    if !awaiting_release && !matches!(probed(root).await, ServerPresence::Starting) {
-        spawns.spawn_captured(root);
+    if !awaiting_release
+        && !matches!(
+            observed_for_owner(root, owner).await?.presence,
+            ServerPresence::Starting
+        )
+    {
+        spawn_for_owner(&mut spawns, root, owner)?;
     }
-    let opened = DatabaseActivity::observed(root).await;
+    let opened = DatabaseActivity::observed_for_owner(root, owner).await?;
     let mut building = false;
     let mut still_serving = None;
     let mut probe_reads = None;
     let deadline = tokio::time::Instant::now() + START_WAIT_MAX;
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        let observation = observed(root).await;
+        let observation = observed_for_owner(root, owner).await?;
         observation.report_change(&mut probe_reads);
         let presence = observation.presence;
         closing.rounds += 1;
@@ -650,20 +846,21 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
         building = matches!(presence, ServerPresence::Starting);
         let election_held = presence.election_held();
         still_serving = replacement.refusal_while_serving(&presence, identity);
-        let adopted = adopt_presence(root, presence, identity, &mut replacement).await?;
+        let adopted =
+            adopt_presence_for_owner(root, owner, presence, identity, &mut replacement).await?;
         // The replaced server released the election, and no other starter
         // took it: this process starts the server it replaces it with.
         if awaiting_release && !election_held {
             awaiting_release = false;
-            spawns.spawn_captured(root);
+            spawn_for_owner(&mut spawns, root, owner)?;
         }
         match spawns.poll(adopted, election_held) {
             SpawnPollOutcome::Ready(running) => {
                 closing.record_answered(started.elapsed());
                 return Ok(running);
             }
-            SpawnPollOutcome::Failed(capture) => return server_start_failed(&capture).fail(),
-            SpawnPollOutcome::ElectionUnheld => spawns.spawn_captured(root),
+            SpawnPollOutcome::Failed(capture) => return Err(server_start_failed(&capture)),
+            SpawnPollOutcome::ElectionUnheld => spawn_for_owner(&mut spawns, root, owner)?,
             SpawnPollOutcome::Waiting => {}
         }
         if tokio::time::Instant::now() >= deadline {
@@ -689,13 +886,52 @@ async fn connect_upstream_with<Asking: Future<Output = RepositoryAsk>>(
     closing.building = building;
     if let Some(refusal) = still_serving {
         closing.record(started.elapsed(), None, &refusal);
-        return refusal.fail();
+        return Err(refusal);
     }
-    let closed = DatabaseActivity::observed(root).await;
+    let closed = DatabaseActivity::observed_for_owner(root, owner).await?;
     let wrote = opened != closed;
     let refusal = start_window_refusal(building && wrote);
     closing.record(started.elapsed(), Some(wrote), &refusal);
-    refusal.fail()
+    Err(refusal)
+}
+
+fn spawn_for_owner(
+    spawns: &mut StartSpawns<StartupCapture>,
+    root: &Path,
+    owner: &SymbolOwner,
+) -> Result<(), RiftError> {
+    if matches!(owner, SymbolOwner::Local) {
+        spawns.spawn_captured(root);
+        return Ok(());
+    }
+    spawns.spawn_captured_with_owner(root, owner)
+}
+
+async fn observed_for_owner(
+    root: &Path,
+    owner: &SymbolOwner,
+) -> Result<ElectionObservation, RiftError> {
+    if matches!(owner, SymbolOwner::Local) {
+        return Ok(observed(root).await);
+    }
+    let root = root.to_path_buf();
+    let owner = owner.clone();
+    tokio::task::spawn_blocking(move || crate::election::observe_with_owner(&root, &owner))
+        .await
+        .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())?
+}
+
+async fn adopt_presence_for_owner(
+    root: &Path,
+    owner: &SymbolOwner,
+    presence: ServerPresence,
+    identity: &ProductIdentity,
+    replacement: &mut Replacement,
+) -> Result<Option<RunningService<RoleClient, ()>>, RiftError> {
+    if let ServerPresence::Serving(lock) = &presence {
+        crate::election::validate_workspace_lock(root, owner, lock)?;
+    }
+    adopt_presence(root, presence, identity, replacement).await
 }
 
 /// What a start window last saw, logged once as the window closes: on a
@@ -716,7 +952,7 @@ impl StartWindowClose {
     /// Logs the window's close after `elapsed`, with `wrote` naming whether
     /// a database file changed during the window when the close read it, and
     /// the `refusal` the request gets.
-    fn record(&self, elapsed: Duration, wrote: Option<bool>, refusal: &ErrorData) {
+    fn record(&self, elapsed: Duration, wrote: Option<bool>, refusal: &RiftError) {
         rift_tracing::info!(
             component = "mcp",
             rounds = self.rounds,
@@ -725,7 +961,7 @@ impl StartWindowClose {
             repository_miss = self.repository_miss.as_ref().map(|miss| format!("{miss:?}")),
             building = self.building,
             wrote,
-            refusal = %refusal.message,
+            refusal = %refusal,
             "start window closed without a server that answers"
         );
     }
@@ -757,6 +993,16 @@ struct DatabaseActivity {
 }
 
 impl DatabaseActivity {
+    async fn observed_for_owner(root: &Path, owner: &SymbolOwner) -> Result<Self, RiftError> {
+        if matches!(owner, SymbolOwner::Local) {
+            return Ok(Self::observed(root).await);
+        }
+        let state = crate::storage::workspace_state_directory(root, owner)?;
+        tokio::task::spawn_blocking(move || Self::read_state(&state))
+            .await
+            .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())
+    }
+
     /// Reads each database file and its write-ahead log below `root`, and none
     /// of their bytes, on the blocking pool. A reading the pool could not
     /// finish names no file.
@@ -775,6 +1021,10 @@ impl DatabaseActivity {
     /// `root`.
     fn read(root: &Path) -> Self {
         let state = root.join(RIFT_STATE_DIRECTORY);
+        Self::read_state(&state)
+    }
+
+    fn read_state(state: &Path) -> Self {
         let log = |database: &str| state.join(format!("{database}{WRITE_AHEAD_LOG_SUFFIX}"));
         let paths = [
             state.join(INDEX_DATABASE_FILE_NAME),
@@ -795,21 +1045,13 @@ impl DatabaseActivity {
 /// that answers: one the caller resends while the holder of the election is
 /// `building` its first index and wrote during the window, and the
 /// operator's next step otherwise.
-fn start_window_refusal(building: bool) -> ErrorData {
+fn start_window_refusal(building: bool) -> RiftError {
     if building {
-        return errors::mcp::start_building()
-            .waited(START_WAIT_MAX)
-            .mcp()
-            .tool_error(wire::ErrorPhase::Read);
+        return errors::mcp::start_building().waited(START_WAIT_MAX).error();
     }
-    ErrorData::internal_error(
-        format!(
-            "no rift server answered for this workspace within {START_WAIT_MAX:?}; the \
-             workspace has no server this caller can reach, and starting one is an \
-             operator action on this host"
-        ),
-        None,
-    )
+    errors::mcp::start_unreachable()
+        .waited(START_WAIT_MAX)
+        .error()
 }
 
 /// The refusal a request gets when the spawned server exited before it
@@ -818,16 +1060,15 @@ fn start_window_refusal(building: bool) -> ErrorData {
 /// Names what the server printed to its own standard error. The caller
 /// has no shell channel of its own, so it learns what actually failed
 /// instead of being pointed at a command it cannot run.
-fn server_start_failed(capture: &CapturedStream) -> ErrorData {
-    let failure = if capture.text.is_empty() {
-        errors::mcp::spawn_no_output().mcp()
+fn server_start_failed(capture: &CapturedStream) -> RiftError {
+    if capture.text.is_empty() {
+        errors::mcp::spawn_no_output().error()
     } else {
         errors::mcp::spawn_failed()
             .stderr(capture.text.clone())
             .stderr_truncated(capture.truncated)
-            .mcp()
-    };
-    failure.tool_error(wire::ErrorPhase::Read)
+            .error()
+    }
 }
 
 /// The recorded serving server as a live connection, when both halves hold.
@@ -836,11 +1077,12 @@ fn server_start_failed(capture: &CapturedStream) -> ErrorData {
 /// refuses the connect or initialize, both answer `None`: the recorded
 /// state is stale and the caller elects afresh. A server of another
 /// identity answers as [`ServerStanding`] decides.
+#[cfg(test)]
 async fn adopt_serving(
     root: &Path,
     identity: &ProductIdentity,
     replacement: &mut Replacement,
-) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
+) -> Result<Option<RunningService<RoleClient, ()>>, RiftError> {
     adopt_presence(root, probed(root).await, identity, replacement).await
 }
 
@@ -857,6 +1099,7 @@ async fn adopt_serving(
 ///
 /// Dropping this future abandons the answer; the probe itself finishes on
 /// the blocking pool and changes nothing.
+#[cfg(test)]
 async fn probed(root: &Path) -> ServerPresence {
     probed_with(root, probe).await
 }
@@ -877,6 +1120,7 @@ async fn observed(root: &Path) -> ElectionObservation {
 }
 
 /// [`probed`] over any probe, so a test can hold one probe open.
+#[cfg(test)]
 async fn probed_with(
     root: &Path,
     probe: impl FnOnce(&Path) -> ServerPresence + Send + 'static,
@@ -897,9 +1141,9 @@ async fn adopt_presence(
     presence: ServerPresence,
     identity: &ProductIdentity,
     replacement: &mut Replacement,
-) -> Result<Option<RunningService<RoleClient, ()>>, ErrorData> {
+) -> Result<Option<RunningService<RoleClient, ()>>, RiftError> {
     let lock = match presence {
-        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Serving(lock) => *lock,
         ServerPresence::Stale(StaleReason::PortUnreachable { pid }) => {
             rift_tracing::info!(
                 component = "mcp",
@@ -918,7 +1162,7 @@ async fn adopt_presence(
             replacement.replace(&lock, identity).await?;
             return Ok(None);
         }
-        ServerStanding::Refuse => return identity_refusal(identity, &lock).fail(),
+        ServerStanding::Refuse => return Err(identity_refusal(identity, &lock)),
     }
     match connect_recorded_for_root(&lock, UPSTREAM_CONNECT_TIMEOUT, root).await {
         Ok(running) => {
@@ -931,10 +1175,9 @@ async fn adopt_presence(
             Ok(Some(running))
         }
         Err(failure) => {
-            let detail = failure.detail();
             rift_tracing::info!(
                 component = "mcp",
-                %detail,
+                failure = %failure,
                 "recorded server did not answer; treating the lock as stale"
             );
             Ok(None)
@@ -1115,7 +1358,7 @@ async fn connect_repository_server(
             pid: lock.pid,
             port: lock.port,
             elapsed_ms: started.elapsed().as_millis(),
-            detail: failure.detail(),
+            detail: failure.to_string(),
         }),
     }
 }
@@ -1207,10 +1450,10 @@ impl Replacement {
         &mut self,
         lock: &ServerLock,
         identity: &ProductIdentity,
-    ) -> Result<(), ErrorData> {
+    ) -> Result<(), RiftError> {
         match &self.asked {
             Some(asked) if names_one_server(asked, lock) => return Ok(()),
-            Some(_) => return identity_refusal(identity, lock).fail(),
+            Some(_) => return Err(identity_refusal(identity, lock)),
             None => {}
         }
         match request_stop(lock).await {
@@ -1228,7 +1471,7 @@ impl Replacement {
                     failure = ?failure,
                     "the workspace server did not accept the stop request"
                 );
-                return identity_refusal(identity, lock).fail();
+                return Err(identity_refusal(identity, lock));
             }
         }
         let server_version = lock.identity.version.as_str();
@@ -1249,7 +1492,7 @@ impl Replacement {
         &self,
         presence: &ServerPresence,
         identity: &ProductIdentity,
-    ) -> Option<ErrorData> {
+    ) -> Option<RiftError> {
         let (Some(asked), ServerPresence::Serving(lock)) = (&self.asked, presence) else {
             return None;
         };
@@ -1264,38 +1507,14 @@ fn names_one_server(asked: &ServerLock, lock: &ServerLock) -> bool {
 
 /// The refusal for a serving process whose build or served tools differ
 /// and that this process does not replace.
-fn identity_refusal(expected: &ProductIdentity, lock: &ServerLock) -> ErrorData {
-    ErrorData::internal_error(
-        format!(
-            "workspace server identity differs from this rift process: server pid {}, version {}, schema digest {}; this process version {}, schema digest {}; run rift server stop, then retry",
-            lock.pid,
-            lock.identity.version,
-            lock.identity.schema_digest,
-            expected.version,
-            expected.schema_digest,
-        ),
-        None,
-    )
-}
-
-/// Why one bounded connect attempt produced no live connection.
-#[derive(Debug)]
-enum ConnectAttemptFailure {
-    /// The transport refused or MCP initialization failed. Boxed to keep
-    /// this failure small beside the large initialize error.
-    Initialize(Box<dyn std::error::Error + Send + Sync>),
-    /// The attempt outlived [`UPSTREAM_CONNECT_TIMEOUT`].
-    TimedOut,
-}
-
-impl ConnectAttemptFailure {
-    /// One line naming what kept the attempt from connecting.
-    fn detail(&self) -> String {
-        match self {
-            Self::Initialize(error) => error.to_string(),
-            Self::TimedOut => format!("connect timed out after {UPSTREAM_CONNECT_TIMEOUT:?}"),
-        }
-    }
+fn identity_refusal(expected: &ProductIdentity, lock: &ServerLock) -> RiftError {
+    errors::mcp::server_identity_mismatch()
+        .pid(lock.pid)
+        .server_version(&lock.identity.version)
+        .server_schema_digest(&lock.identity.schema_digest)
+        .version(&expected.version)
+        .schema_digest(&expected.schema_digest)
+        .error()
 }
 
 /// Connects and initializes against one recorded server, bounded by
@@ -1306,7 +1525,7 @@ impl ConnectAttemptFailure {
 async fn connect_recorded(
     lock: &ServerLock,
     timeout: Duration,
-) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
     connect_recorded_with_root(lock, timeout, None).await
 }
 
@@ -1314,7 +1533,7 @@ async fn connect_recorded_for_root(
     lock: &ServerLock,
     timeout: Duration,
     root: &Path,
-) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
     connect_recorded_with_root(lock, timeout, Some(root)).await
 }
 
@@ -1322,26 +1541,49 @@ async fn connect_recorded_with_root(
     lock: &ServerLock,
     timeout: Duration,
     root: Option<&Path>,
-) -> Result<RunningService<RoleClient, ()>, ConnectAttemptFailure> {
+) -> Result<RunningService<RoleClient, ()>, RiftError> {
     let mut config = StreamableHttpClientTransportConfig::with_uri(format!(
         "http://127.0.0.1:{port}{MCP_PATH}",
         port = lock.port
     ))
     .auth_header(lock.token.clone());
     if let Some(root) = root {
-        let canonical = std::fs::canonicalize(root)
-            .map_err(|error| ConnectAttemptFailure::Initialize(Box::new(error)))?;
-        let value = HeaderValue::from_str(&canonical.to_string_lossy())
-            .map_err(|error| ConnectAttemptFailure::Initialize(Box::new(error)))?;
+        let canonical = std::fs::canonicalize(root).map_err(|error| {
+            errors::mcp::proxy_initialization_failed()
+                .source(error)
+                .error()
+        })?;
+        let value = HeaderValue::from_str(&canonical.to_string_lossy()).map_err(|error| {
+            errors::mcp::proxy_initialization_failed()
+                .source(error)
+                .error()
+        })?;
         config
             .custom_headers
             .insert(HeaderName::from_static(WORKSPACE_ROOT_HEADER), value);
     }
-    let transport = StreamableHttpClientTransport::from_config(config);
+    let transport = StreamableHttpClientTransport::with_client(
+        http_client::HttpClient::new(
+            reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|source| {
+                    errors::mcp::proxy_initialization_failed()
+                        .source(source)
+                        .error()
+                })?,
+        ),
+        config,
+    );
     match tokio::time::timeout(timeout, ().serve(transport)).await {
         Ok(Ok(running)) => Ok(running),
-        Ok(Err(error)) => Err(ConnectAttemptFailure::Initialize(Box::new(error))),
-        Err(_elapsed) => Err(ConnectAttemptFailure::TimedOut),
+        Ok(Err(error)) => errors::mcp::proxy_initialization_failed()
+            .source(error)
+            .fail(),
+        Err(elapsed) => errors::mcp::proxy_initialization_failed()
+            .source(elapsed)
+            .fail(),
     }
 }
 
@@ -1353,29 +1595,16 @@ fn transport_failed(error: &ServiceError) -> bool {
     )
 }
 
-/// The JSON-RPC error a downstream client gets for one upstream failure.
+/// The unchanged remote MCP error or registered local forwarding failure.
 ///
 /// A refusal the server classified travels unchanged, refusal code and
 /// all. A transport-shaped failure reaches here only after its one
 /// reconnect retry also failed, and names what the operator can check;
 /// every other failure names what the upstream did.
-fn forwarded_error(error: ServiceError) -> ErrorData {
+fn forwarded_error(error: ServiceError) -> Result<ErrorData, RiftError> {
     match error {
-        ServiceError::McpError(data) => data,
-        ServiceError::TransportClosed | ServiceError::TransportSend(_) => {
-            ErrorData::internal_error(
-                format!(
-                    "the workspace's rift server dropped the connection and a reconnect \
-                     did not recover it: {error}; check the server with \
-                     `rift server start --foreground`"
-                ),
-                None,
-            )
-        }
-        other => ErrorData::internal_error(
-            format!("the workspace's rift server failed the forwarded request: {other}"),
-            None,
-        ),
+        ServiceError::McpError(data) => Ok(data),
+        other => errors::mcp::forward_failed().source(other).fail(),
     }
 }
 
@@ -1452,28 +1681,52 @@ impl ServerHandler for RiftProxy {
             operation = "tools/call",
             request_id = rift_tracing::empty!(),
             caller_request_id = %context.id,
-            tool = %request.name
+            tool = %request.name,
+            error.type = rift_tracing::empty!()
         );
+        let operation = span.clone();
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("tools/call", {
             answered = span
                 .instrument(async {
                     rift_tracing::debug!("tool forward started");
-                    let request = ClientRequest::CallToolRequest(CallToolRequest::new(request));
-                    let result = self
-                        .forward(request, |result| match result {
-                            ServerResult::CallToolResult(result) => {
-                                Some(CallToolResponse::Complete(result))
-                            }
-                            ServerResult::InputRequiredResult(result) => {
-                                Some(CallToolResponse::InputRequired(result))
-                            }
-                            ServerResult::CreateTaskResult(result) => {
-                                Some(CallToolResponse::Task(result))
-                            }
-                            _ => None,
-                        })
-                        .await;
+                    let registered: Result<_, RiftError> = match self.captured_read(&request).await
+                    {
+                        Err(error) => Err(error),
+                        Ok(Some(answer)) => Ok(answer),
+                        Ok(None) => match self.captured_search(&request).await {
+                            Err(refusal) => Err(refusal),
+                            Ok(Some(answer)) => Ok(answer),
+                            Ok(None) => match self.call_backend(&request) {
+                                Err(refusal) => Err(refusal),
+                                Ok(backend) => {
+                                    let request = ClientRequest::CallToolRequest(
+                                        CallToolRequest::new(request),
+                                    );
+                                    backend
+                                        .forward_registered(request, |result| match result {
+                                            ServerResult::CallToolResult(result) => {
+                                                Some(CallToolResponse::Complete(result))
+                                            }
+                                            ServerResult::InputRequiredResult(result) => {
+                                                Some(CallToolResponse::InputRequired(result))
+                                            }
+                                            ServerResult::CreateTaskResult(result) => {
+                                                Some(CallToolResponse::Task(result))
+                                            }
+                                            _ => None,
+                                        })
+                                        .await
+                                }
+                            },
+                        },
+                    };
+                    if let Err(error) = &registered {
+                        operation.record("error.type", error.slug().as_str());
+                    }
+                    let result = registered
+                        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
+                        .and_then(std::convert::identity);
                     rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
                     result
                 })
@@ -1589,6 +1842,7 @@ fn list_tools_request(page: Option<PaginatedRequestParams>) -> ClientRequest {
 
 #[cfg(test)]
 mod tests {
+    use crate::failure::WireFailure as _;
     use std::any::TypeId;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
@@ -1611,19 +1865,33 @@ mod tests {
     use tokio::io::AsyncBufReadExt as _;
 
     use super::{
-        ConnectAttemptFailure, Replacement, RepositoryAsk, RepositoryMiss, RiftProxy,
-        ServerStanding, Upstream, UpstreamSlot, adopt_serving, connect_recorded, connect_upstream,
-        connect_upstream_with, fallback_info, forwarded_error, identity_refusal, mirrored_info,
-        quit_reason_result, reuse_current, serve_connection, server_start_failed,
-        start_window_refusal, transport_failed,
+        Replacement, RepositoryAsk, RepositoryMiss, RiftProxy, ServerStanding, Upstream,
+        UpstreamSlot, adopt_serving, connect_recorded, connect_upstream, connect_upstream_with,
+        fallback_info, forwarded_error, identity_refusal, mirrored_info, quit_reason_result,
+        reuse_current, serve_connection, server_start_failed, start_window_refusal,
+        transport_failed,
     };
     use crate::election::{ServerPresence, StaleReason, claim};
+    use crate::failure::McpErrorExt as _;
     use crate::output::OutputPolicy;
     use rift_core::CapturedStream;
     use rift_error::errors;
     use rift_protocol::error as wire;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn assert_operator_refusal(refusal: &ErrorData) {
+        assert_eq!(refusal.code, crate::failure::RIFT_ERROR_CODE);
+        let data: wire::ErrorData = serde_json::from_value(
+            refusal
+                .data
+                .clone()
+                .expect("registered refusal carries wire data"),
+        )
+        .expect("registered refusal carries the served error model");
+        assert_eq!(data.code, wire::ErrorCode::InternalError);
+        assert_eq!(data.retry, wire::RetryDirective::OperatorAction);
+    }
 
     /// One build of 0.0.11, and another build of the same version.
     const BUILD_A: &str = "0.0.11+b006b8433ba06679f06a3c7f0743d65634d32c34";
@@ -1659,6 +1927,8 @@ mod tests {
             pid: 4_242,
             identity: identity(BUILD_A, SCHEMA_DIGEST_A),
             server: None,
+            root: None,
+            owner: None,
         }
     }
 
@@ -1679,17 +1949,15 @@ mod tests {
         assert!(!request_starts);
         assert!(std::sync::Arc::ptr_eq(&warmup, &request));
 
-        let refusal = ErrorData::new(
-            rmcp::model::ErrorCode(-32000),
-            "server failed to bind",
-            None,
-        );
+        let refusal = errors::mcp::start_unreachable()
+            .waited(super::START_WAIT_MAX)
+            .error();
         warmup.complete(Err(refusal.clone()));
         let (warmup_result, request_result) = tokio::join!(warmup.outcome(), request.outcome());
         for result in [warmup_result, request_result] {
             let received = result.expect_err("terminal connection result must be shared");
-            assert_eq!(received.code, refusal.code);
-            assert_eq!(received.message, refusal.message);
+            assert_eq!(received.slug(), refusal.slug());
+            assert_eq!(received.to_string(), refusal.to_string());
         }
     }
 
@@ -1700,7 +1968,8 @@ mod tests {
             "the workspace configuration failed validation",
             Some(json!({"code": "configuration_invalid", "retry": "operator_action"})),
         );
-        let forwarded = forwarded_error(ServiceError::McpError(refusal.clone()));
+        let forwarded = forwarded_error(ServiceError::McpError(refusal.clone()))
+            .expect("remote MCP errors remain unchanged");
         assert_eq!(forwarded.code, refusal.code);
         assert_eq!(forwarded.message, refusal.message);
         assert_eq!(
@@ -1712,15 +1981,17 @@ mod tests {
     #[test]
     fn transport_failures_map_to_internal_error_with_operator_hint() {
         for failure in [ServiceError::TransportClosed, transport_send_failure()] {
-            let forwarded = forwarded_error(failure);
-            assert_eq!(forwarded.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            let error = forwarded_error(failure).expect_err("transport failure is registered");
+            assert_eq!(error.slug().as_str(), "rift.mcp.forward_failed");
+            let forwarded = error.mcp().tool_error(wire::ErrorPhase::Read);
+            assert_operator_refusal(&forwarded);
             assert!(
                 forwarded.message.contains("rift server start --foreground"),
                 "{}",
                 forwarded.message
             );
             assert!(
-                forwarded.message.contains("reconnect"),
+                forwarded.message.contains("forwarded request"),
                 "{}",
                 forwarded.message
             );
@@ -1729,8 +2000,11 @@ mod tests {
 
     #[test]
     fn other_service_failures_name_the_upstream_failure() {
-        let forwarded = forwarded_error(ServiceError::UnexpectedResponse);
-        assert_eq!(forwarded.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let error = forwarded_error(ServiceError::UnexpectedResponse)
+            .expect_err("unexpected response is registered");
+        assert_eq!(error.slug().as_str(), "rift.mcp.forward_failed");
+        let forwarded = error.mcp().tool_error(wire::ErrorPhase::Read);
+        assert_operator_refusal(&forwarded);
         assert!(
             forwarded.message.contains("forwarded request"),
             "{}",
@@ -1771,12 +2045,14 @@ mod tests {
 
     #[test]
     fn connect_attempt_failures_name_their_cause() {
-        let refused = super::ConnectAttemptFailure::Initialize(Box::new(
-            rmcp::service::ClientInitializeError::Cancelled,
-        ));
-        assert_eq!(refused.detail(), "Cancelled");
-        let timed_out = super::ConnectAttemptFailure::TimedOut;
-        assert!(timed_out.detail().contains("5s"), "{}", timed_out.detail());
+        let refused = errors::mcp::proxy_initialization_failed()
+            .source(rmcp::service::ClientInitializeError::Cancelled)
+            .error();
+        assert_eq!(
+            refused.slug().as_str(),
+            "rift.mcp.proxy_initialization_failed"
+        );
+        assert!(refused.to_string().contains("Cancelled"));
     }
 
     #[test]
@@ -1857,8 +2133,10 @@ mod tests {
     #[test]
     fn the_identity_refusal_names_both_identities_and_the_operator_step() {
         let expected = identity(BUILD_B, SCHEMA_DIGEST_B);
-        let refusal = identity_refusal(&expected, &recorded_lock(12_345));
-        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let refusal = identity_refusal(&expected, &recorded_lock(12_345))
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
+        assert_operator_refusal(&refusal);
         for named in [
             BUILD_A,
             BUILD_B,
@@ -1931,7 +2209,9 @@ mod tests {
         let refusal = replacement
             .replace(&lock, &newer)
             .await
-            .expect_err("a second server of another identity must be refused");
+            .expect_err("a second server of another identity must be refused")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             refusal.message.contains("rift server stop"),
             "{}",
@@ -1950,7 +2230,9 @@ mod tests {
         let refusal = replacement
             .replace(&recorded_lock(port), &identity("0.0.12", SCHEMA_DIGEST_A))
             .await
-            .expect_err("a server that refused the stop keeps serving");
+            .expect_err("a server that refused the stop keeps serving")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             refusal.message.contains("rift server stop"),
             "{}",
@@ -2034,7 +2316,9 @@ mod tests {
         tokio::time::pause();
         let refusal = connect
             .await?
-            .ok_or("an older server that still serves must be refused")?;
+            .ok_or("an older server that still serves must be refused")?
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             started.elapsed() >= crate::spawn::START_WAIT_MAX,
             "the refusal waits out the start window: {:?}",
@@ -2078,7 +2362,9 @@ mod tests {
         let older_proxy = identity("0.0.10", SCHEMA_DIGEST_A);
         let refusal = adopt_serving(directory.path(), &older_proxy, &mut Replacement::default())
             .await
-            .expect_err("a newer server must be refused");
+            .expect_err("a newer server must be refused")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(refusal.message.contains(BUILD_A), "{}", refusal.message);
         assert_eq!(
             accepted.load(AtomicOrdering::SeqCst),
@@ -2092,8 +2378,10 @@ mod tests {
 
     #[test]
     fn unavailable_refusal_names_the_window_without_a_shell_command_the_caller_cannot_run() {
-        let refusal = start_window_refusal(false);
-        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let refusal = start_window_refusal(false)
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
+        assert_operator_refusal(&refusal);
         assert!(refusal.message.contains("30s"), "{}", refusal.message);
         assert!(
             refusal.message.contains("operator action"),
@@ -2109,7 +2397,9 @@ mod tests {
 
     #[test]
     fn server_start_failed_names_empty_standard_error() {
-        let refusal = server_start_failed(&CapturedStream::default());
+        let refusal = server_start_failed(&CapturedStream::default())
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             refusal.message.contains("wrote no standard error"),
             "{}",
@@ -2147,7 +2437,9 @@ mod tests {
             registered.to_string().contains("[redacted]")
                 && !registered.to_string().contains(&capture.text)
         );
-        let refusal = server_start_failed(&capture);
+        let refusal = server_start_failed(&capture)
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             refusal.message.contains("[redacted]"),
             "{}",
@@ -2178,7 +2470,9 @@ mod tests {
             total_bytes: 9_000,
             truncated: true,
         };
-        let refusal = server_start_failed(&capture);
+        let refusal = server_start_failed(&capture)
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             refusal.message.contains("stderr_truncated true"),
             "a truncated capture must say so: {}",
@@ -2255,7 +2549,9 @@ mod tests {
             ServerResult::ListToolsResult(result) => Some(result),
             _ => None,
         })
-        .expect_err("an answer of another kind must refuse");
+        .expect_err("an answer of another kind must refuse")
+        .mcp()
+        .tool_error(wire::ErrorPhase::Read);
         assert!(
             refusal.message.contains("forwarded request"),
             "{}",
@@ -2455,8 +2751,10 @@ mod tests {
         let _guard = claim(directory.path())?;
         let refusal = connect_upstream(directory.path(), &test_identity())
             .await
-            .expect_err("a holder that never publishes must exhaust the start window");
-        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            .expect_err("a holder that never publishes must exhaust the start window")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
+        assert_operator_refusal(&refusal);
         assert!(
             refusal
                 .message
@@ -2532,9 +2830,11 @@ mod tests {
             }))
         })
         .await
-        .expect_err("a holder that never publishes must exhaust the start window");
+        .expect_err("a holder that never publishes must exhaust the start window")
+        .mcp()
+        .tool_error(wire::ErrorPhase::Read);
         assert_eq!(asked, 1, "a terminal miss is asked once");
-        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_operator_refusal(&refusal);
         assert!(
             refusal
                 .message
@@ -2570,7 +2870,10 @@ mod tests {
         let (refusal, written) =
             tokio::join!(connect_upstream(directory.path(), &identity), writing);
         written?;
-        let refusal = refusal.expect_err("a holder that never publishes exhausts the window");
+        let refusal = refusal
+            .expect_err("a holder that never publishes exhausts the window")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         let data = refusal
             .data
             .ok_or("the refusal carries its classification")?;
@@ -2596,7 +2899,9 @@ mod tests {
     /// selects the retryable refusal.
     #[test]
     fn the_start_window_refusal_follows_the_evidence() {
-        let building = super::start_window_refusal(true);
+        let building = super::start_window_refusal(true)
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
         assert!(
             building
                 .message
@@ -2620,8 +2925,10 @@ mod tests {
             "{}",
             building.message
         );
-        let wedged = super::start_window_refusal(false);
-        assert_eq!(wedged.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        let wedged = super::start_window_refusal(false)
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
+        assert_operator_refusal(&wedged);
         assert!(
             wedged.message.contains("operator action on this host"),
             "{}",
@@ -2677,8 +2984,10 @@ mod tests {
         let missing = directory.path().join("missing");
         let refusal = connect_upstream(&missing, &test_identity())
             .await
-            .expect_err("a workspace nobody serves must exhaust the start window");
-        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+            .expect_err("a workspace nobody serves must exhaust the start window")
+            .mcp()
+            .tool_error(wire::ErrorPhase::Read);
+        assert_operator_refusal(&refusal);
         assert!(
             refusal
                 .message
@@ -2697,7 +3006,8 @@ mod tests {
             .await
             .expect_err("a server that accepts and answers nothing must time out");
         assert!(
-            matches!(failure, ConnectAttemptFailure::TimedOut),
+            failure.slug().as_str() == "rift.mcp.proxy_initialization_failed"
+                && failure.to_string().contains("deadline has elapsed"),
             "{failure:?}"
         );
         drop(listener);
@@ -2801,7 +3111,8 @@ mod tests {
     }
 
     /// Whether `record` was emitted inside the `span` that served `request_id` for the
-    /// `search` tool: its `root_span` member names that span and carries both fields.
+    /// internal `search_candidates` tool: its `root_span` member names that span and
+    /// carries both fields.
     ///
     /// The member is the span the record was emitted in, read from the subscriber's span
     /// stack when the event fired. A record a background lane's task emits while the
@@ -2811,7 +3122,7 @@ mod tests {
             let root = &fields["root_span"];
             root["name"] == span
                 && root["fields"]["request_id"] == request_id
-                && root["fields"]["tool"] == "search"
+                && root["fields"]["tool"] == "search_candidates"
         })
     }
 
@@ -2961,7 +3272,9 @@ mod tests {
     /// schema, and answers a call with structured content, as the shared
     /// server does.
     #[derive(Clone)]
-    struct StructuredUpstream;
+    struct StructuredUpstream {
+        root: String,
+    }
 
     const SECOND_PAGE_CURSOR: &str = "second-page";
     /// A resource the upstream answers with compact text and JSON.
@@ -3035,7 +3348,25 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<CallToolResponse, ErrorData>> {
             std::future::ready(match request.name.as_ref() {
-                "search" => Ok(CallToolResult::structured(json!({"results": 0})).into()),
+                "search_candidates" => {
+                    let response = crate::server::candidates::SearchCandidateResponse {
+                        root: self.root.clone(),
+                        owner: rift_protocol::identity::SymbolOwner::Local,
+                        view: rift_protocol::symbol_read::CapturedView {
+                            id: rift_protocol::symbol_read::CapturedViewId::parse("claims.primary")
+                                .expect("a captured fixture view"),
+                            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+                        },
+                        inputs: rift_server::SearchCandidateInputs::default(),
+                        ranking: rift_protocol::configuration::RankingConfiguration::default(),
+                        results_max: 100,
+                        global: None,
+                    };
+                    Ok(CallToolResult::structured(
+                        serde_json::to_value(response).expect("typed candidate response"),
+                    )
+                    .into())
+                }
                 "failing" => Ok(CallToolResult::structured_error(json!({"code": "failed"})).into()),
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool {other}"),
@@ -3063,7 +3394,16 @@ mod tests {
         // them stay out of every test that awaits this fixture.
         let (running, upstream) = tokio::join!(
             Box::pin(().serve(upstream_client_half)),
-            Box::pin(StructuredUpstream.serve(upstream_server_half))
+            Box::pin(
+                StructuredUpstream {
+                    root: directory
+                        .path()
+                        .canonicalize()?
+                        .to_string_lossy()
+                        .into_owned(),
+                }
+                .serve(upstream_server_half),
+            )
         );
         {
             let mut slot = proxy.upstream.lock().await;
@@ -3128,6 +3468,12 @@ mod tests {
             .call_tool(CallToolRequestParams::new("unknown"))
             .await;
         assert!(refused.is_err(), "the upstream refuses an unknown tool");
+        let Err(ServiceError::McpError(ref error)) = refused else {
+            return Err("an upstream refusal retains its JSON-RPC error".into());
+        };
+        assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(error.message, "unknown tool unknown");
+        assert!(error.data.is_none());
         proxied
             .client
             .read_resource(ReadResourceRequestParams::new(JSON_ONLY_URI))
@@ -3255,6 +3601,512 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn named_projects_are_refused_before_primary_forwarding() -> TestResult {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=debug")
+            .install()?;
+        let proxied = proxied_client(OutputPolicy::All).await?;
+        let identity = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::NamedLocal {
+                name: "cloud".to_owned(),
+            },
+            rift_protocol::read::Language::from_identity_segment("rust")
+                .expect("a canonical fixture language"),
+            vec!["beacon".to_owned()],
+        )
+        .expect("a canonical named fixture identity")
+        .wire_identity();
+        for (tool, arguments) in [
+            ("get_symbol", json!({"id": identity})),
+            ("search", json!({"query": "beacon", "scope": "local@cloud"})),
+            ("search", json!({"query": "beacon", "scope": "local@Cloud"})),
+        ] {
+            let request =
+                CallToolRequestParams::new(tool).with_arguments(serde_json::from_value(arguments)?);
+            let refused = proxied
+                .client
+                .call_tool(request)
+                .await
+                .expect_err("an unknown named project never reaches the primary upstream");
+            let ServiceError::McpError(error) = refused else {
+                return Err("a named refusal retains its JSON-RPC error".into());
+            };
+            let error: wire::ErrorData =
+                serde_json::from_value(error.data.ok_or("a refusal retains its wire payload")?)?;
+            assert_eq!(error.code, wire::ErrorCode::InvalidRequest);
+            assert_eq!(error.retry, wire::RetryDirective::Never);
+        }
+        let primary =
+            proxied
+                .client
+                .call_tool(CallToolRequestParams::new("search").with_arguments(
+                    serde_json::from_value(json!({"query": "beacon", "scope": "local"}))?,
+                ))
+                .await?;
+        let primary: rift_protocol::search::SearchResult = serde_json::from_value(
+            primary
+                .structured_content
+                .ok_or("primary search returns structured content")?,
+        )?;
+        assert!(primary.results.is_empty());
+        assert_eq!(primary.pagination.page_index, 0);
+        assert_eq!(primary.pagination.total_pages, 0);
+        let view = primary
+            .view
+            .ok_or("primary search retains its captured view")?;
+        assert_eq!(view.id.as_str(), "claims.primary");
+        assert_eq!(view.expires_at, "2099-01-01T00:00:00Z");
+        let records = drain.queued_records();
+        let completed = records
+            .iter()
+            .filter(|record| record.message() == "tool forward completed")
+            .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(completed.len(), 4);
+        for (fields, tool) in completed[..3]
+            .iter()
+            .zip(["get_symbol", "search", "search"])
+        {
+            let operation = &fields["root_span"];
+            assert_eq!(operation["name"], "mcp.forward");
+            assert_eq!(operation["fields"]["operation"], "tools/call");
+            assert_eq!(operation["fields"]["tool"], tool);
+            assert!(!operation["fields"]["caller_request_id"].is_null());
+            assert_eq!(
+                operation["fields"]["error.type"],
+                errors::mcp::parameter_invalid::SLUG.as_str()
+            );
+            assert_eq!(fields["is_error"], "true");
+        }
+        assert!(completed[3]["root_span"]["fields"]["error.type"].is_null());
+        assert_eq!(completed[3]["is_error"], "false");
+        Ok(())
+    }
+
+    fn named_proxy(root: &std::path::Path, extra_root: &std::path::Path) -> TestResult<RiftProxy> {
+        let mut saved = rift_protocol::configuration::McpConfiguration::default();
+        saved.extra.insert(
+            "cloud".to_owned(),
+            extra_root.to_string_lossy().into_owned(),
+        );
+        let extra = super::extra::Registrations::accept(root, &saved, &[], None)?;
+        Ok(RiftProxy::with_configuration(
+            root,
+            test_identity(),
+            OutputPolicy::All,
+            &rift_protocol::configuration::ServerConfiguration::default(),
+            extra,
+        ))
+    }
+
+    #[tokio::test]
+    async fn named_backend_retains_root_owner_and_independent_connection_state() -> TestResult {
+        let primary = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        let proxy = named_proxy(primary.path(), extra.path())?;
+        let request = CallToolRequestParams::new("search")
+            .with_arguments(serde_json::from_value(json!({"scope": "local@cloud"}))?);
+        let backend = proxy.call_backend(&request)?;
+        assert_eq!(
+            backend.root.as_ref(),
+            extra.path().canonicalize()?.as_path()
+        );
+        assert_eq!(backend.owner, rift_protocol::identity::SymbolOwner::Local);
+        assert!(!Arc::ptr_eq(&proxy.upstream, &backend.upstream));
+        assert!(!Arc::ptr_eq(&proxy.advertised, &backend.advertised));
+        assert_eq!(proxy.forward_budget, backend.forward_budget);
+        assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        assert_eq!(backend.upstream.lock().await.generation_next, 0);
+        assert!(!primary.path().join(".rift").exists());
+        assert!(!extra.path().join(".rift").exists());
+        Ok(())
+    }
+
+    fn assert_named_get(
+        first_value: &serde_json::Value,
+        arguments: &serde_json::Value,
+        proxy: &RiftProxy,
+    ) {
+        assert_eq!(first_value["symbol"]["id"], arguments["id"]);
+        assert_eq!(first_value["declarations"][0]["source"], "fn load() {}");
+        assert_eq!(first_value["declarations"][0]["path"], "lib.rs");
+        assert_eq!(
+            proxy.backends["cloud"].owner,
+            rift_protocol::identity::SymbolOwner::Local
+        );
+    }
+
+    fn assert_named_held_get(
+        held_value: &serde_json::Value,
+        initial_revision: &serde_json::Value,
+        held: &serde_json::Value,
+    ) {
+        assert_eq!(&held_value["view"], initial_revision);
+        assert_eq!(held_value["symbol"]["id"], held["id"]);
+    }
+
+    fn assert_named_walk(initial: &serde_json::Value) {
+        assert_eq!(initial["results"][0]["hit"]["symbol"]["name"], "zulu");
+        assert_eq!(initial["results"][1]["hit"]["symbol"]["name"], "alpha");
+        for (index, name) in ["zulu", "alpha"].into_iter().enumerate() {
+            assert_eq!(
+                initial["results"][index]["hit"]["symbol"]["id"],
+                format!("rift://symbol/local@cloud/rust/app/{name}")
+            );
+            assert_eq!(
+                initial["results"][index]["source"],
+                format!("fn {name}() {{}}")
+            );
+            assert_eq!(initial["results"][index]["path"], "lib.rs");
+            assert_eq!(initial["results"][index]["view"], initial["view"]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_initial_get_keeps_typed_ids_and_original_view_after_extra_root_retargets()
+    -> TestResult {
+        use std::os::unix::fs::symlink;
+        use tokio::io::AsyncWriteExt as _;
+        let primary = tempfile::tempdir()?;
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let registration_path = primary.path().join("extra");
+        symlink(first.path(), &registration_path)?;
+        let mut proxy = named_proxy(primary.path(), &registration_path)?;
+        let backend = proxy.backends.get("cloud").ok_or("accepted backend")?;
+        let (running, upstream) = direct_upstream();
+        {
+            let mut slot = backend.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let expires_at = jiff::Timestamp::now()
+            .checked_add(std::time::Duration::from_secs(600))?
+            .to_string();
+        let answering = tokio::spawn(async move {
+            let (reading, mut writing) = tokio::io::split(upstream);
+            let mut lines = tokio::io::BufReader::new(reading).lines();
+            let mut count = 0;
+            while count < 2 {
+                let line = lines
+                    .next_line()
+                    .await?
+                    .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+                let request: serde_json::Value = serde_json::from_str(&line)?;
+                assert_eq!(
+                    request["params"]["arguments"]["id"],
+                    "rift://symbol/local/rust/app/load"
+                );
+                if count == 0 {
+                    assert_eq!(request["params"]["arguments"]["rev"], "HEAD");
+                } else {
+                    assert!(request["params"]["arguments"].get("rev").is_none());
+                    assert_eq!(request["params"]["arguments"]["view"], "claims.original");
+                }
+                let answer = json!({"content":[],"structuredContent":{
+                    "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function"},
+                    "view":{"id":"claims.original","expires_at":expires_at},
+                    "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"source":"fn load() {}", "source_complete":true,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
+                }});
+                let response = json!({"jsonrpc":"2.0","id":request["id"],"result":answer});
+                writing
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await?;
+                count += 1;
+            }
+            Ok::<_, std::io::Error>(count)
+        });
+        let arguments = json!({"id":"rift://symbol/local@cloud/rust/app/load","rev":"HEAD"});
+        let request = CallToolRequestParams::new("get_symbol")
+            .with_arguments(serde_json::from_value(arguments.clone())?);
+        let first_response = proxy
+            .captured_read(&request)
+            .await?
+            .ok_or("captured request")??;
+        let CallToolResponse::Complete(first_response) = first_response else {
+            return Err("complete result".into());
+        };
+        let first_value = first_response.structured_content.ok_or("typed result")?;
+        assert_named_get(&first_value, &arguments, &proxy);
+        std::fs::remove_file(&registration_path)?;
+        symlink(second.path(), &registration_path)?;
+        let mut held = arguments;
+        held.as_object_mut().ok_or("request object")?.remove("rev");
+        held["view"] = json!("claims.original");
+        // The served revision is a backend request selector, not a rewritten identity.
+        let initial_revision = first_value["view"].clone();
+        let held_request = CallToolRequestParams::new("get_symbol")
+            .with_arguments(serde_json::from_value(held.clone())?);
+        // Keep the same accepted startup root even after the configured symlink changes.
+        assert_eq!(
+            proxy.backends["cloud"].accepted_root.as_deref(),
+            Some(first.path().canonicalize()?.as_path())
+        );
+        let held_response = proxy
+            .captured_read(&held_request)
+            .await?
+            .ok_or("held request")??;
+        let CallToolResponse::Complete(held_response) = held_response else {
+            return Err("complete held result".into());
+        };
+        assert_named_held_get(
+            held_response
+                .structured_content
+                .as_ref()
+                .ok_or("held value")?,
+            &initial_revision,
+            &held,
+        );
+        assert_eq!(answering.await??, 2);
+        proxy.backends = Arc::new(std::collections::BTreeMap::new());
+        assert!(
+            proxy.captured_read(&held_request).await.is_err(),
+            "removed registration cannot retarget an issued view"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn named_initial_walk_keeps_order_source_and_view_after_extra_root_retargets()
+    -> TestResult {
+        use std::os::unix::fs::symlink;
+        use tokio::io::AsyncWriteExt as _;
+        let primary = tempfile::tempdir()?;
+        let first = tempfile::tempdir()?;
+        let second = tempfile::tempdir()?;
+        let registration_path = primary.path().join("walk");
+        symlink(first.path(), &registration_path)?;
+        let mut proxy = named_proxy(primary.path(), &registration_path)?;
+        let backend = proxy.backends.get("cloud").ok_or("accepted backend")?;
+        let (running, upstream) = direct_upstream();
+        {
+            let mut slot = backend.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let expires_at = jiff::Timestamp::now()
+            .checked_add(std::time::Duration::from_secs(600))?
+            .to_string();
+        let answering = tokio::spawn(async move {
+            let (reading, mut writing) = tokio::io::split(upstream);
+            let mut lines = tokio::io::BufReader::new(reading).lines();
+            for count in 0..2 {
+                let line = lines
+                    .next_line()
+                    .await?
+                    .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+                let request: serde_json::Value = serde_json::from_str(&line)?;
+                let arguments = &request["params"]["arguments"];
+                assert_eq!(
+                    arguments["traversal"]["seed"],
+                    "rift://symbol/local/rust/app/load"
+                );
+                assert_eq!(arguments["scope"], "all");
+                assert_eq!(arguments["limit"], 2);
+                assert_eq!(arguments["page_index"], 0);
+                if count == 0 {
+                    assert!(arguments.get("view").is_none());
+                } else {
+                    assert_eq!(arguments["view"], "claims.walk");
+                }
+                let view = json!({"id":"claims.walk", "expires_at":expires_at});
+                let hits: Vec<_> = ["zulu", "alpha"]
+                    .into_iter()
+                    .map(|name| {
+                        json!({"view":view, "hit":{"target":"symbol", "symbol":{
+                        "id":format!("rift://symbol/local/rust/app/{name}"),
+                        "language":"rust", "name":name, "kind":"function"
+                    }}, "source":format!("fn {name}() {{}}"), "path":"lib.rs",
+                    "range":{"start":0,"end":12}, "line":1})
+                    })
+                    .collect();
+                let answer = json!({"content":[], "structuredContent":{
+                    "view":view, "results":hits,
+                    "pagination":{"page_index":0, "total_pages":1}
+                }});
+                let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":answer});
+                writing
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await?;
+            }
+            Ok::<_, std::io::Error>(2)
+        });
+        let mut arguments = json!({"scope":"all", "limit":2,
+        "include":["source"], "traversal":{
+            "seed":"rift://symbol/local@cloud/rust/app/load", "direction":"incoming"
+        }});
+        let initial = CallToolRequestParams::new("search")
+            .with_arguments(serde_json::from_value(arguments.clone())?);
+        let CallToolResponse::Complete(initial) = proxy
+            .captured_read(&initial)
+            .await?
+            .ok_or("captured walk")??
+        else {
+            return Err("complete walk".into());
+        };
+        let initial = initial.structured_content.ok_or("typed walk")?;
+        assert_named_walk(&initial);
+        assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        std::fs::remove_file(&registration_path)?;
+        symlink(second.path(), &registration_path)?;
+        arguments["view"] = json!("claims.walk");
+        let held =
+            CallToolRequestParams::new("search").with_arguments(serde_json::from_value(arguments)?);
+        let CallToolResponse::Complete(continued) =
+            proxy.captured_read(&held).await?.ok_or("held walk")??
+        else {
+            return Err("complete held walk".into());
+        };
+        assert_eq!(continued.structured_content.ok_or("held result")?, initial);
+        assert_eq!(
+            proxy.backends["cloud"].accepted_root.as_deref(),
+            Some(first.path().canonicalize()?.as_path())
+        );
+        assert_eq!(answering.await??, 2);
+        proxy.backends = Arc::new(std::collections::BTreeMap::new());
+        assert!(proxy.captured_read(&held).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_or_conflicting_named_scope_never_leases_a_backend() -> TestResult {
+        let primary = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        let proxy = named_proxy(primary.path(), extra.path())?;
+        let id = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            rift_protocol::read::Language::from_identity_segment("rust").expect("fixture language"),
+            vec!["beacon".to_owned()],
+        )?
+        .wire_identity();
+        for arguments in [
+            json!({"scope":"local@unknown"}),
+            json!({"scope":"local@cloud", "id":id}),
+        ] {
+            let request = CallToolRequestParams::new("search")
+                .with_arguments(serde_json::from_value(arguments)?);
+            let error = proxy
+                .call_backend(&request)
+                .expect_err("unaccepted owner refuses before connection");
+            assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
+        }
+        assert_eq!(proxy.backends.len(), 1);
+        assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        assert_eq!(
+            proxy.backends["cloud"]
+                .upstream
+                .lock()
+                .await
+                .generation_next,
+            0
+        );
+        assert!(!primary.path().join(".rift").exists());
+        assert!(!extra.path().join(".rift").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_adoption_refuses_wrong_root_or_owner_before_connection() -> TestResult {
+        let root = tempfile::tempdir()?;
+        let other = tempfile::tempdir()?;
+        let owner = rift_protocol::identity::SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        };
+        for (recorded_root, recorded_owner) in [
+            (
+                root.path().canonicalize()?,
+                rift_protocol::identity::SymbolOwner::Local,
+            ),
+            (other.path().canonicalize()?, owner.clone()),
+        ] {
+            let mut lock = recorded_lock(1);
+            lock.root = Some(recorded_root);
+            lock.owner = Some(recorded_owner);
+            let refusal = super::adopt_presence_for_owner(
+                root.path(),
+                &owner,
+                crate::election::ServerPresence::Serving(Box::new(lock)),
+                &test_identity(),
+                &mut Replacement::default(),
+            )
+            .await
+            .expect_err("a foreign lock cannot reach the connect or replacement path");
+            assert_eq!(refusal.slug(), errors::mcp::election_storage_failed::SLUG);
+        }
+        assert!(!root.path().join(".rift").exists());
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarding_budget_records_the_registered_error_before_transport_conversion()
+    -> TestResult {
+        use rmcp::ServiceExt as _;
+
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("rift_mcp=debug")
+            .install()?;
+        let directory = tempfile::tempdir()?;
+        std::fs::write(
+            directory.path().join("rift.toml"),
+            "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"1s\"\n",
+        )?;
+        let proxy = RiftProxy::new(directory.path(), test_identity(), OutputPolicy::default());
+        let (running, _upstream_silent) = direct_upstream();
+        {
+            let mut slot = proxy.upstream.lock().await;
+            slot.connected = Some(Upstream {
+                running,
+                generation: 0,
+            });
+            slot.generation_next = 1;
+        }
+        let (proxy_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let (forwarding, client) =
+            tokio::join!(proxy.serve(proxy_transport), ().serve(client_transport));
+        let forwarding = forwarding?;
+        let client = client?;
+        let error = client
+            .call_tool(CallToolRequestParams::new("search"))
+            .await
+            .expect_err("a silent upstream refuses at the forwarding budget");
+        let ServiceError::McpError(error) = error else {
+            return Err("forwarding budget refusal retains its JSON-RPC error".into());
+        };
+        let data: wire::ErrorData =
+            serde_json::from_value(error.data.ok_or("refusal carries its wire payload")?)?;
+        assert_eq!(data.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(data.retry, wire::RetryDirective::SameRequest);
+        let records = drain.queued_records();
+        let completed = records
+            .iter()
+            .find(|record| record.message() == "tool forward completed")
+            .ok_or("operation records its completed refusal")?;
+        let fields: serde_json::Value = serde_json::from_str(completed.fields())?;
+        let operation = &fields["root_span"];
+        assert_eq!(operation["name"], "mcp.forward");
+        assert_eq!(operation["fields"]["operation"], "tools/call");
+        assert_eq!(operation["fields"]["tool"], "search");
+        assert!(!operation["fields"]["caller_request_id"].is_null());
+        assert!(!operation["fields"]["request_id"].is_null());
+        assert_eq!(
+            operation["fields"]["error.type"],
+            errors::mcp::forward_unanswered::SLUG.as_str()
+        );
+        assert_eq!(fields["is_error"], "true");
+        client.cancel().await?;
+        forwarding.cancel().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn all_output_keeps_both_contents_of_a_resource_read() -> TestResult {
         let proxied = proxied_client(OutputPolicy::All).await?;
         let result = proxied
@@ -3308,7 +4160,17 @@ mod tests {
             .client
             .call_tool(CallToolRequestParams::new("search"))
             .await?;
-        assert_eq!(result.structured_content, Some(json!({"results": 0})));
+        let value = result
+            .structured_content
+            .as_ref()
+            .ok_or("structured search result")?;
+        let result_view: rift_protocol::read::SearchResult = serde_json::from_value(value.clone())?;
+        assert!(result_view.results.is_empty());
+        let view = result_view
+            .view
+            .ok_or("search preserves its captured view")?;
+        assert_eq!(view.id.as_str(), "claims.primary");
+        assert_eq!(view.expires_at, "2099-01-01T00:00:00Z");
         assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
         Ok(())
     }
@@ -3362,7 +4224,9 @@ mod tests {
             }))
         })
         .await
-        .expect_err("a holder that never publishes must exhaust the start window");
+        .expect_err("a holder that never publishes must exhaust the start window")
+        .mcp()
+        .tool_error(wire::ErrorPhase::Read);
         drop(recorder);
         let records = drain.queued_records();
         let messages = |message: &str| {
@@ -3431,11 +4295,13 @@ mod tests {
             )
         })
         .await
-        .expect_err("a holder that never publishes must exhaust the start window");
+        .expect_err("a holder that never publishes must exhaust the start window")
+        .mcp()
+        .tool_error(wire::ErrorPhase::Read);
         drop(recorder);
 
         assert_eq!(asked, 3, "the terminal third ask ends the asking");
-        assert_eq!(refusal.code, rmcp::model::ErrorCode::INTERNAL_ERROR);
+        assert_operator_refusal(&refusal);
         let records = drain.queued_records();
         let closed = records
             .iter()
@@ -3651,8 +4517,15 @@ mod tests {
                 record.message() == "recorded server did not answer; treating the lock as stale"
             })
             .ok_or("the failed connect is recorded")?;
-        let fields = stale.fields();
-        assert!(fields.contains("\"detail\""), "{fields}");
+        let fields: serde_json::Value = serde_json::from_str(stale.fields())?;
+        let failure = fields["failure"]
+            .as_str()
+            .ok_or("stale connect failure is recorded")?;
+        assert!(
+            failure.contains("MCP proxy initialization failed"),
+            "{failure}"
+        );
+        assert!(failure.contains("Send message error"), "{failure}");
         closing.abort();
         Ok(())
     }
@@ -3790,7 +4663,7 @@ mod tests {
 
         let response = answered
             .client
-            .call_tool_once(CallToolRequestParams::new("search"))
+            .call_tool_once(CallToolRequestParams::new("nodes"))
             .await?;
 
         assert!(
@@ -3814,7 +4687,7 @@ mod tests {
         let client = &answered.client;
 
         let called = client
-            .call_tool_once(CallToolRequestParams::new("search"))
+            .call_tool_once(CallToolRequestParams::new("nodes"))
             .await;
         let read = client
             .read_resource_once(ReadResourceRequestParams::new(TWO_CONTENT_URI))

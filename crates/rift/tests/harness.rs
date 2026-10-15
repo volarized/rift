@@ -1792,6 +1792,7 @@ async fn proxied_result_within(
     call_arguments: &serde_json::Value,
     timeout: Duration,
 ) -> TestResult<CallToolResult> {
+    let mut refused = None;
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         let params = CallToolRequestParams::new(name).with_arguments(arguments(call_arguments)?);
         let called = match tokio::time::timeout(timeout, client.call_tool(params))
@@ -1805,17 +1806,26 @@ async fn proxied_result_within(
                     .as_ref()
                     .is_some_and(|data| data.get("retry") == Some(&json!("same_request"))) =>
             {
+                refused = Some(format!("{error:?}"));
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
-        if called.is_error != Some(true)
-            || tool_failure(&called)?.retry != RetryDirective::SameRequest
-        {
+        if called.is_error != Some(true) {
             return Ok(called);
         }
+        let failure = tool_failure(&called)?;
+        if failure.retry != RetryDirective::SameRequest {
+            return Ok(called);
+        }
+        refused = Some(failure.text);
     }
-    Err(format!("the server kept refusing {name}").into())
+    Err(format!(
+        "the server kept refusing {name} through {ACCEPTANCE_ATTEMPTS_MAX} attempts; \
+         the last refusal: {}",
+        refused.unwrap_or_default()
+    )
+    .into())
 }
 
 /// The facts of one failed tool call, read from its error text.

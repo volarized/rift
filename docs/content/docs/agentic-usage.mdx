@@ -63,7 +63,7 @@ The generated `SKILL.md` carries a decision table pointing the agent at the tool
 its situation:
 
 - [`search`](/docs/mcp#tool-search) answers when the target is unknown.
-- [`get_symbol`](/docs/mcp#tool-get_symbol) answers when the declaration name is known.
+- [`get_symbol`](/docs/mcp#tool-get_symbol) reads one exact symbol identity returned by search.
 - [`nodes`](/docs/mcp#tool-nodes) answers when the syntax structure at one position is
   needed.
 - `search` with a `traversal` block answers a symbol's neighbors, its impact (who breaks when it
@@ -103,7 +103,7 @@ indexes, and a session whose tool set lists neither runs `grep`, `rg`, or `find`
 Claude Code runs `rift steer` before every `Grep`, `Glob`, and `Bash` call and pipes it the tool
 call as JSON on stdin. In a workspace Rift has indexed and version control tracks, the first
 search call of a session is denied: the reason names the [`search`](/docs/mcp#tool-search) call
-that answers the same question, [`get_symbol`](/docs/mcp#tool-get_symbol) for a known name,
+that answers the same question, [`get_symbol`](/docs/mcp#tool-get_symbol) for an established symbol identity,
 and [`rift://map`](/docs/mcp#resource-map) for orientation.
 
 The suggested call carries the agent's own search:

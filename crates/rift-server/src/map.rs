@@ -370,12 +370,15 @@ fn entry_points(graph: &NormalizedGraph) -> Vec<SymbolId> {
 /// record cannot be assembled - no established identity, or no provider ever contributed
 /// portable facts for it - is skipped
 /// rather than reported with a guessed kind; ranking continues past it toward the next
-/// candidate, bounded by the same reference graph the tally already walked once.
+/// candidate, bounded by the established records and reference graph the tally walks once.
 fn hubs(
     graph: &NormalizedGraph,
     records_by_identity: &BTreeMap<&CoreSymbolId, &SymbolRecord>,
 ) -> Vec<MapHub> {
-    let mut reference_counts: BTreeMap<CoreSymbolId, u64> = BTreeMap::new();
+    let mut reference_counts: BTreeMap<CoreSymbolId, u64> = records_by_identity
+        .keys()
+        .map(|identity| ((*identity).clone(), 0))
+        .collect();
     for reference in graph.references() {
         for target in reference.targets() {
             if let NormalizedTarget::Symbol(identity) = target {
@@ -1022,6 +1025,51 @@ mod tests {
         ] {
             assert!(value.get(field).is_none(), "field={field}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_map_keeps_declarations_with_no_references() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir_all(directory.path().join("src"))?;
+        fs::write(
+            directory.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )?;
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )?;
+        let map = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?
+        .workspace_map();
+
+        assert!(map.entry_points.is_empty());
+        assert_eq!(map.hubs.len(), 2);
+        assert!(map.hubs.iter().all(|hub| hub.references == 0));
+        assert!(
+            map.hubs
+                .windows(2)
+                .all(|pair| pair[0].symbol.0 < pair[1].symbol.0)
+        );
+        let names = map
+            .hubs
+            .iter()
+            .map(|hub| {
+                let identity = rift_protocol::identity::SymbolIdentity::parse(&hub.symbol.0)?;
+                assert_eq!(
+                    identity.owner(),
+                    &rift_protocol::identity::SymbolOwner::Local
+                );
+                Ok(identity.qualified_path().last().cloned())
+            })
+            .collect::<TestResult<Vec<_>>>()?;
+        assert_eq!(names, [Some("alpha".to_owned()), Some("beta".to_owned())]);
         Ok(())
     }
 

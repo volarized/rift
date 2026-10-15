@@ -13,6 +13,7 @@ use crate::failure::{McpErrorExt as _, WireFailure as _};
 
 fn search_answer() -> SearchResult {
     SearchResult {
+        view: None,
         results: Vec::new(),
         pagination: Pagination {
             page_index: 0,

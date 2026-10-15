@@ -132,7 +132,7 @@ jobs:
           R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY: ${{ secrets.R2_BUILD_CACHE_WRITE_SECRET_ACCESS_KEY }}
         run: uv run --locked --project dev rift-dev build-cache
 
-      - run: uv run --locked --project dev pre-commit run --all-files
+      - run: uv run --locked --project dev pre-commit run --all-files --show-diff-on-failure
         timeout-minutes: 30
       - run: just audit
         timeout-minutes: 1
@@ -284,6 +284,19 @@ jobs:
         timeout-minutes: 10
         env:
           NEXTEST_PROFILE: ci
+      - name: Measure retained material accounting
+        if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
+        timeout-minutes: 5
+        run: |
+          RIFT_RETAINED_MATERIAL_ROOT="$(uv run --locked --project dev rift-dev corpus sync bun)"
+          export RIFT_RETAINED_MATERIAL_ROOT
+          uv run --locked --project dev rift-dev test nextest run \
+            --workspace-remap . \
+            --cargo-metadata target/llvm-cov-target/target/nextest/cargo-metadata.json \
+            --binaries-metadata target/llvm-cov-target/target/nextest/binaries-metadata.json \
+            --target-dir-remap target/llvm-cov-target/target \
+            --profile corpus --no-tests fail --run-ignored all \
+            -E 'test(=read::canonical::tests::captured_preparation_views_measure_shared_accounting_cost)'
       - name: Preserve Rust coverage and test results
         if: ${{ !cancelled() && steps.rust_tests.outcome != 'skipped' }}
         uses: actions/upload-artifact@v7.0.1
@@ -292,8 +305,10 @@ jobs:
           path: |
             lcov.info
             target/nextest/ci/junit.xml
+            target/nextest/corpus/junit.xml
             target/nextest/ci/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
 
@@ -381,6 +396,7 @@ jobs:
             target/nextest/live/junit.xml
             target/nextest/live/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
 
@@ -436,6 +452,7 @@ jobs:
             target/nextest/live/junit.xml
             target/nextest/live/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
 
@@ -584,6 +601,7 @@ jobs:
             target/nextest/${{ matrix.profile || 'ci' }}/junit.xml
             target/nextest/${{ matrix.profile || 'ci' }}/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: error
           retention-days: 7
       # The parent launches its ignored child probe with the fixture environment.
@@ -827,6 +845,7 @@ jobs:
             target/nextest/corpus/junit.xml
             target/nextest/corpus/failure-windows/
             target/integration/nextest/
+            !target/integration/nextest/**/archive/**
           if-no-files-found: warn
           retention-days: 7
 

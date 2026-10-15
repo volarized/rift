@@ -36,7 +36,10 @@ pub const FUSION_K_MIN: u64 = 1;
 pub const FUSION_K_MAX: u64 = 1_000;
 
 /// Which ranking produced an ordered list.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum RankingInputKind {
     /// Identifiers the caller's query carried, matched against indexed names.
     Identifier,
@@ -118,7 +121,8 @@ impl FromIterator<RankingInputKind> for RankingInputSet {
 
 /// One identity an input ranked, the fields that placed it, and, for a row holding
 /// file text, which bytes of its file that row holds.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RankedIdentity {
     identity: DocumentIdentity,
     fields: FieldSet,
@@ -169,6 +173,13 @@ impl RankedIdentity {
     #[must_use]
     pub const fn fields(&self) -> FieldSet {
         self.fields
+    }
+
+    /// Places the same match evidence under a captured document identity.
+    #[must_use]
+    pub fn with_identity(mut self, identity: DocumentIdentity) -> Self {
+        self.identity = identity;
+        self
     }
 }
 
@@ -353,6 +364,17 @@ pub struct FusedCandidate {
 }
 
 impl FusedCandidate {
+    /// Retains the identity and match evidence for another ranking input.
+    #[must_use]
+    pub fn ranked_identity(&self) -> RankedIdentity {
+        RankedIdentity {
+            identity: self.identity.clone(),
+            fields: self.fields,
+            file_range: self.file_range.clone(),
+            identifier_match: self.identifier_match,
+        }
+    }
+
     /// Whether an original identifier equality placed this candidate.
     fn is_original_identifier_match(&self) -> bool {
         self.identifier_match
@@ -435,6 +457,33 @@ pub struct RankedCandidates {
 }
 
 impl RankedCandidates {
+    /// Projects one input's existing order without combining it with another input.
+    ///
+    /// Readers use this order to resolve candidate payloads before a combined search.
+    /// The input already carries its work bound. Its fields, file rows and identifier
+    /// comparisons survive projection; fusion assigns the final order and scores later.
+    #[must_use]
+    pub fn input(input: &RankingInput, phase: QueryPhase) -> Self {
+        let candidates = input
+            .order
+            .iter()
+            .map(|ranked| FusedCandidate {
+                identity: ranked.identity.clone(),
+                fused: 0.0,
+                score: 0.0,
+                inputs: RankingInputSet::of(input.kind),
+                fields: ranked.fields,
+                phase,
+                file_range: ranked.file_range.clone(),
+                identifier_match: ranked.identifier_match,
+            })
+            .collect();
+        Self {
+            candidates,
+            truncated_at: None,
+        }
+    }
+
     /// The empty answer.
     #[must_use]
     pub const fn empty() -> Self {
@@ -741,6 +790,36 @@ mod tests {
 
     fn weights() -> RankingWeights {
         RankingWeights::new(0.35, 0.35, 0.30, 60).expect("weights must be accepted")
+    }
+
+    #[test]
+    fn candidate_input_keeps_order_and_match_evidence_until_combined_fusion() {
+        let matched = crate::identifier_match("alpha", "alpha", "alpha")
+            .expect("original identifier spelling matches");
+        let alpha = RankedIdentity::new(identity("alpha"), FieldSet::of(SearchableField::Name))
+            .with_identifier_match(matched)
+            .with_file_range(4..16);
+        let input = RankingInput::new(
+            RankingInputKind::Identifier,
+            vec![
+                RankedIdentity::new(identity("beta"), FieldSet::of(SearchableField::Name)),
+                alpha.clone(),
+            ],
+        );
+        let projected = RankedCandidates::input(&input, QueryPhase::Precise);
+        assert_eq!(identities(&projected), ["beta", "alpha"]);
+        assert_eq!(projected.candidates()[1].ranked_identity(), alpha);
+        let restored = RankingInput::new(
+            input.kind(),
+            projected
+                .candidates()
+                .iter()
+                .map(FusedCandidate::ranked_identity)
+                .collect(),
+        );
+        let ranked = fuse(&[restored], weights(), QueryPhase::Precise, 2);
+        assert_eq!(identities(&ranked), ["alpha", "beta"]);
+        assert_eq!(ranked.candidates()[0].file_range(), Some(&(4..16)));
     }
 
     /// One lexical answer in exactly `values`' order, the file rows holding `0..64` of

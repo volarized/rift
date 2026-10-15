@@ -16,6 +16,10 @@ pub const SOURCE_POSITION_MAX: u64 = 2_147_483_647;
 /// Reads a source unit or a byte range without requiring a semantic symbol.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.67"))]
+#[schemars(extend("examples" = [
+    {"unit": "rift://source/project/src/lib.rs"}
+]))]
 pub struct GetSourceParams {
     /// Canonical source unit, retaining its physical package or runtime owner.
     pub unit: SourceUnitId,
@@ -33,6 +37,11 @@ pub struct GetSourceParams {
 /// Source bytes, definite absence, or explicit selection unavailability.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+#[schemars(extend("examples" = [{
+    "outcome": "unavailable",
+    "unit": "rift://source/project/src/lib.rs",
+    "reason": "insufficient_coverage"
+}]))]
 pub enum GetSourceResult {
     /// The selected unit exists, including when its requested range is empty.
     Found {

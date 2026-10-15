@@ -1014,6 +1014,114 @@ impl<K: Clone + Ord, V: Clone> PerKeyCache<K, V> {
     }
 }
 
+impl get_size2::GetSize for StagePath {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.0, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for StageDescriptor {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.path, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.component, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.inputs, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for StageNode {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.path, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.component, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.inputs, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for ProviderComposition {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.id, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.stages, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.nodes, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

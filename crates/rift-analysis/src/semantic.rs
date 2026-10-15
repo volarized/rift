@@ -69,6 +69,9 @@ pub struct BuiltSemantics {
     pub refused_contributions: Vec<(ProjectPath, RiftError)>,
 }
 
+type ExternalTarget<'input> =
+    dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
+
 impl WorkspaceSemantics {
     /// Builds one syntax publication and one normalized graph over one file set.
     ///
@@ -178,6 +181,7 @@ impl WorkspaceSemantics {
             revision,
             previous,
             true,
+            None,
         )
     }
 
@@ -219,6 +223,25 @@ impl WorkspaceSemantics {
             revision,
             previous,
             false,
+            None,
+        )
+    }
+
+    pub(crate) fn build_facts_placed_with_external(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        relationships_max: usize,
+        revision: u64,
+        external: &dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        Self::build_facts_placed_inner(
+            documents,
+            declarations_max,
+            relationships_max,
+            revision,
+            None,
+            false,
+            Some(external),
         )
     }
 
@@ -229,6 +252,7 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
         collect_refused_contributions: bool,
+        external: Option<&ExternalTarget<'_>>,
     ) -> Result<BuiltSemantics, RiftError> {
         let index_revision = IndexRevision::new(revision)?;
         let source_revision = SourceRevision::new(revision)?;
@@ -281,13 +305,22 @@ impl WorkspaceSemantics {
         }
         let publication = builder.build()?;
         let publications = Arc::new(PublicationSet::empty(limits).replaced(publication)?);
-        let graph = Normalizer::normalize(
-            index_revision,
-            source_revision,
-            tree_revision,
-            &publications,
-            previous,
-        )?;
+        let graph = match external {
+            Some(external) => Normalizer::normalize_with(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &publications,
+                external,
+            )?,
+            None => Normalizer::normalize(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &publications,
+                previous,
+            )?,
+        };
         let relationships = RelationshipStore::build_capped(&graph, relationships_max);
         Ok(BuiltSemantics {
             semantics: Self {
@@ -361,6 +394,36 @@ impl WorkspaceSemantics {
             record,
             std::slice::from_ref(&self.syntax_provider),
         )
+    }
+}
+
+impl get_size2::GetSize for WorkspaceSemantics {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.graph, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.syntax_provider, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
     }
 }
 

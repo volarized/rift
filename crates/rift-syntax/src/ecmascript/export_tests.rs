@@ -32,7 +32,23 @@ fn ambient_modules_keep_literal_scope_and_commonjs_exports_keep_statement_ranges
         .iter()
         .find(|symbol| symbol.kind == "namespace")
         .expect("ambient module");
-    assert_eq!(module.node_kind, Some("ambient_declaration"));
+    assert_eq!(module.node_kind, Some("module"));
+    let declaration = document
+        .nodes()
+        .iter()
+        .find(|node| node.kind == "module" && node.range == module.item_range)
+        .expect("original module declaration node");
+    let statement = document
+        .nodes()
+        .get(declaration.parent.expect("ambient parent"))
+        .expect("original ambient statement");
+    assert_eq!(statement.kind, "ambient_declaration");
+    assert_eq!(token(types, Some(module.range)), Some(types.trim_end()));
+    assert_eq!(token(types, Some(statement.range)), Some(types.trim_end()));
+    assert_eq!(
+        token(types, Some(module.item_range)),
+        Some("module \"fs\" { export function readFile(path: string): void; }"),
+    );
     assert_eq!(token(types, module.name_range), Some("\"fs\""));
     let binding = &document.facts().export_bindings().expect("exports")[0];
     assert_eq!(

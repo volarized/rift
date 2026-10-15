@@ -49,6 +49,10 @@ async fn the_map_resource_answers_revision_languages_modules_and_entry_points() 
     let (_directory, client, server_task) = served_workspace(
         &[
             (
+                "Cargo.toml",
+                "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"src/lib.rs\"\n",
+            ),
+            (
                 "src/lib.rs",
                 "pub fn beacon() {}\nfn main() { beacon(); }\n",
             ),
@@ -86,11 +90,13 @@ async fn the_map_resource_answers_revision_languages_modules_and_entry_points() 
         "modules name directories, not files: {body:#}"
     );
 
-    assert_eq!(
-        body["entry_points"],
-        serde_json::json!(["rift://symbol/rust/src/lib.rs/main"]),
-        "{body:#}"
-    );
+    let main = rift_protocol::identity::SymbolIdentity::new(
+        rift_protocol::identity::SymbolOwner::Local,
+        rift_protocol::read::Language::from_identity_segment("rust")?,
+        vec!["probe".to_owned(), "main".to_owned()],
+    )?
+    .wire_identity();
+    assert_eq!(body["entry_points"], serde_json::json!([main]), "{body:#}");
     assert_eq!(
         body["docs"],
         serde_json::json!(["docs/guide.md"]),
@@ -218,6 +224,13 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
             {
                 "manager": "cargo",
                 "name": "serde",
+                "requirement": "1.0.228",
+                "availability": "registry_unresolved"
+            },
+            {
+                "manager": "cargo",
+                "name": "serde",
+                "registry": "crates.io",
                 "version": "1.0.228",
                 "availability": "canonical"
             },
@@ -237,15 +250,19 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
     )?;
     // A tool call captures the tree and waits for the publication that indexes it; the
     // map is computed for that same publication.
-    let request =
-        workspace_client::tool_request("get_symbol", &serde_json::json!({ "name": "beacon" }));
+    let request = workspace_client::tool_request(
+        "search",
+        &serde_json::json!({ "query": "beacon", "target": "symbol" }),
+    );
     let lookup = client.call_tool(request).await?;
+    assert_ne!(lookup.is_error, Some(true), "{lookup:#?}");
 
     let body = resource_body(&client, "rift://map").await?;
     let names: Vec<&str> = body["packages"]
         .as_array()
         .ok_or("map packages are an array")?
         .iter()
+        .filter(|package| package["availability"] == "canonical")
         .filter_map(|package| package["name"].as_str())
         .collect();
     assert_eq!(

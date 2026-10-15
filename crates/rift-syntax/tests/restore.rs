@@ -32,6 +32,8 @@ fn parts(facts: &SyntaxFacts) -> SyntaxFactsParts {
         left_out_declarations: facts.left_out_declaration_count(),
         markdown_facts: facts.markdown_facts().cloned(),
         export_bindings: facts.export_bindings().map(<[_]>::to_vec),
+        macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
+        scope: facts.scope().map(<[_]>::to_vec),
         source_digest: *facts.source_digest().expect("source witness"),
     }
 }
@@ -950,4 +952,1082 @@ fn retained_namespace_export_bindings_resolve_original_container_facts() {
             .as_str(),
         "rift.syntax.facts_reference_invalid"
     );
+}
+
+#[test]
+fn retained_source_whitespace_roundtrips_without_portable_identity() {
+    for whitespace in ["\n", "\r", "\t", "\u{000c}"] {
+        let source = format!(
+            ".first,{whitespace}.second {{ color: red; }}\n.neighbor {{ display: block; }}\n"
+        );
+        let document = parsed(ShippedLanguage::Css, &source);
+        assert!(!document.has_errors());
+        let facts = document.facts();
+        let retained = facts
+            .left_out_symbols()
+            .iter()
+            .find(|symbol| symbol.kind == "selector")
+            .expect("original selector with source whitespace");
+        assert!(retained.name.contains(whitespace));
+        assert!(!rift_core::is_portable_name(&retained.name));
+        assert!(rift_protocol::read::symbol_name_is_retained(
+            &retained.name,
+            source.len()
+        ));
+        let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(facts))
+            .expect("original retained selectors and child containers restore");
+        assert_eq!(&restored, facts);
+        assert!(
+            restored
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == ".neighbor")
+        );
+        for control in ['\0', '\u{000b}', '\u{007f}'] {
+            let mut invalid = parts(facts);
+            invalid.left_out_symbols[0].name.push(control);
+            assert_eq!(
+                SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+                    .expect_err("non-whitespace controls remain refused")
+                    .slug()
+                    .as_str(),
+                "rift.syntax.facts_name_invalid"
+            );
+        }
+        let mut invalid = parts(facts);
+        invalid
+            .left_out_symbols
+            .iter_mut()
+            .find(|symbol| symbol.container.is_some())
+            .expect("original child container")
+            .container = Some("absent\nparent".to_owned());
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), invalid)
+                .expect_err("control-containing missing parent remains refused")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_name_invalid"
+        );
+    }
+}
+
+#[test]
+fn rust_macro_invocations_keep_original_top_level_ranges_and_unknown_state() {
+    let source = "macro_rules! cfg_rt { ($($item:item)*) => { $( #[cfg(feature = \"rt\")] $item )* } }\ncfg_rt! { pub mod runtime; }\nmod nested { cfg_rt! { pub mod hidden; } }\npub fn neighbor() {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured Rust invocations");
+    assert_eq!(invocations.len(), 1);
+    let invocation = invocations[0].0;
+    assert_eq!(
+        &source[usize::try_from(invocation.start).expect("start")
+            ..usize::try_from(invocation.end).expect("end")],
+        "cfg_rt! { pub mod runtime; }"
+    );
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("captured macro ranges restore");
+    assert_eq!(&restored, document.facts());
+    assert!(
+        restored
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == "neighbor")
+    );
+    let known_heap = get_size2::GetSize::get_heap_size(&restored);
+    let invocation_heap = get_size2::GetSize::get_heap_size(&captured.macro_invocations);
+    assert!(
+        invocation_heap > 0,
+        "captured invocation ranges own material"
+    );
+    let mut unknown = captured;
+    unknown.macro_invocations = None;
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+        .expect("old unrecorded ranges remain unknown");
+    assert_eq!(restored.macro_invocations(), None);
+    assert_eq!(
+        known_heap,
+        get_size2::GetSize::get_heap_size(&restored).saturating_add(invocation_heap),
+        "retained syntax charge includes every captured invocation allocation"
+    );
+    let plain = parsed(ShippedLanguage::Rust, "pub fn neighbor() {}\n");
+    assert_eq!(plain.facts().macro_invocations(), Some([].as_slice()));
+    let foreign = parsed(ShippedLanguage::Python, "def neighbor(): pass\n");
+    assert_eq!(foreign.facts().macro_invocations(), None);
+    for (source, state) in [
+        ("#[macro_use]\n#[doc(hidden)]\nmod macros;\n", 0),
+        ("#[macro_use]\n#[doc(hidden)]\nmod macros;", 0),
+        ("mod macros;", 0),
+        ("#[macro_use]\n#[path = \"actual.rs\"]\nmod macros;\n", 1),
+        ("#[macro_use]\n#[unknown]\nmod macros;\n", 2),
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        let symbol = &document.facts().symbols()[0];
+        assert_eq!(symbol.node_kind, Some("mod_item"));
+        assert_eq!(symbol.body_range, None);
+        assert_eq!(
+            &source[usize::try_from(symbol.item_range.start).expect("item start")
+                ..usize::try_from(symbol.item_range.end).expect("item end")],
+            "mod macros;",
+        );
+        let path = symbol.module_path.as_ref();
+        match state {
+            0 => assert_eq!(path, Some(&rift_syntax::RustModulePath::Absent)),
+            1 => assert!(matches!(
+                path,
+                Some(rift_syntax::RustModulePath::Literal { .. })
+            )),
+            _ => assert_eq!(path, Some(&rift_syntax::RustModulePath::Unknown)),
+        }
+        let restored =
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+                .expect("captured module attributes restore");
+        assert_eq!(&restored, document.facts());
+    }
+}
+
+#[test]
+fn rust_macro_invocation_restore_refuses_invalid_ranges_language_and_count() {
+    let source = "// 灯\ncfg_rt! { pub mod runtime; }\ncfg_rt! { pub mod fs; }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let ranges = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured invocations");
+    assert_eq!(ranges.len(), 2);
+    let first = ranges[0].clone();
+    for mutation in 0..6 {
+        let mut invalid = captured.clone();
+        let ranges = invalid.macro_invocations.as_mut().expect("captured ranges");
+        match mutation {
+            0 => ranges[0].0.end = ranges[0].0.start,
+            1 => ranges[1].0.start = ranges[0].0.end - 1,
+            2 => ranges.swap(0, 1),
+            3 => ranges[0].0.start = 4,
+            4 => ranges[1].0.end = u64::try_from(source.len() + 1).expect("source bound"),
+            _ => invalid.language = ShippedLanguage::Python.language(),
+        }
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err());
+    }
+    let mut overbound = captured;
+    overbound.macro_invocations = Some(vec![first; 2]);
+    let limits = SyntaxLimits::new(source.len(), 1, 100).expect("positive limits");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, overbound).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG)
+    );
+}
+
+#[test]
+fn rust_macro_direct_tokens_keep_original_ranges_unknown_empty_and_charge() {
+    let source = "cfg_rt! { pub mod runtime; use crate::time::Instant; #[derive(Debug)] enum Timer { Value } impl Timer { fn poll<'a>(&'a self) { let x = '}'; let y = '\\\''; let raw = r##\"} fake! {}\"##; 'again: loop { break 'again; } } } }\ncfg_rt! {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured invocations");
+    assert_eq!(invocations.len(), 2);
+    let direct = invocations[0].2.as_ref().expect("complete direct tokens");
+    let expected = document
+        .nodes()
+        .iter()
+        .filter(|node| {
+            node.parent
+                .and_then(|parent| document.nodes().get(parent))
+                .is_some_and(|parent| {
+                    parent.kind == "token_tree"
+                        && parent
+                            .parent
+                            .and_then(|parent| document.nodes().get(parent))
+                            .is_some_and(|parent| parent.range == invocations[0].0)
+                })
+        })
+        .map(|node| node.range)
+        .collect::<Vec<_>>();
+    assert_eq!(direct, &expected);
+    assert!(direct.iter().any(|range| &source
+        [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+        == "runtime"));
+    assert_eq!(invocations[1].2.as_deref(), Some([].as_slice()));
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("original complete ranges restore");
+    assert_eq!(&restored, document.facts());
+    let mut unknown = captured;
+    let rows = unknown.macro_invocations.as_mut().expect("captured rows");
+    let owned = rows[0].2.take().expect("owned direct ranges");
+    let charge = get_size2::GetSize::get_heap_size(&Some(owned));
+    let unknown = SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+        .expect("old unknown direct ranges remain unknown");
+    assert_eq!(unknown.macro_invocations().expect("rows")[0].2, None);
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&restored),
+        get_size2::GetSize::get_heap_size(&unknown).saturating_add(charge)
+    );
+}
+
+#[test]
+fn rust_macro_direct_tokens_refuse_missing_split_group_and_bound_witnesses() {
+    let source = "cfg_rt! { pub mod runtime; use crate::time; impl Timer { fn value() {} } }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let direct = captured.macro_invocations.as_ref().expect("rows")[0]
+        .2
+        .as_ref()
+        .expect("complete direct ranges");
+    let identifier = direct
+        .iter()
+        .position(|range| {
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")]
+                == "runtime"
+        })
+        .expect("module identifier");
+    let group = direct
+        .iter()
+        .position(|range| source.as_bytes()[usize::try_from(range.start).expect("start")] == b'{')
+        .expect("implementation group");
+    for mutation in 0..6 {
+        let mut invalid = captured.clone();
+        let ranges = invalid.macro_invocations.as_mut().expect("rows")[0]
+            .2
+            .as_mut()
+            .expect("direct rows");
+        match mutation {
+            0 => {
+                ranges.remove(identifier);
+            }
+            1 => {
+                ranges.remove(group);
+            }
+            2 => ranges.clear(),
+            3 => ranges[identifier].end -= 1,
+            4 => ranges[identifier].start = 0,
+            _ => ranges.swap(0, 1),
+        }
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+                .map_err(|error| error.slug()),
+            Err(if mutation == 5 {
+                errors::syntax::facts_order_invalid::SLUG
+            } else {
+                errors::syntax::facts_range_invalid::SLUG
+            })
+        );
+    }
+    let count = captured
+        .macro_invocations
+        .as_ref()
+        .expect("rows")
+        .iter()
+        .map(|(_, modules, direct)| 1 + modules.len() + direct.as_ref().map_or(0, Vec::len))
+        .sum::<usize>();
+    let limits = SyntaxLimits::new(source.len(), count - 1, 100).expect("positive limits");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, captured).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG)
+    );
+}
+
+#[test]
+fn rust_macro_direct_tokens_distinguish_literals_comments_and_invalid_groups() {
+    for body in [
+        "impl Timer { fn poll<'a>(&'a self) { 'again: loop { break 'again; } } }",
+        "const VALUE: char = '}'; const QUOTE: char = '\\\''; const BYTE: u8 = b'}';",
+        "const VALUE: &str = r##\"} /* not comment */ fake! {}\"##;",
+        "// named comment\nimpl Timer { /* comment } */ fn value() {} }",
+    ] {
+        let source = format!("cfg_rt! {{ {body} }}");
+        let document = parsed(ShippedLanguage::Rust, &source);
+        let captured = parts(document.facts());
+        assert!(
+            captured.macro_invocations.as_ref().expect("rows")[0]
+                .2
+                .is_some(),
+            "complete original body: {body}"
+        );
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured)
+                .expect("original literal ranges restore"),
+            *document.facts()
+        );
+    }
+    let document = parsed(
+        ShippedLanguage::Rust,
+        "cfg_rt! { impl Timer { fn value() {} }",
+    );
+    assert!(document.has_errors());
+    assert!(
+        document
+            .facts()
+            .macro_invocations()
+            .is_some_and(|rows| rows.iter().all(|(_, _, direct)| direct.is_none()))
+    );
+}
+
+#[test]
+fn rust_scope_preserves_original_root_and_module_children() {
+    let source = "#![allow(dead_code)]\nextern crate core;\nuse core::fmt;\nmacro_rules! cfg_rt { ($($item:item)*) => { $($item)* }; }\nmod client {\n#[derive(Debug)]\nstruct Client;\nuse super::fmt;\n}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let scopes = document.facts().scope().expect("original Rust scopes");
+    assert_eq!(scopes.len(), 2);
+    for (range, children) in scopes {
+        let (parent, _) = document
+            .nodes()
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                node.range == *range && matches!(node.kind, "source_file" | "declaration_list")
+            })
+            .expect("original scope node");
+        let original = document
+            .nodes()
+            .iter()
+            .filter(|node| node.parent == Some(parent))
+            .map(|node| node.range)
+            .collect::<Vec<_>>();
+        assert_eq!(children.as_ref(), Some(&original));
+    }
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("complete original scopes restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn rust_scope_omitted_imports_attributes_and_definitions_are_refused() {
+    let source = "#![allow(dead_code)]\nextern crate core;\nuse core::fmt;\nmacro_rules! cfg_rt { ($($item:item)*) => { $($item)* }; }\nmod client {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let original = captured.scope.as_ref().expect("scopes")[0]
+        .1
+        .as_ref()
+        .expect("root children");
+    assert_eq!(original.len(), 5);
+    for index in 0..original.len() {
+        let mut invalid = captured.clone();
+        invalid.scope.as_mut().expect("scopes")[0]
+            .1
+            .as_mut()
+            .expect("root children")
+            .remove(index);
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+                .expect_err("omitted original scope effect")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_range_invalid"
+        );
+    }
+}
+
+#[test]
+fn rust_scope_unknown_and_empty_remain_distinct() {
+    for source in ["", "mod client {}\n"] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        let captured = parts(document.facts());
+        assert!(captured.scope.as_ref().is_some_and(|rows| !rows.is_empty()));
+        assert!(
+            captured
+                .scope
+                .as_ref()
+                .expect("scopes")
+                .last()
+                .expect("scope")
+                .1
+                .as_ref()
+                .is_some_and(Vec::is_empty)
+        );
+        let mut unknown = captured.clone();
+        unknown.scope = None;
+        assert!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+                .expect("older unknown scope")
+                .scope()
+                .is_none()
+        );
+        let mut unknown = captured.clone();
+        unknown.scope.as_mut().expect("scopes")[0].1 = None;
+        assert!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+                .expect("unknown direct children")
+                .scope()
+                .expect("scope rows")[0]
+                .1
+                .is_none()
+        );
+        let mut absent = captured;
+        absent.scope = Some(Vec::new());
+        assert!(SyntaxFacts::from_parts(source, SyntaxLimits::default(), absent).is_err());
+    }
+    let source = "mod client { use core::; }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(document.has_errors());
+    let mut invalid = parts(document.facts());
+    invalid.scope.as_mut().expect("original scopes")[0].1 = Some(Vec::new());
+    assert_eq!(
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+            .expect_err("parser errors cannot prove complete scope children")
+            .slug()
+            .as_str(),
+        "rift.syntax.facts_structure_invalid"
+    );
+    assert!(
+        document
+            .facts()
+            .scope()
+            .expect("original scopes")
+            .iter()
+            .any(|(_, children)| children.is_none())
+    );
+}
+
+#[test]
+fn rust_scope_restore_refuses_wrong_ownership_ranges_and_bounds() {
+    let source = "mod client { mod nested {} } fn call() {}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    assert_eq!(captured.scope.as_ref().expect("scopes").len(), 3);
+    for mutation in 0..6 {
+        let mut invalid = captured.clone();
+        let rows = invalid.scope.as_mut().expect("scope rows");
+        match mutation {
+            0 => rows[0].0.start = 1,
+            1 => {
+                rows[1].0 = document
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.name == "call")
+                    .expect("function")
+                    .body_range
+                    .expect("function body");
+            }
+            2 => rows[2].0.end = rows[1].0.end + 1,
+            3 => rows[0].1.as_mut().expect("root children")[0].end = u64::MAX,
+            4 => rows[0].1.as_mut().expect("root children").reverse(),
+            _ => rows[1].1.as_mut().expect("module children")[0].start = 0,
+        }
+        assert!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid).is_err(),
+            "mutation {mutation}"
+        );
+    }
+    let limits = SyntaxLimits::new(source.len(), 1, 100).expect("positive count bound");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, captured)
+            .expect_err("aggregate scope count bound")
+            .slug()
+            .as_str(),
+        "rift.syntax.facts_count_exceeded"
+    );
+}
+
+#[test]
+fn rust_scope_restore_bounds_groups_inside_complete_root_children() {
+    let source = "fn call() { let value = (((1))); }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(document.facts().scope().expect("scopes")[0].1.is_some());
+    let limits = SyntaxLimits::new(source.len(), 1000, 2).expect("positive depth bound");
+    assert!(SyntaxFacts::from_parts(source, limits, parts(document.facts())).is_err());
+}
+
+#[test]
+fn rust_scope_charge_keeps_owned_rows_and_direct_children() {
+    let source = "use core::fmt; mod client { struct Client; }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let captured = parts(document.facts());
+    let known = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("scope material");
+    let mut without_children = captured.clone();
+    let children_charge = without_children
+        .scope
+        .as_mut()
+        .expect("scope rows")
+        .iter_mut()
+        .fold(0_usize, |charge, (_, children)| {
+            let ranges = children.take().expect("complete children");
+            charge.saturating_add(
+                ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ByteRange>()),
+            )
+        });
+    let without_children =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), without_children)
+            .expect("unknown child material");
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&known),
+        get_size2::GetSize::get_heap_size(&without_children).saturating_add(children_charge)
+    );
+    let mut without_scope = captured;
+    let rows = without_scope.scope.take().expect("owned scope rows");
+    let scope_charge = rows.iter().fold(
+        rows.capacity()
+            .saturating_mul(std::mem::size_of::<rift_syntax::Scope>()),
+        |charge, (_, children)| {
+            charge.saturating_add(children.as_ref().map_or(0, |ranges| {
+                ranges
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<ByteRange>())
+            }))
+        },
+    );
+    let without_scope = SyntaxFacts::from_parts(source, SyntaxLimits::default(), without_scope)
+        .expect("unknown scope material");
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&known),
+        get_size2::GetSize::get_heap_size(&without_scope).saturating_add(scope_charge)
+    );
+}
+
+#[test]
+fn rust_original_token_callback_preserves_literals_lifetimes_and_bounds() {
+    let source = "fn call<'a>(value: &'a str) { let character = '\\''; let text = r###\"macro_export! use fake;\"###; /* use hidden; */ nested! { value } }";
+    let range = rift_syntax::ByteRange {
+        start: 0,
+        end: u64::try_from(source.len()).expect("source bound"),
+    };
+    let mut values = Vec::new();
+    assert!(rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::default(),
+        |range| {
+            let value = source
+                .get(
+                    usize::try_from(range.start).expect("start")
+                        ..usize::try_from(range.end).expect("end"),
+                )
+                .expect("original token");
+            values.push(value);
+            true
+        }
+    ));
+    assert!(values.contains(&"'a"));
+    assert!(values.contains(&"'\\''"));
+    assert!(values.contains(&"r###\"macro_export! use fake;\"###"));
+    assert!(!values.contains(&"macro_export"));
+    assert!(!values.contains(&"hidden"));
+    assert!(values.windows(2).any(|pair| pair == ["nested", "!"]));
+    assert!(!rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::default(),
+        |_| false
+    ));
+    for value in [
+        "{ /* nested /* comment */ */ }",
+        "{ \"unfinished",
+        "{ unknown! { }",
+    ] {
+        let range = rift_syntax::ByteRange {
+            start: 0,
+            end: u64::try_from(value.len()).expect("source bound"),
+        };
+        assert!(!rift_syntax::tokens(
+            value,
+            range,
+            SyntaxLimits::default(),
+            |_| true
+        ));
+    }
+    assert!(!rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::new(source.len(), 1, 100).expect("count bound"),
+        |_| true
+    ));
+    assert!(!rift_syntax::tokens(
+        source,
+        range,
+        SyntaxLimits::new(source.len(), 1000, 1).expect("depth bound"),
+        |_| true
+    ));
+}
+
+#[test]
+fn rust_root_expression_macro_invocations_keep_original_parent_and_restore_charge() {
+    let source = "first!(value);\nsecond! { pub mod neighbor; }\nmod nested { inside!(value); }\npub fn body() { inside!(value); }\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("captured root invocations");
+    assert_eq!(invocations.len(), 2);
+    for (index, expected) in ["first!(value)", "second! { pub mod neighbor; }"]
+        .iter()
+        .enumerate()
+    {
+        let range = invocations[index].0;
+        assert_eq!(
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")],
+            *expected
+        );
+        let original = document
+            .nodes()
+            .iter()
+            .find(|node| node.kind == "macro_invocation" && node.range == range)
+            .expect("original invocation node");
+        let parent = document
+            .nodes()
+            .get(original.parent.expect("original parent"))
+            .expect("parent node");
+        if index == 0 {
+            assert_eq!(parent.kind, "expression_statement");
+            let root = document
+                .nodes()
+                .get(parent.parent.expect("original root"))
+                .expect("root node");
+            assert_eq!(root.kind, "source_file");
+            assert_eq!(root.parent, None);
+        } else {
+            assert_eq!(parent.kind, "source_file");
+            assert_eq!(parent.parent, None);
+        }
+        assert!(
+            invocations[index].2.is_some(),
+            "original direct token ranges remain complete"
+        );
+    }
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
+        .expect("original root forms restore");
+    assert_eq!(&restored, document.facts());
+    let mut unknown = captured.clone();
+    let charge = get_size2::GetSize::get_heap_size(&unknown.macro_invocations);
+    unknown.macro_invocations = None;
+    let unknown = SyntaxFacts::from_parts(source, SyntaxLimits::default(), unknown)
+        .expect("old invocation facts remain unknown");
+    assert_eq!(unknown.macro_invocations(), None);
+    assert_eq!(
+        get_size2::GetSize::get_heap_size(&restored),
+        get_size2::GetSize::get_heap_size(&unknown).saturating_add(charge)
+    );
+    let limits = SyntaxLimits::new(source.len(), 1, 100).expect("positive limits");
+    assert_eq!(
+        SyntaxFacts::from_parts(source, limits, captured).map_err(|error| error.slug()),
+        Err(errors::syntax::facts_count_exceeded::SLUG)
+    );
+}
+
+#[test]
+fn rust_macro_doc_comments_keep_original_line_endings_and_refuse_hidden_code() {
+    for ending in ["\n", "\r\n"] {
+        let source = format!(
+            "known! {{{ending}/// original comment{ending}pub mod child;{ending}}}{ending}"
+        );
+        let document = parsed(ShippedLanguage::Rust, &source);
+        assert!(!document.has_errors());
+        let mut captured = parts(document.facts());
+        let rows = captured
+            .macro_invocations
+            .as_mut()
+            .expect("captured invocation");
+        assert_eq!(rows.len(), 1);
+        let children = rows[0]
+            .2
+            .as_mut()
+            .expect("original comment retains complete children");
+        let comment = children
+            .iter()
+            .position(|range| {
+                source[usize::try_from(range.start).expect("start")
+                    ..usize::try_from(range.end).expect("end")]
+                    .starts_with("///")
+            })
+            .expect("original named comment range");
+        let range = children[comment];
+        assert_eq!(
+            &source[usize::try_from(range.start).expect("start")
+                ..usize::try_from(range.end).expect("end")],
+            format!("/// original comment{ending}")
+        );
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured.clone())
+                .expect("exact comment restores"),
+            *document.facts()
+        );
+        let children = captured
+            .macro_invocations
+            .as_mut()
+            .expect("captured invocation")[0]
+            .2
+            .as_mut()
+            .expect("complete children");
+        children[comment].end += 1;
+        assert_eq!(
+            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured)
+                .map_err(|error| error.slug()),
+            Err(errors::syntax::facts_range_invalid::SLUG),
+            "a named comment cannot hide code after its line ending"
+        );
+    }
+    let source = "known! { /* unterminated }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(document.has_errors());
+    assert!(
+        document
+            .facts()
+            .macro_invocations()
+            .is_none_or(|rows| rows.iter().all(|(_, _, children)| children.is_none()))
+    );
+}
+
+#[test]
+fn documentation_cfg_module_paths_restore_original_source_and_unknown_effects() {
+    for (source, expected) in [
+        (
+            "#[cfg_attr(docsrs, doc(cfg(feature = \"rt\")))]\npub mod task;",
+            rift_syntax::RustModulePath::Absent,
+        ),
+        (
+            "#[cfg_attr(docsrs, doc(hidden), path = \"other.rs\")]\nmod task;",
+            rift_syntax::RustModulePath::Unknown,
+        ),
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        assert_eq!(document.symbols()[0].module_path, Some(expected));
+        let restored =
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+                .expect("original documentation attachment facts");
+        assert_eq!(&restored, document.facts());
+        assert_eq!(
+            restored.symbols()[0].item_range,
+            document.symbols()[0].item_range
+        );
+    }
+}
+
+#[test]
+fn rust_macro_multiline_lifetimes_keep_original_direct_children() {
+    let source = "cfg_rt! {\n    pub fn spawn<'a, F>(future: F) -> F\n    where\n        F: Future + Send + 'static,\n        F::Output: Send + 'static,\n    { future }\n}\n";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let invocations = captured
+        .macro_invocations
+        .as_ref()
+        .expect("original invocation");
+    assert_eq!(invocations.len(), 1);
+    let children = invocations[0]
+        .2
+        .as_ref()
+        .expect("complete original lifetime tokens");
+    assert!(children.iter().any(|range| &source
+        [usize::try_from(range.start).expect("start")..usize::try_from(range.end).expect("end")]
+        == "a"));
+    let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
+        .expect("original lifetime ranges restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn rust_macro_lifetime_gaps_refuse_omitted_identifiers_and_character_tokens() {
+    let source = "cfg_rt! { fn named<'a>() {} const LETTER: char = 'x'; const ESCAPED: char = '\\n'; const RAW: &str = r#\"held\"#; }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let captured = parts(document.facts());
+    let children = captured.macro_invocations.as_ref().expect("invocation")[0]
+        .2
+        .as_ref()
+        .expect("original direct tokens");
+    for expected in ["a", "'x'", "'\\n'", "r#\"held\"#"] {
+        let index = children
+            .iter()
+            .position(|range| {
+                &source[usize::try_from(range.start).expect("start")
+                    ..usize::try_from(range.end).expect("end")]
+                    == expected
+            })
+            .expect("original named token");
+        let mut invalid = captured.clone();
+        invalid.macro_invocations.as_mut().expect("invocation")[0]
+            .2
+            .as_mut()
+            .expect("direct tokens")
+            .remove(index);
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), invalid)
+                .expect_err("omitted token cannot become anonymous lifetime gap")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_range_invalid",
+            "{expected}"
+        );
+    }
+}
+
+#[test]
+fn rust_macro_lifetime_gaps_refuse_malformed_and_truncated_original_groups() {
+    for source in [
+        "cfg_rt! { ' }",
+        "cfg_rt! { '\\ }",
+        "cfg_rt! { 'unterminated",
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        assert!(
+            document
+                .facts()
+                .macro_invocations()
+                .is_none_or(|rows| rows.iter().all(|(_, _, children)| children.is_none()))
+        );
+        let mut captured = parts(document.facts());
+        captured.macro_invocations = Some(vec![(
+            rift_syntax::ByteRange {
+                start: 0,
+                end: u64::try_from(source.len()).expect("source length"),
+            },
+            Vec::new(),
+            Some(Vec::new()),
+        )]);
+        assert_eq!(
+            SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
+                .expect_err("malformed original group cannot claim complete direct children")
+                .slug()
+                .as_str(),
+            "rift.syntax.facts_range_invalid"
+        );
+    }
+}
+
+#[test]
+fn literal_macro_functions_keep_original_header_body_and_restore() {
+    let source = "cfg_rt! { #[track_caller] pub fn spawn<F>(future: F) -> JoinHandle<F::Output>\nwhere F: Future + Send + 'static, F::Output: Send + 'static, { future } fn private() {} }";
+    let document = parsed(ShippedLanguage::Rust, source);
+    assert!(!document.has_errors());
+    let spawn = document
+        .facts()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "spawn")
+        .expect("literal original function");
+    assert_eq!(spawn.node_kind, None);
+    assert_eq!(spawn.name_range, None);
+    assert_eq!(spawn.kind, "function");
+    assert_eq!(spawn.visibility.as_deref(), Some("pub"));
+    assert!(
+        spawn
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Callable)
+    );
+    assert!(
+        spawn
+            .facets
+            .contains(&rift_protocol::read::SymbolFacet::Public)
+    );
+    let body = spawn.body_range.expect("original body");
+    let start = usize::try_from(spawn.item_range.start).expect("start");
+    let body_start = usize::try_from(body.start).expect("body start");
+    let end = usize::try_from(body.end).expect("end");
+    assert_eq!(&source[body_start..end], "{ future }");
+    assert_eq!(
+        spawn.signatures[0].display,
+        source[start..body_start].trim_end()
+    );
+    assert_eq!(spawn.range.end, body.end);
+    assert_eq!(document.facts().symbols().len(), 2);
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("original function facts restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn literal_macro_functions_refuse_incomplete_or_nonliteral_headers() {
+    for source in [
+        "wrapper! { fn broken(a:) {} }",
+        "wrapper! { fn broken<T,,>() {} }",
+        "wrapper! { fn broken() arbitrary {} }",
+        "wrapper! { fn broken() -> {} }",
+        "wrapper! { fn broken() where F: {} }",
+        "wrapper! { fn broken() -> type_macro!() {} }",
+        "wrapper! { fn broken() {",
+        "wrapper! { fn broken(a: F {} }",
+    ] {
+        let document = parsed(ShippedLanguage::Rust, source);
+        assert!(
+            !document
+                .facts()
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == "broken"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn literal_macro_functions_exclude_nested_body_functions_and_keep_duplicate_names() {
+    let source = "fn same() {} opaque! { fn same() { fn hidden() {} } fn same() {} } fn plain() {}";
+    let document = parsed(ShippedLanguage::Rust, source);
+    let names = document
+        .facts()
+        .symbols()
+        .iter()
+        .map(|symbol| symbol.qualified_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"plain"));
+    assert!(names.contains(&"same~1"));
+    assert!(names.contains(&"same~2"));
+    assert!(names.contains(&"same~3"));
+    let duplicate_ranges = document
+        .facts()
+        .symbols()
+        .iter()
+        .filter(|symbol| symbol.name == "same")
+        .map(|symbol| symbol.item_range.start)
+        .collect::<Vec<_>>();
+    assert!(duplicate_ranges.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(!names.iter().any(|name| name.contains("hidden")));
+    let restored =
+        SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("normalization and original duplicate ranges restore");
+    assert_eq!(&restored, document.facts());
+}
+
+#[test]
+fn literal_macro_functions_keep_name_bounds_and_reject_corrupt_body_ranges() {
+    let retained_name = "x".repeat(5000);
+    let at_bound = "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX);
+    let name = "x".repeat(rift_core::PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+    let source = format!(
+        "opaque! {{ fn {retained_name}() {{}} fn {at_bound}() {{}} fn {name}() {{}} fn kept() {{}} }}"
+    );
+    let document = parsed(ShippedLanguage::Rust, &source);
+    for retained in [&retained_name, &at_bound] {
+        let symbol = document
+            .facts()
+            .symbols()
+            .iter()
+            .find(|symbol| &symbol.name == retained)
+            .expect("provider-bound name remains an original syntax fact");
+        let item_start = usize::try_from(symbol.item_range.start).expect("item start");
+        let item_end = usize::try_from(symbol.item_range.end).expect("item end");
+        let body = symbol.body_range.expect("original body range");
+        let body_start = usize::try_from(body.start).expect("body start");
+        let body_end = usize::try_from(body.end).expect("body end");
+        assert_eq!(
+            &source[item_start..item_end],
+            format!("fn {retained}() {{}}")
+        );
+        assert_eq!(&source[body_start..body_end], "{}");
+        assert_eq!(symbol.signatures[0].display, format!("fn {retained}()"));
+    }
+    let restored =
+        SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(document.facts()))
+            .expect("provider-bound original facts restore");
+    assert_eq!(&restored, document.facts());
+    assert!(
+        document
+            .facts()
+            .symbols()
+            .iter()
+            .any(|symbol| symbol.name == "kept")
+    );
+    assert!(
+        document
+            .facts()
+            .left_out_symbols()
+            .iter()
+            .any(|symbol| symbol.name == name)
+    );
+    let mut captured = parts(document.facts());
+    let kept = captured
+        .symbols
+        .iter_mut()
+        .find(|symbol| symbol.name == "kept")
+        .expect("kept function");
+    kept.body_range = Some(rift_syntax::ByteRange { start: 0, end: 1 });
+    assert!(SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured).is_err());
+}
+
+#[test]
+fn literal_macro_functions_obey_original_source_and_node_bounds() {
+    let source = "opaque! { fn kept<F>(future: F) -> F { future } }";
+    let language = ShippedLanguage::Rust.language();
+    let provider = rift_syntax::registry::provider_for_language(&language).expect("Rust provider");
+    let path = ProjectPath::new("source.rs").expect("source path");
+    for limits in [
+        SyntaxLimits::new(source.len() - 1, 100, 100).expect("byte bound"),
+        SyntaxLimits::new(source.len(), 2, 100).expect("node bound"),
+    ] {
+        assert!(
+            provider
+                .analyze(
+                    SyntaxSource {
+                        path: &path,
+                        text: source
+                    },
+                    limits
+                )
+                .is_err()
+        );
+    }
+}
+
+fn literal_function_header_tokens(source: &str) -> Vec<&str> {
+    let mut rows = Vec::new();
+    assert!(rift_syntax::tokens(
+        source,
+        rift_syntax::ByteRange {
+            start: 0,
+            end: u64::try_from(source.len()).expect("original header length"),
+        },
+        SyntaxLimits::default(),
+        |range| {
+            let start = usize::try_from(range.start).expect("token start");
+            let end = usize::try_from(range.end).expect("token end");
+            rows.push(&source[start..end]);
+            true
+        },
+    ));
+    rows
+}
+
+#[test]
+fn literal_function_headers_keep_original_lifetime_arguments_and_where_bounds() {
+    for source in [
+        "fn spawn<F>(future: F) -> JoinHandle<F::Output> where F: Future + Send + 'static, F::Output: Send + 'static,",
+        "fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>) -> JoinHandle<T::Output> where T: Future + Send + 'static, T::Output: Send + 'static,",
+    ] {
+        let tokens = literal_function_header_tokens(source);
+        assert!(SyntaxDocument::function_header(
+            &tokens,
+            (tokens.len(), source.len())
+        ));
+        assert!(tokens.iter().all(|token| source.contains(token)));
+        assert_eq!(tokens[0], "fn");
+    }
+}
+
+#[test]
+fn literal_function_headers_refuse_bounds_malformed_and_truncated_tokens() {
+    let source = "fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>) -> JoinHandle<T::Output> where T: Future + Send + 'static,";
+    let tokens = literal_function_header_tokens(source);
+    assert!(!SyntaxDocument::function_header(
+        &tokens,
+        (tokens.len() - 1, source.len())
+    ));
+    assert!(!SyntaxDocument::function_header(&tokens, (tokens.len(), 0)));
+    for source in [
+        "fn spawn_inner<T>(future: T, meta: SpawnMeta<>)",
+        "fn spawn_inner<T>(future: T) ->",
+        "fn spawn_inner<T>(future: T) where T:",
+        "fn spawn_inner<T>(future: T) where T: Future +",
+        "fn spawn_inner<T>(future: T) extra",
+        "fn spawn_inner<T>(future: T, meta: SpawnMeta<'_>, extra)",
+    ] {
+        let tokens = literal_function_header_tokens(source);
+        assert!(
+            !SyntaxDocument::function_header(&tokens, (tokens.len(), source.len())),
+            "{source}"
+        );
+    }
 }

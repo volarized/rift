@@ -1391,7 +1391,7 @@
       "examples": [
         "src/**"
       ],
-      "pattern": "^(?!/)(?!\\.\\.?(/|$))(?!.*(/\\.\\.?)(/|$))[^\\\\\\u0000-\\u001F\\u007F]+$",
+      "pattern": "^(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,})(?:/(?:\\.*[^\\\\\\u0000-\\u001F\\u007F/.][^\\\\\\u0000-\\u001F\\u007F/]*|\\.{3,})?)*$",
       "type": "string"
     },
     "PortRange": {
@@ -1975,6 +1975,18 @@
         }
       ]
     },
+    "TelemetryConfiguration": {
+      "additionalProperties": false,
+      "description": "Request statistics. A user-level disable applies to every project.",
+      "properties": {
+        "disabled": {
+          "default": false,
+          "description": "Disables request statistics. Defaults to `false`; a user-level disable takes\nprecedence over this project's value.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "TextSearchConfiguration": {
       "additionalProperties": false,
       "description": "The `[search.text]` table. `include` selects which visible paths join the\ntext index once every language entry has had its claim, `max_chunk`\nbounds the lexical units derived from them, `large_files` decides what\nhappens to a file past `max_chunk`, and `excluded_lockfiles` names the\nlockfiles the index leaves out of search.",
@@ -2337,6 +2349,13 @@
         "workspace_size": "512mb"
       },
       "description": "Which files below the workspace root the index and reads consider visible, and how\nmany files and bytes the index holds together."
+    },
+    "telemetry": {
+      "$ref": "#/$defs/TelemetryConfiguration",
+      "default": {
+        "disabled": false
+      },
+      "description": "Opt-out settings for counters derived from existing cloud and download requests."
     }
   },
   "title": "WorkspaceConfiguration",

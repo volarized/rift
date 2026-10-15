@@ -18,6 +18,7 @@ mod relationship;
 mod revision;
 mod vector;
 mod workspace;
+pub use workspace::WorkspaceSymbolView;
 
 pub use capture::LastCapture;
 pub use change_set::{
@@ -41,7 +42,10 @@ pub use rift_analysis::documentation::{
 pub use rift_analysis::documentation::{
     DocumentationLayer, DocumentationProjection, DocumentationProjectionTarget,
 };
-pub use rift_analysis::{ArchiveMemberKind, ForceIncludeReach, PathMatcher, PathVerdict};
+pub use rift_analysis::{
+    ArchiveMemberKind, ForceIncludeReach, PathMatcher, PathVerdict, TraversalWalk,
+    walk_traversal_capped, walk_traversal_capped_async,
+};
 pub use rift_error::RiftError;
 pub use trigram_store::{PatternCandidate, PatternCandidates, TrigramBatch, UnindexedRows};
 pub use vector::{StoredVector, VectorStore};

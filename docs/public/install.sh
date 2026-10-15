@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Install Rift from checksummed GitHub Release archive.
+# Request opt-out uses RIFT_TELEMETRY_DISABLED, not project or user TOML.
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash
 #   curl --proto '=https' --tlsv1.2 -fsSL https://volar.sh/rift/install.sh | bash -s -- --version v1.2.3
@@ -7,7 +8,12 @@ set -euo pipefail
 
 readonly RIFT_REPOSITORY="${RIFT_REPOSITORY:-volarized/rift}"
 readonly RIFT_GITHUB_API="${RIFT_GITHUB_API:-https://api.github.com}"
-readonly RIFT_DOWNLOAD_BASE="${RIFT_DOWNLOAD_BASE:-https://github.com/${RIFT_REPOSITORY}/releases/download}"
+if [[ "$RIFT_REPOSITORY" == volarized/rift ]]; then
+  readonly RIFT_DEFAULT_DOWNLOAD_BASE="https://api.volar.sh/rift/releases/download"
+else
+  readonly RIFT_DEFAULT_DOWNLOAD_BASE="https://github.com/${RIFT_REPOSITORY}/releases/download"
+fi
+readonly RIFT_DOWNLOAD_BASE="${RIFT_DOWNLOAD_BASE:-$RIFT_DEFAULT_DOWNLOAD_BASE}"
 readonly RIFT_INSTALL_DIR="${RIFT_INSTALL_DIR:-${HOME}/.rift/bin}"
 REQUESTED_VERSION="${RIFT_VERSION:-latest}"
 
@@ -32,6 +38,7 @@ Options:
 Environment:
   RIFT_VERSION      Exact release used when --version is absent.
   RIFT_INSTALL_DIR  Destination directory for Rift binary.
+  RIFT_TELEMETRY_DISABLED  Set true to exclude requests from Rift's counters.
 EOF
 }
 
@@ -76,6 +83,9 @@ require_https() {
 fetch() {
   local url="$1"
   shift
+  if [[ "${RIFT_TELEMETRY_DISABLED:-false}" != false ]]; then
+    set -- --header 'DNT: 1' "$@"
+  fi
   require_https "$url"
   curl \
     --proto '=https' \
@@ -176,6 +186,14 @@ main() {
   base="${RIFT_DOWNLOAD_BASE%/}/${version}"
 
   work_dir="$(mktemp -d)"
+  if [[ "${RIFT_TELEMETRY_DISABLED:-false}" == false && "$RIFT_DOWNLOAD_BASE" == https://api.volar.sh/rift/releases/download ]]; then
+    cat >&2 <<'EOF'
+Rift collects aggregate download and cloud request statistics by default to measure adoption and improve the service.
+You can disable cloud and update statistics: rift config set --telemetry.disabled=true --user
+For installation, set RIFT_TELEMETRY_DISABLED=true before running the installer.
+Details: https://volar.sh/rift/docs/privacy
+EOF
+  fi
   fetch "${base}/${archive}" --output "${work_dir}/${archive}"
   fetch "${base}/${checksums}" --output "${work_dir}/${checksums}"
   verify_checksum "${work_dir}/${archive}" "${work_dir}/${checksums}"

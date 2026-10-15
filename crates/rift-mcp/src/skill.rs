@@ -24,7 +24,7 @@ pub const TOOLS_REFERENCE_FILE: &str = "tools.md";
 /// the skill, so it leads with the trigger case.
 pub const SKILL_DESCRIPTION: &str = "Use when finding or reading code in a workspace \
     Rift serves: structured search across declarations and source text, symbol reads by exact \
-    name, and syntax inspection.";
+    identity, and syntax inspection.";
 /// The plugin manifest's `description`: the canonical product sentence.
 const PLUGIN_DESCRIPTION: &str =
     "Rift is an agentic development toolkit for reading and discovering codebases.";
@@ -98,20 +98,25 @@ const DECISION_TABLE: &[DecisionRow] = &[
         note: Some("with `pattern`"),
     },
     DecisionRow {
-        situation: "The declaration name is known.",
+        situation: "The exact symbol identity is known.",
         tools: &["get_symbol"],
         note: None,
     },
     DecisionRow {
-        situation: "A dependency's public declaration is needed.",
-        tools: &["get_symbol", "search"],
-        note: Some("with `scope: \"global\"`, or `\"all\"` to answer the project's own too"),
+        situation: "A package or runtime declaration is needed.",
+        tools: &["search"],
+        note: Some(
+            "with `scope: \"global\"` or `\"all\"`; read the returned `id` with `get_symbol`",
+        ),
     },
     DecisionRow {
         situation: "A package version the project does not use, or a package it lacks, is \
                     needed.",
-        tools: &["get_symbol", "search"],
-        note: Some("with `packages` and `scope: \"global\"` or `\"all\"`"),
+        tools: &["search"],
+        note: Some(
+            "with `packages` and `scope: \"global\"` or `\"all\"`; read the returned `id` with \
+                    `get_symbol`",
+        ),
     },
     DecisionRow {
         situation: "The syntax structure at one position is needed.",
@@ -198,7 +203,7 @@ fn skill_markdown(form: SkillForm) -> String {
     rendered.push_str("# Rift\n\n");
     rendered.push_str(
         "Rift indexes this workspace's source and serves it over MCP: structured search, \
-         symbol reads by exact name, and syntax inspection.\n\n",
+         symbol reads by exact identity, and syntax inspection.\n\n",
     );
     rendered.push_str("Rift writes no source: apply a change with your own edit tools.\n\n");
     rendered.push_str(
@@ -448,11 +453,30 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| A package version the project does not use, or a package it lacks, is \
-                     needed. | `get_symbol`, `search` (with `packages` and `scope: \"global\"` \
-                     or `\"all\"`) |"
+                     needed. | `search` (with `packages` and `scope: \"global\"` \
+                     or `\"all\"`; read the returned `id` with `get_symbol`) |"
                 ),
                 "{rendered}"
             );
+        }
+    }
+
+    #[test]
+    fn decision_table_reads_known_ids_and_discovers_package_names() {
+        let known = DECISION_TABLE
+            .iter()
+            .find(|row| row.situation == "The exact symbol identity is known.")
+            .expect("known identities must have a read route");
+        assert_eq!(known.tools, &["get_symbol"]);
+        assert!(known.note.is_none());
+        for row in DECISION_TABLE
+            .iter()
+            .filter(|row| row.situation.contains("package") || row.situation.contains("runtime"))
+        {
+            assert_eq!(row.tools, &["search"]);
+            let note = row.note.expect("discovery must select its search scope");
+            assert!(note.contains("scope"));
+            assert!(note.contains("returned `id` with `get_symbol`"));
         }
     }
 

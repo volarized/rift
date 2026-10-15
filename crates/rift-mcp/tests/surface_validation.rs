@@ -8,6 +8,8 @@ mod fake_engine;
 )]
 mod global_api;
 mod hermetic_search;
+#[path = "python_runtime/environment.rs"]
+mod python_runtime_environment;
 // This binary serves its own fixture and uses `workspace_client` only to wait for map readiness.
 #[expect(dead_code, reason = "the relative-root helpers serve other suites")]
 mod workspace_client;
@@ -34,7 +36,7 @@ const FOLLOWED_PAGES_MAX: usize = 16;
 
 #[path = "surface_corpus.rs"]
 mod surface_corpus;
-use surface_corpus::{TRAVERSAL_CALLEE, TRAVERSAL_CALLER, corpus};
+use surface_corpus::corpus;
 
 fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
     value
@@ -48,7 +50,6 @@ fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
 fn paged_rows<'result>(name: &str, structured: &'result Value) -> Option<&'result [Value]> {
     let rows = match name {
         "search" => "results",
-        "get_symbol" => "hits",
         _ => return None,
     };
     structured[rows].as_array().map(Vec::as_slice)
@@ -65,8 +66,8 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
     );
 }
 
-/// Proves one tool result carries no non-project source-unit
-/// resolver, that every `search` hit names exactly one location, and that a read result
+/// Proves one tool result carries source-unit resolvers the request reaches,
+/// that every `search` hit names exactly one location, and that a read result
 /// warns only what it is entitled to.
 ///
 /// `get_symbol` and `nodes` carry empty `warnings`: the live server resolves one published
@@ -82,14 +83,16 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
 /// flight while it runs, or a pool busy past that bound, fails it rather than becoming a
 /// warning every caller learned to ignore.
 ///
-/// A `get_symbol` or `search` request whose `scope` reaches packages carries the package
+/// A `get_symbol` request with a released owner, or a `search` request whose `scope`
+/// reaches packages, carries the package
 /// warnings and no other: the fixture's path dependency `helper` answers
 /// `package_unavailable`, the standard library entry the fixture global API cannot
 /// resolve answers `package_requirement_absent`, and the global API's own page warnings
 /// arrive as `global_page_warning`.
 fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     let context = format!("{name} result");
-    let reaches_dependencies = matches!(request["scope"].as_str(), Some("global" | "all"));
+    let reaches_dependencies = request_reaches_dependencies(name, request)
+        .expect("a validated exact request carries a canonical symbol identity");
     // Schema validation above checks the separate revision and documentation digest forms.
     assert_source_unit_ids_use_served_resolvers(structured, &context, reaches_dependencies);
     if reaches_dependencies {
@@ -107,7 +110,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
         let expects_source = include.is_none_or(|entries| entries.contains(&Value::from("source")));
         let expects_history =
             include.is_some_and(|entries| entries.contains(&Value::from("history")));
-        for hit in structured["hits"].as_array().into_iter().flatten() {
+        for hit in structured["declarations"].as_array().into_iter().flatten() {
             assert_eq!(
                 hit.get("source").is_some(),
                 expects_source,
@@ -122,7 +125,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             );
             if !expects_history {
                 assert!(
-                    hit.get("history").is_none(),
+                    structured.get("history").is_none(),
                     "a hit omits history unless the request includes it: {request:#} {hit:#}"
                 );
             }
@@ -179,6 +182,62 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     }
 }
 
+/// Exact retrieval reaches the released owner its canonical identity names.
+fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
+    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+    if name != "get_symbol" {
+        return Some(matches!(request["scope"].as_str(), Some("global" | "all")));
+    }
+    let identity = SymbolIdentity::parse(request["id"].as_str()?).ok()?;
+    Some(matches!(
+        identity.owner(),
+        SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+    ))
+}
+
+#[test]
+fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity() -> TestResult {
+    use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+    let package = global_api::collected_identity(global_api::SymbolFixture::Valid, "beacon");
+    let runtime = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
+    let local = SymbolIdentity::new(
+        SymbolOwner::Local,
+        rift_protocol::read::Language::from_identity_segment("rust")?,
+        vec!["beacon".to_owned()],
+    )?
+    .wire_identity();
+    for (identity, reaches_dependencies) in [(package, true), (runtime, true), (local, false)] {
+        assert_eq!(
+            request_reaches_dependencies("get_symbol", &json!({"id": identity})),
+            Some(reaches_dependencies)
+        );
+    }
+    let package_source = json!({"unit": global_api::COLLECTED_UNIT});
+    assert_source_unit_ids_use_served_resolvers(&package_source, "released source", true);
+    assert!(
+        std::panic::catch_unwind(|| {
+            assert_source_unit_ids_use_served_resolvers(&package_source, "project source", false);
+        })
+        .is_err()
+    );
+    for request in [json!({"id": "beacon"}), json!({})] {
+        assert_eq!(request_reaches_dependencies("get_symbol", &request), None);
+        assert!(
+            std::panic::catch_unwind(|| assert_wire_hygiene("get_symbol", &request, &json!({})))
+                .is_err()
+        );
+    }
+    assert_eq!(
+        request_reaches_dependencies("search", &json!({"scope": "global"})),
+        Some(true)
+    );
+    assert_eq!(
+        request_reaches_dependencies("nodes", &json!({})),
+        Some(false)
+    );
+    Ok(())
+}
+
 /// A search hit in a file is addressed by exactly one of `path` and `unit`, and a file hit
 /// carries `unit` only for a package file, which a package scope alone reaches. A commit
 /// hit carries neither.
@@ -227,8 +286,8 @@ fn assert_dependency_warnings_only(structured: &Value) {
 }
 
 /// Walks `value`, proving every `rift://source/` identity uses a resolver the request can
-/// reach: the project resolver always, and the Cargo resolver when the request's `scope`
-/// reaches the packages the global API serves.
+/// reach: the project resolver always, and the Cargo resolver when the exact owner or
+/// search scope reaches the packages the global API serves.
 fn assert_source_unit_ids_use_served_resolvers(
     value: &Value,
     context: &str,
@@ -286,7 +345,30 @@ async fn served_fixture_with_configuration(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
-    let fixture = surface_corpus::SurfaceFixture::start().await?;
+    served_fixture_with_setup(source, search, false, false).await
+}
+
+async fn served_fixture_with_setup(
+    source: Option<&str>,
+    search: Option<&rift_protocol::configuration::SearchConfiguration>,
+    canonical_change: bool,
+    complete_selection: bool,
+) -> TestResult<(
+    surface_corpus::SurfaceFixture,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    let fixture = if complete_selection {
+        let fixture = surface_corpus::SurfaceFixture::start().await?;
+        let path = fixture.root().join("lib.rs");
+        let original = std::fs::read_to_string(&path)?;
+        assert!(fixture.root().join("change_witness.rs").is_file());
+        std::fs::write(path, format!("{original}pub mod change_witness;\n"))?;
+        rift_history::fixture::commit_all(fixture.root(), "declare the original change module");
+        fixture
+    } else {
+        surface_corpus::SurfaceFixture::start().await?
+    };
     if let Some(search) = search {
         let path = fixture.root().join("rift.toml");
         let written = std::fs::read_to_string(&path)?;
@@ -300,6 +382,20 @@ async fn served_fixture_with_configuration(
     }
     if let Some(source) = source {
         std::fs::write(fixture.root().join("alternatives.rs"), source)?;
+        if complete_selection {
+            let path = fixture.root().join("lib.rs");
+            let original = std::fs::read_to_string(&path)?;
+            std::fs::write(path, format!("{original}pub mod alternatives;\n"))?;
+        }
+    }
+    if canonical_change {
+        let path = fixture.root().join("lib.rs");
+        let original = std::fs::read_to_string(&path)?;
+        std::fs::write(
+            path,
+            format!("{original}#[path=\"change_witness.rs\"] pub mod changed;\n"),
+        )?;
+        rift_history::fixture::commit_all(fixture.root(), "admit canonical change witness");
     }
     let server = RiftMcp::build(fixture.root(), WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
@@ -315,10 +411,45 @@ async fn served_fixture_with_configuration(
     Ok((fixture, client, server_task))
 }
 
+async fn served_canonical_miss_fixture(
+    source: Option<&str>,
+    search: Option<&rift_protocol::configuration::SearchConfiguration>,
+) -> TestResult<(
+    surface_corpus::SurfaceFixture,
+    rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tokio::task::JoinHandle<()>,
+)> {
+    served_fixture_with_setup(source, search, false, true).await
+}
+
+/// Builds an absent exact request from an observed owner, language and logical path.
+async fn absent_request(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    language: &str,
+    revision: Option<&str>,
+) -> TestResult<Value> {
+    use rift_protocol::identity::SymbolIdentity;
+    let anchor = workspace_client::captured_seed(client, "beacon_one", "lib.rs").await?;
+    let anchor = SymbolIdentity::parse(&anchor)?;
+    let mut path = anchor.qualified_path().to_vec();
+    name.clone_into(path.last_mut().ok_or("observed terminal name")?);
+    let missing = SymbolIdentity::new(
+        anchor.owner().clone(),
+        rift_protocol::read::Language::from_identity_segment(language)?,
+        path,
+    )?;
+    let mut request = json!({"id":missing.wire_identity(),"include":[]});
+    if let Some(revision) = revision {
+        request["rev"] = json!(revision);
+    }
+    Ok(request)
+}
+
 /// A miss keeps the empty answer and proposes declarations the caller can retrieve (#590).
 #[tokio::test]
 async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
-    let (_fixture, client, server_task) = served_fixture().await?;
+    let (_fixture, client, server_task) = served_canonical_miss_fixture(None, None).await?;
     let tools = client.list_all_tools().await?;
     let tool = tools
         .iter()
@@ -331,8 +462,8 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
             .clone(),
     );
     let validator = jsonschema::validator_for(&schema)?;
-    assert_symbol_alternative_bounds(tool, &schema)?;
-    let request = json!({"name": "beacon_ane", "language": "rust", "include": []});
+    assert_symbol_alternative_bounds(tool, &schema);
+    let request = absent_request(&client, "beacon_ane", "rust", None).await?;
     let result = client
         .call_tool(tools_call_request("get_symbol", &request)?)
         .await?;
@@ -343,26 +474,32 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
     let answer = result
         .structured_content
         .ok_or("structured answer absent")?;
-    assert_validates(&validator, &answer, "get_symbol miss");
-    assert_eq!(answer["hits"], json!([]));
-    let warning = answer["warnings"]
-        .as_array()
-        .and_then(|warnings| {
-            warnings
-                .iter()
-                .find(|warning| warning["code"] == "symbol_not_found")
-        })
-        .ok_or("a miss must name the unavailable symbol")?;
-    assert_eq!(warning["name"], "beacon_ane");
-    assert!(warning.get("detail").is_none());
-    assert_eq!(
-        warning["alternatives"],
-        json!([
-            "rift://symbol/rust/lib.rs/beacon_one",
-            "rift://symbol/rust/lib.rs/beacon_two",
-            "rift://symbol/rust/lib.rs/beacon_three"
-        ])
+    eprintln!(
+        "exact miss context: {}",
+        json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
     );
+    assert_validates(&validator, &answer, "get_symbol miss");
+    assert_eq!(answer["outcome"], "missing");
+    let warning = &answer["symbol_not_found"];
+    assert_eq!(warning["id"], request["id"]);
+    assert!(warning.get("detail").is_none());
+    let mut expected = Vec::new();
+    for name in ["beacon_one", "beacon_two", "beacon_three"] {
+        expected.push(workspace_client::captured_seed(&client, name, "lib.rs").await?);
+    }
+    let actual: Vec<_> = warning["alternatives"]
+        .as_array()
+        .ok_or("alternatives")?
+        .iter()
+        .map(|item| item["id"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(actual, expected);
+    for alternative in warning["alternatives"].as_array().ok_or("alternatives")? {
+        assert_eq!(
+            alternative["match_context"],
+            json!(["owner", "language", "name"])
+        );
+    }
     let text = result
         .content
         .iter()
@@ -370,7 +507,7 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("beacon_ane"),
+        text.contains(request["id"].as_str().ok_or("requested id")?),
         "the missing name must reach the caller: {text}"
     );
     assert!(
@@ -382,28 +519,18 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
     Ok(())
 }
 
-fn assert_symbol_alternative_bounds(tool: &rmcp::model::Tool, schema: &Value) -> TestResult {
-    let variants = schema["$defs"]["ReadWarning"]["oneOf"]
-        .as_array()
-        .ok_or("warning variants absent")?;
-    let miss = variants
-        .iter()
-        .find(|variant| variant["properties"]["code"]["const"] == "symbol_not_found")
-        .ok_or("symbol_not_found schema absent")?;
+fn assert_symbol_alternative_bounds(tool: &rmcp::model::Tool, schema: &Value) {
+    let miss = &schema["$defs"]["SymbolNotFound"];
     assert_eq!(
         miss["properties"]["alternatives"]["maxItems"],
         json!(rift_protocol::read::SYMBOL_ALTERNATIVES_MAX)
     );
     assert_eq!(
-        miss["properties"]["name"]["maxLength"],
+        schema["$defs"]["SymbolAlternative"]["properties"]["name"]["maxLength"],
         json!(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
     );
-    assert_eq!(
-        tool.input_schema["properties"]["name"]["maxLength"],
-        json!(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
-    );
+    assert!(tool.input_schema["properties"].get("id").is_some());
     assert_eq!(miss["properties"]["detail"]["maxLength"], json!(4096));
-    Ok(())
 }
 
 #[tokio::test]
@@ -414,7 +541,7 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
         ..Default::default()
     };
     let (_fixture, client, server_task) =
-        served_fixture_with_configuration(None, Some(&search)).await?;
+        served_canonical_miss_fixture(None, Some(&search)).await?;
     let validators = tool_validators(&client.list_all_tools().await?)?;
     let (_, output) = validators
         .get("get_symbol")
@@ -427,9 +554,9 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
         .error()
         .to_string();
     for request in [
-        json!({"name":"İ","language":"rust","include":[]}),
-        json!({"name":"İ","language":"python","include":[]}),
-        json!({"name":"İ","language":"rust","include":[],"rev":"baseline"}),
+        absent_request(&client, "İ", "rust", None).await?,
+        absent_request(&client, "İ", "python", None).await?,
+        absent_request(&client, "İ", "rust", Some("baseline")).await?,
     ] {
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
@@ -438,21 +565,17 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
+        eprintln!(
+            "exact miss context: {}",
+            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+        );
         assert_validates(output, &answer, "configured work result");
-        let warning = answer["warnings"]
-            .as_array()
-            .and_then(|warnings| {
-                warnings
-                    .iter()
-                    .find(|warning| warning["code"] == "symbol_not_found")
-            })
-            .ok_or("named miss absent")?;
+        let warning = &answer["symbol_not_found"];
         assert_eq!(
             warning,
-            &json!({"code":"symbol_not_found","name":"İ","alternatives":[],"detail":expected})
+            &json!({"id":request["id"],"alternatives":[],"detail":expected})
         );
-        assert_eq!(answer["hits"], json!([]));
-        assert_eq!(answer["pagination"]["total_pages"], 0);
+        assert_eq!(answer["outcome"], "missing");
         let text = result
             .content
             .iter()
@@ -461,14 +584,16 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
             .join("\n");
         assert!(text.contains(&expected), "{text}");
     }
+    let exact_id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
     let result = client
         .call_tool(tools_call_request(
             "get_symbol",
-            &json!({"name":"beacon_one","include":[]}),
+            &json!({"id":exact_id,"include":[]}),
         )?)
         .await?;
     let answer = result.structured_content.ok_or("exact answer absent")?;
-    assert!(!answer["hits"].as_array().ok_or("hits absent")?.is_empty());
+    assert_eq!(answer["outcome"], "found");
+    assert_eq!(answer["symbol"]["id"], exact_id);
     assert!(!answer["warnings"].as_array().is_some_and(|warnings| {
         warnings
             .iter()
@@ -488,7 +613,8 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
             .expect("a string write succeeds");
         source
     });
-    let (_fixture, client, server_task) = served_fixture_with_source(Some(&source)).await?;
+    let (_fixture, client, server_task) =
+        served_canonical_miss_fixture(Some(&source), None).await?;
     let tools = client.list_all_tools().await?;
     let schema = tools
         .iter()
@@ -496,11 +622,11 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
         .and_then(|tool| tool.output_schema.as_deref())
         .ok_or("get_symbol output schema absent")?;
     let validator = jsonschema::validator_for(&Value::Object(schema.clone()))?;
-    let name = "İ".repeat(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX);
+    let name = "x".repeat(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX);
     for request in [
-        json!({"name": name, "language": "rust", "include": []}),
-        json!({"name": name, "language": "python", "include": []}),
-        json!({"name": name, "language": "rust", "include": [], "rev": "baseline"}),
+        absent_request(&client, &name, "rust", None).await?,
+        absent_request(&client, &name, "python", None).await?,
+        absent_request(&client, &name, "rust", Some("baseline")).await?,
     ] {
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
@@ -509,17 +635,17 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
+        eprintln!(
+            "exact miss context: {}",
+            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+        );
         assert_validates(&validator, &answer, "get_symbol work bound");
-        let warning = answer["warnings"]
-            .as_array()
-            .and_then(|warnings| {
-                warnings
-                    .iter()
-                    .find(|warning| warning["code"] == "symbol_not_found")
-            })
-            .ok_or("named miss absent")?;
-        assert_eq!(warning["name"], name);
-        let exhausted = request.get("rev").is_none() && request["language"] == "rust";
+        let warning = &answer["symbol_not_found"];
+        assert_eq!(warning["id"], request["id"]);
+        let requested = rift_protocol::identity::SymbolIdentity::parse(
+            request["id"].as_str().ok_or("requested id")?,
+        )?;
+        let exhausted = request.get("rev").is_none() && requested.language().name == "rust";
         assert_eq!(warning.get("detail").is_some(), exhausted, "{answer:#}");
         if exhausted {
             assert_eq!(warning["alternatives"], json!([]));
@@ -529,7 +655,7 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
                 .filter_map(|content| content.as_text().map(|content| content.text.as_str()))
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(text.contains(&name));
+            assert!(text.contains(request["id"].as_str().ok_or("requested id")?));
             assert!(text.contains("work bound"), "{text}");
             assert!(text.contains("closest"), "{text}");
         } else {
@@ -549,29 +675,24 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
 #[tokio::test]
 async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_warning() -> TestResult
 {
-    let (_fixture, client, server_task) = served_fixture().await?;
+    let (_fixture, client, server_task) = served_canonical_miss_fixture(None, None).await?;
     for (revision, expected) in [(None, true), (Some("baseline"), false)] {
-        let mut request = json!({"name": "change_witnesz", "language": "rust", "include": []});
-        if let Some(revision) = revision {
-            request["rev"] = json!(revision);
-        }
+        let request = absent_request(&client, "change_witnesz", "rust", revision).await?;
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
             .await?;
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
-        let alternatives = answer["warnings"]
+        eprintln!(
+            "exact miss context: {}",
+            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+        );
+        let alternatives = answer["symbol_not_found"]["alternatives"]
             .as_array()
-            .and_then(|warnings| {
-                warnings
-                    .iter()
-                    .find(|warning| warning["code"] == "symbol_not_found")
-            })
-            .and_then(|warning| warning["alternatives"].as_array())
-            .ok_or("symbol alternatives absent")?;
+            .ok_or("alternatives absent")?;
         let carries_current = alternatives.iter().any(|identity| {
-            identity
+            identity["id"]
                 .as_str()
                 .is_some_and(|identity| identity.ends_with("/change_witness"))
         });
@@ -580,24 +701,42 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
             "revision controls which declarations can be proposed: {answer:#}"
         );
     }
+    let remote = surface_corpus::prepared_corpus(&client)
+        .await?
+        .into_iter()
+        .find(|(tool, request)| {
+            *tool == "get_symbol"
+                && request["id"]
+                    .as_str()
+                    .is_some_and(|id| id.contains("/cargo/"))
+        })
+        .ok_or("observed remote exact request")?
+        .1;
+    let answer = client
+        .call_tool(tools_call_request("get_symbol", &remote)?)
+        .await?
+        .structured_content
+        .ok_or("remote answer")?;
+    assert_eq!(answer["outcome"], "found");
+    assert_eq!(answer["symbol"]["id"], remote["id"]);
+    assert!(answer.get("symbol_not_found").is_none());
     for request in [
-        json!({"name": "helper_beacon", "scope": "global", "include": []}),
-        json!({"name": "helper_beacon", "scope": "all", "include": []}),
-        json!({"name": "helper_beacon", "scope": "all", "include": [], "limit": 1, "page_index": 100}),
+        json!({"query":"helper_beacon","scope":"global","include":[]}),
+        json!({"query":"helper_beacon","scope":"all","include":[]}),
+        json!({"query":"helper_beacon","scope":"all","include":[],"limit":1,"page_index":100}),
     ] {
-        let result = client
-            .call_tool(tools_call_request("get_symbol", &request)?)
-            .await?;
-        let answer = result
+        let answer = client
+            .call_tool(tools_call_request("search", &request)?)
+            .await?
             .structured_content
-            .ok_or("structured answer absent")?;
+            .ok_or("remote discovery")?;
         assert!(
             !answer["warnings"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .any(|warning| warning["code"] == "symbol_not_found"),
-            "a matched remote declaration clears the miss, even past the final page: {answer:#}"
+            "matched remote discovery clears the miss, including an empty later page: {answer:#}"
         );
     }
     client.cancel().await?;
@@ -628,7 +767,7 @@ impl CorpusArms {
     /// Records how many hits the global API answered, on a `get_symbol` and a `search`
     /// answer alike, and how many entries the answer names `package_unavailable`.
     fn observe(&mut self, structured: &Value) {
-        self.dependency_units += dependency_unit_count(&structured["hits"]);
+        self.dependency_units += dependency_unit_count(&structured["declarations"]);
         self.search_dependency_units += dependency_unit_count(&structured["results"]);
         self.unavailable_entries += structured["warnings"]
             .as_array()
@@ -836,7 +975,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
     let validators = tool_validators(&tools)?;
 
     let mut arms = CorpusArms::default();
-    for (name, request) in corpus() {
+    for (name, request) in surface_corpus::prepared_corpus(&client).await? {
         let (input_validator, output_validator) = validators
             .get(name)
             .ok_or_else(|| format!("corpus names unadvertised tool {name}"))?;
@@ -959,11 +1098,11 @@ enum InputSchema {
 /// beside `rev` or `change` refuses; the relationship graph serves the project alone, so a
 /// walk under `scope: "global"` refuses; and call hierarchy names calls alone, so an
 /// outgoing walk asking for `references` alone has no lane.
-fn traversal_refusal_corpus() -> Vec<(Value, InputSchema, ErrorCode)> {
-    let outgoing = json!({ "seed": TRAVERSAL_CALLER, "direction": "outgoing" });
+fn traversal_refusal_corpus(target: &str, seed: &str) -> Vec<(Value, InputSchema, ErrorCode)> {
+    let outgoing = json!({ "seed": seed, "direction": "outgoing" });
     vec![
         (
-            json!({ "rev": "main", "traversal": { "seed": TRAVERSAL_CALLEE } }),
+            json!({ "rev": "main", "traversal": { "seed": target } }),
             InputSchema::Admits,
             ErrorCode::CapabilityUnavailable,
         ),
@@ -980,7 +1119,7 @@ fn traversal_refusal_corpus() -> Vec<(Value, InputSchema, ErrorCode)> {
         (
             json!({
                 "traversal": {
-                    "seed": TRAVERSAL_CALLER,
+                    "seed": seed,
                     "direction": "outgoing",
                     "facets": ["references"]
                 }
@@ -1006,7 +1145,10 @@ async fn every_refused_traversal_carries_its_code_and_the_schema_verdict() -> Te
     let (input_validator, _output_validator) = validators
         .get("search")
         .ok_or("search must be advertised")?;
-    for (request, verdict, code) in traversal_refusal_corpus() {
+    let target = workspace_client::captured_seed(&client, "callee", "traversal_callee.py").await?;
+    let seed =
+        workspace_client::captured_seed(&client, "calls_callee", "traversal_caller.py").await?;
+    for (request, verdict, code) in traversal_refusal_corpus(&target, &seed) {
         assert_eq!(
             input_validator.is_valid(&request),
             verdict == InputSchema::Admits,
@@ -1035,7 +1177,13 @@ async fn every_refused_traversal_carries_its_code_and_the_schema_verdict() -> Te
 async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> TestResult {
     let (_engine, configuration) = fake_engine::rust_engine(fake_engine::READY_UNPREPARED_ENGINE)?;
     let (_directory, client, _server_task) = workspace_client::served_workspace(
-        &[("lib.rs", "pub struct Beacon;\n")],
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"surface_fixture\"\nversion=\"1.0.0\"\n[lib]\npath=\"lib.rs\"\n",
+            ),
+            ("lib.rs", "pub struct Beacon;\n"),
+        ],
         Some(configuration),
     )
     .await?;
@@ -1048,8 +1196,9 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         workspace_client::tool_request("search", &json!({ "query": "Beacon" })),
     )
     .await?;
+    let beacon = workspace_client::captured_seed(&client, "Beacon", "lib.rs").await?;
     let unprepared = json!({
-        "traversal": { "seed": "rift://symbol/rust/lib.rs/Beacon", "direction": "outgoing" }
+        "traversal": { "seed": beacon, "direction": "outgoing" }
     });
     assert_validates(
         input_validator,
@@ -1074,8 +1223,9 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         fake_engine::SERVED_LINES,
     )
     .await?;
+    let caller = workspace_client::captured_seed(&client, "caller", "lib.rs").await?;
     let unconfirmed = json!({
-        "traversal": { "seed": "rift://symbol/rust/lib.rs/caller", "direction": "outgoing" }
+        "traversal": { "seed": caller, "direction": "outgoing" }
     });
     assert_validates(input_validator, &unconfirmed, "an outgoing walk");
     let structured = workspace_client::call_retrying_acceptance(
@@ -1114,20 +1264,22 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
          [languages.python.lsp]\nembedded = \"ty\"\n",
         global.endpoint
     );
-    let (_directory, client, _server_task) = workspace_client::served_workspace(
-        &[(
+    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        &[("pyproject.toml", "[build-system]\nrequires=[\"setuptools==80.9.0\"]\nbuild-backend=\"setuptools.build_meta\"\n[tool.setuptools]\npy-modules=[\"caller\"]\n"), (
             "caller.py",
             "import json\n\n\ndef caller() -> int:\n    return len(json.dumps(1))\n",
         )],
         Some(configuration),
+        python_runtime_environment::prepare,
     )
     .await?;
     let validators = tool_validators(&client.list_all_tools().await?)?;
     let (input_validator, output_validator) = validators
         .get("search")
         .ok_or("search must be advertised")?;
+    let caller = workspace_client::captured_seed(&client, "caller", "caller.py").await?;
     let walk = json!({
-        "traversal": { "seed": "rift://symbol/python/caller.py/caller", "direction": "outgoing" }
+        "traversal": { "seed": caller, "direction": "outgoing" }
     });
     assert_validates(input_validator, &walk, "an outgoing walk");
     let structured = workspace_client::call_retrying_acceptance(
@@ -1148,7 +1300,9 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         .collect();
     assert_eq!(
         units,
-        [&json!("rift://source/stdlib/python@3.12.9/builtins.pyi")],
+        [&json!(global_api::named_unit(
+            &global_api::NAMED_POSITIONS[0]
+        ))],
         "{structured:#}"
     );
     assert_eq!(
@@ -1169,14 +1323,12 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
     let (_directory, client, server_task) = served_fixture().await?;
     let validators = tool_validators(&client.list_all_tools().await?)?;
     let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
+    let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
     let requests = [
+        ("get_symbol", json!({ "id": id, "packages": packages })),
         (
             "get_symbol",
-            json!({ "name": "helper_beacon", "packages": packages }),
-        ),
-        (
-            "get_symbol",
-            json!({ "name": "helper_beacon", "scope": "all", "rev": "main", "packages": packages }),
+            json!({ "id": id, "scope": "all", "rev": "main", "packages": packages }),
         ),
         (
             "search",
@@ -1191,7 +1343,14 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
         let (input_validator, _) = validators
             .get(name)
             .ok_or_else(|| format!("{name} is advertised"))?;
-        assert_validates(input_validator, &request, &format!("{name} request"));
+        if name == "get_symbol" {
+            assert!(
+                !input_validator.is_valid(&request),
+                "removed exact selection fields refuse in schema"
+            );
+        } else {
+            assert_validates(input_validator, &request, &format!("{name} request"));
+        }
         let failure = workspace_client::failed_call(
             client.call_tool(tools_call_request(name, &request)?).await,
         )?;
@@ -1201,11 +1360,26 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
             "{request}: {}",
             failure.text
         );
-        assert!(
-            failure.message.contains("field packages"),
-            "the refusal names the field: {request}: {}",
-            failure.message
-        );
+        if name == "get_symbol" {
+            assert!(
+                failure.message.contains("tool get_symbol")
+                    && failure.message.contains("accepted declaration_cursor")
+                    && !failure.message.contains("accepted packages"),
+                "the schema refusal lists exact retrieval fields: {request}: {}",
+                failure.message
+            );
+        } else {
+            let field = if request.get("rev").is_some() {
+                "field scope"
+            } else {
+                "field packages"
+            };
+            assert!(
+                failure.message.contains(field),
+                "the refusal names the field: {request}: {}",
+                failure.message
+            );
+        }
     }
 
     client.cancel().await?;
@@ -1313,10 +1487,11 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
 #[tokio::test]
 async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
+    let id = workspace_client::captured_seed(&client, "beacon_one", "lib.rs").await?;
     let refused = [
         (
             "get_symbol",
-            json!({ "name": "beacon_one", "rev": "HEAD@{1}" }),
+            json!({ "id": id, "rev": "HEAD@{1}" }),
             "field rev",
         ),
         (

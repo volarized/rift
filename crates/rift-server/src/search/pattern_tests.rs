@@ -495,9 +495,9 @@ fn a_package_scope_answers_the_project_side_of_a_pattern() -> TestResult {
 }
 
 /// `packages` travels to the global API beside a package-scoped `pattern`, so the project
-/// side of `all` and `global` answers as it does without the argument. The search refuses
-/// naming `packages` where the argument has nothing to change: beside the `local` scope and
-/// beside a revision, which every search checks before `pattern`.
+/// side of `all` and `global` answers as it does without the argument. The `local` scope
+/// refuses naming `packages`. A scope reaching packages beside a revision refuses naming
+/// `scope`, which every search checks before `pattern`.
 #[test]
 fn packages_beside_a_pattern_refuse_only_where_the_argument_cannot_answer() -> TestResult {
     let (_directory, service) = fixture()?;
@@ -505,14 +505,16 @@ fn packages_beside_a_pattern_refuse_only_where_the_argument_cannot_answer() -> T
     let refused = [
         (
             json!({"pattern": "TODO", "packages": packages}),
+            "packages",
             "the local scope reads the project alone",
         ),
         (
             json!({"pattern": "TODO", "scope": "all", "rev": "main", "packages": packages}),
+            "scope",
             "current tree alone",
         ),
     ];
-    for (request, expected) in refused {
+    for (request, field, expected) in refused {
         let error = service
             .search(&params(request.clone())?, &StoreAnswer::identifier_only())
             .expect_err("the argument has nothing to change");
@@ -520,7 +522,7 @@ fn packages_beside_a_pattern_refuse_only_where_the_argument_cannot_answer() -> T
         assert!(
             error
                 .context()
-                .any(|(key, value)| key == "field" && value == "packages"),
+                .any(|(key, value)| key == "field" && value == field),
             "{request}: {error}"
         );
         let message = error.to_string();

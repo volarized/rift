@@ -20,6 +20,7 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     let NodesResult {
         nodes,
         source,
+        view,
         warnings,
     } = result;
     if nodes.len() != source.len() {
@@ -35,7 +36,14 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
         lines.blank()?;
         lines.verbatim(0, innermost)?;
     }
-    warning::section(out, warnings)
+    warning::section(out, warnings)?;
+    if let Some(view) = view {
+        out.raw_line(
+            0,
+            &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+        )?;
+    }
+    Ok(())
 }
 
 /// Writes one node: kind and facts, identity, symbol, and regions.

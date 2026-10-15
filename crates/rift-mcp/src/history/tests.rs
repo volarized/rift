@@ -77,8 +77,13 @@ async fn wait_until_held(root: &Path, analyzer_revision: &str, commit: &str) -> 
 fn history_task(root: &Path, gate: Option<AnalysisGate>) -> TestResult<HistoryTask> {
     let configuration = ConfigurationState::accept(root);
     let history = configuration.history_configuration();
-    let opened = OpenedStore::open(root, &configuration, &history, ANALYZER_A)()
-        .ok_or("a committed workspace opens its history store")?;
+    let opened = OpenedStore::open_with_owner(
+        (root, &rift_protocol::identity::SymbolOwner::Local),
+        &configuration,
+        &history,
+        ANALYZER_A,
+    )()
+    .ok_or("a committed workspace opens its history store")?;
     Ok(HistoryTask {
         store: Arc::new(opened.store),
         analysis: Arc::new(opened.analysis),
@@ -128,7 +133,12 @@ fn opened_under_capture(root: &Path) -> TestResult<(Option<OpenedStore>, LogDrai
     let configuration = ConfigurationState::accept(root);
     let history = configuration.history_configuration();
     let (recorder, drain) = rift_tracing::ScopedRecorder::builder().install()?;
-    let opened = OpenedStore::open(root, &configuration, &history, ANALYZER_A)();
+    let opened = OpenedStore::open_with_owner(
+        (root, &rift_protocol::identity::SymbolOwner::Local),
+        &configuration,
+        &history,
+        ANALYZER_A,
+    )();
     drop(recorder);
     Ok((opened, drain))
 }
@@ -370,12 +380,20 @@ fn a_read_only_common_git_directory_keeps_the_store_in_the_worktree_and_warns_on
     let history = configuration.history_configuration();
     fs::set_permissions(root.join(".git"), fs::Permissions::from_mode(0o555))?;
     let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
-    let opened = OpenedStore::open(root, &configuration, &history, ANALYZER_A)();
+    let opened = OpenedStore::open_with_owner(
+        (root, &rift_protocol::identity::SymbolOwner::Local),
+        &configuration,
+        &history,
+        ANALYZER_A,
+    )();
     drop(recorder);
     fs::set_permissions(root.join(".git"), fs::Permissions::from_mode(0o755))?;
 
     let opened = opened.ok_or("the worktree's state directory takes the store")?;
-    assert_eq!(opened.store.location().folder(), root.join(".rift"));
+    assert_eq!(
+        opened.store.location().folder(),
+        root.canonicalize()?.join(".rift")
+    );
     assert!(!root.join(".git").join(STORE_FOLDER_NAME).exists());
     let records = drain.queued_records();
     let first = records.first().ok_or("no record was captured")?;
@@ -462,7 +480,12 @@ fn a_workspace_removed_before_its_store_opens_leaves_the_lane_off_and_warns() ->
     let root = directory.path().to_path_buf();
     let configuration = ConfigurationState::accept(&root);
     let history = configuration.history_configuration();
-    let opening = OpenedStore::open(&root, &configuration, &history, ANALYZER_A);
+    let opening = OpenedStore::open_with_owner(
+        (&root, &rift_protocol::identity::SymbolOwner::Local),
+        &configuration,
+        &history,
+        ANALYZER_A,
+    );
     fs::remove_dir_all(&root)?;
     let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
 

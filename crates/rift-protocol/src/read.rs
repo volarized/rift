@@ -826,6 +826,10 @@ pub struct NodesParams {
     /// refuses.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: u64,
+    /// Captured view selected by discovery. The server reads nodes from that view and
+    /// refuses an expired or foreign view. The caller MUST omit `rev` beside `view`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedViewId>,
     /// The version-control revision to read - a branch, tag, or commit id as the
     /// workspace's version control spells it. Omitted reads the current tree. The server
     /// refuses a revision read when the workspace has no version-control repository.
@@ -852,7 +856,7 @@ pub struct NodesParams {
             },
             {
                 "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-                "symbol": "rift://symbol/rust/src/config.rs/load_config",
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "function_item",
@@ -934,6 +938,10 @@ pub struct NodesResult {
     /// One excerpt per node in `nodes`, in the same order, each spanning that node's own
     /// range. Empty when `nodes` is empty.
     pub source: Vec<String>,
+    /// Captured view used for this read, with its original expiry. Absent when the
+    /// request did not select a captured view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<crate::symbol_read::CapturedView>,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
@@ -1137,11 +1145,74 @@ pub enum SyntaxFramework {
     Tailwind,
 }
 
+/// The public field bound that omitted one retained object from a read answer.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(try_from = "ObjectUnavailableInput", deny_unknown_fields)]
+#[schemars(!try_from)]
+pub struct ObjectUnavailable {
+    /// Physical source unit, paired with `range`, or absent for a source-less object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<SourceUnitId>,
+    /// Original declaration range, paired with `unit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<TextRange>,
+    /// Full original qualified name of the retained object.
+    pub qualified_name: String,
+    /// Public field whose bound the object crossed.
+    #[schemars(length(min = 1, max = 128))]
+    pub field: String,
+    /// Enforced public field bound.
+    #[schemars(range(min = 1_u64))]
+    pub bound: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObjectUnavailableInput {
+    #[serde(default, deserialize_with = "crate::index::warning::present")]
+    unit: (bool, Option<SourceUnitId>),
+    #[serde(default, deserialize_with = "crate::index::warning::present")]
+    range: (bool, Option<TextRange>),
+    qualified_name: String,
+    field: String,
+    bound: u64,
+}
+
+impl TryFrom<ObjectUnavailableInput> for ObjectUnavailable {
+    type Error = &'static str;
+
+    fn try_from(input: ObjectUnavailableInput) -> Result<Self, Self::Error> {
+        if input.unit.0 != input.range.0
+            || !crate::index::warning::object_is_valid(
+                input.unit.1.as_ref(),
+                input.range.1.as_ref(),
+                &input.field,
+                input.bound,
+            )
+        {
+            return Err(
+                "object_unavailable requires paired source unit and range and valid field bounds",
+            );
+        }
+        Ok(Self {
+            unit: input.unit.1,
+            range: input.range.1,
+            qualified_name: input.qualified_name,
+            field: input.field,
+            bound: input.bound,
+        })
+    }
+}
+
 /// One warning attached to a read result. The answer stands; the warning carries evidence
 /// of a condition the caller weighs before relying on it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "code", deny_unknown_fields, rename_all = "snake_case")]
+#[schemars(transform = schema::pair_identity_unresolved_source)]
 pub enum ReadWarning {
+    /// One object crossed a public field bound. Its original facts remain retained;
+    /// every other admitted object can answer.
+    ObjectUnavailable(ObjectUnavailable),
     /// Framework context could not be resolved for one source. Ordinary syntax stands;
     /// framework-specific facts whose context is missing are left out.
     FrameworkContextUnresolved {
@@ -1854,19 +1925,83 @@ fn revision_id_violation(value: &str) -> Option<RevisionIdViolation> {
 const ANCESTRY_MARKERS: [u8; 2] = *b"~^";
 
 /// Which corpus a read searches. The names identify logical corpora, not storage
-/// locations: `global` reaches dependency package facts wherever the server holds them.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
-)]
-#[serde(rename_all = "snake_case")]
+/// locations: `global` reaches collected package and runtime facts selected by the dependency context.
+/// A `local@name` scope selects an extra project accepted by the current connection.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SearchScope {
     /// The project tree the server serves.
     #[default]
     Local,
-    /// The dependency packages, answered from their public declarations alone.
+    /// Collected package and runtime facts selected by the dependency context.
     Global,
-    /// Both: hits merge by rank; at equal rank a project hit orders before a package hit.
+    /// The primary project, accepted extra projects, and global facts, merged by rank.
     All,
+    /// One extra project accepted by the current connection.
+    NamedLocal {
+        /// Accepted registration name.
+        name: String,
+    },
+}
+
+impl Serialize for SearchScope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Local => serializer.serialize_str("local"),
+            Self::Global => serializer.serialize_str("global"),
+            Self::All => serializer.serialize_str("all"),
+            Self::NamedLocal { name } => {
+                if name.len() > crate::identity::SYMBOL_ID_BYTES_MAX {
+                    let error = rift_error::errors::core::symbol_identity_invalid()
+                        .violation("Length")
+                        .error();
+                    return Err(serde::ser::Error::custom(error));
+                }
+                let scope = crate::identity::SymbolOwner::NamedLocal { name: name.clone() }
+                    .local_scope()
+                    .map_err(serde::ser::Error::custom)?;
+                serializer.serialize_str(&scope)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SearchScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "global" => Ok(Self::Global),
+            "all" => Ok(Self::All),
+            _ => {
+                let owner =
+                    crate::identity::parse_local_scope(&value).map_err(serde::de::Error::custom)?;
+                Ok(match owner {
+                    crate::identity::SymbolOwner::NamedLocal { name } => Self::NamedLocal { name },
+                    _ => Self::Local,
+                })
+            }
+        }
+    }
+}
+
+impl JsonSchema for SearchScope {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "SearchScope".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX,
+            "anyOf": [
+                {"enum": ["local", "global", "all"]},
+                {
+                    "pattern": crate::identity::LOCAL_SCOPE_PATTERN,
+                    "not": {"enum": ["local@local", "local@global", "local@all"]}
+                }
+            ],
+            "description": "Which corpus a read searches. A named local scope requires an extra project accepted by the current connection."
+        })
+    }
 }
 
 /// How much a `Diagnostic` matters, in the provider's own judgement. Providers map their
@@ -2172,6 +2307,23 @@ pub struct Symbol {
     pub document_local: bool,
 }
 
+/// Whether a retained name fits the public character bound, independently of export visibility.
+#[must_use]
+pub fn symbol_name_is_public(name: &str) -> bool {
+    name.chars().take(SYMBOL_NAME_CHARACTERS_MAX + 1).count() <= SYMBOL_NAME_CHARACTERS_MAX
+}
+
+/// Whether an original name fits the retained byte bound, including source whitespace.
+/// Portable identities apply their separate control-character restriction.
+#[must_use]
+pub fn symbol_name_is_retained(name: &str, bytes_max: usize) -> bool {
+    !name.is_empty()
+        && name.len() <= bytes_max
+        && !name.chars().any(|character| {
+            character.is_control() && !matches!(character, '\t' | '\n' | '\r' | '\u{000c}')
+        })
+}
+
 impl Symbol {
     /// Whether the name fits the public character bound.
     ///
@@ -2180,11 +2332,7 @@ impl Symbol {
     /// directories omit objects outside the public character bound.
     #[must_use]
     pub fn name_is_public(&self) -> bool {
-        self.name
-            .chars()
-            .take(SYMBOL_NAME_CHARACTERS_MAX + 1)
-            .count()
-            <= SYMBOL_NAME_CHARACTERS_MAX
+        symbol_name_is_public(&self.name)
     }
 
     /// Whether the original name fits an admitted artifact record's byte bound.
@@ -2194,9 +2342,7 @@ impl Symbol {
     /// of public character bounds and portable identity admission.
     #[must_use]
     pub fn name_is_retained(&self, bytes_max: usize) -> bool {
-        !self.name.is_empty()
-            && self.name.len() <= bytes_max
-            && !self.name.chars().any(char::is_control)
+        symbol_name_is_retained(&self.name, bytes_max)
     }
 }
 
@@ -2448,6 +2594,7 @@ pub enum SymbolVersionKind {
 /// another, so that `end` is never below `start` is asserted by the surface
 /// validation tests instead.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[schemars(extend("examples" = [{"start": 0, "end": 0}]))]
 pub struct TextRange {
     /// First byte of the range, counted from the start of the file.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
@@ -2550,6 +2697,142 @@ mod tests {
     use schemars::schema_for;
     use serde_json::json;
     use strum::VariantArray;
+
+    #[test]
+    fn unavailable_read_objects_pair_source_fields_in_serde_and_schema() {
+        let schema = serde_json::to_value(schema_for!(ReadWarning)).expect("warning schema");
+        let validator = jsonschema::validator_for(&schema).expect("warning schema compiles");
+        for (fields, accepted) in [
+            (json!({}), true),
+            (json!({"unit":null,"range":null}), true),
+            (
+                json!({"unit":"rift://source/project/lib.rs","range":{"start":1,"end":8}}),
+                true,
+            ),
+            (json!({"unit":"rift://source/project/lib.rs"}), false),
+            (json!({"range":{"start":1,"end":8}}), false),
+            (json!({"unit":null}), false),
+            (json!({"range":null}), false),
+            (json!({"unit":null,"range":{"start":1,"end":8}}), false),
+            (
+                json!({"unit":"rift://source/project/lib.rs","range":null}),
+                false,
+            ),
+        ] {
+            let mut wire = json!({
+                "code":"object_unavailable", "qualified_name":"S".repeat(4097),
+                "field":"name", "bound":4096,
+            });
+            wire.as_object_mut()
+                .expect("warning object")
+                .extend(fields.as_object().expect("source fields").clone());
+            assert_eq!(validator.is_valid(&wire), accepted, "schema: {wire}");
+            let parsed = serde_json::from_value::<ReadWarning>(wire.clone());
+            assert_eq!(parsed.is_ok(), accepted, "serde: {wire}");
+            if let Ok(warning) = parsed {
+                let encoded = serde_json::to_value(&warning).expect("warning serializes");
+                assert_eq!(encoded["code"], "object_unavailable");
+                assert_eq!(encoded["qualified_name"], "S".repeat(4097));
+                assert!(validator.is_valid(&encoded));
+                assert_eq!(
+                    serde_json::from_value::<ReadWarning>(encoded).expect("warning roundtrip"),
+                    warning
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_read_objects_refuse_invalid_fields_and_source_ranges() {
+        for fields in [
+            json!({"field":""}),
+            json!({"field":"x".repeat(129)}),
+            json!({"bound":0}),
+            json!({"unit":"rift://source/project/lib.rs","range":{"start":8,"end":1}}),
+            json!({"unit":"rift://source/project/../lib.rs","range":{"start":1,"end":8}}),
+            json!({"unexpected":true}),
+        ] {
+            let mut wire = json!({"code":"object_unavailable", "qualified_name":"start",
+                "field":"name", "bound":4096});
+            wire.as_object_mut()
+                .expect("warning object")
+                .extend(fields.as_object().expect("source fields").clone());
+            assert!(
+                serde_json::from_value::<ReadWarning>(wire.clone()).is_err(),
+                "{wire}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_scope_uses_the_shared_named_codec_and_preserves_legacy_spelling() {
+        let schema = serde_json::to_value(schema_for!(SearchScope)).expect("scope schema");
+        let validator = jsonschema::validator_for(&schema).expect("scope schema compiles");
+        for (wire, scope) in [
+            ("local", SearchScope::Local),
+            ("global", SearchScope::Global),
+            ("all", SearchScope::All),
+            (
+                "local@cloud",
+                SearchScope::NamedLocal {
+                    name: "cloud".to_owned(),
+                },
+            ),
+        ] {
+            assert!(validator.is_valid(&json!(wire)));
+            assert_eq!(
+                serde_json::from_value::<SearchScope>(json!(wire)).expect("accepted scope"),
+                scope
+            );
+            assert_eq!(
+                serde_json::to_value(scope).expect("scope serializes"),
+                json!(wire)
+            );
+        }
+        for wire in [
+            "local@",
+            "local@local",
+            "local@global",
+            "local@all",
+            "local@Cloud",
+            "local@cloud/path",
+            "local@cloud%2D",
+            "npm/npmjs.org/beacon@1.0.0",
+        ] {
+            assert!(!validator.is_valid(&json!(wire)));
+            assert!(serde_json::from_value::<SearchScope>(json!(wire)).is_err());
+        }
+        for name in [
+            String::new(),
+            "global".to_owned(),
+            "Cloud".to_owned(),
+            "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX + 1),
+        ] {
+            assert!(serde_json::to_value(SearchScope::NamedLocal { name }).is_err());
+        }
+    }
+
+    #[test]
+    fn search_scope_named_bound_matches_the_shared_codec_and_schema() {
+        let name = "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX - "local@".len());
+        let scope = SearchScope::NamedLocal { name };
+        let wire = serde_json::to_value(&scope).expect("exact bound serializes");
+        assert_eq!(
+            serde_json::from_value::<SearchScope>(wire.clone()).expect("exact bound parses"),
+            scope
+        );
+        let past_bound = format!("{}x", wire.as_str().expect("scope is a string"));
+        assert!(serde_json::from_value::<SearchScope>(json!(past_bound)).is_err());
+        let schema = serde_json::to_value(schema_for!(SearchScope)).expect("schema serializes");
+        assert_eq!(
+            schema["maxLength"],
+            json!(crate::identity::SYMBOL_ID_BYTES_MAX)
+        );
+        assert_eq!(
+            schema["anyOf"][1]["pattern"],
+            json!(crate::identity::LOCAL_SCOPE_PATTERN)
+        );
+    }
 
     /// Each relationship facet label matches the spelling serde emits.
     #[test]
@@ -3573,5 +3856,86 @@ mod tests {
             let parsed: SourceUnitId = serde_json::from_value(json!(id)).expect("deserialize");
             assert_eq!(serde_json::to_value(&parsed).expect("serialize"), json!(id));
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_name_tests {
+    use super::symbol_name_is_retained;
+
+    #[test]
+    fn retained_names_accept_source_whitespace_without_portable_identity() {
+        for whitespace in ['\t', '\n', '\r', '\u{000c}'] {
+            let name = format!(".first,{whitespace}.second");
+            assert!(symbol_name_is_retained(&name, name.len()));
+            assert!(!symbol_name_is_retained(&name, name.len() - 1));
+            let encoded = serde_json::to_vec(&name).expect("source spelling encodes");
+            assert_eq!(
+                serde_json::from_slice::<String>(&encoded).expect("source spelling decodes"),
+                name
+            );
+        }
+        for name in ["", "bad\0name", "bad\u{000b}name", "bad\u{007f}name"] {
+            assert!(!symbol_name_is_retained(name, usize::MAX));
+        }
+    }
+}
+
+#[cfg(test)]
+mod captured_nodes_tests {
+    use super::{NodesParams, NodesResult};
+    use crate::symbol_read::{CapturedView, CapturedViewId};
+    use serde_json::json;
+
+    #[test]
+    fn nodes_view_is_optional_and_preserves_selected_authority() {
+        let legacy: NodesParams =
+            serde_json::from_value(json!({"path":"lib.rs","position":2})).expect("legacy request");
+        assert!(legacy.view.is_none());
+        assert!(
+            serde_json::to_value(&legacy)
+                .expect("request")
+                .get("view")
+                .is_none()
+        );
+        let selected: NodesParams =
+            serde_json::from_value(json!({"path":"lib.rs","position":2,"view":"claims.nodes"}))
+                .expect("captured request");
+        assert_eq!(
+            selected.view.as_ref().map(CapturedViewId::as_str),
+            Some("claims.nodes")
+        );
+        let view = CapturedView {
+            id: selected.view.expect("selected view"),
+            expires_at: "2030-01-01T00:15:00Z".to_owned(),
+        };
+        let result = NodesResult {
+            nodes: Vec::new(),
+            source: Vec::new(),
+            warnings: Vec::new(),
+            view: Some(view.clone()),
+        };
+        let wire = serde_json::to_value(result).expect("captured result");
+        let decoded: NodesResult = serde_json::from_value(wire).expect("roundtrip");
+        assert_eq!(decoded.view, Some(view));
+    }
+
+    #[test]
+    fn nodes_view_refuses_malformed_keys_and_unknown_fields() {
+        for wire in [
+            json!({"path":"lib.rs","position":2,"view":"latest"}),
+            json!({"path":"lib.rs","position":2,"view":"claims.nodes","owner":"local"}),
+        ] {
+            assert!(serde_json::from_value::<NodesParams>(wire).is_err());
+        }
+        let legacy: NodesResult =
+            serde_json::from_value(json!({"nodes":[],"source":[]})).expect("legacy result");
+        assert!(legacy.view.is_none());
+        assert!(
+            serde_json::to_value(legacy)
+                .expect("result")
+                .get("view")
+                .is_none()
+        );
     }
 }

@@ -77,6 +77,8 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
             left_out_declarations: enriched.left_out_declaration_count(),
             markdown_facts: None,
             export_bindings: enriched.facts().export_bindings().map(<[_]>::to_vec),
+            macro_invocations: enriched.facts().macro_invocations().map(<[_]>::to_vec),
+            scope: enriched.facts().scope().map(<[_]>::to_vec),
             source_digest: *enriched.source_digest().expect("digest"),
         };
         assert_eq!(
@@ -407,5 +409,69 @@ fn tailwind_screen_variant_keeps_version_and_escaped_configuration_unresolved() 
             let end = usize::try_from(range.end).expect("bounded source bytes");
             text[start..end].contains(r"'./tailwind\.config.js'")
         }));
+    }
+}
+
+#[test]
+fn pinned_nextjs_post_body_keeps_multiline_facts_with_tailwind() {
+    let original = include_str!("nextjs-post-body.module.css");
+    let lf = original.replace("\r\n", "\n");
+    let crlf = lf.replace('\n', "\r\n");
+    for text in [original, lf.as_str(), crlf.as_str()] {
+        let path = ProjectPath::new("examples/cms-umbraco/components/post-body.module.css")
+            .expect("pinned Next path");
+        let source = SyntaxSource { path: &path, text };
+        let limits = SyntaxLimits::default();
+        let original = CssSyntaxProvider::default()
+            .analyze(source, limits)
+            .expect("CSS facts");
+        assert!(!original.has_errors());
+        let retained = original.facts().left_out_symbols();
+        let start = text.find(".content p,").expect("original selector start");
+        let final_selector = ".content blockquote";
+        let end = start
+            + text[start..]
+                .find(final_selector)
+                .expect("original selector end")
+            + final_selector.len();
+        let expected = &text[start..end];
+        let retained_selector = retained
+            .iter()
+            .find(|symbol| symbol.name == expected)
+            .expect("retained selector keeps original line endings");
+        assert_eq!(retained_selector.name.as_bytes(), expected.as_bytes());
+        let retained_start =
+            usize::try_from(retained_selector.range.start).expect("bounded source bytes");
+        let retained_end =
+            usize::try_from(retained_selector.range.end).expect("bounded source bytes");
+        assert!(text[retained_start..retained_end].starts_with(expected));
+        let facts = tailwind_symbols(source, &original, 4, limits).expect("Tailwind facts");
+        assert!(facts.unresolved.is_empty());
+        let combined = append_framework_symbols(source, limits, &original, facts.symbols)
+            .expect("pinned multiline selectors and Tailwind facts remain admitted");
+        for symbol in retained {
+            assert!(
+                combined.facts().left_out_symbols().contains(symbol),
+                "original retained fact: {symbol:?}"
+            );
+        }
+        for symbol in original.symbols() {
+            assert!(
+                combined.symbols().contains(symbol),
+                "original portable fact: {symbol:?}"
+            );
+        }
+        assert!(
+            combined
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == "text-lg")
+        );
+        assert!(
+            combined
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.name == ".content a")
+        );
     }
 }

@@ -12,6 +12,9 @@ use crate::markdown::MarkdownFacts;
 /// the `~N` suffix `SymbolId` advertises.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
+mod retained_size;
+pub(crate) mod rust_macros;
+
 /// Half-open UTF-8 byte range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ByteRange {
@@ -172,6 +175,12 @@ pub enum SyntaxOrigin {
     Framework,
 }
 
+/// Captured invocation, direct module items, and optional complete direct token ranges.
+pub type MacroInvocation = (ByteRange, Vec<ByteRange>, Option<Vec<ByteRange>>);
+
+/// Original Rust scope range and optional complete direct child ranges.
+pub type Scope = (ByteRange, Option<Vec<ByteRange>>);
+
 /// Immutable syntax facts shared by documents at different paths, without complete node rows.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
@@ -182,6 +191,8 @@ pub struct SyntaxFacts {
     symbols: Vec<SyntaxSymbol>,
     left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
+    macro_invocations: Option<Vec<MacroInvocation>>,
+    scope: Option<Vec<Scope>>,
     has_errors: bool,
     left_out_declarations: usize,
     markdown_facts: Option<MarkdownFacts>,
@@ -300,14 +311,100 @@ impl SyntaxDocument {
         language: Language,
         path: ProjectPath,
         nodes: Vec<SyntaxNode>,
+        symbols: Vec<SyntaxSymbol>,
+        has_errors: bool,
+    ) -> Self {
+        Self::assemble(language, path, nodes, symbols, has_errors, None)
+    }
+
+    /// Checks literal Rust function header tokens within the token and source byte bounds.
+    ///
+    /// The tokens must come from the caller's checked original source range.
+    #[must_use]
+    pub fn function_header(input: &[&str], bounds: (usize, usize)) -> bool {
+        let (tokens_max, source_bytes_max) = bounds;
+        input.len() <= tokens_max
+            && input
+                .iter()
+                .try_fold(0_usize, |bytes, token| bytes.checked_add(token.len()))
+                .is_some_and(|bytes| bytes <= source_bytes_max)
+            && rust_macros::function_header_tokens(input)
+    }
+
+    pub(crate) fn new_rust(
+        language: Language,
+        source: crate::SyntaxSource<'_>,
+        limits: crate::SyntaxLimits,
+        nodes: Vec<SyntaxNode>,
         mut symbols: Vec<SyntaxSymbol>,
         has_errors: bool,
+    ) -> Self {
+        let mut invocations = Self::invocations(&language, &nodes);
+        if let Some(invocations) = &mut invocations {
+            rust_macros::capture(
+                source.text,
+                &nodes,
+                invocations,
+                Some((&language, limits, &mut symbols)),
+            );
+        }
+        symbols.sort_by_key(|symbol| symbol.item_range.start);
+        let mut document = Self::assemble(
+            language,
+            source.path.clone(),
+            nodes,
+            symbols,
+            has_errors,
+            invocations,
+        );
+        let facts = Arc::make_mut(&mut document.facts);
+        facts.source_digest = Some(FileDigest::of(source.text.as_bytes()));
+        facts.scope = rust_macros::capture_scope(source.text, &document.nodes, has_errors);
+        facts.syntax_limits = Some(limits);
+        document
+    }
+
+    fn invocations(language: &Language, nodes: &[SyntaxNode]) -> Option<Vec<MacroInvocation>> {
+        (language.name == "rust" && language.dialect.is_none()).then(|| {
+            nodes
+                .iter()
+                .filter(|node| {
+                    node.kind == "macro_invocation"
+                        && node
+                            .parent
+                            .and_then(|parent| nodes.get(parent))
+                            .is_some_and(|parent| {
+                                (parent.kind == "source_file" && parent.parent.is_none())
+                                    || (parent.kind == "expression_statement"
+                                        && parent
+                                            .parent
+                                            .and_then(|root| nodes.get(root))
+                                            .is_some_and(|root| {
+                                                root.kind == "source_file" && root.parent.is_none()
+                                            }))
+                            })
+                })
+                .map(|node| (node.range, Vec::new(), None))
+                .collect()
+        })
+    }
+
+    fn assemble(
+        language: Language,
+        path: ProjectPath,
+        nodes: Vec<SyntaxNode>,
+        mut symbols: Vec<SyntaxSymbol>,
+        has_errors: bool,
+        captured: Option<Vec<MacroInvocation>>,
     ) -> Self {
         suffix_duplicate_qualified_names(&mut symbols);
         let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
         for symbol in &mut symbols {
-            symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            if symbol.node_kind.is_none() {
+                symbol.node_kind = declaration_nodes.get(&symbol.range).copied();
+            }
         }
+        let macro_invocations = captured.or_else(|| Self::invocations(&language, &nodes));
         let left_out_symbols = leave_out_refused_names(&mut symbols);
         let left_out_declarations = left_out_symbols.len();
         Self {
@@ -318,6 +415,8 @@ impl SyntaxDocument {
                 symbols,
                 left_out_symbols,
                 export_bindings: None,
+                macro_invocations,
+                scope: None,
                 has_errors,
                 left_out_declarations,
                 markdown_facts: None,
@@ -380,7 +479,14 @@ impl SyntaxDocument {
     }
 
     pub(crate) fn with_source_witness(mut self, source: &str) -> Self {
-        Arc::make_mut(&mut self.facts).source_digest = Some(FileDigest::of(source.as_bytes()));
+        let facts = Arc::make_mut(&mut self.facts);
+        facts.source_digest = Some(FileDigest::of(source.as_bytes()));
+        if facts.language.name == "rust" && facts.language.dialect.is_none() {
+            facts.scope = rust_macros::capture_scope(source, &self.nodes, facts.has_errors);
+        }
+        if let Some(invocations) = &mut facts.macro_invocations {
+            rust_macros::capture(source, &self.nodes, invocations, None);
+        }
         self
     }
 
@@ -444,6 +550,18 @@ impl SyntaxFacts {
     #[must_use]
     pub fn export_bindings(&self) -> Option<&[SyntaxExportBinding]> {
         self.export_bindings.as_deref()
+    }
+
+    /// Returns original Rust scopes, or `None` for unrecorded scope facts.
+    #[must_use]
+    pub fn scope(&self) -> Option<&[Scope]> {
+        self.scope.as_deref()
+    }
+
+    /// Returns captured top-level Rust macro invocations, or `None` for unrecorded facts.
+    #[must_use]
+    pub fn macro_invocations(&self) -> Option<&[MacroInvocation]> {
+        self.macro_invocations.as_deref()
     }
     /// Returns whether these facts came from a provider or framework context.
     #[must_use]
@@ -547,6 +665,8 @@ impl SyntaxFacts {
             symbols: parts.symbols,
             left_out_symbols: parts.left_out_symbols,
             export_bindings: parts.export_bindings,
+            macro_invocations: parts.macro_invocations,
+            scope: parts.scope,
             has_errors: parts.has_errors,
             left_out_declarations: parts.left_out_declarations,
             markdown_facts: parts.markdown_facts,

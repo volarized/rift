@@ -135,6 +135,8 @@ pub struct DocumentationCollection {
     resolution_cache: Option<super::resolution::ResolutionCache>,
 }
 
+mod retained_size;
+
 impl DocumentationCollection {
     /// Validates a bounded set of stored blocks and their source facts for search projection.
     ///

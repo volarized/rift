@@ -1,5 +1,8 @@
 //! Provider Contributions and normalized symbol records.
 
+mod retained_extensions;
+mod retained_size;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -581,7 +584,7 @@ impl ContributionRelationship {
 }
 
 /// One immutable provider record.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Contribution {
     key: ContributionKey,
     applicability: SourceApplicability,
@@ -593,9 +596,31 @@ pub struct Contribution {
     references: Vec<SemanticReference>,
     relationships: Vec<ContributionRelationship>,
     namespaced: Extensions,
+    namespaced_material_bytes: usize,
+}
+
+impl PartialEq for Contribution {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.applicability == other.applicability
+            && self.facts == other.facts
+            && self.origin == other.origin
+            && self.source == other.source
+            && self.identity_anchor == other.identity_anchor
+            && self.equivalence == other.equivalence
+            && self.references == other.references
+            && self.relationships == other.relationships
+            && self.namespaced == other.namespaced
+    }
 }
 
 impl Contribution {
+    /// Material retained by validated provider-specific facts, including clones.
+    #[must_use]
+    pub const fn namespaced_material_bytes(&self) -> usize {
+        self.namespaced_material_bytes
+    }
+
     /// Starts one Contribution builder with portable facts.
     #[must_use]
     pub fn builder(
@@ -616,6 +641,7 @@ impl Contribution {
                 references: Vec::new(),
                 relationships: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
+                namespaced_material_bytes: 0,
             },
         }
     }
@@ -639,6 +665,7 @@ impl Contribution {
                 references: Vec::new(),
                 relationships: Vec::new(),
                 namespaced: Extensions(std::collections::BTreeMap::new()),
+                namespaced_material_bytes: 0,
             },
         }
     }
@@ -758,8 +785,10 @@ impl ContributionBuilder {
     /// # Errors
     ///
     /// Returns [`RiftError`] for invalid facts, bounds, origin, or identity evidence.
-    pub fn build(self) -> Result<Contribution, RiftError> {
+    pub fn build(mut self) -> Result<Contribution, RiftError> {
         validate_contribution(&self.contribution)?;
+        self.contribution.namespaced_material_bytes =
+            retained_extensions::compact(&mut self.contribution.namespaced);
         Ok(self.contribution)
     }
 }
@@ -1406,6 +1435,10 @@ mod tests {
 
         assert!(contribution.facts().is_none());
         assert_eq!(contribution.namespaced(), &namespaced);
+        let bytes = contribution.namespaced_material_bytes();
+        assert!(bytes > 0 && bytes < usize::MAX);
+        assert_eq!(contribution.clone(), contribution);
+        assert!(get_size2::GetSize::get_heap_size(&contribution) >= bytes);
     }
 
     #[test]

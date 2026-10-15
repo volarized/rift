@@ -23,6 +23,9 @@ pub(crate) struct SelectedFile<'source> {
 /// Original file paths and exact provider declaration names mapped to established IDs.
 pub(super) type Anchors = BTreeMap<String, BTreeMap<String, SymbolId>>;
 
+#[cfg(test)]
+mod digest_tests;
+
 /// One export binding whose defining declaration and logical owner are established.
 pub(crate) struct ExportBinding {
     pub(crate) path: String,
@@ -39,6 +42,7 @@ pub(crate) struct ExportBinding {
 #[derive(Default)]
 pub(crate) struct PreparedNamespace {
     pub(crate) anchors: Anchors,
+    pub(crate) public_names: BTreeMap<String, BTreeSet<String>>,
     pub(crate) mappings: BTreeMap<String, BTreeMap<String, rift_syntax::LogicalDeclaration>>,
     pub(crate) exports: Vec<ExportBinding>,
     pub(crate) unresolved_exports: bool,
@@ -58,9 +62,6 @@ pub(crate) fn placed_aliases(
     let mut aliases = BTreeMap::<String, Vec<rift_syntax::PlacedAlias>>::new();
     for export in &prepared.exports {
         let source = *positions.get(export.path.as_str()).ok_or_else(&invalid)?;
-        let target = *positions
-            .get(export.target_path.as_str())
-            .ok_or_else(&invalid)?;
         let range = export.binding.range;
         let bytes = usize::try_from(range.start)
             .ok()
@@ -70,7 +71,23 @@ pub(crate) fn placed_aliases(
         if bytes.is_none() {
             return Err(invalid());
         }
-        let placement = placements.get(target).ok_or_else(&invalid)?;
+        let owner = rift_protocol::identity::SymbolIdentity::parse(export.identity.as_str())
+            .map_err(|_| invalid())?;
+        let target_owner = rift_protocol::identity::SymbolIdentity::parse(export.target.as_str())
+            .map_err(|_| invalid())?;
+        let target_identity = if owner.owner() == target_owner.owner() {
+            let target = *positions
+                .get(export.target_path.as_str())
+                .ok_or_else(&invalid)?;
+            let placement = placements.get(target).ok_or_else(&invalid)?;
+            rift_core::symbol_identity(
+                &selected[target].syntax.language().identity_segment(),
+                placement.identity_path(),
+                &export.target_qualified_name,
+            )
+        } else {
+            export.target.as_str().to_owned()
+        };
         aliases
             .entry(export.path.clone())
             .or_default()
@@ -78,11 +95,7 @@ pub(crate) fn placed_aliases(
                 name: export.name.clone(),
                 qualified_name: export.qualified_name.clone(),
                 identity: export.identity.clone(),
-                target_identity: rift_core::symbol_identity(
-                    &selected[target].syntax.language().identity_segment(),
-                    placement.identity_path(),
-                    &export.target_qualified_name,
-                ),
+                target_identity,
                 range,
             });
     }
@@ -97,12 +110,19 @@ pub(super) fn prepare(
     prepare_context(&input.namespace_input(), selected)
 }
 
+pub(crate) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
+    rust::library(input)
+}
+
 pub(crate) fn prepare_context(
     input: &NamespaceInput<'_>,
     selected: &[SelectedFile<'_>],
 ) -> PreparedNamespace {
     let mut prepared = typescript::prepare(input, selected);
-    prepared.anchors.extend(rust::prepare(input, selected));
+    let rust = rust::prepare(input, selected);
+    prepared.anchors.extend(rust.anchors);
+    prepared.exports.extend(rust.exports);
+    prepared.unresolved_exports |= rust.unresolved_exports;
     let mut roots = input.import_roots().to_vec();
     for root in python::import_roots(input) {
         if !roots.iter().any(|accepted| {
@@ -111,22 +131,37 @@ pub(crate) fn prepare_context(
             roots.push(root);
         }
     }
-    let roots_accepted = crate::input::validate_roots(&roots).is_ok();
+    let roots_accepted = crate::input::validate_roots(&roots)
+        .and_then(|()| {
+            crate::input::validate_runtime_roots(
+                input.owner(),
+                input.language(),
+                input.files(),
+                &roots,
+            )
+        })
+        .is_ok();
+    let captured = input
+        .files()
+        .iter()
+        .map(|source| (source.path().as_str(), *source))
+        .collect::<BTreeMap<_, _>>();
     for file in selected {
         if file.syntax.language().name == "python" {
             prepared.anchors.insert(
                 file.path.as_str().to_owned(),
-                if roots_accepted {
-                    identity_anchors_with_roots(
-                        input,
-                        file.syntax,
-                        file.path.as_str(),
-                        file.source,
-                        &roots,
-                    )
-                } else {
-                    BTreeMap::new()
-                },
+                captured
+                    .get(file.path.as_str())
+                    .filter(|source| roots_accepted && source.text() == file.source)
+                    .map_or_else(BTreeMap::new, |source| {
+                        identity_anchors_with_roots(
+                            input,
+                            file.syntax,
+                            file.path.as_str(),
+                            *source,
+                            &roots,
+                        )
+                    }),
             );
         }
     }
@@ -137,20 +172,23 @@ fn identity_anchors_with_roots(
     input: &NamespaceInput<'_>,
     syntax: &SyntaxFacts,
     path: &str,
-    source: &str,
+    source: crate::PackageSource<'_>,
     roots: &[PackageImportRoot],
 ) -> BTreeMap<String, SymbolId> {
     if syntax.language().name != "python"
         || syntax.language().dialect.is_some()
         || syntax.has_errors()
-        || syntax.source_digest() != Some(&rift_core::FileDigest::of(source.as_bytes()))
     {
+        return BTreeMap::new();
+    }
+    let digest = source.source_digest();
+    if syntax.source_digest() != Some(&digest) {
         return BTreeMap::new();
     }
     let Some(module) = python_module(path, roots) else {
         return BTreeMap::new();
     };
-    let revision = crate::documentation::content_digest(source.as_bytes()).0;
+    let mut revision = None::<String>;
     let mut occurrences = BTreeMap::<String, usize>::new();
     let mut declarations = BTreeMap::<String, Vec<&rift_syntax::SyntaxSymbol>>::new();
     for symbol in syntax.symbols() {
@@ -214,6 +252,7 @@ fn identity_anchors_with_roots(
             continue;
         };
         if let Some(number) = occurrence {
+            let revision = revision.get_or_insert_with(|| occurrence_revision(digest));
             let Ok(occurrence) = SymbolOccurrence::new(number, revision.clone()) else {
                 continue;
             };
@@ -227,6 +266,16 @@ fn identity_anchors_with_roots(
         }
     }
     anchors
+}
+
+fn occurrence_revision(digest: rift_core::FileDigest) -> String {
+    use std::fmt::Write as _;
+
+    let mut revision = String::with_capacity(digest.as_bytes().len() * 2);
+    for byte in digest.as_bytes() {
+        write!(&mut revision, "{byte:02x}").expect("String accepts formatted bytes");
+    }
+    revision
 }
 
 fn python_declaration_name(symbol: &rift_syntax::SyntaxSymbol) -> Option<String> {
@@ -271,13 +320,15 @@ fn python_module(path: &str, roots: &[PackageImportRoot]) -> Option<Vec<String>>
             continue;
         }
         let spelling = parts.join(".");
-        if !root.modules().iter().any(|module| {
-            spelling == *module
-                || (root.origin() != PackageImportRootOrigin::PyModules
-                    && spelling
-                        .strip_prefix(module.as_str())
-                        .is_some_and(|tail| tail.starts_with('.')))
-        }) {
+        if root.origin() != PackageImportRootOrigin::Runtime
+            && !root.modules().iter().any(|module| {
+                spelling == *module
+                    || (root.origin() != PackageImportRootOrigin::PyModules
+                        && spelling
+                            .strip_prefix(module.as_str())
+                            .is_some_and(|tail| tail.starts_with('.')))
+            })
+        {
             continue;
         }
         modules.insert(parts.into_iter().map(str::to_owned).collect::<Vec<_>>());
@@ -420,4 +471,17 @@ mod tests {
         );
         assert_eq!(python_module("six-1.17.0.data/data/six.py", &roots), None);
     }
+}
+
+#[cfg(test)]
+mod runtime_tests;
+
+pub(crate) fn namespace_paths(
+    input: &NamespaceInput<'_>,
+    documents: &[&crate::IndexedFile],
+    contains: &dyn Fn(&str) -> bool,
+    selected: &BTreeSet<rift_core::ProjectPath>,
+    files_max: usize,
+) -> Result<BTreeSet<rift_core::ProjectPath>, rift_error::RiftError> {
+    rust::namespace_paths(input, documents, contains, selected, files_max)
 }

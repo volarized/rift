@@ -30,12 +30,16 @@ pub enum ArchiveMemberKind {
 }
 
 mod import_root;
-pub(crate) use import_root::validate_roots;
+pub(crate) use import_root::{validate_roots, validate_runtime_roots};
 #[cfg(feature = "collector")]
 mod namespace;
 
 #[cfg(feature = "collector")]
 pub use namespace::{NamespaceInput, NamespaceModule};
+#[cfg(feature = "collector")]
+mod dependency;
+#[cfg(feature = "collector")]
+pub use dependency::PackageDependency;
 
 pub use import_root::{
     PACKAGE_IMPORT_BYTES_MAX, PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot,
@@ -405,12 +409,16 @@ pub struct ExactPackageInput<'input> {
     #[cfg(feature = "collector")]
     modules: &'input [NamespaceModule<'input>],
     #[cfg(feature = "collector")]
+    dependencies: &'input [PackageDependency<'input>],
+    #[cfg(feature = "collector")]
     build_paths: Option<
         &'input std::collections::BTreeMap<
             rift_protocol::read::ProjectPath,
             Option<ArchiveMemberKind>,
         >,
     >,
+    #[cfg(feature = "collector")]
+    library: Option<(PackageSource<'input>, PackageSource<'input>)>,
     limits: ExactPackageLimits,
 }
 
@@ -446,7 +454,11 @@ impl<'input> ExactPackageInput<'input> {
             #[cfg(feature = "collector")]
             modules: &[],
             #[cfg(feature = "collector")]
+            dependencies: &[],
+            #[cfg(feature = "collector")]
             build_paths: None,
+            #[cfg(feature = "collector")]
+            library: None,
             limits,
         })
     }
@@ -462,6 +474,20 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub fn namespace_input(self) -> NamespaceInput<'input> {
         NamespaceInput::from_package(&self)
+    }
+
+    /// Adds admitted dependency publications and their original selected sources.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for a missing manifest selector or exceeded bounds.
+    #[cfg(feature = "collector")]
+    pub fn with_dependencies(
+        mut self,
+        dependencies: &'input [PackageDependency<'input>],
+    ) -> Result<Self, RiftError> {
+        self.namespace_input().with_dependencies(dependencies)?;
+        self.dependencies = dependencies;
+        Ok(self)
     }
 
     /// Adds selected module observations validated against this source inventory.
@@ -508,6 +534,7 @@ impl<'input> ExactPackageInput<'input> {
         roots: &'input [PackageImportRoot],
     ) -> Result<Self, RiftError> {
         import_root::validate_roots(roots)?;
+        import_root::validate_runtime_roots(self.owner, self.language, self.files, roots)?;
         self.import_roots = roots;
         Ok(self)
     }
@@ -523,6 +550,27 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub const fn import_roots(self) -> &'input [PackageImportRoot] {
         self.import_roots
+    }
+
+    /// Captures the explicitly selected non-test Cargo library acquisition.
+    ///
+    /// The manifest and library root must be original admitted sources for this owner.
+    /// The parsed manifest must select this root for the same package name and version.
+    /// This context does not establish feature, platform, or custom cfg applicability.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for a missing or mismatched owner, source,
+    /// manifest, or library target.
+    #[cfg(feature = "collector")]
+    pub fn with_library(
+        mut self,
+        owner: &SymbolOwner,
+        manifest: PackageSource<'input>,
+        root: PackageSource<'input>,
+    ) -> Result<Self, RiftError> {
+        self.namespace_input().with_library(owner, manifest, root)?;
+        self.library = Some((manifest, root));
+        Ok(self)
     }
 
     /// Selected artifact, when its immutable content was captured.
@@ -586,6 +634,14 @@ impl<'input> ExactPackageInput<'input> {
         )?;
         self.context_sources = sources;
         self.frameworks = frameworks;
+        #[cfg(feature = "collector")]
+        self.namespace_input()
+            .with_dependencies(self.dependencies)?;
+        #[cfg(feature = "collector")]
+        if let Some((manifest, root)) = self.library {
+            self.namespace_input()
+                .with_library(self.owner, manifest, root)?;
+        }
         #[cfg(feature = "collector")]
         if let Some(paths) = self.build_paths {
             self.namespace_input().with_build_paths(paths)?;

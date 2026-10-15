@@ -1,7 +1,7 @@
 use super::{
     BTreeMap, BTreeSet, ByteRange, LogicalDeclaration, NamespaceInput, PackageMetadata,
     PreparedNamespace, ProjectPath, SelectedFile, SymbolOwner, SyntaxExportKind, binding_name,
-    map_files, prepare_file, selected_source_is_valid,
+    commonjs, map_files, prepare_file, selected_source_is_valid,
 };
 use crate::NamespaceModule;
 
@@ -20,6 +20,17 @@ pub(super) fn prepare(
         };
         if implementation.syntax.language().name != "javascript" {
             prepared.unresolved_exports = true;
+            continue;
+        }
+        if observation.declarations().is_empty() {
+            commonjs::prepare(
+                input,
+                metadata,
+                selected,
+                observation,
+                implementation,
+                prepared,
+            );
             continue;
         }
         for source in observation.declarations() {
@@ -140,7 +151,7 @@ fn package_observation(
     })
 }
 
-fn target_path(target: &str) -> Option<ProjectPath> {
+pub(super) fn target_path(target: &str) -> Option<ProjectPath> {
     ProjectPath::new(target.strip_prefix("./").unwrap_or(target)).ok()
 }
 
@@ -190,7 +201,7 @@ fn ambient_containers<'source>(file: &'source SelectedFile<'_>, module: &str) ->
     containers.into_iter().collect()
 }
 
-fn literal_module_name(source: &str, range: ByteRange) -> Option<String> {
+pub(super) fn literal_module_name(source: &str, range: ByteRange) -> Option<String> {
     let start = usize::try_from(range.start).ok()?;
     let end = usize::try_from(range.end).ok()?;
     let token = source.get(start..end)?;

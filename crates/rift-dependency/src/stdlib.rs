@@ -575,6 +575,42 @@ pub(crate) fn pyvenv_version(text: &str) -> Option<Pin> {
     })
 }
 
+/// Reads an exact `CPython` version from one selected environment's marker.
+/// Partial versions and other implementations establish no runtime owner.
+#[must_use]
+pub fn python_environment_runtime(
+    path: &Path,
+    inputs: &mut dyn StaticInputs,
+) -> Option<rift_protocol::read::RuntimeIdentity> {
+    let text = pin_text(inputs, &path.join(crate::PROJECT_ENVIRONMENT_MARKER))?;
+    let mut implementations = lines_inclusive(&text).filter_map(|line| {
+        let (key, value) = without_ending(line).split_once('=')?;
+        (key.trim() == "implementation").then_some(value.trim())
+    });
+    if implementations.next()? != "CPython" || implementations.next().is_some() {
+        return None;
+    }
+    let Pin::Exact(version) = pyvenv_version(&text)? else {
+        return None;
+    };
+    for key in PYVENV_VERSION_KEYS {
+        let mut values = lines_inclusive(&text).filter_map(|line| {
+            let (name, value) = without_ending(line).split_once('=')?;
+            (name.trim() == key).then_some(value.trim())
+        });
+        if let Some(value) = values.next()
+            && (values.next().is_some()
+                || python_version_word(value) != Pin::Exact(version.clone()))
+        {
+            return None;
+        }
+    }
+    Some(rift_protocol::read::RuntimeIdentity {
+        runtime: "cpython".to_owned(),
+        version,
+    })
+}
+
 /// The version `.python-version` names: its first line that is not blank or a comment.
 #[must_use]
 pub(crate) fn python_pin_line(text: &str) -> Option<Pin> {

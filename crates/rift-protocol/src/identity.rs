@@ -12,6 +12,9 @@ use crate::read::Language;
 /// Maximum encoded size of a symbol identity in bytes.
 pub const SYMBOL_ID_BYTES_MAX: usize = 8_192;
 
+/// Structural local scope pattern. The codec also refuses reserved registration names.
+pub const LOCAL_SCOPE_PATTERN: &str = r"^local(?:@[a-z][a-z0-9_-]*)?$";
+
 /// The canonical owner and logical path format this codec accepts.
 pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 1;
 
@@ -231,7 +234,7 @@ impl schemars::JsonSchema for SymbolIdentity {
             "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://symbol/local/rust/app/parser/parse",
-                "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+                "rift://symbol/local@cloud/rust/app/load",
                 "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
                 "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ]

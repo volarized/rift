@@ -22,7 +22,9 @@ pub struct NamespaceInput<'input> {
     files_max: usize,
     bytes_max: u64,
     syntax: SyntaxLimits,
+    library: Option<(PackageSource<'input>, PackageSource<'input>)>,
     modules: &'input [NamespaceModule<'input>],
+    dependencies: &'input [super::PackageDependency<'input>],
     build_paths:
         Option<&'input BTreeMap<rift_protocol::read::ProjectPath, Option<ArchiveMemberKind>>>,
 }
@@ -41,7 +43,9 @@ impl<'input> NamespaceInput<'input> {
                 .min(input.limits.publication().units) as usize,
             bytes_max: input.limits.bytes_max(),
             syntax: input.limits.syntax(),
+            library: input.library,
             modules: input.modules,
+            dependencies: input.dependencies,
             build_paths: input.build_paths,
         }
     }
@@ -116,6 +120,7 @@ impl<'input> NamespaceInput<'input> {
             None => rift_syntax::source_unit_for_path(file.path),
         })?;
         super::import_root::validate_roots(import_roots)?;
+        super::import_root::validate_runtime_roots(owner, language, files, import_roots)?;
         Ok(Self {
             owner,
             language,
@@ -125,9 +130,60 @@ impl<'input> NamespaceInput<'input> {
             files_max,
             bytes_max,
             syntax,
+            library: None,
             modules: &[],
+            dependencies: &[],
             build_paths: None,
         })
+    }
+
+    /// Adds dependency witnesses without copying their foreign objects.
+    ///
+    /// Each selector must occur in an original admitted Cargo manifest. Missing or
+    /// conflicting target declarations remain unresolved during requested lookup.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for invalid witnesses or exceeded bounds.
+    pub fn with_dependencies(
+        mut self,
+        dependencies: &'input [super::PackageDependency<'input>],
+    ) -> Result<Self, RiftError> {
+        self.validate_count(dependencies.len())?;
+        let mut names = BTreeSet::new();
+        let mut sources = self
+            .files
+            .len()
+            .checked_add(self.context_sources.len())
+            .ok_or_else(invalid)?;
+        let mut bytes = self
+            .files
+            .iter()
+            .chain(self.context_sources)
+            .try_fold(0_u64, |bytes, source| {
+                counted_bytes(bytes, source.text.len(), self.bytes_max)
+            })?;
+        for dependency in dependencies {
+            bytes = counted_bytes(bytes, dependency.name().len(), self.bytes_max)?;
+            if !names.insert(dependency.name()) {
+                return Err(invalid());
+            }
+            sources = sources
+                .checked_add(dependency.sources().len())
+                .ok_or_else(invalid)?;
+            self.validate_count(sources)?;
+            for source in dependency.sources() {
+                bytes = counted_bytes(bytes, source.text().len(), self.bytes_max)?;
+            }
+            dependency.validate(&self)?;
+        }
+        self.dependencies = dependencies;
+        Ok(self)
+    }
+
+    /// Borrowed admitted dependency publications, in caller order.
+    #[must_use]
+    pub const fn dependencies(self) -> &'input [super::PackageDependency<'input>] {
+        self.dependencies
     }
 
     /// Adds selected module observations without combining their export conditions.
@@ -142,7 +198,7 @@ impl<'input> NamespaceInput<'input> {
         mut self,
         modules: &'input [NamespaceModule<'input>],
     ) -> Result<Self, RiftError> {
-        validate_modules(self, modules)?;
+        validate_modules(&self, modules)?;
         self.modules = modules;
         Ok(self)
     }
@@ -184,6 +240,60 @@ impl<'input> NamespaceInput<'input> {
         }
         self.build_paths = Some(paths);
         Ok(self)
+    }
+
+    /// Captures an explicitly selected non-test Cargo library acquisition.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal unless owner, manifest, and library root
+    /// match the original admitted sources and parsed library target.
+    pub fn with_library(
+        mut self,
+        owner: &SymbolOwner,
+        manifest: PackageSource<'input>,
+        root: PackageSource<'input>,
+    ) -> Result<Self, RiftError> {
+        if owner != self.owner || self.language.name != "rust" || self.language.dialect.is_some() {
+            return Err(invalid());
+        }
+        for (source, admitted) in [
+            (
+                manifest,
+                self.files
+                    .iter()
+                    .chain(self.context_sources)
+                    .find(|file| file.path == manifest.path),
+            ),
+            (root, self.files.iter().find(|file| file.path == root.path)),
+        ] {
+            let Some(admitted) = admitted else {
+                return Err(invalid());
+            };
+            if source.text != admitted.text || source.physical != admitted.physical {
+                return Err(invalid());
+            }
+        }
+        let files = [root];
+        let context = [manifest];
+        let selected = NamespaceInput {
+            files: &files,
+            context_sources: &context,
+            library: None,
+            ..self
+        };
+        if crate::analyzer::namespace::library(&selected)
+            .is_none_or(|(path, _)| path != root.path.as_str())
+        {
+            return Err(invalid());
+        }
+        self.library = Some((manifest, root));
+        Ok(self)
+    }
+
+    /// Explicitly selected non-test library sources, or unknown acquisition context.
+    #[must_use]
+    pub const fn library(self) -> Option<(PackageSource<'input>, PackageSource<'input>)> {
+        self.library
     }
 
     /// Captured build-path observations, or no supplied observations.
@@ -228,6 +338,29 @@ impl<'input> NamespaceInput<'input> {
     #[must_use]
     pub const fn syntax(self) -> SyntaxLimits {
         self.syntax
+    }
+
+    /// Returns captured Cargo targets and literal module paths needed by selected declarations.
+    ///
+    /// The supplied inventory contains paths from the same committed tree. Returned paths
+    /// request source witnesses; they do not establish object identities.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal when requested source paths exceed the input bound.
+    pub fn namespace_paths(
+        self,
+        documents: &[&crate::IndexedFile],
+        contains: &dyn Fn(&str) -> bool,
+        selected: &std::collections::BTreeSet<rift_core::ProjectPath>,
+    ) -> Result<std::collections::BTreeSet<rift_core::ProjectPath>, RiftError> {
+        self.validate_count(documents.len())?;
+        crate::analyzer::namespace::namespace_paths(
+            &self,
+            documents,
+            contains,
+            selected,
+            self.files_max,
+        )
     }
 
     fn validate_count(self, observed: usize) -> Result<(), RiftError> {
@@ -287,7 +420,7 @@ impl<'input> NamespaceModule<'input> {
 }
 
 fn validate_modules(
-    input: NamespaceInput<'_>,
+    input: &NamespaceInput<'_>,
     modules: &[NamespaceModule<'_>],
 ) -> Result<(), RiftError> {
     input.validate_count(modules.len())?;

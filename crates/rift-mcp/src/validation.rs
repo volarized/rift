@@ -2044,6 +2044,7 @@ fn names_a_directory(validation: &IndexValidation, kind: EventKind, path: &Path)
 }
 
 /// Creates an empty readable publication and retains its owner for background preparation.
+#[cfg(test)]
 pub(crate) fn empty_workspace_preparation(
     root: &Path,
     limits: WorkspaceIndexLimits,
@@ -12304,6 +12305,10 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir()?;
         let root = directory.path();
         fs::create_dir(root.join("src"))?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n",
+        )?;
         fs::write(
             root.join("src/lib.rs"),
             "pub struct Beacon;\npub fn old() {}\n",

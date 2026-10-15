@@ -121,6 +121,38 @@ impl IndexedFile {
     }
 }
 
+impl get_size2::GetSize for IndexedFile {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 4 * std::mem::size_of::<usize>();
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.path, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.syntax, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.declarations, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rift_core::ProjectPath;

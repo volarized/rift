@@ -293,6 +293,8 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Code::InternalError,
             Retry::SameRequest,
             &[
+                "rift.cli.config_home_unresolved",
+                "rift.cli.config_write_failed",
                 "rift.cli.install_home_unresolved",
                 "rift.cli.install_remove_failed",
                 "rift.cli.install_settings_unparsable",

@@ -467,10 +467,49 @@ These keys use variables such as `RIFT_PACKAGE_ARCHIVE_COMPRESSED_SIZE` and
 `RIFT_PACKAGE_ARCHIVE_EXPANSION_RATIO`. Archive limits apply before the selected source budgets,
 so raising a publication limit does not raise archive admission.
 
+## Telemetry
+
+`telemetry` controls daily counters derived from existing cloud and download requests.
+Rift sends no separate activity report, collects no additional local metadata, and creates
+no telemetry marker. [Privacy](/docs/privacy) describes the counters and retention.
+
+```toml
+[telemetry]
+disabled = false
+```
+
+`disabled` defaults to `false`. Set it to `true` to exclude this project's requests from counters:
+
+```sh
+rift config set --telemetry.disabled=true
+```
+
+`rift config set` updates the current directory's `rift.toml`, preserving other values and
+comments. The command supports only `telemetry.disabled`, with boolean `true` or
+`false`; malformed documents and symbolic-link targets are refused without replacement.
+
+For every project, write the setting to `~/.rift/config.toml`:
+
+```sh
+rift config set --telemetry.disabled=true --user
+```
+
+A global disable takes precedence over a project's `false` value. Set the global value to
+`false` to allow each project to choose its own value. `RIFT_TELEMETRY_DISABLED=true` also
+suppresses counters; `false` cannot override a disable in either file.
+
+Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` for the same opt-out. They do
+not read the CLI's TOML files. Local-only use creates no telemetry request, so these counters
+cannot measure offline activity or unique daily active users. A disable affects future
+requests; existing counters expire under their retention policy.
+
 ## Global
 
 `global` controls package reads through the configured REST API. The local server creates this
 client on the first `global` or `all` read that can return package declarations.
+
+The default global API records daily request counts by country, agent category, operation,
+method, and response status. [Privacy](/docs/privacy) explains the collection and retention.
 
 ```toml
 [global]
@@ -713,9 +752,9 @@ One that crash-loops does: once the budget is spent, requests for its languages 
 The first process a workspace starts is the start, not a replacement, and a refused `command`
 program, empty or an absolute path, is reported at once rather than started again.
 
-A symbol address spells its language as an identity segment, and a declaration in a `.tsx` file
-is addressed under the dialect: `rift://symbol/typescript:tsx/view.tsx/Banner`. The server looks
-the entry up by that exact identity, so the bare language and the dialect are two independent
+A symbol identity carries its exact language, including the dialect for a declaration in a
+`.tsx` file. The server looks the language entry up by that exact identity, so the bare language
+and the dialect are two independent
 entries, each selecting its own process, and both may select the same named one. Each dialect needs its own entry.
 
 A minimal entry names its process inline. This one names

@@ -11,27 +11,28 @@ async fn test_fixture_paged_reads_ask_for_the_advertised_page_limit() {
             .await;
         assert!(pages.is_ok(), "{pages:?}");
         assert_eq!(server.state.last_query.lock().await.as_deref(), Some(asked));
-        let pages = client
-            .list_package_symbols_pages(&symbol_request(), PAGE_LIMIT_MAX)
-            .await;
-        assert!(pages.is_ok(), "{pages:?}");
-        let last_query = server.state.last_query.lock().await.clone();
-        assert_eq!(
-            last_query
-                .as_deref()
-                .and_then(|query| query.split('&').next()),
-            Some(asked),
-            "the symbol pages follow a cursor at the same limit"
+        let result = client
+            .get_symbol(&symbol_request())
+            .await
+            .expect("exact read");
+        assert!(
+            matches!(result, GetSymbolResult::Found { ref declarations, .. } if declarations.len() == 1)
         );
+        assert_eq!(server.state.last_query.lock().await.as_deref(), None);
+        let requests = server.state.request_log.lock().await;
+        let sent = requests.last().expect("exact request");
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("request body");
+        assert_eq!(body["declaration_limit"], 5);
     }
 
     let (_server, client) = operation_client(OperationFixture::PageLimitMax(200)).await;
-    assert_eq!(
-        client
+    assert_registered_field(
+        &client
             .search_packages(&search_request(), PAGE_LIMIT_MAX, None)
-            .await,
-        Err(ClientError::InvalidRequest { field: "limit" }),
-        "one page asked past the advertised bound stays refused"
+            .await
+            .expect_err("one page asked past the advertised bound stays refused"),
+        "rift.client.request_invalid",
+        "limit",
     );
 }
 
@@ -43,10 +44,13 @@ async fn test_fixture_capabilities_accept_a_page_limit_up_to_the_client_bound() 
 
     for advertised in [PAGE_LIMIT_MAX + 1, 0] {
         let (_server, client) = operation_client(OperationFixture::PageLimitMax(advertised)).await;
-        assert_eq!(
-            client.get_capabilities().await,
-            Err(ClientError::InvalidResponseField { field: "bounds" }),
-            "{advertised}"
+        assert_registered_field(
+            &client
+                .get_capabilities()
+                .await
+                .expect_err("advertised page bound refusal"),
+            "rift.client.response_invalid",
+            "bounds",
         );
     }
 }
@@ -94,14 +98,16 @@ async fn test_fixture_page_assembly_leaves_a_body_bound_cursor_to_the_caller() {
     assert!(pages.warnings.iter().any(is_result_truncated));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 
-    let (server, client) = operation_client(OperationFixture::BodyBoundStop).await;
-    let pages = client
-        .list_package_symbols_pages(&symbol_request(), 20)
+    let mut value = symbol_result_json("demo", "first");
+    value["declaration_cursor"] = serde_json::json!("next");
+    let (server, client) = operation_client(OperationFixture::ExactSymbol(value)).await;
+    let result = client
+        .get_symbol(&symbol_request())
         .await
-        .unwrap_or_else(|error| panic!("symbol pages: {error:?}"));
-    assert_eq!(pages.items.len(), 1);
-    assert_eq!(pages.next_cursor.as_deref(), Some("next"));
-    assert!(pages.warnings.iter().any(is_result_truncated));
+        .expect("exact declaration page");
+    assert!(
+        matches!(result, GetSymbolResult::Found { ref declarations, ref declaration_cursor, .. } if declarations.len() == 1 && declaration_cursor.as_deref() == Some("next"))
+    );
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
 }
 
@@ -161,7 +167,7 @@ fn test_stopped_at_body_bound_needs_a_short_marked_page() {
 /// repeats a cursor, and records the refusal a later request answers; it stops at the
 /// advertised candidate bound.
 #[tokio::test]
-async fn test_fixture_symbol_page_assembly_refuses_what_search_assembly_refuses() {
+async fn test_fixture_search_page_assembly_records_refusals() {
     let refusals = [
         (OperationFixture::PageRevisionChange, "revision"),
         (OperationFixture::MismatchedCursor, "duplicate_item"),
@@ -169,28 +175,82 @@ async fn test_fixture_symbol_page_assembly_refuses_what_search_assembly_refuses(
     ];
     for (mode, field) in refusals {
         let (server, client) = operation_client(mode).await;
-        let expected = Err(ClientError::InvalidResponseField { field });
-        assert_eq!(
-            client
-                .list_package_symbols_pages(&symbol_request(), 20)
-                .await
-                .map(|pages| pages.items.len()),
-            expected,
-        );
+        let error = client
+            .search_packages_pages(&search_request(), 20)
+            .await
+            .expect_err("page assembly refusal");
+        assert_registered_field(&error, "rift.client.response_invalid", field);
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 3, "{field}");
-        assert_eq!(
-            client.get_capabilities().await.map(|_| 0),
-            expected,
-            "{field} is recorded"
-        );
+        let cached = client
+            .get_capabilities()
+            .await
+            .expect_err("recorded page refusal");
+        assert_eq!(cached.to_string(), error.to_string(), "{field} is recorded");
         assert_eq!(server.state.requests.load(Ordering::SeqCst), 3, "{field}");
     }
 
     let (server, client) = operation_client(OperationFixture::CandidateBound).await;
     let pages = client
-        .list_package_symbols_pages(&symbol_request(), 20)
+        .search_packages_pages(&search_request(), 20)
         .await
-        .map(|pages| (pages.items.len(), pages.next_cursor));
-    assert_eq!(pages, Ok((1, None)));
+        .expect("candidate bound page");
+    assert_eq!((pages.items.len(), pages.next_cursor), (1, None));
     assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+}
+
+/// Declaration continuation keeps the exact issued view and never sends an implicit page.
+#[tokio::test]
+async fn test_exact_declaration_cursor_keeps_view_and_bounds() {
+    use rift_protocol::symbol_read::CapturedViewId;
+    let mut request = symbol_request();
+    request.view = Some(CapturedViewId::parse(&"a".repeat(64)).expect("view"));
+    request.declaration_cursor = Some("next".to_owned());
+    request.declaration_limit = 1;
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    let result = client
+        .get_symbol(&request)
+        .await
+        .expect("same-view continuation");
+    assert!(
+        matches!(result, GetSymbolResult::Found { ref view, ref declarations, .. } if Some(&view.id) == request.view.as_ref() && declarations.len() == 1)
+    );
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 2);
+    let requests = server.state.request_log.lock().await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&requests.last().expect("request").body).expect("body");
+    assert_eq!(body["declaration_cursor"], "next");
+    assert_eq!(body["view"], "a".repeat(64));
+    assert_eq!(body["declaration_limit"], 1);
+    drop(requests);
+    let mut foreign = symbol_result_json("demo", "first");
+    foreign["view"]["id"] = serde_json::json!("b".repeat(64));
+    assert_registered_field(
+        &canonical_symbol_response(foreign, &request, SOURCE_BYTES_MAX)
+            .await
+            .expect_err("foreign view"),
+        "rift.client.response_invalid",
+        "body",
+    );
+    request.view = None;
+    let (server, client) = operation_client(OperationFixture::Valid).await;
+    assert_registered_field(
+        &client
+            .get_symbol(&request)
+            .await
+            .expect_err("unbound continuation"),
+        "rift.client.request_invalid",
+        "declaration_cursor",
+    );
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 0);
+    request.view = Some(CapturedViewId::parse(&"a".repeat(64)).expect("view"));
+    request.declaration_cursor = Some("x".repeat(CURSOR_BYTES_MAX + 1));
+    assert_registered_field(
+        &client
+            .get_symbol(&request)
+            .await
+            .expect_err("oversized cursor"),
+        "rift.client.request_invalid",
+        "declaration_cursor",
+    );
+    assert_eq!(server.state.requests.load(Ordering::SeqCst), 0);
 }

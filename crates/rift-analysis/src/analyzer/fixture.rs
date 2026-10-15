@@ -76,6 +76,16 @@ pub(super) fn package_result_with_metadata(
     syntax: Option<SyntaxLimits>,
     metadata: Option<(&str, &str)>,
 ) -> Result<PackageAnalysis, RiftError> {
+    package_result_with_syntax(shipped, files, syntax, metadata, |_| None)
+}
+
+pub(super) fn package_result_with_syntax(
+    shipped: ShippedLanguage,
+    files: Vec<(&str, &str)>,
+    syntax: Option<SyntaxLimits>,
+    metadata: Option<(&str, &str)>,
+    supplied: impl FnMut(&crate::PackageSyntaxSource<'_>) -> Option<crate::PackageSyntax>,
+) -> Result<PackageAnalysis, RiftError> {
     let mut package = identity();
     match shipped {
         ShippedLanguage::JavaScript
@@ -170,7 +180,7 @@ pub(super) fn package_result_with_metadata(
     .expect("captured fixture package metadata")
     .with_import_roots(&roots)
     .expect("captured fixture Python module placement");
-    PackageAnalyzer::analyze(input, 1)
+    PackageAnalyzer::analyze_with_syntax(input, 1, supplied)
 }
 
 fn fixture_metadata(

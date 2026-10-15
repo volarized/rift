@@ -75,11 +75,11 @@ use rift_protocol::lock::{
 use rift_protocol::retry::RetryPolicy;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Tool};
 use serde_json::json;
-use surface_corpus::{SurfaceFixture, corpus};
+use surface_corpus::SurfaceFixture;
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
+const SERVED_TOOL_NAMES: [&str; 4] = ["get_source", "get_symbol", "nodes", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -141,7 +141,7 @@ fn document_path(root: &Path) -> PathBuf {
 
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
-        ServerPresence::Serving(lock) => Some(lock),
+        ServerPresence::Serving(lock) => Some(*lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
@@ -171,16 +171,24 @@ async fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
-/// One proxied `get_symbol` round trip for the fixture's `beacon` symbol.
+/// One proxied search round trip for the fixture's `beacon` symbol.
 async fn beacon_lookup(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<serde_json::Value> {
     await_workspace_ready(client).await?;
-    proxied_call(client, "get_symbol", &json!({"name": "beacon"})).await
+    proxied_call(
+        client,
+        "search",
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
-    assert_eq!(lookup["hits"][0]["symbol"]["name"], json!("beacon"));
+    assert_eq!(
+        lookup["results"][0]["hit"]["symbol"]["name"],
+        json!("beacon")
+    );
 }
 
 /// Retains only the foreground child this fixture started.
@@ -233,7 +241,7 @@ async fn repository_foreground(
                 return None;
             }
             match rift_mcp::probe_state_directory(state_directory) {
-                ServerPresence::Serving(lock) if lock.pid == child.0.id() => Some(lock),
+                ServerPresence::Serving(lock) if lock.pid == child.0.id() => Some(*lock),
                 _ => None,
             }
         },
@@ -284,21 +292,32 @@ async fn repository_workspace_reads(
         .as_str()
         .ok_or("map carries its revision")?
         .to_owned();
-    let lookup = proxied_call(client, "get_symbol", &json!({"name": name}))
-        .await
-        .map_err(|error| format!("positive get_symbol: {error:?}"))?;
-    assert_eq!(lookup["hits"][0]["symbol"]["name"], name, "{lookup}");
+    let lookup = proxied_call(
+        client,
+        "search",
+        &json!({"query": name, "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("positive search: {error:?}"))?;
+    assert_eq!(
+        lookup["results"][0]["hit"]["symbol"]["name"], name,
+        "{lookup}"
+    );
     let other = names
         .iter()
         .find(|other| **other != name)
         .ok_or("fixture has another symbol")?;
-    let absent = proxied_call(client, "get_symbol", &json!({"name": other}))
-        .await
-        .map_err(|error| format!("negative get_symbol: {error:?}"))?;
+    let absent = proxied_call(
+        client,
+        "search",
+        &json!({"query": other, "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("negative search: {error:?}"))?;
     assert!(
-        absent["hits"]
+        absent["results"]
             .as_array()
-            .ok_or("lookup carries hits")?
+            .ok_or("search carries results")?
             .is_empty(),
         "{absent}"
     );
@@ -511,19 +530,14 @@ fn windows_indigo_first_index_xfail_matches_only_the_recorded_refusal() {
     }
 }
 
-/// All internal root routes share one elected process and retain separate workspace facts.
-#[tokio::test]
-async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
--> TestResult {
-    let names = ["amber", "cedar", "indigo", "quartz"];
-    let main = laid_out_workspace(
-        &[("lib.rs", "pub fn amber() {}\n")],
-        &harness::assigned_port_key()?,
-    )?;
-    fixture_git(main.path(), &["init", "-q"])?;
-    fixture_git(main.path(), &["add", "lib.rs", "rift.toml"])?;
+fn repository_linked_workspaces(
+    main: &Path,
+    names: &[&str],
+) -> TestResult<(tempfile::TempDir, Vec<PathBuf>)> {
+    fixture_git(main, &["init", "-q"])?;
+    fixture_git(main, &["add", "lib.rs", "rift.toml"])?;
     fixture_git(
-        main.path(),
+        main,
         &[
             "-c",
             "commit.gpgsign=false",
@@ -533,11 +547,11 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         ],
     )?;
     let linked_parent = tempfile::tempdir()?;
-    let mut roots = vec![main.path().to_path_buf()];
+    let mut roots = vec![main.to_path_buf()];
     for name in names.iter().skip(1) {
         let root = linked_parent.path().join(format!("worktree-é-{name}"));
         fixture_git(
-            main.path(),
+            main,
             &[
                 "worktree",
                 "add",
@@ -550,6 +564,19 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         fs::write(root.join("lib.rs"), format!("pub fn {name}() {{}}\n"))?;
         roots.push(root);
     }
+    Ok((linked_parent, roots))
+}
+
+/// All internal root routes share one elected process and retain separate workspace facts.
+#[tokio::test]
+async fn repository_foreground_routes_four_linked_workspaces_and_restarts_changed_settings()
+-> TestResult {
+    let names = ["amber", "cedar", "indigo", "quartz"];
+    let main = laid_out_workspace(
+        &[("lib.rs", "pub fn amber() {}\n")],
+        &harness::assigned_port_key()?,
+    )?;
+    let (_linked_parent, roots) = repository_linked_workspaces(main.path(), &names)?;
     let common = rift_mcp::repository::discover_common_directory(main.path())
         .ok_or("fixture repository has a common Git directory")?;
     let state_directory =
@@ -583,7 +610,7 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
         "source catalog follows workspace bytes"
     );
     let after = match rift_mcp::probe_state_directory(&state_directory) {
-        ServerPresence::Serving(lock) => lock,
+        ServerPresence::Serving(lock) => *lock,
         other => return Err(format!("repository must remain serving: {other:?}").into()),
     };
     assert_eq!(
@@ -593,10 +620,17 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let changed = fs::read_to_string(main.path().join("rift.toml"))?
         .replace("[server]\n", "[server]\nnum_workers = 2\n");
     fs::write(main.path().join("rift.toml"), &changed)?;
-    let pinned = proxied_call(&clients[3], "get_symbol", &json!({"name": "quartz"}))
-        .await
-        .map_err(|error| format!("workspace quartz after settings change get_symbol: {error:?}"))?;
-    assert_eq!(pinned["hits"][0]["symbol"]["name"], "quartz", "{pinned}");
+    let pinned = proxied_call(
+        &clients[3],
+        "search",
+        &json!({"query": "quartz", "target": "symbol"}),
+    )
+    .await
+    .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
+    assert_eq!(
+        pinned["results"][0]["hit"]["symbol"]["name"], "quartz",
+        "{pinned}"
+    );
     require_success(
         &run_rift(&roots[3], &["server", "status", "--repository"]).await?,
         "status after authority settings change",
@@ -710,7 +744,12 @@ async fn beacon_result(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<CallToolResult> {
     await_workspace_ready(client).await?;
-    proxied_result(client, "get_symbol", &json!({"name": "beacon"})).await
+    proxied_result(
+        client,
+        "search",
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await
 }
 
 /// Every tool one proxy lists, within the proxied-call bound.
@@ -948,9 +987,11 @@ fn stated_identities<'value>(
     name: &str,
     structured: &'value serde_json::Value,
 ) -> Vec<&'value str> {
+    if name == "get_symbol" {
+        return structured["symbol"]["id"].as_str().into_iter().collect();
+    }
     let (key, pointer) = match name {
         "search" => ("results", "/hit/symbol/id"),
-        "get_symbol" => ("hits", "/symbol/id"),
         _ => ("nodes", "/id"),
     };
     structured
@@ -974,9 +1015,214 @@ fn text_of(result: &CallToolResult) -> TestResult<&str> {
         .as_str())
 }
 
-/// The text block is the same through the `all` and the `text` proxy of one server, the `text`
-/// result carries no structured content, and the text states the identity of each symbol hit
-/// and each node of the `all` result's structured content as a bare token.
+/// Removes one rendered view after parsing its exact identity and expiry.
+fn proxy_text_view(
+    text: &str,
+) -> TestResult<(String, Option<rift_protocol::symbol_read::CapturedView>)> {
+    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
+    let mut body = String::new();
+    let mut view = None;
+    for line in text.split_inclusive('\n') {
+        if let Some(value) = line.trim_end_matches(['\r', '\n']).strip_prefix("view ") {
+            let (id, expires_at) = value
+                .split_once(" · expires ")
+                .ok_or("the captured view must state its expiry")?;
+            assert!(view.is_none(), "one captured view per result");
+            assert!(
+                !expires_at.is_empty(),
+                "the captured expiry must be present"
+            );
+            view = Some(CapturedView {
+                id: CapturedViewId::parse(id)?,
+                expires_at: expires_at.to_owned(),
+            });
+        } else {
+            body.push_str(line);
+        }
+    }
+    Ok((body, view))
+}
+
+/// Reads the exact inline view facts while preserving every other byte of the answer.
+fn proxy_row_views(
+    text: &str,
+) -> TestResult<(String, Vec<rift_protocol::symbol_read::CapturedView>)> {
+    let mut body = String::new();
+    let mut views = Vec::new();
+    for line in text.split_inclusive('\n') {
+        let Some((before, captured)) = line.split_once(" · view ") else {
+            body.push_str(line);
+            continue;
+        };
+        let (id, expiry) = captured
+            .split_once(" · expires ")
+            .ok_or("inline view must state its expiry")?;
+        let end = expiry
+            .find(" · ")
+            .unwrap_or_else(|| expiry.trim_end_matches(['\r', '\n']).len());
+        assert!(!expiry[..end].is_empty(), "inline view expiry is empty");
+        views.push(rift_protocol::symbol_read::CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(id)?,
+            expires_at: expiry[..end].to_owned(),
+        });
+        body.push_str(before);
+        body.push_str(&expiry[end..]);
+    }
+    Ok((body, views))
+}
+
+/// Reads a row's physical source through the proxy that advertised its captured view.
+async fn proxy_row_source(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    row: &serde_json::Value,
+    view: &rift_protocol::symbol_read::CapturedView,
+) -> TestResult<String> {
+    let unit = if let Some(unit) = row["unit"].as_str() {
+        rift_protocol::read::SourceUnitId::parse(unit)?
+    } else {
+        let path = row["path"]
+            .as_str()
+            .ok_or("captured row must state its source path")?;
+        rift_protocol::read::SourceUnitId::parse(&format!(
+            "rift://source/project/{}",
+            rift_protocol::identity::encode_source_unit_key(path)
+        ))?
+    };
+    let request = json!({"unit": unit, "range": row["range"], "view": view.id});
+    let response = proxied_result(client, "get_source", &request).await?;
+    assert_ne!(
+        response.is_error,
+        Some(true),
+        "captured row source: {response:?}"
+    );
+    let (body, answered) = proxy_text_view(text_of(&response)?)?;
+    assert_eq!(
+        answered.as_ref(),
+        Some(view),
+        "row source retains the original view and expiry"
+    );
+    if let Some(structured) = &response.structured_content {
+        let result: rift_protocol::source_read::GetSourceResult =
+            serde_json::from_value(structured.clone())?;
+        let rift_protocol::source_read::GetSourceResult::Found {
+            source,
+            source_complete,
+            view: selected,
+            ..
+        } = result
+        else {
+            return Err(format!(
+                "captured row source must remain available: request {request}, response {response:?}"
+            )
+            .into());
+        };
+        assert!(source_complete, "captured row source must be complete");
+        assert_eq!(
+            source.span.unit, unit,
+            "captured row source unit is unchanged"
+        );
+        if !row["range"].is_null() {
+            assert_eq!(
+                serde_json::to_value(source.span.range)?,
+                row["range"],
+                "captured row source range is unchanged"
+            );
+        }
+        assert_eq!(
+            &selected, view,
+            "captured row source retains the original selection"
+        );
+    }
+    Ok(body)
+}
+
+/// Validates each row selection before comparing source bytes between the proxies.
+async fn validated_proxy_rows(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    body: &str,
+    result: &CallToolResult,
+    reference: &serde_json::Value,
+) -> TestResult<(String, Vec<String>)> {
+    let (body, views) = proxy_row_views(body)?;
+    let rows: Vec<_> = reference["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| !row["view"].is_null())
+        .collect();
+    assert_eq!(
+        views.len(),
+        rows.len(),
+        "text states every captured row view"
+    );
+    if let Some(structured) = &result.structured_content {
+        let expected: Vec<rift_protocol::symbol_read::CapturedView> = structured["results"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|row| !row["view"].is_null())
+            .map(|row| serde_json::from_value(row["view"].clone()))
+            .collect::<Result<_, _>>()?;
+        assert_eq!(
+            views, expected,
+            "text states the exact structured row views and expiries"
+        );
+    }
+    let mut sources = Vec::new();
+    for (row, view) in rows.into_iter().zip(&views) {
+        sources.push(proxy_row_source(client, row, view).await?);
+    }
+    Ok((body, sources))
+}
+
+/// Reads each advertised view through its owning proxy before comparing the remaining text.
+async fn validated_proxy_text(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &'static str,
+    request: &serde_json::Value,
+    result: &CallToolResult,
+    reference: &serde_json::Value,
+) -> TestResult<(String, Vec<String>)> {
+    let original = text_of(result)?;
+    let (body, view) = proxy_text_view(original)?;
+    if let Some(structured) = &result.structured_content {
+        assert_eq!(
+            structured.get("view").filter(|value| !value.is_null()),
+            view.as_ref()
+                .map(serde_json::to_value)
+                .transpose()?
+                .as_ref(),
+            "{name}: text states the exact structured view and expiry"
+        );
+    }
+    if let Some(view) = view {
+        let mut held_request = request.clone();
+        held_request["view"] = serde_json::to_value(&view.id)?;
+        held_request
+            .as_object_mut()
+            .ok_or("tool arguments must be an object")?
+            .remove("rev");
+        let held = proxied_result(client, name, &held_request).await?;
+        assert_ne!(held.is_error, Some(true), "{name}: {held:?}");
+        assert_eq!(
+            text_of(&held)?,
+            original,
+            "{name}: the owning proxy retains the view, expiry, identities and source"
+        );
+        if let Some(structured) = &held.structured_content {
+            assert_eq!(
+                structured.get("view"),
+                Some(&serde_json::to_value(view)?),
+                "{name}: held structured content retains the original view and expiry"
+            );
+        }
+    }
+    validated_proxy_rows(client, &body, result, reference).await
+}
+
+/// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
+/// view is read back through that proxy with its original expiry. The `text` result carries no
+/// structured content, and each symbol and node identity is a bare token in the `all` text.
 ///
 /// The text-against-structured checks of `rift-mcp` (`crates/rift-mcp/tests/text_complete`) live
 /// in that crate's test binary and are not shared here: they run over the whole surface corpus
@@ -997,7 +1243,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
     await_search_population(&all, &json!({"query": "beacon"})).await?;
     await_commit_population(&all).await?;
 
-    'cases: for (name, initial_request) in corpus() {
+    'cases: for (name, initial_request) in surface_corpus::prepared_corpus(&all).await? {
         let mut request = initial_request;
         let mut page_index = request["page_index"].as_u64().unwrap_or(0);
         loop {
@@ -1053,7 +1299,15 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
             );
             text_complete::assert_text_states(name, &all_result);
             let all_text = text_of(&all_result)?;
-            assert_eq!(all_text, text_of(&text_result)?, "{name}: texts differ");
+            let reference = all_result
+                .structured_content
+                .as_ref()
+                .ok_or("all proxy must return structured content")?;
+            let (all_body, text_body) = tokio::join!(
+                validated_proxy_text(&all, name, &request, &all_result, reference),
+                validated_proxy_text(&text, name, &request, &text_result, reference),
+            );
+            assert_eq!(all_body?, text_body?, "{name}: texts differ");
 
             let structured = all_result
                 .structured_content
@@ -1211,6 +1465,8 @@ async fn stale_lock_document_yields_a_fresh_election() -> TestResult {
         pid: 1,
         identity: rift_binary_identity()?,
         server: None,
+        root: None,
+        owner: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -1489,8 +1745,8 @@ async fn assert_refused_without_a_stop(version: &str) -> TestResult {
     let refusal = within(
         "the refusal from a server this proxy does not replace",
         client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         ),
     )
     .await?
@@ -1611,6 +1867,8 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
         pid: 1,
         identity: rift_binary_identity()?,
         server: None,
+        root: None,
+        owner: None,
     })?;
 
     let (client, stderr) = relayed_proxy_client(root).await?;
@@ -1618,8 +1876,8 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     let refusal = within(
         "the unserved workspace's refusal",
         client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         ),
     )
     .await?
@@ -1682,8 +1940,8 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr
     let refusal = within(
         "the refusal from a server that could not bind its port",
         client.call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         ),
     )
     .await?
@@ -1766,8 +2024,13 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    let declaration = proxied_call(&client, "get_symbol", &json!({"name": "beacon"})).await?;
-    let seed = declaration["hits"][0]["symbol"]["id"]
+    let declaration = proxied_call(
+        &client,
+        "search",
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await?;
+    let seed = declaration["results"][0]["hit"]["symbol"]["id"]
         .as_str()
         .ok_or("beacon declaration must carry its symbol identity")?;
     let result = proxied_engine_call(

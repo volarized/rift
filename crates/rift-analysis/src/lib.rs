@@ -23,6 +23,7 @@ mod selection;
 mod semantic;
 #[cfg(feature = "collector")]
 mod source;
+mod traversal;
 
 #[cfg(feature = "collector")]
 pub use analyzer::{
@@ -40,7 +41,7 @@ pub use input::{
     PACKAGE_IMPORT_ENTRIES_MAX, PackageImportRoot, PackageImportRootOrigin, PackageSource,
 };
 #[cfg(feature = "collector")]
-pub use input::{NamespaceInput, NamespaceModule};
+pub use input::{NamespaceInput, NamespaceModule, PackageDependency};
 #[cfg(feature = "collector")]
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::{
@@ -57,6 +58,7 @@ pub use selection::{
 pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
+pub use traversal::{TraversalWalk, walk_traversal_capped, walk_traversal_capped_async};
 
 #[cfg(feature = "collector")]
 mod package_syntax;

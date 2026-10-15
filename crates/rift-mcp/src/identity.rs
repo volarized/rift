@@ -260,6 +260,8 @@ mod tests {
                     schema_digest: "b".repeat(64),
                 },
                 server: None,
+                root: None,
+                owner: None,
             };
             assert_eq!(lock.validate(), Ok(()), "{checkout:?}");
         }

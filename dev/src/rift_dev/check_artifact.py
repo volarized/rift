@@ -42,14 +42,20 @@ def lay_out_workspace(root: Path) -> None:
 
 async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonObject:
     """Select an exact named declaration from the validated lookup answer."""
-    answer = await client.call("get_symbol", {"name": name, "language": language})
-    hits = array_value(answer.get("hits"), "get_symbol.hits")
-    matches = [
-        object_value(hit, "hit")
-        for hit in hits
-        if object_value(object_value(hit, "hit").get("symbol"), "symbol").get("name")
-        == name
-    ]
+    answer = await client.call(
+        "search",
+        {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
+    )
+    hits = array_value(answer.get("results"), "search.results")
+    matches = []
+    for hit in hits:
+        row = object_value(hit, "hit")
+        target = object_value(row.get("hit"), "hit")
+        if target.get("target") != "symbol":
+            continue
+        symbol = object_value(target.get("symbol"), "symbol")
+        if symbol.get("name") == name and symbol.get("language") == language:
+            matches.append(row)
     require(len(matches) == 1, f"expected one {name} declaration: {answer}")
     return matches[0]
 
@@ -57,8 +63,31 @@ async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonO
 def symbol_id(hit: JsonObject) -> str:
     """Use the read side's emitted identity as the traversal seed."""
     return string_value(
-        object_value(hit.get("symbol"), "symbol").get("id"), "symbol.id"
+        object_value(object_value(hit.get("hit"), "hit").get("symbol"), "symbol").get(
+            "id"
+        ),
+        "symbol.id",
     )
+
+
+async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
+    """Read the observed identity and retain its original declaration bytes."""
+    identity = symbol_id(hit)
+    answer = await client.call("get_symbol", {"id": identity, "include": ["source"]})
+    require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
+    require(
+        object_value(answer.get("symbol"), "symbol").get("id") == identity,
+        f"symbol identity changed: {answer}",
+    )
+    declarations = array_value(answer.get("declarations"), "symbol declarations")
+    require(len(declarations) == 1, f"expected one declaration: {answer}")
+    declaration = object_value(declarations[0], "declaration")
+    for field in ("path", "range", "source"):
+        require(
+            declaration.get(field) == hit.get(field),
+            f"symbol declaration changed {field}: {answer}",
+        )
+    return declaration
 
 
 async def incoming_references(client: Client, seed: str) -> JsonObject:
@@ -91,6 +120,7 @@ async def check_reads(client: Client) -> None:
         f"search missed beacon_one: {search}",
     )
     before = await symbol_hit(client, "beacon_one")
+    await symbol_read(client, before)
     require(
         before.get("source") == "pub fn beacon_one() -> u8 { 1 }",
         f"unexpected source: {before}",
@@ -103,6 +133,7 @@ async def check_external_change(client: Client, root: Path) -> None:
     path = root / "lib.rs"
     path.write_bytes(expected.encode("utf-8"))
     after = await symbol_hit(client, "beacon_one")
+    await symbol_read(client, after)
     require(
         after.get("source") == "pub fn beacon_one() -> u8 { 3 }",
         f"filesystem change was absent from reads: {after}",

@@ -88,6 +88,7 @@ impl WorkspaceSemantics {
             revision,
             previous,
             true,
+            None,
         )
     }
 }

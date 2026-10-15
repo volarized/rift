@@ -32,8 +32,8 @@ pub use contribution::{
 };
 pub use css::CssSyntaxProvider;
 pub use document::{
-    ByteRange, PythonOverload, RustModulePath, SyntaxDocument, SyntaxExportBinding,
-    SyntaxExportKind, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
+    ByteRange, MacroInvocation, PythonOverload, RustModulePath, Scope, SyntaxDocument,
+    SyntaxExportBinding, SyntaxExportKind, SyntaxFacts, SyntaxNode, SyntaxOrigin, SyntaxSymbol,
 };
 pub use html::HtmlSyntaxProvider;
 pub use javascript::JavaScriptSyntaxProvider;
@@ -63,3 +63,5 @@ mod restore;
 pub use restore::{MarkdownFactsParts, SyntaxFactsParts, SyntaxNames};
 
 pub use tailwind::{TailwindFacts, append_framework_symbols, tailwind_symbols};
+
+pub use document::rust_macros::tokens;

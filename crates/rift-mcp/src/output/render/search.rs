@@ -25,6 +25,7 @@ const PATH_INDENT: usize = 1;
 
 /// The fields of a hit that do not depend on its target.
 struct HitView<'a> {
+    captured: Option<&'a rift_protocol::symbol_read::CapturedView>,
     score: Option<f64>,
     matched_by: &'a [MatchedField],
     source: Option<&'a str>,
@@ -39,6 +40,7 @@ struct HitView<'a> {
 /// Splits a hit into its target and the fields every target shares.
 fn split(hit: &SearchHit) -> (&SearchHitTarget, HitView<'_>) {
     let SearchHit {
+        view: captured,
         hit: target,
         score,
         matched_by,
@@ -52,6 +54,7 @@ fn split(hit: &SearchHit) -> (&SearchHitTarget, HitView<'_>) {
         change,
     } = hit;
     let view = HitView {
+        captured: captured.as_ref(),
         score: *score,
         matched_by,
         source: source.as_deref(),
@@ -119,6 +122,10 @@ fn hit(lines: &mut Lines<'_>, hit: &SearchHit) -> Result<(), TextError> {
 fn rank_facts(view: &HitView<'_>, facts: &mut Facts) {
     if let Some(score) = view.score {
         facts.push(&format!("score {score}"));
+    }
+    if let Some(captured) = view.captured {
+        facts.push(&format!("view {}", captured.id.as_str()));
+        facts.push(&format!("expires {}", captured.expires_at));
     }
 }
 

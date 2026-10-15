@@ -24,7 +24,7 @@ pub struct PlacedAlias {
     pub qualified_name: String,
     /// Established logical alias identity.
     pub identity: SymbolId,
-    /// Physical identity of the defining declaration.
+    /// Defining declaration identity supplied to normalization.
     pub target_identity: String,
     /// Original export statement range.
     pub range: crate::ByteRange,

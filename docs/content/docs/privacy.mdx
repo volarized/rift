@@ -1,0 +1,87 @@
+---
+title: Privacy
+description: What Rift records when you download it or use the global API.
+---
+
+This notice covers download and global API request statistics.
+
+## Controller
+
+The [Impressum](/impressum) lists the controller's identity, postal address, and privacy contact.
+
+## Request statistics
+
+Rift collects aggregate download and cloud request statistics by default to measure adoption,
+understand service demand, and identify HTTP failures. Statistics include the UTC day, country,
+recognized agent category, operation, HTTP method, and response status. Download statistics
+also include recognized release and platform. Other release tags share an unknown category.
+
+The service derives country from the request's network location. An existing User-Agent header
+can identify Codex or Claude; other callers share one category. These values describe the
+request, so a proxy can change the country and a caller can change the agent category.
+
+The counters contain no IP addresses, installation identifiers, account identifiers, raw
+User-Agent headers, code, queries, request bodies, or project paths. The service deletes counters older than
+90 UTC days during its daily cleanup. Cleanup can take up to one further day. Recoverable database
+history can retain deleted counters for up to a further 30 days. Download counts
+include retries and updates. They do not confirm installations or unique users.
+
+Downloading a release directly from GitHub bypasses the download service.
+
+The purpose is to plan service capacity, maintain supported downloads, and identify HTTP
+failures. Where this processing involves personal data, we pursue those interests under
+GDPR Article 6(1)(f).
+
+## Telemetry settings
+
+Rift sends no separate local activity report and creates no telemetry marker, identifier,
+or event queue. The counters come from requests needed to download Rift or use the global
+API. Local-only use sends no telemetry request.
+
+Exclude this project's cloud and update requests from counters:
+
+```sh
+rift config set --telemetry.disabled=true
+```
+
+Exclude Rift's cloud and update requests for every project:
+
+```sh
+rift config set --telemetry.disabled=true --user
+```
+
+The first command writes `[telemetry] disabled = true` in the current directory's `rift.toml`.
+The second writes it in `~/.rift/config.toml`. A global disable takes precedence over a
+project's setting.
+`RIFT_TELEMETRY_DISABLED=true` also disables counters. A `false` value removes only that
+source's disable; it cannot override another source's disable. Downloads and API use continue
+to work.
+
+Standalone installers accept `RIFT_TELEMETRY_DISABLED=true` in their environment; they do
+not read these TOML files. Other API clients can send `DNT: 1`. Opt-out excludes future requests; previous counters
+expire under their retention policy. These
+settings control Rift's counters; Cloudflare and GitHub have separate processing described below.
+
+## Service providers
+
+- [Cloudflare](https://www.cloudflare.com/privacypolicy/) hosts the services and stores counters in an EU database. Incoming requests pass through its global network.
+- [GitHub](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) serves release downloads after a redirect from Rift's download service.
+
+These providers can process request data outside the European Economic Area, including in the
+United States. Cloudflare's [data processing addendum](https://www.cloudflare.com/cloudflare-customer-dpa/)
+provides standard contractual clauses for applicable transfers. GitHub's privacy statement
+describes its transfer safeguards. Their processing and retention are separate from Rift's counters.
+
+## Rights and contact
+
+Subject to the GDPR's conditions, you can request access, correction, erasure, restriction,
+and portability of personal data. You can object to processing based on legitimate interests
+on grounds relating to your particular situation. Contact
+the privacy contact listed in the [Impressum](/impressum) to exercise these rights or ask questions.
+
+The counters carry no caller identifier or personal event history. The service does not
+collect additional identifiers to make contributions identifiable. The controller reviews
+each request and explains whether it concerns data that can be identified.
+
+You can complain to a data protection authority, including the
+[Berlin Commissioner for Data Protection and Freedom of Information](https://www.datenschutz-berlin.de/ueber-uns/kontakt/).

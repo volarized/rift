@@ -216,6 +216,60 @@ pub struct RelationshipStore {
     dropped_edges: u64,
 }
 
+impl get_size2::GetSize for RelationshipEdge {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.from, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.to, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.occurrence, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for RelationshipStore {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (outgoing, tracker) = rift_protocol::retained_map_material(
+            &self.outgoing,
+            tracker,
+            rift_protocol::retained_vector_material,
+        );
+        let (incoming, tracker) = rift_protocol::retained_map_material(
+            &self.incoming,
+            tracker,
+            rift_protocol::retained_vector_material,
+        );
+        (outgoing.saturating_add(incoming), tracker)
+    }
+}
+
 impl RelationshipStore {
     /// Builds the adjacency from every reference in `graph`, capped at
     /// [`RELATIONSHIP_EDGES_MAX`].

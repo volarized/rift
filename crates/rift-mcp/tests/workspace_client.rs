@@ -158,11 +158,14 @@ pub(crate) async fn served_root_unsettled(
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
+        let held = server.clone();
         let service = server
             .serve(server_transport)
             .await
             .expect("server must initialize");
-        service.waiting().await.expect("server must stop cleanly");
+        let stopped = service.waiting().await;
+        held.engine_pool().await.shutdown().await;
+        stopped.expect("server must stop cleanly");
     });
     let client = ().serve(client_transport).await?;
     Ok((client, server_task))
@@ -453,4 +456,66 @@ fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
         serde_json::from_value(Value::String(code.to_owned()))?,
         serde_json::from_value(Value::String(retry.to_owned()))?,
     ))
+}
+
+/// Selects one original declaration before a canonical read or engine walk.
+pub(crate) async fn captured_seed(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    path: &str,
+) -> TestResult<String> {
+    let answer = call_retrying_acceptance(
+        client,
+        tool_request(
+            "search",
+            &serde_json::json!({
+                "query": name, "target": "symbol", "include": ["source"], "limit": 1000
+            }),
+        ),
+    )
+    .await?;
+    let rows = answer["results"]
+        .as_array()
+        .ok_or("search carries original declarations")?;
+    let mut selected = rows
+        .iter()
+        .filter(|row| row["path"] == path && row["hit"]["symbol"]["name"] == name);
+    let row = selected
+        .next()
+        .ok_or_else(|| format!("original declaration {name} at {path}: {answer}"))?;
+    assert!(
+        selected.next().is_none(),
+        "one original declaration {name} at {path}: {answer}"
+    );
+    assert!(
+        row["hit"]["symbol"]["kind"]
+            .as_str()
+            .is_some_and(|kind| !kind.is_empty()),
+        "original kind: {row}"
+    );
+    assert!(
+        row["source"]
+            .as_str()
+            .is_some_and(|source| !source.is_empty()),
+        "original source: {row}"
+    );
+    let start = row["range"]["start"]
+        .as_u64()
+        .ok_or("original range start")?;
+    let end = row["range"]["end"].as_u64().ok_or("original range end")?;
+    assert!(start < end, "original byte range: {row}");
+    let identity = row["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("original declaration has canonical identity")?;
+    let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
+    assert_eq!(
+        parsed.owner(),
+        &rift_protocol::identity::SymbolOwner::Local,
+        "original owner: {row}"
+    );
+    assert_eq!(
+        row["view"], answer["view"],
+        "same captured selection: {answer}"
+    );
+    Ok(identity.to_owned())
 }

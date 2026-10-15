@@ -118,8 +118,8 @@ fn arguments(value: &serde_json::Value) -> TestResult<serde_json::Map<String, se
 async fn beacon_lookup(client: &RunningService<RoleClient, ()>) -> TestResult<serde_json::Value> {
     let served = client
         .call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "beacon"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
         )
         .await?;
     served
@@ -167,7 +167,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
         .iter()
         .map(|tool| tool.name.as_ref())
         .collect();
-    for expected in ["get_symbol", "search", "nodes"] {
+    for expected in ["get_source", "get_symbol", "nodes", "search"] {
         assert!(
             names.contains(&expected),
             "{expected} missing from {names:?}"
@@ -175,7 +175,10 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
     }
 
     let lookup = beacon_lookup(&client).await?;
-    assert_eq!(lookup["hits"][0]["symbol"]["name"], json!("beacon"));
+    assert_eq!(
+        lookup["results"][0]["hit"]["symbol"]["name"],
+        json!("beacon")
+    );
 
     fs::write(
         directory.path().join("lib.rs"),
@@ -184,13 +187,16 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
 
     let lantern = client
         .call_tool(
-            CallToolRequestParams::new("get_symbol")
-                .with_arguments(arguments(&json!({"name": "lantern"}))?),
+            CallToolRequestParams::new("search")
+                .with_arguments(arguments(&json!({"query": "lantern", "target": "symbol"}))?),
         )
         .await?
         .structured_content
-        .ok_or("get_symbol must return structured content")?;
-    assert_eq!(lantern["hits"][0]["symbol"]["name"], json!("lantern"));
+        .ok_or("search must return structured content")?;
+    assert_eq!(
+        lantern["results"][0]["hit"]["symbol"]["name"],
+        json!("lantern")
+    );
 
     client.cancel().await?;
     shutdown.cancel();
@@ -319,8 +325,8 @@ async fn invalid_configuration_still_serves_typed_refusals() -> TestResult {
     let failure = failed_call(
         client
             .call_tool(
-                CallToolRequestParams::new("get_symbol")
-                    .with_arguments(arguments(&json!({"name": "beacon"}))?),
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
             )
             .await,
     )?;
@@ -341,8 +347,14 @@ async fn two_concurrent_clients_are_both_served() -> TestResult {
     let second = connected_client(&server).await?;
 
     let (first_lookup, second_lookup) = tokio::join!(beacon_lookup(&first), beacon_lookup(&second));
-    assert_eq!(first_lookup?["hits"][0]["symbol"]["name"], json!("beacon"));
-    assert_eq!(second_lookup?["hits"][0]["symbol"]["name"], json!("beacon"));
+    assert_eq!(
+        first_lookup?["results"][0]["hit"]["symbol"]["name"],
+        json!("beacon")
+    );
+    assert_eq!(
+        second_lookup?["results"][0]["hit"]["symbol"]["name"],
+        json!("beacon")
+    );
 
     first.cancel().await?;
     second.cancel().await?;
@@ -402,6 +414,31 @@ async fn foreign_host_and_origin_are_refused_at_the_boundary() -> TestResult {
         .send()
         .await?;
     assert_eq!(loopback_origin.status(), reqwest::StatusCode::ACCEPTED);
+    shutdown.cancel();
+    stopped_within_deadline(server).await
+}
+
+#[tokio::test]
+async fn http_tools_list_preserves_object_output_unions() -> TestResult {
+    let directory = workspace_with(None)?;
+    let (shutdown, server) = served(directory.path()).await?;
+    let client = connected_client(&server).await?;
+    let listing = client.list_tools(None).await?;
+    let exported = schema::tool_listing();
+    assert_eq!(listing.tools.len(), 4);
+    for tool in &listing.tools {
+        let output = tool
+            .output_schema
+            .as_deref()
+            .ok_or("output schema missing")?;
+        assert_eq!(output.get("type"), Some(&json!("object")), "{}", tool.name);
+        let expected = exported
+            .iter()
+            .find(|entry| entry.name == tool.name)
+            .ok_or("exported tool missing")?;
+        assert_eq!(tool.output_schema, expected.output_schema);
+    }
+    client.cancel().await?;
     shutdown.cancel();
     stopped_within_deadline(server).await
 }

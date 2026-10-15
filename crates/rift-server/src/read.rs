@@ -32,6 +32,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::history::{StoredHistory, SymbolTimelines};
 
+mod canonical;
+pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
     /// Workspace root to index.
@@ -731,6 +734,22 @@ impl ReadService {
         &self.index
     }
 
+    pub(crate) fn engine_revision(&self) -> &str {
+        &self.revisions.tree_revision
+    }
+
+    pub(crate) fn engine_index_current(&self) -> bool {
+        self.revisions.tree_revision == self.revisions.index_tree_revision
+    }
+
+    /// Returns at most two established identities retained during this snapshot's capture.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] for an invalid result limit.
+    pub fn canonical_examples(&self, limit: usize) -> Result<Vec<rift_core::SymbolId>, RiftError> {
+        self.index.canonical_examples(limit)
+    }
+
     /// Paths whose captured entry kinds decide the Python import roots.
     #[must_use]
     pub const fn build_path_requests(&self) -> &BTreeSet<ProjectPath> {
@@ -830,11 +849,12 @@ impl ReadService {
     /// with an entry outside its advertised lengths.
     pub fn read_context(
         &self,
-        scope: SearchScope,
+        scope: &SearchScope,
         rev: Option<&RevisionId>,
         packages: &[RequestedPackage],
     ) -> Result<Arc<DependencyContext>, RiftError> {
         validate_requested_packages(scope, rev.is_some(), packages)?;
+        self.validate_dependency_scope(scope, rev)?;
         if packages.is_empty() {
             return Ok(Arc::clone(&self.context));
         }
@@ -918,6 +938,13 @@ impl ReadService {
     /// Returns [`RiftError`] for invalid paths, missing files, or a `position` at or past the
     /// file's byte length.
     pub fn nodes(&self, params: NodesParams) -> Result<NodesResult, RiftError> {
+        if let Some(view) = &params.view {
+            return errors::server::search_view_context()
+                .operation("nodes")
+                .view(view.as_str())
+                .fail();
+        }
+
         validate_common(params.rev.is_some())?;
         let path = CoreProjectPath::new(params.path.0).map_err(|error| {
             errors::server::read_invalid()
@@ -960,6 +987,13 @@ impl ReadService {
     /// Returns [`RiftError`] for an invalid or absent path, a path outside the selected source
     /// set, a parse refusal, or a source that changed during the read.
     pub fn nodes_for_preparation(&self, params: NodesParams) -> Result<NodesResult, RiftError> {
+        if let Some(view) = &params.view {
+            return errors::server::search_view_context()
+                .operation("nodes")
+                .view(view.as_str())
+                .fail();
+        }
+
         validate_common(params.rev.is_some())?;
         let path = CoreProjectPath::new(params.path.0.clone()).map_err(|error| {
             errors::server::read_invalid()
@@ -1133,8 +1167,8 @@ impl ReadService {
         validate_common(params.rev.is_some())?;
         accepted_symbol_name(&params.name)?;
         let limit = accepted_limit(params.limit)?;
-        validate_requested_packages(params.scope, params.rev.is_some(), &params.packages)?;
-        self.validate_dependency_scope(params.scope, params.rev.as_ref())?;
+        validate_requested_packages(&params.scope, params.rev.is_some(), &params.packages)?;
+        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
         // The whole ranked match set is collected up to the project index's own
         // `results_max` bound, so `pagination.total_pages` counts the full result set the
         // pages divide.
@@ -1142,15 +1176,30 @@ impl ReadService {
         let mut candidates = if params.scope == SearchScope::Global {
             Vec::new()
         } else {
-            self.index.symbols(&params.name, results_max)?
+            let mut candidates = self.index.symbols(&params.name, results_max)?;
+            candidates.extend(self.index.left_out_symbols(&params.name, results_max)?);
+            candidates
+                .sort_by_key(|matched| (matched.rank, matched.symbol.qualified_name.as_str()));
+            candidates.truncate(results_max);
+            candidates
         };
         let bound_reached = candidates.len() >= results_max;
         if let Some(language) = &params.language {
             candidates
                 .retain(|matched| language_selects(language, matched.file.syntax().language()));
         }
-        let absent = candidates.is_empty();
-        let (window, pagination) = page(candidates, params.page_index, limit);
+        let mut public_candidates = Vec::with_capacity(candidates.len());
+        let mut object_warnings = Vec::new();
+        for matched in candidates {
+            let assembled = wire_symbol(&self.index, matched)?;
+            if assembled.0.name_is_public() {
+                public_candidates.push((matched, assembled));
+            } else {
+                object_warnings.push(object_unavailable(matched));
+            }
+        }
+        let absent = public_candidates.is_empty() && object_warnings.is_empty();
+        let (window, pagination) = page(public_candidates, params.page_index, limit);
         let include_source = params.include.contains(&GetSymbolInclude::Source);
         let include_history = params.include.contains(&GetSymbolInclude::History);
         let include_documentation = params.include.contains(&GetSymbolInclude::Documentation);
@@ -1163,9 +1212,9 @@ impl ReadService {
         };
         let mut hits = Vec::with_capacity(window.len());
         let mut disagreements = Vec::new();
-        for matched in window {
+        for (matched, assembled) in window {
             let (mut hit, disagreement) =
-                self.project_hit(matched, include_source, timelines.as_mut())?;
+                Self::project_hit(matched, assembled, include_source, timelines.as_mut())?;
             disagreements.extend(disagreement);
             if include_documentation && let Some(symbol) = &hit.symbol.id {
                 hit.documentation = Some(rift_index::documentation_context_with_budget(
@@ -1178,6 +1227,7 @@ impl ReadService {
             hits.push(hit);
         }
         let mut warnings = self.warnings();
+        warnings.extend(object_warnings);
         warnings.extend(disagreements);
         if absent {
             warnings.push(self.symbol_not_found(params)?);
@@ -1231,10 +1281,10 @@ impl ReadService {
     /// revision.
     pub(crate) fn validate_dependency_scope(
         &self,
-        scope: SearchScope,
+        scope: &SearchScope,
         rev: Option<&RevisionId>,
     ) -> Result<(), RiftError> {
-        if scope == SearchScope::Local {
+        if scope == &SearchScope::Local {
             return Ok(());
         }
         if rev.is_some() || self.revision.is_some() {
@@ -1249,12 +1299,12 @@ impl ReadService {
     /// One `get_symbol` hit from the project index, with the `symbol_disagreement`
     /// warning its assembly raised.
     fn project_hit(
-        &self,
         matched: SymbolMatch<'_>,
+        assembled: (Symbol, Option<ReadWarning>),
         include_source: bool,
         timelines: Option<&mut SymbolTimelines>,
     ) -> Result<(GetSymbolHit, Option<ReadWarning>), RiftError> {
-        let (symbol, disagreement) = wire_symbol(&self.index, matched)?;
+        let (symbol, disagreement) = assembled;
         let history = match (timelines, symbol.id.as_ref()) {
             (Some(timelines), Some(identity)) => Some(timelines.timeline(
                 language_provider(matched.file.syntax().language()),
@@ -1368,7 +1418,7 @@ const LOCAL_SCOPE_ALONE: &str = "the local scope reads the project alone";
 ///
 /// Returns [`RiftError`] naming `packages` for the first rule the argument breaks.
 pub(crate) fn validate_requested_packages(
-    scope: SearchScope,
+    scope: &SearchScope,
     rev: bool,
     packages: &[RequestedPackage],
 ) -> Result<(), RiftError> {
@@ -1384,14 +1434,14 @@ pub(crate) fn validate_requested_packages(
 /// The first rule a `packages` argument breaks, in precedence order: the read it rides
 /// on, then the list bound, then each entry in list order.
 fn requested_packages_violation(
-    scope: SearchScope,
+    scope: &SearchScope,
     rev: bool,
     packages: &[RequestedPackage],
 ) -> Option<String> {
     match packages {
         [] => None,
         _ if rev => Some(CURRENT_TREE_ALONE.to_owned()),
-        _ if scope == SearchScope::Local => Some(LOCAL_SCOPE_ALONE.to_owned()),
+        _ if scope == &SearchScope::Local => Some(LOCAL_SCOPE_ALONE.to_owned()),
         _ if packages.len() > REQUESTED_PACKAGES_MAX => Some(format!(
             "{} entries exceed the maximum {REQUESTED_PACKAGES_MAX}",
             packages.len()
@@ -1484,6 +1534,16 @@ pub(crate) fn wire_symbol(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
 ) -> Result<(Symbol, Option<ReadWarning>), RiftError> {
+    if !rift_core::is_portable_name(&matched.symbol.name)
+        || !rift_core::is_portable_name(&matched.symbol.qualified_name)
+    {
+        let placement = rift_syntax::DocumentPlacement::project_path(matched.file.path())?;
+        let facts = matched.symbol.facts(matched.file.syntax().language());
+        return Ok((
+            rift_provider::AssembledSymbol::wire_facts(&facts, placement.origin()),
+            None,
+        ));
+    }
     let readable = index.assembled_symbol(matched)?;
     let symbol = assembled_wire_symbol(&readable);
     let disagreement = symbol_disagreement_warning(readable.assembled());
@@ -1721,6 +1781,30 @@ fn unparsed_warning(unparsed: &[&WorkspaceIndexWarning]) -> Option<ReadWarning> 
     Some(ReadWarning::LargeFileUnparsed { files, detail })
 }
 
+/// The public name bound omitted this retained physical declaration.
+pub(crate) fn object_unavailable(matched: SymbolMatch<'_>) -> ReadWarning {
+    object_unavailable_at(
+        &matched.symbol.qualified_name,
+        Some(source_unit_id(matched.file.path())),
+        Some(text_range(matched.symbol.range)),
+    )
+}
+
+pub(crate) fn object_unavailable_at(
+    qualified_name: &str,
+    unit: Option<SourceUnitId>,
+    range: Option<TextRange>,
+) -> ReadWarning {
+    ReadWarning::ObjectUnavailable(rift_protocol::read::ObjectUnavailable {
+        unit,
+        range,
+        qualified_name: qualified_name.to_owned(),
+        field: "name".to_owned(),
+        bound: u64::try_from(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX)
+            .expect("the public name bound fits u64"),
+    })
+}
+
 /// Mints the project resolver's source-unit identity: the resolver name, then the
 /// project-relative path as the resolver's own canonical unit key.
 pub(crate) fn source_unit_id(path: &CoreProjectPath) -> SourceUnitId {
@@ -1760,6 +1844,7 @@ fn nodes_at_file(
         .map(|node| excerpt(file, node.range))
         .collect();
     Ok(NodesResult {
+        view: None,
         nodes,
         source,
         warnings,
@@ -2108,6 +2193,7 @@ pub(crate) mod tests {
         );
         Ok(())
     }
+
     /// A read snapshot over `root` under `limits` and `languages`, built through the
     /// same entry point the server itself uses.
     fn reads_with(
@@ -2334,6 +2420,7 @@ pub(crate) mod tests {
 
         let error = service
             .nodes(NodesParams {
+                view: None,
                 path: ProjectPath("lib.rs".to_owned()),
                 position: 0,
                 rev: None,
@@ -2533,6 +2620,7 @@ pub fn compute() -> i32 {
     fn nodes_return_typed_rust_facts_from_real_file() -> TestResult {
         let (_directory, service) = fixture()?;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 5,
             rev: None,
@@ -2601,6 +2689,7 @@ pub fn compute() -> i32 {
 
         fs::write(&source_path, "pub fn replacement() {}\n".repeat(40))?;
         let actual = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath(path.as_str().to_owned()),
             position,
             rev: None,
@@ -2648,6 +2737,7 @@ pub fn compute() -> i32 {
             .map(|node| wire_node(service.index(), file, node))
             .collect::<Result<Vec<_>, _>>()?;
         let actual = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath(path.as_str().to_owned()),
             position,
             rev: None,
@@ -2756,6 +2846,7 @@ pub fn compute() -> i32 {
             &LanguageFileSelections::default(),
         )?;
         let params = NodesParams {
+            view: None,
             path: ProjectPath("src/kept.rs".to_owned()),
             position: 0,
             rev: None,
@@ -2788,6 +2879,7 @@ pub fn compute() -> i32 {
 
         for path in ["invalid.rs", "large.rs"] {
             let params = NodesParams {
+                view: None,
                 path: ProjectPath(path.to_owned()),
                 position: 0,
                 rev: None,
@@ -2822,6 +2914,7 @@ pub fn compute() -> i32 {
             &LanguageFileSelections::default(),
         )?;
         let params = NodesParams {
+            view: None,
             path: ProjectPath("large.rs".to_owned()),
             position: 0,
             rev: None,
@@ -2851,6 +2944,7 @@ pub fn compute() -> i32 {
         fs::create_dir(directory.path().join("blocked.rs"))?;
         let error = partial
             .nodes_for_preparation(NodesParams {
+                view: None,
                 path: ProjectPath("blocked.rs".to_owned()),
                 position: 0,
                 rev: None,
@@ -2894,6 +2988,7 @@ pub fn compute() -> i32 {
             &LanguageFileSelections::default(),
         )?;
         let params = NodesParams {
+            view: None,
             path: ProjectPath("b.rs".to_owned()),
             position: 0,
             rev: None,
@@ -2919,6 +3014,7 @@ pub fn compute() -> i32 {
         for position in [length, length + 1] {
             let error = service
                 .nodes(NodesParams {
+                    view: None,
                     path: ProjectPath("src/lib.rs".to_owned()),
                     position,
                     rev: None,
@@ -2940,6 +3036,7 @@ pub fn compute() -> i32 {
         let source = fs::read_to_string(directory.path().join("src/lib.rs"))?;
         let length = source.len() as u64;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: length - 1,
             rev: None,
@@ -2973,6 +3070,7 @@ pub fn compute() -> i32 {
             "the chosen position must sit inside the multi-byte character"
         );
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: u64::try_from(mid_character_position)
                 .expect("the fixture offset fits in u64"),
@@ -2989,6 +3087,7 @@ pub fn compute() -> i32 {
     fn nodes_source_carries_one_excerpt_per_node_in_order_spanning_its_own_range() -> TestResult {
         let (directory, service) = fixture()?;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 5,
             rev: None,
@@ -3484,6 +3583,7 @@ pub fn compute() -> i32 {
     fn nodes_missing_source_is_not_found() -> TestResult {
         let (_directory, service) = fixture()?;
         let missing = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/missing.rs".to_owned()),
             position: 0,
             rev: None,
@@ -3514,6 +3614,7 @@ pub fn compute() -> i32 {
 
     fn nodes_at_root(service: &ReadService, path: &str) -> Result<NodesResult, super::RiftError> {
         service.nodes(NodesParams {
+            view: None,
             path: ProjectPath(path.to_owned()),
             position: 0,
             rev: None,
@@ -3733,6 +3834,7 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let error = service
             .nodes(NodesParams {
+                view: None,
                 path: ProjectPath("/etc/passwd".to_owned()),
                 position: 0,
                 rev: None,
@@ -3784,6 +3886,75 @@ pub fn compute() -> i32 {
         let root = directory.path();
         let service = ReadService::build(root, limits, &visibility, &text_inclusion, history)?;
         Ok((directory, service))
+    }
+
+    #[test]
+    fn raw_four_byte_names_answer_physical_reads_without_canonical_identity() -> TestResult {
+        let retained = "𐐀".repeat(3000);
+        let unavailable = "𐐀".repeat(4097);
+        let source = format!(
+            "/// Retained declaration.\npub fn {retained}() -> u8 {{ 1 }}\n\
+             /// Unavailable declaration.\npub fn {unavailable}() -> u8 {{ 2 }}\n\
+             pub fn finish() {{}}\n"
+        );
+        let (_directory, service) = project_fixture(&source)?;
+        let request = serde_json::from_value(json!({"name": retained, "include": ["source"]}))?;
+        let result = service.get_symbol(&request)?;
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.symbol.name, retained);
+        assert!(hit.symbol.id.is_none());
+        assert_eq!(hit.path, Some(ProjectPath("src/lib.rs".to_owned())));
+        assert!(hit.node.is_some());
+        assert!(
+            hit.source
+                .as_ref()
+                .is_some_and(|source| source.contains(&retained))
+        );
+        assert!(!hit.symbol.signatures.is_empty());
+        assert!(!hit.symbol.documentation.is_empty());
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            ReadWarning::ObjectUnavailable(object)
+                if object.qualified_name == unavailable && object.bound == 4096
+        )));
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, ReadWarning::SymbolNotFound { .. }))
+        );
+        let raw_address = format!(
+            "rift://symbol/local/rust/beacon/{}",
+            rift_core::encode_path(&retained),
+        );
+        let refused = rift_protocol::identity::SymbolIdentity::new(
+            rift_protocol::identity::SymbolOwner::Local,
+            Language::from_identity_segment("rust")?,
+            vec!["beacon".to_owned(), retained],
+        );
+        assert!(refused.is_err());
+        assert!(
+            serde_json::from_value::<rift_protocol::symbol_read::GetSymbolParams>(
+                json!({"id": raw_address})
+            )
+            .is_err()
+        );
+        let neighbor = service.get_symbol(&serde_json::from_value(json!({"name": "finish"}))?)?;
+        assert_eq!(neighbor.hits.len(), 1);
+        assert!(neighbor.hits[0].symbol.id.is_some());
+        let symbol = &neighbor.hits[0].symbol;
+        let mut edge = json!({
+            "from": symbol.id,
+            "to": symbol.id,
+            "kind": symbol.kind,
+            "facets": ["calls"],
+            "derivation": "syntax"
+        });
+        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge.clone()).is_ok());
+        edge["to"] = json!(raw_address);
+        assert!(serde_json::from_value::<rift_protocol::read::Relationship>(edge).is_err());
+        Ok(())
     }
 
     /// One project holding `pub fn beacon` alone.
@@ -3949,11 +4120,11 @@ pub fn compute() -> i32 {
             version: None,
         };
         let at_bound = vec![package("serde"); REQUESTED_PACKAGES_MAX];
-        assert!(validate_requested_packages(SearchScope::All, false, &at_bound).is_ok());
-        assert!(validate_requested_packages(SearchScope::Local, true, &[]).is_ok());
+        assert!(validate_requested_packages(&SearchScope::All, false, &at_bound).is_ok());
+        assert!(validate_requested_packages(&SearchScope::Local, true, &[]).is_ok());
 
         let past_bound = vec![package("serde"); REQUESTED_PACKAGES_MAX + 1];
-        let error = validate_requested_packages(SearchScope::Global, false, &past_bound)
+        let error = validate_requested_packages(&SearchScope::Global, false, &past_bound)
             .expect_err("one entry past the bound refuses");
         assert_eq!(
             packages_violation(&error),
@@ -3961,7 +4132,7 @@ pub fn compute() -> i32 {
         );
 
         let error = validate_requested_packages(
-            SearchScope::All,
+            &SearchScope::All,
             false,
             &[package("serde"), package(""), package("")],
         )
@@ -3977,7 +4148,7 @@ pub fn compute() -> i32 {
     #[test]
     fn read_context_applies_the_requested_packages_for_one_read() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
-        let unchanged = service.read_context(SearchScope::Global, None, &[])?;
+        let unchanged = service.read_context(&SearchScope::Global, None, &[])?;
         assert!(Arc::ptr_eq(&unchanged, service.dependency_context()));
 
         let requested = [RequestedPackage {
@@ -3990,12 +4161,12 @@ pub fn compute() -> i32 {
         let mut expected = held.clone();
         expected.push(requested[0].context_entry());
         expected.sort();
-        let read = service.read_context(SearchScope::All, None, &requested)?;
+        let read = service.read_context(&SearchScope::All, None, &requested)?;
         assert_eq!(read.entries(), expected);
         assert_eq!(service.dependency_context().entries(), held);
 
         let error = service
-            .read_context(SearchScope::Local, None, &requested)
+            .read_context(&SearchScope::Local, None, &requested)
             .expect_err("a local read names no package");
         assert!(packages_violation(&error).is_some(), "{error}");
         Ok(())
@@ -4034,6 +4205,7 @@ pub fn compute() -> i32 {
             .ok_or("fixture must contain expression")? as u64
             + 2;
         let expression = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: expression_position,
             rev: None,
@@ -4044,6 +4216,7 @@ pub fn compute() -> i32 {
             .find("total;")
             .ok_or("fixture must contain statement")? as u64;
         let statement = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: statement_position,
             rev: None,
@@ -4054,6 +4227,7 @@ pub fn compute() -> i32 {
             .find("lookout")
             .ok_or("fixture must contain comment")? as u64;
         let comment = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: comment_position,
             rev: None,
@@ -4129,6 +4303,7 @@ pub fn compute() -> i32 {
             .find("Beacon")
             .ok_or("fixture must contain the struct name")? as u64;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
             rev: None,
@@ -4154,6 +4329,7 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let position = "pub struct ".len() as u64;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
             rev: None,
@@ -4178,6 +4354,7 @@ pub fn compute() -> i32 {
         let (_directory, service) = fixture()?;
         let position = "pub struct Beacon;\n".len() as u64;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position,
             rev: None,
@@ -4313,6 +4490,7 @@ pub fn compute() -> i32 {
         let source = fs::read_to_string(directory.path().join("src/App.tsx"))?;
         let position = source.find("<main>").ok_or("fixture must contain JSX")? as u64;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/App.tsx".to_owned()),
             position,
             rev: None,
@@ -4434,6 +4612,7 @@ pub fn compute() -> i32 {
             .find("beacon works")
             .ok_or("fixture must contain the prose line")? as u64;
         let params = NodesParams {
+            view: None,
             path: ProjectPath("src/guide.md".to_owned()),
             position,
             rev: None,
@@ -4595,6 +4774,7 @@ pub fn compute() -> i32 {
         let source = fs::read_to_string(directory.path().join("settings.json"))?;
         let position = source.find("8080").ok_or("fixture must contain the port")? as u64;
         let params = NodesParams {
+            view: None,
             path: ProjectPath("settings.json".to_owned()),
             position,
             rev: None,
@@ -4632,6 +4812,7 @@ pub fn compute() -> i32 {
             .find("retries")
             .ok_or("fixture must contain the entry")? as u64;
         let params = NodesParams {
+            view: None,
             path: ProjectPath("pipeline.yaml".to_owned()),
             position,
             rev: None,
@@ -4825,6 +5006,7 @@ pub fn compute() -> i32 {
         let service = revision_service(directory.path(), "main")?;
         let error = service
             .nodes(NodesParams {
+                view: None,
                 path: ProjectPath("Cargo.lock".to_owned()),
                 position: 0,
                 rev: Some(RevisionId("main".to_owned())),
@@ -4956,6 +5138,7 @@ pub fn compute() -> i32 {
         let directory = committed_fixture()?;
         let service = revision_service(directory.path(), "main")?;
         let result = service.nodes(NodesParams {
+            view: None,
             path: ProjectPath("src/lib.rs".to_owned()),
             position: 8,
             rev: Some(RevisionId("main".to_owned())),

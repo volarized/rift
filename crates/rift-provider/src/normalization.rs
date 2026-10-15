@@ -345,6 +345,29 @@ impl Normalizer {
         publications: &Arc<PublicationSet>,
         _previous: Option<&NormalizedGraph>,
     ) -> Result<NormalizedGraph, RiftError> {
+        Self::normalize_with(
+            index_revision,
+            source_revision,
+            tree_revision,
+            publications,
+            &|_| None,
+        )
+    }
+
+    /// Normalizes edges with explicitly supplied, source-checked external targets.
+    ///
+    /// Existing local contributions take precedence, including unresolved local
+    /// contributions. The callback cannot add records, anchors, or associations.
+    ///
+    /// # Errors
+    /// Returns the same record validation errors as `normalize`.
+    pub fn normalize_with(
+        index_revision: IndexRevision,
+        source_revision: SourceRevision,
+        tree_revision: TreeRevision,
+        publications: &Arc<PublicationSet>,
+        external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
+    ) -> Result<NormalizedGraph, RiftError> {
         let graph_publications = Arc::clone(publications);
         let contributions = applicable_contributions(publications, source_revision, tree_revision);
         let references = reference_index(&contributions);
@@ -377,6 +400,7 @@ impl Normalizer {
             groups,
             conflicting: &conflicting,
             candidates,
+            external,
         })
     }
 }
@@ -624,6 +648,7 @@ struct GraphBuild<'a> {
     groups: UnionFind,
     conflicting: &'a BTreeSet<usize>,
     candidates: Vec<AssociationCandidate>,
+    external: &'a dyn Fn(&ContributionReference) -> Option<SymbolId>,
 }
 
 fn build_records(
@@ -673,17 +698,21 @@ fn normalize_edges(
     contributions: &[&Contribution],
     records: &[SymbolRecord],
     records_by_contribution: &BTreeMap<ContributionReference, usize>,
+    external: &dyn Fn(&ContributionReference) -> Option<SymbolId>,
 ) -> (Vec<NormalizedReference>, Vec<NormalizedRelationship>) {
     let normalize_target = |target: &ContributionReference| {
-        records_by_contribution
-            .get(target)
-            .and_then(|index| records.get(*index))
-            .and_then(SymbolRecord::identity)
-            .cloned()
-            .map_or_else(
-                || NormalizedTarget::Contribution(target.clone()),
-                NormalizedTarget::Symbol,
-            )
+        let identity = if let Some(index) = records_by_contribution.get(target) {
+            records
+                .get(*index)
+                .and_then(SymbolRecord::identity)
+                .cloned()
+        } else {
+            external(target)
+        };
+        identity.map_or_else(
+            || NormalizedTarget::Contribution(target.clone()),
+            NormalizedTarget::Symbol,
+        )
     };
     let mut references = Vec::new();
     let mut relationships = Vec::new();
@@ -725,6 +754,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         mut groups,
         conflicting,
         mut candidates,
+        external,
     } = input;
     let (records, records_by_contribution) = build_records(
         index_revision,
@@ -752,6 +782,7 @@ fn build_graph(input: GraphBuild<'_>) -> Result<NormalizedGraph, RiftError> {
         contributions,
         &records,
         &records_by_contribution,
+        external,
     );
 
     let contribution_positions = contribution_positions(&publications);
@@ -817,6 +848,165 @@ impl UnionFind {
         if self.rank[left_root] == self.rank[right_root] {
             self.rank[left_root] = self.rank[left_root].saturating_add(1);
         }
+    }
+}
+
+impl get_size2::GetSize for AssociationCandidate {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.target, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for NormalizedReference {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.binding, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.targets, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for NormalizedRelationship {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes: usize = 0;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.source, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.target, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.occurrence, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
+    }
+}
+
+impl get_size2::GetSize for NormalizedTarget {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        match self {
+            Self::Symbol(value) => get_size2::GetSize::get_heap_size_with_tracker(value, tracker),
+            Self::Contribution(value) => {
+                get_size2::GetSize::get_heap_size_with_tracker(value, tracker)
+            }
+        }
+    }
+}
+
+impl get_size2::GetSize for NormalizedGraph {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(
+        &self,
+        mut tracker: T,
+    ) -> (usize, T) {
+        let mut bytes = rift_protocol::btree_material_bytes::<ContributionReference, usize>(
+            self.records_by_contribution.len(),
+        )
+        .saturating_add(
+            rift_protocol::btree_material_bytes::<ContributionKey, usize>(
+                self.contribution_positions.len(),
+            ),
+        )
+        .saturating_add(2 * std::mem::size_of::<usize>());
+        let (field, next) = rift_protocol::retained_arc_material(
+            &self.publications,
+            tracker,
+            get_size2::GetSize::get_heap_size_with_tracker,
+        );
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) = get_size2::GetSize::get_heap_size_with_tracker(&self.records, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.records_by_contribution, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.contribution_positions, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.candidates, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.references, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        let (field, next) =
+            get_size2::GetSize::get_heap_size_with_tracker(&self.relationships, tracker);
+        bytes = bytes.saturating_add(field);
+        tracker = next;
+        (bytes, tracker)
     }
 }
 

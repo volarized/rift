@@ -78,6 +78,7 @@ pub(crate) fn text_of<T: Render + ?Sized>(answer: &T) -> Result<String, TextErro
 impl Render for SearchResult {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         let Self {
+            view,
             results,
             pagination,
             warnings,
@@ -86,7 +87,41 @@ impl Render for SearchResult {
             pagination,
             warnings,
         };
-        search::answer(out, &page, results)
+        search::answer(out, &page, results)?;
+        if let Some(view) = view {
+            out.raw_line(
+                0,
+                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Render for rift_protocol::search_read::SearchReadResult {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        match self {
+            Self::Results(result) => result.render(out),
+            Self::Unavailable(result) => result.render(out),
+        }
+    }
+}
+
+impl Render for rift_protocol::search_read::SearchUnavailable {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        let Self::Unavailable {
+            reason,
+            view,
+            warnings,
+        } = self;
+        out.raw_line(0, &format!("unavailable · {reason:?}"))?;
+        if let Some(view) = view {
+            out.raw_line(
+                0,
+                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+            )?;
+        }
+        warning::section(out, warnings)
     }
 }
 
@@ -136,3 +171,58 @@ mod tests;
 #[cfg(test)]
 #[path = "resource_render_tests.rs"]
 mod resource_tests;
+
+impl Render for rift_protocol::symbol_read::GetSymbolResult {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        symbol::canonical(out, self)
+    }
+}
+
+impl Render for rift_protocol::source_read::GetSourceResult {
+    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
+        let (view, warnings) = match self {
+            Self::Found {
+                source,
+                source_complete,
+                view,
+                warnings,
+            } => {
+                out.raw_line(0, source.span.unit.as_str())?;
+                out.raw_line(
+                    0,
+                    &format!("{}..{}", source.span.range.start, source.span.range.end),
+                )?;
+                if !source_complete {
+                    out.raw_line(0, "source (incomplete):")?;
+                }
+                out.raw_lines(1, &source.text)?;
+                (Some(view), warnings)
+            }
+            Self::Missing {
+                unit,
+                view,
+                warnings,
+            } => {
+                out.raw_line(0, &format!("missing · {}", unit.as_str()))?;
+                (Some(view), warnings)
+            }
+            Self::Unavailable {
+                unit,
+                view,
+                reason,
+                warnings,
+            } => {
+                out.raw_line(0, &format!("unavailable · {reason:?}"))?;
+                out.raw_line(0, unit.as_str())?;
+                (view.as_ref(), warnings)
+            }
+        };
+        if let Some(view) = view {
+            out.raw_line(
+                0,
+                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
+            )?;
+        }
+        warning::section(out, warnings)
+    }
+}

@@ -549,14 +549,84 @@ async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForegroun
     }
 }
 
+async fn repository_beacon(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult {
+    let answer = proxied_call(
+        client,
+        "search",
+        &serde_json::json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+    )
+    .await?;
+    let hits = answer["results"].as_array().ok_or("captured symbol hits")?;
+    let mut exact = hits.iter().filter(|hit| {
+        hit["hit"]["symbol"]["name"] == "beacon"
+            && hit["hit"]["symbol"]["language"] == "rust"
+            && hit["path"] == "lib.rs"
+    });
+    let hit = exact.next().ok_or("captured seed declaration")?;
+    assert!(exact.next().is_none(), "one exact fixture seed: {answer}");
+    let identity = hit["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("captured seed has an established identity")?;
+    let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
+    assert_eq!(
+        parsed.owner(),
+        &rift_protocol::identity::SymbolOwner::Local,
+        "fixture owner: {answer}"
+    );
+    assert_eq!(parsed.wire_identity(), identity);
+    assert_eq!(parsed.language().name, "rust", "{answer}");
+    assert_eq!(hit["hit"]["symbol"]["kind"], "function", "{answer}");
+    let view = hit["view"]["id"]
+        .as_str()
+        .ok_or("the seed retains its captured view")?;
+    let lookup = proxied_call(
+        client,
+        "get_symbol",
+        &serde_json::json!({"id": identity, "view": view, "include": ["source"]}),
+    )
+    .await?;
+    assert_eq!(lookup["outcome"], "found", "{lookup}");
+    assert_eq!(lookup["symbol"]["id"], identity, "{lookup}");
+    assert_eq!(lookup["symbol"]["name"], "beacon", "{lookup}");
+    assert_eq!(lookup["view"], hit["view"], "{lookup}");
+    let declarations = lookup["declarations"]
+        .as_array()
+        .ok_or("the seed has source declarations")?;
+    let mut matching = declarations
+        .iter()
+        .filter(|declaration| declaration["path"] == "lib.rs");
+    let declaration = matching
+        .next()
+        .ok_or("the seed preserves its original source path")?;
+    assert!(
+        matching.next().is_none(),
+        "one original seed binding: {lookup}"
+    );
+    assert_eq!(declaration["range"], hit["range"], "{lookup}");
+    assert_eq!(declaration["source"], hit["source"], "{lookup}");
+    assert_eq!(declaration["source_complete"], true, "{lookup}");
+    Ok(())
+}
+
 /// CLI reads keep repository-served records separate before and after shutdown.
 ///
 /// Every stop stage, including the log drain, must finish successfully.
 #[tokio::test]
 async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
-    let main = laid_out_workspace(&[("lib.rs", LIBRARY)], &harness::assigned_port_key()?)?;
+    let main = laid_out_workspace(
+        &[
+            ("lib.rs", LIBRARY),
+            (
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
+            ),
+        ],
+        &harness::assigned_port_key()?,
+    )?;
     fixture_git(main.path(), &["init", "-q"])?;
-    fixture_git(main.path(), &["add", "lib.rs", "rift.toml"])?;
+    fixture_git(main.path(), &["add", "lib.rs", "Cargo.toml", "rift.toml"])?;
     fixture_git(
         main.path(),
         &["-c", "commit.gpgsign=false", "commit", "-qm", "add sources"],
@@ -586,13 +656,7 @@ async fn a_repository_served_workspace_answers_its_own_records() -> TestResult {
     for root in &roots {
         let client = proxy_client(root).await?;
         await_workspace_ready(&client).await?;
-        let lookup = proxied_call(
-            &client,
-            "get_symbol",
-            &serde_json::json!({"name": "beacon"}),
-        )
-        .await?;
-        assert_eq!(lookup["hits"][0]["symbol"]["name"], "beacon", "{lookup}");
+        repository_beacon(&client).await?;
         clients.push(client);
     }
     for (index, root) in roots.iter().enumerate() {

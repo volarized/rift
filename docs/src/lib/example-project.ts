@@ -69,6 +69,14 @@ pub type ConfigError = Box<dyn std::error::Error + Send + Sync>;
 `,
   },
   {
+    path: "src/lib.rs",
+    language: "rust",
+    excerpt: false,
+    code: `pub mod config;
+pub mod error;
+`,
+  },
+  {
     path: "src/main.rs",
     language: "rust",
     excerpt: false,

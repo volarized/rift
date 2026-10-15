@@ -537,7 +537,7 @@ fn stop_line_of(stderr: &str) -> TestResult<&str> {
 
 fn serving_document(root: &Path) -> Option<ServerLock> {
     match probe(root) {
-        ServerPresence::Serving(lock) => Some(lock),
+        ServerPresence::Serving(lock) => Some(*lock),
         ServerPresence::Starting | ServerPresence::Stale(_) | ServerPresence::Absent => None,
     }
 }
@@ -558,11 +558,27 @@ fn search_request_with_timeout(
     query: &str,
     timeout: Option<Duration>,
 ) -> TestResult<String> {
+    tool_request_with_timeout(
+        port,
+        token,
+        "search",
+        &serde_json::json!({"query": query}),
+        timeout,
+    )
+}
+
+fn tool_request_with_timeout(
+    port: u16,
+    token: &str,
+    name: &str,
+    arguments: &serde_json::Value,
+    timeout: Option<Duration>,
+) -> TestResult<String> {
     let body = serde_json::to_vec(&serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
-        "params": {"name": "search", "arguments": {"query": query}},
+        "params": {"name": name, "arguments": arguments},
     }))?;
     let head = format!(
         "POST /api/mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
@@ -588,7 +604,7 @@ fn symbol_request(port: u16, token: &str, name: &str) -> TestResult<String> {
         port,
         token,
         "tools/call",
-        &serde_json::json!({"name": "get_symbol", "arguments": {"name": name}}),
+        &serde_json::json!({"name": "search", "arguments": {"query": name, "target": "symbol"}}),
     )
 }
 
@@ -981,6 +997,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
+    let first = lexical_hit_with_validated_view(serving.port, &serving.token, first)?;
 
     stop_foreground_server(root, &mut child, &stderr)?;
     wait_until_port_refuses(serving.port)?;
@@ -993,12 +1010,65 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
+    let second = lexical_hit_with_validated_view(reopened.port, &reopened.token, second)?;
     assert_eq!(second, first, "reopen must preserve the lexical search hit");
 
     stop_foreground_server(root, &mut child, &stderr)?;
     wait_until_port_refuses(reopened.port)?;
     failure_window.passed();
     Ok(())
+}
+
+fn lexical_hit_with_validated_view(
+    port: u16,
+    token: &str,
+    hit: serde_json::Value,
+) -> TestResult<rift_protocol::search::SearchHit> {
+    let mut hit: rift_protocol::search::SearchHit = serde_json::from_value(hit)?;
+    let view = hit
+        .view
+        .take()
+        .ok_or("the lexical hit must carry its captured view")?;
+    let unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/notes.md")?;
+    let answer = tool_request_with_timeout(
+        port,
+        token,
+        "get_source",
+        &serde_json::json!({"unit": unit, "view": view.id}),
+        Some(CONNECT_TIMEOUT),
+    )?;
+    let body = answer
+        .split_once("\r\n\r\n")
+        .ok_or("the MCP response must contain an HTTP body")?
+        .1;
+    let response: serde_json::Value = serde_json::from_str(body)?;
+    let result: rift_protocol::source_read::GetSourceResult =
+        serde_json::from_value(response["result"]["structuredContent"].clone())?;
+    let rift_protocol::source_read::GetSourceResult::Found {
+        source,
+        source_complete,
+        view: returned_view,
+        ..
+    } = result
+    else {
+        return Err(format!("the captured project source must remain readable: {response}").into());
+    };
+    assert_eq!(
+        returned_view, view,
+        "held reads retain the original view and expiry"
+    );
+    assert_eq!(source.span.unit, unit);
+    assert_eq!(
+        source.text,
+        "amber canoe velvet: persistent lexical content\n"
+    );
+    assert!(source_complete);
+    assert_eq!(Some(&source.span.range), hit.range.as_ref());
+    assert_eq!(
+        serde_json::to_value(&hit.path)?,
+        serde_json::json!("notes.md")
+    );
+    Ok(hit)
 }
 
 #[test]
@@ -2318,6 +2388,8 @@ fn stale_document_is_replaced_by_a_fresh_election() -> TestResult {
         pid: 1,
         identity: stale_identity(),
         server: None,
+        root: None,
+        owner: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     assert!(
@@ -2609,6 +2681,8 @@ fn status_reports_absent_stale_and_serving_states() -> TestResult {
         pid: 1,
         identity: stale_identity(),
         server: None,
+        root: None,
+        owner: None,
     };
     fs::write(document_path(root), serde_json::to_vec(&stale)?)?;
     let stale_status = rift(root, &["server", "status"])?;

@@ -70,6 +70,8 @@ fn assert_nested_template(shipped: ShippedLanguage) {
             left_out_declarations: document.left_out_declaration_count(),
             markdown_facts: document.facts().markdown_facts().cloned(),
             export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
+            macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
+            scope: document.facts().scope().map(<[_]>::to_vec),
             source_digest: FileDigest::of(text.as_bytes()),
         },
     )
@@ -94,6 +96,8 @@ fn assert_nested_template(shipped: ShippedLanguage) {
             left_out_declarations: document.left_out_declaration_count(),
             markdown_facts: document.facts().markdown_facts().cloned(),
             export_bindings: document.facts().export_bindings().map(<[_]>::to_vec),
+            macro_invocations: document.facts().macro_invocations().map(<[_]>::to_vec),
+            scope: document.facts().scope().map(<[_]>::to_vec),
             source_digest: FileDigest::of(text.as_bytes()),
         },
     );

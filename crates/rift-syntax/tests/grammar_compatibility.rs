@@ -94,11 +94,11 @@ fn javascript_language() -> Language {
 }
 
 fn typescript_language() -> Language {
-    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+    tree_sitter_typescript::language_typescript()
 }
 
 fn tsx_language() -> Language {
-    tree_sitter_typescript::LANGUAGE_TSX.into()
+    tree_sitter_typescript::language_tsx()
 }
 
 fn markdown_language() -> Language {

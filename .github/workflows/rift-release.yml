@@ -125,6 +125,18 @@ jobs:
       - name: Report the build cache
         if: ${{ !cancelled() && env.RUSTC_WRAPPER == 'sccache' }}
         run: sccache --show-stats
+      - name: Validate release binary
+        run: >-
+          uv run --locked --project dev rift-dev artifact
+          --binary "${{ matrix.binary }}"
+          --junit target/integration/release-artifact.xml
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: release-tests-${{ matrix.target }}
+          path: target/integration/
+          if-no-files-found: error
+          retention-days: 7
       - name: Package release archive
         run: >-
           uv run --locked --project tools/rift-release rift-release package
@@ -205,6 +217,7 @@ jobs:
         run: >-
           gh release create "$RIFT_TAG" dist/*
           --verify-tag
+          --draft
           --title "Rift $RIFT_TAG"
           --generate-notes
 

@@ -2238,7 +2238,7 @@
       "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
       "examples": [
         "rift://symbol/local/rust/app/parser/parse",
-        "rift://symbol/local@cloud/rust/rift_cloud_service/resolution/resolve_entries",
+        "rift://symbol/local@cloud/rust/app/load",
         "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
         "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
       ],
@@ -2373,6 +2373,12 @@
     },
     "TextRange": {
       "description": "Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts\nfrom whatever its toolchain counts in at its own boundary, so two toolchains' column\nnumbers arrive here on the same scale. No JSON Schema keyword can tie one field to\nanother, so that `end` is never below `start` is asserted by the surface\nvalidation tests instead.",
+      "examples": [
+        {
+          "end": 0,
+          "start": 0
+        }
+      ],
       "properties": {
         "end": {
           "description": "One past the last byte. Equal to `start` for an empty range, which is how a position\nbetween two bytes is spelled.",
@@ -2607,7 +2613,7 @@
       "type": "integer"
     },
     "objects": {
-      "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Names follow the provider's byte\nbound; public directories apply the smaller public character bound separately.",
+      "description": "Every normalized logical object, including objects omitted from public directories.\nUnresolved objects retain their facts with no ID. Artifact consumers enforce aggregate\nand complete-record byte bounds before parsing and restoration. Public directories\napply the public character bound separately.",
       "items": {
         "description": "Readable Symbol assembled from normalized Contributions. Source structure lives in Node\nand is connected through Relationship.",
         "properties": {
@@ -2663,7 +2669,6 @@
           },
           "name": {
             "description": "The human-readable name, as written in the source: `parseConfig`. Rendered\nsignatures live in `signatures`.",
-            "maxLength": 8192,
             "type": "string"
           },
           "origin": {

@@ -1,12 +1,12 @@
 //! Generated response decoding after bounded body collection.
 
+use rift_error::RiftError;
+
 use crate::{
-    Capabilities, ClientError, GetCapabilitiesRequest, GetCapabilitiesResponse,
-    ListPackageSymbolsRequest, ListPackageSymbolsResponse, PackagePatternPage,
-    PackageResolutionResponse, PackageSearchPage, PackageSymbolPage, ProblemDetails, RawResponse,
-    ResolvePackageContextRequest, ResolvePackageContextResponse, ResponseMeta,
-    SearchPackagePatternsRequest, SearchPackagePatternsResponse, SearchPackagesRequest,
-    SearchPackagesResponse,
+    Capabilities, GetCapabilitiesRequest, GetCapabilitiesResponse, PackagePatternPage,
+    PackageResolutionResponse, PackageSearchPage, RawResponse, ResolvePackageContextRequest,
+    ResolvePackageContextResponse, ResponseMeta, SearchPackagePatternsRequest,
+    SearchPackagePatternsResponse, contract, failure,
 };
 
 pub(crate) struct Parsed<T> {
@@ -19,12 +19,21 @@ pub(crate) enum ParsedCapabilities {
     NotModified(ResponseMeta),
 }
 
-pub(crate) async fn capabilities(response: RawResponse) -> Result<ParsedCapabilities, ClientError> {
-    let (response, meta) = generated_response(response)?;
+pub(crate) async fn capabilities(response: RawResponse) -> Result<ParsedCapabilities, RiftError> {
+    let operation = contract::Endpoint::Capabilities.operation_id();
+    let (response, meta) = generated_response(response, operation)?;
     let status = meta.status;
     let response = GetCapabilitiesRequest::parse_response(response)
         .await
-        .map_err(|_| ClientError::Decode { status })?;
+        .map_err(|error| {
+            failure::response_source(
+                operation,
+                "body",
+                "global response decode failed",
+                Some(status),
+                error,
+            )
+        })?;
     match response {
         GetCapabilitiesResponse::Ok(value) => {
             Ok(ParsedCapabilities::Ok(Box::new(Parsed { value, meta })))
@@ -38,19 +47,30 @@ pub(crate) async fn capabilities(response: RawResponse) -> Result<ParsedCapabili
         | GetCapabilitiesResponse::InternalServerError(problem)
         | GetCapabilitiesResponse::BadGateway(problem)
         | GetCapabilitiesResponse::ServiceUnavailable(problem)
-        | GetCapabilitiesResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
-        GetCapabilitiesResponse::Unknown => Err(unknown_http_error(meta)),
+        | GetCapabilitiesResponse::GatewayTimeout(problem) => {
+            Err(failure::remote(operation, &meta, Some(&problem)))
+        }
+        GetCapabilitiesResponse::Unknown => Err(failure::remote(operation, &meta, None)),
     }
 }
 
 pub(crate) async fn resolution(
     response: RawResponse,
-) -> Result<Parsed<PackageResolutionResponse>, ClientError> {
-    let (response, meta) = generated_response(response)?;
+) -> Result<Parsed<PackageResolutionResponse>, RiftError> {
+    let operation = contract::Endpoint::Resolutions.operation_id();
+    let (response, meta) = generated_response(response, operation)?;
     let status = meta.status;
     let response = ResolvePackageContextRequest::parse_response(response)
         .await
-        .map_err(|_| ClientError::Decode { status })?;
+        .map_err(|error| {
+            failure::response_source(
+                operation,
+                "body",
+                "global response decode failed",
+                Some(status),
+                error,
+            )
+        })?;
     match response {
         ResolvePackageContextResponse::Ok(value) => Ok(Parsed { value, meta }),
         ResolvePackageContextResponse::BadRequest(problem)
@@ -63,139 +83,142 @@ pub(crate) async fn resolution(
         | ResolvePackageContextResponse::InternalServerError(problem)
         | ResolvePackageContextResponse::BadGateway(problem)
         | ResolvePackageContextResponse::ServiceUnavailable(problem)
-        | ResolvePackageContextResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
-        ResolvePackageContextResponse::Unknown => Err(unknown_http_error(meta)),
+        | ResolvePackageContextResponse::GatewayTimeout(problem) => {
+            Err(failure::remote(operation, &meta, Some(&problem)))
+        }
+        ResolvePackageContextResponse::Unknown => Err(failure::remote(operation, &meta, None)),
     }
 }
 
-pub(crate) async fn search(
-    response: RawResponse,
-) -> Result<Parsed<PackageSearchPage>, ClientError> {
-    let (response, meta) = generated_response(response)?;
-    let status = meta.status;
-    let response = SearchPackagesRequest::parse_response(response)
-        .await
-        .map_err(|_| ClientError::Decode { status })?;
-    match response {
-        SearchPackagesResponse::Ok(value) => Ok(Parsed { value, meta }),
-        SearchPackagesResponse::BadRequest(problem)
-        | SearchPackagesResponse::Unauthorized(problem)
-        | SearchPackagesResponse::Forbidden(problem)
-        | SearchPackagesResponse::NotAcceptable(problem)
-        | SearchPackagesResponse::ContentTooLarge(problem)
-        | SearchPackagesResponse::UnsupportedMediaType(problem)
-        | SearchPackagesResponse::TooManyRequests(problem)
-        | SearchPackagesResponse::InternalServerError(problem)
-        | SearchPackagesResponse::BadGateway(problem)
-        | SearchPackagesResponse::ServiceUnavailable(problem)
-        | SearchPackagesResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
-        SearchPackagesResponse::Unknown => Err(unknown_http_error(meta)),
-    }
+pub(crate) fn search(response: RawResponse) -> Result<Parsed<PackageSearchPage>, RiftError> {
+    exact_response(
+        response,
+        contract::Endpoint::Search.operation_id(),
+        &[200],
+        |_, _| true,
+    )
 }
 
 pub(crate) fn exact_symbol(
     response: RawResponse,
-) -> Result<Parsed<rift_protocol::symbol_read::GetSymbolResult>, ClientError> {
+) -> Result<Parsed<rift_protocol::symbol_read::GetSymbolResult>, RiftError> {
     use rift_protocol::symbol_read::GetSymbolResult;
-    exact_response(response, &[200, 404, 503], |status, value| {
-        matches!(
-            (status, value),
-            (200, GetSymbolResult::Found { .. })
-                | (404, GetSymbolResult::Missing { .. })
-                | (503, GetSymbolResult::Unavailable { .. })
-        )
-    })
+    exact_response(
+        response,
+        contract::Endpoint::Symbols.operation_id(),
+        &[200, 404, 503],
+        |status, value| {
+            matches!(
+                (status, value),
+                (200, GetSymbolResult::Found { .. })
+                    | (404, GetSymbolResult::Missing { .. })
+                    | (503, GetSymbolResult::Unavailable { .. })
+            )
+        },
+    )
 }
 
 pub(crate) fn exact_source(
     response: RawResponse,
-) -> Result<Parsed<rift_protocol::source_read::GetSourceResult>, ClientError> {
+) -> Result<Parsed<rift_protocol::source_read::GetSourceResult>, RiftError> {
     use rift_protocol::source_read::GetSourceResult;
-    exact_response(response, &[200, 404, 503], |status, value| {
-        matches!(
-            (status, value),
-            (200, GetSourceResult::Found { .. })
-                | (404, GetSourceResult::Missing { .. })
-                | (503, GetSourceResult::Unavailable { .. })
-        )
-    })
+    exact_response(
+        response,
+        contract::Endpoint::Source.operation_id(),
+        &[200, 404, 503],
+        |status, value| {
+            matches!(
+                (status, value),
+                (200, GetSourceResult::Found { .. })
+                    | (404, GetSourceResult::Missing { .. })
+                    | (503, GetSourceResult::Unavailable { .. })
+            )
+        },
+    )
 }
 
 pub(crate) fn source_declarations(
     response: RawResponse,
-) -> Result<Parsed<rift_protocol::source_read::FindDeclarationsResult>, ClientError> {
-    exact_response(response, &[200], |_, _| true)
+) -> Result<Parsed<rift_protocol::source_read::FindDeclarationsResult>, RiftError> {
+    exact_response(
+        response,
+        contract::Endpoint::Declarations.operation_id(),
+        &[200],
+        |_, _| true,
+    )
 }
 
 fn exact_response<T: serde::de::DeserializeOwned>(
     response: RawResponse,
+    operation: &'static str,
     statuses: &[u16],
     accepts: impl FnOnce(u16, &T) -> bool,
-) -> Result<Parsed<T>, ClientError> {
+) -> Result<Parsed<T>, RiftError> {
     let RawResponse { status, body, meta } = response;
     if statuses.contains(&status.as_u16()) && crate::is_media(&meta, "application/json") {
-        let value: T = serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
-            status: status.as_u16(),
+        let value: T = serde_json::from_slice(&body).map_err(|error| {
+            failure::response_source(
+                operation,
+                "body",
+                "global response decode failed",
+                Some(status.as_u16()),
+                error,
+            )
         })?;
         if !accepts(status.as_u16(), &value) {
-            return Err(ClientError::InvalidResponse {
-                status: status.as_u16(),
-            });
+            return Err(failure::response_invalid(
+                operation,
+                "status",
+                "unsupported global response status",
+                Some(status.as_u16()),
+            ));
         }
         return Ok(Parsed { value, meta });
     }
     if status == reqwest::StatusCode::OK {
-        return Err(ClientError::InvalidMediaType {
-            status: status.as_u16(),
-            content_type: meta.content_type,
-        });
+        return Err(failure::response_invalid(
+            operation,
+            "content_type",
+            &format!("invalid response media type: {:?}", meta.content_type),
+            Some(status.as_u16()),
+        ));
     }
     if matches!(
         status.as_u16(),
         400 | 401 | 403 | 406 | 413 | 415 | 429 | 500 | 502 | 503 | 504
     ) && crate::is_media(&meta, "application/problem+json")
     {
-        let problem = serde_json::from_slice(&body).map_err(|_| ClientError::Decode {
-            status: status.as_u16(),
+        let problem = serde_json::from_slice(&body).map_err(|error| {
+            failure::response_source(
+                operation,
+                "body",
+                "global response decode failed",
+                Some(status.as_u16()),
+                error,
+            )
         })?;
-        return Err(http_error(meta, problem));
+        return Err(failure::remote(operation, &meta, Some(&problem)));
     }
-    Err(unknown_http_error(meta))
-}
-
-pub(crate) async fn symbols(
-    response: RawResponse,
-) -> Result<Parsed<PackageSymbolPage>, ClientError> {
-    let (response, meta) = generated_response(response)?;
-    let status = meta.status;
-    let response = ListPackageSymbolsRequest::parse_response(response)
-        .await
-        .map_err(|_| ClientError::Decode { status })?;
-    match response {
-        ListPackageSymbolsResponse::Ok(value) => Ok(Parsed { value, meta }),
-        ListPackageSymbolsResponse::BadRequest(problem)
-        | ListPackageSymbolsResponse::Unauthorized(problem)
-        | ListPackageSymbolsResponse::Forbidden(problem)
-        | ListPackageSymbolsResponse::NotAcceptable(problem)
-        | ListPackageSymbolsResponse::ContentTooLarge(problem)
-        | ListPackageSymbolsResponse::UnsupportedMediaType(problem)
-        | ListPackageSymbolsResponse::TooManyRequests(problem)
-        | ListPackageSymbolsResponse::InternalServerError(problem)
-        | ListPackageSymbolsResponse::BadGateway(problem)
-        | ListPackageSymbolsResponse::ServiceUnavailable(problem)
-        | ListPackageSymbolsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
-        ListPackageSymbolsResponse::Unknown => Err(unknown_http_error(meta)),
-    }
+    Err(failure::remote(operation, &meta, None))
 }
 
 pub(crate) async fn patterns(
     response: RawResponse,
-) -> Result<Parsed<PackagePatternPage>, ClientError> {
-    let (response, meta) = generated_response(response)?;
+) -> Result<Parsed<PackagePatternPage>, RiftError> {
+    let operation = contract::Endpoint::Patterns.operation_id();
+    let (response, meta) = generated_response(response, operation)?;
     let status = meta.status;
     let response = SearchPackagePatternsRequest::parse_response(response)
         .await
-        .map_err(|_| ClientError::Decode { status })?;
+        .map_err(|error| {
+            failure::response_source(
+                operation,
+                "body",
+                "global response decode failed",
+                Some(status),
+                error,
+            )
+        })?;
     match response {
         SearchPackagePatternsResponse::Ok(value) => Ok(Parsed { value, meta }),
         SearchPackagePatternsResponse::BadRequest(problem)
@@ -208,35 +231,30 @@ pub(crate) async fn patterns(
         | SearchPackagePatternsResponse::InternalServerError(problem)
         | SearchPackagePatternsResponse::BadGateway(problem)
         | SearchPackagePatternsResponse::ServiceUnavailable(problem)
-        | SearchPackagePatternsResponse::GatewayTimeout(problem) => Err(http_error(meta, problem)),
-        SearchPackagePatternsResponse::Unknown => Err(unknown_http_error(meta)),
+        | SearchPackagePatternsResponse::GatewayTimeout(problem) => {
+            Err(failure::remote(operation, &meta, Some(&problem)))
+        }
+        SearchPackagePatternsResponse::Unknown => Err(failure::remote(operation, &meta, None)),
     }
 }
 
 fn generated_response(
     response: RawResponse,
-) -> Result<(reqwest::Response, ResponseMeta), ClientError> {
+    operation: &'static str,
+) -> Result<(reqwest::Response, ResponseMeta), RiftError> {
     let RawResponse { status, body, meta } = response;
     let response = http::Response::builder()
         .status(status)
         .body(body)
         .map(reqwest::Response::from)
-        .map_err(|_| ClientError::InvalidResponse {
-            status: status.as_u16(),
+        .map_err(|error| {
+            failure::response_source(
+                operation,
+                "status",
+                "global response construction failed",
+                Some(status.as_u16()),
+                error,
+            )
         })?;
     Ok((response, meta))
-}
-
-fn http_error(meta: ResponseMeta, problem: ProblemDetails) -> ClientError {
-    ClientError::Http {
-        meta: Box::new(meta),
-        problem: Some(Box::new(problem)),
-    }
-}
-
-fn unknown_http_error(meta: ResponseMeta) -> ClientError {
-    ClientError::Http {
-        meta: Box::new(meta),
-        problem: None,
-    }
 }

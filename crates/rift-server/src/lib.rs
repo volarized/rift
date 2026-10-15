@@ -26,11 +26,17 @@ pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,
 };
-pub use read::{ReadService, ReadServiceBuild, accepted_limit, wire_digest};
+pub use read::{
+    LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accepted_limit,
+    wire_digest,
+};
 pub use rift_core::CapturedStream;
 pub use rift_error::RiftError;
 pub use rift_lsp::capabilities::PositionEncoding;
-pub use search::{PatternBounds, StoreAnswer, accepted_pattern, search_page_limit};
+pub use search::{
+    PatternBounds, SearchCandidateInput, SearchCandidateInputs, SearchCandidateItem, StoreAnswer,
+    accepted_pattern, matched_fields, search_page_limit,
+};
 
 /// Compile-time marker for server-layer ownership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

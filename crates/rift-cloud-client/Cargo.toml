@@ -21,6 +21,7 @@ reqwest = { workspace = true, features = ["json", "query"] }
 regex.workspace = true
 rift-core.workspace = true
 rift-analysis.workspace = true
+rift-error.workspace = true
 rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-tracing.workspace = true
@@ -29,6 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 tokio.workspace = true
+toml.workspace = true
 validator.workspace = true
 
 [dev-dependencies]

@@ -16,6 +16,8 @@ autotests = false
 workspace = true
 
 [dependencies]
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+sse-stream = "=0.2.5"
 axum.workspace = true
 data-encoding.workspace = true
 getrandom.workspace = true
@@ -57,6 +59,7 @@ tower-service = "0.3.3"
 windows-spawn.workspace = true
 
 [dev-dependencies]
+ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
 stats_alloc = "=0.1.10"
 rift-history = { workspace = true, features = ["fixtures"] }
 rift-tracing = { workspace = true, features = ["fixtures"] }
