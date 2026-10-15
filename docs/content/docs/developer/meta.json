@@ -1,4 +1,5 @@
 {
   "title": "Developer",
-  "pages": ["index", "architecture", "implementation", "configuration", "testing", "protocol"]
+  "pages": ["architecture", "implementation", "testing", "mcp"],
+  "icon": "Code"
 }

@@ -1,6 +1,7 @@
+import type { Icon } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
-
 import { DiagramFullscreen } from "@/components/diagram-fullscreen";
+import { IconCard } from "@/components/icon-card";
 import {
   buildScene,
   DEFAULT_METRICS,
@@ -43,7 +44,16 @@ export type FlatDiagramConnectorRoute = {
  * around it - a click opens the same SVG in a fullscreen dialog with pan and
  * zoom.
  */
+export type FlatDiagramCard = {
+  icon: Icon;
+  description?: string;
+  address?: string;
+  owner?: string;
+  dashed?: boolean;
+};
+
 export type FlatDiagramProps = {
+  title: string;
   /** A mermaid flowchart definition. The graph, and only the graph. */
   chart: string;
   /** What the diagram says, for anyone who cannot see it. */
@@ -62,6 +72,7 @@ export type FlatDiagramProps = {
   groupBadges?: Readonly<Record<string, string>>;
   /** Optional endpoint ports for connectors keyed as `from->to`. */
   connectorRoutes?: Readonly<Record<string, FlatDiagramConnectorRoute>>;
+  cards?: Readonly<Record<string, FlatDiagramCard>>;
   className?: string;
 };
 
@@ -133,6 +144,7 @@ function StatusBadge({ text, x, y }: { text: string; x: number; y: number }) {
 }
 
 export async function FlatDiagram({
+  title,
   chart,
   alt,
   metrics,
@@ -143,6 +155,7 @@ export async function FlatDiagram({
   groupBadges = {},
   connectorRoutes = {},
   className,
+  cards = {},
 }: FlatDiagramProps) {
   const flow = await parseFlowchart(chart);
   const sceneMetrics = {
@@ -155,6 +168,8 @@ export async function FlatDiagram({
     (node) => (icons[node.id] ? node.id : null),
     sceneMetrics,
     (node) => {
+      const card = cards[node.id];
+      if (card) return { width: 270, depth: card.description ? 180 : 72 };
       const panel = nodePanels[node.id];
       const badge = nodeBadges[node.id];
       const header = node.label[0] ?? node.id;
@@ -187,7 +202,7 @@ export async function FlatDiagram({
   const noteOpacity = variant === "soft" ? 0.8 : INK.note;
 
   return (
-    <DiagramFullscreen className={className}>
+    <DiagramFullscreen title={title} className={className}>
       <svg
         viewBox={`${x0} ${y0} ${width} ${height}`}
         role="img"
@@ -251,6 +266,38 @@ export async function FlatDiagram({
           </g>
         ))}
         {scene.plates.map((plate) => {
+          const card = cards[plate.id];
+          if (card) {
+            return (
+              <foreignObject
+                key={plate.id}
+                x={plate.x - plate.width / 2}
+                y={plate.z - plate.depth / 2}
+                width={plate.width}
+                height={plate.depth}
+              >
+                <IconCard
+                  icon={card.icon}
+                  title={plate.label[0] ?? plate.id}
+                  className={`not-prose flex h-full flex-col text-left [&>div:last-child]:flex [&>div:last-child]:flex-1 [&>div:last-child]:flex-col ${card.dashed ? "border-dashed" : ""} ${!card.description ? "justify-center" : ""}`}
+                >
+                  {card.description && (
+                    <p className="mt-3 mb-4 flex-1 font-sans leading-relaxed">{card.description}</p>
+                  )}
+                  {card.address && (
+                    <div className="flex flex-wrap items-center gap-2 font-mono text-xs">
+                      {card.owner && (
+                        <span className="border border-border px-2 py-1 text-[10px] text-muted-foreground">
+                          {card.owner}
+                        </span>
+                      )}
+                      <span className="text-foreground">{card.address}</span>
+                    </div>
+                  )}
+                </IconCard>
+              </foreignObject>
+            );
+          }
           const panel = nodePanels[plate.id];
           const badge = nodeBadges[plate.id];
           const plateLeft = plate.x - plate.width / 2;

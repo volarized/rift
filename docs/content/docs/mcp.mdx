@@ -1,5 +1,6 @@
 ---
 title: MCP
+icon: MCP
 description: From repository discovery to precise edit targets.
 ---
 
@@ -71,7 +72,7 @@ Rift updates the map when it publishes a new index, so later reads follow change
 While Rift prepares the local index, the map can show discovered files before their symbols
 are available. A `local_index_preparing` warning reports that incomplete preparation.
 
-The [map reference](/docs/developer/protocol/mcp#resource-map) describes additional facts, such as
+The [map reference](/docs/developer/mcp#resource-map) describes additional facts, such as
 entry points and relationships, and when they are available. It also shows a map as compact text.
 
 </Callout>
@@ -118,7 +119,7 @@ For example, the agent can ask where the project reads its settings:
 ```
 
 This uses the same `query` argument as full-text search. When vector ranking is available,
-it contributes to the combined result order. The [search configuration](/docs/developer/configuration#search)
+it contributes to the combined result order. The [search configuration](/docs/configuration#search)
 controls ranking weights, embedding options, and included text files.
 
 <Accordions>
@@ -129,7 +130,7 @@ A result tagged `matched_by: ["ranked"]` can come from vector ranking without a 
 
 While vectors are being prepared, or when their model cannot load, results carry a warning.
 Identifier and full-text matching remain available independently of vector ranking.
-The [read reference](/docs/developer/protocol/mcp#reads) describes these warnings.
+The [read reference](/docs/developer/mcp#reads) describes these warnings.
 
 </Accordion>
 </Accordions>
@@ -157,7 +158,7 @@ carries a `pattern_index_preparing` warning until the index catches up.
 
 `pattern` doesn't combine with `query`, `traversal`, `change`, or `rev`. With `scope` set to
 `global` or `all`, it also searches the package files the global index holds. The
-[pattern reference](/docs/developer/protocol/mcp#search-pattern) describes the bounds a search
+[pattern reference](/docs/developer/mcp#search-pattern) describes the bounds a search
 runs under and the warning a file with too many matches carries.
 
 ### More search options
@@ -181,7 +182,7 @@ The map can help the agent restrict a search to the relevant part of the reposit
 
 Here, `paths.include` selects files, while the top-level `include` asks for source excerpts.
 If a needed file is excluded from the index, `paths.force_include` can request an on-demand
-search, subject to the [search limits](/docs/developer/protocol/mcp#search).
+search, subject to the [search limits](/docs/developer/mcp#search).
 
 </Accordion>
 <Accordion title="Dependencies" id="search-scope">
@@ -234,9 +235,9 @@ beside the `local` scope or `rev`.
 
 A dependency no public registry serves, such as a path outside the project or a git repository,
 has no declarations in the global index, and the answer names it in a `package_unavailable`
-warning. See [package scope](/docs/developer/protocol/mcp#search-scope) for package results,
-nearest releases, and paging, [requested packages](/docs/developer/protocol/mcp#requested-packages)
-for the argument's constraints, and the [read reference](/docs/developer/protocol/mcp#reads) for
+warning. See [package scope](/docs/developer/mcp#search-scope) for package results,
+nearest releases, and paging, [requested packages](/docs/developer/mcp#requested-packages)
+for the argument's constraints, and the [read reference](/docs/developer/mcp#reads) for
 the warnings a package read carries.
 
 </Accordion>
@@ -262,8 +263,8 @@ An engine-resolved callee in an installed package or runtime can carry a global 
 walk stops at that global object; its physical source unit remains separate from the identity.
 
 Traversal works on current local code and needs a configured
-[language engine](/docs/developer/configuration#languages-and-lsp) that resolves references and
-calls. The [traversal reference](/docs/developer/protocol/mcp#search-traversal) describes result
+[language engine](/docs/configuration#languages-and-lsp) that resolves references and
+calls. The [traversal reference](/docs/developer/mcp#search-traversal) describes result
 paths, coverage warnings, and unsupported requests.
 
 </Accordion>
@@ -275,7 +276,7 @@ result identifies the caller or the callee. A callee in an installed package or 
 is named by the global index. These relationships belong to this read and do not become indexed
 relationships in the map.
 
-See [language-engine references](/docs/developer/protocol/mcp#search-engine-references) for
+See [language-engine references](/docs/developer/mcp#search-engine-references) for
 validation, retries, and failure behavior.
 
 </Accordion>
@@ -298,7 +299,7 @@ side is the current local index, so staged, unstaged, untracked, and deleted fil
 ```
 
 `change` selects the result set on its own; see the
-[change reference](/docs/developer/protocol/mcp#search-change) for classifications and argument
+[change reference](/docs/developer/mcp#search-change) for classifications and argument
 constraints.
 
 </Accordion>
@@ -373,7 +374,7 @@ later search answers the rest. A search that finds no commit yet reads:
 	history_store_filling · analyzed 40 · total 100: the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest
 ```
 
-A commit search takes `query` alone; see the [commit search reference](/docs/developer/protocol/mcp#search-commits)
+A commit search takes `query` alone; see the [commit search reference](/docs/developer/mcp#search-commits)
 for ordering, bounds, and refusals.
 
 </Accordion>
@@ -460,7 +461,7 @@ A malformed identity is refused before lookup:
 
  An incomplete exact selection returns
 `outcome: "unavailable"` with its typed reason, rather than a definite miss.
-See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
+See the [symbol reference](/docs/developer/mcp#tool-get_symbol) for bounds and refusals.
 
 ## Source [#tool-get_source]
 
@@ -524,7 +525,7 @@ In the text response:
 
 The agent chooses the range it needs and applies the change with its own editing tools.
 After the file changes, it should read again before using its ranges for another edit.
-See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the response shape and supported files.
+See the [nodes reference](/docs/developer/mcp#tool-nodes) for the response shape and supported files.
 
 ## Edits and index updates [#edit-and-index-updates]
 
@@ -534,7 +535,7 @@ when they change, so the next read can use the new code.
 `search` also reaches collected package and runtime facts. `get_symbol` reads the exact
 owner named in its canonical identity; edits to project source update
 the local index. See [Index](/docs/developer/architecture#index) for local updates and
-[package scope](/docs/developer/protocol/mcp#get_symbol-scope) for dependency reads.
+[package scope](/docs/developer/mcp#get_symbol-scope) for dependency reads.
 
 ## Reading results [#reads]
 
@@ -549,7 +550,7 @@ For example, `stale_index` reports an index behind the captured project state or
 Large files and lockfiles carry their own: `large_file_unparsed` names a file too large to parse,
 whose text still answers, `large_file_skipped` counts files left out of text search, and
 `lockfile_excluded` names a lockfile the path selection reached but search leaves out.
-The [read reference](/docs/developer/protocol/mcp#reads) describes each warning.
+The [read reference](/docs/developer/mcp#reads) describes each warning.
 
 The agent reads each answer as compact text. The text is a list of sections, and each section
 starts with a title that counts its entries, such as `2 results` or `1 warning`, with the entries
@@ -568,7 +569,7 @@ truncated history. `rift mcp` returns compact text by default. A program that ne
 `rift mcp --output=all`, which includes structured output and output schemas in the tool listing.
 The workspace resource then carries both compact text and JSON. The map always returns JSON.
 
-The [result content reference](/docs/developer/protocol/mcp#result-content) defines the form.
+The [result content reference](/docs/developer/mcp#result-content) defines the form.
 
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
@@ -582,7 +583,7 @@ For example, this reads the function from `main` without changing the working tr
 
 Git's ancestry suffixes work too, so `"rev": "HEAD~1"` reads the commit below `HEAD`.
 Revision reads use committed source from a branch, tag, or commit and require a Git repository.
-See [revision-addressed reads](/docs/developer/protocol/mcp#revision-reads) for configuration
+See [revision-addressed reads](/docs/developer/mcp#revision-reads) for configuration
 and argument constraints.
 
 </Accordion>
@@ -647,7 +648,7 @@ the same request again can help, and the line below states what failed:
 - The `retry` of the first entry governs the call; a cause's `retry` says what could be done
   about that cause.
 
-See [tool execution failures](/docs/developer/protocol/mcp#tool-execution-failures) for the other
+See [tool execution failures](/docs/developer/mcp#tool-execution-failures) for the other
 directives and the complete form.
 
 </Accordion>
@@ -660,13 +661,13 @@ resources or diagnostics through [`rift server logs`](/docs/developer/implementa
 The CLI reads recorded diagnostics directly from storage, with or without a running server:
 
 <Cards>
-<IconCard id="resource-workspace" title="Workspace" href="/docs/developer/protocol/mcp#resource-workspace" icon={GearIcon}>
+<IconCard id="resource-workspace" title="Workspace" href="/docs/developer/mcp#resource-workspace" icon={GearIcon}>
 
 `rift://workspace` shows accepted configuration and the source catalog, including which files
 and languages Rift serves.
 
 </IconCard>
-<IconCard title="MCP reference" href="/docs/developer/protocol/mcp" icon={BookOpenIcon}>
+<IconCard title="MCP reference" href="/docs/developer/mcp" icon={BookOpenIcon}>
 
 Complete tool examples, resource fields, limits, warnings, and failure behavior.
 
@@ -693,5 +694,5 @@ source:
   digest.
 
 
-See [resource contents](/docs/developer/protocol/mcp#resource-contents) for the compact text and
+See [resource contents](/docs/developer/mcp#resource-contents) for the compact text and
 the JSON body a read carries.

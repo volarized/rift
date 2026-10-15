@@ -190,3 +190,16 @@
 .version-switch-item > div:first-child:empty {
   display: none;
 }
+
+/* The API reference uses the same square outlines and fonts as the docs. */
+.global-index-tabs {
+  border-radius: 0;
+}
+
+.rift-api .scalar-app {
+  --scalar-header-height: 56px;
+  --scalar-font: var(--font-inter), sans-serif;
+  --scalar-font-code: var(--font-geist-mono), monospace;
+  --scalar-radius: 0px;
+  --scalar-radius-max: 0px;
+}

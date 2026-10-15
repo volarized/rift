@@ -1,8 +1,7 @@
 ---
 title: Testing
+icon: TestTube
 ---
-
-<VersionBadge version="v0.0.45" />
 
 Unit tests, live language-engine and embedding-model suites, and the corpus, artifact, agent, and
 cold-start checks all run on every pull request and push to `main`. The corpus checks run against
@@ -12,8 +11,6 @@ it targets. Windows runs the server and proxy regressions under the same `ci` pr
 x86-64 Linux runs the unit suite from one instrumented archive, and the corpus checks there reuse one optimized archive
 rather than compiling their own. The `gate` job waits for every other `ci.yml` job
 and fails unless each one succeeded, and `main` accepts a pull request only once `gate` passes.
-
-<VersionBadge version="v0.0.47" />
 
 Local index regressions compare complete incremental read-service facts with a cold build after
 replacement, deletion, restoration, and case changes. The comparison keeps file digests, map
@@ -337,8 +334,6 @@ When the cold check fails, it prints the container's standard error, the persist
 proxy's standard error, and the failure window read through `docker exec` from just before the
 container was created. The container and its files are removed afterwards, so nothing is kept. The cold check starts no
 collector: the container runs with `--network none`, so the server inside cannot reach one.
-
-
 
 The export reports what it loses on the server's stderr, as `opentelemetry_sdk` warnings and
 errors, whatever `RUST_LOG` names: the first span a full batch queue drops, the dropped total at
