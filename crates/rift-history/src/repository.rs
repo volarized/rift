@@ -155,6 +155,8 @@ impl ChangedFiles {
 pub struct Repository {
     pub(crate) inner: gix::Repository,
     root: PathBuf,
+    worktree_root: PathBuf,
+    git_directory: PathBuf,
     pub(crate) common_directory: PathBuf,
     /// The workspace root's forward-slash path inside the repository's
     /// working tree; empty when the workspace is that root.
@@ -199,6 +201,16 @@ impl Repository {
                 .detail(&error)
                 .error()
         })?;
+        let git_directory = if inner.git_dir() == inner.common_dir() {
+            common_directory.clone()
+        } else {
+            std::fs::canonicalize(inner.git_dir()).map_err(|error| {
+                errors::history::storage()
+                    .operation("canonicalize repository directory")
+                    .detail(&error)
+                    .error()
+            })?
+        };
         let prefix = root
             .strip_prefix(&workdir)
             .map_err(|_| unversioned())?
@@ -209,6 +221,8 @@ impl Repository {
         Ok(Self {
             inner,
             root,
+            worktree_root: workdir,
+            git_directory,
             common_directory,
             prefix,
         })
@@ -229,12 +243,12 @@ impl Repository {
         main_worktree_root(&self.inner)
     }
 
-    /// The Git index lock for this workspace's worktree.
+    /// The canonical Git index lock path for this workspace's worktree.
     ///
     /// Linked worktrees have separate index locks in their own Git directories.
     #[must_use]
     pub fn index_lock_path(&self) -> PathBuf {
-        self.inner.index_path().with_extension("lock")
+        self.git_directory.join("index.lock")
     }
 
     /// The repository-local exclusion file shared by every linked worktree.
@@ -243,10 +257,10 @@ impl Repository {
         self.common_directory().join("info/exclude")
     }
 
-    /// The worktree root that repository-relative exclusion patterns are matched against.
+    /// The canonical worktree root that repository-relative exclusion patterns are matched against.
     #[must_use]
     pub fn worktree_root(&self) -> &Path {
-        self.inner.workdir().unwrap_or(&self.root)
+        &self.worktree_root
     }
 
     /// Whether `root` itself is a linked Git worktree, excluding submodules.
@@ -1019,6 +1033,28 @@ mod tests {
         assert!(!main_repository.exclude_path().exists());
         assert_eq!(main_repository.worktree_root(), main_repository.root());
         assert_eq!(linked_repository.worktree_root(), linked_repository.root());
+        for (workspace, repository) in [
+            (main.path(), &main_repository),
+            (linked.as_path(), &linked_repository),
+        ] {
+            let nested = workspace.join("src/nested");
+            fs::create_dir_all(&nested).expect("nested workspace");
+            let nested_repository = Repository::open(&nested).expect("nested repository");
+            assert_eq!(
+                nested_repository.root(),
+                fs::canonicalize(&nested).expect("canonical nested workspace")
+            );
+            assert_eq!(
+                nested_repository.worktree_root(),
+                repository.worktree_root()
+            );
+            assert_eq!(nested_repository.prefix, "src/nested");
+            assert_eq!(
+                nested_repository.index_lock_path(),
+                repository.index_lock_path()
+            );
+            assert!(!nested_repository.index_lock_path().exists());
+        }
         assert_eq!(
             main_repository.index_lock_path(),
             main_repository.common_directory().join("index.lock")
@@ -1029,7 +1065,9 @@ mod tests {
         );
         assert_eq!(
             linked_repository.index_lock_path(),
-            linked_repository.inner.git_dir().join("index.lock")
+            fs::canonicalize(linked_repository.inner.git_dir())
+                .expect("canonical linked Git directory")
+                .join("index.lock")
         );
     }
 

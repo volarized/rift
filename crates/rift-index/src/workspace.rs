@@ -5220,7 +5220,7 @@ fn walked_file(entry: &DirEntry, directory_depth_max: usize) -> Result<Option<&P
 
 /// Compiles bounded workspace `.gitignore` chain for direct event matching.
 /// The workspace's `.gitignore` files, each compiled against the directory that declares
-/// it, shallowest first.
+/// it, indexed by that directory.
 ///
 /// Git reads every ignore file relative to its own directory, and a deeper file decides
 /// over a shallower one. Compiling them all against the workspace root moves every pattern
@@ -5229,7 +5229,7 @@ fn walked_file(entry: &DirEntry, directory_depth_max: usize) -> Result<Option<&P
 /// this policy would see no source event at all.
 #[derive(Debug)]
 pub(crate) struct GitignoreChain {
-    layers: Vec<Gitignore>,
+    layers: BTreeMap<PathBuf, Vec<Gitignore>>,
     inputs: BTreeMap<PathBuf, FileDigest>,
     root: PathBuf,
     directory_depth_max: usize,
@@ -5244,7 +5244,7 @@ impl GitignoreChain {
         limits: WorkspaceIndexLimits,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
-        let mut layers = Vec::new();
+        let mut layers: BTreeMap<PathBuf, Vec<Gitignore>> = BTreeMap::new();
         let mut inputs = BTreeMap::new();
         if let Ok(repository) = rift_history::Repository::open(root) {
             let exclude = repository.exclude_path();
@@ -5252,7 +5252,10 @@ impl GitignoreChain {
                 let repository_root = repository.worktree_root();
                 let (layer, digest) = compiled_gitignore(&exclude, repository_root, limits)?;
                 inputs.insert(exclude, digest);
-                layers.push(layer);
+                layers
+                    .entry(repository_root.to_path_buf())
+                    .or_default()
+                    .push(layer);
             }
         }
         let mut ignore_files = inputs.len();
@@ -5278,9 +5281,11 @@ impl GitignoreChain {
             ignore_files += 1;
             let (layer, digest) = compiled_gitignore(path, path.parent().unwrap_or(path), limits)?;
             inputs.insert(path.to_path_buf(), digest);
-            layers.push(layer);
+            layers
+                .entry(layer.path().to_path_buf())
+                .or_default()
+                .push(layer);
         }
-        layers.sort_by_key(|layer| layer.path().components().count());
         Ok(Self {
             layers,
             inputs,
@@ -5292,8 +5297,8 @@ impl GitignoreChain {
     /// Whether workspace ignore files exclude `path` or an ancestor directory.
     ///
     /// Each entry composes the applicable layers in precedence order. A descendant
-    /// whitelist cannot restore a path beneath an excluded directory. Work is bounded
-    /// by the configured directory depth times the bounded ignore-file count.
+    /// whitelist cannot restore a path beneath an excluded directory. Each entry looks
+    /// up only its parent directories in the bounded compiled ignore-file map.
     fn excludes(&self, path: &Path, is_directory: bool) -> bool {
         let Ok(relative) = path.strip_prefix(&self.root) else {
             return true;
@@ -5320,18 +5325,24 @@ impl GitignoreChain {
 
     /// Composes compiled layers for one entry after its parent directories were accepted.
     fn excludes_entry(&self, path: &Path, is_directory: bool) -> bool {
-        let mut excluded = false;
-        for layer in &self.layers {
-            if path == layer.path() || !path.starts_with(layer.path()) {
+        let ancestors_max = self
+            .root
+            .components()
+            .count()
+            .saturating_add(self.directory_depth_max);
+        for directory in path.ancestors().skip(1).take(ancestors_max) {
+            let Some(layers) = self.layers.get(directory) else {
                 continue;
-            }
-            match layer.matched(path, is_directory) {
-                Match::Ignore(_) => excluded = true,
-                Match::Whitelist(_) => excluded = false,
-                Match::None => {}
+            };
+            for layer in layers.iter().rev() {
+                match layer.matched(path, is_directory) {
+                    Match::Ignore(_) => return true,
+                    Match::Whitelist(_) => return false,
+                    Match::None => {}
+                }
             }
         }
-        excluded
+        false
     }
 }
 
@@ -9648,8 +9659,11 @@ mod tests {
                 linked.to_str().expect("fixture path"),
             ],
         );
-        fs::write(root.join(".git/info/exclude"), "\u{feff}generated.rs\r\n")
-            .expect("local exclusions");
+        fs::write(
+            root.join(".git/info/exclude"),
+            "\u{feff}generated.rs\r\nsubtree/generated.rs\r\n",
+        )
+        .expect("local exclusions");
 
         for workspace in [&root, &linked] {
             fs::write(workspace.join("generated.rs"), "pub fn generated() {}\n")
@@ -9673,6 +9687,33 @@ mod tests {
             assert!(policy.visible(&canonical.join("kept.rs")));
             assert!(!policy.visible(&canonical.join("generated.rs")));
             assert!(!policy.may_include_descendant(&canonical.join("generated.rs")));
+            git(workspace, &["check-ignore", "--quiet", "generated.rs"]);
+            let subtree = workspace.join("subtree");
+            fs::create_dir(&subtree).expect("nested workspace");
+            fs::write(subtree.join("kept.rs"), "pub fn nested_kept() {}\n")
+                .expect("nested kept source");
+            fs::write(
+                subtree.join("generated.rs"),
+                "pub fn nested_generated() {}\n",
+            )
+            .expect("nested excluded source");
+            git(
+                workspace,
+                &["check-ignore", "--quiet", "subtree/generated.rs"],
+            );
+            let nested_policy = WorkspaceSourcePolicy::build(
+                &subtree,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("nested source policy");
+            let canonical_subtree = subtree.canonicalize().expect("canonical nested workspace");
+            assert!(nested_policy.visible(&canonical_subtree.join("kept.rs")));
+            assert!(!nested_policy.visible(&canonical_subtree.join("generated.rs")));
+            let nested_index = indexed(&subtree, &TextFileInclusion::default());
+            assert!(has_symbol(&nested_index, "nested_kept"));
+            assert!(!has_symbol(&nested_index, "nested_generated"));
             let forced =
                 SourceVisibility::default().with_force_include(vec!["generated.rs".to_owned()]);
             assert!(has_symbol(&built(workspace, &forced), "generated"));
@@ -9820,7 +9861,7 @@ mod tests {
 
     #[test]
     fn test_repository_excluded_parent_cannot_be_restored_by_a_nested_ignore_file() {
-        use rift_history::fixture::init;
+        use rift_history::fixture::{git, init};
 
         let directory = tempfile::tempdir().expect("workspace");
         let root = directory
@@ -9832,6 +9873,7 @@ mod tests {
         fs::write(root.join(".git/info/exclude"), "generated/\n").expect("parent exclusion");
         fs::write(root.join("generated/.gitignore"), "!kept.rs\n").expect("nested whitelist");
         fs::write(root.join("generated/kept.rs"), "pub fn kept() {}\n").expect("source");
+        git(&root, &["check-ignore", "--quiet", "generated/kept.rs"]);
         let visibility = SourceVisibility::default();
         let policy = WorkspaceSourcePolicy::build(
             &root,
@@ -9862,6 +9904,7 @@ mod tests {
             "generated/\n!generated/kept.rs\n",
         )
         .expect("same-file whitelist");
+        git(&root, &["check-ignore", "--quiet", "generated/kept.rs"]);
         let unchanged = WorkspaceSourcePolicy::build(
             &root,
             WorkspaceIndexLimits::default(),
