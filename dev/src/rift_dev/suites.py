@@ -6,6 +6,7 @@ run from it; without one, each suite compiles what it runs.
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 from collections.abc import Sequence
@@ -145,6 +146,33 @@ def archive_selection(archive: Path | None, sources: list[str]) -> list[str]:
     ]
 
 
+def coverage_percentage(summary: str) -> float:
+    """Read the weighted line total cargo-llvm-cov uses for its coverage floor."""
+    document = json.loads(summary)
+    if (
+        not isinstance(document, dict)
+        or document.get("type") != "llvm.coverage.json.export"
+    ):
+        raise ValueError("coverage summary has an invalid export type")
+    data = document.get("data")
+    if not isinstance(data, list) or not data:
+        raise ValueError("coverage summary has no export data")
+    count = 0
+    covered = 0
+    for export in data:
+        try:
+            lines = export["totals"]["lines"]
+            found = lines["count"]
+            hit = lines["covered"]
+        except (KeyError, TypeError) as error:
+            raise ValueError("coverage summary has no line totals") from error
+        if type(found) is not int or type(hit) is not int or not 0 <= hit <= found:
+            raise ValueError("coverage summary has invalid line totals")
+        count += found
+        covered += hit
+    return covered * 100 / count if count else 0.0
+
+
 def unit(archive: Path | None) -> None:
     """Run the unit suite once under one coverage report.
 
@@ -169,20 +197,22 @@ def unit(archive: Path | None) -> None:
         )
     )
 
-    report = CargoCommand(
+    report_arguments = (
         "llvm-cov",
         "report",
         "--ignore-filename-regex",
         GENERATED_CLIENT,
-        "--lcov",
-        "--output-path",
-        "lcov.info",
-        "--fail-under-lines",
-        COVERAGE_FLOOR,
     )
+    report = CargoCommand(*report_arguments, "--lcov", "--output-path", "lcov.info")
+    # The floor needs totals alone, without a second full JSON export.
+    summary = CargoCommand(*report_arguments, "--json", "--summary-only")
     if archive is not None:
         report.with_args("--nextest-archive-file", archive)
+        summary.with_args("--nextest-archive-file", archive)
     report.run()
+    percentage = coverage_percentage(summary.output())
+    if percentage < float(COVERAGE_FLOOR):
+        raise ValueError(f"line coverage {percentage:.2f}% is below {COVERAGE_FLOOR}%")
 
 
 def live(archive: Path | None) -> None:
