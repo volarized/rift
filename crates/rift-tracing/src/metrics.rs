@@ -100,13 +100,13 @@ pub(crate) const SCOPE: InstrumentScope =
 
 /// Instrumentation scopes, and so meters, one process builds, at most: one per emitting
 /// crate. `rift-tracing`, `rift-index`, `rift-history-store`, `rift-mcp`, and
-/// `rift-cloud-client` declare instruments; `rift-server` and `rift-lsp` emit the span
+/// `rift-cloud-client` declare instruments; `rift-server`, `rift-lsp`, and `rift-search` emit the span
 /// metrics of their `traced!` operations. The
 /// architecture check `rift-dev rust-architecture` counts the crates whose shipped source
 /// declares a `SCOPE` or opens a `traced!` operation and refuses more than this bound. An
 /// instrument whose scope arrives past the bound records nothing,
 /// and the first such refusal is recorded once as a `WARN` record naming the scope.
-pub const SCOPES_MAX: usize = 7;
+pub const SCOPES_MAX: usize = 8;
 
 const _: () = assert!(
     SCOPES_MAX >= 1,

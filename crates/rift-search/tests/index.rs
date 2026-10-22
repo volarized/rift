@@ -1346,6 +1346,50 @@ async fn readiness_walks_from_preparing_to_ready() -> TestResult {
 }
 
 #[tokio::test]
+async fn vector_population_records_preparation_selection_inference_and_storage() -> TestResult {
+    let root = workspace()?;
+    let index = prepared(root.path(), limits()).await?;
+    let fixture = two()?;
+    let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+        .capture("info")
+        .install()?;
+    whole_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    let records = drain.queued_records();
+    for operation in [
+        "search.populate.documents",
+        "search.populate.select",
+        "search.populate.inference",
+        "search.populate.store",
+    ] {
+        let record = records
+            .iter()
+            .find(|record| record.message() == operation)
+            .ok_or_else(|| format!("missing operation {operation}"))?;
+        let fields: serde_json::Value = serde_json::from_str(record.fields())?;
+        assert!(fields.get("elapsed_ms").is_some(), "{operation}: {fields}");
+    }
+
+    incremental_pass(&index, fixture.documents(), &fixture.described(), REVISION).await?;
+    let records = drain.queued_records();
+    assert!(
+        records
+            .iter()
+            .any(|record| record.message() == "search.populate.select")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.message() == "search.populate.inference")
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.message() == "search.populate.store")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn vectors_with_no_document_to_rank_them_as_leave_the_full_text_ranking_alone() -> TestResult
 {
     let root = workspace()?;

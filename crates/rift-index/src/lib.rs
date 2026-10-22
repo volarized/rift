@@ -54,9 +54,10 @@ pub use workspace::{
     WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceIndexPreparation,
     WorkspaceIndexWarning, WorkspaceMapPaths, WorkspaceSourcePolicy, capture_digests,
     capture_digests_with_languages, capture_digests_with_languages_cancellable,
-    capture_selected_paths_cancellable, capture_visible_digests_with_languages_cancellable,
-    declaration_identity, relative_path, source_line_matches, symbol_matches, text_line_matches,
-    validate_project_owner,
+    capture_selected_paths_cancellable,
+    capture_visible_digests_retaining_with_languages_cancellable,
+    capture_visible_digests_with_languages_cancellable, declaration_identity, relative_path,
+    source_line_matches, symbol_matches, text_line_matches, validate_project_owner,
 };
 
 /// Compile-time marker for index-layer ownership.

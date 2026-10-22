@@ -63,20 +63,20 @@ pub const SOURCE_DIRECTORY_DEPTH_FIELD: &str = "source.directory_depth";
 #[schemars(transform = crate::schema::declare_source_ranges)]
 pub struct SourceConfiguration {
     /// Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.
-    /// Empty includes every file `exclude` and `.gitignore` leave standing.
+    /// Empty includes every file `exclude` and the repository ignore rules leave standing.
     #[schemars(length(max = 512))]
     pub include: Vec<PathPattern>,
     /// Exact file paths or globs dropped from visibility, in [`PathPattern`] syntax. A match
     /// here is dropped even when `include` also matches it.
     #[schemars(length(max = 512))]
     pub exclude: Vec<PathPattern>,
-    /// Exact file paths or globs that stay visible although the workspace's `.gitignore`
-    /// hides them, in [`PathPattern`] syntax. A match here needs no `include` match, and a
+    /// Exact file paths or globs that stay visible although repository ignore rules
+    /// hide them, in [`PathPattern`] syntax. A match here needs no `include` match, and a
     /// match `exclude` also names is still dropped.
     #[schemars(length(max = 512))]
     pub force_include: Vec<PathPattern>,
-    /// Whether the workspace's own `.gitignore` files, root and nested, hide the paths they
-    /// match. Global and parent-directory gitignore sources are never read.
+    /// Whether root and nested `.gitignore` files and repository-local `.git/info/exclude` hide matching paths.
+    /// Global and parent-directory ignore sources are never read.
     pub respect_gitignore: bool,
     /// Most files the index holds, 1000 to 5000000. A workspace past it refuses its rebuild
     /// naming this key.

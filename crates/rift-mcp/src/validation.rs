@@ -67,11 +67,10 @@ pub(crate) const RUNNING_CAPTURE_READS_MAX: usize = 64;
 /// What the next rebuild must cover, accumulated between publications.
 ///
 /// A watcher event and a change tool both name paths, so an ordinary rebuild reads only
-/// what moved. An observation that names no trustworthy path set - a watch failure, a
-/// `.gitignore` write, a directory appearing or disappearing, or more retained paths than
-/// the workspace's own file bound allows - asks for the whole workspace instead, and no
-/// later path narrows that back down. A `rift.toml` write keeps its exact path so acceptance
-/// can decide whether index-owned configuration changed.
+/// what moved. An ignore-file write or directory event asks for the whole workspace and
+/// retains the event paths. A rescan, watch failure, or path-count overflow retains no
+/// trustworthy paths and requires another complete capture. A `rift.toml` write keeps its
+/// exact path so acceptance can decide whether index-owned configuration changed.
 #[derive(Debug, Default)]
 pub(crate) struct PendingWork {
     paths: BTreeSet<ProjectPath>,
@@ -102,6 +101,20 @@ impl PendingWork {
         self.whole_workspace
     }
 
+    /// Whether no named path can identify the whole-workspace observation.
+    fn is_unscoped(&self) -> bool {
+        self.whole_workspace && self.paths.is_empty()
+    }
+
+    /// Retains the event paths whose complete subtree or ignore policy requires capture.
+    fn scope(&mut self, paths: impl IntoIterator<Item = ProjectPath>, paths_max: usize) {
+        if self.is_unscoped() {
+            return;
+        }
+        self.retain(paths, paths_max);
+        self.whole_workspace = true;
+    }
+
     /// The `index.rebuild.trigger` of the rebuild this observation starts: `rescan` when
     /// it reads every visible file again, `filesystem` when it reads the paths it names.
     const fn rebuild_trigger(&self) -> &'static str {
@@ -121,7 +134,7 @@ impl PendingWork {
     /// Retains `paths` for the next rebuild, or escalates to the whole workspace once
     /// more paths are retained than the workspace may hold files.
     fn retain(&mut self, paths: impl IntoIterator<Item = ProjectPath>, paths_max: usize) {
-        if self.whole_workspace {
+        if self.is_unscoped() {
             return;
         }
         self.paths.extend(paths);
@@ -140,11 +153,13 @@ impl PendingWork {
     /// it ran. Publication is the acknowledgement that lets them be dropped, so an attempt
     /// that never published returns its work here.
     fn absorb(&mut self, other: Self, paths_max: usize) {
-        if other.whole_workspace {
+        if other.is_unscoped() {
             self.escalate();
             return;
         }
+        let whole_workspace = other.whole_workspace;
         self.retain(other.paths, paths_max);
+        self.whole_workspace |= whole_workspace;
     }
 }
 
@@ -627,6 +642,15 @@ pub(crate) struct IndexState {
 }
 
 impl IndexState {
+    /// Retains a source file-count or byte refusal until its input changes.
+    fn retains_source_limit_failure(&self, observed_epoch: u64) -> bool {
+        self.failure.as_ref().is_some_and(|(epoch, error)| {
+            *epoch == observed_epoch
+                && matches!(error.slug(), slug if slug == errors::index::workspace_too_many_files::SLUG
+                    || slug == errors::index::workspace_workspace_too_large::SLUG)
+        })
+    }
+
     /// Clones one validated publication and its latest failure.
     pub(crate) fn snapshot(&self) -> (Arc<PublishedWorkspace>, Option<(u64, Arc<RiftError>)>) {
         (Arc::clone(&self.current), self.failure.clone())
@@ -1240,7 +1264,19 @@ impl IndexValidation {
         let result = match impact {
             WatchImpact::None => Ok(None),
             WatchImpact::WholeWorkspace => {
-                publication.escalate();
+                let paths = (!event.need_rescan())
+                    .then(|| {
+                        event
+                            .paths
+                            .iter()
+                            .map(|path| roots.project_path(path))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .flatten();
+                match paths {
+                    Some(paths) if !paths.is_empty() => publication.scope(paths, self.paths_max),
+                    Some(_) | None => publication.escalate(),
+                }
                 self.observe_locked(&mut publication, route).map(Some)
             }
             WatchImpact::Paths(paths) => {
@@ -1468,6 +1504,7 @@ pub(crate) struct WatchRoots {
     canonical: PathBuf,
     watched: PathBuf,
     git_directory: Option<PathBuf>,
+    git_exclude: Option<PathBuf>,
 }
 
 impl WatchRoots {
@@ -1483,12 +1520,14 @@ impl WatchRoots {
                 .detail(error.to_string())
                 .error()
         })?;
+        let repository = rift_history::Repository::open(&canonical).ok();
         Ok(Self {
-            git_directory: rift_history::Repository::open(&canonical)
-                .ok()
-                .and_then(|repository| {
-                    repository.index_lock_path().parent().map(Path::to_path_buf)
-                }),
+            git_directory: repository.as_ref().and_then(|repository| {
+                repository.index_lock_path().parent().map(Path::to_path_buf)
+            }),
+            git_exclude: repository
+                .as_ref()
+                .map(rift_history::Repository::exclude_path),
             canonical,
             watched: root.to_path_buf(),
         })
@@ -1507,6 +1546,7 @@ impl WatchRoots {
             canonical: root.to_path_buf(),
             watched: root.to_path_buf(),
             git_directory: None,
+            git_exclude: None,
         }
     }
 
@@ -1585,6 +1625,18 @@ pub(crate) fn workspace_watcher(
                     .error()
             })?;
     }
+    if let Some(directory) = roots.git_exclude.as_deref().and_then(Path::parent)
+        && directory.is_dir()
+    {
+        watcher
+            .watch(directory, RecursiveMode::NonRecursive)
+            .map_err(|error| {
+                errors::server::read_unavailable()
+                    .operation("workspace watch")
+                    .detail(error.to_string())
+                    .error()
+            })?;
+    }
     Ok(watcher)
 }
 
@@ -1633,8 +1685,8 @@ pub(crate) fn report_watch_outcome(
             return;
         }
     };
-    // Git control changes live outside linked worktrees. Route HEAD and index.lock
-    // before the source floor; access events keep the existing rescan classification.
+    // Git control changes live outside linked worktrees. Route them before the source
+    // floor; reading a control file never schedules another capture.
     let observed = if names_git_control(roots, &event) {
         WATCH_EVENTS
             .labeled([watch_event_kind(event.kind), WATCH_ROUTE_WHOLE_WORKSPACE])
@@ -1648,19 +1700,22 @@ pub(crate) fn report_watch_outcome(
     }
 }
 
-/// Whether `event`, other than an access, names `HEAD` or `index.lock` directly inside the
-/// Git directory.
+/// Whether a write names the repository exclusion file, `HEAD`, or `index.lock`.
 fn names_git_control(roots: &WatchRoots, event: &Event) -> bool {
     let Some(directory) = roots.git_directory.as_ref() else {
         return false;
     };
     !matches!(event.kind, EventKind::Access(_))
         && event.paths.iter().any(|path| {
-            path.parent() == Some(directory.as_path())
-                && matches!(
-                    path.file_name().and_then(|name| name.to_str()),
-                    Some("HEAD" | "index.lock")
-                )
+            roots
+                .git_exclude
+                .as_ref()
+                .is_some_and(|exclude| path == exclude)
+                || (path.parent() == Some(directory.as_path())
+                    && matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("HEAD" | "index.lock")
+                    ))
         })
 }
 
@@ -2306,7 +2361,7 @@ impl<'request> RunningCapture<'request> {
     fn pending_supersedes(&self, validation: &IndexValidation) -> bool {
         let incremental = self.records.as_ref().zip(self.request.previous.as_ref());
         let pending = validation.locked_pending();
-        let whole_workspace = pending.covers_whole_workspace();
+        let whole_workspace = pending.is_unscoped();
         let named =
             (incremental.is_some() && !whole_workspace && self.takes_reads(pending.paths.len()))
                 .then(|| pending.paths.clone());
@@ -2504,6 +2559,12 @@ fn whole_workspace_candidate(
     let text_inclusion = configuration.text_inclusion();
     let languages = configuration.language_file_selections();
     let dependencies_configuration = configuration.dependencies_configuration();
+    if let Some(previous) = sharing
+        && previous.preparation.is_none()
+        && unchanged_whole_workspace(root, previous, &configuration, limits, cancelled)?
+    {
+        return Ok(previous.under(configuration, epoch));
+    }
     let reads = match sharing {
         Some(previous) => previous.reads.rescanned_cancellable(
             root,
@@ -2549,6 +2610,36 @@ fn whole_workspace_candidate(
         map,
         epoch,
     })
+}
+
+/// Validates complete visible bytes and inclusion rules before reusing captured facts.
+fn unchanged_whole_workspace(
+    root: &Path,
+    previous: &PublishedWorkspace,
+    configuration: &ConfigurationState,
+    limits: WorkspaceIndexLimits,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<bool, RiftError> {
+    if !previous.visible_refused.is_empty() || previous.reads.project_environment_moved() {
+        return Ok(false);
+    }
+    let Some(previous_policy) = previous.source_policy.as_deref() else {
+        return Ok(false);
+    };
+    let policy = WorkspaceSourcePolicy::build_with_languages_cancellable(
+        root,
+        limits,
+        &configuration.source_visibility(),
+        &configuration.text_inclusion(),
+        &configuration.language_file_selections(),
+        cancelled,
+    )?;
+    if !policy.same_inclusion_rules(previous_policy) {
+        return Ok(false);
+    }
+    let visible = policy.visible_digests_cancellable(cancelled)?;
+    let complete = policy.visible_paths_cancellable(cancelled)?.len() == visible.len();
+    Ok(complete && visible == *previous.visible_digests)
 }
 
 /// Replaces the files `changes` names and shares every other file with `previous`.
@@ -2660,9 +2751,19 @@ pub(crate) async fn populate_search(
     if index.pass_readiness() == VectorReadiness::Disabled {
         return;
     }
-    let units = published.reads.symbol_index_documents_by_file();
-    let described = published.reads.described_symbol_units_by_file(&units);
     let tree_revision = published.reads.tree_revision();
+    let units = rift_tracing::traced!(
+        component = "search",
+        operation = "search.populate.prepare",
+        tree_revision = tree_revision,
+        { published.reads.symbol_index_documents_by_file() }
+    );
+    let described = rift_tracing::traced!(
+        component = "search",
+        operation = "search.populate.describe",
+        tree_revision = tree_revision,
+        { published.reads.described_symbol_units_by_file(&units) }
+    );
     rift_tracing::info!(
         component = "search",
         operation = "search.populate",
@@ -4262,6 +4363,7 @@ fn prepare_initial_batch(
     batch: InitialWorkspaceBatch,
 ) -> Result<(WorkspaceIndexPreparation, LastCapture, RebuildOutcome), RiftError> {
     let cancelled = || token.is_cancelled();
+    let epoch = batch.validation.observed_epoch();
     let mut preparation = batch.preparation;
     let current = batch.state.blocking_read().snapshot().0;
     let mut index = {
@@ -4307,12 +4409,26 @@ fn prepare_initial_batch(
     let candidate = preparation_publication(
         &batch.root,
         index,
-        batch.source_policy,
+        Arc::clone(&batch.source_policy),
         &batch.configuration,
         candidate_state,
-        batch.validation.observed_epoch(),
+        epoch,
         &cancelled,
     )?;
+    if batch.complete
+        && !complete_preparation_matches(
+            &batch.root,
+            &batch.configuration,
+            &batch.source_policy,
+            &preparation,
+            candidate.reads.workspace_limits(),
+            &cancelled,
+        )?
+    {
+        let pending = batch.validation.locked_pending();
+        trace_preparation_superseded(candidate.epoch, batch.validation.observed_epoch(), &pending);
+        return Ok((preparation, last, RebuildOutcome::Superseded));
+    }
     let handoff = if batch.complete {
         batch
             .lexical
@@ -4328,6 +4444,30 @@ fn prepare_initial_batch(
         handoff,
     );
     Ok((preparation, last, outcome))
+}
+
+/// Proves the complete batch still owns the selected paths and inclusion rules it captured.
+fn complete_preparation_matches(
+    root: &Path,
+    configuration: &ConfigurationState,
+    source_policy: &WorkspaceSourcePolicy,
+    preparation: &WorkspaceIndexPreparation,
+    limits: WorkspaceIndexLimits,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<bool, RiftError> {
+    let visibility = configuration.source_visibility();
+    if !preparation.discovered_paths_unchanged(&visibility, cancelled)? {
+        return Ok(false);
+    }
+    let current = WorkspaceSourcePolicy::build_with_languages_cancellable(
+        root,
+        limits,
+        &visibility,
+        &configuration.text_inclusion(),
+        &configuration.language_file_selections(),
+        cancelled,
+    )?;
+    Ok(source_policy.same_inclusion_rules(&current))
 }
 
 /// Builds the publication of one preparation batch: the dependency context and every
@@ -4393,10 +4533,9 @@ fn preparation_publication(
 /// Publishes one preparation batch's candidate under the publication lane, unless the
 /// observation the lane holds supersedes it.
 ///
-/// Pending work that asks for the whole workspace, a `rift.toml` that moved, or an
-/// observation the candidate cannot answer leaves the publication to the supervisor's
-/// next rebuild, and records `index preparation superseded` once with the pending
-/// work's trigger.
+/// A pathless full observation, a `rift.toml` that moved, or an observation the candidate
+/// cannot answer leaves the publication to the supervisor's next rebuild. The refusal
+/// records `index preparation superseded` once with the pending work's trigger.
 fn publish_preparation_after(
     root: &Path,
     published: &RwLock<IndexState>,
@@ -4406,15 +4545,17 @@ fn publish_preparation_after(
 ) -> RebuildOutcome {
     let pending = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
-    if pending.covers_whole_workspace()
+    if pending.is_unscoped()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
     {
         trace_preparation_superseded(candidate.epoch, observed_epoch, &pending);
         drop(pending);
         return RebuildOutcome::Superseded;
     }
-    let answer = answered_candidate(root, candidate, &pending, observed_epoch)
-        .published_at_startup(candidate);
+    let answer = answered_candidate(root, candidate, &pending, observed_epoch, &|| {
+        validation.cancellation.is_cancelled()
+    })
+    .published_at_startup(candidate);
     let Some(answer) = answer else {
         trace_preparation_superseded(candidate.epoch, observed_epoch, &pending);
         drop(pending);
@@ -4471,7 +4612,6 @@ pub(crate) async fn run_index_supervisor_with(
     let _watch = WatchRunning::new(watcher, &context.validation);
     let validation = Arc::clone(&context.validation);
     let published = Arc::clone(&context.published);
-    let population = context.population.clone();
     // The guard reports the supervisor's end however it comes: a return, a cancellation, or
     // a panic unwinding this task. A reader that meets the readiness deadline needs to know
     // which of those happened, and the process that panicked cannot tell them afterwards.
@@ -4536,9 +4676,11 @@ pub(crate) async fn run_index_supervisor_with(
             let pending = validation.locked_pending();
             !pending.covers_whole_workspace() && pending.paths.is_empty()
         };
-        if pending_is_empty
-            && validation.observed_epoch() <= read_published(&published).await.snapshot().0.epoch
-        {
+        let state = read_published(&published).await;
+        let skip = (pending_is_empty && validation.observed_epoch() <= state.snapshot().0.epoch)
+            || state.retains_source_limit_failure(validation.observed_epoch());
+        drop(state);
+        if skip {
             continue;
         }
         let request = validation.take_pending();
@@ -4562,7 +4704,7 @@ pub(crate) async fn run_index_supervisor_with(
         match result {
             Ok(RebuildOutcome::Published) => {
                 let (current, _) = read_published(&published).await.snapshot();
-                if let Some(lane) = population.as_ref() {
+                if let Some(lane) = context.population.as_ref() {
                     lane.request(current);
                 }
             }
@@ -4577,12 +4719,15 @@ pub(crate) async fn run_index_supervisor_with(
 /// Records one failed rebuild under the publication lane and wakes the requests waiting
 /// on it; a failure the pool can no longer record marks the watch unhealthy instead.
 async fn publish_rebuild_failure(context: &IndexSupervisorContext, epoch: u64, error: RiftError) {
+    let causes = rift_error::causes(&error).join("; ");
     rift_tracing::warn!(
         component = "index",
         operation = "index.build",
         epoch,
         error_code = crate::failure::wire_code_for_error(&error)
             .unwrap_or_else(|| "internal_error".to_owned()),
+        error = %error,
+        causes,
         "index rebuild failed"
     );
     let failed_state = Arc::clone(&context.published);
@@ -4866,7 +5011,7 @@ pub(crate) fn capture_rebuild_with(
         validation.restore_pending(request.work);
         return Ok(CapturedRebuild::Cancelled);
     }
-    let unchanged = change_set.is_empty()
+    let unchanged = (change_set.is_empty() || Arc::ptr_eq(&candidate.reads, &previous.reads))
         && candidate.configuration.fingerprint == previous.configuration.fingerprint;
     if unchanged {
         return Ok(CapturedRebuild::Unchanged {
@@ -4967,8 +5112,10 @@ pub(crate) fn publish_rebuild_after(
 ) -> RebuildOutcome {
     let publication = validation.locked_pending();
     let observed_epoch = validation.observed_epoch();
-    let candidate =
-        answered_candidate(root, candidate, &publication, observed_epoch).into_current();
+    let candidate = answered_candidate(root, candidate, &publication, observed_epoch, &|| {
+        validation.cancellation.is_cancelled()
+    })
+    .into_current();
     let mut state = write_published(published);
     after_state_lock();
     if validation.cancellation.is_cancelled() {
@@ -5016,9 +5163,8 @@ enum CandidateAnswer {
     /// The observation names a path whose bytes the candidate does not hold, or could not
     /// read under its own policy; a rebuild reading the named paths answers it.
     Behind,
-    /// The observation asks for the whole workspace, names a path the candidate holds
-    /// files below that is gone from the disk, or was made while `rift.toml` moved since
-    /// the candidate accepted it; only a capture of the whole workspace answers it.
+    /// The observation has no trustworthy paths, its complete visible state differs,
+    /// or the accepted configuration moved; another full capture answers it.
     Rescan,
 }
 
@@ -5062,20 +5208,21 @@ impl CandidateAnswer {
 /// holds all of them answers the later observation too, as its twin under that epoch: a
 /// change's own write reaches the watcher after the change captured it, and reading the
 /// same bytes a second time is the work this drops. An observation that names a path the
-/// candidate does not hold leaves it behind; one that asks for the whole workspace, one
-/// naming a path the candidate holds files below that is gone from the disk, or one made
-/// while `rift.toml` moved, asks for a rescan.
+/// candidate does not hold leaves it behind. A named whole-workspace observation compares
+/// the complete visible file set and inclusion rules with the candidate. A pathless
+/// observation, a changed complete set, or a changed configuration asks for a rescan.
 ///
-/// Work is one digest per observed path, bounded by how many paths one observation
-/// retains, and it runs under the publication lane alone.
+/// Named full observations inspect the whole tree under [`WorkspaceIndexLimits`]. Other
+/// observations read one digest per retained path. Both run under the publication lane.
 fn answered_candidate(
     root: &Path,
     candidate: &Arc<PublishedWorkspace>,
     pending: &PendingWork,
     observed_epoch: u64,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> CandidateAnswer {
     if !matches!(
-        captured_build_paths_match(root, &candidate.reads, &|| false),
+        captured_build_paths_match(root, &candidate.reads, cancelled),
         Ok(true)
     ) {
         return CandidateAnswer::Rescan;
@@ -5083,11 +5230,33 @@ fn answered_candidate(
     if candidate.epoch == observed_epoch {
         return CandidateAnswer::Current(Arc::clone(candidate));
     }
-    if pending.covers_whole_workspace()
+    if pending.is_unscoped()
         || candidate.configuration.fingerprint != configuration_fingerprint(root)
         || candidate.holds_files_below_a_gone_path(root, &pending.paths)
     {
         return CandidateAnswer::Rescan;
+    }
+    if pending.covers_whole_workspace() {
+        let complete = candidate.preparation.is_none()
+            && candidate
+                .configuration
+                .index_limits(candidate.reads.workspace_limits())
+                .is_ok_and(|limits| {
+                    unchanged_whole_workspace(
+                        root,
+                        candidate,
+                        &candidate.configuration,
+                        limits,
+                        cancelled,
+                    )
+                    .unwrap_or(false)
+                });
+        if !complete {
+            return CandidateAnswer::Rescan;
+        }
+        return CandidateAnswer::Current(Arc::new(
+            candidate.under(candidate.configuration.clone(), observed_epoch),
+        ));
     }
     if !candidate.holds_observed(root, &pending.paths) {
         return CandidateAnswer::Behind;
@@ -6822,7 +6991,8 @@ pub(crate) mod tests {
                 &root,
                 &current,
                 &super::PendingWork::default(),
-                current.epoch
+                current.epoch,
+                &|| false,
             ),
             super::CandidateAnswer::Rescan
         ));
@@ -7897,6 +8067,118 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Issue #623: an unchanged full observation validates bytes without rebuilding facts.
+    #[test]
+    fn an_unchanged_whole_observation_shares_complete_published_facts() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("opaque.unknown"),
+            "unclassified bytes",
+        )?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        let (validation, _receiver) =
+            IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+        let state = RwLock::new(IndexState {
+            current: Arc::clone(&previous),
+            failure: None,
+        });
+        validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let outcome = super::capture_rebuild_with(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &state,
+            &validation,
+            request,
+            super::workspace_capture(),
+        )?;
+        drop(recorder);
+        let super::CapturedRebuild::Unchanged { published, .. } = outcome else {
+            return Err("an unchanged full capture must retain the publication".into());
+        };
+        assert!(Arc::ptr_eq(&published.reads, &previous.reads));
+        assert_eq!(published.visible_digests, previous.visible_digests);
+        assert_eq!(published_facts(&published)?, published_facts(&previous)?);
+        let records = drain.queued_records();
+        for stage in [
+            "index.semantics",
+            "documentation.collect",
+            "index.lexical_write",
+        ] {
+            assert!(
+                !records.iter().any(|record| record.message() == stage),
+                "unchanged full capture must not run {stage}"
+            );
+        }
+        Ok(())
+    }
+
+    /// New refused files change the publication even when their bytes cannot be indexed.
+    #[test]
+    fn a_full_observation_retains_a_new_oversized_file_refusal() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        fs::write(
+            directory.path().join("rift.toml"),
+            "[providers.syntax]\nmax_file = \"1kb\"\n[search.text]\nlarge_files = \"skip\"\n",
+        )?;
+        let previous = stable_candidate(directory.path(), 0)?;
+        fs::write(directory.path().join("large.rs"), vec![b'x'; 2048])?;
+        let request = RebuildRequest {
+            previous: Some(Arc::clone(&previous)),
+            ..RebuildRequest::initial(1)
+        };
+        let WorkspaceCandidate::Stable { published, .. } =
+            build_workspace_candidate(directory.path(), WorkspaceIndexLimits::default(), &request)?
+        else {
+            return Err("a stable full capture must publish its refusal".into());
+        };
+        assert!(!Arc::ptr_eq(&published.reads, &previous.reads));
+        assert!(
+            published
+                .visible_refused
+                .contains_key(&rift_core::ProjectPath::new("large.rs")?)
+        );
+        let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
+        let answer = published.reads.get_symbol(&params)?;
+        assert!(
+            !answer.warnings.is_empty(),
+            "the new refused file must be reported"
+        );
+        let repeated = RebuildRequest {
+            previous: Some(published),
+            ..RebuildRequest::initial(2)
+        };
+        let WorkspaceCandidate::Stable { published, .. } = build_workspace_candidate(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &repeated,
+        )?
+        else {
+            return Err("a repeated full capture must retain the refused file".into());
+        };
+        assert!(!published.visible_refused.is_empty());
+        assert!(!published.reads.get_symbol(&params)?.warnings.is_empty());
+        fs::remove_file(directory.path().join("large.rs"))?;
+        let repaired = RebuildRequest {
+            previous: Some(published),
+            ..RebuildRequest::initial(3)
+        };
+        let WorkspaceCandidate::Stable { published, .. } = build_workspace_candidate(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &repaired,
+        )?
+        else {
+            return Err("removing the refused file must publish the repaired tree".into());
+        };
+        assert!(published.visible_refused.is_empty());
+        assert!(published.reads.get_symbol(&params)?.warnings.is_empty());
+        Ok(())
+    }
+
     #[test]
     fn a_whole_workspace_rebuild_rescans_under_unchanged_index_configuration() -> TestResult {
         let directory = tempfile::tempdir()?;
@@ -8114,6 +8396,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn repository_exclude_changes_invalidate_main_and_linked_workspaces() -> TestResult {
+        use rift_history::fixture::{commit_all, git, init};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("main");
+        fs::create_dir(&root)?;
+        init(&root);
+        fs::write(root.join("lib.rs"), "pub struct Beacon;\n")?;
+        commit_all(&root, "fixture source");
+        let linked = directory.path().join("linked");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().ok_or("fixture path must be UTF-8")?,
+            ],
+        );
+        let exclude = root.canonicalize()?.join(".git/info/exclude");
+        fs::write(&exclude, "generated.rs\n")?;
+        for present in [true, false] {
+            if !present {
+                fs::remove_file(&exclude)?;
+            }
+            for workspace in [&root, &linked] {
+                let roots = super::WatchRoots::resolve(workspace)?;
+                assert_eq!(roots.git_exclude.as_ref(), Some(&exclude));
+                let (validation, _receiver) =
+                    IndexValidation::new(WorkspaceIndexLimits::default().files_max());
+                let kind = if present {
+                    EventKind::Modify(ModifyKind::Any)
+                } else {
+                    EventKind::Create(CreateKind::File)
+                };
+                super::report_watch_outcome(
+                    &roots,
+                    &validation,
+                    Ok(Event::new(kind).add_path(exclude.clone())),
+                );
+                assert_eq!(validation.observed_epoch(), 1);
+                assert!(validation.take_pending().work.covers_whole_workspace());
+                let access = Event::new(EventKind::Access(notify::event::AccessKind::Read))
+                    .add_path(exclude.clone());
+                super::report_watch_outcome(&roots, &validation, Ok(access));
+                assert_eq!(
+                    validation.observed_epoch(),
+                    1,
+                    "reading exclusion rules must not cause another rescan"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn git_control_access_events_do_not_invalidate_the_workspace() {
         use notify::event::{AccessKind, AccessMode};
 
@@ -8124,6 +8463,7 @@ pub(crate) mod tests {
                 canonical: root.clone(),
                 watched: root.clone(),
                 git_directory: Some(git_directory.clone()),
+                git_exclude: Some(git_directory.join("info/exclude")),
             };
             let (validation, mut receiver) =
                 IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -8159,6 +8499,7 @@ pub(crate) mod tests {
                 canonical: root.clone(),
                 watched: root.clone(),
                 git_directory: Some(git_directory.clone()),
+                git_exclude: Some(git_directory.join("info/exclude")),
             };
             let (validation, mut receiver) =
                 IndexValidation::new(WorkspaceIndexLimits::default().files_max());
@@ -8624,6 +8965,43 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// Issue #475: a late named rescan already represented by a complete candidate is acknowledged.
+    #[tokio::test]
+    async fn late_ignore_and_directory_events_already_captured_do_not_supersede() -> TestResult {
+        for scope in [".gitignore", "fresh"] {
+            let (directory, validation, state, _epoch, _invalidations) = observed_rewrite()?;
+            let root = directory.path();
+            fs::create_dir(root.join("fresh"))?;
+            fs::write(root.join("fresh/lib.rs"), "pub fn fresh() {}\n")?;
+            fs::write(root.join(".gitignore"), "*.tmp\n")?;
+            validation.observe_whole_workspace()?;
+            let request = validation.take_pending();
+            let state = Arc::new(state);
+            let blocking = BlockingExecutor::isolated(1, 60_000);
+            let context = cancellation_context(root, &validation, &state, &blocking);
+            let observing = Arc::clone(&validation);
+            let capture = move |root: &std::path::Path, limits, request: &RebuildRequest| {
+                let candidate = build_workspace_candidate(root, limits, request)?;
+                let event =
+                    Event::new(EventKind::Create(CreateKind::Any)).add_path(root.join(scope));
+                observing.observe_event(&super::WatchRoots::at(root), &event)?;
+                Ok(candidate)
+            };
+            let outcome = super::rebuild_workspace(&context, request, capture).await?;
+            assert_eq!(
+                outcome,
+                RebuildOutcome::Published,
+                "already captured event {scope}"
+            );
+            assert!(validation.superseded_after(0).is_none());
+            let (published, failure) = state.read().await.snapshot();
+            assert!(failure.is_none());
+            assert_eq!(published.epoch, validation.observed_epoch());
+            assert_eq!(declarations_named(&published, "fresh")?, 1);
+        }
+        Ok(())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn supervisor_records_a_superseded_rebuild_with_both_epochs() -> TestResult {
         let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
@@ -9012,20 +9390,17 @@ pub(crate) mod tests {
     /// Native events delivered after the empty startup publication and before the complete
     /// batch publishes, in the order the macOS stream delivered them. The capture boundary's
     /// `.rift` writes stay below the hard floor: the epoch holds and the preparation
-    /// publishes the tree. A `Create(Folder)` for `src`, a directory the fixture wrote
-    /// before the watcher started, asks for the whole workspace: the preparation records
-    /// `index preparation superseded` and publishes nothing, and the supervisor's rescan
-    /// publishes the tree a cold build reads.
+    /// publishes the tree. A `Create(Folder)` for `src` also permits publication when
+    /// the complete batch already captured that directory. Publication facts must equal
+    /// an independent cold build without discarding the captured batch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_directory_event_during_preparation_leaves_the_startup_tree_to_the_supervisor()
-    -> TestResult {
+    async fn directory_events_during_preparation_publish_only_the_captured_tree() -> TestResult {
         for directory_event in [false, true] {
             let directory = tempfile::tempdir()?;
             let root = directory.path();
             fs::create_dir(root.join("src"))?;
             fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
             fs::write(root.join("README.md"), "See [Beacon](src/lib.rs#Beacon).\n")?;
-            let cold = published_facts(stable_candidate(root, 0)?.as_ref())?;
             let (context, invalidations) = initial_preparation_context(root)?;
             let validation = Arc::clone(&context.validation);
             let state = Arc::clone(&context.published);
@@ -9048,6 +9423,7 @@ pub(crate) mod tests {
                 0,
                 "`.rift` events move no epoch"
             );
+            let batch = complete_initial_batch(&context, initial);
             if directory_event {
                 let event = Event::new(EventKind::Create(CreateKind::Folder))
                     .add_path(roots.canonical().join("src"));
@@ -9055,7 +9431,7 @@ pub(crate) mod tests {
                 assert_eq!(validation.observed_epoch(), 1);
             }
 
-            let batch = complete_initial_batch(&context, initial);
+            let cold = published_facts(stable_candidate(root, 0)?.as_ref())?;
             let cancellation = validation.cancellation.clone();
             // The blocking thread does not inherit this thread's default subscriber:
             // the closure installs its own recorder and hands its drain back.
@@ -9074,14 +9450,8 @@ pub(crate) mod tests {
                 .filter(|record| matches!(record.operation(), "index.build" | "index.publish"))
                 .map(|record| record.message().to_owned())
                 .collect::<Vec<_>>();
-            if directory_event {
-                assert_eq!(outcome?.2, RebuildOutcome::Superseded);
-                assert_eq!(records, ["index preparation superseded"]);
-                assert!(state.read().await.current.preparation.is_some());
-            } else {
-                assert_eq!(outcome?.2, RebuildOutcome::Published);
-                assert_eq!(records, ["index snapshot published"]);
-            }
+            assert_eq!(outcome?.2, RebuildOutcome::Published);
+            assert_eq!(records, ["index snapshot published"]);
 
             let watcher = super::unwatched(root, &validation)?;
             let supervisor =
@@ -9098,6 +9468,100 @@ pub(crate) mod tests {
                 "startup publication facts must equal an independent cold build"
             );
         }
+        Ok(())
+    }
+
+    /// A directory event must not publish newly discovered bytes without their declarations.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_source_added_after_discovery_cannot_publish_an_incomplete_tree() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::create_dir(root.join("src"))?;
+        fs::write(root.join("src/lib.rs"), "pub struct Beacon;\n")?;
+        let (context, invalidations) = initial_preparation_context(root)?;
+        let validation = Arc::clone(&context.validation);
+        let state = Arc::clone(&context.published);
+        let roots = super::WatchRoots::resolve(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        fs::write(root.join("src/new.rs"), "pub struct Arrived;\n")?;
+        super::report_watch_outcome(
+            &roots,
+            &validation,
+            Ok(Event::new(EventKind::Create(CreateKind::Folder))
+                .add_path(roots.canonical().join("src"))),
+        );
+        let cold = published_facts(stable_candidate(root, 0)?.as_ref())?;
+        let batch = complete_initial_batch(&context, initial);
+        let cancellation = validation.cancellation.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || super::prepare_initial_batch(&cancellation, batch))
+                .await??
+                .2;
+        if outcome == RebuildOutcome::Published {
+            assert_eq!(
+                published_facts(&state.read().await.current)?,
+                cold,
+                "a complete startup publication must include every selected declaration"
+            );
+        } else {
+            assert_eq!(outcome, RebuildOutcome::Superseded);
+        }
+        let watcher = super::unwatched(root, &validation)?;
+        let supervisor = tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
+        let published = publication_matching(&state, &validation, &cold.digests).await;
+        validation.cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
+        assert_eq!(published_facts(published?.as_ref())?, cold);
+        Ok(())
+    }
+
+    /// Changed rules must replace the retained policy even when selected paths stay equal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn startup_preparation_rejects_changed_inclusion_rules() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        fs::write(root.join("lib.rs"), "pub struct Beacon;\n")?;
+        fs::write(root.join(".gitignore"), "old.tmp\n")?;
+        let (context, invalidations) = initial_preparation_context(root)?;
+        let validation = Arc::clone(&context.validation);
+        let state = Arc::clone(&context.published);
+        let roots = super::WatchRoots::resolve(root)?;
+        let initial = super::discover_initial_workspace(&context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        fs::write(root.join(".gitignore"), "future.rs\n")?;
+        super::report_watch_outcome(
+            &roots,
+            &validation,
+            Ok(Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(roots.canonical().join(".gitignore"))),
+        );
+        let cold = published_facts(stable_candidate(root, 0)?.as_ref())?;
+        let batch = complete_initial_batch(&context, initial);
+        let cancellation = validation.cancellation.clone();
+        let outcome =
+            tokio::task::spawn_blocking(move || super::prepare_initial_batch(&cancellation, batch))
+                .await??
+                .2;
+        assert_eq!(outcome, RebuildOutcome::Superseded);
+        let watcher = super::unwatched(root, &validation)?;
+        let supervisor = tokio::spawn(super::run_index_supervisor(watcher, invalidations, context));
+        let published = publication_matching(&state, &validation, &cold.digests).await;
+        validation.cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), supervisor).await??;
+        let published = published?;
+        assert_eq!(published_facts(&published)?, cold);
+        fs::write(root.join("future.rs"), "pub struct Hidden;\n")?;
+        assert!(
+            !published
+                .source_policy
+                .as_ref()
+                .ok_or("a filesystem publication must retain its source policy")?
+                .visible(&roots.canonical().join("future.rs")),
+            "the replacement policy must exclude future files under its current rules"
+        );
         Ok(())
     }
 
@@ -12475,6 +12939,47 @@ pub(crate) mod tests {
         assert_eq!(fields[2]["commit_state"], "owed");
         assert_eq!(fields[2]["cause"], "the store refused");
         assert!(fields[2].get("running_ms").is_none(), "{}", fields[2]);
+        Ok(())
+    }
+
+    /// A named directory event must reject bytes changed after the candidate was captured.
+    #[tokio::test]
+    async fn late_directory_events_reject_changed_captured_bytes() -> TestResult {
+        let (directory, validation, state, _epoch, _invalidations) = observed_rewrite()?;
+        let root = directory.path();
+        fs::create_dir(root.join("fresh"))?;
+        fs::write(root.join("fresh/lib.rs"), "pub fn before() {}\n")?;
+        validation.observe_whole_workspace()?;
+        let request = validation.take_pending();
+        let state = Arc::new(state);
+        let blocking = BlockingExecutor::isolated(1, 60_000);
+        let context = cancellation_context(root, &validation, &state, &blocking);
+        let observing = Arc::clone(&validation);
+        let capture = move |root: &std::path::Path, limits, request: &RebuildRequest| {
+            let candidate = build_workspace_candidate(root, limits, request)?;
+            fs::write(root.join("fresh/lib.rs"), "pub fn latest() {}\n")
+                .expect("the fixture source must change after capture");
+            let event =
+                Event::new(EventKind::Create(CreateKind::Folder)).add_path(root.join("fresh"));
+            observing.observe_event(&super::WatchRoots::at(root), &event)?;
+            Ok(candidate)
+        };
+        assert_eq!(
+            super::rebuild_workspace(&context, request, capture).await?,
+            RebuildOutcome::Superseded
+        );
+        let request = validation.take_pending();
+        assert_eq!(
+            super::rebuild_workspace(&context, request, build_workspace_candidate).await?,
+            RebuildOutcome::Published
+        );
+        let (published, failure) = state.read().await.snapshot();
+        assert!(failure.is_none());
+        assert_eq!(declarations_named(&published, "latest")?, 1);
+        assert_eq!(
+            published_facts(&published)?,
+            published_facts(stable_candidate(root, 0)?.as_ref())?
+        );
         Ok(())
     }
 }

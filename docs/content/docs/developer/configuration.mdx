@@ -202,9 +202,11 @@ directory_depth = 64
 The four glob lists decide in one order:
 
 1. `exclude` drops a file, whatever else matched it.
-2. `force_include` keeps a file `.gitignore` would hide, and keeps it without an `include` match.
-3. `respect_gitignore`, on by default, applies the workspace's own `.gitignore` files, root and
-   nested; the server never reads global or parent-directory ignore sources.
+2. `force_include` keeps a file the repository ignore rules would hide, and keeps it without an
+   `include` match.
+3. `respect_gitignore`, on by default, applies root and nested `.gitignore` files and the
+   repository-local `.git/info/exclude` file. Linked worktrees share the repository-local
+   exclusions. The server never reads global or parent-directory ignore sources.
 4. `include`, when it is not empty, is what a remaining file has to match. Empty `include`
    includes every file the steps above leave standing.
 
@@ -216,9 +218,8 @@ version control at once - design documents, a scratch corpus, a generated tree t
 force_include = [".plans/**"]
 ```
 
-A workspace naming no `force_include` pattern indexes exactly what it indexed before. A workspace
-naming one walks those subtrees a second time with `.gitignore` not consulted, spending the same
-`files` budget as the first walk.
+The server walks `force_include` subtrees a second time without consulting repository ignore
+rules, spending the same `files` budget as the first walk.
 
 `.git`, `.rift`, and `target` stay invisible whatever this table says: no `include`, `exclude`,
 `force_include`, or `.gitignore` entry can make the server serve them.

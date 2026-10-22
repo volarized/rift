@@ -162,11 +162,11 @@ impl ChangedBlobs {
 }
 
 impl Repository {
-    /// The common git directory every worktree of this repository shares:
+    /// The canonical common git directory every worktree of this repository shares:
     /// `git rev-parse --git-common-dir`.
     #[must_use]
     pub fn common_directory(&self) -> &Path {
-        self.inner.common_dir()
+        &self.common_directory
     }
 
     /// The `HEAD` commit of every live worktree, this workspace's own first,

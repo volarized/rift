@@ -55,7 +55,7 @@ pub use selection::{
     documentation_format,
 };
 #[cfg(feature = "collector")]
-pub use semantic::{BuiltSemantics, PlacedDocument, WorkspaceSemantics};
+pub use semantic::{BuiltSemantics, PlacedDocument, PreparedSemantics, WorkspaceSemantics};
 #[cfg(feature = "collector")]
 pub use source::{FileDigest, IndexedFile};
 pub use traversal::{TraversalWalk, walk_traversal_capped, walk_traversal_capped_async};

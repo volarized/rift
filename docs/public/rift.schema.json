@@ -1846,7 +1846,7 @@
         },
         "force_include": {
           "default": [],
-          "description": "Exact file paths or globs that stay visible although the workspace's `.gitignore`\nhides them, in [`PathPattern`] syntax. A match here needs no `include` match, and a\nmatch `exclude` also names is still dropped.",
+          "description": "Exact file paths or globs that stay visible although repository ignore rules\nhide them, in [`PathPattern`] syntax. A match here needs no `include` match, and a\nmatch `exclude` also names is still dropped.",
           "items": {
             "$ref": "#/$defs/PathPattern"
           },
@@ -1855,7 +1855,7 @@
         },
         "include": {
           "default": [],
-          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty includes every file `exclude` and `.gitignore` leave standing.",
+          "description": "Exact file paths or globs a file must match to stay visible, in [`PathPattern`] syntax.\nEmpty includes every file `exclude` and the repository ignore rules leave standing.",
           "items": {
             "$ref": "#/$defs/PathPattern"
           },
@@ -1872,7 +1872,7 @@
         },
         "respect_gitignore": {
           "default": true,
-          "description": "Whether the workspace's own `.gitignore` files, root and nested, hide the paths they\nmatch. Global and parent-directory gitignore sources are never read.",
+          "description": "Whether root and nested `.gitignore` files and repository-local `.git/info/exclude` hide matching paths.\nGlobal and parent-directory ignore sources are never read.",
           "type": "boolean"
         },
         "workspace_size": {

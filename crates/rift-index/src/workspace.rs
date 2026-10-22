@@ -785,7 +785,11 @@ impl WorkspaceSourcePolicy {
         self.visible_paths_cancellable(&|| false)
     }
 
-    fn visible_paths_cancellable(
+    /// Lists visible regular files, checking cancellation during discovery.
+    ///
+    /// # Errors
+    /// Returns discovery, configured-bound, or cancellation refusals.
+    pub fn visible_paths_cancellable(
         &self,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Vec<ProjectPath>, RiftError> {
@@ -886,8 +890,20 @@ impl WorkspaceSourcePolicy {
     /// Returns [`RiftError`] for a read that fails or a walk past the file count
     /// bound.
     pub fn visible_digests(&self) -> Result<WorkspaceDigests, RiftError> {
+        self.visible_digests_cancellable(&|| false)
+    }
+
+    /// Captures visible file digests, checking cancellation between files.
+    ///
+    /// # Errors
+    /// Returns the same refusals as [`Self::visible_digests`], plus cancellation.
+    pub fn visible_digests_cancellable(
+        &self,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<WorkspaceDigests, RiftError> {
         let mut digests = Vec::new();
-        for path in self.visible_paths()? {
+        for path in self.visible_paths_cancellable(cancelled)? {
+            check_cancelled(cancelled)?;
             let absolute = self.root.join(path.as_str());
             match self.visible_digest(&absolute) {
                 Ok(Some(digest)) => digests.push((path, digest)),
@@ -900,6 +916,16 @@ impl WorkspaceSourcePolicy {
             }
         }
         Ok(WorkspaceDigests::new(digests))
+    }
+
+    /// Whether both policies compiled the same repository ignore files and bytes.
+    ///
+    /// The caller separately compares accepted source and language configuration.
+    #[must_use]
+    pub fn same_inclusion_rules(&self, other: &Self) -> bool {
+        self.root == other.root
+            && self.gitignore.as_ref().map(|chain| &chain.inputs)
+                == other.gitignore.as_ref().map(|chain| &chain.inputs)
     }
 
     /// Carries the checks [`Self::visible`] and [`Self::includes`] share, against a path
@@ -1849,6 +1875,43 @@ impl WorkspaceIndexPreparation {
             .map(project_path)
             .collect::<Result<Vec<_>, _>>()?;
         Ok((source, other))
+    }
+
+    /// Whether current source, text, and lockfile paths match this preparation's discovery.
+    ///
+    /// Source providers are compared by language identity. Discovery uses the retained
+    /// language policy and bounds, and the caller supplies the accepted source visibility.
+    /// Returns `false` before discovery has completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] for discovery, configured bounds, or cancellation.
+    pub fn discovered_paths_unchanged(
+        &self,
+        visibility: &SourceVisibility,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<bool, RiftError> {
+        check_cancelled(cancelled)?;
+        let Some(original) = &self.discovered else {
+            return Ok(false);
+        };
+        let current = discover_cancellable(
+            &self.root,
+            self.limits,
+            visibility,
+            &self.language,
+            cancelled,
+        )?;
+        Ok(original
+            .source
+            .iter()
+            .map(|(path, provider)| (path, provider.language()))
+            .eq(current
+                .source
+                .iter()
+                .map(|(path, provider)| (path, provider.language())))
+            && original.text == current.text
+            && original.lockfiles == current.lockfiles)
     }
 
     /// Project-relative paths discovered under this preparation's visibility policy, split
@@ -4643,9 +4706,8 @@ fn captured_project_semantics(
     contents: &IndexContents,
     limits: WorkspaceIndexLimits,
     fingerprint: &WorkspaceFingerprint,
-    previous: Option<&NormalizedGraph>,
     owner: &SymbolOwner,
-) -> Result<BuiltSemantics, RiftError> {
+) -> Result<rift_analysis::PreparedSemantics, RiftError> {
     let revision = captured_semantic_revision(fingerprint, root, owner)?;
     let revision = captured_build_paths_revision(
         revision,
@@ -4654,12 +4716,10 @@ fn captured_project_semantics(
     );
     let documents = contents.files.values().map(Arc::as_ref).collect::<Vec<_>>();
     let Some(first) = documents.first() else {
-        return WorkspaceSemantics::build_project_facts_with_relationships(
+        return WorkspaceSemantics::prepare_project_facts(
             std::iter::empty(),
             limits.declarations_max(),
-            limits.relationships_max(),
             revision,
-            previous,
         );
     };
     let files = documents
@@ -4689,13 +4749,11 @@ fn captured_project_semantics(
         ),
     )?
     .with_build_paths(&contents.build_paths)?;
-    WorkspaceSemantics::build_captured_project_facts(
+    WorkspaceSemantics::prepare_captured_project_facts(
         input,
         &documents,
         limits.declarations_max(),
-        limits.relationships_max(),
         revision,
-        previous,
     )
 }
 
@@ -4828,43 +4886,38 @@ fn built_contents_with_owner(
                     &contents.framework_sources,
                     &contents.left_out,
                 );
-                let built = rift_tracing::traced!(
-                    component = "index",
-                    operation = "WorkspaceSemantics::build_project_facts",
-                    phase = "WorkspaceSemantics::build_project_facts",
-                    files = contents.files.len(),
-                    {
-                        captured_project_semantics(
-                            root,
-                            &contents,
-                            limits,
-                            &fingerprint,
-                            previous,
-                            owner,
-                        )
-                    }
-                );
+                let built =
+                    captured_project_semantics(root, &contents, limits, &fingerprint, owner);
                 match built {
-                    Ok(BuiltSemantics {
-                        semantics,
-                        beyond_declaration_bound,
-                        refused_contributions,
-                    }) => {
-                        if !beyond_declaration_bound.is_empty() || !refused_contributions.is_empty()
+                    Ok(prepared) => {
+                        if !prepared.beyond_declaration_bound.is_empty()
+                            || !prepared.refused_contributions.is_empty()
                         {
                             passes = passes.saturating_add(1);
                             leave_out_refused_contributions(
                                 &mut contents,
-                                refused_contributions,
+                                prepared.refused_contributions,
                                 passes < passes_max,
                             )?;
                             leave_out_beyond_declaration_bound(
                                 &mut contents,
-                                &beyond_declaration_bound,
+                                &prepared.beyond_declaration_bound,
                                 passes < passes_max,
                             )?;
                             continue;
                         }
+                        let BuiltSemantics { semantics, .. } = rift_tracing::traced!(
+                            component = "index",
+                            operation = "WorkspaceSemantics::build_project_facts",
+                            phase = "WorkspaceSemantics::build_project_facts",
+                            files = contents.files.len(),
+                            { prepared.build(limits.relationships_max(), previous) }
+                        )
+                        .map_err(|error| {
+                            error
+                                .with(ctx::operation("index.build"))
+                                .with(ctx::workspace(root))
+                        })?;
                         let IndexContents {
                             files,
                             text_files,
@@ -5061,6 +5114,10 @@ fn discover_cancellable(
         visibility.force_include(),
     )?;
     let gitignore = GitignorePolicy::from_respecting(visibility.respect_gitignore());
+    let ignore_chain = visibility
+        .respect_gitignore()
+        .then(|| GitignoreChain::build_cancellable(root, limits, cancelled))
+        .transpose()?;
     let mut discovered = DiscoveredPaths::default();
     for entry in source_walk(root, limits.directory_depth_max, gitignore) {
         check_cancelled(cancelled)?;
@@ -5068,7 +5125,11 @@ fn discover_cancellable(
         let Some(path) = walked_file(&entry, limits.directory_depth_max)? else {
             continue;
         };
-        if !matcher.includes(path) {
+        if !matcher.includes(path)
+            || ignore_chain
+                .as_ref()
+                .is_some_and(|chain| chain.excludes(path, false))
+        {
             continue;
         }
         let Some(class) = language.classifies(path)? else {
@@ -5169,6 +5230,9 @@ fn walked_file(entry: &DirEntry, directory_depth_max: usize) -> Result<Option<&P
 #[derive(Debug)]
 pub(crate) struct GitignoreChain {
     layers: Vec<Gitignore>,
+    inputs: BTreeMap<PathBuf, FileDigest>,
+    root: PathBuf,
+    directory_depth_max: usize,
 }
 
 impl GitignoreChain {
@@ -5181,7 +5245,17 @@ impl GitignoreChain {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
         let mut layers = Vec::new();
-        let mut ignore_files = 0_usize;
+        let mut inputs = BTreeMap::new();
+        if let Ok(repository) = rift_history::Repository::open(root) {
+            let exclude = repository.exclude_path();
+            if exclude.is_file() {
+                let repository_root = repository.worktree_root();
+                let (layer, digest) = compiled_gitignore(&exclude, repository_root, limits)?;
+                inputs.insert(exclude, digest);
+                layers.push(layer);
+            }
+        }
+        let mut ignore_files = inputs.len();
         for entry in source_walk(root, limits.directory_depth_max, GitignorePolicy::Ignore) {
             check_cancelled(cancelled)?;
             let entry = entry.map_err(|error| walk_error(root, error))?;
@@ -5202,23 +5276,56 @@ impl GitignoreChain {
                     .fail();
             }
             ignore_files += 1;
-            layers.push(compiled_gitignore(path)?);
+            let (layer, digest) = compiled_gitignore(path, path.parent().unwrap_or(path), limits)?;
+            inputs.insert(path.to_path_buf(), digest);
+            layers.push(layer);
         }
         layers.sort_by_key(|layer| layer.path().components().count());
-        Ok(Self { layers })
+        Ok(Self {
+            layers,
+            inputs,
+            root: root.to_path_buf(),
+            directory_depth_max: limits.directory_depth_max,
+        })
     }
 
-    /// Whether the workspace's ignore files exclude `path`.
+    /// Whether workspace ignore files exclude `path` or an ancestor directory.
     ///
-    /// Each layer whose directory contains `path` answers in turn, and the deepest one that
-    /// matches decides, which is git's own precedence.
+    /// Each entry composes the applicable layers in precedence order. A descendant
+    /// whitelist cannot restore a path beneath an excluded directory. Work is bounded
+    /// by the configured directory depth times the bounded ignore-file count.
     fn excludes(&self, path: &Path, is_directory: bool) -> bool {
+        let Ok(relative) = path.strip_prefix(&self.root) else {
+            return true;
+        };
+        let components_max = self
+            .directory_depth_max
+            .saturating_add(usize::from(!is_directory));
+        if relative
+            .components()
+            .take(components_max.saturating_add(1))
+            .count()
+            > components_max
+        {
+            return true;
+        }
+        let excluded_parent = path
+            .ancestors()
+            .skip(1)
+            .take(self.directory_depth_max.saturating_add(1))
+            .take_while(|parent| parent.starts_with(&self.root))
+            .any(|parent| self.excludes_entry(parent, true));
+        excluded_parent || self.excludes_entry(path, is_directory)
+    }
+
+    /// Composes compiled layers for one entry after its parent directories were accepted.
+    fn excludes_entry(&self, path: &Path, is_directory: bool) -> bool {
         let mut excluded = false;
         for layer in &self.layers {
-            if !path.starts_with(layer.path()) {
+            if path == layer.path() || !path.starts_with(layer.path()) {
                 continue;
             }
-            match layer.matched_path_or_any_parents(path, is_directory) {
+            match layer.matched(path, is_directory) {
                 Match::Ignore(_) => excluded = true,
                 Match::Whitelist(_) => excluded = false,
                 Match::None => {}
@@ -5229,21 +5336,53 @@ impl GitignoreChain {
 }
 
 /// Compiles one `.gitignore` file against the directory that declares it.
-fn compiled_gitignore(path: &Path) -> Result<Gitignore, RiftError> {
-    let directory = path.parent().unwrap_or(path);
-    let mut builder = GitignoreBuilder::new(directory);
-    if let Some(error) = builder.add(path) {
-        return errors::index::workspace_filesystem()
+fn compiled_gitignore(
+    path: &Path,
+    directory: &Path,
+    limits: WorkspaceIndexLimits,
+) -> Result<(Gitignore, FileDigest), RiftError> {
+    const UTF8_BYTE_ORDER_MARK: char = '\u{feff}';
+
+    let file = fs::File::open(path).map_err(|error| catalog_io_error(path, error))?;
+    let bytes = read_file_bytes(file, path, limits)?;
+    if bytes.len() > limits.file_bytes_max() {
+        return errors::index::workspace_file_too_large()
             .path(path)
-            .source(error)
+            .field("source.file_bytes")
+            .observed(bytes.len())
+            .maximum(limits.file_bytes_max())
             .fail();
     }
-    builder.build().map_err(|error| {
+    let text = std::str::from_utf8(&bytes).map_err(|error| {
         errors::index::workspace_filesystem()
             .path(path)
             .source(error)
             .error()
-    })
+    })?;
+    let text = text.trim_start_matches(UTF8_BYTE_ORDER_MARK);
+    let mut builder = GitignoreBuilder::new(directory);
+    for line in rift_core::line::lines_inclusive(text) {
+        builder
+            .add_line(
+                Some(path.to_path_buf()),
+                rift_core::line::without_ending(line),
+            )
+            .map_err(|error| {
+                errors::index::workspace_filesystem()
+                    .path(path)
+                    .source(error)
+                    .error()
+            })?;
+    }
+    builder
+        .build()
+        .map(|layer| (layer, FileDigest::of(&bytes)))
+        .map_err(|error| {
+            errors::index::workspace_filesystem()
+                .path(path)
+                .source(error)
+                .error()
+        })
 }
 
 /// Hashes one already-discovered source and text path set without parsing syntax. Both
@@ -5269,6 +5408,7 @@ fn capture_paths(
     )
 }
 
+#[cfg(test)]
 fn capture_paths_with_boundary(
     root: &Path,
     paths: &DiscoveredPaths,
@@ -5278,9 +5418,30 @@ fn capture_paths_with_boundary(
     root_identity: Option<(u64, u64)>,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(WorkspaceDigests, LastCapture), RiftError> {
+    recorded_capture_paths_with_boundary(
+        root,
+        paths,
+        limits,
+        last,
+        boundary,
+        root_identity,
+        cancelled,
+    )?
+    .completed()
+}
+
+fn recorded_capture_paths_with_boundary(
+    root: &Path,
+    paths: &DiscoveredPaths,
+    limits: WorkspaceIndexLimits,
+    last: &LastCapture,
+    boundary: Option<CaptureBoundary>,
+    root_identity: Option<(u64, u64)>,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<RecordedCapture, RiftError> {
     let source: Vec<PathBuf> = paths.source.iter().map(|(path, _)| path.clone()).collect();
     let other: Vec<PathBuf> = paths.text.iter().chain(&paths.lockfiles).cloned().collect();
-    capture_path_lists_with_boundary(
+    recorded_capture_path_lists(
         root,
         limits,
         &CapturePathLists {
@@ -5303,11 +5464,31 @@ struct CapturePathLists<'a> {
     cancelled: &'a (dyn Fn() -> bool + Sync),
 }
 
+/// One capture's answer and reusable file observations, including a refused capture.
+struct RecordedCapture<Digests = WorkspaceDigests> {
+    digests: Result<Digests, RiftError>,
+    last: LastCapture,
+}
+
+impl<Digests> RecordedCapture<Digests> {
+    fn completed(self) -> Result<(Digests, LastCapture), RiftError> {
+        self.digests.map(|digests| (digests, self.last))
+    }
+}
+
 fn capture_path_lists_with_boundary(
     root: &Path,
     limits: WorkspaceIndexLimits,
     paths: &CapturePathLists<'_>,
 ) -> Result<(WorkspaceDigests, LastCapture), RiftError> {
+    recorded_capture_path_lists(root, limits, paths)?.completed()
+}
+
+fn recorded_capture_path_lists(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    paths: &CapturePathLists<'_>,
+) -> Result<RecordedCapture, RiftError> {
     let CapturePathLists {
         source,
         other,
@@ -5322,37 +5503,43 @@ fn capture_path_lists_with_boundary(
         .checked_add(other.len())
         .ok_or_else(|| errors::index::workspace_too_many_files().path(root).error())?;
     let mut next = LastCapture::under(limits, held, boundary, root_identity);
-    let mut capture = PathCapture {
-        workspace_bytes: &mut workspace_bytes,
-        root,
-        limits,
-        last,
-        next: &mut next,
-        boundary,
-        root_identity,
-        cancelled,
-    };
-    let (source, unparsed): (Vec<_>, Vec<_>) = capture
-        .path_class(source)?
-        .into_iter()
-        .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
-    let text = capture.path_class(other)?;
-    rift_tracing::debug!(
-        component = "index",
-        operation = "fingerprint.bytes",
-        bytes = workspace_bytes,
-        source = source.len(),
-        text = text.len(),
-    );
-    let digests = WorkspaceDigests::classified(
-        source
+    let digests = (|| {
+        let mut capture = PathCapture {
+            workspace_bytes: &mut workspace_bytes,
+            root,
+            limits,
+            last,
+            next: &mut next,
+            boundary,
+            root_identity,
+            cancelled,
+        };
+        let (source, unparsed): (Vec<_>, Vec<_>) = capture
+            .path_class(source)?
             .into_iter()
-            .map(|captured| (captured.path, captured.state, captured.content)),
-        text.into_iter()
-            .chain(unparsed)
-            .map(|captured| (captured.path, captured.state)),
-    );
-    Ok((digests, next))
+            .partition(|captured| captured.length <= limits.syntax().source_bytes_max());
+        let text = capture.path_class(other)?;
+        rift_tracing::debug!(
+            component = "index",
+            operation = "fingerprint.bytes",
+            bytes = workspace_bytes,
+            source = source.len(),
+            text = text.len(),
+        );
+        let digests = WorkspaceDigests::classified(
+            source
+                .into_iter()
+                .map(|captured| (captured.path, captured.state, captured.content)),
+            text.into_iter()
+                .chain(unparsed)
+                .map(|captured| (captured.path, captured.state)),
+        );
+        Ok(digests)
+    })();
+    Ok(RecordedCapture {
+        digests,
+        last: next,
+    })
 }
 
 /// One file the capture kept: its digests, and the bytes it counts. A claimed file past
@@ -5486,80 +5673,19 @@ pub fn capture_visible_digests_with_languages_cancellable(
 ) -> Result<(WorkspaceDigests, WorkspaceDigests, LastCapture), RiftError> {
     let mut changed = None;
     for _ in 0..3 {
-        let result: Result<_, RiftError> = (|| {
-            check_cancelled(cancelled)?;
-            let root = canonical_root(root)?;
-            let (indexed, mut next) = capture_digests_attempt(
-                &root,
-                limits,
-                visibility,
-                text_inclusion,
-                languages,
-                last,
-                cancelled,
-            )?;
-            let policy = rift_tracing::traced!(
-                component = "index",
-                operation = "fingerprint.source_policy",
-                {
-                    WorkspaceSourcePolicy::build_with_languages_cancellable(
-                        &root,
-                        limits,
-                        visibility,
-                        text_inclusion,
-                        languages,
-                        cancelled,
-                    )
-                }
-            )?;
-            let paths = rift_tracing::traced!(
-                component = "index",
-                operation = "fingerprint.visible_paths",
-                { policy.visible_paths_cancellable(cancelled) }
-            )?;
-            let boundary = next.boundary();
-            let root_identity = next.root_identity();
-            let mut visible = Vec::with_capacity(paths.len());
-            rift_tracing::traced!(
-                component = "index",
-                operation = "fingerprint.visible_read",
-                paths = paths.len(),
-                {
-                    for batch in paths.chunks(SOURCE_BATCH_FILES) {
-                        check_cancelled(cancelled)?;
-                        let read: Vec<Result<(PathBuf, CapturedPath, bool), RiftError>> = batch
-                            .par_iter()
-                            .map(|path| {
-                                check_cancelled(cancelled)?;
-                                let absolute = root.join(path.as_str());
-                                let (capture, was_read) = match next.captured(&absolute) {
-                                    Some(capture) => (capture, false),
-                                    None => capture_path(
-                                        &absolute,
-                                        limits,
-                                        last,
-                                        boundary,
-                                        root_identity,
-                                    )?,
-                                };
-                                Ok((absolute, capture, was_read))
-                            })
-                            .collect();
-                        for (path, capture) in batch.iter().zip(read) {
-                            check_cancelled(cancelled)?;
-                            let (absolute, capture, was_read) = capture?;
-                            if next.captured(&absolute).is_none() {
-                                next.record(&absolute, capture, was_read);
-                            }
-                            if let Some((_, digest)) = capture.content() {
-                                visible.push((path.clone(), digest));
-                            }
-                        }
-                    }
-                }
-            );
-            Ok((indexed, WorkspaceDigests::new(visible), next))
-        })();
+        let result = recorded_capture_visible_attempt(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            last,
+            cancelled,
+        )
+        .and_then(|recorded| {
+            let ((indexed, visible), next) = recorded.completed()?;
+            Ok((indexed, visible, next))
+        });
         match result {
             Err(error) if error.slug() == errors::index::workspace_changed_during_capture::SLUG => {
                 changed = Some(error);
@@ -5570,6 +5696,137 @@ pub fn capture_visible_digests_with_languages_cancellable(
     changed
         .expect("three changed captures leave one change error")
         .fail()
+}
+
+/// Captures indexed and visible digests, retaining bounded observations across refusals.
+///
+/// Only a successful complete capture returns workspace digests. The retained record
+/// keeps existing filesystem, root, limit and racy-stat checks for every reused file.
+///
+/// # Errors
+/// Returns configuration, discovery, read, configured-bound, or cancellation refusals.
+///
+/// # Panics
+/// Panics if the retry loop finishes without recording its changed-capture refusal.
+pub fn capture_visible_digests_retaining_with_languages_cancellable(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+    last: &mut LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<(WorkspaceDigests, WorkspaceDigests), RiftError> {
+    check_cancelled(cancelled)?;
+    let mut changed = None;
+    for _ in 0..3 {
+        let recorded = recorded_capture_visible_attempt(
+            root,
+            limits,
+            visibility,
+            text_inclusion,
+            languages,
+            last,
+            cancelled,
+        )?;
+        *last = recorded.last;
+        match recorded.digests {
+            Err(error) if error.slug() == errors::index::workspace_changed_during_capture::SLUG => {
+                changed = Some(error);
+            }
+            result => return result,
+        }
+    }
+    changed
+        .expect("three changed captures leave one change error")
+        .fail()
+}
+
+fn recorded_capture_visible_attempt(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<RecordedCapture<(WorkspaceDigests, WorkspaceDigests)>, RiftError> {
+    check_cancelled(cancelled)?;
+    let root = canonical_root(root)?;
+    let recorded = recorded_capture_digests_attempt(
+        &root,
+        limits,
+        visibility,
+        text_inclusion,
+        languages,
+        last,
+        cancelled,
+    )?;
+    let mut next = recorded.last;
+    let digests = (|| {
+        let indexed = recorded.digests?;
+        let policy = rift_tracing::traced!(
+            component = "index",
+            operation = "fingerprint.source_policy",
+            {
+                WorkspaceSourcePolicy::build_with_languages_cancellable(
+                    &root,
+                    limits,
+                    visibility,
+                    text_inclusion,
+                    languages,
+                    cancelled,
+                )
+            }
+        )?;
+        let paths = rift_tracing::traced!(
+            component = "index",
+            operation = "fingerprint.visible_paths",
+            { policy.visible_paths_cancellable(cancelled) }
+        )?;
+        let boundary = next.boundary();
+        let root_identity = next.root_identity();
+        let mut visible = Vec::with_capacity(paths.len());
+        rift_tracing::traced!(
+            component = "index",
+            operation = "fingerprint.visible_read",
+            paths = paths.len(),
+            {
+                for batch in paths.chunks(SOURCE_BATCH_FILES) {
+                    check_cancelled(cancelled)?;
+                    let read: Vec<Result<(PathBuf, CapturedPath, bool), RiftError>> = batch
+                        .par_iter()
+                        .map(|path| {
+                            check_cancelled(cancelled)?;
+                            let absolute = root.join(path.as_str());
+                            let (capture, was_read) = match next.captured(&absolute) {
+                                Some(capture) => (capture, false),
+                                None => {
+                                    capture_path(&absolute, limits, last, boundary, root_identity)?
+                                }
+                            };
+                            Ok((absolute, capture, was_read))
+                        })
+                        .collect();
+                    for (path, capture) in batch.iter().zip(read) {
+                        check_cancelled(cancelled)?;
+                        let (absolute, capture, was_read) = capture?;
+                        if next.captured(&absolute).is_none() {
+                            next.record(&absolute, capture, was_read);
+                        }
+                        if let Some((_, digest)) = capture.content() {
+                            visible.push((path.clone(), digest));
+                        }
+                    }
+                }
+            }
+        );
+        Ok((indexed, WorkspaceDigests::new(visible)))
+    })();
+    Ok(RecordedCapture {
+        digests,
+        last: next,
+    })
 }
 
 /// Captures one publication's selected source and other paths without walking the workspace.
@@ -5637,6 +5894,27 @@ fn capture_digests_attempt(
     last: &LastCapture,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<(WorkspaceDigests, LastCapture), RiftError> {
+    recorded_capture_digests_attempt(
+        root,
+        limits,
+        visibility,
+        text_inclusion,
+        languages,
+        last,
+        cancelled,
+    )?
+    .completed()
+}
+
+fn recorded_capture_digests_attempt(
+    root: &Path,
+    limits: WorkspaceIndexLimits,
+    visibility: &SourceVisibility,
+    text_inclusion: &TextFileInclusion,
+    languages: &LanguageFileSelections,
+    last: &LastCapture,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> Result<RecordedCapture, RiftError> {
     let root = canonical_root(root)?;
     let boundary = CaptureBoundary::create(&root);
     let root_identity = root_identity(&root);
@@ -5651,13 +5929,14 @@ fn capture_digests_attempt(
         })?;
     let source = classified.source.len();
     let text = classified.text.len() + classified.lockfiles.len();
-    rift_tracing::traced!(
+    let next;
+    let digests = rift_tracing::traced!(
         component = "index",
         operation = "fingerprint.read",
         source = source,
         text = text,
         {
-            capture_paths_with_boundary(
+            let recorded = recorded_capture_paths_with_boundary(
                 &root,
                 &classified,
                 limits,
@@ -5665,9 +5944,15 @@ fn capture_digests_attempt(
                 boundary,
                 root_identity,
                 cancelled,
-            )
+            )?;
+            next = recorded.last;
+            recorded.digests
         }
-    )
+    );
+    Ok(RecordedCapture {
+        digests,
+        last: next,
+    })
 }
 
 /// One request-time capture's running state: the bytes kept so far, and the record the
@@ -5710,10 +5995,14 @@ impl PathCapture<'_> {
             })
             .collect();
         let mut captured = Vec::with_capacity(paths.len());
+        for (path, capture) in paths.iter().zip(&read) {
+            if let Ok((capture, was_read)) = capture {
+                self.next.record(path, *capture, *was_read);
+            }
+        }
         for (path, capture) in paths.iter().zip(read) {
             check_cancelled(cancelled)?;
-            let (capture, was_read) = capture?;
-            self.next.record(path, capture, was_read);
+            let (capture, _) = capture?;
             let Some(file) = capture.file() else {
                 continue;
             };
@@ -5821,7 +6110,8 @@ fn source_walk(root: &Path, directory_depth_max: usize, gitignore: GitignorePoli
         .max_depth(Some(directory_depth_max.saturating_add(1)))
         .sort_by_file_name(OsStr::cmp)
         .filter_entry(hard_floor_includes)
-        .git_ignore(gitignore == GitignorePolicy::Respect);
+        .git_ignore(gitignore == GitignorePolicy::Respect)
+        .git_exclude(gitignore == GitignorePolicy::Respect);
     builder.build()
 }
 
@@ -7385,6 +7675,55 @@ mod tests {
             2
         );
         (directory, preparation)
+    }
+
+    #[test]
+    fn preparation_discovery_detects_changed_source_text_and_lockfile_paths() {
+        let visibility = SourceVisibility::default();
+        for (name, contents) in [
+            ("arrived.rs", "pub fn arrived() {}\n"),
+            ("arrived.txt", "arrived text\n"),
+            ("Cargo.lock", "version = 3\n"),
+        ] {
+            let (directory, preparation) = two_text_preparation();
+            assert!(
+                preparation
+                    .discovered_paths_unchanged(&visibility, &|| false)
+                    .expect("unchanged discovery")
+            );
+            let added = directory.path().join(name);
+            fs::write(&added, contents).expect("add selected path");
+            assert!(
+                !preparation
+                    .discovered_paths_unchanged(&visibility, &|| false)
+                    .expect("changed discovery"),
+                "new selected path {name} invalidates completed discovery",
+            );
+            fs::remove_file(added).expect("remove added selected path");
+            assert!(
+                preparation
+                    .discovered_paths_unchanged(&visibility, &|| false)
+                    .expect("restored discovery")
+            );
+            let cancelled = preparation
+                .discovered_paths_unchanged(&visibility, &|| true)
+                .expect_err("cancelled discovery");
+            assert_eq!(cancelled.slug(), errors::index::workspace_cancelled::SLUG);
+        }
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let preparation = WorkspaceIndexPreparation::new(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &TextFileInclusion::default(),
+            &LanguageFileSelections::default(),
+        )
+        .expect("preparation configuration");
+        assert!(
+            !preparation
+                .discovered_paths_unchanged(&visibility, &|| false)
+                .expect("discovery has not run")
+        );
     }
 
     #[test]
@@ -9288,6 +9627,269 @@ mod tests {
     }
 
     #[test]
+    fn test_repository_exclude_applies_to_main_and_linked_worktree_sources() {
+        use rift_history::fixture::{commit_all, git, init};
+
+        // Issue #623: repository-local exclusions govern discovery and direct path checks.
+        let directory = tempfile::tempdir().expect("repository fixture");
+        let root = directory.path().join("main");
+        fs::create_dir(&root).expect("main worktree");
+        init(&root);
+        fs::write(root.join("kept.rs"), "pub fn kept() {}\n").expect("committed source");
+        commit_all(&root, "fixture source");
+        let linked = directory.path().join("linked");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                linked.to_str().expect("fixture path"),
+            ],
+        );
+        fs::write(root.join(".git/info/exclude"), "\u{feff}generated.rs\r\n")
+            .expect("local exclusions");
+
+        for workspace in [&root, &linked] {
+            fs::write(workspace.join("generated.rs"), "pub fn generated() {}\n")
+                .expect("generated source");
+            fs::write(workspace.join("kept.rs"), "pub fn kept() {}\n").expect("kept source");
+            let index = indexed(workspace, &TextFileInclusion::default());
+            let policy = WorkspaceSourcePolicy::build(
+                workspace,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("source policy");
+            let canonical = workspace.canonicalize().expect("canonical worktree");
+            assert!(has_symbol(&index, "kept"));
+            assert!(
+                !has_symbol(&index, "generated"),
+                "excluded source in {}",
+                workspace.display()
+            );
+            assert!(policy.visible(&canonical.join("kept.rs")));
+            assert!(!policy.visible(&canonical.join("generated.rs")));
+            assert!(!policy.may_include_descendant(&canonical.join("generated.rs")));
+            let forced =
+                SourceVisibility::default().with_force_include(vec!["generated.rs".to_owned()]);
+            assert!(has_symbol(&built(workspace, &forced), "generated"));
+            let disabled = SourceVisibility::new(Vec::new(), Vec::new(), false);
+            assert!(has_symbol(&built(workspace, &disabled), "generated"));
+            fs::write(workspace.join(".gitignore"), "!generated.rs\n")
+                .expect("higher-precedence ignore file");
+            let whitelisted = indexed(workspace, &TextFileInclusion::default());
+            assert!(has_symbol(&whitelisted, "generated"));
+            let updated = WorkspaceSourcePolicy::build(
+                workspace,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("updated source policy");
+            assert!(updated.visible(&canonical.join("generated.rs")));
+            assert!(!policy.same_inclusion_rules(&updated));
+        }
+    }
+
+    #[test]
+    fn test_source_policy_compares_ignore_inputs_and_preserves_cancellation() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory.path();
+        fs::write(root.join("kept.rs"), "pub fn kept() {}\n").expect("source");
+        let policy = || {
+            WorkspaceSourcePolicy::build(
+                root,
+                WorkspaceIndexLimits::default(),
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect("source policy")
+        };
+        let initial = policy();
+        assert!(initial.same_inclusion_rules(&policy()));
+        fs::write(root.join(".gitignore"), "generated.rs\n").expect("ignore file");
+        let changed = policy();
+        assert!(!initial.same_inclusion_rules(&changed));
+        assert!(changed.same_inclusion_rules(&policy()));
+        fs::write(root.join(".gitignore"), "different.rs\n").expect("same-length rewrite");
+        assert!(!changed.same_inclusion_rules(&policy()));
+        fs::remove_file(root.join(".gitignore")).expect("remove ignore file");
+        assert!(initial.same_inclusion_rules(&policy()));
+        let capture = initial
+            .visible_digests_cancellable(&|| false)
+            .expect("visible capture");
+        assert_eq!(
+            capture,
+            initial.visible_digests().expect("ordinary capture")
+        );
+        assert!(initial.visible_digests_cancellable(&|| true).is_err());
+    }
+
+    #[test]
+    fn test_captured_ignore_parser_preserves_dependency_bom_and_line_endings() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let path = root.join(".gitignore");
+        let generated = root.join("generated.rs");
+        for text in [
+            "\u{feff}generated.rs\n",
+            "\u{feff}\u{feff}generated.rs\r\n",
+            "generated.rs\r\n",
+            "generated.rs",
+        ] {
+            fs::write(&path, text).expect("ignore input");
+            let mut dependency = GitignoreBuilder::new(&root);
+            assert!(dependency.add(&path).is_none());
+            let dependency = dependency.build().expect("dependency matcher");
+            let (captured, digest) =
+                compiled_gitignore(&path, &root, WorkspaceIndexLimits::default())
+                    .expect("captured matcher");
+            assert_eq!(digest, FileDigest::of(text.as_bytes()));
+            assert!(
+                dependency
+                    .matched_path_or_any_parents(&generated, false)
+                    .is_ignore()
+            );
+            assert!(
+                captured
+                    .matched_path_or_any_parents(&generated, false)
+                    .is_ignore()
+            );
+        }
+    }
+
+    #[test]
+    fn test_source_policy_preserves_ignore_input_refusal_context() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical workspace");
+        rift_history::fixture::init(&root);
+        let exclude = rift_history::Repository::open(&root)
+            .expect("repository")
+            .exclude_path();
+        if exclude.is_file() {
+            fs::remove_file(&exclude).expect("remove repository exclusion file");
+        }
+        assert!(!exclude.exists());
+        let path = root.join(".gitignore");
+        let limits = WorkspaceIndexLimits::new(10, 8, 80, 4, 100).expect("bounds");
+        WorkspaceSourcePolicy::build(
+            &root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("absent repository exclusion file permits source policy");
+        for (bytes, expected) in [
+            (
+                b"123456789".as_slice(),
+                errors::index::workspace_file_too_large::SLUG,
+            ),
+            (
+                b"\xff".as_slice(),
+                errors::index::workspace_filesystem::SLUG,
+            ),
+            (
+                b"[z-a]\n".as_slice(),
+                errors::index::workspace_filesystem::SLUG,
+            ),
+        ] {
+            fs::write(&path, bytes).expect("invalid ignore input");
+            let error = WorkspaceSourcePolicy::build(
+                &root,
+                limits,
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+            )
+            .expect_err("invalid ignore input refuses source policy");
+            assert_eq!(error.slug(), expected);
+            assert_eq!(
+                error
+                    .context()
+                    .find(|(key, _)| *key == "path")
+                    .map(|(_, value)| value),
+                Some(path.display().to_string()),
+            );
+        }
+    }
+
+    #[test]
+    fn test_repository_excluded_parent_cannot_be_restored_by_a_nested_ignore_file() {
+        use rift_history::fixture::init;
+
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        init(&root);
+        fs::create_dir(root.join("generated")).expect("excluded directory");
+        fs::write(root.join(".git/info/exclude"), "generated/\n").expect("parent exclusion");
+        fs::write(root.join("generated/.gitignore"), "!kept.rs\n").expect("nested whitelist");
+        fs::write(root.join("generated/kept.rs"), "pub fn kept() {}\n").expect("source");
+        let visibility = SourceVisibility::default();
+        let policy = WorkspaceSourcePolicy::build(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &visibility,
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+        assert!(!has_symbol(&built(&root, &visibility), "kept"));
+        assert!(!policy.visible(&root.join("generated/kept.rs")));
+        assert!(!policy.may_include_descendant(&root.join("generated")));
+        let forced = visibility.with_force_include(vec!["generated/**".to_owned()]);
+        let forced_policy = WorkspaceSourcePolicy::build(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &forced,
+            &TextFileInclusion::default(),
+        )
+        .expect("forced source policy");
+        assert!(has_symbol(&built(&root, &forced), "kept"));
+        assert!(forced_policy.visible(&root.join("generated/kept.rs")));
+        assert!(has_symbol(
+            &built(&root, &SourceVisibility::new(Vec::new(), Vec::new(), false)),
+            "kept"
+        ));
+        fs::write(
+            root.join(".git/info/exclude"),
+            "generated/\n!generated/kept.rs\n",
+        )
+        .expect("same-file whitelist");
+        let unchanged = WorkspaceSourcePolicy::build(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("same-file source policy");
+        assert!(!has_symbol(
+            &built(&root, &SourceVisibility::default()),
+            "kept"
+        ));
+        assert!(!unchanged.visible(&root.join("generated/kept.rs")));
+        fs::write(root.join(".gitignore"), "!generated/\n").expect("restore parent directory");
+        let restored = WorkspaceSourcePolicy::build(
+            &root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("restored source policy");
+        assert!(has_symbol(
+            &built(&root, &SourceVisibility::default()),
+            "kept"
+        ));
+        assert!(restored.visible(&root.join("generated/kept.rs")));
+    }
+
+    #[test]
     fn test_respect_gitignore_toggle_includes_or_hides_matching_files() {
         let directory = tempfile::tempdir().expect("temporary workspace");
         fs::create_dir_all(directory.path().join("vendor")).expect("fixture directories");
@@ -9954,6 +10556,97 @@ mod tests {
             errors::index::workspace_workspace_too_large::SLUG,
             "a reused length still counts against workspace_bytes_max"
         );
+    }
+
+    #[test]
+    fn test_refused_capture_retains_observations_and_recovers_after_input_changes() {
+        // Issue #623: a deterministic byte refusal must not hash unchanged inputs again.
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("trace")
+            .install()
+            .expect("capture records");
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let paths = [root.join("first.rs"), root.join("second.rs")];
+        for path in &paths {
+            fs::write(path, b"//abc\n").expect("source");
+        }
+        #[cfg(unix)]
+        if crate::capture::supports_stat_reuse(&root) {
+            advance_capture_clock(&root, &paths);
+        }
+        let limits = WorkspaceIndexLimits::new(10, 8, 10, 4, 100).expect("bounds");
+        let capture = |limits, last: &mut LastCapture, cancelled: &(dyn Fn() -> bool + Sync)| {
+            capture_visible_digests_retaining_with_languages_cancellable(
+                &root,
+                limits,
+                &SourceVisibility::default(),
+                &TextFileInclusion::default(),
+                &LanguageFileSelections::default(),
+                last,
+                cancelled,
+            )
+        };
+        let mut last = LastCapture::default();
+        let first = capture(limits, &mut last, &|| false).expect_err("aggregate refusal");
+        let records = drain.queued_records();
+        let refused = records
+            .iter()
+            .find(|record| record.message() == "fingerprint.read")
+            .expect("the refused read records its outcome");
+        let fields: serde_json::Value =
+            serde_json::from_str(refused.fields()).expect("record fields");
+        assert_eq!(fields["status.code"], "Error");
+        assert_eq!(fields["error.type"], first.slug().as_str());
+        assert_eq!(
+            first.slug(),
+            errors::index::workspace_workspace_too_large::SLUG
+        );
+        assert_eq!(last.read_paths(), 2);
+        let repeated = capture(limits, &mut last, &|| false).expect_err("same aggregate refusal");
+        assert_eq!(repeated.slug(), first.slug());
+        assert_eq!(repeated.to_string(), first.to_string());
+        assert_eq!(
+            last.read_paths(),
+            if cfg!(unix) && crate::capture::supports_stat_reuse(&root) {
+                0
+            } else {
+                2
+            }
+        );
+
+        let raised = WorkspaceIndexLimits::new(10, 8, 12, 4, 100).expect("raised bound");
+        assert!(capture(raised, &mut last, &|| false).is_ok());
+        assert_eq!(
+            last.read_paths(),
+            2,
+            "changed limits do not reuse an old capture"
+        );
+        let cancelled = capture(limits, &mut last, &|| true).expect_err("cancelled capture");
+        assert_eq!(cancelled.slug(), errors::index::workspace_cancelled::SLUG);
+        fs::write(&paths[0], b"//\n").expect("shrink earlier source");
+        let repaired = capture(limits, &mut last, &|| false).expect("input now fits");
+        let mut cold = LastCapture::default();
+        assert_eq!(
+            repaired,
+            capture(limits, &mut cold, &|| false).expect("cold capture")
+        );
+        fs::remove_file(&paths[1]).expect("remove excess source");
+        assert_eq!(
+            capture(limits, &mut last, &|| false)
+                .expect("removed input fits")
+                .0
+                .len(),
+            1
+        );
+        fs::write(root.join("raw.bin"), b"raw\0").expect("unindexed visible file");
+        let (indexed, visible) =
+            capture(limits, &mut last, &|| false).expect("complete visible capture");
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(visible.len(), 2);
     }
 
     #[test]
@@ -12900,6 +13593,10 @@ mod tests {
     /// takes the bound as a parameter and this case passes one it can cross.
     #[test]
     fn test_a_workspace_past_the_declaration_bound_publishes_what_fits() {
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder()
+            .capture("trace")
+            .install()
+            .expect("normalization records");
         let root = tempfile::tempdir().expect("temporary directory");
         let provider = registry::provider_for_extension("rs").expect("the rust provider");
         let mut contents = IndexContents::default();
@@ -12952,6 +13649,17 @@ mod tests {
         assert_eq!(
             built.warnings[0].reason(),
             "stands past the declarations the index holds (source.declarations)"
+        );
+        assert_eq!(
+            drain
+                .queued_records()
+                .iter()
+                .filter(|record| {
+                    record.operation() == "WorkspaceSemantics::build_project_facts"
+                })
+                .count(),
+            1,
+            "declaration admission must precede graph construction"
         );
     }
 
@@ -14449,5 +15157,36 @@ mod framework_cache_tests {
             &raw,
             ordinary.file(&path).expect("file").syntax_facts()
         ));
+    }
+}
+
+#[cfg(test)]
+mod source_policy_depth_tests {
+    use super::*;
+
+    #[test]
+    fn visible_paths_respect_directory_depth_bound() {
+        let directory = tempfile::tempdir().expect("workspace");
+        let root = fs::canonicalize(directory.path()).expect("canonical workspace");
+        let at_bound = root.join("first/second");
+        let beyond = at_bound.join("third");
+        fs::create_dir_all(&beyond).expect("source directories");
+        let at_bound_file = at_bound.join("kept.rs");
+        let beyond_file = beyond.join("refused.rs");
+        fs::write(&at_bound_file, "pub fn kept() {}\n").expect("source at depth bound");
+        fs::write(&beyond_file, "pub fn refused() {}\n").expect("source beyond depth bound");
+        let limits = WorkspaceIndexLimits::new(10, 1_024, 4_096, 2, 100).expect("bounds");
+        let policy = WorkspaceSourcePolicy::build(
+            &root,
+            limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )
+        .expect("source policy");
+
+        assert!(policy.visible(&at_bound_file));
+        assert!(policy.may_include_descendant(&at_bound));
+        assert!(!policy.visible(&beyond_file));
+        assert!(!policy.may_include_descendant(&beyond));
     }
 }

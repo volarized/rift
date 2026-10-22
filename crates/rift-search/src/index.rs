@@ -1049,11 +1049,23 @@ impl SearchIndex {
         tree_revision: &str,
     ) -> Result<(), RiftError> {
         let total = as_count(described.len());
-        let documents = documents(described, as_usize(total.min(self.limits.max_vectors)));
+        let documents = rift_tracing::traced!(
+            component = "search",
+            operation = "search.populate.documents",
+            total = total,
+            { documents(described, as_usize(total.min(self.limits.max_vectors))) }
+        );
         let vectors = self.vector_store().await?;
-        let stored = vectors.digests(&model.space.identity()).await?;
-        self.embed_batches(&vectors, model, &selected(&documents, &stored, embedding))
-            .await?;
+        let wanted = rift_tracing::traced!(
+            component = "search",
+            operation = "search.populate.select",
+            async {
+                let stored = vectors.digests(&model.space.identity()).await?;
+                Ok::<_, RiftError>(selected(&documents, &stored, embedding))
+            }
+        )
+        .await?;
+        self.embed_batches(&vectors, model, &wanted).await?;
         let live: BTreeSet<String> = documents.iter().map(|one| one.digest.clone()).collect();
         let _pruned = vectors.prune_absent(&model.space.identity(), &live).await?;
         let corpus = self.read_corpus(&vectors, model).await?;
@@ -1115,11 +1127,26 @@ impl SearchIndex {
         // nothing to apply to, and a bound that cannot trip is not a bound.
         for chunk in wanted.chunks(batch.saturating_mul(in_flight).max(1)) {
             let texts: Vec<String> = chunk.iter().map(|one| one.text.clone()).collect();
-            let embedded = model.models.embed_documents(texts, schedule).await?;
+            let count = chunk.len();
+            let embedded = rift_tracing::traced!(
+                component = "search",
+                operation = "search.populate.inference",
+                documents = count,
+                async { model.models.embed_documents(texts, schedule).await }
+            )
+            .await?;
             let vectors = paired(chunk, embedded);
-            store
-                .store(&model.space.identity(), model.space.dimensions(), &vectors)
-                .await?;
+            rift_tracing::traced!(
+                component = "search",
+                operation = "search.populate.store",
+                documents = count,
+                async {
+                    store
+                        .store(&model.space.identity(), model.space.dimensions(), &vectors)
+                        .await
+                }
+            )
+            .await?;
         }
         Ok(())
     }

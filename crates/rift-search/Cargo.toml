@@ -31,4 +31,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+rift-tracing = { workspace = true, features = ["fixtures"] }
 tempfile.workspace = true

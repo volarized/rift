@@ -153,6 +153,19 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
         "identifier matching still answers: {answer:#}"
     );
 
+    // Issue #623: removing excess input restores the lexical ranking without a restart.
+    for index in 0..200 {
+        fs::remove_file(directory.path().join(format!("note-{index:04}.txt")))?;
+    }
+    let recovered = search_until(
+        &client,
+        "beacon",
+        "the lexical ranking never recovered after removing excess input",
+        |answer| warning_detail(answer, "lexical_ranking_unavailable").is_none(),
+    )
+    .await?;
+    assert!(hit_paths(&recovered).contains(&"lib.rs"), "{recovered:#}");
+
     client.cancel().await?;
     server_task.await?;
     Ok(())
