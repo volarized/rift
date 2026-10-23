@@ -46,30 +46,7 @@ impl RiftMcp {
                 .map_err(read_failure);
         }
         if !params.unit.is_project() {
-            let deadline = self.request_deadline().await;
-            let resolved = self
-                .published_workspace(super::wire::ErrorPhase::Read, deadline)
-                .await?;
-            resolved
-                .published
-                .configuration
-                .accepted_for_tool(super::wire::ErrorPhase::Read)?;
-            let configuration = resolved.published.configuration.global_configuration();
-            let result = tokio::time::timeout_at(
-                deadline.at(),
-                self.global.exact_source(&configuration, &params),
-            )
-            .await
-            .map_err(|_| {
-                read_failure(
-                    errors::server::read_unavailable()
-                        .operation("get_source")
-                        .detail("a request spent its whole readiness budget")
-                        .error(),
-                )
-            })?
-            .map_err(read_failure)?;
-            return source_context(context, result, configuration.endpoint);
+            return self.global_source(&params, context).await;
         }
         let rev = params.rev.clone();
         let server = self.clone();
@@ -122,6 +99,47 @@ impl RiftMcp {
     }
 }
 
+impl RiftMcp {
+    async fn global_source(
+        &self,
+        params: &GetSourceParams,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
+    ) -> Result<Json<GetSourceResult>, super::ToolFailure> {
+        let deadline = self.request_deadline().await;
+        let resolved = self
+            .published_workspace(super::wire::ErrorPhase::Read, deadline)
+            .await?;
+        resolved
+            .published
+            .configuration
+            .accepted_for_tool(super::wire::ErrorPhase::Read)?;
+        let configuration = resolved.published.configuration.global_configuration();
+        super::global_context(
+            context,
+            &configuration.endpoint,
+            params.view.as_ref(),
+            "get_source",
+        )?;
+        let result = tokio::time::timeout_at(
+            deadline.at(),
+            self.global.exact_source(&configuration, params),
+        )
+        .await
+        .map_err(|_| {
+            read_failure(
+                errors::server::read_unavailable()
+                    .operation("get_source")
+                    .detail("a request spent its whole readiness budget")
+                    .error(),
+            )
+        })?
+        .map_err(read_failure)?;
+        source_context(context, result, configuration.endpoint)
+    }
+}
+
 impl super::ReadAnswer for GetSourceResult {
     fn warnings_mut(&mut self) -> &mut Vec<rift_protocol::read::ReadWarning> {
         match self {
@@ -147,6 +165,8 @@ fn source_context(
             root,
             owner: None,
             view: view.clone(),
+            project: None,
+            upstream_view: None,
         };
         crate::proxy::encode_bounded(&selected, super::BYTES_MAX)
             .map_err(super::transport_failure)?;
@@ -403,6 +423,64 @@ mod tests {
         } if unit == request.unit && Some(&view.id) == request.view.as_ref()));
         assert_eq!(count[0].load(Ordering::SeqCst), 1);
         assert_eq!(count[1].load(Ordering::SeqCst), 1);
+        http_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_global_context_refuses_endpoint_change_and_expiry_before_io() -> TestResult {
+        let (_directory, server, count, http_task) = source_server().await?;
+        let endpoint = server
+            .published
+            .read()
+            .await
+            .current
+            .configuration
+            .global_configuration()
+            .endpoint;
+        let view: CapturedView = serde_json::from_value(json!({
+            "id":"claims.remote", "expires_at":"2030-01-01T00:10:00Z"
+        }))?;
+        let source: GetSourceParams = serde_json::from_value(json!({
+            "unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs", "view":view.id
+        }))?;
+        let symbol: rift_protocol::symbol_read::GetSymbolParams = serde_json::from_value(json!({
+            "id":"rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon", "view":view.id
+        }))?;
+        for expired in [false, true] {
+            let mut selected = crate::global::candidates::SavedCandidateBackend {
+                owner: None,
+                backend: "global".to_owned(),
+                root: if expired {
+                    endpoint.clone()
+                } else {
+                    "http://127.0.0.1:1/changed".to_owned()
+                },
+                view: view.clone(),
+                project: None,
+                upstream_view: None,
+            };
+            if expired {
+                selected.view.expires_at = "2000-01-01T00:10:00Z".to_owned();
+            }
+            let context = std::sync::Mutex::new(Some(selected));
+            assert!(
+                server
+                    .exact_source_with_context(source.clone(), Some(&context))
+                    .await
+                    .is_err()
+            );
+            assert!(
+                server
+                    .exact_symbol_with_context(symbol.clone(), Some(&context))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                count[0].load(Ordering::SeqCst) + count[1].load(Ordering::SeqCst),
+                0
+            );
+        }
         http_task.abort();
         Ok(())
     }

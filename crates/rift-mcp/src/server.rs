@@ -2368,7 +2368,17 @@ impl RiftMcp {
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
+        extensions: rmcp::model::Extensions,
     ) -> Result<Json<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
+        if params.traversal.is_some() {
+            let context = extensions.get::<std::sync::Arc<
+                std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+            >>();
+            return self
+                .captured_traversal(&params, context.map(std::sync::Arc::as_ref))
+                .await
+                .map(Json);
+        }
         if let Some(captured) = self.captured_query(&params).await? {
             return Ok(Json(captured));
         }
@@ -4192,11 +4202,22 @@ impl ServerHandler for RiftMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         let parameter_failure = ParameterFailure::default();
         let _ = context.extensions.insert(parameter_failure.clone());
-        let captured = matches!(request.name.as_ref(), "get_symbol" | "get_source").then(|| {
-            std::sync::Arc::new(std::sync::Mutex::new(
-                None::<crate::global::candidates::SavedCandidateBackend>,
-            ))
-        });
+        let expected = match crate::global::candidates::SavedCandidateBackend::from_request(
+            request.meta.as_ref(),
+        ) {
+            Ok(expected) => expected,
+            Err(error) => {
+                return error
+                    .mcp()
+                    .tool_failure(wire::ErrorPhase::Read)
+                    .into_call_tool_result();
+            }
+        };
+        let captured = matches!(
+            request.name.as_ref(),
+            "get_symbol" | "get_source" | "search"
+        )
+        .then(|| std::sync::Arc::new(std::sync::Mutex::new(expected)));
         if let Some(captured) = &captured {
             let _ = context.extensions.insert(std::sync::Arc::clone(captured));
         }
@@ -4258,21 +4279,7 @@ impl ServerHandler for RiftMcp {
                             Ok(response) => Ok(response),
                         }
                     };
-                    if let Ok(CallToolResponse::Complete(response)) = &mut result
-                        && let Some(captured) = &captured
-                        && let Some(selected) = captured
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .take()
-                    {
-                        let meta = response
-                            .meta
-                            .get_or_insert_with(rmcp::model::MetaObject::new);
-                        meta.insert("backend".to_owned(), serde_json::json!(selected.backend));
-                        meta.insert("root".to_owned(), serde_json::json!(selected.root));
-                        meta.insert("owner".to_owned(), serde_json::json!(selected.owner));
-                        meta.insert("view".to_owned(), serde_json::json!(selected.view));
-                    }
+                    candidates::write_captured_context(&mut result, captured.as_deref());
                     rift_tracing::debug!(
                         is_error = Ending::of_tool_call(&result) != Ending::Answered,
                         "tool request completed"
@@ -6048,7 +6055,9 @@ done
             &self,
             params: Parameters<SearchParams>,
         ) -> Result<super::Json<SearchResult>, super::ToolFailure> {
-            let super::Json(answer) = self.search(params).await?;
+            let super::Json(answer) = self
+                .search(params, rmcp::model::Extensions::default())
+                .await?;
             match answer {
                 rift_protocol::search_read::SearchReadResult::Results(answer) => {
                     Ok(super::Json(*answer))

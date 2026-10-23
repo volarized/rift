@@ -1,6 +1,6 @@
 ---
 name: rift
-description: Use when finding or reading code in a workspace Rift serves: structured search across declarations and source text, symbol reads by exact identity, and syntax inspection.
+description: "Use when finding or reading code in a workspace Rift serves: structured search across declarations and source text, symbol reads by exact identity, and syntax inspection."
 ---
 
 # Rift
@@ -9,7 +9,7 @@ Rift indexes this workspace's source and serves it over MCP: structured search, 
 
 Rift writes no source: apply a change with your own edit tools.
 
-Start an unfamiliar repository at `rift://map`; it names the served languages and the workspace's own layout before any tool call.
+Read `rift://map` first for served languages, workspace layout, and language server recommendations. When configuring language servers, run listed `rift config set` commands from the workspace root. After creating a named profile, reconnect MCP to use its `local@name` scope.
 
 ## Which tool
 

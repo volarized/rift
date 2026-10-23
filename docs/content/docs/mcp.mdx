@@ -56,6 +56,11 @@ For any task, directories help the agent choose where to search.
 Documentation paths point to project guidance, while dependency entries identify the packages
 and versions used by the project.
 
+The map's `recommendations` section lists installed language servers that the configuration has
+not selected. Each entry carries `language`, `root`, and a `command` to apply with `rift config set`
+from the map project's root.
+After the configuration is accepted, the next map publication leaves that entry out.
+
 For the example project, a map can look like this:
 
 <WorkspaceMapExample />
@@ -200,6 +205,9 @@ An `all` search retains identities from the primary project, a named local proje
 served package in one answer:
 
 <ReadExample name="all-search" />
+
+Use `query` to combine registered projects under `all`. The returned page includes each hit's
+own `view`; pass that view with the hit's `id` when reading its symbol.
 
 For example, a project using Tokio can search its dependency declarations for `spawn_blocking`:
 
@@ -449,8 +457,10 @@ continue those bindings in the same view:
 Local Git `rev` is refused beside `view` and for package or runtime owners. Released source
 units remain physical addresses separate from logical symbol identities.
 
-A valid absent identity returns `outcome: "missing"` with `symbol_not_found` and bounded
-structural alternatives; alternatives do not replace the requested symbol:
+A valid absent identity returns MCP `isError: true` and `outcome: "missing"` with
+`symbol_not_found` and bounded structural alternatives. Its compact text starts with
+`error: symbol_not_found` and lists alternatives under `closest matches:`. The
+`--output all` policy retains the typed answer in `structuredContent`:
 
 <ReadExample name="missing-symbol" />
 

@@ -21,6 +21,39 @@ pub(crate) struct SavedCandidateBackend {
     pub(crate) backend: String,
     pub(crate) root: String,
     pub(crate) view: CapturedView,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upstream_view: Option<CapturedView>,
+}
+
+impl SavedCandidateBackend {
+    pub(crate) fn from_request(
+        meta: Option<&rmcp::model::RequestMetaObject>,
+    ) -> Result<Option<Self>, RiftError> {
+        let Some(meta) = meta else {
+            return Ok(None);
+        };
+        let fields = ["backend", "root", "owner", "view"];
+        if !fields.iter().any(|field| meta.0.contains_key(*field)) {
+            return Ok(None);
+        }
+        let mut context = serde_json::Map::new();
+        for field in fields {
+            let value = meta.0.get(field).ok_or_else(|| {
+                errors::server::read_invalid()
+                    .field("view")
+                    .violation("captured backend context does not match")
+                    .error()
+            })?;
+            context.insert(field.to_owned(), value.clone());
+        }
+        crate::proxy::encode_bounded(&context, CANDIDATE_BYTES_MAX)
+            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        serde_json::from_value(context.into())
+            .map(Some)
+            .map_err(|source| errors::mcp::forward_failed().source(source).error())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -208,6 +241,42 @@ mod tests {
         SearchableField,
     };
     use rift_server::{SearchCandidateInput, SearchCandidateInputs, SearchCandidateItem};
+
+    #[test]
+    fn saved_backend_accepts_legacy_metadata_and_refuses_partial_context() {
+        let value = serde_json::json!({"backend":"global", "root":"https://rift.test", "owner":null,
+            "view":{"id":"claims.remote", "expires_at":"2030-01-01T00:10:00Z"}});
+        let meta = serde_json::from_value(value.clone()).expect("request metadata");
+        let selected = super::SavedCandidateBackend::from_request(Some(&meta))
+            .expect("context")
+            .expect("selected");
+        assert!(selected.project.is_none() && selected.upstream_view.is_none());
+        assert_eq!(
+            serde_json::to_value(selected).expect("legacy serialization"),
+            value
+        );
+        assert!(
+            super::SavedCandidateBackend::from_request(None)
+                .expect("no metadata")
+                .is_none()
+        );
+        let trace = serde_json::from_value(serde_json::json!({"traceparent":"captured"}))
+            .expect("trace metadata");
+        assert!(
+            super::SavedCandidateBackend::from_request(Some(&trace))
+                .expect("trace only")
+                .is_none()
+        );
+        for field in ["backend", "root", "owner", "view"] {
+            let mut partial = value.clone();
+            partial.as_object_mut().expect("object").remove(field);
+            let meta = serde_json::from_value(partial).expect("partial metadata");
+            assert!(
+                super::SavedCandidateBackend::from_request(Some(&meta)).is_err(),
+                "{field}"
+            );
+        }
+    }
 
     fn pool(backend: &str, start: u64, id: Option<&str>) -> SearchCandidatePool {
         let mut symbol = serde_json::json!({"language":"rust","name":"beacon","kind":"function"});

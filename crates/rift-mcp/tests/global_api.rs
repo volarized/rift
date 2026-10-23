@@ -87,6 +87,9 @@ pub(crate) const PYTHON_STANDARD_LIBRARY: (&str, &str, &str) =
 /// on its first line.
 pub(crate) const GREETING: (&str, &str, &str) = ("pypi", "greeting", "1.0.0");
 
+pub(crate) const GREETING_SOURCE: &str =
+    "def greet(name: str) -> str:\n    return name\n\n\ndef quiet() -> None:\n    return None\n";
+
 /// One declaration a Python collection names at a package position.
 pub(crate) struct NamedPosition {
     /// The package, as `manager`, `name`, and `version`.
@@ -642,6 +645,9 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         .copied()
         .find(|name| collected_identity(fixture, name) == id);
     let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
+    if id == named_identity(&NAMED_POSITIONS[1]) {
+        return greeting_symbol(request, &view);
+    }
     let Some(declaration) = declaration else {
         return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view});
     };
@@ -651,6 +657,34 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         binding["source"] = source.clone();
     }
     json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
+}
+
+fn greeting_symbol(request: &Value, view: &Value) -> Value {
+    let source = GREETING_SOURCE
+        .split("\n\n")
+        .next()
+        .expect("greet declaration");
+    let origin = json!({
+        "location":"dependency", "package":package_value(GREETING),
+        "source_kind":"authored"
+    });
+    let mut declaration = json!({
+        "origin":origin, "unit":named_unit(&NAMED_POSITIONS[1]),
+        "range":{"start":0,"end":source.len()}, "line":1,
+        "source_complete":includes_source(request),
+        "signature_indices":[], "type_indices":[], "documentation_indices":[]
+    });
+    if includes_source(request) {
+        declaration["source"] = json!(source);
+    }
+    json!({
+        "outcome":"found", "view":view,
+        "symbol":{
+            "id":named_identity(&NAMED_POSITIONS[1]), "language":"python",
+            "name":"greet", "kind":"function", "origin":origin
+        },
+        "declarations":[declaration]
+    })
 }
 
 /// Reads the original collected source under its exact unit, range, and captured view.
@@ -670,14 +704,22 @@ fn source(fixture: SymbolFixture, body: &Value, view: &Value) -> Option<Value> {
         }));
     }
     let runtime_unit = named_unit(&NAMED_POSITIONS[0]);
-    if request.unit.as_str() != COLLECTED_UNIT && request.unit.as_str() != runtime_unit {
+    let greeting_unit = named_unit(&NAMED_POSITIONS[1]);
+    if request.unit.as_str() != COLLECTED_UNIT
+        && request.unit.as_str() != runtime_unit
+        && request.unit.as_str() != greeting_unit
+    {
         return Some(json!({"outcome": "missing", "unit": request.unit, "view": view}));
     }
     let runtime_source = (request.unit.as_str() == runtime_unit).then(python_runtime::builtins);
-    let text = runtime_source.as_deref().unwrap_or(match fixture {
-        SymbolFixture::CasePairs => CASE_SOURCE,
-        SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
-    });
+    let text = if request.unit.as_str() == greeting_unit {
+        GREETING_SOURCE
+    } else {
+        runtime_source.as_deref().unwrap_or(match fixture {
+            SymbolFixture::CasePairs => CASE_SOURCE,
+            SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
+        })
+    };
     let range = request.range.unwrap_or(rift_protocol::read::TextRange {
         start: 0,
         end: u64::try_from(text.len()).ok()?,

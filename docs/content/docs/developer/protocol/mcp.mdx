@@ -437,6 +437,13 @@ A package folder inside the workspace, such as `node_modules` or `.venv`, maps a
 The server then asks the global API which declaration holds each such callee's position, in one
 request per walk, and the walk does not continue from a package callee.
 
+Each dependency hit carries its own immutable `view` for subsequent `get_symbol` and
+`get_source` reads. The caller **MUST** use that hit's view rather than the top-level search
+view, which retains the project graph and paging selection. Each hit's view expires no later
+than either the project or cloud selection. The proxy retains the originating project and
+global endpoint for those reads and refuses a changed context instead of selecting another
+publication.
+
 The server captures source and configuration before and after the engine request. If either
 changes, the server captures the current publication, refreshes the search ranking, and repeats
 the reference request, with at most three attempts. The publication wait, the search ranking,
@@ -659,6 +666,9 @@ logical owner in the canonical identity, preserving physical declaration locatio
 
 <ReadExample name="all-search" />
 
+The caller **MUST** use `query` to combine registered project results under `all`.
+The server returns one combined page; each hit retains its captured view for exact reads.
+
 Local search runs the indexed declarations and lines, `paths.force_include`, ranked tier,
 and traversal. Global search runs the global query and pattern lanes. Under `order: "path"`,
 project paths precede released source units.
@@ -718,6 +728,10 @@ object:
 `missing` means the exact selection was searched completely; `symbol_not_found`
 names the requested identity and up to three actual structural alternatives. An incomplete
 selection answers `unavailable` with a typed reason.
+
+For `missing`, the server **MUST** set MCP `isError` to `true` and retain the same typed
+answer in `structuredContent` under `--output all`. The `--output text` policy removes
+`structuredContent` while retaining the error flag and compact text.
 
 The [search configuration](/docs/developer/configuration#search) bounds optional alternative
 work through `symbol_alternatives_work` and `symbol_alternatives_lowercase_work`. Reached
@@ -1014,11 +1028,25 @@ The server **MUST** write the items section first: `N results`, or `1 result`, f
 
 For `search`, the server **MUST** append ` · page P/T` to the title of the items section when `total_pages` is greater than 1 or the requested `page_index` lies past the last page, where P is `page_index` plus 1 and T is `total_pages`. The title is the only place the text carries pagination, so a caller requests the next page with a `page_index` equal to P.
 
-When the result carries warnings, the server **MUST** write the warnings section after the items section: the title `N warnings`, or `1 warning`, then one line per warning. A result without warnings has no warnings section. The line of a warning has these parts:
+When compact text carries warnings, the server **MUST** write the warnings section after the
+items section: the title `N warnings`, or `1 warning`, counting the displayed groups and
+other distinct warning lines. A result without displayed warnings has no warnings section.
+The line of a warning has these parts:
 
 - the `code` of the warning
 - each payload field except `detail`, as ` · name value`, in the order the warning declares them; a list joins its items with `, `, a package identity is `name@version (manager)`, and a package context entry is `name@version` or `name requirement` followed by `(manager)`, with the availability added after the manager unless it is `canonical`; a value holding ` · ` or `: ` is quoted
 - `: ` and the `detail`, when the warning carries one, quoted when it holds ` · ` or `: `
+
+The server **MUST** group `framework_context_unresolved` warnings with equal `framework`
+and `detail`. Each group omits `unit` from its heading and lists sorted, distinct file
+identities below `files:`; other equal warning lines appear once. The structured `warnings`
+array retains its original entries.
+
+For canonical `get_symbol`, a proxy suppresses repeated framework warning text when the
+distinct details and files remain unchanged for the same originating project, symbol owner,
+and framework on that MCP connection. Changed facts or an intervening answer without that
+framework make its text visible again. The proxy retains at most 256 observations, evicts
+the oldest when full, and starts empty on a new MCP connection.
 
 When the result holds more than one item, the server **MUST** start each item with `[n] ` at one level, counting from 1 in result order, and write every further line of the item at two levels. A result with one item carries no marker and writes every line at one level.
 
@@ -1102,7 +1130,8 @@ A found `get_symbol` result writes the declaration, exact identity, exceptional 
 then documentation and requested documentation context or history. A `declarations:` section
 retains each physical location, byte range, available node identity, and requested source.
 A returned `declaration_cursor` names remaining bindings. There is no hit count or hit paging.
-A missing result writes `symbol_not_found`, the requested identity and bounded alternatives;
+A missing result writes `error: symbol_not_found`, the requested identity and bounded
+alternatives below `closest matches:` when alternatives exist;
 an unavailable result writes its typed reason and requested identity. A captured selection ends
 with `view ID · expires TIMESTAMP`, followed by warnings when present.
 
@@ -1278,6 +1307,13 @@ A read of `rift://map` answers `contents` with one JSON entry whose `mimeType` i
 requested `uri`: compact text with `mimeType` `text/plain`, then the JSON body with `mimeType`
 `application/json`. The server makes both workspace contents from the same data.
 
+The map's `recommendations` entries carry `language`, `root`, and `command` for installed
+language servers without a selected configuration. The server **MUST** omit `recommendations`
+when none remain and remove a matching entry from the next publication after accepting its
+configuration. `root` is relative to the map's project, with `.` selecting the project itself.
+A `command` is a `rift config set` invocation quoted for the server's operating system;
+the caller runs it from the map project's root.
+
 The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves compact text as the only content of a workspace read. The map remains JSON under both selections.
 
 The compact text of the workspace resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.
@@ -1389,13 +1425,14 @@ upstream.
 
 ### Tool execution failures [#tool-execution-failures]
 
-The server **MUST** answer a tool execution failure with a completed tool result that has
+The server **MUST** answer a registered tool execution failure with a completed tool result that has
 `isError` set to `true` and one `content` text block of compact text. The result **MUST NOT**
 carry `structuredContent` under either output selection. The MCP specification
 [reports tool execution errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#error-handling)
 in the result, where the model can read the failure and adjust its request.
 
-The advertised `outputSchema` of each tool describes the success result only. A proxy started
+The advertised `outputSchema` describes typed tool answers, including the `get_symbol`
+`missing` outcome; registered operating failures carry no such answer. A proxy started
 with `--output text` forwards the failure unchanged: it keeps `isError` and `content`, and the
 result had no `structuredContent` to remove.
 

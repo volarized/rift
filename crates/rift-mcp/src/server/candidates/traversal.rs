@@ -16,12 +16,16 @@ pub(super) struct SavedTraversal {
     params: SearchParams,
     results: Vec<SearchHit>,
     warnings: Vec<ReadWarning>,
+    global_backend: Option<crate::global::candidates::SavedCandidateBackend>,
 }
 
 impl RiftMcp {
-    pub(super) async fn captured_traversal(
+    pub(in crate::server) async fn captured_traversal(
         &self,
         params: &SearchParams,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
     ) -> Result<SearchReadResult, super::ToolFailure> {
         let views = self
             .local_views
@@ -47,6 +51,12 @@ impl RiftMcp {
                 ));
             }
             Err(reason) => return Ok(unavailable_result(reason, Some(saved.view))),
+        }
+        if let Some(context) = context {
+            context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone_from(&saved.global_backend);
         }
         let limit = usize::try_from(
             params
@@ -145,6 +155,20 @@ impl RiftMcp {
     ) -> Result<Result<SavedTraversal, SearchReadResult>, super::ToolFailure> {
         let (resolved, answer, warnings, references, _) =
             self.current_search_inputs(params).await?;
+        let global_backend = references.package_views().next().map(|view| {
+            crate::global::candidates::SavedCandidateBackend {
+                backend: "global".to_owned(),
+                root: resolved
+                    .published
+                    .configuration
+                    .global_configuration()
+                    .endpoint,
+                owner: None,
+                view: view.clone(),
+                project: None,
+                upstream_view: None,
+            }
+        });
         let ready = resolved.published.preparation.is_none();
         let requested = params.clone();
         let ((mut results, mut captured_warnings), material) = self
@@ -176,7 +200,9 @@ impl RiftMcp {
         views
             .capture_with(material, |view| {
                 for hit in &mut results {
-                    hit.view = Some(view.clone());
+                    if hit.view.is_none() {
+                        hit.view = Some(view.clone());
+                    }
                 }
                 let response = SavedTraversal {
                     root,
@@ -185,6 +211,7 @@ impl RiftMcp {
                     params: crate::proxy::normalized_params(params),
                     results,
                     warnings: captured_warnings,
+                    global_backend,
                 };
                 let bytes = crate::proxy::encode_bounded(
                     &SavedRead::Traversal(Box::new(response)),

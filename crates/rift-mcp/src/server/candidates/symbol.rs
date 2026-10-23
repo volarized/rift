@@ -217,6 +217,12 @@ impl RiftMcp {
             .configuration
             .accepted_for_tool(super::wire::ErrorPhase::Read)?;
         let configuration = resolved.published.configuration.global_configuration();
+        super::global_context(
+            context,
+            &configuration.endpoint,
+            params.view.as_ref(),
+            "get_symbol",
+        )?;
         let result = tokio::time::timeout_at(
             deadline.at(),
             self.global.exact_symbol(&configuration, params),
@@ -245,6 +251,8 @@ impl RiftMcp {
                 root: configuration.endpoint,
                 owner: None,
                 view: view.clone(),
+                project: None,
+                upstream_view: None,
             };
             crate::proxy::encode_bounded(&selected, super::BYTES_MAX)
                 .map_err(super::transport_failure)?;

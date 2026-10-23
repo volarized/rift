@@ -23,6 +23,13 @@ pub const MAP_PACKAGES_MAX: usize = 1_000;
 /// [`WorkspaceMap::module_relationships`] entries one map carries, at most.
 pub const MAP_MODULE_RELATIONSHIPS_MAX: usize = 100;
 
+/// [`WorkspaceMap::recommendations`] entries one map carries, at most.
+pub const MAP_RECOMMENDATIONS_MAX: usize = 100;
+/// Characters in one recommendation's project folder, at most.
+pub const MAP_RECOMMENDATION_ROOT_CHARS_MAX: usize = 1_000;
+/// Characters in one recommendation's exact apply command, at most.
+pub const MAP_RECOMMENDATION_COMMAND_CHARS_MAX: usize = 8_192;
+
 /// Workspace orientation snapshot served by `rift://map`. Carries per-language totals, the
 /// directory tree indexed files sit under, the most-referenced symbols, entry points,
 /// documentation paths, and the packages the workspace depends on. Computed once when the
@@ -72,6 +79,12 @@ pub struct WorkspaceMap {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 1_000))]
     pub packages: Vec<PackageContextEntry>,
+    /// Installed language servers not selected by this project's configuration, with
+    /// exact commands that select them. Sorted by project folder and language, at most
+    /// [`MAP_RECOMMENDATIONS_MAX`] entries. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 100))]
+    pub recommendations: Vec<MapRecommendation>,
     /// Conditions that qualify this map. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
@@ -91,6 +104,20 @@ pub struct MapLanguage {
     /// Declarations this language's provider extracted from those files.
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub symbols: u64,
+}
+
+/// One installed language server the project can select explicitly.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapRecommendation {
+    /// Exact language identity served by the recommended process.
+    pub language: Language,
+    /// Folder relative to this map's project. `.` selects the project itself.
+    #[schemars(length(min = 1, max = 1_000))]
+    pub root: String,
+    /// Exact `rift config set` command, quoted for this server's operating system.
+    #[schemars(length(min = 1, max = 8_192))]
+    pub command: String,
 }
 
 /// Resolved references reaching from one listed module into another.
@@ -193,6 +220,7 @@ mod tests {
                 requirement: None,
                 availability: PackageAvailability::Canonical,
             }],
+            recommendations: Vec::new(),
             warnings: Vec::new(),
             pagination: Pagination {
                 page_index: 0,
@@ -205,6 +233,30 @@ mod tests {
     fn warnings_are_omitted_when_empty() {
         let value = serde_json::to_value(map()).expect("map serializes");
         assert!(value.get("warnings").is_none());
+    }
+
+    #[test]
+    fn map_recommendations_round_trip_exact_apply_commands() {
+        let mut snapshot = map();
+        let command = "rift config set '--language=typescript' '--lsp-program=typescript-language-server' '--profile=docs' '--profile-root=docs' '--lsp-argument=--stdio'";
+        snapshot.recommendations.push(MapRecommendation {
+            language: Language::from_identity_segment("typescript").expect("language identity"),
+            root: "docs".to_owned(),
+            command: command.to_owned(),
+        });
+        let mut value = serde_json::to_value(&snapshot).expect("map serializes");
+        assert_eq!(
+            value["recommendations"][0],
+            json!({
+                "language":"typescript", "root":"docs", "command":command,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkspaceMap>(value.clone()).expect("map deserializes"),
+            snapshot
+        );
+        value["recommendations"][0]["unknown"] = json!(true);
+        assert!(serde_json::from_value::<WorkspaceMap>(value).is_err());
     }
 
     #[test]
@@ -267,6 +319,7 @@ mod tests {
         assert!(value.get("entry_points").is_none());
         assert!(value.get("docs").is_none());
         assert!(value.get("module_relationships").is_none());
+        assert!(value.get("recommendations").is_none());
 
         let deserialized: WorkspaceMap =
             serde_json::from_value(value).expect("omitted collections deserialize as empty");
@@ -309,6 +362,19 @@ mod tests {
             json!(MAP_MODULE_RELATIONSHIPS_MAX)
         );
         assert_eq!(properties["packages"]["maxItems"], json!(MAP_PACKAGES_MAX));
+        assert_eq!(
+            properties["recommendations"]["maxItems"],
+            json!(MAP_RECOMMENDATIONS_MAX)
+        );
+        let recommendation = &schema["$defs"]["MapRecommendation"]["properties"];
+        assert_eq!(
+            recommendation["root"]["maxLength"],
+            json!(MAP_RECOMMENDATION_ROOT_CHARS_MAX)
+        );
+        assert_eq!(
+            recommendation["command"]["maxLength"],
+            json!(MAP_RECOMMENDATION_COMMAND_CHARS_MAX)
+        );
 
         let module = &schema["$defs"]["MapModule"]["properties"];
         assert_eq!(
@@ -329,6 +395,7 @@ mod tests {
             "docs",
             "module_relationships",
             "packages",
+            "recommendations",
         ] {
             assert_eq!(properties[name]["default"], json!([]), "field={name}");
         }

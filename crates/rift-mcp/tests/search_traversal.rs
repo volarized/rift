@@ -1754,6 +1754,70 @@ fn callee_hit(structured: &Value, name: &str) -> TestResult<Value> {
         .ok_or_else(|| format!("{name} must be a hit: {structured}").into())
 }
 
+async fn read_dependency_hit(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    hit: &Value,
+) -> TestResult {
+    let selected = &hit["view"];
+    let symbol = call_retrying_acceptance(
+        client,
+        tool_request(
+            "get_symbol",
+            &json!({
+                "id":hit["hit"]["symbol"]["id"], "view":selected["id"],
+                "include":["source"]
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(symbol["outcome"], "found", "{symbol}");
+    assert_eq!(symbol["view"], *selected, "{symbol}");
+    assert_eq!(symbol["declarations"][0]["unit"], hit["unit"], "{symbol}");
+    assert!(
+        symbol["declarations"][0]["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("def greet(")),
+        "{symbol}"
+    );
+    let source = call_retrying_acceptance(
+        client,
+        tool_request(
+            "get_source",
+            &json!({
+                "unit":hit["unit"], "view":selected["id"]
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(source["outcome"], "found", "{source}");
+    assert_eq!(source["view"], *selected, "{source}");
+    assert_eq!(
+        source["source"]["text"],
+        global_api::GREETING_SOURCE,
+        "{source}"
+    );
+    Ok(())
+}
+
+async fn held_dependency_graph(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    mut request: Value,
+    original: &Value,
+    endpoint: &str,
+) -> TestResult {
+    request["view"] = original["view"]["id"].clone();
+    let held = client.call_tool(tool_request("search", &request)).await?;
+    assert_ne!(held.is_error, Some(true), "{held:?}");
+    let body = held.structured_content.ok_or("held traversal result")?;
+    assert_eq!(&body, original, "captured graph and hit views stay fixed");
+    let greet = callee_hit(&body, "greet")?;
+    let meta = held.meta.ok_or("held dependency backend")?;
+    assert_eq!(meta.get("backend"), Some(&json!("global")));
+    assert_eq!(meta.get("root"), Some(&json!(endpoint)));
+    assert_eq!(meta.get("view"), Some(&greet["view"]));
+    read_dependency_hit(client, &greet).await
+}
+
 /// A standard library callee's position goes to the global API as `stdlib/python` at the
 /// release the resolution served, at typeshed's own path, and the answered declaration ends
 /// the edge: the callee is a hit addressed by its unit, and nothing drops.
@@ -1896,18 +1960,14 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
     let (_directory, client, _server_task) =
         served_workspace(INSTALLED_FILES, Some(configuration)).await?;
 
-    let hello = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
-            }),
-        ),
-    )
-    .await?;
+    let request = json!({"include":["source"], "limit":1,
+        "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
+    });
+    let hello = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
+    held_dependency_graph(&client, request, &hello, &fixture.endpoint).await?;
     assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
     let greet = callee_hit(&hello, "greet")?;
+    read_dependency_hit(&client, &greet).await?;
     assert_eq!(
         greet["hit"]["symbol"]["id"],
         json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),

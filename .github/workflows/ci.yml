@@ -238,8 +238,9 @@ jobs:
     needs: rust-build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    # Artifact download and setup have their own allowance outside the test budget.
-    timeout-minutes: 25
+    # Allow the measured 22m42s archive delivery plus 14m17s for the other steps.
+    # The test step and nextest keep their own execution deadlines.
+    timeout-minutes: 40
     permissions:
       contents: read
 
@@ -344,7 +345,9 @@ jobs:
     needs: rust-build
     if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Allow the shared archive's measured 22m42s delivery plus 2m14s for other steps.
+    # The live test step keeps its own execution deadline.
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:

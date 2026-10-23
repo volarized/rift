@@ -1888,6 +1888,7 @@ pub fn declare_workspace_map_empty_defaults(schema: &mut Schema) {
             property!(WorkspaceMap, docs),
             property!(WorkspaceMap, module_relationships),
             property!(WorkspaceMap, packages),
+            property!(WorkspaceMap, recommendations),
             property!(WorkspaceMap, warnings),
         ],
     );

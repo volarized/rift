@@ -330,7 +330,7 @@ impl std::error::Error for CliError {
 /// What a completed command prints.
 #[derive(Debug)]
 enum CliOutcome {
-    Config(PathBuf),
+    Config(config::ConfigOutcome),
     Server(server::ServerOutcome),
     Update(update::UpdateOutcome),
     Install(install::InstallOutcome),
@@ -340,7 +340,7 @@ enum CliOutcome {
 impl fmt::Display for CliOutcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Config(path) => write!(formatter, "configuration written: {}", path.display()),
+            Self::Config(outcome) => outcome.fmt(formatter),
             Self::Server(outcome) => outcome.fmt(formatter),
             Self::Update(outcome) => outcome.fmt(formatter),
             Self::Install(outcome) => outcome.fmt(formatter),

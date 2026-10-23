@@ -65,7 +65,7 @@ use crate::global::candidates::SavedCandidateBackend;
 )]
 enum SavedCandidateRead {
     Search(Box<SavedCandidateSearch>),
-    Symbol(SavedCandidateBackend),
+    Symbol(Box<SavedCandidateBackend>),
 }
 
 impl Default for CandidateViews {
@@ -128,7 +128,7 @@ impl CandidateViews {
         Ok(view)
     }
 
-    fn backend(
+    pub(super) fn backend(
         &self,
         id: &CapturedViewId,
         now: SystemTime,
@@ -213,7 +213,7 @@ fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError>
     let saved: SavedCandidateRead = serde_json::from_slice(bytes)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
     Ok(match saved {
-        SavedCandidateRead::Symbol(backend) => vec![backend],
+        SavedCandidateRead::Symbol(backend) => vec![*backend],
         SavedCandidateRead::Search(saved) => saved
             .captured
             .pools
@@ -223,6 +223,8 @@ fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError>
                 backend: pool.backend,
                 root: pool.root,
                 view: pool.view,
+                project: None,
+                upstream_view: None,
             })
             .collect(),
     })

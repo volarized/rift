@@ -20,6 +20,63 @@ use super::{ReadAnswer, RiftMcp, ToolFailure, wire};
 const BYTES_MAX: usize = crate::global::candidates::CANDIDATE_BYTES_MAX;
 const SLOTS_MAX: usize = 256;
 
+pub(in crate::server) fn write_captured_context(
+    result: &mut Result<CallToolResponse, rmcp::ErrorData>,
+    captured: Option<&Mutex<Option<crate::global::candidates::SavedCandidateBackend>>>,
+) {
+    if let Ok(CallToolResponse::Complete(response)) = result
+        && let Some(captured) = captured
+        && let Some(selected) = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    {
+        let meta = response
+            .meta
+            .get_or_insert_with(rmcp::model::MetaObject::new);
+        meta.insert("backend".to_owned(), serde_json::json!(selected.backend));
+        meta.insert("root".to_owned(), serde_json::json!(selected.root));
+        meta.insert("owner".to_owned(), serde_json::json!(selected.owner));
+        meta.insert("view".to_owned(), serde_json::json!(selected.view));
+    }
+}
+
+fn global_context(
+    context: Option<&Mutex<Option<crate::global::candidates::SavedCandidateBackend>>>,
+    endpoint: &str,
+    view: Option<&rift_protocol::symbol_read::CapturedViewId>,
+    operation: &str,
+) -> Result<(), ToolFailure> {
+    let Some(context) = context else {
+        return Ok(());
+    };
+    let context = context
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(selected) = context.as_ref() else {
+        return Ok(());
+    };
+    if selected.backend != "global"
+        || selected.root != endpoint
+        || selected.owner.is_some()
+        || view != Some(&selected.view.id)
+    {
+        return Err(captured_read_refusal(
+            operation,
+            &selected.view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+        ));
+    }
+    if crate::proxy::captured_expiry(&selected.view).map_err(read_failure)? <= SystemTime::now() {
+        return Err(captured_read_refusal(
+            operation,
+            &selected.view.id,
+            rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchCandidateRequest {
@@ -132,7 +189,7 @@ impl RiftMcp {
             )
         };
         if params.traversal.is_some() {
-            return self.captured_traversal(params).await.map(Some);
+            return self.captured_traversal(params, None).await.map(Some);
         }
         if params.pattern.is_some()
             || params.change.is_some()
@@ -639,7 +696,10 @@ mod captured_search_startup_tests {
             "query": "beacon", "scope": "local", "include": ["source"]
         }))?;
         let initial = server
-            .search(super::super::Parameters(params.clone()))
+            .search(
+                super::super::Parameters(params.clone()),
+                rmcp::model::Extensions::default(),
+            )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
@@ -660,7 +720,10 @@ mod captured_search_startup_tests {
         std::fs::write(directory.path().join("lib.rs"), "pub fn replacement() {}\n")?;
         params.view = Some(view.id.clone());
         let later = server
-            .search(super::super::Parameters(params.clone()))
+            .search(
+                super::super::Parameters(params.clone()),
+                rmcp::model::Extensions::default(),
+            )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
@@ -670,7 +733,10 @@ mod captured_search_startup_tests {
         assert_eq!(later, initial);
         params.page_index = 1;
         let page = server
-            .search(super::super::Parameters(params.clone()))
+            .search(
+                super::super::Parameters(params.clone()),
+                rmcp::model::Extensions::default(),
+            )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
@@ -682,7 +748,10 @@ mod captured_search_startup_tests {
         params.query = Some("replacement".to_owned());
         assert!(matches!(
             server
-                .search(super::super::Parameters(params))
+                .search(
+                    super::super::Parameters(params),
+                    rmcp::model::Extensions::default()
+                )
                 .await
                 .map_err(|failure| format!("{failure:?}"))?
                 .0,
@@ -927,7 +996,10 @@ mod tests {
         }))?;
         let failure = assembled
             .server
-            .search(super::super::Parameters(params))
+            .search(
+                super::super::Parameters(params),
+                rmcp::model::Extensions::default(),
+            )
             .await
             .err()
             .expect("preparing publication must refuse the malformed query");
@@ -983,7 +1055,10 @@ mod tests {
                 }))?;
                 let direct = assembled
                     .server
-                    .search(super::super::Parameters(params))
+                    .search(
+                        super::super::Parameters(params),
+                        rmcp::model::Extensions::default(),
+                    )
                     .await
                     .map_err(|failure| format!("{failure:?}"))?
                     .0;

@@ -468,8 +468,8 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
         .call_tool(tools_call_request("get_symbol", &request)?)
         .await?;
     assert!(
-        !result.is_error.unwrap_or(false),
-        "a miss must remain a successful read"
+        result.is_error.unwrap_or(false),
+        "a miss must report a tool error with its typed answer"
     );
     let answer = result
         .structured_content
@@ -561,7 +561,7 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
             .await?;
-        assert!(!result.is_error.unwrap_or(false));
+        assert!(result.is_error.unwrap_or(false));
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
@@ -591,6 +591,7 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
             &json!({"id":exact_id,"include":[]}),
         )?)
         .await?;
+    assert!(!result.is_error.unwrap_or(false));
     let answer = result.structured_content.ok_or("exact answer absent")?;
     assert_eq!(answer["outcome"], "found");
     assert_eq!(answer["symbol"]["id"], exact_id);
@@ -631,7 +632,7 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
         let result = client
             .call_tool(tools_call_request("get_symbol", &request)?)
             .await?;
-        assert!(!result.is_error.unwrap_or(false));
+        assert!(result.is_error.unwrap_or(false));
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;

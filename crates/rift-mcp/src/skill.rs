@@ -198,7 +198,7 @@ fn skill_markdown(form: SkillForm) -> String {
     let mut rendered = String::new();
     rendered.push_str("---\n");
     let _ = writeln!(rendered, "name: {SKILL_NAME}");
-    let _ = writeln!(rendered, "description: {SKILL_DESCRIPTION}");
+    let _ = writeln!(rendered, "description: {}", json!(SKILL_DESCRIPTION));
     rendered.push_str("---\n\n");
     rendered.push_str("# Rift\n\n");
     rendered.push_str(
@@ -207,8 +207,10 @@ fn skill_markdown(form: SkillForm) -> String {
     );
     rendered.push_str("Rift writes no source: apply a change with your own edit tools.\n\n");
     rendered.push_str(
-        "Start an unfamiliar repository at `rift://map`; it names the served languages and \
-         the workspace's own layout before any tool call.\n\n",
+        "Read `rift://map` first for served languages, workspace layout, and language server \
+         recommendations. When configuring language servers, run listed `rift config set` \
+         commands from the workspace root. After creating a named profile, reconnect MCP to \
+         use its `local@name` scope.\n\n",
     );
     rendered.push_str("## Which tool\n\n");
     rendered.push_str("| Situation | Tool |\n");

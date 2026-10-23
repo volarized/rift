@@ -22,21 +22,29 @@ Set this project's or the user's configuration
 Usage: rift config <COMMAND>
 
 Commands:
-  set   Set request statistics enablement in this project's rift.toml
-  help  Print this message or the help of the given subcommand(s)
+  set        Set request statistics or a language server in this project's rift.toml
+  recommend  Recommend installed language servers and commands that select them
+  help       Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help  Print help
 
 $ rift config set --help
-Set request statistics enablement in this project's rift.toml
+Set request statistics or a language server in this project's rift.toml
 
-Usage: rift config set [OPTIONS] --telemetry.disabled=<BOOL>
+Usage: rift config set [OPTIONS]
 
 Options:
-      --telemetry.disabled=<BOOL>  Disable request statistics with true, or enable them with false [possible values: true, false]
-      --user                       Write ~/.rift/config.toml; a user disable applies to every project
-  -h, --help                       Print help
+      --telemetry.disabled=<BOOL>    Disable request statistics with true, or enable them with false [possible values: true, false]
+      --language <LANGUAGE>          Exact language identity, such as typescript or typescript:tsx
+      --profile <PROFILE>            Named local project registered in mcp.extra; absence selects the primary project
+      --profile-root <PROFILE_ROOT>  Workspace-relative folder for a new named local project
+      --include <INCLUDE>            Language path pattern within the selected project, repeated for additional patterns
+      --exclude <EXCLUDE>            Language path pattern to exclude within the selected project
+      --lsp-program <LSP_PROGRAM>    Executable name or relative path, started directly without a shell
+      --lsp-argument=<LSP_ARGUMENT>  Literal process argument, repeated for additional arguments
+      --user                         Write ~/.rift/config.toml; a user disable applies to every project
+  -h, --help                         Print help
 
 $ rift mcp --help
 Serve agents over stdio MCP by proxying this workspace's rift server

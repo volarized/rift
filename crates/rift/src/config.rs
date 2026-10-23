@@ -1,4 +1,9 @@
-//! Request statistics configuration writes.
+//! Workspace configuration writes and language server recommendations.
+
+mod editing;
+mod lsp;
+mod profile;
+mod recommendations;
 
 use std::fs;
 use std::io::{Read as _, Write as _};
@@ -13,26 +18,68 @@ use toml_edit::{Document, Item, Value};
 
 #[derive(Debug, Subcommand)]
 pub(super) enum ConfigCommand {
-    /// Set request statistics enablement in this project's rift.toml.
+    /// Set request statistics or a language server in this project's rift.toml.
     Set {
         /// Disable request statistics with true, or enable them with false.
-        #[arg(long = "telemetry.disabled", action = ArgAction::Set, require_equals = true, value_name = "BOOL", required = true)]
-        telemetry_disabled: bool,
+        #[arg(long = "telemetry.disabled", action = ArgAction::Set, require_equals = true, value_name = "BOOL", required_unless_present = "language", conflicts_with = "language")]
+        telemetry_disabled: Option<bool>,
+        #[command(flatten)]
+        lsp: lsp::LspSetOptions,
         /// Write ~/.rift/config.toml; a user disable applies to every project.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "language")]
         user: bool,
     },
+    /// Recommend installed language servers and commands that select them.
+    Recommend,
+}
+
+#[derive(Debug)]
+pub(super) enum ConfigOutcome {
+    Written(PathBuf),
+    Recommendations(String),
+    Profile {
+        registration: PathBuf,
+        configuration: PathBuf,
+    },
+}
+
+impl std::fmt::Display for ConfigOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Written(path) => write!(formatter, "configuration written: {}", path.display()),
+            Self::Recommendations(recommendations) => formatter.write_str(recommendations),
+            Self::Profile {
+                registration,
+                configuration,
+            } => write!(
+                formatter,
+                "configuration written: {}\nregistration written: {}",
+                configuration.display(),
+                registration.display()
+            ),
+        }
+    }
 }
 
 pub(super) fn run(
     command: &ConfigCommand,
     root: &Path,
     home: Option<&Path>,
-) -> Result<PathBuf, RiftError> {
+) -> Result<ConfigOutcome, RiftError> {
+    if matches!(command, ConfigCommand::Recommend) {
+        return recommendations::recommend(root).map(ConfigOutcome::Recommendations);
+    }
     let ConfigCommand::Set {
         telemetry_disabled,
+        lsp,
         user,
-    } = command;
+    } = command
+    else {
+        unreachable!("recommendation commands return before configuration writes")
+    };
+    if lsp.profile.is_some() {
+        return profile::set(root, lsp);
+    }
     let path = if *user {
         home.filter(|path| !path.as_os_str().is_empty())
             .ok_or_else(|| {
@@ -44,8 +91,14 @@ pub(super) fn run(
     } else {
         root.join(WORKSPACE_CONFIGURATION_FILE)
     };
-    set(&path, *telemetry_disabled)?;
-    Ok(path)
+    if let Some(disabled) = telemetry_disabled {
+        set(&path, *disabled)?;
+    } else {
+        let raw = read(&path).map_err(|source| write_failure(&path, source))?;
+        let rendered = lsp.edit(&path, &raw)?;
+        persist(&path, &rendered).map_err(|source| write_failure(&path, source))?;
+    }
+    Ok(ConfigOutcome::Written(path))
 }
 
 fn invalid(path: &Path, detail: &str) -> RiftError {
@@ -90,6 +143,9 @@ fn persist(path: &Path, rendered: &str) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let mut staged = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = fs::metadata(path) {
+        staged.as_file().set_permissions(metadata.permissions())?;
+    }
     staged.write_all(rendered.as_bytes())?;
     staged.as_file().sync_all()?;
     staged.persist(path).map_err(|error| error.error)?;
@@ -101,9 +157,18 @@ fn edit(path: &Path, raw: &str, disabled: bool) -> Result<String, RiftError> {
         return Err(invalid(path, "configuration exceeds the file byte limit"));
     }
     let document = Document::parse(raw).map_err(|error| invalid(path, &error.to_string()))?;
-    let (range, replacement) = replacement(path, &document, disabled)?;
-    let mut rendered = raw.to_owned();
-    rendered.replace_range(range, &replacement);
+    if let Some(telemetry) = document.as_table().get("telemetry") {
+        let table = telemetry
+            .as_table_like()
+            .ok_or_else(|| invalid(path, "telemetry must be a table"))?;
+        if table
+            .get("disabled")
+            .is_some_and(|value| value.as_bool().is_none())
+        {
+            return Err(invalid(path, "telemetry.disabled must be a boolean"));
+        }
+    }
+    let rendered = editing::set(path, raw, &["telemetry", "disabled"], Value::from(disabled))?;
     if rendered.len() as u64 > CONFIGURATION_FILE_BYTES_MAX {
         return Err(invalid(path, "configuration exceeds the file byte limit"));
     }
@@ -125,110 +190,11 @@ fn edit(path: &Path, raw: &str, disabled: bool) -> Result<String, RiftError> {
     Ok(rendered)
 }
 
-fn replacement(
-    path: &Path,
-    document: &Document<&str>,
-    disabled: bool,
-) -> Result<(std::ops::Range<usize>, String), RiftError> {
-    let raw = document.raw();
-    let Some(telemetry) = document.as_table().get("telemetry") else {
-        return Ok(append_table(raw, disabled));
-    };
-    if let Some(previous) = telemetry
-        .as_table_like()
-        .and_then(|table| table.get("disabled"))
-    {
-        let value = previous
-            .as_value()
-            .filter(|value| value.is_bool())
-            .ok_or_else(|| invalid(path, "telemetry.disabled must be a boolean"))?;
-        let range = value
-            .span()
-            .ok_or_else(|| invalid(path, "configuration value has no parsed span"))?;
-        return Ok((range, disabled.to_string()));
-    }
-    match telemetry {
-        Item::Table(table) if table.is_dotted() => {
-            let ending = line_ending(raw);
-            Ok((0..0, format!("telemetry.disabled = {disabled}{ending}")))
-        }
-        Item::Table(table) if table.is_implicit() => Ok(append_table(raw, disabled)),
-        Item::Table(table) => match table.span() {
-            Some(header) => {
-                let line = lines_inclusive(&raw[header.start..])
-                    .next()
-                    .unwrap_or_default();
-                let end = header.start + line.len();
-                let ending = line_ending(raw);
-                let prefix = if LineEnding::of(line).is_some() {
-                    ""
-                } else {
-                    ending
-                };
-                Ok((end..end, format!("{prefix}disabled = {disabled}{ending}")))
-            }
-            None => Ok(append_table(raw, disabled)),
-        },
-        Item::Value(Value::InlineTable(_)) => inline_replacement(path, document, disabled),
-        _ => Err(invalid(path, "telemetry must be a table")),
-    }
-}
-
 fn line_ending(raw: &str) -> &'static str {
     lines_inclusive(raw)
         .find_map(LineEnding::of)
         .unwrap_or(LineEnding::Lf)
         .as_str()
-}
-
-fn append_table(raw: &str, disabled: bool) -> (std::ops::Range<usize>, String) {
-    let ending = line_ending(raw);
-    let prefix = if raw.is_empty() || LineEnding::of(raw).is_some() {
-        ""
-    } else {
-        ending
-    };
-    (
-        raw.len()..raw.len(),
-        format!("{prefix}[telemetry]{ending}disabled = {disabled}{ending}"),
-    )
-}
-
-fn inline_replacement(
-    path: &Path,
-    document: &Document<&str>,
-    disabled: bool,
-) -> Result<(std::ops::Range<usize>, String), RiftError> {
-    let table = document
-        .as_table()
-        .get("telemetry")
-        .and_then(Item::as_inline_table)
-        .ok_or_else(|| invalid(path, "telemetry must be a table"))?;
-    let range = table
-        .span()
-        .ok_or_else(|| invalid(path, "configuration value has no parsed span"))?;
-    let raw = document.raw();
-    if raw.as_bytes().get(range.start) != Some(&b'{') {
-        return Err(invalid(
-            path,
-            "configuration inline table has no opening brace",
-        ));
-    }
-    let position = range.start + 1;
-    let separator = if table.is_empty() { "" } else { "," };
-    let spacing = if raw
-        .as_bytes()
-        .get(position)
-        .is_some_and(u8::is_ascii_whitespace)
-    {
-        ""
-    } else {
-        " "
-    };
-    Ok((
-        position..position,
-        format!(" disabled = {disabled}{separator}{spacing}"),
-    ))
 }
 
 #[cfg(test)]
@@ -243,7 +209,8 @@ mod tests {
         fs::write(&path, "# retained\n[source]\nrespect_gitignore = false\n")?;
         run(
             &ConfigCommand::Set {
-                telemetry_disabled: true,
+                telemetry_disabled: Some(true),
+                lsp: lsp::LspSetOptions::default(),
                 user: false,
             },
             root.path(),
@@ -260,7 +227,8 @@ mod tests {
             assert!(
                 run(
                     &ConfigCommand::Set {
-                        telemetry_disabled: true,
+                        telemetry_disabled: Some(true),
+                        lsp: lsp::LspSetOptions::default(),
                         user: true
                     },
                     root.path(),
@@ -278,10 +246,13 @@ mod tests {
         let root = tempfile::tempdir()?;
         let home = tempfile::tempdir()?;
         let command = ConfigCommand::Set {
-            telemetry_disabled: true,
+            telemetry_disabled: Some(true),
+            lsp: lsp::LspSetOptions::default(),
             user: true,
         };
-        let path = run(&command, root.path(), Some(home.path()))?;
+        let ConfigOutcome::Written(path) = run(&command, root.path(), Some(home.path()))? else {
+            panic!("set must return the written path");
+        };
         assert_eq!(path, home.path().join(".rift/config.toml"));
         assert_eq!(fs::read_dir(home.path().join(".rift"))?.count(), 1);
         assert!(!root.path().join("rift.toml").exists());
