@@ -16,8 +16,9 @@ fn anchors(text: &str, parsed: &str, captured: bool) -> BTreeMap<String, SymbolI
     .expect("captured unit");
     let origin = ContributionOrigin::new(Some(SourceLocation::External {}), SourceKind::Authored)
         .expect("captured origin");
-    let digest = SourceDigest::parse(&format!("{:x}", Sha256::digest(text.as_bytes())))
-        .expect("complete digest");
+    let digest =
+        SourceDigest::parse(&data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())))
+            .expect("complete digest");
     let source = PackageSource::new(&path, text);
     let source = if captured {
         source
@@ -89,7 +90,7 @@ fn python_cached_digest_keeps_complete_occurrence_revision() {
     let captured = anchors(text, text, true);
     assert_eq!(ordinary, captured);
     assert_eq!(ordinary.len(), 2);
-    let expected = format!("{:x}", Sha256::digest(text.as_bytes()));
+    let expected = data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes()));
     let mut occurrences = std::collections::BTreeSet::new();
     for identity in captured.values() {
         let parsed = SymbolIdentity::parse(identity.as_str()).expect("canonical identity");

@@ -17,7 +17,9 @@ const ANALYZER_MANIFEST: &str = include_str!("analyzer-manifest.json");
 pub fn analyzer_digest() -> String {
     static DIGEST: OnceLock<String> = OnceLock::new();
     DIGEST
-        .get_or_init(|| format!("{:x}", Sha256::digest(ANALYZER_MANIFEST.as_bytes())))
+        .get_or_init(|| {
+            data_encoding::HEXLOWER.encode(&Sha256::digest(ANALYZER_MANIFEST.as_bytes()))
+        })
         .clone()
 }
 
@@ -40,7 +42,8 @@ mod tests {
 
     #[test]
     fn persisted_analyzer_digest_keeps_every_sha256_byte() {
-        let expected = format!("{:x}", Sha256::digest(ANALYZER_MANIFEST.as_bytes()));
+        let expected =
+            data_encoding::HEXLOWER.encode(&Sha256::digest(ANALYZER_MANIFEST.as_bytes()));
         let digest = analyzer_digest();
         assert_eq!(digest, expected);
         assert_eq!(digest.len(), 64);

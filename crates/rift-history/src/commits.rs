@@ -291,7 +291,7 @@ impl Repository {
             let mut reference = reference.map_err(|error| {
                 errors::history::storage()
                     .operation("read tag")
-                    .detail(&*error)
+                    .detail(&error)
                     .error()
             })?;
             let name = reference.name().shorten().to_str_lossy().into_owned();

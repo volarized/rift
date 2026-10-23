@@ -10,6 +10,7 @@ import platform
 import re
 import threading
 import time
+import tomllib
 import uuid
 import zlib
 from collections.abc import Iterable, Iterator, Sequence
@@ -18,8 +19,8 @@ from pathlib import Path
 from statistics import median
 from typing import Annotated, Literal
 
-import tomllib
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
 from rift_dev.commands import REPOSITORY, CargoCommand, Command, CommandFailed
 from rift_dev.progress import start
 from rift_dev.trace import (

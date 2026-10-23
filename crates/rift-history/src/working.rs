@@ -499,14 +499,14 @@ impl<'repo> BaseChecks<'repo> {
             }
         }
         rewind(&mut file)?;
-        let mut hasher = Sha256::new();
+        let mut hasher = digest_io::IoWrapper(Sha256::new());
         std::io::copy(&mut file, &mut hasher).map_err(|error| {
             errors::history::storage()
                 .operation("read working file")
                 .detail(&error)
                 .error()
         })?;
-        Ok(pointer_id(&hasher.finalize(), size, base.kind())? == base)
+        Ok(pointer_id(&hasher.0.finalize(), size, base.kind())? == base)
     }
 }
 
@@ -585,8 +585,9 @@ fn pointer_id(
     size: u64,
     kind: gix::hash::Kind,
 ) -> Result<gix::ObjectId, RiftError> {
+    let digest = data_encoding::HEXLOWER.encode(digest);
     let pointer =
-        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{digest:x}\nsize {size}\n");
+        format!("version https://git-lfs.github.com/spec/v1\noid sha256:{digest}\nsize {size}\n");
     gix::objs::compute_hash(kind, gix::objs::Kind::Blob, pointer.as_bytes()).map_err(|error| {
         errors::history::storage()
             .operation("hash lfs pointer")

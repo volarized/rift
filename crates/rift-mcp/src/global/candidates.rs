@@ -195,7 +195,7 @@ fn captured_identity(
     let key = (&pool.backend, &pool.root, &pool.view, object);
     let encoded = crate::proxy::encode_bounded(&key, CANDIDATE_BYTES_MAX)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    DocumentIdentity::new(format!("{:x}", Sha256::digest(encoded)))
+    DocumentIdentity::new(data_encoding::HEXLOWER.encode(&Sha256::digest(encoded)))
 }
 
 #[cfg(test)]

@@ -145,7 +145,7 @@ pub fn select_server_configuration(
 pub fn server_settings_digest(server: &ServerConfiguration) -> Result<String, ErrorData> {
     let canonical = canonical_json(server)
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(canonical.as_bytes())))
 }
 
 /// Discovers the existing common Git directory without accepting server settings.
@@ -168,7 +168,7 @@ pub fn repository_election_directory(
 ) -> Result<PathBuf, ErrorData> {
     let canonical = canonical_json(identity)
         .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-    let digest = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+    let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(canonical.as_bytes()));
     Ok(common_directory
         .join(rift_core::constants::RIFT_STATE_DIRECTORY)
         .join(digest))

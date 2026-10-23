@@ -349,7 +349,8 @@ impl<'source> PackageSource<'source> {
     ) -> Result<Self, RiftError> {
         validate_captured_origin(unit, origin)?;
         let actual = Sha256::digest(self.text.as_bytes());
-        if unit.key() != original_path || format!("{actual:x}") != digest.as_str() {
+        if unit.key() != original_path || data_encoding::HEXLOWER.encode(&actual) != digest.as_str()
+        {
             return errors::analysis::package_input_identity_invalid()
                 .path(self.path.as_str())
                 .fail();
@@ -946,8 +947,9 @@ mod tests {
             ContributionOrigin::new(Some(SourceLocation::External {}), SourceKind::Authored)
                 .expect("physical origin");
         let text = "def open() -> None: ...";
-        let digest = SourceDigest::parse(&format!("{:x}", Sha256::digest(text.as_bytes())))
-            .expect("complete source digest");
+        let digest =
+            SourceDigest::parse(&data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())))
+                .expect("complete source digest");
         let source = PackageSource::new(&alias, text)
             .with_captured_source_unit(&unit, &external, &original, &digest)
             .expect("captured source proof");

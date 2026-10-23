@@ -12,6 +12,7 @@ import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
@@ -827,9 +828,12 @@ class Corpus:
                         "node end",
                     )
                     >= end
-                    and number(node["range"].get("start"), "node start") <= end - 1
+                    and number(
+                        cast(JsonObject, node["range"]).get("start"), "node start"
+                    )
+                    <= end - 1
                     and (
-                        node["range"].get("end") == end
+                        cast(JsonObject, node["range"]).get("end") == end
                         or "declaration" in node.get("facets", [])
                     )
                 ]

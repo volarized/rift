@@ -470,10 +470,13 @@ impl TreeDatabase {
             AnswerRefusal::Invalid(format!("tree root is not UTF-8: {}", path.display()))
         })?;
         let system = HermeticSystem::new(&system_root);
-        let mut metadata = ProjectMetadata::discover_without_uv(&system_root, &system)
-            .map_err(|error| AnswerRefusal::Invalid(format!("ty project discovery: {error}")))?;
+        let mut metadata =
+            ProjectMetadata::discover_with_uv(&system_root, &system, ty_project::UseUv::Off)
+                .map_err(|error| {
+                    AnswerRefusal::Invalid(format!("ty project discovery: {error}"))
+                })?;
         if let Some(options) = environment.options(&system_root) {
-            metadata.apply_fallback_options(options);
+            metadata.set_fallback_options(options);
         }
         let runtime = captured_python_runtime(&metadata, &system_root, &system);
         let database = ProjectDatabase::fallible(metadata, system)
@@ -1052,7 +1055,8 @@ mod tests {
             SystemPathBuf::from_path_buf(root.to_path_buf()).expect("a UTF-8 temporary root");
         let system = ruff_db::system::OsSystem::new(&system_root);
         let metadata =
-            ProjectMetadata::discover_without_uv(&system_root, &system).expect("ty's discovery");
+            ProjectMetadata::discover_with_uv(&system_root, &system, ty_project::UseUv::Off)
+                .expect("ty's discovery");
         let database = ProjectDatabase::fallible(metadata, system).expect("a default database");
         let app = system_path_to_file(&database, system_root.join("app.py")).expect("app.py");
         let findings: Vec<(String, String)> = database
@@ -1167,6 +1171,29 @@ mod tests {
             names_module(&removed, "inside"),
             "the removed `.venv` resolves nothing: {removed:?}"
         );
+    }
+
+    #[test]
+    fn test_a_script_uses_the_tree_environment() {
+        let (_tree, root) = importing_tree();
+        std::fs::write(
+            root.join("app.py"),
+            format!(
+                "# /// script\n# requires-python = \">=3.12\"\n# dependencies = []\n# ///\n{IMPORTS}"
+            ),
+        )
+        .expect("script metadata");
+        let before = engine_unresolved_imports(&root);
+        assert!(names_module(&before, "inside"), "{before:?}");
+        assert!(names_module(&before, "outside"), "{before:?}");
+
+        installed_environment(&root.join(PROJECT_ENVIRONMENT_DIRECTORY), "inside");
+        let installed = engine_unresolved_imports(&root);
+        assert!(
+            !names_module(&installed, "inside"),
+            "the tree's `.venv` resolves `inside`: {installed:?}"
+        );
+        assert!(names_module(&installed, "outside"), "{installed:?}");
     }
 
     /// A distribution installed into the tree's existing `.venv` after the first request

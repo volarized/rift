@@ -7,9 +7,8 @@ import os
 import re
 import shutil
 import tempfile
-from pathlib import Path, PurePosixPath
-
 import tomllib
+from pathlib import Path, PurePosixPath
 
 from rift_dev.commands import GitCommand
 from rift_dev.config import CorpusPins
