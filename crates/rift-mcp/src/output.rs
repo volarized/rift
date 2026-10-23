@@ -1,6 +1,7 @@
 //! Tool answer output: compact text, structured content, and proxy selection.
 
 mod failure;
+mod framework_warnings;
 mod policy;
 mod render;
 mod text;
@@ -17,6 +18,7 @@ use render::{Render, text_of};
 use text::TextError;
 
 pub(crate) use failure::ToolFailure;
+pub(crate) use framework_warnings::FrameworkWarnings;
 pub use policy::OutputPolicy;
 
 /// A typed tool answer that serves as compact text and as structured content.
@@ -35,7 +37,12 @@ impl<T: Render + Serialize> IntoCallToolResult for Json<T> {
             Ok(structured) => structured,
             Err(error) => return refused(AnswerFault::Structured(error)),
         };
-        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        let content = vec![ContentBlock::text(text)];
+        let mut result = if self.0.is_error() {
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        };
         result.structured_content = Some(structured);
         Ok(result.into())
     }

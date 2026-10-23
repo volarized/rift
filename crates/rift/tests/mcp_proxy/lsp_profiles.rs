@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::harness::{
     StopOnDrop, TestResult, assigned_port_key, await_workspace_ready, laid_out_workspace,
-    proxied_call, proxy_client, require_success, run_rift,
+    proxied_call, proxy_client, require_success, run_rift, within,
 };
 
 #[path = "../../../rift-mcp/tests/fake_engine/script.rs"]
@@ -147,6 +147,72 @@ async fn symbol_read(
     Ok(answer)
 }
 
+async fn named_missing_read(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    hit: &SearchHit,
+) -> TestResult {
+    let found = symbol_id(hit)?;
+    let identity = SymbolIdentity::parse(found.as_str())?;
+    let mut path = identity.qualified_path().to_vec();
+    "beacpn".clone_into(path.last_mut().ok_or("symbol path absent")?);
+    let missing = rift_protocol::read::SymbolId::from_identity(&SymbolIdentity::new(
+        identity.owner().clone(),
+        identity.language().clone(),
+        path,
+    )?);
+    let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
+    let mut first = None;
+    for _ in 0..2 {
+        let mut arguments = json!({"id":missing});
+        if let Some(view) = &selected {
+            arguments["view"] = json!(view.id);
+        }
+        let response = within(
+            "named missing symbol",
+            client.call_tool(
+                rmcp::model::CallToolRequestParams::new("get_symbol")
+                    .with_arguments(serde_json::from_value(arguments)?),
+            ),
+        )
+        .await??;
+        assert_eq!(response.is_error, Some(true), "{response:?}");
+        let value = response
+            .structured_content
+            .ok_or("typed missing answer absent")?;
+        let result: GetSymbolResult = serde_json::from_value(value.clone())?;
+        let GetSymbolResult::Missing {
+            symbol_not_found,
+            view,
+            ..
+        } = result
+        else {
+            return Err(format!("expected named symbol miss: {value}").into());
+        };
+        assert_eq!(symbol_not_found.id, missing, "{value}");
+        assert!(
+            symbol_not_found
+                .alternatives
+                .iter()
+                .any(|alternative| &alternative.id == found),
+            "{value}"
+        );
+        for alternative in symbol_not_found.alternatives {
+            assert_eq!(
+                SymbolIdentity::parse(alternative.id.as_str())?.owner(),
+                identity.owner(),
+                "{value}"
+            );
+        }
+        if let Some(previous) = &first {
+            assert_eq!(&value, previous, "held missing answer stays fixed");
+        } else {
+            first = Some(value);
+        }
+        selected = Some(view);
+    }
+    Ok(())
+}
+
 async fn caller_read(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     hit: &SearchHit,
@@ -267,6 +333,9 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
         };
         assert_eq!(hit.source.as_deref(), Some(expected), "{hit:?}");
         symbol_read(&client, hit).await?;
+        if matches!(identity.owner(), SymbolOwner::NamedLocal { .. }) {
+            named_missing_read(&client, hit).await?;
+        }
     }
     assert_eq!(owners, BTreeSet::from(["main", "docs"]));
     fs::write(root.join("lib.rs"), main_source.replace("11", "33"))?;

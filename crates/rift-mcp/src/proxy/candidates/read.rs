@@ -10,6 +10,8 @@ use rmcp::model::{
 };
 use std::time::SystemTime;
 
+mod dependency;
+
 impl RiftProxy {
     pub(in crate::proxy) async fn captured_read(
         &self,
@@ -46,16 +48,22 @@ impl RiftProxy {
             let (backend, selected) = self.selected_read_backend(view, Some(&owner))?;
             let mut dispatched = params.clone();
             dispatched.id = super::super::identity::dispatch_id(&params.id, &selected.backend)?;
-            let upstream = symbol_request(request, &dispatched)?;
+            let expected = dependency::upstream_backend(&selected);
+            let upstream =
+                dependency::upstream_request(symbol_request(request, &dispatched)?, &selected)?;
+            if selected.upstream_view.is_some() {
+                dispatched.view = Some(expected.view.id.clone());
+            }
             let mut response = backend.forward_read(upstream).await?;
             if let Ok(CallToolResponse::Complete(result)) = &response
-                && result.is_error != Some(true)
+                && canonical_symbol_response(result)
             {
                 let mut decoded = decode_symbol(result)?;
-                validate_symbol(&dispatched, &decoded, Some(&selected.view))?;
+                validate_symbol(&dispatched, &decoded, Some(&expected.view))?;
+                validate_global_backend(result, &selected, symbol_view(&decoded))?;
+                dependency::public_symbol_view(&mut decoded, &selected);
                 super::super::identity::qualify_symbol_result(&mut decoded, &selected.backend)?;
                 validate_symbol(&params, &decoded, Some(&selected.view))?;
-                validate_global_backend(result, &selected, symbol_view(&decoded))?;
                 response = symbol_response(decoded, result)?;
             }
             return Ok(Some(response));
@@ -77,7 +85,7 @@ impl RiftProxy {
                 .reserve_symbol(name, root, &actual_owner, SystemTime::now())?;
         let mut response = backend.forward_read(upstream).await?;
         if let Ok(CallToolResponse::Complete(result)) = &response
-            && result.is_error != Some(true)
+            && canonical_symbol_response(result)
         {
             let mut decoded = decode_symbol(result)?;
             validate_symbol(&dispatched, &decoded, None)?;
@@ -242,11 +250,14 @@ impl RiftProxy {
                         root: root.to_owned(),
                         owner: Some(actual_owner),
                         view,
+                        project: None,
+                        upstream_view: None,
                     },
                     SystemTime::now(),
                 )?;
             }
-            response = qualified_read_response(request, value.clone(), name)?;
+            let value = self.dependency_views(result, value.clone(), name, root)?;
+            response = qualified_read_response(request, value, name)?;
         }
         Ok(Some(response))
     }
@@ -285,7 +296,10 @@ impl RiftProxy {
             .transpose()?
             .map(|identity| identity.owner().clone());
         let (backend, selected) = self.selected_read_backend(&view, owner.as_ref())?;
-        let upstream = dispatch_read_request(request, &selected.backend)?;
+        let upstream = dependency::upstream_request(
+            dispatch_read_request(request, &selected.backend)?,
+            &selected,
+        )?;
         let mut response = backend.forward_read(upstream.clone()).await?;
         if let Ok(CallToolResponse::Complete(result)) = &response
             && result.is_error != Some(true)
@@ -299,13 +313,21 @@ impl RiftProxy {
                 )
             })?;
             let returned = returned_view(&upstream, value.clone())?;
-            if returned.as_ref().is_some_and(|view| view != &selected.view) {
+            let expected = dependency::upstream_backend(&selected);
+            if returned.as_ref().is_some_and(|view| view != &expected.view) {
                 return Err(invalid("view", "captured backend context does not match"));
             }
             if request.name == "get_source" {
                 validate_global_backend(result, &selected, returned.as_ref())?;
             }
-            let mut qualified = qualified_read_response(request, value.clone(), &selected.backend)?;
+            let mut value = value.clone();
+            if selected.upstream_view.is_some() && returned.is_some() {
+                value["view"] = serde_json::json!(selected.view);
+            }
+            if request.name == "search" {
+                value = self.dependency_views(result, value, &selected.backend, &selected.root)?;
+            }
+            let mut qualified = qualified_read_response(request, value, &selected.backend)?;
             if let Ok(CallToolResponse::Complete(answered)) = &mut qualified {
                 answered.meta.clone_from(&result.meta);
             }
@@ -337,7 +359,8 @@ impl RiftProxy {
                 rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
             ));
         }
-        let backend = match selected.backend.as_str() {
+        let name = selected.project.as_deref().unwrap_or(&selected.backend);
+        let backend = match name {
             "local" | "global" => self,
             name => self.backends.get(name).ok_or_else(|| {
                 view_refusal(
@@ -488,6 +511,13 @@ fn decode_symbol(result: &rmcp::model::CallToolResult) -> Result<GetSymbolResult
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
 }
 
+fn canonical_symbol_response(result: &rmcp::model::CallToolResult) -> bool {
+    result.is_error != Some(true)
+        || result.structured_content.as_ref().is_some_and(|value| {
+            value.get("outcome").and_then(serde_json::Value::as_str) == Some("missing")
+        })
+}
+
 fn symbol_response(
     decoded: GetSymbolResult,
     original: &rmcp::model::CallToolResult,
@@ -530,6 +560,8 @@ fn symbol_backend(
             root: root.to_owned(),
             owner: Some(owner.clone()),
             view: view.clone(),
+            project: None,
+            upstream_view: None,
         });
     };
     if !global {
@@ -595,7 +627,7 @@ fn validate_global_backend(
             rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
         )
     })?;
-    if global_backend(meta, returned)? != *selected {
+    if global_backend(meta, returned)? != dependency::upstream_backend(selected) {
         return Err(view_refusal(
             &selected.view.id,
             rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
@@ -662,11 +694,7 @@ fn returned_view(
                     let view = result
                         .view
                         .ok_or_else(|| invalid("view", "captured response has no selected view"))?;
-                    if result
-                        .results
-                        .iter()
-                        .any(|hit| hit.view.as_ref() != Some(&view))
-                    {
+                    if result.results.iter().any(|hit| hit.view.is_none()) {
                         return Err(invalid("view", "captured backend context does not match"));
                     }
                     Ok(Some(view))

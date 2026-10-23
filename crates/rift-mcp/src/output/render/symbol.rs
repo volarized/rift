@@ -221,15 +221,18 @@ pub(super) fn canonical(
             view,
             warnings,
         } => {
+            out.raw_line(0, "error: symbol_not_found")?;
             let mut lines = Lines::new(out, 0, 1);
-            lines.head("symbol_not_found")?;
             lines.line(0, symbol_not_found.id.as_str())?;
+            if !symbol_not_found.alternatives.is_empty() {
+                lines.line(0, "closest matches:")?;
+            }
             for alternative in &symbol_not_found.alternatives {
                 lines.line(
-                    0,
+                    1,
                     &format!("{} · {}", alternative.id.as_str(), alternative.name),
                 )?;
-                lines.line(1, &format!("{:?}", alternative.match_context))?;
+                lines.line(2, &format!("{:?}", alternative.match_context))?;
             }
             if let Some(detail) = &symbol_not_found.detail {
                 lines.verbatim(0, detail)?;

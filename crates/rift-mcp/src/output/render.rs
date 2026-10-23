@@ -55,6 +55,11 @@ pub(crate) use error::RegisteredFailure;
 
 /// An answer that writes itself as text.
 pub(crate) trait Render {
+    /// Whether this typed answer reports a failed tool call.
+    fn is_error(&self) -> bool {
+        false
+    }
+
     /// Writes this answer into `out`.
     ///
     /// # Errors
@@ -173,6 +178,10 @@ mod tests;
 mod resource_tests;
 
 impl Render for rift_protocol::symbol_read::GetSymbolResult {
+    fn is_error(&self) -> bool {
+        matches!(self, Self::Missing { .. })
+    }
+
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         symbol::canonical(out, self)
     }

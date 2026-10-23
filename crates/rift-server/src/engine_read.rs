@@ -155,6 +155,7 @@ impl EngineReferences {
                 let held = PackageDeclaration {
                     symbol: callee.symbol(&declaration)?,
                     unit: callee.unit(&declaration.origin)?,
+                    view: declaration.view.clone(),
                 };
                 Some((declaration.id, end, held))
             });
@@ -184,6 +185,13 @@ impl EngineReferences {
         self.package_declarations.get(symbol)
     }
 
+    /// Global selections retained by the package declarations this walk reached.
+    pub fn package_views(&self) -> impl Iterator<Item = &rift_protocol::symbol_read::CapturedView> {
+        self.package_declarations
+            .values()
+            .map(|declaration| &declaration.view)
+    }
+
     pub(crate) fn captured_for(&self, reads: &ReadService) -> bool {
         reads.engine_index_current() && self.revision.as_deref() == Some(reads.engine_revision())
     }
@@ -209,7 +217,18 @@ impl EngineReferences {
             |declaration, tracker| {
                 let (symbol, tracker) = declaration.symbol.get_heap_size_with_tracker(tracker);
                 let (unit, tracker) = declaration.unit.get_heap_size_with_tracker(tracker);
-                (symbol.saturating_add(unit), tracker)
+                let (view, tracker) = declaration.view.id.get_heap_size_with_tracker(tracker);
+                let (expiry, tracker) = declaration
+                    .view
+                    .expires_at
+                    .get_heap_size_with_tracker(tracker);
+                (
+                    symbol
+                        .saturating_add(unit)
+                        .saturating_add(view)
+                        .saturating_add(expiry),
+                    tracker,
+                )
             },
         );
         let (unconfirmed, _) = retained_sequence_material(
@@ -261,6 +280,7 @@ impl EngineReferences {
 pub(crate) struct PackageDeclaration {
     pub(crate) symbol: Symbol,
     pub(crate) unit: SourceUnitId,
+    pub(crate) view: rift_protocol::symbol_read::CapturedView,
 }
 
 /// Whether this search can request references from a configured language engine.
@@ -1593,6 +1613,11 @@ mod tests {
             (callee.path().as_str() == "builtins.pyi").then(|| CalleeDeclaration {
                 id: len.clone(),
                 kind: ExactKind("function".to_owned()),
+                view: rift_protocol::symbol_read::CapturedView {
+                    id: rift_protocol::symbol_read::CapturedViewId::parse("claims.package")
+                        .expect("view"),
+                    expires_at: "2099-10-10T10:05:00Z".to_owned(),
+                },
                 origin: rift_core::SourceLocation::Stdlib {
                     runtime: Some(python.clone()),
                 },

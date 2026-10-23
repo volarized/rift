@@ -309,9 +309,19 @@ impl LocalSymbolViews {
         let index_bytes = input.material.index.retained_material_bytes();
         let ready = input.ready;
         let id = self.next_key(&mut state)?;
-        let expires = now
+        let mut expires = now
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
+        if let Some((_, references)) = &input.material.traversal {
+            for selected in references.package_views() {
+                let selected = chrono::DateTime::parse_from_rfc3339(&selected.expires_at)
+                    .map_err(|error| material_error("read package view expiry", &error))?;
+                expires = expires.min(SystemTime::from(selected));
+            }
+        }
+        if expires <= now {
+            return Ok(None);
+        }
         let view = CapturedView {
             id: CapturedViewId::parse(&id)?,
             expires_at: chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339(),

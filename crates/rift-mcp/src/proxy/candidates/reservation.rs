@@ -35,21 +35,38 @@ impl CandidateViews {
         owner: Option<&SymbolOwner>,
         now: SystemTime,
     ) -> Result<CandidateReservation<'_>, RiftError> {
+        self.reserve_captured(
+            &SavedCandidateBackend {
+                owner: owner.cloned(),
+                backend: backend.to_owned(),
+                root: root.to_owned(),
+                view: CapturedView {
+                    id: CapturedViewId::parse("claims.pending")?,
+                    expires_at: String::new(),
+                },
+                project: None,
+                upstream_view: None,
+            },
+            now,
+        )
+    }
+
+    pub(super) fn reserve_captured(
+        &self,
+        selected: &SavedCandidateBackend,
+        now: SystemTime,
+    ) -> Result<CandidateReservation<'_>, RiftError> {
         let expires = now
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
-        let template = SavedCandidateBackend {
-            owner: owner.cloned(),
-            backend: backend.to_owned(),
-            root: root.to_owned(),
-            view: CapturedView {
-                id: CapturedViewId::parse(&format!("{}.x", "a".repeat(VIEW_KEY_BYTES_MAX - 2)))?,
-                // Worst JSON escaping is charged; final metadata uses these same bounds.
-                expires_at: "\u{0001}".repeat(VIEW_EXPIRY_BYTES_MAX),
-            },
+        let mut template = selected.clone();
+        template.view = CapturedView {
+            id: CapturedViewId::parse(&format!("{}.x", "a".repeat(VIEW_KEY_BYTES_MAX - 2)))?,
+            // Worst JSON escaping is charged; final metadata uses these same bounds.
+            expires_at: "\u{0001}".repeat(VIEW_EXPIRY_BYTES_MAX),
         };
         let bytes = super::super::encode_bounded(
-            &SavedCandidateRead::Symbol(template),
+            &SavedCandidateRead::Symbol(Box::new(template)),
             CANDIDATE_BYTES_MAX,
         )
         .map_err(|source| {
@@ -135,14 +152,6 @@ impl CandidateReservation<'_> {
                 "captured view expiry does not match the reservation",
             ));
         }
-        for row in rows.iter().filter(|row| row.reservation.is_none()) {
-            if saved_backends(&row.bytes)?
-                .iter()
-                .any(|backend| backend.view.id == view.id)
-            {
-                return Err(invalid("view", "captured search view is already retained"));
-            }
-        }
         let saved: SavedCandidateRead =
             serde_json::from_slice(&rows[position].bytes).map_err(|source| {
                 rift_error::errors::mcp::forward_failed()
@@ -155,11 +164,33 @@ impl CandidateReservation<'_> {
         if backend.owner != selected.owner
             || backend.backend != selected.backend
             || backend.root != selected.root
+            || backend.project != selected.project
+            || backend.upstream_view != selected.upstream_view
         {
             return Err(invalid(
                 "view",
                 "captured view context does not match the reservation",
             ));
+        }
+        let mut retained = None;
+        for row in rows.iter().filter(|row| row.reservation.is_none()) {
+            for backend in saved_backends(&row.bytes)? {
+                if backend.view.id == view.id {
+                    retained = Some(backend);
+                    break;
+                }
+            }
+            if retained.is_some() {
+                break;
+            }
+        }
+        if let Some(retained) = retained {
+            if selected.upstream_view.is_some() && retained == *selected {
+                rows.remove(position);
+                self.finished = true;
+                return Ok(());
+            }
+            return Err(invalid("view", "captured search view is already retained"));
         }
         backend.view = view.clone();
         let bytes =
@@ -218,6 +249,8 @@ mod tests {
             backend: "local".to_owned(),
             root: "/fixture/main".to_owned(),
             view: view(key),
+            project: None,
+            upstream_view: None,
         }
     }
 
@@ -252,6 +285,74 @@ mod tests {
                 .backend(
                     &response.view.id,
                     captured_expiry(&response.view).expect("expiry")
+                )
+                .expect("expired"),
+            Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired)
+        );
+    }
+
+    #[test]
+    fn dependency_reservations_reuse_identical_concurrent_context_only() {
+        let store = std::sync::Arc::new(CandidateViews::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut selected = selected("claims.dependency");
+        selected.backend = "global".to_owned();
+        selected.project = Some("docs".to_owned());
+        selected.upstream_view = Some(view("claims.remote"));
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let store = std::sync::Arc::clone(&store);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let selected = selected.clone();
+                    scope.spawn(move || {
+                        let mut pending =
+                            store.reserve_captured(&selected, clock()).expect("reserve");
+                        barrier.wait();
+                        pending.finalize(&selected, clock()).expect("same context");
+                    })
+                })
+                .collect();
+            barrier.wait();
+            for handle in handles {
+                handle.join().expect("retained dependency");
+            }
+        });
+        assert_eq!(store.rows.lock().expect("rows").len(), 1);
+        assert_eq!(
+            store
+                .backend(&selected.view.id, clock())
+                .expect("decode")
+                .expect("authority"),
+            Some(selected.clone())
+        );
+        for field in ["project", "owner", "upstream", "expiry"] {
+            let mut other = selected.clone();
+            match field {
+                "project" => other.project = Some("local".to_owned()),
+                "owner" => other.owner = None,
+                "upstream" => other.upstream_view = Some(view("claims.other")),
+                "expiry" => other.view.expires_at = "2030-01-01T00:09:00Z".to_owned(),
+                _ => unreachable!(),
+            }
+            let mut pending = store
+                .reserve_captured(&other, clock())
+                .expect("reserve conflict");
+            assert!(pending.finalize(&other, clock()).is_err(), "{field}");
+            drop(pending);
+            assert_eq!(store.rows.lock().expect("rows").len(), 1);
+        }
+        let mut foreign = store
+            .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
+            .expect("foreign reservation");
+        assert!(foreign.finalize(&selected, clock()).is_err());
+        drop(foreign);
+        assert_eq!(store.rows.lock().expect("rows").len(), 1);
+        assert_eq!(
+            store
+                .backend(
+                    &selected.view.id,
+                    captured_expiry(&selected.view).expect("expiry")
                 )
                 .expect("expired"),
             Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired)

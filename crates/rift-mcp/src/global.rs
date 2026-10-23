@@ -513,7 +513,7 @@ pub(crate) async fn callee_declarations(
                 line: position.line,
                 character: position.character,
             };
-            named.insert((encoding.clone(), key), (id, kind));
+            named.insert((encoding.clone(), key), (id, kind, view));
         }
         if selected.is_none() {
             break;
@@ -909,8 +909,14 @@ const MERGE_WEIGHTS: RankingWeights = RankingWeights::fixed(0.5, 0.5, 0.0, 60);
 pub(crate) struct CalleeDeclarations {
     /// The declaration answered at each position asked, with its kind, by the position's
     /// encoding and key.
-    named:
-        HashMap<(PackageDeclarationRequestPositionEncoding, CalleePosition), (SymbolId, ExactKind)>,
+    named: HashMap<
+        (PackageDeclarationRequestPositionEncoding, CalleePosition),
+        (
+            SymbolId,
+            ExactKind,
+            rift_protocol::symbol_read::CapturedView,
+        ),
+    >,
 }
 
 /// One package position as a request carries it and its answer names it.
@@ -928,11 +934,12 @@ impl CalleeDeclarations {
     pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
         let origin = callee_origin(callee)?;
         let key = (wire_encoding(callee), callee_position(callee, &origin)?);
-        let (id, kind) = self.named.get(&key)?;
+        let (id, kind, view) = self.named.get(&key)?;
         Some(CalleeDeclaration {
             id: id.clone(),
             kind: kind.clone(),
             origin,
+            view: view.clone(),
         })
     }
 }

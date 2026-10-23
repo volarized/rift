@@ -33,11 +33,20 @@ impl LocalSymbolViews {
             Ok(held) => held,
             Err(reason) => return Ok(Err(reason)),
         };
-        if results
-            .iter()
-            .any(|hit| hit.view.as_ref().is_some_and(|view| view != &held.view))
-        {
-            return Ok(Err(SymbolUnavailableReason::ViewContext));
+        for hit in results.iter() {
+            if hit.view.as_ref().is_none_or(|view| view == &held.view) {
+                continue;
+            }
+            let rift_protocol::search::SearchHitTarget::Symbol { symbol } = &hit.hit else {
+                return Ok(Err(SymbolUnavailableReason::ViewContext));
+            };
+            let declaration = symbol.id.as_ref().and_then(|id| {
+                let id = rift_core::SymbolId::new(id.as_str()).ok()?;
+                held.material.traversal.as_ref()?.1.package_declaration(&id)
+            });
+            if declaration.is_none_or(|declaration| hit.view.as_ref() != Some(&declaration.view)) {
+                return Ok(Err(SymbolUnavailableReason::ViewContext));
+            }
         }
         Ok(Ok(crate::search::populate_sources_from(
             results,
@@ -170,11 +179,7 @@ impl LocalSymbolMaterial {
                 .traversal
                 .as_ref()
                 .and_then(|(_, references)| references.package_declaration(identity))
-                .map(|declaration| {
-                    let mut hit = crate::traversal::package_traversal_hit(declaration, path);
-                    hit.view = Some(view.clone());
-                    hit
-                }));
+                .map(|declaration| crate::traversal::package_traversal_hit(declaration, path)));
         };
         let symbol = readable.to_protocol_symbol();
         if !symbol.name_is_public() {
