@@ -8,7 +8,7 @@ use rift_syntax::DocumentPlacement;
 use crate::analyzer::namespace::{SelectedFile, placed_aliases, prepare_context};
 use crate::{IndexedFile, NamespaceInput};
 
-use super::{BuiltSemantics, PlacedFacts, WorkspaceSemantics};
+use super::{BuiltSemantics, PlacedFacts, PreparedSemantics, WorkspaceSemantics};
 
 impl WorkspaceSemantics {
     /// Builds project semantics from one captured owner, source set, and metadata set.
@@ -26,6 +26,20 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
+        Self::prepare_captured_project_facts(input, documents, declarations_max, revision)?
+            .build(relationships_max, previous)
+    }
+
+    /// Admits captured project declarations, including namespace aliases, before graph construction.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal for an owner or source outside the captured context.
+    pub fn prepare_captured_project_facts(
+        input: NamespaceInput<'_>,
+        documents: &[&IndexedFile],
+        declarations_max: usize,
+        revision: u64,
+    ) -> Result<PreparedSemantics, RiftError> {
         if !matches!(
             input.owner(),
             SymbolOwner::Local | SymbolOwner::NamedLocal { .. }
@@ -81,15 +95,7 @@ impl WorkspaceSemantics {
                 .with_logical_declarations(namespace.mappings.remove(path).unwrap_or_default())
                 .with_aliases(aliases.remove(path).unwrap_or_default());
         }
-        Self::build_facts_placed_inner(
-            &placed,
-            declarations_max,
-            relationships_max,
-            revision,
-            previous,
-            true,
-            None,
-        )
+        Self::prepare_facts_placed(&placed, declarations_max, revision, true)
     }
 }
 

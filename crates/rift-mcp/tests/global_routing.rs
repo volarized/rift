@@ -289,6 +289,39 @@ const CALLEE_FILES: &[(&str, &str)] = &[
     ("app.py", "def counted() -> int:\n    return len([1])\n"),
 ];
 
+/// Confirms the local engine answers callers before a deadline test waits on the global API.
+async fn await_local_caller(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    fixture: &GlobalFixture,
+) -> TestResult {
+    let incoming = json!({
+        "traversal": { "seed": "rift://symbol/local/rust/walk/beacon", "direction": "incoming" }
+    });
+    let answer = call_retrying_acceptance(client, tool_request("search", &incoming)).await?;
+    let results = answer["results"]
+        .as_array()
+        .ok_or("the local caller walk returns results")?;
+    assert_eq!(results.len(), 1, "{answer:#}");
+    assert_eq!(
+        results[0]["hit"]["symbol"]["id"], "rift://symbol/local/rust/walk/caller",
+        "{answer:#}"
+    );
+    if let Some(warnings) = answer.get("warnings") {
+        let warnings = warnings.as_array().ok_or("warnings are an array")?;
+        assert!(
+            warnings.iter().all(|warning| !warning["code"]
+                .as_str()
+                .is_some_and(|code| code.starts_with("engine_"))),
+            "the local engine answers without warnings: {answer:#}"
+        );
+    }
+    assert!(
+        fixture.requests().await.is_empty(),
+        "the local caller walk makes no global request"
+    );
+    Ok(())
+}
+
 /// An outgoing walk from `caller` against a fixture holding `hold` past the request
 /// deadline: the walk answers well before the held answer would have arrived, the
 /// standard library callee drops, and the answer carries the timeout warning.
@@ -349,6 +382,7 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
             }
         })
         .await?;
+    await_local_caller(&client, &fixture).await?;
     let walk = json!({
         "traversal": { "seed": "rift://symbol/local/rust/walk/caller", "direction": "outgoing" }
     });

@@ -69,6 +69,69 @@ pub struct BuiltSemantics {
     pub refused_contributions: Vec<(ProjectPath, RiftError)>,
 }
 
+/// An admitted syntax publication awaiting graph construction.
+#[derive(Debug)]
+#[must_use]
+pub struct PreparedSemantics {
+    publications: Arc<PublicationSet>,
+    revision: u64,
+    /// Documents outside the publication's declaration capacity.
+    pub beyond_declaration_bound: Vec<ProjectPath>,
+    /// Documents whose contributions were refused.
+    pub refused_contributions: Vec<(ProjectPath, RiftError)>,
+}
+
+impl PreparedSemantics {
+    /// Builds the graph after the caller has handled omitted documents.
+    ///
+    /// # Errors
+    /// Returns a typed error when graph validation fails.
+    pub fn build(
+        self,
+        relationships_max: usize,
+        previous: Option<&NormalizedGraph>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        self.build_with_external(relationships_max, previous, None)
+    }
+
+    fn build_with_external(
+        self,
+        relationships_max: usize,
+        previous: Option<&NormalizedGraph>,
+        external: Option<&ExternalTarget<'_>>,
+    ) -> Result<BuiltSemantics, RiftError> {
+        let index_revision = IndexRevision::new(self.revision)?;
+        let source_revision = SourceRevision::new(self.revision)?;
+        let tree_revision = TreeRevision::new(self.revision)?;
+        let graph = match external {
+            Some(external) => Normalizer::normalize_with(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &self.publications,
+                external,
+            )?,
+            None => Normalizer::normalize(
+                index_revision,
+                source_revision,
+                tree_revision,
+                &self.publications,
+                previous,
+            )?,
+        };
+        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
+        Ok(BuiltSemantics {
+            semantics: WorkspaceSemantics {
+                graph,
+                relationships,
+                syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
+            },
+            beyond_declaration_bound: self.beyond_declaration_bound,
+            refused_contributions: self.refused_contributions,
+        })
+    }
+}
+
 type ExternalTarget<'input> =
     dyn Fn(&rift_core::ContributionReference) -> Option<rift_core::SymbolId> + 'input;
 
@@ -164,6 +227,19 @@ impl WorkspaceSemantics {
         revision: u64,
         previous: Option<&NormalizedGraph>,
     ) -> Result<BuiltSemantics, RiftError> {
+        Self::prepare_project_facts(documents, declarations_max, revision)?
+            .build(relationships_max, previous)
+    }
+
+    /// Admits project declarations before graph construction.
+    ///
+    /// # Errors
+    /// Returns a typed error when source placement or publication validation fails.
+    pub fn prepare_project_facts<'a>(
+        documents: impl IntoIterator<Item = (&'a SyntaxFacts, &'a ProjectPath)>,
+        declarations_max: usize,
+        revision: u64,
+    ) -> Result<PreparedSemantics, RiftError> {
         let placed = documents
             .into_iter()
             .map(|(facts, path)| {
@@ -174,15 +250,7 @@ impl WorkspaceSemantics {
                 })
             })
             .collect::<Result<Vec<_>, RiftError>>()?;
-        Self::build_facts_placed_inner(
-            &placed,
-            declarations_max,
-            relationships_max,
-            revision,
-            previous,
-            true,
-            None,
-        )
+        Self::prepare_facts_placed(&placed, declarations_max, revision, true)
     }
 
     /// Builds one publication and graph over compact syntax facts with explicit source paths.
@@ -254,7 +322,21 @@ impl WorkspaceSemantics {
         collect_refused_contributions: bool,
         external: Option<&ExternalTarget<'_>>,
     ) -> Result<BuiltSemantics, RiftError> {
-        let index_revision = IndexRevision::new(revision)?;
+        Self::prepare_facts_placed(
+            documents,
+            declarations_max,
+            revision,
+            collect_refused_contributions,
+        )?
+        .build_with_external(relationships_max, previous, external)
+    }
+
+    fn prepare_facts_placed(
+        documents: &[PlacedFacts<'_>],
+        declarations_max: usize,
+        revision: u64,
+        collect_refused_contributions: bool,
+    ) -> Result<PreparedSemantics, RiftError> {
         let source_revision = SourceRevision::new(revision)?;
         let tree_revision = TreeRevision::new(revision)?;
         let provider_revision = ProviderRevision::new(revision)?;
@@ -305,29 +387,9 @@ impl WorkspaceSemantics {
         }
         let publication = builder.build()?;
         let publications = Arc::new(PublicationSet::empty(limits).replaced(publication)?);
-        let graph = match external {
-            Some(external) => Normalizer::normalize_with(
-                index_revision,
-                source_revision,
-                tree_revision,
-                &publications,
-                external,
-            )?,
-            None => Normalizer::normalize(
-                index_revision,
-                source_revision,
-                tree_revision,
-                &publications,
-                previous,
-            )?,
-        };
-        let relationships = RelationshipStore::build_capped(&graph, relationships_max);
-        Ok(BuiltSemantics {
-            semantics: Self {
-                graph,
-                relationships,
-                syntax_provider: ProviderId::new(SYNTAX_PROVIDER_ID)?,
-            },
+        Ok(PreparedSemantics {
+            publications,
+            revision,
             beyond_declaration_bound,
             refused_contributions,
         })

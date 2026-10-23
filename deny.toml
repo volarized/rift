@@ -13,6 +13,12 @@ ignore = [
   # gemm, candle-core's CPU matrix kernel, uses paste for its macro expansion. No candle
   # release drops it, and the crate is a build-time proc macro with no runtime surface.
   { id = "RUSTSEC-2024-0436", reason = "paste is a build-time proc macro reached only through gemm <- candle-core" },
+  # zip 8.6.0 remains affected, but the pinned consumers do not call the affected
+  # filesystem extraction APIs. See .cargo/audit.toml for the consumer review,
+  # advisory links, upstream version constraints, and review/removal conditions.
+  { id = "RUSTSEC-2026-0367", reason = "pinned zip consumers do not use filesystem extraction that preserves privileged permission bits" },
+  { id = "RUSTSEC-2026-0368", reason = "pinned zip consumers do not use filesystem extraction that creates archive symbolic links" },
+  { id = "RUSTSEC-2026-0369", reason = "pinned zip consumers do not use filesystem extraction that changes archive permissions through symbolic links" },
 ]
 
 [licenses]

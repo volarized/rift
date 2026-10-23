@@ -809,6 +809,7 @@ fn a_scope_past_the_bound_is_refused_and_recorded_once() -> Result<(), Box<dyn s
         "test-scope-5",
         "test-scope-6",
         "test-scope-7",
+        "test-scope-8",
     ];
     let (recorder, mut drain) = ScopedRecorder::builder().install()?;
     assert_eq!(

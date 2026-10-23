@@ -145,6 +145,47 @@ def archive_selection(archive: Path | None, sources: list[str]) -> list[str]:
     ]
 
 
+def coverage_percentage(report: str) -> float:
+    """Read the weighted line total from LLVM's completed LCOV file records."""
+    files: set[str] = set()
+    current: str | None = None
+    totals: dict[str, int] = {}
+    count = 0
+    covered = 0
+    for line in report.splitlines():
+        if line.startswith("SF:"):
+            path = line[3:]
+            if current is not None or not path or path in files:
+                raise ValueError("coverage report has an invalid source record")
+            current = path
+        elif line == "end_of_record":
+            if current is None or set(totals) != {"LF", "LH"}:
+                raise ValueError("coverage report has no complete line totals")
+            found, hit = totals["LF"], totals["LH"]
+            if hit > found:
+                raise ValueError("coverage report has invalid line totals")
+            count += found
+            covered += hit
+            files.add(current)
+            current = None
+            totals = {}
+        elif line.startswith(("LF:", "LH:")):
+            field, value = line.split(":", 1)
+            if (
+                current is None
+                or field in totals
+                or not value.isascii()
+                or not value.isdecimal()
+            ):
+                raise ValueError("coverage report has invalid line totals")
+            totals[field] = int(value)
+        elif current is None and line:
+            raise ValueError("coverage report has data outside a source record")
+    if current is not None or not files:
+        raise ValueError("coverage report has no complete source records")
+    return covered * 100 / count if count else 0.0
+
+
 def unit(archive: Path | None) -> None:
     """Run the unit suite once under one coverage report.
 
@@ -169,20 +210,19 @@ def unit(archive: Path | None) -> None:
         )
     )
 
-    report = CargoCommand(
+    report_arguments = (
         "llvm-cov",
         "report",
         "--ignore-filename-regex",
         GENERATED_CLIENT,
-        "--lcov",
-        "--output-path",
-        "lcov.info",
-        "--fail-under-lines",
-        COVERAGE_FLOOR,
     )
+    report = CargoCommand(*report_arguments, "--lcov", "--output-path", "lcov.info")
     if archive is not None:
         report.with_args("--nextest-archive-file", archive)
     report.run()
+    percentage = coverage_percentage((REPOSITORY / "lcov.info").read_text())
+    if percentage < float(COVERAGE_FLOOR):
+        raise ValueError(f"line coverage {percentage:.2f}% is below {COVERAGE_FLOOR}%")
 
 
 def live(archive: Path | None) -> None:

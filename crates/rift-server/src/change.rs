@@ -752,21 +752,29 @@ mod tests {
         /// Answers the comparison `params` asks for over this fixture, against a
         /// current index built from the working tree as it stands.
         fn search(&self, params: &serde_json::Value) -> Result<SearchResult, RiftError> {
+            self.search_with_visibility(params, &SourceVisibility::default())
+        }
+
+        /// Uses the same source visibility for the current index and the comparison.
+        fn search_with_visibility(
+            &self,
+            params: &serde_json::Value,
+            visibility: &SourceVisibility,
+        ) -> Result<SearchResult, RiftError> {
             let params: SearchParams =
                 serde_json::from_value(params.clone()).expect("test parameters must deserialize");
             let change = params.change.clone().expect("the test names a change");
             let root = self.directory.path();
-            let visibility = SourceVisibility::default();
             let inclusion = TextFileInclusion::default();
             let history = HistoryConfiguration::default();
-            let current = ReadService::build(root, self.limits, &visibility, &inclusion, history)?;
+            let current = ReadService::build(root, self.limits, visibility, &inclusion, history)?;
             search_change(
                 root,
                 &params,
                 &change,
                 &current,
                 self.limits,
-                &SourceVisibility::default(),
+                visibility,
                 (
                     &TextFileInclusion::default(),
                     &LanguageFileSelections::default(),
@@ -980,9 +988,9 @@ mod tests {
 
     /// The working tree as `head` answers the declarations every kind of
     /// uncommitted edit changed, on a checkout under `core.autocrlf=true`: a
-    /// staged edit, an unstaged one, a file git does not track, one only git's
-    /// own excludes name, a deleted file, a pure rename, and a CRLF file with one
-    /// edited declaration. An LFS pointer left as committed answers nothing.
+    /// staged edit, an unstaged one, a file git does not track, a deleted file,
+    /// a pure rename, and a CRLF file with one edited declaration. A repository
+    /// excluded path and an LFS pointer left as committed answer nothing.
     #[test]
     fn change_against_the_working_tree_answers_every_uncommitted_edit() -> TestResult {
         let crlf = "pub fn kept() {\n    let x = 1;\n}\npub fn edited() {\n    let x = 1;\n}\n";
@@ -1044,7 +1052,6 @@ mod tests {
                     Some("src/crlf.rs"),
                     Some("src/crlf.rs")
                 ),
-                row("excluded", "introduced", None, Some("src/excluded.rs")),
                 row(
                     "staged",
                     "body_changed",
@@ -1067,6 +1074,39 @@ mod tests {
             ]
         );
         assert!(answer.warnings.is_empty(), "{:?}", answer.warnings);
+        Ok(())
+    }
+
+    /// Repository exclusions apply to working-tree comparisons unless source visibility
+    /// disables them or force-includes the path.
+    #[test]
+    fn change_against_the_working_tree_follows_repository_excludes_and_source_controls()
+    -> TestResult {
+        let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
+        let root = fixture.directory.path();
+        fs::write(root.join("src/excluded.rs"), "pub fn excluded() {}\n")?;
+        fs::write(root.join(".git/info/exclude"), "src/excluded.rs\n")?;
+        let params = json!({
+            "change": {"base": "baseline", "head": {"kind": "working_tree"}}
+        });
+
+        for (visibility, included) in [
+            (SourceVisibility::default(), false),
+            (SourceVisibility::new(Vec::new(), Vec::new(), false), true),
+            (
+                SourceVisibility::default().with_force_include(vec!["src/excluded.rs".to_owned()]),
+                true,
+            ),
+        ] {
+            let answer = fixture.search_with_visibility(&params, &visibility)?;
+            let expected = if included {
+                vec![row("excluded", "introduced", None, Some("src/excluded.rs"))]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(sorted_changes(&answer), expected, "{visibility:?}");
+            assert!(answer.warnings.is_empty(), "{answer:?}");
+        }
         Ok(())
     }
 

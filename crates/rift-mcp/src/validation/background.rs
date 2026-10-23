@@ -5,8 +5,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rift_error::errors;
+#[cfg(test)]
+use rift_index::capture_visible_digests_with_languages_cancellable;
 use rift_index::{
-    LastCapture, PathChange, PathChanges, capture_visible_digests_with_languages_cancellable,
+    LastCapture, PathChange, PathChanges,
+    capture_visible_digests_retaining_with_languages_cancellable,
 };
 use rift_protocol::configuration::ServerConfiguration;
 use rift_server::RiftError;
@@ -62,6 +65,15 @@ pub(super) struct BackgroundValidation {
     interval: Duration,
     deadline: Instant,
     last: Arc<Mutex<LastCapture>>,
+    observed_input: Option<ValidatedInput>,
+}
+
+/// Complete captured input used to decide whether a retained refusal can change.
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatedInput {
+    indexed: rift_index::WorkspaceFingerprint,
+    visible: rift_index::WorkspaceFingerprint,
+    configuration: super::ConfigurationFingerprint,
 }
 
 impl BackgroundValidation {
@@ -71,6 +83,7 @@ impl BackgroundValidation {
             interval,
             deadline: Instant::now() + interval,
             last: Arc::new(Mutex::new(LastCapture::default())),
+            observed_input: None,
         }
     }
 
@@ -131,7 +144,10 @@ impl BackgroundValidation {
         &mut self,
         context: &IndexSupervisorContext,
     ) -> Result<(), RiftError> {
-        let (current, failure) = super::read_published(&context.published).await.snapshot();
+        let state = super::read_published(&context.published).await;
+        let retained = state.retains_source_limit_failure(context.validation.observed_epoch());
+        let (current, failure) = state.snapshot();
+        drop(state);
         let recovering = failure.is_some();
         let root = context.root.clone();
         let limits = context.limits;
@@ -142,49 +158,32 @@ impl BackgroundValidation {
                 "background workspace validation",
                 context.validation.cancellation.clone(),
                 move |cancellation| {
+                    if configuration_fingerprint(&root) != current.configuration.fingerprint {
+                        return Ok((std::collections::BTreeSet::new(), true, None));
+                    }
                     let mut last = last
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let (digests, visible, next) =
-                        capture_visible_digests_with_languages_cancellable(
+                    let (digests, visible) =
+                        capture_visible_digests_retaining_with_languages_cancellable(
                             &root,
                             current.configuration.index_limits(limits)?,
                             &current.configuration.source_visibility(),
                             &current.configuration.text_inclusion(),
                             &current.configuration.language_file_selections(),
-                            &last,
+                            &mut last,
                             &|| cancellation.is_cancelled(),
                         )?;
                     rift_tracing::debug!(
                         component = "index",
                         operation = "index.validate",
-                        read_paths = next.read_paths(),
+                        read_paths = last.read_paths(),
                         "background filesystem validation captured"
                     );
-                    *last = next;
+                    let indexed = digests.fingerprint();
+                    let visible_fingerprint = visible.fingerprint();
                     let held = current.reads.workspace_digests();
-                    let mut known_path_removed = false;
-                    let compared = if let Some(preparation) = &current.preparation {
-                        let known: std::collections::BTreeSet<_> = preparation
-                            .map_source_paths
-                            .iter()
-                            .map(|(path, _)| path)
-                            .chain(preparation.map_text_paths.iter())
-                            .collect();
-                        known_path_removed = known.iter().any(|path| digests.get(path).is_none());
-                        // Discovered files awaiting preparation have no published bytes to
-                        // compare yet. Their presence alone does not restart preparation.
-                        rift_index::WorkspaceDigests::new(
-                            digests
-                                .iter()
-                                .filter(|(path, _)| {
-                                    held.get(path).is_some() || !known.contains(path)
-                                })
-                                .map(|(path, digest)| (path.clone(), digest)),
-                        )
-                    } else {
-                        digests
-                    };
+                    let (compared, known_path_removed) = compared_digests(&current, &held, digests);
                     let changes = PathChanges::between(&held, &compared);
                     let visible_changes = if current.preparation.is_none() {
                         PathChanges::between(&current.visible_digests, &visible)
@@ -211,12 +210,22 @@ impl BackgroundValidation {
                         || configuration_fingerprint(&root) != current.configuration.fingerprint
                         || (!added_or_removed.is_empty()
                             && !current.rebuild_moves_every(&root, &added_or_removed));
-                    Ok((paths, full))
+                    let input = ValidatedInput {
+                        indexed,
+                        visible: visible_fingerprint,
+                        configuration: configuration_fingerprint(&root),
+                    };
+                    Ok((paths, full, Some(input)))
                 },
             )
             .await;
         self.deadline = Instant::now() + self.interval;
-        let (paths, full) = observation?;
+        let (paths, full, input) = observation?;
+        let unchanged = input.is_some() && self.observed_input.as_ref() == input.as_ref();
+        self.observed_input = input;
+        if retained && unchanged {
+            return Ok(());
+        }
         if full {
             context.validation.observe_whole_workspace()?;
         } else if !paths.is_empty() || recovering {
@@ -224,6 +233,32 @@ impl BackgroundValidation {
         }
         Ok(())
     }
+}
+
+/// Discovered files awaiting preparation have no published bytes to compare yet.
+/// Their presence alone does not restart preparation; a removed known path does.
+fn compared_digests(
+    current: &super::PublishedWorkspace,
+    held: &rift_index::WorkspaceDigests,
+    digests: rift_index::WorkspaceDigests,
+) -> (rift_index::WorkspaceDigests, bool) {
+    let Some(preparation) = &current.preparation else {
+        return (digests, false);
+    };
+    let known: std::collections::BTreeSet<_> = preparation
+        .map_source_paths
+        .iter()
+        .map(|(path, _)| path)
+        .chain(preparation.map_text_paths.iter())
+        .collect();
+    let known_path_removed = known.iter().any(|path| digests.get(path).is_none());
+    let compared = rift_index::WorkspaceDigests::new(
+        digests
+            .iter()
+            .filter(|(path, _)| held.get(path).is_some() || !known.contains(path))
+            .map(|(path, digest)| (path.clone(), digest)),
+    );
+    (compared, known_path_removed)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -970,6 +1005,116 @@ mod tests {
                 .is_some(),
             "the missed create becomes readable"
         );
+        Ok(())
+    }
+
+    /// Source bounds recover through validation after removal or configuration repair.
+    #[tokio::test]
+    async fn source_limit_repair_without_a_watcher_event_resumes_preparation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for repair_configuration in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let root = directory.path();
+            std::fs::write(root.join("rift.toml"), "[source]\nfiles = 1000\n")?;
+            std::fs::write(root.join("lib.rs"), "pub fn old() {}\n")?;
+            let (context, _invalidations) = stable_context(root)?;
+            for index in 0..1000 {
+                std::fs::write(
+                    root.join(format!("added-{index}.rs")),
+                    "pub fn added() {}\n",
+                )?;
+            }
+            let mut background = BackgroundValidation::new(&ServerConfiguration::default());
+            let error = background
+                .validate(&context)
+                .await
+                .expect_err("excess source must refuse validation");
+            assert_eq!(error.slug(), errors::index::workspace_too_many_files::SLUG);
+            super::super::publish_rebuild_failure(&context, 0, error).await;
+            for _ in 0..2 {
+                assert!(background.validate(&context).await.is_err());
+                assert_eq!(
+                    context.validation.observed_epoch(),
+                    0,
+                    "a retained refusal creates no new rebuild epoch"
+                );
+            }
+            if repair_configuration {
+                std::fs::write(root.join("rift.toml"), "[source]\nfiles = 2000\n")?;
+            } else {
+                for index in 0..1000 {
+                    std::fs::remove_file(root.join(format!("added-{index}.rs")))?;
+                }
+            }
+            background.validate(&context).await?;
+            assert!(context.validation.observed_epoch() > 0);
+            let request = context.validation.take_pending();
+            let outcome = super::super::rebuild_workspace(
+                &context,
+                request,
+                super::super::workspace_capture(),
+            )
+            .await?;
+            assert!(matches!(
+                outcome,
+                super::super::RebuildOutcome::Published | super::super::RebuildOutcome::Unchanged
+            ));
+            assert!(context.published.read().await.failure.is_none());
+        }
+        Ok(())
+    }
+
+    /// Issue #623: validation keeps a deterministic refusal until captured input changes.
+    #[tokio::test]
+    async fn a_refused_input_does_not_schedule_itself_again_and_restore_recovers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let original = "pub fn old() {}\n";
+        std::fs::write(directory.path().join("lib.rs"), original)?;
+        let (context, _invalidations) = stable_context(directory.path())?;
+        let mut background = BackgroundValidation::new(&ServerConfiguration::default());
+        std::fs::write(directory.path().join("lib.rs"), "pub fn moved() {}\n")?;
+        background.validate(&context).await?;
+        let epoch = context.validation.observed_epoch();
+        let refusal = errors::index::workspace_too_many_files()
+            .path(directory.path().join("lib.rs"))
+            .field("source.files")
+            .observed(2_usize)
+            .maximum(1_usize)
+            .error();
+        let rendered = refusal.to_string();
+        let (_recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        super::super::publish_rebuild_failure(&context, epoch, refusal).await;
+        let records = drain.queued_records();
+        let failed = records
+            .iter()
+            .find(|record| record.message() == "index rebuild failed")
+            .ok_or("rebuild refusal record")?;
+        let fields: serde_json::Value = serde_json::from_str(failed.fields())?;
+        assert_eq!(fields["error"], rendered);
+        assert!(rendered.contains("source.files"), "{rendered}");
+        assert!(rendered.contains("observed 2"), "{rendered}");
+        assert!(context.published.read().await.failure.is_some());
+        for _ in 0..3 {
+            background.validate(&context).await?;
+            assert_eq!(
+                context.validation.observed_epoch(),
+                epoch,
+                "unchanged refused input owes no new rebuild"
+            );
+        }
+        std::fs::write(directory.path().join("lib.rs"), original)?;
+        background.validate(&context).await?;
+        assert!(
+            context.validation.observed_epoch() > epoch,
+            "restored input resumes preparation without a watcher event"
+        );
+        let request = context.validation.take_pending();
+        let outcome =
+            super::super::rebuild_workspace(&context, request, super::super::workspace_capture())
+                .await?;
+        assert_eq!(outcome, super::super::RebuildOutcome::Unchanged);
+        assert!(context.published.read().await.failure.is_none());
         Ok(())
     }
 
