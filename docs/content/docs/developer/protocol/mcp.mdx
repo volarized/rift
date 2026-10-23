@@ -659,6 +659,9 @@ logical owner in the canonical identity, preserving physical declaration locatio
 
 <ReadExample name="all-search" />
 
+The caller **MUST** use `query` to combine registered project results under `all`.
+The server returns one combined page; each hit retains its captured view for exact reads.
+
 Local search runs the indexed declarations and lines, `paths.force_include`, ranked tier,
 and traversal. Global search runs the global query and pattern lanes. Under `order: "path"`,
 project paths precede released source units.

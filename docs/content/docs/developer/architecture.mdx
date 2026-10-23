@@ -340,7 +340,8 @@ diagnostics over [LSP](https://microsoft.github.io/language-server-protocol/).
 Each [`[languages.<identity>]`](/docs/developer/configuration#languages-and-lsp) table selects
 one named or inline process for an exact language identity: rust-analyzer for `rust`, or
 `typescript-language-server` for `typescript` and `typescript:tsx`. Several identities may
-select the same named process.
+select the same named process. [LSP profiles](/docs/developer/configuration#lsp-profiles) register
+directories as separate projects, each with its own configuration and language processes.
 
 [`search`](/docs/mcp#search-engine-references) uses the engine for relationship traversal: the
 engine is the one source of the references an incoming walk follows and of the calls an outgoing

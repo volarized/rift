@@ -503,8 +503,9 @@ rift config set --telemetry.disabled=true
 ```
 
 `rift config set` updates the current directory's `rift.toml`, preserving other values and
-comments. The command supports only `telemetry.disabled`, with boolean `true` or
-`false`; malformed documents and symbolic-link targets are refused without replacement.
+comments. The `telemetry.disabled` setting takes boolean `true` or `false`; malformed
+documents and symbolic-link targets are refused without replacement. The command also
+applies [LSP selections](#lsp-recommendations).
 
 For every project, write the setting to `~/.rift/config.toml`:
 
@@ -700,6 +701,106 @@ command = ["node_modules/.bin/typescript-language-server", "--stdio"]
 [lsp.typescript.initialization_options.tsserver]
 useSyntaxServer = "never"
 ```
+
+### LSP recommendations
+
+<VersionBadge version="v0.0.70" languages={["Rust", "Python", "JavaScript", "TypeScript"]} />
+
+Rift can recommend installed language servers for the source and package directories in the
+project:
+
+```sh
+rift config recommend
+```
+
+For each selected project, the command checks that project's local executables before `PATH`
+for `rust-analyzer`, `pyright-langserver`, and `typescript-language-server`. It prints `rift config set` commands
+for selections the configuration does not already provide. The command reads the project's
+visible files and leaves `rift.toml` unchanged.
+
+The recommendation command reads each directly registered project's own configuration and
+visible files. Registered names must resolve to distinct directories, each different from the
+primary project root.
+
+Apply a process selection for a language:
+
+```sh
+rift config set --language=typescript --lsp-program=node_modules/.bin/typescript-language-server --lsp-argument=--stdio
+```
+
+The command writes an inline `lsp` process table in the language entry. Add `--profile` and
+`--profile-root` to select a process for one directory:
+
+```sh
+rift config set --language=typescript --profile=docs --profile-root=docs --lsp-program=node_modules/.bin/typescript-language-server --lsp-argument=--stdio
+```
+
+Repeat `--lsp-argument` for each literal argument. A profile also accepts repeated `--include`
+and `--exclude` patterns relative to its root. Omitted patterns preserve the child's existing
+language filters.
+
+The profile command writes the child project's `rift.toml`, adds its registration to the primary
+project, and appends the profile directory to the primary project's `[source] exclude` list.
+The primary project leaves that directory to the registered project. An existing profile name
+keeps its registered root; changing that root is refused.
+
+The profile command refuses a root that overlaps another registered project's root. A new
+profile root stays below the primary project; an existing external registration can receive
+language settings by profile name.
+
+### LSP profiles
+
+<VersionBadge version="v0.0.70" />
+
+A project can keep separate package installations in its root and in `docs/`. Named profiles
+use registered projects so each directory has its own language configuration and symbol identities:
+
+<Tabs items={["rift.toml", "docs/rift.toml"]}>
+
+<Tab value="rift.toml">
+
+Register the documentation project in the primary project's configuration:
+
+```toml
+[mcp.extra]
+docs = "docs"
+
+[source]
+exclude = ["docs/**"]
+
+[languages.typescript]
+lsp.command = ["node_modules/.bin/typescript-language-server", "--stdio"]
+```
+
+</Tab>
+
+<Tab value="docs/rift.toml">
+
+Select the documentation project's language server from its own configuration:
+
+```toml
+[languages.typescript]
+lsp.command = ["node_modules/.bin/typescript-language-server", "--stdio"]
+```
+
+</Tab>
+
+</Tabs>
+
+The `docs` registration starts a server rooted at `docs/`, whose language server reads that
+directory's package installation. Its symbols carry the `local@docs` owner, while the primary
+project's symbols carry `local`.
+
+Search selects the registered project with `scope: "local@docs"`.
+A `query` search with `scope: "all"` includes both projects and global facts.
+
+Relative registration paths start at the primary project root. Each registered project reads its
+own `rift.toml`; its `include` and `exclude` patterns are relative to its own root. Registrations
+in that file are not imported recursively.
+
+The primary project's `[source] exclude` entry leaves `docs/` to its registered project.
+
+### Language engines
 
 <VersionBadge version="v0.0.31" languages={["Python"]} />
 

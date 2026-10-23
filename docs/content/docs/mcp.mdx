@@ -201,6 +201,9 @@ served package in one answer:
 
 <ReadExample name="all-search" />
 
+Use `query` to combine registered projects under `all`. The returned page includes each hit's
+own `view`; pass that view with the hit's `id` when reading its symbol.
+
 For example, a project using Tokio can search its dependency declarations for `spawn_blocking`:
 
 ```json
