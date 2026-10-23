@@ -2,7 +2,7 @@
 # do not call ZipArchive::extract or ZipStreamReader::extract. Rift reads archive
 # entries into memory and validates Windows update members before writing them.
 # candle-core 0.11.0 reads tensor entries with by_index/by_name. Ruff's ruff_db and
-# ty_vendored 0.0.8 at 2b0d21094e2a55491bff60c07fd6f8803876cae5 read an in-memory
+# ty_vendored 0.0.14 at 11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a read an in-memory
 # archive or write the bundled typeshed archive; they do not extract archive paths
 # or permissions to the filesystem.
 #

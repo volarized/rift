@@ -13,7 +13,6 @@ certificate even where the Git configuration turns verification off.
 from __future__ import annotations
 
 import re
-
 import tomllib
 
 from rift_dev import repository

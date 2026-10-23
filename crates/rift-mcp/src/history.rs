@@ -105,7 +105,7 @@ pub(crate) fn store_revision(
         hasher.update([0]);
         hasher.update(release.as_bytes());
     }
-    format!("{:x}", hasher.finalize())
+    data_encoding::HEXLOWER.encode(&hasher.finalize())
 }
 
 fn owner_store_revision(
@@ -123,7 +123,7 @@ fn owner_store_revision(
     hasher.update(revision.as_bytes());
     hasher.update([0]);
     hasher.update(identity.as_bytes());
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(data_encoding::HEXLOWER.encode(&hasher.finalize()))
 }
 
 /// One server's history lane: the store handle every snapshot attaches.

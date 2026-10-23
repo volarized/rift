@@ -515,7 +515,8 @@ fn a_staged_pointer_edit_reverted_in_the_working_tree_answers_unchanged() {
 fn pointer_for(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
     let size = content.len();
-    format!("version https://git-lfs.github.com/spec/v1\noid sha256:{digest:x}\nsize {size}\n")
+    let digest = data_encoding::HEXLOWER.encode(&digest);
+    format!("version https://git-lfs.github.com/spec/v1\noid sha256:{digest}\nsize {size}\n")
 }
 
 #[test]

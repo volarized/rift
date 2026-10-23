@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import cast
 
 from rift_dev.check_artifact import (
     check_external_change,
@@ -171,7 +172,7 @@ async def declaration_node(client: Client, name: str) -> str:
         "nodes",
         {
             "path": string_value(declaration.get("path"), "declaration.path"),
-            "position": end - 1,
+            "position": cast(int, end) - 1,
             "view": string_value(view.get("id"), "view.id"),
         },
     )

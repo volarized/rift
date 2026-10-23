@@ -17,6 +17,7 @@ archive = ["dep:flate2", "dep:rawzip", "dep:tar", "dep:zip"]
 parallel = ["dep:rayon"]
 
 [dependencies]
+data-encoding.workspace = true
 get-size2.workspace = true
 ignore = { workspace = true, optional = true }
 rift-core.workspace = true

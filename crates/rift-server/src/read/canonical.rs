@@ -365,7 +365,7 @@ impl LocalSymbolViews {
         let mut hash = Sha256::new();
         hash.update(self.service_key);
         hash.update(state.serial.to_be_bytes());
-        Ok(format!("{:x}", hash.finalize()))
+        Ok(data_encoding::HEXLOWER.encode(&hash.finalize()))
     }
 
     /// Returns the retained view selected by a complete service-issued key.

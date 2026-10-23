@@ -153,7 +153,8 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
     await_workspace_ready(&client).await?;
 
     let identity = advertised_identity(&client)?;
-    let expected_schema_digest = format!("{:x}", Sha256::digest(schema::schema_document()));
+    let expected_schema_digest =
+        data_encoding::HEXLOWER.encode(&Sha256::digest(schema::schema_document()));
     assert_eq!(identity.schema_digest, expected_schema_digest);
     assert_eq!(
         identity.version,

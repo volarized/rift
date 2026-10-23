@@ -72,7 +72,7 @@ fn write_tokenizer_with(directory: &Path, post_process: bool) -> TestResult {
         .unk_token("[UNK]".to_owned())
         .build()?;
     let mut tokenizer = Tokenizer::new(model);
-    tokenizer.with_normalizer(Some(normalizers::BertNormalizer::default()));
+    tokenizer.with_normalizer(Some(normalizers::BertNormalizer::default()))?;
     tokenizer.with_pre_tokenizer(Some(pre_tokenizers::bert::BertPreTokenizer));
     if post_process {
         tokenizer.with_post_processor(Some(BertProcessing::new(
@@ -459,7 +459,6 @@ mod through_the_embedding_contract {
         QueryTransformation, RetrievalModels, RiftLocalDocumentModel, RiftLocalQueryModel,
         RiftOpenAiEmbeddingModel,
     };
-    use rig_core::embeddings::EmbeddingModel as _;
     use std::sync::Arc;
 
     /// The fixture model behind both handles, in its own space.
@@ -482,9 +481,8 @@ mod through_the_embedding_contract {
 
     #[tokio::test]
     async fn rig_builds_each_handle_from_the_encoder_it_was_handed() -> TestResult {
-        // Rift never calls `make`; the trait requires it, and a handle built from
-        // the wrong side of the encoder would be invisible until a Rig client of
-        // these models' own type existed.
+        // Constructing a handle must preserve the document and query sides of
+        // the loaded encoder.
         let directory = tempfile::tempdir()?;
         write_model(directory.path())?;
         let held = LocalEncoder::new(Arc::new(loaded(directory.path())?));
@@ -610,11 +608,11 @@ mod through_the_embedding_contract {
     #[test]
     fn a_local_handle_states_the_widest_batch_it_accepts() {
         assert_eq!(
-            <rift_search::RiftLocalDocumentModel as rig_core::embeddings::EmbeddingModel>::MAX_DOCUMENTS,
+            rift_search::RiftLocalDocumentModel::MAX_DOCUMENTS,
             LOCAL_INPUTS_MAX
         );
         assert_eq!(
-            <rift_search::RiftLocalQueryModel as rig_core::embeddings::EmbeddingModel>::MAX_DOCUMENTS,
+            rift_search::RiftLocalQueryModel::MAX_DOCUMENTS,
             LOCAL_INPUTS_MAX
         );
     }

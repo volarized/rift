@@ -76,7 +76,7 @@ pub fn content_chunk_identity(
 /// Returns the full SHA-256 digest of exact source bytes.
 #[must_use]
 pub fn content_digest(bytes: &[u8]) -> DocumentationDigest {
-    let full = format!("{:x}", Sha256::digest(bytes));
+    let full = data_encoding::HEXLOWER.encode(&Sha256::digest(bytes));
     DocumentationDigest(full)
 }
 

@@ -57,7 +57,7 @@ pub(crate) fn validated_root(root: &Path, owner: &SymbolOwner) -> Result<PathBuf
 fn identity_digest(root: &Path, owner: &SymbolOwner) -> Result<String, RiftError> {
     let canonical =
         canonical_json(&(root, owner)).map_err(|error| invalid(root, io::Error::other(error)))?;
-    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    Ok(data_encoding::HEXLOWER.encode(&Sha256::digest(canonical.as_bytes())))
 }
 
 fn invalid(root: &Path, source: io::Error) -> RiftError {

@@ -125,7 +125,7 @@ pub fn render_analyzer_manifest(root: &Path) -> Result<String, ManifestError> {
         for relative in found {
             let text = read_text(&root.join(&relative))?;
             sources.push(SourcePin {
-                digest: format!("{:x}", Sha256::digest(text.as_bytes())),
+                digest: data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes())),
                 path: relative,
             });
         }

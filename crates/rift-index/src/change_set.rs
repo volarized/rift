@@ -245,7 +245,7 @@ pub(crate) fn tree_revision_of<'a>(
         hasher.update(digest.as_bytes());
         hasher.update([TREE_REVISION_FILE_SEPARATOR]);
     }
-    format!("{:x}", hasher.finalize())
+    data_encoding::HEXLOWER.encode(&hasher.finalize())
 }
 
 /// What one rebuild covers.

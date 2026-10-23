@@ -653,9 +653,9 @@ fn archive_sha256(path: &Path) -> Result<String, RiftError> {
 /// `RELEASE_ARCHIVE_BYTES_MAX` first.
 fn sha256(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
-    let mut digest = Sha256::new();
+    let mut digest = digest_io::IoWrapper(Sha256::new());
     io::copy(&mut file, &mut digest)?;
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(data_encoding::HEXLOWER.encode(&digest.0.finalize()))
 }
 
 /// Read limit accepting one sentinel byte past `bytes_max` to detect oversized payloads.
@@ -1409,7 +1409,7 @@ mod tests {
         let archive = directory.path().join("rift.tar.gz");
         let manifest = directory.path().join("checksums");
         fs::write(&archive, b"archive")?;
-        let digest = format!("{:x}", Sha256::digest(b"archive"));
+        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(b"archive"));
         fs::write(&manifest, format!("{digest}  rift.tar.gz\n"))?;
         verify_checksum(&archive, &manifest, "rift.tar.gz")?;
 
@@ -1446,11 +1446,11 @@ mod tests {
         let executable = directory.path().join("rift-test-binary");
         let length = super::RELEASE_ARCHIVE_BYTES_MAX + 1;
         fs::File::create(&executable)?.set_len(length)?;
-        let mut expected = Sha256::new();
+        let mut expected = digest_io::IoWrapper(Sha256::new());
         std::io::copy(&mut std::io::repeat(0).take(length), &mut expected)?;
         assert_eq!(
             super::sha256(&executable)?,
-            format!("{:x}", expected.finalize())
+            data_encoding::HEXLOWER.encode(&expected.0.finalize())
         );
 
         let refused = super::archive_sha256(&executable)
@@ -2103,7 +2103,7 @@ mod tests {
         let error =
             verify_checksum(&archive, &manifest, "rift.tar.gz").expect_err("mismatch must fail");
         let text = error.to_string();
-        let actual = format!("{:x}", Sha256::digest(b"archive"));
+        let actual = data_encoding::HEXLOWER.encode(&Sha256::digest(b"archive"));
         assert!(text.starts_with("the downloaded release does not match its published checksum"));
         assert!(text.contains(&expected));
         assert!(text.contains(&actual));
@@ -2120,7 +2120,7 @@ mod tests {
         let archive = directory.path().join("rift.tar.gz");
         let manifest = directory.path().join("checksums");
         fs::write(&archive, b"archive")?;
-        let digest = format!("{:x}", Sha256::digest(b"archive"));
+        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(b"archive"));
         let mut overflowing = String::new();
         for index in 0..=super::CHECKSUM_ENTRY_COUNT_MAX {
             writeln!(overflowing, "{digest}  other-{index}.tar.gz")?;
@@ -2246,7 +2246,7 @@ mod tests {
         let archive_path = build.path().join(&artifact.archive_name);
         write_tar_gz(&archive_path, &release_members(&artifact))?;
         let archive = fs::read(&archive_path)?;
-        let digest = format!("{:x}", Sha256::digest(&archive));
+        let digest = data_encoding::HEXLOWER.encode(&Sha256::digest(&archive));
         let manifest = format!("{digest}  {}\n", artifact.archive_name).into_bytes();
 
         let staging = tempfile::tempdir()?;

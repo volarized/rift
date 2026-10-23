@@ -1,20 +1,18 @@
 //! Model dispatch for the vector ranking.
 //!
-//! Rig owns the `EmbeddingModel` contract: one trait every model this crate can
-//! run implements, so search, fusion, `SQLite`, and MCP call one method however
-//! the vectors are produced. Adding a model family changes the loader and the
-//! adapter tests alone.
+//! Rig owns model dispatch: every adapter implements its embedding transport,
+//! so search, fusion, `SQLite`, and MCP call one method however the vectors are
+//! produced. Adding a model family changes the loader and the adapter tests alone.
 //!
 //! Rift keeps what Rig does not: acquiring the weights, running the local
 //! encoder, scheduling batches under the operator's bounds, converting the
 //! coordinates once at the boundary, and recording the space a corpus was
 //! embedded into.
 //!
-//! The OpenAI-compatible arm builds on Rig's own client - its builder takes the
-//! key, the base URL, and the workspace's timeout-configured HTTP client - but
-//! decodes the response here. Rig 0.42.0 parses each response `index` and then
-//! zips the response array with the input array positionally
-//! (`src/providers/openai/embedding.rs`), so a service answering out of order
+//! The OpenAI-compatible arm uses Rig's HTTP transport and provider configuration,
+//! but builds the request body and decodes the response here. Rig 0.45.0 ignores
+//! each response `index` and pairs vectors with inputs positionally
+//! (`src/providers/openai/wire/modality.rs`), so a service answering out of order
 //! would attach every vector to the wrong declaration. Nothing in Rift's
 //! contract makes array order meaningful: the response `index` decides, and a
 //! duplicate, missing, or out-of-range index is refused.
@@ -24,9 +22,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use data_encoding::HEXLOWER;
-use rig_core::embeddings::{Embedding, EmbeddingError, EmbeddingModel};
-use rig_core::http_client::{Error as HttpClientError, HttpClientExt as _};
+use rig_core::driver::{Exchange, Local, Opened, Opening, Step, Transport};
+use rig_core::embeddings::{Embedding, EmbeddingResponse};
+use rig_core::error::ProviderError;
+use rig_core::http_client::{Error as HttpClientError, HttpClientExt, Request};
+use rig_core::operation::Embedding as EmbeddingOperation;
 use rig_core::providers::openai;
+use rig_core::wire::Capabilities;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
@@ -246,10 +248,8 @@ impl<DocumentModel, QueryModel> RetrievalModels<DocumentModel, QueryModel> {
 
 /// Every model family this crate can run.
 ///
-/// One enum with concrete pairs rather than a trait object: Rig's
-/// `EmbeddingModel` returns an opaque future and takes `impl IntoIterator`, so
-/// it is not dyn-compatible. Each method matches once and hands the concrete
-/// model to a generic helper, which is where the compiler picks the arm.
+/// Each method matches once and hands its adapter to Rig's model driver.
+/// Both local handles share the encoder, while remote handles share one HTTP client.
 #[derive(Clone, Debug)]
 pub enum EmbeddingModels {
     /// An encoder this process loaded and runs.
@@ -295,8 +295,26 @@ impl EmbeddingModels {
         schedule: BatchSchedule,
     ) -> Result<Vec<Vec<f32>>, RiftError> {
         match self {
-            Self::Local(pair) => embed_all(&pair.documents, texts, schedule, pair.space()).await,
-            Self::OpenAi(pair) => embed_all(&pair.documents, texts, schedule, pair.space()).await,
+            Self::Local(pair) => {
+                embed_all(
+                    &pair.documents,
+                    texts,
+                    schedule,
+                    pair.space(),
+                    LOCAL_INPUTS_MAX,
+                )
+                .await
+            }
+            Self::OpenAi(pair) => {
+                embed_all(
+                    &pair.documents,
+                    texts,
+                    schedule,
+                    pair.space(),
+                    REMOTE_INPUTS_MAX,
+                )
+                .await
+            }
         }
     }
 
@@ -309,10 +327,24 @@ impl EmbeddingModels {
         let schedule = BatchSchedule::new(1, 1);
         let embedded = match self {
             Self::Local(pair) => {
-                embed_all(&pair.query, vec![text.to_owned()], schedule, pair.space()).await
+                embed_all(
+                    &pair.query,
+                    vec![text.to_owned()],
+                    schedule,
+                    pair.space(),
+                    LOCAL_INPUTS_MAX,
+                )
+                .await
             }
             Self::OpenAi(pair) => {
-                embed_all(&pair.query, vec![text.to_owned()], schedule, pair.space()).await
+                embed_all(
+                    &pair.query,
+                    vec![text.to_owned()],
+                    schedule,
+                    pair.space(),
+                    REMOTE_INPUTS_MAX,
+                )
+                .await
             }
         }?;
         embedded.into_iter().next().ok_or_else(|| {
@@ -327,27 +359,32 @@ impl EmbeddingModels {
 /// input slot.
 ///
 /// Batches are cut to the lower of the configured `batch_inputs` and the
-/// model's own `MAX_DOCUMENTS`, and at most `max_in_flight` of them are open
+/// model's own input limit, and at most `max_in_flight` of them are open
 /// at once. A completed batch returns to the slots its inputs came from, so
 /// concurrency never reorders the answer.
 ///
-/// The count is checked after the batches are joined as well as inside each
-/// one: the remote arm refuses a wrong count per response, and this is where
-/// a local model that answered a short batch is caught before a caller pairs
-/// the vectors with its declarations by position.
+/// Rig refuses a wrong vector count per batch before pairing vectors with
+/// their inputs. Rift validates each response index before the remote batch
+/// reaches that check.
 async fn embed_all<Model>(
-    model: &Model,
+    transport: &Model,
     texts: Vec<String>,
     schedule: BatchSchedule,
     space: &EmbeddingSpace,
+    documents_max: usize,
 ) -> Result<Vec<Vec<f32>>, RiftError>
 where
-    Model: EmbeddingModel + Clone + Send + Sync + 'static,
+    Model: Transport<Local<EmbeddingOperation>>,
 {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
-    let batch = schedule.batch_for(Model::MAX_DOCUMENTS);
+    let model = rig_core::Model::new(
+        Local::<EmbeddingOperation>::new(space.kind)
+            .with_capabilities(Capabilities::embedding(documents_max, space.dimensions())),
+        transport.clone(),
+    );
+    let batch = schedule.batch_for(model.capabilities().max_documents);
     let chunks: Vec<Vec<String>> = texts.chunks(batch).map(<[String]>::to_vec).collect();
     let mut placed: Vec<Option<Vec<Vec<f32>>>> = vec![None; chunks.len()];
     let mut running = tokio::task::JoinSet::new();
@@ -358,7 +395,11 @@ where
         let model = model.clone();
         let width = space.dimensions();
         running.spawn(async move {
-            let embedded = model.embed_texts(chunk).await;
+            let embedded = model
+                .call(chunk)
+                .await
+                .map_err(Box::new)
+                .map(|response| response.embeddings);
             (position, embedded.map(|held| narrowed(held, width)))
         });
     }
@@ -373,22 +414,13 @@ where
                 .error()
         })?);
     }
-    if answered.len() != texts.len() {
-        return errors::search::encode_failed()
-            .stage(format!(
-                "{} vectors for {} inputs",
-                answered.len(),
-                texts.len()
-            ))
-            .fail();
-    }
     Ok(answered)
 }
 
 /// The batch type one scheduled embedding task answers with.
 type BatchAnswer = (
     usize,
-    Result<Result<Vec<Vec<f32>>, RiftError>, EmbeddingError>,
+    Result<Result<Vec<Vec<f32>>, RiftError>, Box<ProviderError>>,
 );
 
 /// Waits for one batch and files it under the position its inputs came from.
@@ -455,9 +487,8 @@ fn stored_coordinate(value: f64) -> Option<f32> {
 
 /// The already loaded encoder a local model handle is cloned from.
 ///
-/// Acquiring the files, reading them, and detecting the family are fallible
-/// and all finish before this exists. Rig's `make` is infallible, so it may
-/// only clone a handle that is already ready.
+/// Acquiring the files, reading them, and detecting the family finish before
+/// this exists. Each handle clones the encoder that is already ready.
 #[derive(Clone, Debug)]
 pub struct LocalEncoder {
     encoder: Arc<Encoder>,
@@ -504,23 +535,31 @@ pub struct RiftLocalQueryModel {
     encoder: Arc<Encoder>,
 }
 
-impl EmbeddingModel for RiftLocalDocumentModel {
-    const MAX_DOCUMENTS: usize = LOCAL_INPUTS_MAX;
+impl RiftLocalDocumentModel {
+    /// Inputs one local embedding call may carry, at most.
+    pub const MAX_DOCUMENTS: usize = LOCAL_INPUTS_MAX;
 
-    type Client = LocalEncoder;
-
-    fn make(client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+    /// Clones the documents handle from the loaded encoder.
+    #[must_use]
+    pub fn make(client: &LocalEncoder, _model: impl Into<String>, _dims: Option<usize>) -> Self {
         client.documents()
     }
 
-    fn ndims(&self) -> usize {
+    /// The width every returned vector carries.
+    #[must_use]
+    pub fn ndims(&self) -> usize {
         self.encoder.dimension()
     }
 
-    async fn embed_texts(
+    /// Embeds the supplied inputs in their original order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder or transport failure when a batch cannot be embedded.
+    pub async fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
+    ) -> Result<Vec<Embedding>, Box<ProviderError>> {
         let texts: Vec<String> = texts.into_iter().collect();
         let encoder = Arc::clone(&self.encoder);
         let asked = texts.clone();
@@ -532,23 +571,31 @@ impl EmbeddingModel for RiftLocalDocumentModel {
     }
 }
 
-impl EmbeddingModel for RiftLocalQueryModel {
-    const MAX_DOCUMENTS: usize = LOCAL_INPUTS_MAX;
+impl RiftLocalQueryModel {
+    /// Inputs one local embedding call may carry, at most.
+    pub const MAX_DOCUMENTS: usize = LOCAL_INPUTS_MAX;
 
-    type Client = LocalEncoder;
-
-    fn make(client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
+    /// Clones the query handle from the loaded encoder.
+    #[must_use]
+    pub fn make(client: &LocalEncoder, _model: impl Into<String>, _dims: Option<usize>) -> Self {
         client.query()
     }
 
-    fn ndims(&self) -> usize {
+    /// The width every returned vector carries.
+    #[must_use]
+    pub fn ndims(&self) -> usize {
         self.encoder.dimension()
     }
 
-    async fn embed_texts(
+    /// Embeds the supplied inputs in their original order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder or transport failure when a batch cannot be embedded.
+    pub async fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
+    ) -> Result<Vec<Embedding>, Box<ProviderError>> {
         let texts: Vec<String> = texts.into_iter().collect();
         let encoder = Arc::clone(&self.encoder);
         let asked = texts.clone();
@@ -579,13 +626,13 @@ fn paired(texts: Vec<String>, embedded: Vec<Vec<f32>>) -> Vec<Embedding> {
 }
 
 /// A blocking encoder task that did not return, as Rig's own failure.
-fn joined(source: tokio::task::JoinError) -> EmbeddingError {
-    EmbeddingError::DocumentError(Box::new(source))
+fn joined(source: tokio::task::JoinError) -> Box<ProviderError> {
+    Box::new(ProviderError::request(source))
 }
 
 /// One encoder refusal, as Rig's own failure.
-fn encoded(source: RiftError) -> EmbeddingError {
-    EmbeddingError::DocumentError(Box::new(source))
+fn encoded(source: RiftError) -> Box<ProviderError> {
+    Box::new(ProviderError::request(source))
 }
 
 /// What one OpenAI-compatible endpoint needs before a model can be built.
@@ -628,13 +675,14 @@ impl std::fmt::Debug for RemoteEmbeddingSettings {
 
 /// One model served by an endpoint speaking the `OpenAI` embedding shape.
 ///
-/// Rig's client carries the credential, the base URL, and the workspace's
-/// timeout-configured HTTP client. The request body and the response decode
-/// are Rift's, because Rig 0.42.0 associates each returned vector with an
-/// input by array position and ignores the `index` the service declared.
+/// Rig's provider configuration carries the credential and the base URL; its
+/// HTTP transport wraps the workspace's timeout-configured client. Rift keeps
+/// the configured dimensions in every request and restores response order from
+/// each declared `index`, which Rig's `OpenAI` decoder ignores.
 #[derive(Clone)]
 pub struct RiftOpenAiEmbeddingModel {
-    client: openai::Client<reqwest::Client>,
+    client: rig_reqwest::ReqwestClient,
+    provider: Arc<openai::OpenAIConfig>,
     model: String,
     dimensions: usize,
     attempts: u32,
@@ -652,22 +700,12 @@ impl std::fmt::Debug for RiftOpenAiEmbeddingModel {
 }
 
 impl RiftOpenAiEmbeddingModel {
-    /// Builds one model over `settings`, through Rig's own client builder.
-    ///
-    /// The builder takes the credential, the configured base URL, and an HTTP
-    /// client carrying the configured request timeout. Rig's
-    /// `Client::from_env` is deliberately not used: it fixes the credential
-    /// and endpoint variable names, which the `api_key_env` key exists to
-    /// choose.
+    /// Builds one model over the configured endpoint, credential, and timeout.
     ///
     /// # Errors
     ///
-    /// Returns `model_source_invalid` when the HTTP client cannot be built or
-    /// the endpoint cannot be used as a base URL. Neither arm is reachable from
-    /// a test: `reqwest`'s builder fails only when its TLS backend cannot start,
-    /// and Rig 0.42.0 never constructs `ClientBuilderError::InvalidProperty`, so
-    /// its builder carries no validation of its own. Acceptance refuses a
-    /// malformed endpoint before it reaches here.
+    /// Returns `model_source_invalid` when the HTTP client cannot be built.
+    /// Configuration acceptance validates the endpoint before construction.
     pub fn new(settings: &RemoteEmbeddingSettings) -> Result<Self, RiftError> {
         let http = reqwest::Client::builder()
             .timeout(settings.request_timeout)
@@ -679,20 +717,11 @@ impl RiftOpenAiEmbeddingModel {
                     .source(source)
                     .error()
             })?;
-        let client = openai::Client::builder()
-            .api_key(settings.api_key.clone())
-            .base_url(settings.endpoint.clone())
-            .http_client(http)
-            .build()
-            .map_err(|source| {
-                errors::search::model_source_invalid()
-                    .model("OpenAI-compatible endpoint")
-                    .expected("a valid base URL")
-                    .source(source)
-                    .error()
-            })?;
+        let provider = openai::OpenAIConfig::new(settings.api_key.clone())
+            .with_base_url(settings.endpoint.clone());
         Ok(Self {
-            client,
+            client: rig_reqwest::ReqwestClient::from(http),
+            provider: Arc::new(provider),
             model: settings.model.clone(),
             dimensions: settings.dimensions,
             attempts: settings.attempts,
@@ -706,7 +735,7 @@ impl RiftOpenAiEmbeddingModel {
     /// because the service answers a malformed body, a rejected credential,
     /// and an unknown model the same way however often they are sent; a
     /// transient one is retried up to the configured attempt count.
-    async fn request(&self, inputs: &[String]) -> Result<Vec<Vec<f64>>, EmbeddingError> {
+    async fn request(&self, inputs: &[String]) -> Result<Vec<Vec<f64>>, Box<ProviderError>> {
         let mut attempted = self.attempt(inputs).await;
         let mut remaining = self.attempts.saturating_sub(1);
         while remaining > 0 && attempted.as_ref().is_err_and(AttemptFailure::is_transient) {
@@ -719,7 +748,7 @@ impl RiftOpenAiEmbeddingModel {
     /// One request and one decode.
     ///
     /// A non-success status never reaches a response here: the transport
-    /// refuses it first (`rig_core::http_client`'s `into_lazy_response`), so
+    /// refuses it first (`rig-reqwest`'s `into_response`), so
     /// the status the retry reads rides on the transport failure.
     async fn attempt(&self, inputs: &[String]) -> Result<Vec<Vec<f64>>, AttemptFailure> {
         let body = serde_json::to_vec(&EmbeddingRequestBody {
@@ -727,24 +756,28 @@ impl RiftOpenAiEmbeddingModel {
             input: inputs,
             dimensions: self.dimensions,
         })
-        .map_err(|error| AttemptFailure::refused(error.into()))?;
-        let request = self
-            .client
-            .post(EMBEDDINGS_PATH)
-            .map_err(|error| AttemptFailure::refused(error.into()))?
-            .body(body)
-            .map_err(|error| AttemptFailure::refused(EmbeddingError::HttpError(error.into())))?;
-        let response = self
-            .client
-            .send(request)
+        .map_err(|error| AttemptFailure::refused(Box::new(error.into())))?;
+        let request = Request::post(format!(
+            "{}{}",
+            self.provider.base_url.trim_end_matches('/'),
+            EMBEDDINGS_PATH
+        ))
+        .header("Content-Type", "application/json")
+        .header(
+            "Authorization",
+            format!("Bearer {}", self.provider.api_key.expose()),
+        )
+        .body(body)
+        .map_err(|error| AttemptFailure::refused(Box::new(ProviderError::request(error))))?;
+        let response = HttpClientExt::send(&self.client, request)
             .await
-            .map_err(|error| AttemptFailure::new(outcome_of(&error), error.into()))?;
+            .map_err(|error| AttemptFailure::new(outcome_of(&error), Box::new(error.into())))?;
         let received: Vec<u8> = response
             .into_body()
             .await
-            .map_err(|error| AttemptFailure::transient(error.into()))?;
+            .map_err(|error| AttemptFailure::transient(Box::new(error.into())))?;
         let decoded: EmbeddingResponseBody = serde_json::from_slice(&received)
-            .map_err(|error| AttemptFailure::refused(error.into()))?;
+            .map_err(|error| AttemptFailure::refused(Box::new(error.into())))?;
         placed_by_index(decoded.data, inputs.len()).map_err(AttemptFailure::refused)
     }
 }
@@ -763,22 +796,22 @@ enum AttemptOutcome {
 #[derive(Debug)]
 struct AttemptFailure {
     outcome: AttemptOutcome,
-    error: EmbeddingError,
+    error: Box<ProviderError>,
 }
 
 impl AttemptFailure {
     /// Names the outcome and the failure it carries.
-    const fn new(outcome: AttemptOutcome, error: EmbeddingError) -> Self {
+    const fn new(outcome: AttemptOutcome, error: Box<ProviderError>) -> Self {
         Self { outcome, error }
     }
 
     /// A failure another attempt could answer differently.
-    const fn transient(error: EmbeddingError) -> Self {
+    const fn transient(error: Box<ProviderError>) -> Self {
         Self::new(AttemptOutcome::Transient, error)
     }
 
     /// A failure every repeat of this request would meet again.
-    const fn refused(error: EmbeddingError) -> Self {
+    const fn refused(error: Box<ProviderError>) -> Self {
         Self::new(AttemptOutcome::Refused, error)
     }
 
@@ -788,7 +821,7 @@ impl AttemptFailure {
     }
 
     /// The failure this attempt carries.
-    fn into_error(self) -> EmbeddingError {
+    fn into_error(self) -> Box<ProviderError> {
         self.error
     }
 }
@@ -799,19 +832,9 @@ impl AttemptFailure {
 /// which another attempt can answer. A failure carrying one is classified by
 /// [`outcome_of_status`].
 fn outcome_of(error: &HttpClientError) -> AttemptOutcome {
-    match status_of(error) {
+    match error.non_success_status().map(|status| status.as_u16()) {
         Some(status) => outcome_of_status(status),
         None => AttemptOutcome::Transient,
-    }
-}
-
-/// The status one transport failure declares, absent when it carries none.
-const fn status_of(error: &HttpClientError) -> Option<u16> {
-    match error {
-        HttpClientError::InvalidStatusCode(status)
-        | HttpClientError::InvalidStatusCodeWithMessage(status, _)
-        | HttpClientError::InvalidStatusCodeWithDetails { status, .. } => Some(status.as_u16()),
-        _ => None,
     }
 }
 
@@ -863,20 +886,20 @@ struct EmbeddingDatum {
 fn placed_by_index(
     data: Vec<EmbeddingDatum>,
     inputs: usize,
-) -> Result<Vec<Vec<f64>>, EmbeddingError> {
+) -> Result<Vec<Vec<f64>>, Box<ProviderError>> {
     if data.len() != inputs {
-        return Err(EmbeddingError::ResponseError(format!(
+        return Err(Box::new(ProviderError::Response(format!(
             "the embedding response carries {} vectors for {inputs} inputs",
             data.len()
-        )));
+        ))));
     }
     let mut placed: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
     for datum in data {
         let index = datum.index;
         if index >= inputs || placed.insert(index, datum.embedding).is_some() {
-            return Err(EmbeddingError::ResponseError(format!(
+            return Err(Box::new(ProviderError::Response(format!(
                 "the embedding response declares index {index} for {inputs} inputs"
-            )));
+            ))));
         }
     }
     // The response carries `inputs` vectors, every declared index is distinct
@@ -885,12 +908,21 @@ fn placed_by_index(
     Ok(placed.into_values().collect())
 }
 
-impl EmbeddingModel for RiftOpenAiEmbeddingModel {
-    const MAX_DOCUMENTS: usize = REMOTE_INPUTS_MAX;
+impl RiftOpenAiEmbeddingModel {
+    /// Inputs one remote embedding call may carry, at most.
+    pub const MAX_DOCUMENTS: usize = REMOTE_INPUTS_MAX;
 
-    type Client = RemoteEmbeddingSettings;
-
-    fn make(client: &Self::Client, model: impl Into<String>, dims: Option<usize>) -> Self {
+    /// Builds the named model with the supplied width, or the configured width.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the accepted settings cannot build an HTTP client.
+    #[must_use]
+    pub fn make(
+        client: &RemoteEmbeddingSettings,
+        model: impl Into<String>,
+        dims: Option<usize>,
+    ) -> Self {
         let mut settings = client.clone();
         settings.model = model.into();
         settings.dimensions = dims.unwrap_or(settings.dimensions);
@@ -899,14 +931,21 @@ impl EmbeddingModel for RiftOpenAiEmbeddingModel {
         })
     }
 
-    fn ndims(&self) -> usize {
+    /// The width every returned vector carries.
+    #[must_use]
+    pub fn ndims(&self) -> usize {
         self.dimensions
     }
 
-    async fn embed_texts(
+    /// Embeds the supplied inputs in their original order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the encoder or transport failure when a batch cannot be embedded.
+    pub async fn embed_texts(
         &self,
         texts: impl IntoIterator<Item = String> + Send,
-    ) -> Result<Vec<Embedding>, EmbeddingError> {
+    ) -> Result<Vec<Embedding>, Box<ProviderError>> {
         let texts: Vec<String> = texts.into_iter().collect();
         if texts.is_empty() {
             return Ok(Vec::new());
@@ -920,6 +959,40 @@ impl EmbeddingModel for RiftOpenAiEmbeddingModel {
     }
 }
 
+impl Transport<Local<EmbeddingOperation>> for RiftLocalDocumentModel {
+    fn send(&self, texts: Vec<String>, _exchange: Exchange) -> Opening<Step<EmbeddingOperation>> {
+        let model = self.clone();
+        embedding_reply(async move { model.embed_texts(texts).await })
+    }
+}
+
+impl Transport<Local<EmbeddingOperation>> for RiftLocalQueryModel {
+    fn send(&self, texts: Vec<String>, _exchange: Exchange) -> Opening<Step<EmbeddingOperation>> {
+        let model = self.clone();
+        embedding_reply(async move { model.embed_texts(texts).await })
+    }
+}
+
+impl Transport<Local<EmbeddingOperation>> for RiftOpenAiEmbeddingModel {
+    fn send(&self, texts: Vec<String>, _exchange: Exchange) -> Opening<Step<EmbeddingOperation>> {
+        let model = self.clone();
+        embedding_reply(async move { model.embed_texts(texts).await })
+    }
+}
+
+/// Opens the response one adapter returns through Rig's embedding driver.
+fn embedding_reply(
+    embedded: impl Future<Output = Result<Vec<Embedding>, Box<ProviderError>>> + Send + 'static,
+) -> Opening<Step<EmbeddingOperation>> {
+    Opening::ready(Opened::new(futures_util::stream::once(async move {
+        embedded
+            .await
+            .map_err(|error| *error)
+            .map(EmbeddingResponse::new)
+            .map(Step::End)
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -928,7 +1001,9 @@ mod tests {
         embed_all, narrowed, outcome_of, outcome_of_status, placed_by_index, stored_coordinate,
     };
     use rift_error::errors;
-    use rig_core::embeddings::{Embedding, EmbeddingModel};
+    use rig_core::driver::{Exchange, Local, Opening, Step, Transport};
+    use rig_core::embeddings::Embedding;
+    use rig_core::operation::Embedding as EmbeddingOperation;
     use std::time::Duration;
 
     fn datum(index: usize, value: f64) -> EmbeddingDatum {
@@ -1116,33 +1191,20 @@ mod tests {
     #[derive(Clone)]
     struct ShortModel;
 
-    impl EmbeddingModel for ShortModel {
-        const MAX_DOCUMENTS: usize = 8;
-
-        type Client = ();
-
-        fn make(_client: &Self::Client, _model: impl Into<String>, _dims: Option<usize>) -> Self {
-            Self
-        }
-
-        fn ndims(&self) -> usize {
-            1
-        }
-
-        fn embed_texts(
+    impl Transport<Local<EmbeddingOperation>> for ShortModel {
+        fn send(
             &self,
-            texts: impl IntoIterator<Item = String> + Send,
-        ) -> impl Future<Output = Result<Vec<Embedding>, rig_core::embeddings::EmbeddingError>> + Send
-        {
-            let mut texts: Vec<String> = texts.into_iter().collect();
+            mut texts: Vec<String>,
+            _exchange: Exchange,
+        ) -> Opening<Step<EmbeddingOperation>> {
             texts.pop();
-            std::future::ready(Ok(texts
+            super::embedding_reply(std::future::ready(Ok(texts
                 .into_iter()
                 .map(|document| Embedding {
                     document,
                     vec: vec![1.0],
                 })
-                .collect()))
+                .collect())))
         }
     }
 
@@ -1158,12 +1220,13 @@ mod tests {
             vec!["one".to_owned(), "two".to_owned()],
             BatchSchedule::new(8, 1),
             &space,
+            8,
         )
         .await
         .expect_err("a short answer must be refused");
         assert_eq!(refused.slug(), errors::search::encode_failed::SLUG);
         assert!(
-            format!("{refused}").contains("1 vectors for 2 inputs"),
+            format!("{refused}").contains("1 embeddings for 2 documents"),
             "the refusal names both counts: {refused}"
         );
     }
@@ -1197,9 +1260,7 @@ mod tests {
 
     #[test]
     fn test_the_model_rig_builds_carries_the_name_and_width_it_was_given() {
-        // Rift never calls `make`; the trait requires it, and an implementation
-        // that dropped the arguments would be invisible until a Rig client of
-        // this model's own type existed.
+        // The configured model name and width must survive construction.
         let built = RiftOpenAiEmbeddingModel::make(&remote_settings(), "other-model", Some(256));
         let rendered = format!("{built:?}");
         assert!(rendered.contains("other-model"), "{rendered}");

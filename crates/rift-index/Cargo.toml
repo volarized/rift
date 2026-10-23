@@ -11,6 +11,7 @@ description = "Persistent indexing and retrieval for Rift"
 workspace = true
 
 [dependencies]
+data-encoding.workspace = true
 get-size2.workspace = true
 async-trait.workspace = true
 ignore.workspace = true

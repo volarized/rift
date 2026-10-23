@@ -149,10 +149,7 @@ pub fn product_identity_of(
 fn schema_digest() -> &'static str {
     static DIGEST: OnceLock<String> = OnceLock::new();
     DIGEST.get_or_init(|| {
-        format!(
-            "{:x}",
-            Sha256::digest(crate::schema::schema_document().as_bytes())
-        )
+        data_encoding::HEXLOWER.encode(&Sha256::digest(crate::schema::schema_document().as_bytes()))
     })
 }
 

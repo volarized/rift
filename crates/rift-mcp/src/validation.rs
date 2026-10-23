@@ -929,7 +929,7 @@ impl ConfigurationState {
             "dependencies": configuration.dependencies,
             "syntax": configuration.providers.syntax,
         });
-        format!("{:x}", Sha256::digest(tables.to_string().as_bytes()))
+        data_encoding::HEXLOWER.encode(&Sha256::digest(tables.to_string().as_bytes()))
     }
 
     /// The `[providers.syntax]` bounds from the last acceptance, or the defaults while
@@ -2843,7 +2843,7 @@ pub(crate) fn derivation_revision(
     hasher.update(rift_ranking::CorpusRevision::current().as_str().as_bytes());
     hasher.update([0]);
     hasher.update(configuration.index_configuration_digest().as_bytes());
-    format!("{:x}", hasher.finalize())
+    data_encoding::HEXLOWER.encode(&hasher.finalize())
 }
 
 /// What one lexical commit writes.

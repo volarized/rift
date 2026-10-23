@@ -17,6 +17,7 @@ import re
 import shutil
 import threading
 import time
+import tomllib
 import traceback
 import xml.etree.ElementTree as ET
 from collections.abc import (
@@ -35,7 +36,6 @@ from types import TracebackType
 from typing import BinaryIO, NamedTuple, Self, TextIO, TypeAlias, cast
 
 import psutil
-import tomllib
 from jsonschema import Draft202012Validator
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client

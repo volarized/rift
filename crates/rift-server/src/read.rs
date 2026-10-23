@@ -2044,7 +2044,7 @@ pub fn wire_digest(full: &str) -> Digest {
 /// Renders one already-computed SHA-256 digest in the `DIGEST_WIRE_CHARS` wire form, the
 /// truncation behind [`digest_hex8`] and the minted `ChangeId`.
 pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
-    format!("{digest:x}")[..DIGEST_WIRE_CHARS].to_owned()
+    data_encoding::HEXLOWER.encode(digest)[..DIGEST_WIRE_CHARS].to_owned()
 }
 
 /// Finds the symbol a witnessed syntax node belongs to.

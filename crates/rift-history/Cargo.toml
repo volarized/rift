@@ -11,6 +11,8 @@ description = "Version-control access for Rift workspaces"
 workspace = true
 
 [dependencies]
+digest-io.workspace = true
+data-encoding.workspace = true
 gix.workspace = true
 rift-core.workspace = true
 rift-error.workspace = true

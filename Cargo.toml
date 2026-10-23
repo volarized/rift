@@ -9,7 +9,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "0.0.68"
+version = "0.0.69"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
@@ -52,11 +52,12 @@ candle-nn = { version = "0.11.0", default-features = false }
 candle-transformers = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.5", features = ["derive"] }
 data-encoding = "2.6.0"
+digest-io = "=0.1.0"
 getrandom = { version = "0.4.3", features = ["std"] }
-get-size2 = "=0.10.3"
+get-size2 = "=0.11.1"
 flate2 = "1.1.9"
 fs4 = "1.1.0"
-gix = { version = "0.86.0", default-features = false, features = ["revision", "sha1", "status"] }
+gix = { version = "0.90.0", default-features = false, features = ["revision", "sha1", "status"] }
 globset = { version = "0.4.20", default-features = false }
 http = "1.4"
 ignore = { version = "0.4.23", default-features = false }
@@ -121,8 +122,9 @@ regex-automata = { version = "0.4.18", default-features = false, features = [
     "unicode",
 ] }
 regex-syntax = "0.8.11"
-rig-core = { version = "=0.42.0", default-features = false }
-# The version toasty-driver-sqlite 0.10.0 already builds, so the history store links no
+rig-core = { version = "=0.45.0", default-features = false }
+rig-reqwest = { version = "=0.45.0", default-features = false }
+# The version toasty-driver-sqlite 0.11.0 already builds, so the history store links no
 # second SQLite.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
 rmcp = { version = "=3.6.0", default-features = false, features = ["macros", "server", "transport-io"] }
@@ -136,15 +138,15 @@ serde_path_to_error = "0.1.20"
 serde_json_lenient = "0.2.4"
 serde_with = "3.21"
 strum = { version = "0.28.0", features = ["derive"] }
-sha2 = "=0.10.9"
+sha2 = "=0.11.1"
 tar = "0.4.46"
-toasty = { version = "=0.10.0", default-features = false, features = ["migration", "sqlite"] }
-toasty-core = "=0.10.0"
-toasty-driver-sqlite = "=0.10.0"
-# candle-core has a non-optional `tokenizers 0.22` dependency with the `onig` backend on
-# every non-wasm target, so the version is pinned to match it: a second tokenizers would
-# be a duplicate the dependency policy refuses, and could not avoid onig either.
-tokenizers = { version = "0.22.2", default-features = false }
+toasty = { version = "=0.11.0", default-features = false, features = ["migration", "sqlite"] }
+toasty-core = "=0.11.0"
+toasty-driver-sqlite = "=0.11.0"
+# candle-core still requires tokenizers 0.22 internally. Rift's encoder owns its
+# tokenizer and passes token ids to candle tensors, so the types do not cross
+# this boundary. Keep the onig backend on both versions.
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 toml_edit = { version = "=0.25.15", default-features = false, features = ["parse", "display"] }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 syn = { version = "2.0.119", features = ["full"] }
@@ -190,13 +192,13 @@ unicode-width = "0.2.2"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # Embedded ty: git dependencies pinned to the ruff submodule sha of ty release
-# 0.0.71. ty_project and ty_ide are unpublished, so git is the only route.
-ty_project = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
-ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
-ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5", features = ["os"] }
-ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
-ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
-ty_python_core = { git = "https://github.com/astral-sh/ruff", rev = "2b0d21094e2a55491bff60c07fd6f8803876cae5" }
+# 0.0.84. ty_project and ty_ide are unpublished, so git is the only route.
+ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a", features = ["os"] }
+ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+ruff_text_size = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+ty_python_core = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

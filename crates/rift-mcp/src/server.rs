@@ -7270,7 +7270,8 @@ done
         advertised.sort_by(|left, right| left.name.cmp(&right.name));
 
         let schema_document = crate::schema::schema_document();
-        let schema_digest = format!("{:x}", Sha256::digest(schema_document.as_bytes()));
+        let schema_digest =
+            data_encoding::HEXLOWER.encode(&Sha256::digest(schema_document.as_bytes()));
         let peer_info = client
             .peer_info()
             .ok_or("initialize must advertise server information")?;

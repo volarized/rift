@@ -25,7 +25,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: tools/rift-release/uv.lock
@@ -83,7 +83,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.2.0
+      # Cargo's libgit2 checkout needs this for Ruff's snapshot paths.
+      - name: Enable long Git paths
+        if: ${{ runner.os == 'Windows' }}
+        run: git config --global core.longpaths true
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -96,7 +100,7 @@ jobs:
           shared-key: ${{ matrix.registry }}
           cache-targets: false
           save-if: false
-      - uses: taiki-e/install-action@v2.87.24
+      - uses: taiki-e/install-action@v2.87.29
         with:
           tool: sccache@0.18.0
       # The build passes no `--target`, so RUSTFLAGS reaches proc-macros too;
@@ -130,7 +134,7 @@ jobs:
           uv run --locked --project dev rift-dev artifact
           --binary "${{ matrix.binary }}"
           --junit target/integration/release-artifact.xml
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         if: always()
         with:
           name: release-tests-${{ matrix.target }}
@@ -142,7 +146,7 @@ jobs:
           uv run --locked --project tools/rift-release rift-release package
           --binary "${{ matrix.binary }}"
           --output dist
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: rift-${{ matrix.target }}
           path: dist/*
@@ -174,7 +178,7 @@ jobs:
       - run: bunx tsc --noEmit
       - run: bun run build
       - run: bun run pack
-      - uses: actions/upload-artifact@v7.0.1
+      - uses: actions/upload-artifact@v7.0.2
         with:
           name: docs-site
           path: docs/dist
@@ -194,11 +198,11 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: astral-sh/setup-uv@v10.3.0
         with:
           enable-cache: true
           cache-dependency-glob: tools/rift-release/uv.lock
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           path: dist
           pattern: rift-*
@@ -217,9 +221,14 @@ jobs:
         run: >-
           gh release create "$RIFT_TAG" dist/*
           --verify-tag
-          --draft
+          --latest
           --title "Rift $RIFT_TAG"
           --generate-notes
+      - name: Verify published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name' | grep -Fx "$RIFT_TAG"
 
   deploy-docs:
     needs: publish
@@ -237,7 +246,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2.2.0
         with:
           bun-version: latest
-      - uses: actions/download-artifact@v8.0.1
+      - uses: actions/download-artifact@v8.0.2
         with:
           name: docs-site
           path: docs/dist
