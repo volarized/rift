@@ -345,10 +345,22 @@ impl PublishedWorkspace {
 
     /// This publication's twin under `configuration` and `epoch`.
     ///
-    /// Every part is shared, so the twin costs the clones of its handles and reads no
-    /// file again. It is what a capture that read nothing new publishes: the same tree,
-    /// answering a later observation.
+    /// Loaded source is shared. Unchanged configuration also shares the cached map.
+    /// A configuration change refreshes its recommendations on the blocking publication
+    /// lane before the same tree answers the later observation.
     fn under(&self, configuration: ConfigurationState, epoch: u64) -> Self {
+        let map = if self.configuration.fingerprint == configuration.fingerprint {
+            Arc::clone(&self.map)
+        } else {
+            let mut map = (*self.map).clone();
+            update_map_recommendations(
+                &mut map,
+                &self.reads,
+                self.preparation.as_ref(),
+                &configuration,
+            );
+            Arc::new(map)
+        };
         Self {
             reads: Arc::clone(&self.reads),
             configuration,
@@ -357,7 +369,7 @@ impl PublishedWorkspace {
             preparation: self.preparation.clone(),
             visible_digests: Arc::clone(&self.visible_digests),
             visible_refused: Arc::clone(&self.visible_refused),
-            map: Arc::clone(&self.map),
+            map,
             epoch,
         }
     }
@@ -519,6 +531,7 @@ impl LocalIndexPreparation {
 fn publication_map(
     reads: &ReadService,
     preparation: Option<&LocalIndexPreparation>,
+    configuration: &ConfigurationState,
 ) -> Arc<WorkspaceMap> {
     let mut map = rift_tracing::traced!(component = "index", operation = "index.map", {
         preparation.map_or_else(
@@ -534,7 +547,33 @@ fn publication_map(
     if let Some(warning) = preparation.and_then(LocalIndexPreparation::warning) {
         map.warnings.push(warning);
     }
+    update_map_recommendations(&mut map, reads, preparation, configuration);
     Arc::new(map)
+}
+
+/// Adds advisory observations while the publication build owns the blocking lane.
+fn update_map_recommendations(
+    map: &mut WorkspaceMap,
+    reads: &ReadService,
+    preparation: Option<&LocalIndexPreparation>,
+    configuration: &ConfigurationState,
+) {
+    map.recommendations.clear();
+    if preparation.is_some() {
+        return;
+    }
+    let Ok(configuration) = &configuration.accepted else {
+        return;
+    };
+    match reads.workspace_recommendations(configuration) {
+        Ok(recommendations) => map.recommendations = recommendations,
+        Err(error) => rift_tracing::warn!(
+            component = "index",
+            operation = "index.recommendations",
+            error = %error,
+            "language server recommendations unavailable"
+        ),
+    }
 }
 
 /// `index.epoch`: the epoch the index last published and the filesystem epoch it last
@@ -2150,7 +2189,7 @@ pub(crate) fn empty_workspace_preparation_with_owner(
         map_source_paths: Arc::new(Vec::new()),
         map_text_paths: Arc::new(Vec::new()),
     };
-    let map = publication_map(&reads, Some(&preparation_state));
+    let map = publication_map(&reads, Some(&preparation_state), &configuration);
     let published = Arc::new(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
@@ -2598,7 +2637,7 @@ fn whole_workspace_candidate(
                 }),
             )
         })?;
-    let map = publication_map(&reads, None);
+    let map = publication_map(&reads, None, &configuration);
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
@@ -2697,7 +2736,7 @@ fn shared_workspace_candidate(
         paths = observed_paths.len(),
         { previous.update_visible_digests(root, &reads, observed_paths) }
     )?;
-    let map = publication_map(&reads, previous.preparation.as_ref());
+    let map = publication_map(&reads, previous.preparation.as_ref(), &configuration);
     Ok(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),
@@ -4516,7 +4555,7 @@ fn preparation_publication(
         }
         complete_visible_digests(root, &reads, &source_policy)?
     };
-    let map = publication_map(&reads, preparation.as_ref());
+    let map = publication_map(&reads, preparation.as_ref(), configuration);
     Ok(Arc::new(PublishedWorkspace {
         fingerprint: reads.workspace_fingerprint().clone(),
         reads: Arc::new(reads),

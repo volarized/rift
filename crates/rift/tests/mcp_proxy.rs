@@ -42,6 +42,9 @@ mod live_engine_gate;
 #[cfg(unix)]
 #[path = "mcp_proxy/lsp_profiles.rs"]
 mod lsp_profiles;
+#[cfg(unix)]
+#[path = "mcp_proxy/map_recommendations.rs"]
+mod map_recommendations;
 mod rust_engine;
 #[path = "../../rift-mcp/tests/surface_corpus.rs"]
 mod surface_corpus;

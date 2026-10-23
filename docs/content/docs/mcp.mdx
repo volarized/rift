@@ -56,6 +56,11 @@ For any task, directories help the agent choose where to search.
 Documentation paths point to project guidance, while dependency entries identify the packages
 and versions used by the project.
 
+The map's `recommendations` section lists installed language servers that the configuration has
+not selected. Each entry carries `language`, `root`, and a `command` to apply with `rift config set`
+from the map project's root.
+After the configuration is accepted, the next map publication leaves that entry out.
+
 For the example project, a map can look like this:
 
 <WorkspaceMapExample />

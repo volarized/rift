@@ -257,6 +257,7 @@ mod tests {
             docs: Vec::new(),
             module_relationships: Vec::new(),
             packages: Vec::new(),
+            recommendations: Vec::new(),
             warnings: Vec::new(),
             pagination: Pagination {
                 page_index: 0,

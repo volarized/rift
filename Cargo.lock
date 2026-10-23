@@ -4647,7 +4647,6 @@ dependencies = [
  "ty_vendored",
  "unicode-width",
  "waitpid-any",
- "which",
  "windows-sys 0.59.0",
  "zip",
 ]

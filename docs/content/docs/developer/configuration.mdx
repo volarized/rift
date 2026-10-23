@@ -722,6 +722,10 @@ The recommendation command reads each directly registered project's own configur
 visible files. Registered names must resolve to distinct directories, each different from the
 primary project root.
 
+The [map](/docs/mcp#resource-map) also lists actionable recommendations in `recommendations`,
+with each entry's `language`, `root`, and `command`. Once the matching configuration is accepted,
+the next map publication leaves that recommendation out.
+
 Apply a process selection for a language:
 
 ```sh
@@ -793,6 +797,9 @@ project's symbols carry `local`.
 
 Search selects the registered project with `scope: "local@docs"`.
 A `query` search with `scope: "all"` includes both projects and global facts.
+
+After creating a named profile, reconnect the MCP client before searching its registered scope
+or including it in `all` results. Existing projects accept language selections on later requests.
 
 Relative registration paths start at the primary project root. Each registered project reads its
 own `rift.toml`; its `include` and `exclude` patterns are relative to its own root. Registrations

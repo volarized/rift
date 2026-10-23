@@ -13,6 +13,7 @@ mod history_fill;
 mod map;
 mod process;
 mod read;
+mod recommendations;
 mod search;
 mod traversal;
 
@@ -29,6 +30,9 @@ pub use history_fill::{
 pub use read::{
     LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accepted_limit,
     wire_digest,
+};
+pub use recommendations::{
+    LspRecommendation, LspRecommendationBatch, LspRecommendationInputs, LspRecommendationStatus,
 };
 pub use rift_core::CapturedStream;
 pub use rift_error::RiftError;

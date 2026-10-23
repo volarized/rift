@@ -110,6 +110,7 @@ pub(crate) fn build_workspace_map(
         docs: docs(index),
         module_relationships: module_relationships(graph, &unit_paths, &records_by_identity),
         packages,
+        recommendations: Vec::new(),
         warnings: Vec::new(),
         pagination: Pagination {
             page_index: 0,
@@ -159,6 +160,7 @@ pub(crate) fn build_preparation_map(
         docs: Vec::new(),
         module_relationships: Vec::new(),
         packages: Vec::new(),
+        recommendations: Vec::new(),
         warnings: Vec::new(),
         pagination: Pagination {
             page_index: 0,

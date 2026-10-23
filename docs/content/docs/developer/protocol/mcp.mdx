@@ -1281,6 +1281,13 @@ A read of `rift://map` answers `contents` with one JSON entry whose `mimeType` i
 requested `uri`: compact text with `mimeType` `text/plain`, then the JSON body with `mimeType`
 `application/json`. The server makes both workspace contents from the same data.
 
+The map's `recommendations` entries carry `language`, `root`, and `command` for installed
+language servers without a selected configuration. The server **MUST** omit `recommendations`
+when none remain and remove a matching entry from the next publication after accepting its
+configuration. `root` is relative to the map's project, with `.` selecting the project itself.
+A `command` is a `rift config set` invocation quoted for the server's operating system;
+the caller runs it from the map project's root.
+
 The listings of resources and resource templates declare `application/json`, the type of the JSON body. A caller **SHOULD** select a content by its `mimeType`, because the `text` [output selection](#result-content) leaves compact text as the only content of a workspace read. The map remains JSON under both selections.
 
 The compact text of the workspace resource follows the layout of a [tool result](#result-content): the facts of one line are separated by ` · `, a direction is written with `→`, a lowercase hex value of at least 8 characters is cut to its first 8, and the normal state of a fact is left out. Warnings form the section `N warnings`, or `1 warning`, after the last section, and a section with no entry is omitted. The server enforces a byte limit on the text and refuses a read whose text crosses it as a protocol failure, with the typed `ErrorData` as `data`.

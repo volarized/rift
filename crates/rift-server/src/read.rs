@@ -313,6 +313,62 @@ impl ReadService {
         )
     }
 
+    /// Observes installed language servers for this snapshot's captured source catalog.
+    ///
+    /// The caller runs this on the blocking publication lane and retains the result.
+    /// It reuses the compiled source policy and never walks the project tree again.
+    /// No language server is started.
+    ///
+    /// # Errors
+    /// Returns the configuration or filesystem failure that prevented a recommendation.
+    pub fn workspace_recommendations(
+        &self,
+        configuration: &rift_protocol::configuration::WorkspaceConfiguration,
+    ) -> Result<Vec<rift_protocol::map::MapRecommendation>, RiftError> {
+        use rift_protocol::map::MapRecommendation;
+
+        let Some(policy) = self.source_policy() else {
+            return Ok(Vec::new());
+        };
+        let root = self.index.root();
+        let paths = self
+            .content_digests()
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        let mut inputs = crate::LspRecommendationInputs::new(root, configuration.clone())?;
+        inputs.include_project(root, &paths, policy)?;
+        let batch = inputs.finish_available()?;
+        if batch.truncated {
+            rift_tracing::warn!(
+                component = "index",
+                operation = "index.recommendations",
+                "language server recommendations reached the map limit"
+            );
+        }
+        Ok(batch
+            .items
+            .into_iter()
+            .filter_map(|recommendation| {
+                let crate::LspRecommendationStatus::Available { command, .. } =
+                    recommendation.status
+                else {
+                    return None;
+                };
+                if recommendation.root != "."
+                    && CoreProjectPath::new(recommendation.root.as_str()).is_err()
+                {
+                    return None;
+                }
+                Some(MapRecommendation {
+                    language: Language::from_identity_segment(&recommendation.language).ok()?,
+                    root: recommendation.root,
+                    command,
+                })
+            })
+            .collect())
+    }
+
     /// Builds file counts for paths already selected by workspace discovery. Symbol facts
     /// and dependency entries remain empty until the prepared index is complete.
     #[must_use]
