@@ -39,6 +39,9 @@ mod harness;
 #[path = "../../rift-mcp/tests/hermetic_search.rs"]
 mod hermetic_search;
 mod live_engine_gate;
+#[cfg(unix)]
+#[path = "mcp_proxy/lsp_profiles.rs"]
+mod lsp_profiles;
 mod rust_engine;
 #[path = "../../rift-mcp/tests/surface_corpus.rs"]
 mod surface_corpus;
