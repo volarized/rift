@@ -121,7 +121,7 @@ regex-automata = { version = "0.4.18", default-features = false, features = [
     "unicode",
 ] }
 regex-syntax = "0.8.11"
-rig-core = { version = "=0.42.0", default-features = false }
+rig-core = { version = "=0.45.0", default-features = false }
 # The version toasty-driver-sqlite 0.10.0 already builds, so the history store links no
 # second SQLite.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
