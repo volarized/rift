@@ -78,7 +78,7 @@ oas3 = "=0.22.0"
 # the `metrics` API, its span export enables `trace`, and its log record export enables
 # `logs`. The SDK aggregates and its async-runtime periodic reader exports over the same
 # Tokio-driven `reqwest` client the span batches and the log record batches use.
-opentelemetry = { version = "=0.33.0", default-features = false, features = ["logs", "metrics"] }
+opentelemetry = { version = "=0.33.1", default-features = false, features = ["logs", "metrics"] }
 opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = [
     "http-proto",
     "logs",
@@ -86,7 +86,7 @@ opentelemetry-otlp = { version = "=0.33.0", default-features = false, features =
     "reqwest-client",
     "trace",
 ] }
-opentelemetry_sdk = { version = "=0.33.0", default-features = false, features = [
+opentelemetry_sdk = { version = "=0.33.1", default-features = false, features = [
     "experimental_logs_batch_log_processor_with_async_runtime",
     "experimental_metrics_custom_reader",
     "experimental_metrics_periodicreader_with_async_runtime",
@@ -125,9 +125,9 @@ rig-core = { version = "=0.42.0", default-features = false }
 # The version toasty-driver-sqlite 0.10.0 already builds, so the history store links no
 # second SQLite.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
-rmcp = { version = "=3.5.1", default-features = false, features = ["macros", "server", "transport-io"] }
+rmcp = { version = "=3.6.0", default-features = false, features = ["macros", "server", "transport-io"] }
 same-file = "1.0.6"
-schemars = { version = "=1.2.2", default-features = false, features = ["derive", "std"] }
+schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -145,7 +145,7 @@ toasty-driver-sqlite = "=0.10.0"
 # every non-wasm target, so the version is pinned to match it: a second tokenizers would
 # be a duplicate the dependency policy refuses, and could not avoid onig either.
 tokenizers = { version = "0.22.2", default-features = false }
-toml_edit = { version = "=0.25.13", default-features = false, features = ["parse", "display"] }
+toml_edit = { version = "=0.25.15", default-features = false, features = ["parse", "display"] }
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde"] }
 syn = { version = "2.0.119", features = ["full"] }
 # The process sampler reads one process: its resident and virtual memory, CPU time and usage,
@@ -153,7 +153,7 @@ syn = { version = "2.0.119", features = ["full"] }
 # lock already holds.
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
-tokio = { version = "=1.53.2", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.53.3", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
