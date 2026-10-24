@@ -21,7 +21,7 @@ pub(crate) fn installed_command(
         return Some(command);
     }
     if matches!(manager, LspPackageManager::Bun | LspPackageManager::Npm) {
-        let native = native_typescript_program();
+        let native = native_typescript_program(std::env::consts::OS, std::env::consts::ARCH);
         if which::which_in(&native, None::<&OsStr>, root).is_ok() {
             return Some(CommandInput::ProgramAndArguments(vec![
                 native,
@@ -164,28 +164,22 @@ fn cargo_command(root: &Path, search: Option<&OsStr>) -> Option<CommandInput> {
 }
 
 /// Mirrors the installed TypeScript getExePath.js platform package selection.
-fn native_typescript_program() -> String {
-    let platform = match std::env::consts::OS {
+fn native_typescript_program(platform: &str, architecture: &str) -> String {
+    let windows = platform == "windows";
+    let platform = match platform {
         "macos" => "darwin",
         "windows" => "win32",
         other => other,
     };
-    let architecture = match std::env::consts::ARCH {
+    let architecture = match architecture {
         "aarch64" => "arm64",
         "x86_64" => "x64",
         "x86" => "ia32",
         "powerpc64" => "ppc64",
         other => other,
     };
-    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    let suffix = if windows { ".exe" } else { "" };
     format!("node_modules/@typescript/typescript-{platform}-{architecture}/lib/tsc{suffix}")
-}
-
-/// Command used when no installed candidate was found, so the ordinary engine start
-/// reports the missing executable through its typed launch failure.
-pub(crate) fn missing_command(manager: LspPackageManager) -> CommandInput {
-    let candidate = &candidates(manager)[0];
-    candidate.command(candidate.local.unwrap_or(candidate.program))
 }
 
 struct Candidate {
@@ -298,11 +292,25 @@ mod tests {
                 .ok_or("missing ty")?;
         assert_eq!(command.program(), ".venv/bin/ty");
         assert_eq!(command.arguments(), ["server"]);
+        std::fs::remove_file(root.path().join(".venv/bin/ty"))?;
+        std::fs::remove_file(root.path().join(".venv/bin/pyright-langserver"))?;
+        let command =
+            installed_command(LspPackageManager::Uv, root.path(), Some(search.as_os_str()))
+                .ok_or("missing PATH ty")?;
+        assert_eq!(command.program(), "ty");
+        assert_eq!(command.arguments(), ["server"]);
+        std::fs::remove_file(search.join("ty"))?;
+        install(root.path(), "bin/pyright-langserver")?;
+        let command =
+            installed_command(LspPackageManager::Uv, root.path(), Some(search.as_os_str()))
+                .ok_or("missing PATH pyright")?;
+        assert_eq!(command.program(), "pyright-langserver");
+        assert_eq!(command.arguments(), ["--stdio"]);
         Ok(())
     }
 
     #[test]
-    fn missing_servers_keep_fixed_names_and_arguments() -> Result<(), Box<dyn std::error::Error>> {
+    fn missing_servers_have_no_command() -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         for manager in [
             LspPackageManager::Cargo,
@@ -311,8 +319,6 @@ mod tests {
             LspPackageManager::Uv,
         ] {
             assert!(installed_command(manager, root.path(), Some(OsStr::new(""))).is_none());
-            let command = missing_command(manager);
-            assert!(!command.program().is_empty());
         }
         Ok(())
     }
@@ -321,7 +327,7 @@ mod tests {
     fn native_typescript_precedes_javascript_server() -> Result<(), Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         install(root.path(), "node_modules/.bin/typescript-language-server")?;
-        let native = native_typescript_program();
+        let native = native_typescript_program(std::env::consts::OS, std::env::consts::ARCH);
         install(root.path(), &native)?;
         for manager in [LspPackageManager::Bun, LspPackageManager::Npm] {
             let command = installed_command(manager, root.path(), Some(OsStr::new("")))
@@ -465,6 +471,119 @@ mod tests {
         assert!(installed_cargo_server(&command, root.path(), &mut inputs).is_none());
         install(root.path(), "toolchain/bin/rust-analyzer")?;
         assert!(installed_cargo_server(&command, root.path(), &mut inputs).is_some());
+        Ok(())
+    }
+    #[test]
+    fn native_typescript_uses_platform_package_names() {
+        for (platform, architecture, expected) in [
+            (
+                "macos",
+                "aarch64",
+                "node_modules/@typescript/typescript-darwin-arm64/lib/tsc",
+            ),
+            (
+                "windows",
+                "x86_64",
+                "node_modules/@typescript/typescript-win32-x64/lib/tsc.exe",
+            ),
+            (
+                "linux",
+                "x86",
+                "node_modules/@typescript/typescript-linux-ia32/lib/tsc",
+            ),
+            (
+                "linux",
+                "powerpc64",
+                "node_modules/@typescript/typescript-linux-ppc64/lib/tsc",
+            ),
+            (
+                "linux",
+                "riscv64",
+                "node_modules/@typescript/typescript-linux-riscv64/lib/tsc",
+            ),
+        ] {
+            assert_eq!(native_typescript_program(platform, architecture), expected);
+        }
+    }
+
+    #[test]
+    fn manifest_reads_refuse_oversized_invalid_utf8_and_directory_inputs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("package.json");
+        let maximum = usize::try_from(CONFIGURATION_FILE_BYTES_MAX)?;
+        std::fs::write(&path, vec![b' '; maximum])?;
+        assert_eq!(read_text(&path).ok_or("accepted bound")?.len(), maximum);
+        std::fs::write(&path, vec![b' '; maximum + 1])?;
+        assert!(read_text(&path).is_none());
+        std::fs::write(&path, [0xff])?;
+        assert!(read_text(&path).is_none());
+        assert!(read_text(root.path()).is_none());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_recommendations_never_run_a_pinned_toolchain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        install(root.path(), "bin/rustup")?;
+        std::fs::write(
+            root.path().join("rust-toolchain.toml"),
+            "[toolchain]\nchannel='nightly-1900-01-01'\n",
+        )?;
+        let search = root.path().join("bin");
+        let dependencies = DependenciesConfiguration {
+            resolution: rift_protocol::dependencies::DependencyResolution::Static,
+            ..DependenciesConfiguration::default()
+        };
+        assert!(
+            installed_command(
+                LspPackageManager::Cargo,
+                root.path(),
+                Some(search.as_os_str())
+            )
+            .is_some()
+        );
+        assert!(
+            recommended_command(
+                LspPackageManager::Cargo,
+                root.path(),
+                Some(search.as_os_str()),
+                &dependencies
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_recommendations_refuse_failed_truncated_and_empty_sysroot_answers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let command = CommandInput::ProgramAndArguments(vec![
+            "rustup".to_owned(),
+            "run".to_owned(),
+            "1.98".to_owned(),
+            "rust-analyzer".to_owned(),
+        ]);
+        for (exit_code, stdout_truncated) in [
+            (Some(1), false),
+            (None, false),
+            (Some(0), true),
+            (Some(0), false),
+        ] {
+            let mut inputs = CargoProbe {
+                output: Some(rift_dependency::CommandOutput {
+                    exit_code,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    stdout_truncated,
+                }),
+                ..CargoProbe::default()
+            };
+            assert!(installed_cargo_server(&command, root.path(), &mut inputs).is_none());
+        }
         Ok(())
     }
 }
