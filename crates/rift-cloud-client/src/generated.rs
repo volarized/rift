@@ -1123,6 +1123,8 @@ pub struct Capabilities {
     pub bounds: CapabilityBounds,
     /// Documentation revision used for documentation reads.
     pub documentation_revision: Option<String>,
+    /// Complete relationship operations supported by existing collected facts. Absence establishes no supported operation.
+    pub relationship_capabilities: Option<Vec<RelationshipCapability>>,
     /// Additional properties not defined in the schema.
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
@@ -3122,6 +3124,8 @@ impl<'de> serde::Deserialize<'de> for PositionEncoding {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(default)]
 pub struct ReadWarning {
+    #[default(Some("object_unavailable".to_string()))]
+    pub code: Option<String>,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: Option<String>,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
@@ -3136,8 +3140,6 @@ pub struct ReadWarning {
     pub field: Option<String>,
     /// Enforced public field bound.
     pub bound: Option<u64>,
-    #[default(Some("object_unavailable".to_string()))]
-    pub code: Option<String>,
     /// Frameworks whose syntax depends on package or component context.
     pub framework: Option<SyntaxFramework>,
     /// The missing package version, configuration, or template source.
@@ -3829,6 +3831,200 @@ impl<'de> serde::Deserialize<'de> for SyntaxFramework {
         }
     }
 }
+/// The captured selection cannot serve this search or pattern request.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum SearchUnavailable {
+    /// Presence or absence cannot be established in the requested selection.
+    #[default]
+    Object(SearchUnavailableObject),
+}
+impl SearchUnavailable {
+    /// Presence or absence cannot be established in the requested selection.
+    pub fn object(reason: SymbolUnavailableReason) -> Self {
+        Self::Object(SearchUnavailableObject {
+            reason,
+            ..Default::default()
+        })
+    }
+}
+/// The exclusive raw relationship request on the existing search endpoint.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipSearchRequest {
+    /// One incoming or outgoing adjacency selection, without ranking or path projection.
+    #[validate(nested)]
+    pub relationships: RelationshipSelection,
+    /// Exact eligible package domain. Required unless `view` retains that domain.
+    #[validate(length(min = 1u64, max = 20_000u64), nested)]
+    pub packages: Option<Vec<PackageIdentity>>,
+    /// Exact eligible runtime domain, retaining compiler or runtime versions.
+    #[validate(length(min = 1u64, max = 20_000u64), nested)]
+    pub runtimes: Option<Vec<RuntimeIdentity>>,
+    /// Requested exact projections; source bytes use the same selected publication.
+    #[validate(length(max = 1u64))]
+    pub include: Option<Vec<GetSymbolInclude>>,
+    /// A service-issued key for one immutable view in one serving context.
+    #[validate(
+        length(min = 3u64, max = 4_096u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
+    )]
+    pub view: Option<String>,
+}
+/// One incoming or outgoing adjacency selection, without ranking or path projection.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipSelection {
+    /// Established subjects whose complete adjacency is required.
+    #[validate(length(min = 1u64, max = 64u64))]
+    pub seeds: Vec<String>,
+    /// Which edge direction a search traversal walks from each visited symbol. A language
+    /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
+    /// `outgoing`.
+    pub direction: TraversalDirection,
+    /// Portable relationship facets. Empty selects every available facet.
+    #[validate(length(max = 16u64))]
+    pub facets: Vec<RelationshipFacet>,
+}
+/// One raw relationship page from an immutable selected publication.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipSearchPage {
+    /// One authoritative group for every requested subject, in request order.
+    pub groups: Vec<RelationshipGroup>,
+    /// Exact symbols reached by this page. Identical captured records may repeat across pages;
+    /// conflicting records are refused.
+    pub symbols: Option<Vec<QuerySymbol>>,
+    /// Physical source catalog and requested bytes for reached declarations and occurrences.
+    /// Identical captured records may repeat across pages; conflicting records are refused.
+    pub sources: Option<Vec<RelationshipSource>>,
+    /// Opaque continuation bound to subjects, direction, facets and selected domain.
+    pub next_cursor: Option<String>,
+    /// Existing warnings retained without treating missing facts as complete empty.
+    pub warnings: Option<Vec<ReadWarning>>,
+    /// Analyzer revision shared by every page and exact read.
+    pub analyzer_revision: String,
+    /// Corpus revision shared by every page and exact read.
+    pub corpus_revision: String,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: CapturedView,
+}
+/// Original relationship records for one requested subject on this page.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipGroup {
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    pub seed: String,
+    /// Original records, preserving parallel edges, evidence and occurrences.
+    pub relationships: Vec<RelationshipRecord>,
+    /// Physical usages, including recursive and file-level locations without a caller symbol.
+    pub occurrences: Option<Vec<QueryOccurrence>>,
+    /// Provider exhausted this subject's adjacency under the selected exact domain.
+    pub complete: bool,
+}
+/// One original relationship record, independent of equal endpoint or evidence payloads.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipRecord {
+    /// Opaque full identity of one original relationship record within its selected publication.
+    pub id: String,
+    /// One directed edge between two symbols. Its evidence is the nodes it was read from, and
+    /// its derivation is how much the provider knew when it was read.
+    pub relationship: Relationship,
+}
+/// Opaque full identity of one original relationship record within its selected publication.
+pub type RelationshipRecordId = String;
+/// One physical reference or call supplied by a selected provider.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct QueryOccurrence {
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    pub target: String,
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    pub enclosing: Option<String>,
+    /// One byte range in a source-catalog unit.
+    pub source: SourceUnitSpan,
+    /// One portable category an edge falls into. The local kinds `import` and `use` can share
+    /// the `imports` facet, which lets one query cross languages.
+    pub facet: RelationshipFacet,
+}
+/// A symbol together with the physical declarations selected for this read.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct QuerySymbol {
+    /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
+    /// and is connected through Relationship.
+    pub symbol: Symbol,
+    /// Physical declarations, preserving their association indices.
+    pub declarations: Vec<SymbolDeclaration>,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipSource {
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    pub unit: String,
+    /// Complete lowercase SHA-256 digest of immutable source bytes.
+    pub digest: String,
+    /// Selected text, absent when source is unavailable or unrequested.
+    pub text: Option<String>,
+}
+/// Selected source bytes, when their projection was requested.
+#[serde_with::skip_serializing_none]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    validator::Validate,
+    oas3_gen_support::Default
+)]
+#[serde(deny_unknown_fields)]
+pub struct QuerySource {
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    #[validate(
+        length(min = 17u64, max = 8_192u64),
+        regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
+    )]
+    pub unit: String,
+    /// Complete lowercase SHA-256 digest of immutable source bytes.
+    #[validate(
+        length(min = 64u64, max = 64u64),
+        regex(path = "REGEX_DOCUMENTATION_BLOCK_IDENTITY")
+    )]
+    pub digest: Option<String>,
+    /// Selected text, absent when source is unavailable or unrequested.
+    #[validate(length(max = 67_108_864u64))]
+    pub text: Option<String>,
+}
+/// Complete lowercase SHA-256 digest of immutable source bytes.
+pub type SourceDigest = String;
+/// One relationship operation the reader establishes from its existing collected facts.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipCapability {
+    /// Which edge direction a search traversal walks from each visited symbol. A language
+    /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
+    /// `outgoing`.
+    pub direction: TraversalDirection,
+    /// Facets whose complete selected-domain reads the reader supports.
+    pub facets: Vec<RelationshipFacet>,
+}
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct GetCapabilitiesRequest {}
@@ -4075,6 +4271,28 @@ pub enum ResolvePackageContextResponse {
     ///default: Unknown response
     Unknown,
 }
+#[derive(Debug, Clone, PartialEq, Serialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum SearchRequestBody {
+    /// A lexical package declaration search or a bounded relationship walk.
+    #[default]
+    Package(PackageSearchRequest),
+    /// The exclusive raw relationship request on the existing search endpoint.
+    Relationship(RelationshipSearchRequest),
+}
+impl SearchRequestBody {
+    /// A lexical package declaration search or a bounded relationship walk.
+    pub fn package() -> Self {
+        Self::Package(PackageSearchRequest::default())
+    }
+    /// The exclusive raw relationship request on the existing search endpoint.
+    pub fn relationship(relationships: RelationshipSelection) -> Self {
+        Self::Relationship(RelationshipSearchRequest {
+            relationships,
+            ..Default::default()
+        })
+    }
+}
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -4099,8 +4317,7 @@ pub struct SearchPackagesRequest {
     #[validate(nested)]
     pub query: SearchPackagesRequestQuery,
     /// Structured package search query.
-    #[validate(nested)]
-    pub body: PackageSearchRequest,
+    pub body: SearchRequestBody,
 }
 impl SearchPackagesRequest {
     /// Parse the HTTP response into the response enum.
@@ -4110,7 +4327,7 @@ impl SearchPackagesRequest {
         let status = req.status();
         if status == http::StatusCode::OK {
             let data = oas3_gen_support::Diagnostics::<
-                PackageSearchPage,
+                Search200Response,
             >::json_with_diagnostics(req)
                 .await?;
             return Ok(SearchPackagesResponse::Ok(data));
@@ -4179,11 +4396,29 @@ impl SearchPackagesRequest {
             return Ok(SearchPackagesResponse::BadGateway(data));
         }
         if status == http::StatusCode::SERVICE_UNAVAILABLE {
-            let data = oas3_gen_support::Diagnostics::<
-                ProblemDetails,
-            >::json_with_diagnostics(req)
-                .await?;
-            return Ok(SearchPackagesResponse::ServiceUnavailable(data));
+            let content_type_str = req
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("application/json");
+            if content_type_str.contains("json") {
+                let data = oas3_gen_support::Diagnostics::<
+                    ProblemDetails,
+                >::json_with_diagnostics(req)
+                    .await?;
+                return Ok(
+                    SearchPackagesResponse::ServiceUnavailableProblemDetails(data),
+                );
+            }
+            if content_type_str.contains("json") {
+                let data = oas3_gen_support::Diagnostics::<
+                    SearchUnavailable,
+                >::json_with_diagnostics(req)
+                    .await?;
+                return Ok(
+                    SearchPackagesResponse::ServiceUnavailableSearchUnavailable(data),
+                );
+            }
         }
         if status == http::StatusCode::GATEWAY_TIMEOUT {
             let data = oas3_gen_support::Diagnostics::<
@@ -4200,7 +4435,7 @@ impl SearchPackagesRequest {
 #[derive(Debug, Clone)]
 pub enum SearchPackagesResponse {
     ///200: One ranked package declaration page.
-    Ok(PackageSearchPage),
+    Ok(Search200Response),
     ///400: Request JSON, query parameters, or field relationships are invalid.
     BadRequest(ProblemDetails),
     ///401: Authentication is required or credentials are invalid.
@@ -4220,7 +4455,9 @@ pub enum SearchPackagesResponse {
     ///502: The server received an invalid upstream response.
     BadGateway(ProblemDetails),
     ///503: The service is temporarily unavailable.
-    ServiceUnavailable(ProblemDetails),
+    ServiceUnavailableProblemDetails(ProblemDetails),
+    ///503: The service is temporarily unavailable.
+    ServiceUnavailableSearchUnavailable(SearchUnavailable),
     ///504: The upstream request timed out.
     GatewayTimeout(ProblemDetails),
     ///default: Unknown response
@@ -4991,6 +5228,8 @@ impl<'de> serde::Deserialize<'de> for PackageSearchHitContributingField {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentityProjectPath {
+    #[default("project".to_string())]
+    pub kind: String,
     /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
     /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
     /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
@@ -5002,8 +5241,6 @@ pub struct DocumentationSourceIdentityProjectPath {
         regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
     )]
     pub path: String,
-    #[default("project".to_string())]
-    pub kind: String,
 }
 /// A source unit supplied by an exact package adapter.
 #[derive(
@@ -5017,14 +5254,14 @@ pub struct DocumentationSourceIdentityProjectPath {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct DocumentationSourceIdentitySourceUnitId {
+    #[default("package".to_string())]
+    pub kind: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
         regex(path = "REGEX_PACKAGE_SEARCH_HIT_UNIT")
     )]
     pub unit: String,
-    #[default("package".to_string())]
-    pub kind: String,
 }
 /// A valid identifier stored in the notebook.
 #[derive(
@@ -5038,11 +5275,11 @@ pub struct DocumentationSourceIdentitySourceUnitId {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject {
+    #[default("authored".to_string())]
+    pub kind: String,
     /// Identifier accepted by the notebook format.
     #[validate(length(min = 1u64))]
     pub id: String,
-    #[default("authored".to_string())]
-    pub kind: String,
 }
 /// The cell's zero-based position in its notebook.
 #[derive(
@@ -5056,11 +5293,11 @@ pub struct NotebookCellIdentityObject {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct NotebookCellIdentityObject2 {
+    #[default("indexed".to_string())]
+    pub kind: String,
     /// Position among every cell, including unselected cells.
     #[validate(range(min = 0))]
     pub index: u32,
-    #[default("indexed".to_string())]
-    pub kind: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum PackageDocumentationHitContributingField {
@@ -5109,11 +5346,11 @@ impl<'de> serde::Deserialize<'de> for PackageDocumentationHitContributingField {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetDocumentationHit {
+    #[default("documentation".to_string())]
+    pub target: String,
     /// One documentation block projected from its existing content owner.
     #[validate(nested)]
     pub documentation: DocumentationHit,
-    #[default("documentation".to_string())]
-    pub target: String,
 }
 /// A symbol hit: the declaration a provider resolved.
 #[derive(
@@ -5127,12 +5364,12 @@ pub struct SearchHitTargetDocumentationHit {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetSymbol {
+    #[default("symbol".to_string())]
+    pub target: String,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
     /// and is connected through Relationship.
     #[validate(nested)]
     pub symbol: Symbol,
-    #[default("symbol".to_string())]
-    pub target: String,
 }
 /// A node hit: one place in a syntax tree, without its enclosing symbol record.
 #[derive(
@@ -5146,6 +5383,8 @@ pub struct SearchHitTargetSymbol {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetNodeId {
+    #[default("node".to_string())]
+    pub target: String,
     /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
     /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
     /// of the SHA-256 of the node's source bytes. The identity describes the node in the
@@ -5155,8 +5394,6 @@ pub struct SearchHitTargetNodeId {
         regex(path = "REGEX_PARAMETER_NODE")
     )]
     pub node: String,
-    #[default("node".to_string())]
-    pub target: String,
 }
 /// A file hit: one entry of the tree, whether or not any provider reads it.
 #[serde_with::skip_serializing_none]
@@ -5171,6 +5408,8 @@ pub struct SearchHitTargetNodeId {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetObject {
+    #[default("file".to_string())]
+    pub target: String,
     /// Size in bytes.
     #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub size: u64,
@@ -5178,8 +5417,6 @@ pub struct SearchHitTargetObject {
     /// Absent when empty.
     #[default(Some(Default::default()))]
     pub languages: Option<Vec<String>>,
-    #[default("file".to_string())]
-    pub target: String,
 }
 /// A commit hit: one commit the history store holds, matched by its message.
 #[derive(
@@ -5193,11 +5430,11 @@ pub struct SearchHitTargetObject {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetCommitHit {
+    #[default("commit".to_string())]
+    pub target: String,
     /// One commit whose message matched a commit search, as the history store holds it.
     #[validate(nested)]
     pub commit: CommitHit,
-    #[default("commit".to_string())]
-    pub target: String,
 }
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackageSearchItemVariant0 {
@@ -5297,6 +5534,8 @@ pub struct PackageSearchItemVariant2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject {
+    #[default("found".to_string())]
+    pub outcome: String,
     /// One exact position in a project, package or runtime source unit.
     pub position: SourcePosition,
     /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
@@ -5305,37 +5544,37 @@ pub struct DeclarationPositionResultObject {
     pub kind: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// Complete captured coverage contains no declaration at this position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject2 {
+    #[default("missing".to_string())]
+    pub outcome: String,
     /// One exact position in a project, package or runtime source unit.
     pub position: SourcePosition,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
-    #[default("missing".to_string())]
-    pub outcome: String,
 }
 /// Presence or absence cannot be established at this exact position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct DeclarationPositionResultObject3 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// One exact position in a project, package or runtime source unit.
     pub position: SourcePosition,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 /// The selected unit exists, including when its requested range is empty.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSourceResultObject {
+    #[default("found".to_string())]
+    pub outcome: String,
     /// A copy of source from the catalog. The unit may belong to the project, a dependency, or
     /// the standard library; the excerpt preserves bytes as they were when the answer was
     /// produced.
@@ -5346,26 +5585,26 @@ pub struct GetSourceResultObject {
     pub view: CapturedView,
     /// Projection cuts and other typed read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// The unit is absent from completely searched captured coverage.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSourceResultObject2 {
+    #[default("missing".to_string())]
+    pub outcome: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
     /// Other typed read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("missing".to_string())]
-    pub outcome: String,
 }
 /// The exact selection cannot establish presence or absence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSourceResultObject3 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
     /// The immutable serving view and the expiry promised by its owner.
@@ -5374,13 +5613,13 @@ pub struct GetSourceResultObject3 {
     pub reason: SymbolUnavailableReason,
     /// Details and partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("unavailable".to_string())]
-    pub outcome: String,
 }
 /// The exact identity was established, even when it has no source declarations.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject {
+    #[default("found".to_string())]
+    pub outcome: String,
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
     /// and is connected through Relationship.
     pub symbol: Symbol,
@@ -5400,26 +5639,26 @@ pub struct GetSymbolResultObject {
     pub documentation: Option<DocumentationContext>,
     /// Projection cuts and other typed read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("found".to_string())]
-    pub outcome: String,
 }
 /// The valid identity is absent from the completely searched exact selection.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject2 {
+    #[default("missing".to_string())]
+    pub outcome: String,
     /// Definite absence after a complete exact selection, with bounded alternatives.
     pub symbol_not_found: SymbolNotFound,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
     /// Warnings, including incomplete candidate work.
     pub warnings: Option<Vec<ReadWarning>>,
-    #[default("missing".to_string())]
-    pub outcome: String,
 }
 /// The exact selection cannot establish presence or absence.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject3 {
+    #[default("unavailable".to_string())]
+    pub outcome: String,
     /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// The immutable serving view and the expiry promised by its owner.
@@ -5428,7 +5667,27 @@ pub struct GetSymbolResultObject3 {
     pub reason: SymbolUnavailableReason,
     /// Details and available partial-read warnings.
     pub warnings: Option<Vec<ReadWarning>>,
+}
+/// Presence or absence cannot be established in the requested selection.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct SearchUnavailableObject {
     #[default("unavailable".to_string())]
     pub outcome: String,
+    /// Why an exact selection cannot establish presence or definite absence.
+    pub reason: SymbolUnavailableReason,
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: Option<CapturedView>,
+    /// Details and partial-read warnings.
+    pub warnings: Option<Vec<ReadWarning>>,
+}
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum Search200Response {
+    /// One ranked page of package declarations. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first item that would, and the page carries the items that fit, `next_cursor` at the first item left out, and a `result_truncated` warning. The server **MUST** retain the captured view and its original expiry on every page, including an empty page.
+    #[default]
+    Package(PackageSearchPage),
+    /// One raw relationship page from an immutable selected publication.
+    Relationship(RelationshipSearchPage),
 }
 

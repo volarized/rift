@@ -33,14 +33,19 @@ impl GlobalClient {
     pub fn relationship_capabilities(
         capabilities: &crate::Capabilities,
     ) -> Result<Vec<RelationshipCapability>, RiftError> {
-        let Some(value) = capabilities
-            .additional_properties
-            .get("relationship_capabilities")
-        else {
+        let Some(operations) = capabilities.relationship_capabilities.as_ref() else {
             return Ok(Vec::new());
         };
-        let supported: Vec<RelationshipCapability> = serde_json::from_value(value.clone())
-            .map_err(|_| invalid("relationship capabilities are invalid"))?;
+        let supported = operations
+            .iter()
+            .map(|operation| {
+                serde_json::from_value::<RelationshipCapability>(serde_json::json!({
+                    "direction": operation.direction,
+                    "facets": operation.facets,
+                }))
+                .map_err(|_| invalid("relationship capabilities are invalid"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if supported.len() > 2 {
             return Err(invalid("relationship capabilities repeat a direction"));
         }

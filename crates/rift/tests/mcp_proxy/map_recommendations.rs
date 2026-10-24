@@ -4,10 +4,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
+use crate::workspace_client::query;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::map::{MapRecommendation, WorkspaceMap};
-use rift_protocol::search::SearchHitTarget;
-use rift_protocol::search_read::SearchReadResult;
 use serde_json::json;
 
 use crate::harness::{
@@ -153,10 +152,10 @@ async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> T
     assert!(configuration.mcp.extra.is_empty());
     assert_eq!(configuration.profiles["docs"].root, "docs");
     wait_until_configured(&client).await?;
-    let query = json!({
+    let query = serde_json::to_value(query::retrieval(&serde_json::from_value(json!({
         "query":"beacon", "target":"symbol", "scope":"local#docs",
         "paths":{"include":["page.ts"]},
-    });
+    }))?)?)?;
     let refused = proxied_call(&client, "search", &query)
         .await
         .expect_err("the existing connection has no docs profile");
@@ -171,20 +170,11 @@ async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> T
     child.cancel().await?;
     let reconnected = proxy_client(root).await?;
     let answer = proxied_call(&reconnected, "search", &query).await?;
-    let result: SearchReadResult = serde_json::from_value(answer.clone())?;
-    let SearchReadResult::Results(result) = result else {
-        return Err(format!("named project search unavailable: {answer}").into());
-    };
-    assert_eq!(result.results.len(), 1, "{answer}");
-    let SearchHitTarget::Symbol { symbol } = &result.results[0].hit else {
-        return Err(format!("named project symbol absent: {answer}").into());
-    };
-    let id = symbol
-        .id
-        .as_ref()
-        .ok_or_else(|| format!("symbol ID absent: {answer}"))?;
+    let rows = query::rows(&answer)?;
+    assert_eq!(rows.len(), 1, "{answer}");
+    let id = query::iri(&rows[0], "symbol")?;
     assert_eq!(
-        SymbolIdentity::parse(id.as_str())?.owner(),
+        SymbolIdentity::parse(id)?.owner(),
         &SymbolOwner::ProfileLocal {
             name: "docs".to_owned()
         },

@@ -923,7 +923,7 @@ pub async fn serve_elected_with_storage(
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<ElectedServer, RiftError> {
     serve_elected_at(
         root,
@@ -947,7 +947,7 @@ pub async fn serve_elected_with_storage_for_owner(
     shutdown: CancellationToken,
     storage: WorkspaceStorage,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<ElectedServer, RiftError> {
     elect_and_serve_with_owner(
         workspace,
@@ -970,9 +970,10 @@ pub async fn serve_repository_elected(
     shutdown: CancellationToken,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<ElectedServer, RiftError> {
-    let identity = crate::identity::product_identity(checkout)
+    let checkout = checkout.into();
+    let identity = crate::identity::product_identity(checkout.checkout)
         .await
         .map_err(|source| {
             errors::mcp::election_storage_failed()
@@ -1036,7 +1037,7 @@ pub(crate) async fn serve_elected_at(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<ElectedServer, RiftError> {
     let elected = elect_and_serve(root, guard, shutdown, storage, limits, check, checkout).await;
     if let Err(error) = &elected {
@@ -1073,7 +1074,7 @@ async fn elect_and_serve(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<ElectedServer, RiftError> {
     elect_and_serve_with_owner(
         (root, rift_protocol::identity::SymbolOwner::Local),
@@ -1094,7 +1095,7 @@ async fn elect_and_serve_with_owner(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<ElectedServer, RiftError> {
     guard.validate_workspace_owner(root, &owner)?;
     storage.validate_owner(root, &owner)?;

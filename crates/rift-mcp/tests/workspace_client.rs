@@ -155,7 +155,9 @@ pub(crate) async fn served_root_unsettled(
     rmcp::service::RunningService<rmcp::RoleClient, ()>,
     tokio::task::JoinHandle<()>,
 )> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let held = server.clone();
@@ -169,6 +171,13 @@ pub(crate) async fn served_root_unsettled(
     });
     let client = ().serve(client_transport).await?;
     Ok((client, server_task))
+}
+
+/// The exact executable supplied by Cargo or the shared Nextest inventory owner.
+pub(crate) fn query_program() -> TestResult<PathBuf> {
+    std::env::var_os("CARGO_BIN_EXE_rift")
+        .map(PathBuf::from)
+        .ok_or_else(|| "test runner must provide CARGO_BIN_EXE_rift".into())
 }
 
 /// MIME type of the compact text content a resource read returns first.

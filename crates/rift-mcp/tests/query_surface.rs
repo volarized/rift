@@ -25,6 +25,112 @@ const FILES: &[(&str, &str)] = &[
     ("src/lib.rs", "pub fn beacon() -> bool { true }\n"),
 ];
 
+#[tokio::test]
+async fn captured_view_does_not_authorize_supplied_query_records() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(FILES, None).await?;
+    let identity = "rift://symbol/local/rust/query_fixture/beacon";
+    let original = call_retrying_acceptance(
+        &client,
+        tool_request("get_symbol", &json!({"id":identity,"include":[]})),
+    )
+    .await?;
+    assert_eq!(original["outcome"], "found");
+    let mut supplied_symbol = original["symbol"].clone();
+    supplied_symbol["name"] = json!("changed");
+    let producer: rift_protocol::read::SearchParams = serde_json::from_value(json!({
+        "query":"beacon","include":[]
+    }))?;
+    let result: rift_protocol::read::SearchResult = serde_json::from_value(json!({
+        "view":original["view"],
+        "results":[{"hit":{"target":"symbol","symbol":supplied_symbol},"view":original["view"]}],
+        "pagination":{"page_index":0,"total_pages":1}
+    }))?;
+    let supplied = rift_search::sparql::QueryServiceData {
+        request: producer.clone(),
+        result,
+    };
+    let rejected = client
+        .call_tool(tool_request(
+            "query_candidates",
+            &json!({
+                "params":query::retrieval(&producer)?,"retrievals":[supplied]
+            }),
+        ))
+        .await?;
+    assert_eq!(rejected.is_error, Some(true));
+    assert!(
+        serde_json::to_string(&rejected)?
+            .contains("query evaluation does not accept supplied fact records")
+    );
+    assert!(
+        rejected
+            .structured_content
+            .as_ref()
+            .is_none_or(|value| value.get("view").is_none())
+    );
+    let held = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({"id":identity,"view":original["view"]["id"],"include":[]}),
+        ),
+    )
+    .await?;
+    assert_eq!(held["symbol"], original["symbol"]);
+    assert_eq!(held["view"], original["view"]);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_children_preserve_source_and_metadata_responses_under_concurrent_queries()
+-> TestResult {
+    use std::time::{Duration, Instant};
+
+    let (_directory, client, server_task) = served_workspace(FILES, None).await?;
+    let ready = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":"ASK { ?symbol :name 'beacon' }"})),
+    )
+    .await?;
+    assert_eq!(ready["answer"]["value"], true);
+    let statement = json!({"query":"SELECT ?number { VALUES ?number { 1 2 3 } }"});
+    let source = json!({"unit":"rift://source/project/src/lib.rs"});
+    let started = Instant::now();
+    let work = async {
+        tokio::join!(
+            call_retrying_acceptance(&client, tool_request("search", &statement)),
+            call_retrying_acceptance(&client, tool_request("search", &statement)),
+            async {
+                let started = Instant::now();
+                let result =
+                    call_retrying_acceptance(&client, tool_request("get_source", &source)).await;
+                (result, started.elapsed())
+            },
+            client.list_all_tools(),
+        )
+    };
+    let (left, right, (source, source_elapsed), tools) =
+        tokio::time::timeout(Duration::from_secs(30), work).await?;
+    assert_eq!(query::rows(&left?)?.len(), 3);
+    assert_eq!(query::rows(&right?)?.len(), 3);
+    assert!(serde_json::to_string(&source?)?.contains("pub fn beacon"));
+    assert!(tools?.iter().any(|tool| tool.name == "search"));
+    let followup =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":"ASK {}"})))
+            .await?;
+    assert_eq!(followup["answer"]["value"], true);
+    eprintln!(
+        "concurrent query elapsed_ms={} source elapsed_ms={}",
+        started.elapsed().as_millis(),
+        source_elapsed.as_millis(),
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn query_forms_validate_against_live_schemas_and_preserve_exact_identity() -> TestResult {

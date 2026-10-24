@@ -99,7 +99,13 @@ async fn served_configured_workspace(
     if let Some(configuration) = configuration {
         fs::write(directory.path().join("rift.toml"), configuration)?;
     }
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(
+            std::env::var_os("CARGO_BIN_EXE_rift")
+                .ok_or("test runner must provide CARGO_BIN_EXE_rift")?
+                .into(),
+        );
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server

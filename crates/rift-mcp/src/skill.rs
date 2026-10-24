@@ -239,6 +239,12 @@ fn skill_markdown(form: SkillForm) -> String {
          with exact symbol and source reads. Missing required facts return unavailability, \
          never a false boolean or empty complete answer.\n\n",
     );
+    let _ = writeln!(
+        rendered,
+        "The `:` vocabulary is `{}`. The local named graph is `{}`.\n",
+        rift_search::sparql::VOCABULARY,
+        rift_search::sparql::LOCAL_GRAPH,
+    );
     rendered.push_str("## When a call refuses\n\n");
     rendered.push_str(
         "Read `rift server logs` when a refusal alone does not say why; it carries the \

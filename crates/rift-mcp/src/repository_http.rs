@@ -29,7 +29,6 @@ use crate::http::{
     HttpServer, IdleTracker, MCP_PATH, RequestGate, STOP_PATH, TokenCheck, WORKSPACE_ROOT_HEADER,
     authorize_request, bind_loopback_listener, guard_loopback_boundary, mint_token, watch_idle,
 };
-use crate::identity::BuildCheckout;
 use crate::repository::{ServerConfigurationSelection, select_server_configuration};
 use crate::server::{BlockingExecutor, EngineHold};
 use crate::storage::WorkspaceStorage;
@@ -82,8 +81,9 @@ pub(crate) async fn serve_repository_http(
     shutdown: CancellationToken,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<HttpServer, RiftError> {
+    let checkout = checkout.into();
     let authority_root = tokio::fs::canonicalize(authority_root)
         .await
         .map_err(|error| {
@@ -101,7 +101,7 @@ pub(crate) async fn serve_repository_http(
                 .error()
         })?;
     let blocking = BlockingExecutor::for_configuration(&server_configuration)?;
-    let identity = crate::identity::product_identity(checkout)
+    let identity = crate::identity::product_identity(checkout.checkout)
         .await
         .map_err(|error| {
             errors::mcp::http_serve_failed()
@@ -200,7 +200,7 @@ pub(crate) struct RepositoryWorkspaceRegistry {
     common_directory: std::path::PathBuf,
     server_configuration: ServerConfiguration,
     limits: WorkspaceIndexLimits,
-    checkout: BuildCheckout,
+    checkout: crate::ServeOptions,
     blocking: BlockingExecutor,
     stop: CancellationToken,
     idle_timeout: Duration,
@@ -496,11 +496,12 @@ impl RepositoryWorkspaceRegistry {
             &root,
             self.limits,
             storage,
-            self.checkout,
+            self.checkout.checkout,
             self.blocking.clone(),
         )
         .await
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "workspace build failed"))?;
+        let server = self.checkout.clone().apply(server);
         let settings_changed = server.server_configuration().await != self.server_configuration;
         let supervisor = server.index_supervisor();
         let engines = server.engine_hold();
@@ -1236,7 +1237,7 @@ mod tests {
             workspaces_max: 1,
             server_configuration,
             limits: WorkspaceIndexLimits::default(),
-            checkout: BuildCheckout::Unversioned,
+            checkout: BuildCheckout::Unversioned.into(),
             stop: CancellationToken::new(),
             build_gate: tokio::sync::Mutex::new(()),
             workspaces: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),

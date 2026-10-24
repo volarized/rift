@@ -113,6 +113,13 @@ impl LocalSymbolViewInput {
             .transpose()
     }
 
+    pub(crate) fn captured_history_bytes(&self) -> Option<&[u8]> {
+        self.material
+            .history
+            .as_ref()
+            .map(|(_, bytes)| bytes.as_ref())
+    }
+
     /// Retains one encoded execution result under the existing material admission bound.
     #[must_use]
     pub fn with_query_result(self, bytes: Vec<u8>) -> Self {

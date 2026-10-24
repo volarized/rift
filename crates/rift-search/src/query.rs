@@ -9,9 +9,10 @@ pub use rift_protocol::query::{QuerySource, QuerySymbol};
 use rift_protocol::read::{
     Node, Relationship, RelationshipFacet, SymbolHistory, SymbolId, TraversalDirection,
 };
+use serde::{Deserialize, Serialize};
 
 /// Complete domain records acquired under one immutable serving selection.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct QueryFacts {
     /// Families not captured by the selected publication.
     pub unavailable_families: Vec<QueryFactFamily>,
@@ -42,7 +43,7 @@ pub struct QueryFacts {
 }
 
 /// Domain families whose absence must not become a negative query answer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum QueryFactFamily {
     /// Complete concrete syntax node rows.
     Nodes,
@@ -53,7 +54,7 @@ pub enum QueryFactFamily {
 }
 
 /// Accepted bounds supplied by the serving owner.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct QueryLimits {
     /// Most UTF-8 bytes admitted before parsing.
     pub query_bytes_max: usize,
@@ -69,8 +70,33 @@ pub struct QueryLimits {
     pub result_bytes_max: usize,
 }
 
+impl TryFrom<&rift_protocol::query::QueryConfiguration> for QueryLimits {
+    type Error = rift_error::RiftError;
+
+    fn try_from(
+        configuration: &rift_protocol::query::QueryConfiguration,
+    ) -> Result<Self, Self::Error> {
+        let quantity = |value| {
+            usize::try_from(value).map_err(|_| {
+                rift_error::errors::server::read_unavailable()
+                    .operation("query acquisition")
+                    .detail("query configuration exceeds the platform bound")
+                    .error()
+            })
+        };
+        Ok(Self {
+            query_bytes_max: quantity(configuration.statement_size.bytes())?,
+            algebra_nodes_max: quantity(configuration.algebra_nodes)?,
+            quads_max: quantity(configuration.statements)?,
+            rdf_bytes_max: quantity(configuration.fact_size.bytes())?,
+            result_items_max: quantity(configuration.results)?,
+            result_bytes_max: quantity(configuration.result_size.bytes())?,
+        })
+    }
+}
+
 /// Complete adjacency required from one established subject.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct AdjacencyRequirement {
     /// Canonical identity at the anchored end of the expression.
     pub seed: SymbolId,
@@ -83,7 +109,7 @@ pub struct AdjacencyRequirement {
 }
 
 /// Sufficient domain operations required before evaluation can report a complete answer.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct FactRequirements {
     /// Whether ordinary selected domain facts are required outside a query service.
     pub domain: bool,

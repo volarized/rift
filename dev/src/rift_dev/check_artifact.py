@@ -52,9 +52,12 @@ def lay_out_workspace(root: Path) -> None:
 
 async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonObject:
     """Select an exact named declaration from the validated lookup answer."""
-    answer = await client.call(
+    answer = await settled_local(
+        client,
         "search",
         declaration_request(name),
+        seconds=ARTIFACT_SECONDS,
+        poll_seconds=POLL_SECONDS,
     )
     matches = [
         row

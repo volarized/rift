@@ -131,15 +131,35 @@ class ListedSuite(BaseModel):
     """Discovery owns binary IDs; JSON+ owns display names."""
 
     package_name: str = Field(alias="package-name")
+    package_id: str = Field(alias="package-id")
     binary_id: str = Field(alias="binary-id")
     binary_name: str = Field(alias="binary-name")
     testcases: dict[str, ListedTest]
+
+
+class NonTestBinary(BaseModel):
+    """One executable or library in Nextest's build inventory."""
+
+    name: str
+    kind: str
+    path: Path
+    build_platform: Literal["target", "host"] | None = Field(
+        default=None, alias="build-platform"
+    )
+
+
+class RustBuildMetadata(BaseModel):
+    """Artifact paths after Nextest applies any archive relocation."""
+
+    target_directory: Path = Field(alias="target-directory")
+    non_test_binaries: dict[str, list[NonTestBinary]] = Field(alias="non-test-binaries")
 
 
 class TestList(BaseModel):
     """Nextest's public test list, validated before execution."""
 
     rust_suites: dict[str, ListedSuite] = Field(alias="rust-suites")
+    rust_build_meta: RustBuildMetadata = Field(alias="rust-build-meta")
 
 
 class CaseIdentity(BaseModel):
@@ -801,6 +821,67 @@ def reuse_archive(
     )
 
 
+def query_program(discovered: TestList) -> Path | None:
+    """Select the actual Rift executable from the current build inventory.
+
+    Nextest exposes a binary only to tests in its own package. The shared
+    environment supplies the same artifact to in-process MCP fixtures.
+
+    >>> root = Path.cwd().resolve() / "worker-selection"
+    >>> binary = {"name": "rift", "kind": "bin-exe", "path": "debug/rift", "build-platform": "target"}
+    >>> suite = {"package-name": "rift", "package-id": "rift-package", "binary-id": "rift-tests", "binary-name": "rift-tests", "testcases": {}}
+    >>> build = {"target-directory": root, "non-test-binaries": {"rift-package": [binary]}}
+    >>> listed = TestList.model_validate({"rust-suites": {"rift-tests": suite}, "rust-build-meta": build})
+    >>> query_program(listed) == root / "debug/rift"
+    True
+    >>> relocated = listed.model_copy(update={"rust_build_meta": listed.rust_build_meta.model_copy(update={"target_directory": root / "relocated"})})
+    >>> query_program(relocated) == root / "relocated/debug/rift"
+    True
+    >>> query_program(listed.model_copy(update={"rust_suites": {}})) is None
+    True
+    >>> bad = listed.rust_build_meta.model_copy(update={"target_directory": Path("relative")})
+    >>> query_program(listed.model_copy(update={"rust_build_meta": bad}))
+    Traceback (most recent call last):
+        ...
+    ValueError: Nextest Rift executable path is outside its target directory
+    >>> escaped = NonTestBinary.model_validate({**binary, "path": "../rift"})
+    >>> bad = listed.rust_build_meta.model_copy(update={"non_test_binaries": {"rift-package": [escaped]}})
+    >>> query_program(listed.model_copy(update={"rust_build_meta": bad}))
+    Traceback (most recent call last):
+        ...
+    ValueError: Nextest Rift executable path is outside its target directory
+    >>> other = NonTestBinary.model_validate({**binary, "path": "other/rift"})
+    >>> original = NonTestBinary.model_validate(binary)
+    >>> bad = listed.rust_build_meta.model_copy(update={"non_test_binaries": {"rift-package": [original, other]}})
+    >>> query_program(listed.model_copy(update={"rust_build_meta": bad}))
+    Traceback (most recent call last):
+        ...
+    ValueError: Nextest inventory contains more than one Rift executable
+    """
+    owners = {
+        suite.package_id
+        for suite in discovered.rust_suites.values()
+        if suite.package_name == "rift"
+    }
+    paths = {
+        binary.path
+        for owner in owners
+        for binary in discovered.rust_build_meta.non_test_binaries.get(owner, [])
+        if binary.name == "rift"
+        and binary.kind == "bin-exe"
+        and binary.build_platform == "target"
+    }
+    if not paths:
+        return None
+    if len(paths) != 1:
+        raise ValueError("Nextest inventory contains more than one Rift executable")
+    path = paths.pop()
+    root = discovered.rust_build_meta.target_directory
+    if not root.is_absolute() or path.is_absolute() or ".." in path.parts:
+        raise ValueError("Nextest Rift executable path is outside its target directory")
+    return root / path
+
+
 def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path]:
     """Discover exact identities using the same instrumented build as execution."""
     arguments = controlled_arguments(command.arguments[2:])
@@ -887,6 +968,11 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
     discovered = TestList.model_validate_json(discovered_bytes)
     if archive_directory is not None:
         reuse_archive(command, arguments, archive_directory, llvm_cov=llvm_cov)
+    program = query_program(discovered)
+    if program is not None:
+        if not program.is_file():
+            raise ValueError(f"Nextest Rift executable is missing: {program}")
+        command.with_env(CARGO_BIN_EXE_rift=str(program))
     outcomes: dict[str, Outcome] = {}
     for suite in discovered.rust_suites.values():
         for name, test in suite.testcases.items():

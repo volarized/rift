@@ -290,7 +290,7 @@ async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_w
     let forced = forced
         .structured_content
         .ok_or("search answers with structured content")?;
-    assert_eq!(forced["outcome"], "unavailable", "{forced}");
+    assert!(hit_paths(&forced).contains(&"src/lib.rs"), "{forced:#}");
     assert!(
         names_unavailable(&forced, "src/wide.rs"),
         "the answer names the refused file: {forced:#}"

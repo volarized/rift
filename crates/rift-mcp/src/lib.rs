@@ -16,6 +16,7 @@ pub mod repository;
 mod repository_http;
 mod resource;
 pub mod schema;
+mod serve_options;
 mod server;
 pub mod skill;
 mod spawn;
@@ -33,12 +34,13 @@ pub use election::{
 pub use failure::{McpErrorExt, McpErrorFailExt, McpFailure};
 pub use http::{
     DeferredDatabaseShutdown, HttpServer, STOP_REQUEST_TIMEOUT, StopRequestFailure, TokenCheck,
-    request_stop, serve_http, stop_stage, stop_stage_within,
+    request_stop, serve_http, serve_http_with_options, stop_stage, stop_stage_within,
 };
 pub use identity::{BuildCheckout, product_identity_of};
 pub use logs::logs_configuration;
 pub use output::OutputPolicy;
 pub use proxy::{forward_budget, serve_proxy};
+pub use serve_options::ServeOptions;
 pub use server::RiftMcp;
 pub use spawn::{
     PRESENCE_POLL_INTERVAL, SERVER_STDERR_FILE_NAME, START_POLL_ATTEMPT_COUNT,

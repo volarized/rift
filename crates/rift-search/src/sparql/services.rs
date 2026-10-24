@@ -8,6 +8,7 @@ use oxigraph::sparql::{QueryResults, QuerySolutionIter, ServiceHandler, SparqlEv
 use oxiri::Iri;
 use rift_protocol::query::{QueryAnswer, RdfTerm};
 use rift_protocol::read::{SearchParams, SearchResult};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
@@ -19,7 +20,7 @@ use super::{
 };
 
 /// One complete result produced by the existing retrieval owner.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct QueryServiceData {
     /// The accepted request whose results were acquired.
     pub request: SearchParams,
@@ -28,7 +29,7 @@ pub struct QueryServiceData {
 }
 
 /// One retained table, addressed by its execution's service IRI.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RetainedResult {
     /// The execution IRI selected in the SPARQL statement.
     pub service: String,
@@ -37,7 +38,7 @@ pub struct RetainedResult {
 }
 
 /// Adapter-owned local service inputs; callbacks perform no acquisition or I/O.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct QueryServices {
     /// Complete results from existing ranked, regex, revision and change producers.
     pub retrievals: Vec<QueryServiceData>,

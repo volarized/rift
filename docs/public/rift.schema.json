@@ -1576,6 +1576,73 @@
       },
       "type": "object"
     },
+    "QueryConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[search.query]` bounds for acquisition, evaluation and retained answers.",
+      "properties": {
+        "algebra_nodes": {
+          "default": 8192,
+          "description": "Most parsed algebra nodes, 1 to 65536.",
+          "format": "uint64",
+          "maximum": 65536,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "fact_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256mb",
+          "description": "Most projected RDF term bytes, 1mb to 4gb."
+        },
+        "page_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Most encoded answer bytes in one transport page, 1kb to 4mb."
+        },
+        "page_size": {
+          "default": 1000,
+          "description": "Most rows or triples served in one transport page, 1 to 10000.",
+          "format": "uint64",
+          "maximum": 10000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "requests": {
+          "default": 20000,
+          "description": "Most provider requests during one acquisition, 1 to 100000.",
+          "format": "uint64",
+          "maximum": 100000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "result_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "128mb",
+          "description": "Most serialized bytes retained for one answer, 1kb to 1gb."
+        },
+        "results": {
+          "default": 1000000,
+          "description": "Most evaluated rows or triples retained, 1 to 1000000.",
+          "format": "uint64",
+          "maximum": 1000000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "statement_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64kb",
+          "description": "Most query text admitted before parsing, 1kb to 1mb."
+        },
+        "statements": {
+          "default": 2000000,
+          "description": "Most projected RDF statements, 1 to 10000000.",
+          "format": "uint64",
+          "maximum": 10000000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "RankingConfiguration": {
       "additionalProperties": false,
       "description": "The `[search.ranking]` table: what each ranking input contributes to a\nfused score, and how sharply a top rank counts.\n\nThe three weights need not sum to 1. The executor normalizes the weights\nof the inputs that answered, so an unavailable vector ranking does not\nrescale what identifier matching and the lexical ranking returned.",
@@ -1748,6 +1815,21 @@
           "maximum": 16,
           "minimum": 1,
           "type": "integer"
+        },
+        "query": {
+          "$ref": "#/$defs/QueryConfiguration",
+          "default": {
+            "algebra_nodes": 8192,
+            "fact_size": "256mb",
+            "page_limit": "4mb",
+            "page_size": 1000,
+            "requests": 20000,
+            "result_size": "128mb",
+            "results": 1000000,
+            "statement_size": "64kb",
+            "statements": 2000000
+          },
+          "description": "Admission, evaluation, and retained-result bounds for query search."
         },
         "ranking": {
           "$ref": "#/$defs/RankingConfiguration",
@@ -2417,6 +2499,17 @@
         "pattern_matches_per_file": 1000,
         "pattern_verified_size": "128mb",
         "pool_slots": 4,
+        "query": {
+          "algebra_nodes": 8192,
+          "fact_size": "256mb",
+          "page_limit": "4mb",
+          "page_size": 1000,
+          "requests": 20000,
+          "result_size": "128mb",
+          "results": 1000000,
+          "statement_size": "64kb",
+          "statements": 2000000
+        },
         "ranking": {
           "fusion_k": 60,
           "identifier_weight": 0.35,

@@ -17,9 +17,17 @@ impl RiftProxy {
         &self,
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        let backend = self.call_backend(request)?;
+        let forwarded = self.query_forward(request).await?;
+        let name = forwarded.backend.as_str();
+        let backend = if name == "local" {
+            self
+        } else {
+            self.backends
+                .get(name)
+                .ok_or_else(|| self.extra.refusal(name, "search", "scope"))?
+        };
         let root = accepted_root(backend)?;
-        let response = backend.forward_read(request.clone()).await?;
+        let response = forwarded.response;
         if let Ok(CallToolResponse::Complete(result)) = &response
             && result.is_error != Some(true)
         {
@@ -38,7 +46,7 @@ impl RiftProxy {
                 && let Some(view) = answer.view
             {
                 let selected = SavedCandidateBackend {
-                    backend: "local".to_owned(),
+                    backend: name.to_owned(),
                     root: root.to_owned(),
                     owner: None,
                     view,
@@ -50,10 +58,49 @@ impl RiftProxy {
                     .backend(&selected.view.id, SystemTime::now())?
                     .map_err(|reason| view_refusal(&selected.view.id, reason))?
                 {
-                    Some(held) if held != selected => {
+                    Some(held)
+                        if held.backend != selected.backend
+                            || held.root != selected.root
+                            || held.view != selected.view =>
+                    {
                         return Err(invalid("view", "captured backend context does not match"));
                     }
                     Some(_) => {}
+                    None if !forwarded.captured.is_empty() => {
+                        let mut backends = Vec::new();
+                        for captured in forwarded.captured {
+                            for pool in captured.pools {
+                                let context = SavedCandidateBackend {
+                                    backend: pool.backend,
+                                    root: pool.root,
+                                    owner: pool.owner,
+                                    view: selected.view.clone(),
+                                    project: None,
+                                    upstream_view: Some(pool.view),
+                                };
+                                if let Some(previous) =
+                                    backends.iter().find(|previous: &&SavedCandidateBackend| {
+                                        previous.backend == context.backend
+                                            && previous.owner == context.owner
+                                    })
+                                {
+                                    if previous != &context {
+                                        return Err(invalid(
+                                            "view",
+                                            "captured backend contexts do not match",
+                                        ));
+                                    }
+                                } else {
+                                    backends.push(context);
+                                }
+                            }
+                        }
+                        self.candidate_views.save_query(
+                            &selected.view,
+                            backends,
+                            SystemTime::now(),
+                        )?;
+                    }
                     None => {
                         let mut pending = self.candidate_views.reserve_backend(
                             &selected.backend,
@@ -465,7 +512,7 @@ impl RiftProxy {
     ) -> Result<(&'a Self, SavedCandidateBackend), RiftError> {
         let selected = self
             .candidate_views
-            .backend(view, SystemTime::now())?
+            .backend_for(view, owner, SystemTime::now())?
             .map_err(|reason| view_refusal(view, reason))?
             .ok_or_else(|| {
                 view_refusal(
@@ -500,7 +547,7 @@ impl RiftProxy {
         Ok((backend, selected))
     }
 
-    async fn forward_read(
+    pub(in crate::proxy) async fn forward_read(
         &self,
         request: CallToolRequestParams,
     ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {

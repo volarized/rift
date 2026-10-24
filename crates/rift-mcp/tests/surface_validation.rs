@@ -400,7 +400,9 @@ async fn served_fixture_with_setup(
         )?;
         rift_history::fixture::commit_all(fixture.root(), "admit canonical change witness");
     }
-    let server = RiftMcp::build(fixture.root(), WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(fixture.root(), WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
@@ -1195,10 +1197,13 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     )?;
     assert_eq!(
         failure.code,
-        ErrorCode::CapabilityUnavailable,
+        ErrorCode::TemporarilyUnavailable,
         "{failure:?}"
     );
-    assert!(failure.message.contains("of kind `struct`"), "{failure:?}");
+    assert!(
+        failure.message.contains("prepared no call hierarchy item"),
+        "{failure:?}"
+    );
     client.cancel().await?;
 
     let (_engine, (_directory, client, _server_task)) = fake_engine::scripted_calls_workspace(
@@ -1259,7 +1264,7 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         .get("search")
         .ok_or("search must be advertised")?;
     let caller = workspace_client::captured_seed(&client, "caller", "caller.py").await?;
-    let walk = json!({"query":format!("SELECT ?symbol ?name ?unit {{ <{caller}> :calls ?symbol . ?symbol :name ?name; :declarations/:source/:unit ?unit }} ORDER BY ?name")});
+    let walk = json!({"query":format!("SELECT ?symbol ?name ?unit {{ <{caller}> :calls ?symbol . ?symbol :name ?name; :declarations/:unit ?unit }} ORDER BY ?name")});
     assert_validates(input_validator, &walk, "an outgoing walk");
     let structured = workspace_client::call_retrying_acceptance(
         &client,

@@ -97,7 +97,11 @@ async fn request_admission_counts_http_pages_and_keeps_cached_capabilities_free(
     let client = client.with_request_admission(move || {
         let attempt = observed.fetch_add(1, Ordering::Relaxed);
         if attempt >= 2 {
-            return Err(crate::relationships::invalid("request bound reached"));
+            return Err(crate::failure::request_invalid(
+                "query",
+                "requests",
+                "request bound reached",
+            ));
         }
         Ok(())
     });
@@ -375,19 +379,18 @@ async fn relationship_capability_direction_and_every_required_facet_are_explicit
     .await;
     let capabilities = client.get_capabilities().await.expect("capabilities");
     let mut old = capabilities.clone();
-    old.additional_properties
-        .remove("relationship_capabilities");
+    old.relationship_capabilities = None;
     assert!(
         crate::GlobalClient::relationship_capabilities(&old)
             .expect("older metadata")
             .is_empty()
     );
     let mut duplicate = capabilities.clone();
-    duplicate.additional_properties.insert(
-        "relationship_capabilities".to_owned(),
-        json!([
+    duplicate.relationship_capabilities = Some(
+        serde_json::from_value(json!([
             {"direction":"incoming","facets":["references","references"]}
-        ]),
+        ]))
+        .expect("generated capability fields"),
     );
     assert!(crate::GlobalClient::relationship_capabilities(&duplicate).is_err());
     let mut selected = request();

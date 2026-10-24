@@ -14,6 +14,7 @@ mod map;
 mod package_manager;
 mod process;
 mod query;
+mod query_process;
 mod read;
 mod recommendations;
 mod search;
@@ -33,6 +34,10 @@ pub use history::{FillCounts, FillProgress, StoredHistory};
 pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,
+};
+pub use query_process::{
+    QUERY_CHILD_COMMAND, QueryFactBudget, QueryProcessLimits, evaluate_query, prepare_query,
+    run_query_child,
 };
 pub use read::{
     LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accepted_limit,

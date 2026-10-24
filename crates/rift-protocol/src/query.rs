@@ -40,6 +40,10 @@ pub enum QueryLanguage {
 /// A query over the accepted workspace and explicitly selected datasets.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("examples" = [
+    { "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } LIMIT 20" },
+    { "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }", "language": "sparql" }
+]))]
 pub struct QueryParams {
     /// SPARQL Query text. The server supplies vocabulary and standard prefixes.
     pub query: String,
@@ -85,7 +89,7 @@ pub struct QuerySource {
     pub digest: Option<crate::identity::SourceDigest>,
     /// Selected text, absent when source is unavailable or unrequested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 67108864))]
+    #[schemars(length(max = 67_108_864))]
     pub text: Option<String>,
 }
 
@@ -109,6 +113,17 @@ pub struct QueryResult {
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
 #[schemars(transform = crate::schema::require_query_result_object)]
+#[schemars(extend("examples" = [
+    {
+        "answer": { "result": "bindings", "variables": ["name"], "bindings": [
+            { "name": { "type": "literal", "value": "ReadService", "datatype": "http://www.w3.org/2001/XMLSchema#string" } }
+        ] },
+        "pagination": { "page_index": 0, "total_pages": 1 }
+    },
+    { "answer": { "result": "boolean", "value": true }, "pagination": { "page_index": 0, "total_pages": 1 } },
+    { "answer": { "result": "graph", "triples": [] }, "pagination": { "page_index": 0, "total_pages": 0 } },
+    { "outcome": "unavailable", "reason": "view_context", "warnings": [] }
+]))]
 pub enum QueryReadResult {
     /// An answer evaluated over every required fact.
     Results(Box<QueryResult>),

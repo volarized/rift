@@ -367,7 +367,9 @@ async fn search_change_refuses_a_workspace_with_no_repository() -> TestResult {
         hermetic_search::HERMETIC_TABLES,
     )?;
     write_all(directory.path(), BASELINE)?;
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server

@@ -104,7 +104,9 @@ pub(super) fn upstream_backend(selected: &SavedCandidateBackend) -> SavedCandida
     let mut upstream = selected.clone();
     if let Some(view) = &selected.upstream_view {
         upstream.view = view.clone();
-        upstream.owner = None;
+        if upstream.backend == "global" {
+            upstream.owner = None;
+        }
         upstream.project = None;
         upstream.upstream_view = None;
     }
@@ -124,6 +126,9 @@ pub(super) fn upstream_request(
         .as_mut()
         .ok_or_else(|| invalid("arguments", "captured request has no arguments"))?
         .insert("view".to_owned(), serde_json::json!(upstream.view.id));
+    if upstream.backend != "global" {
+        return Ok(request);
+    }
     let meta = request
         .meta
         .get_or_insert_with(rmcp::model::RequestMetaObject::new);

@@ -48,7 +48,6 @@ use crate::election::{
 };
 use crate::failure::{McpErrorExt as _, WireFailure as _};
 use crate::http::{MCP_PATH, StopRequestFailure, WORKSPACE_ROOT_HEADER, request_stop};
-use crate::identity::BuildCheckout;
 use crate::metrics::{
     Ending, MCP_CLIENT_OPERATION_DURATION, McpRequest, RESOURCE_TEMPLATES_LIST, RESOURCES_LIST,
     RESOURCES_READ, TOOLS_LIST,
@@ -101,11 +100,12 @@ const FORWARD_ANSWER_GRACE: Duration = Duration::from_secs(10);
 /// connection; the detached server keeps serving the workspace.
 pub async fn serve_proxy(
     root: &Path,
-    checkout: BuildCheckout,
+    options: impl Into<crate::ServeOptions>,
     output: OutputPolicy,
     extra: &[String],
     home: Option<&Path>,
 ) -> Result<(), RiftError> {
+    let options = options.into();
     rift_tracing::info!(
         component = "mcp",
         transport = "stdio",
@@ -115,11 +115,16 @@ pub async fn serve_proxy(
     let configuration = rift_server::load_configuration(root)?;
     let registrations = extra::Registrations::accept(root, &configuration.mcp, extra, home)?
         .with_profiles(root, &configuration)?;
-    let identity = crate::identity::product_identity(checkout)
+    let identity = crate::identity::product_identity(options.checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
-    let proxy =
+    let mut proxy =
         RiftProxy::with_configuration(root, identity, output, &configuration.server, registrations);
+    proxy.query_program = options.query_program.map(Arc::new);
+    proxy.query_worker = Some(crate::server::BlockingExecutor::for_configuration(
+        &configuration.server,
+    )?);
+    proxy.query_configuration = configuration.search.query;
     let warmup = tokio::spawn(warm_up(proxy.clone()));
     let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
     warmup.abort();
@@ -217,6 +222,12 @@ struct RiftProxy {
     backends: Arc<BTreeMap<String, RiftProxy>>,
     candidate_views: Arc<candidates::CandidateViews>,
     framework_warnings: Arc<crate::output::FrameworkWarnings>,
+    query_program: Option<Arc<std::path::PathBuf>>,
+    /// One admission owner for this stdio process, shared by its proxy clones.
+    /// Profile backends do not allocate another pool. Independent proxy and server
+    /// processes each apply their accepted worker count; this is not a host-wide cap.
+    query_worker: Option<crate::server::BlockingExecutor>,
+    query_configuration: rift_protocol::query::QueryConfiguration,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -356,6 +367,13 @@ impl RiftProxy {
         proxy.accepted_root = extra.primary_root().map(Arc::from);
         proxy.extra = Arc::new(extra);
         proxy.backends = Arc::new(backends);
+        #[cfg(test)]
+        {
+            proxy.query_worker = Some(
+                crate::server::BlockingExecutor::for_configuration(server)
+                    .expect("accepted fixture worker bounds"),
+            );
+        }
         proxy
     }
 
@@ -379,6 +397,13 @@ impl RiftProxy {
             backends: Arc::new(BTreeMap::new()),
             candidate_views: Arc::new(candidates::CandidateViews::default()),
             framework_warnings: Arc::new(crate::output::FrameworkWarnings::default()),
+            #[cfg(test)]
+            query_program: std::env::var_os("CARGO_BIN_EXE_rift")
+                .map(|program| Arc::new(std::path::PathBuf::from(program))),
+            #[cfg(not(test))]
+            query_program: None,
+            query_worker: None,
+            query_configuration: rift_protocol::query::QueryConfiguration::default(),
         }
     }
 

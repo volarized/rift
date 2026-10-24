@@ -75,7 +75,9 @@ fn workspace_with(configuration: Option<&str>) -> TestResult<tempfile::TempDir> 
 }
 
 async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let service = server

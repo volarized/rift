@@ -16,6 +16,7 @@ use crate::server::candidates::{
 
 use super::RiftProxy;
 
+mod query;
 mod read;
 mod reservation;
 
@@ -66,6 +67,7 @@ use crate::global::candidates::SavedCandidateBackend;
 enum SavedCandidateRead {
     Search(Box<SavedCandidateSearch>),
     Symbol(Box<SavedCandidateBackend>),
+    Query(Vec<SavedCandidateBackend>),
 }
 
 impl Default for CandidateViews {
@@ -98,6 +100,35 @@ impl CandidateViews {
             CANDIDATE_BYTES_MAX,
         )
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        self.save_read(&view, bytes, now)?;
+        Ok(view)
+    }
+
+    fn save_query(
+        &self,
+        view: &CapturedView,
+        backends: Vec<SavedCandidateBackend>,
+        now: SystemTime,
+    ) -> Result<(), RiftError> {
+        if backends.is_empty() || backends.iter().any(|backend| backend.view != *view) {
+            return Err(invalid("view", "captured backend context does not match"));
+        }
+        let bytes =
+            super::encode_bounded(&SavedCandidateRead::Query(backends), CANDIDATE_BYTES_MAX)
+                .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        self.save_read(view, bytes, now)
+    }
+
+    fn save_read(
+        &self,
+        view: &CapturedView,
+        bytes: Vec<u8>,
+        now: SystemTime,
+    ) -> Result<(), RiftError> {
+        let expires = captured_expiry(view)?;
+        if expires <= now {
+            return Err(invalid("view", "captured search view has expired"));
+        }
         let mut rows = self
             .rows
             .lock()
@@ -125,12 +156,21 @@ impl CandidateViews {
             bytes,
             reservation: None,
         });
-        Ok(view)
+        Ok(())
     }
 
     pub(super) fn backend(
         &self,
         id: &CapturedViewId,
+        now: SystemTime,
+    ) -> Result<Result<Option<SavedCandidateBackend>, SymbolUnavailableReason>, RiftError> {
+        self.backend_for(id, None, now)
+    }
+
+    pub(super) fn backend_for(
+        &self,
+        id: &CapturedViewId,
+        owner: Option<&SymbolOwner>,
         now: SystemTime,
     ) -> Result<Result<Option<SavedCandidateBackend>, SymbolUnavailableReason>, RiftError> {
         let rows = self
@@ -143,10 +183,17 @@ impl CandidateViews {
             if row.reservation.is_some() {
                 continue;
             }
-            for accepted in saved_backends(&row.bytes)?
-                .into_iter()
-                .filter(|accepted| accepted.view.id == *id)
-            {
+            let accepted = saved_backends(&row.bytes)?;
+            let mut matching = accepted.into_iter().filter(|accepted| {
+                accepted.view.id == *id
+                    && owner.is_none_or(|owner| {
+                        accepted.owner.as_ref().is_none_or(|actual| {
+                            super::identity::public_owner(actual, &accepted.backend)
+                                .is_ok_and(|actual| &actual == owner)
+                        })
+                    })
+            });
+            while let Some(accepted) = matching.next() {
                 if row.expires <= now {
                     expired = true;
                     continue;
@@ -158,6 +205,9 @@ impl CandidateViews {
                     return Ok(Err(SymbolUnavailableReason::ViewContext));
                 }
                 selected = Some(accepted);
+                if owner.is_none() {
+                    break;
+                }
             }
         }
         if expired {
@@ -214,6 +264,7 @@ fn saved_backends(bytes: &[u8]) -> Result<Vec<SavedCandidateBackend>, RiftError>
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
     Ok(match saved {
         SavedCandidateRead::Symbol(backend) => vec![*backend],
+        SavedCandidateRead::Query(backends) => backends,
         SavedCandidateRead::Search(saved) => saved
             .captured
             .pools
@@ -284,6 +335,61 @@ fn captured_view(captured: &CapturedCandidates) -> Result<(CapturedView, SystemT
 }
 
 impl RiftProxy {
+    pub(super) async fn query_retrieval(
+        &self,
+        params: &SearchParams,
+    ) -> Result<
+        Result<(rift_protocol::read::SearchResult, CapturedCandidates), CallToolResult>,
+        RiftError,
+    > {
+        let captured = match self.captured_candidates(params, &[]).await? {
+            Err(error) => return Err(errors::mcp::forward_failed().source(error).error()),
+            Ok(CandidateAnswer::Response(response)) => return Ok(Err(response)),
+            Ok(CandidateAnswer::Captured(captured)) => captured,
+        };
+        let view = self
+            .candidate_views
+            .save(params, &captured, SystemTime::now())?;
+        let policy = &captured.ranking;
+        let weights = rift_ranking::RankingWeights::new(
+            policy.identifier_weight,
+            policy.lexical_weight,
+            policy.vector_weight,
+            policy.fusion_k,
+        )?;
+        let mut paging = params.clone();
+        paging.limit = Some(rift_protocol::read::PAGE_LIMIT_MAX);
+        paging.page_index = 0;
+        let mut complete = crate::global::candidates::merge_candidate_pools(
+            &paging,
+            &captured.pools,
+            weights,
+            captured.results_max,
+        )?;
+        while paging
+            .page_index
+            .checked_add(1)
+            .is_some_and(|next| next < complete.pagination.total_pages)
+        {
+            paging.page_index += 1;
+            let page = crate::global::candidates::merge_candidate_pools(
+                &paging,
+                &captured.pools,
+                weights,
+                captured.results_max,
+            )?;
+            complete.results.extend(page.results);
+            super::encode_bounded(&complete, CANDIDATE_BYTES_MAX)
+                .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+        }
+        complete.pagination = rift_protocol::read::Pagination {
+            page_index: 0,
+            total_pages: 1,
+        };
+        complete.view = Some(view);
+        Ok(Ok((complete, captured)))
+    }
+
     fn candidate_backends<'a>(
         &'a self,
         params: &'a SearchParams,

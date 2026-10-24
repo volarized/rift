@@ -9,8 +9,8 @@ use rift_protocol::read::{ReadWarning, TraversalDirection};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::SymbolUnavailableReason;
 use rift_search::sparql::{
-    FactRequirements, LOCAL_GRAPH, PreparedQuery, QueryCancellation, QueryFacts, QueryLimits,
-    QueryServiceData, QueryServices, RESULT_SERVICE_PREFIX, RetainedResult,
+    FactRequirements, LOCAL_GRAPH, QueryFacts, QueryLimits, QueryPlan, QueryServiceData,
+    QueryServices, RESULT_SERVICE_PREFIX, RetainedResult,
 };
 
 use super::{Json, RiftMcp, ToolFailure, wire};
@@ -20,7 +20,26 @@ mod global;
 mod retrieval;
 mod selection;
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QueryCandidateRequest {
+    pub(crate) params: QueryParams,
+    pub(crate) retrievals: Vec<QueryServiceData>,
+}
+
 impl RiftMcp {
+    pub(super) fn query_candidates_call(
+        _request: rmcp::model::CallToolRequestParams,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        use rmcp::handler::server::tool::IntoCallToolResult;
+        failure(
+            errors::server::read_unsupported()
+                .capability("query evaluation does not accept supplied fact records")
+                .error(),
+        )
+        .into_call_tool_result()
+    }
+
     pub(super) async fn graph_query(
         &self,
         params: QueryParams,
@@ -35,13 +54,36 @@ impl RiftMcp {
             .search_configuration()
             .query;
         let limits = query_limits(&configuration)?;
-        let prepared = self
-            .blocking
-            .run("query parse", move || {
-                PreparedQuery::parse(&params.query, limits)
-            })
-            .await
-            .map_err(failure)?;
+        let program = self.query_program.clone().ok_or_else(|| {
+            failure(
+                errors::server::read_unsupported()
+                    .capability("query execution requires a compatible Rift executable")
+                    .error(),
+            )
+        })?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let prepared = tokio::time::timeout_at(
+            deadline.at(),
+            self.blocking
+                .run_with_cancellation("query parse", cancellation, move |cancelled| {
+                    rift_server::prepare_query(
+                        program.as_path(),
+                        params.query,
+                        limits,
+                        deadline.at().into_std(),
+                        &|| cancelled.is_cancelled(),
+                    )
+                }),
+        )
+        .await
+        .map_err(|_| {
+            failure(acquisition_failure(
+                "query parsing exceeded the request deadline",
+            ))
+        })?
+        .map_err(failure)?;
+        drop(guard);
         if prepared
             .requirements()
             .datasets
@@ -109,13 +151,34 @@ impl RiftMcp {
             if let Some(material) = retained_material {
                 let material = limit_material(material, expiry.as_ref())?;
                 let requirements = prepared.requirements().clone();
-                let (facts, material) = self
-                    .blocking
-                    .run("retained query facts", move || {
-                        Ok((material.query_facts(&requirements, limits)?, material))
-                    })
-                    .await
-                    .map_err(failure)?;
+                let cancellation = tokio_util::sync::CancellationToken::new();
+                let guard = cancellation.clone().drop_guard();
+                let (facts, material) = tokio::time::timeout_at(
+                    deadline.at(),
+                    self.blocking.run_with_cancellation(
+                        "retained query facts",
+                        cancellation,
+                        move |cancelled| {
+                            let cancelled = || cancelled.is_cancelled() || deadline.is_spent();
+                            Ok((
+                                material.query_facts_with_cancellation(
+                                    &requirements,
+                                    limits,
+                                    &cancelled,
+                                )?,
+                                material,
+                            ))
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    failure(acquisition_failure(
+                        "query acquisition exceeded its deadline",
+                    ))
+                })?
+                .map_err(failure)?;
+                drop(guard);
                 let answer = self
                     .evaluate_query(prepared, facts, limits, services, deadline)
                     .await?;
@@ -160,14 +223,35 @@ impl RiftMcp {
         let reads = Arc::clone(&resolved.published.reads);
         let requirements = prepared.requirements().clone();
         let ((mut facts, material), mut warnings) = {
-            let projection = self
-                .blocking
-                .run("query facts", move || {
-                    let material = reads.local_search_view_input(true)?;
-                    Ok((material.query_facts(&requirements, limits)?, material))
-                })
-                .await
-                .map_err(failure)?;
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let guard = cancellation.clone().drop_guard();
+            let projection = tokio::time::timeout_at(
+                deadline.at(),
+                self.blocking.run_with_cancellation(
+                    "query facts",
+                    cancellation,
+                    move |cancelled| {
+                        let cancelled = || cancelled.is_cancelled() || deadline.is_spent();
+                        let material = reads.local_search_view_input(true)?;
+                        Ok((
+                            material.query_facts_with_cancellation(
+                                &requirements,
+                                limits,
+                                &cancelled,
+                            )?,
+                            material,
+                        ))
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| {
+                failure(acquisition_failure(
+                    "query acquisition exceeded its deadline",
+                ))
+            })?
+            .map_err(failure)?;
+            drop(guard);
             (
                 projection,
                 resolved.stale.clone().into_iter().collect::<Vec<_>>(),
@@ -281,19 +365,35 @@ impl RiftMcp {
 
     async fn evaluate_query(
         &self,
-        prepared: PreparedQuery,
+        prepared: QueryPlan,
         facts: QueryFacts,
         limits: QueryLimits,
         services: QueryServices,
         deadline: super::RequestDeadline,
     ) -> Result<rift_protocol::query::QueryAnswer, ToolFailure> {
-        let cancellation = QueryCancellation::default();
-        let guard = QueryCancellationGuard(cancellation.clone());
+        let program = self.query_program.clone().ok_or_else(|| {
+            failure(
+                errors::server::read_unsupported()
+                    .capability("query execution requires a compatible Rift executable")
+                    .error(),
+            )
+        })?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
         let answer = tokio::time::timeout_at(
             deadline.at(),
-            self.blocking.run("query evaluate", move || {
-                prepared.evaluate_with_services(facts, limits, cancellation, services)
-            }),
+            self.blocking
+                .run_with_cancellation("query evaluate", cancellation, move |cancelled| {
+                    rift_server::evaluate_query(
+                        program.as_path(),
+                        prepared,
+                        facts,
+                        limits,
+                        services,
+                        deadline.at().into_std(),
+                        &|| cancelled.is_cancelled(),
+                    )
+                }),
         )
         .await
         .map_err(|_| {
@@ -311,7 +411,7 @@ impl RiftMcp {
 
     async fn query_services(
         &self,
-        prepared: &PreparedQuery,
+        prepared: &QueryPlan,
         configuration: &QueryConfiguration,
         deadline: super::RequestDeadline,
     ) -> Result<Result<SelectedQueryServices, SearchUnavailable>, ToolFailure> {
@@ -911,11 +1011,4 @@ fn query_limits(configuration: &QueryConfiguration) -> Result<QueryLimits, ToolF
 
 fn failure(error: RiftError) -> ToolFailure {
     error.mcp().tool_failure(wire::ErrorPhase::Read)
-}
-
-struct QueryCancellationGuard(QueryCancellation);
-impl Drop for QueryCancellationGuard {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
 }

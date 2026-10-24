@@ -3,6 +3,7 @@
 mod dataset;
 mod failure;
 mod page;
+mod plan;
 mod recipes;
 mod requirements;
 mod result;
@@ -19,6 +20,7 @@ pub use crate::query::{
     QuerySymbol,
 };
 pub use page::{PageForm, PageSelection, continuation_query};
+pub use plan::QueryPlan;
 pub use recipes::retrieval_query;
 pub use services::{QueryServiceData, QueryServices, RetainedResult};
 

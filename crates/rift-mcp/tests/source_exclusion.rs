@@ -38,7 +38,9 @@ fn reaches(answer: &Value, path: &str) -> TestResult<bool> {
 }
 
 async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let service = server
@@ -174,27 +176,21 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
     fs::write(directory.path().join("rift.toml"), excluded_configuration)?;
     let client = client_for(directory.path()).await?;
 
-    let plain = call(
-        &client,
-        "search",
-        retrieval(json!({ "query": "phantom_generated", "target": "symbol" }))?,
-    )
-    .await?;
+    let plain_arguments = serde_json::from_value(retrieval(json!({
+        "query": "phantom_generated", "target": "symbol"
+    }))?)?;
+    let plain = search_after_population(&client, &plain_arguments).await?;
     assert!(
         !reaches(&plain, "phantom_symbol.rs")?,
         "an excluded file must not answer a plain search: {plain:#}"
     );
 
-    let forced = call(
-        &client,
-        "search",
-        retrieval(json!({
-            "query": "phantom_generated",
-            "target": "symbol",
-            "paths": { "force_include": ["phantom_symbol.rs"] }
-        }))?,
-    )
-    .await?;
+    let forced_arguments = serde_json::from_value(retrieval(json!({
+        "query": "phantom_generated",
+        "target": "symbol",
+        "paths": { "force_include": ["phantom_symbol.rs"] }
+    }))?)?;
+    let forced = search_after_population(&client, &forced_arguments).await?;
     assert!(
         reaches(&forced, "phantom_symbol.rs")?,
         "force_include must still reach a source-excluded file: {forced:#}"

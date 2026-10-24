@@ -12,7 +12,9 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use rift_mcp::{HttpServer, TokenCheck, schema, serve_http};
+use rift_mcp::{
+    BuildCheckout, HttpServer, ServeOptions, TokenCheck, schema, serve_http_with_options,
+};
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use rift_protocol::lock::ProductIdentity;
 use rmcp::ServiceExt as _;
@@ -88,7 +90,9 @@ async fn served_under(
     check: TokenCheck,
 ) -> TestResult<(CancellationToken, HttpServer)> {
     let shutdown = CancellationToken::new();
-    let server = serve_http(root, shutdown.clone(), check).await?;
+    let options = ServeOptions::from(BuildCheckout::Unversioned)
+        .with_query_program(workspace_client::query_program()?);
+    let server = serve_http_with_options(root, shutdown.clone(), check, options).await?;
     Ok((shutdown, server))
 }
 

@@ -1,5 +1,6 @@
 pub(crate) mod candidates;
 mod query;
+pub(crate) use query::QueryCandidateRequest;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -1796,6 +1797,7 @@ pub struct RiftMcp {
     tool_router: ToolRouter<Self>,
     local_views: Arc<std::sync::OnceLock<rift_server::LocalSymbolViews>>,
     candidate_responses: Arc<candidates::CandidateResponses>,
+    query_program: Option<Arc<PathBuf>>,
 }
 
 /// The search tier one server opens at startup: the index, the lanes over it, and the
@@ -1845,6 +1847,14 @@ impl AssembledServer {
 
 #[tool_router(router = declared_tool_router, vis = "pub(crate)")]
 impl RiftMcp {
+    /// Selects the compatible Rift executable used for bounded query child processes.
+    /// In-process embedders supply this executable explicitly.
+    #[must_use]
+    pub fn with_query_program(mut self, program: PathBuf) -> Self {
+        self.query_program = Some(Arc::new(program));
+        self
+    }
+
     /// Starts a server with an empty workspace publication, applying the
     /// accepted `rift.toml`'s `[source]` policy to background preparation and its
     /// `[server]` table to the blocking pool. While `rift.toml` is invalid,
@@ -2133,6 +2143,11 @@ impl RiftMcp {
             tool_router: Self::tool_router(),
             local_views: Arc::new(local_views),
             candidate_responses: Arc::default(),
+            #[cfg(test)]
+            query_program: std::env::var_os("CARGO_BIN_EXE_rift")
+                .map(|program| Arc::new(PathBuf::from(program))),
+            #[cfg(not(test))]
+            query_program: None,
         };
         Ok(AssembledServer {
             server,
@@ -4293,6 +4308,8 @@ impl ServerHandler for RiftMcp {
                     }
                     let mut result = if request.name == "search_candidates" {
                         self.search_candidates_call(request, &operation).await
+                    } else if request.name == "query_candidates" {
+                        Self::query_candidates_call(request)
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
                         match self.tool_router.call(routed).await {

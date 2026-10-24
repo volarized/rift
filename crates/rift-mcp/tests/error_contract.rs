@@ -28,7 +28,9 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
@@ -94,7 +96,9 @@ async fn failing_tool_error(
     tool: &'static str,
     request: serde_json::Value,
 ) -> TestResult<ToolFailure> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server

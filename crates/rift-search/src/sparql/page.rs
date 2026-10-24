@@ -1,5 +1,6 @@
 //! Exact retained-page requests identified from the library's parsed algebra.
 
+use serde::{Deserialize, Serialize};
 use spargebra::Query;
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern};
@@ -57,7 +58,7 @@ pub fn continuation_query(
 }
 
 /// Result form requested by an exact retained-page projection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PageForm {
     /// Original projected variables, in their requested order.
     Bindings {
@@ -69,7 +70,7 @@ pub enum PageForm {
 }
 
 /// One exact retained-page request whose owner still validates its original result form.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PageSelection {
     /// Expanded service IRI, preserving the accepted retained context and page.
     pub service: String,

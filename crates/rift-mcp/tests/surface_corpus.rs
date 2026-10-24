@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::global_api::{GlobalFixture, SymbolFixture};
+use crate::global_api::GlobalFixture;
 use crate::hermetic_search;
 use serde_json::{Value, json};
 
@@ -436,7 +436,11 @@ pub(crate) struct SurfaceFixture {
 impl SurfaceFixture {
     /// Builds fixture files, Git history, and global API for each corpus request.
     pub(crate) async fn start() -> Result<Self, Box<dyn std::error::Error>> {
-        let global = GlobalFixture::start(SymbolFixture::Valid).await?;
+        let global = GlobalFixture::start_with(crate::global_api::FixtureOptions {
+            query_narrowed: false,
+            ..crate::global_api::FixtureOptions::default()
+        })
+        .await?;
         let directory = tempfile::tempdir()?;
         // The manifest names the helper by a path outside the workspace, which no index
         // serves, so every package-scoped answer names it `package_unavailable`.

@@ -171,7 +171,7 @@ mod tests {
         )
     }
 
-    fn metadata(root: &Path, source: serde_json::Value, manifest: &Path) -> Vec<u8> {
+    fn metadata(root: &Path, source: &serde_json::Value, manifest: &Path) -> Vec<u8> {
         serde_json::to_vec(
             &serde_json::json!({"version":1,"workspace_root":root,"packages":[{
                 "name":"helper","version":"1.0.0","source":source,"manifest_path":manifest
@@ -186,7 +186,7 @@ mod tests {
         let root = std::env::temp_dir().join("registry/opaque-directory/helper");
         let bytes = metadata(
             &workspace,
-            serde_json::json!(SOURCE),
+            &serde_json::json!(SOURCE),
             &root.join("Cargo.toml"),
         );
         let folders =
@@ -212,7 +212,7 @@ mod tests {
             serde_json::Value::Null,
             serde_json::json!("registry+https://other.example/index"),
         ] {
-            let bytes = metadata(&workspace, source, &manifest);
+            let bytes = metadata(&workspace, &source, &manifest);
             assert!(
                 CargoResolver::installed_folders(
                     &bytes,
@@ -231,7 +231,7 @@ mod tests {
     fn test_metadata_refuses_malformed_foreign_root_and_count_or_byte_overflow() {
         let workspace = std::env::temp_dir().join("rift-cargo-metadata-workspace");
         let manifest = std::env::temp_dir().join("registry/helper/Cargo.toml");
-        let bytes = metadata(&workspace, serde_json::json!(SOURCE), &manifest);
+        let bytes = metadata(&workspace, &serde_json::json!(SOURCE), &manifest);
         let accepted = accepted(&workspace);
         assert_eq!(
             CargoResolver::installed_folders(b"{", &workspace, &accepted, 4_096, 10),
@@ -257,7 +257,7 @@ mod tests {
         );
         let relative = metadata(
             &workspace,
-            serde_json::json!(SOURCE),
+            &serde_json::json!(SOURCE),
             Path::new("helper/Cargo.toml"),
         );
         assert_eq!(

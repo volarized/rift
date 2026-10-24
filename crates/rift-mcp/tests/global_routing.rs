@@ -773,12 +773,17 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
 /// Ordinary prose keeps the broad full-text order before the requested result limit.
 #[tokio::test]
 async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        ..FixtureOptions::default()
+    })
+    .await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
     for limit in [1_usize, 2] {
@@ -851,6 +856,7 @@ async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResul
     for (advertised, limit) in [(200, "limit=200"), (1_000, "limit=1000")] {
         let fixture = GlobalFixture::start_with(FixtureOptions {
             page_limit_max: advertised,
+            query_narrowed: false,
             ..FixtureOptions::default()
         })
         .await?;
@@ -859,18 +865,18 @@ async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResul
              request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
             fixture.endpoint
         );
+        let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
         let workspace = served_dependent_workspace(Some(&configuration)).await?;
         let (directory, client, server_task) = workspace.served;
-        let answer = call_tool(
+        let answer = search_symbols(
             &client,
-            "search",
             json!({"query":"helper_beacon demo","scope":"global"}),
         )
         .await?;
         assert!(
-            answer["results"]
-                .as_array()
-                .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
+            workspace_client::query::rows(&answer)?.iter().any(|hit| {
+                workspace_client::query::iri(hit, "unit").is_ok_and(|unit| unit == COLLECTED_UNIT)
+            }),
             "{answer:#}"
         );
         let searches = search_requests(&fixture).await;
@@ -2233,30 +2239,36 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
 /// match beside no global warning.
 #[tokio::test]
 async fn a_body_matched_package_declaration_answers_as_a_content_match() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        ..FixtureOptions::default()
+    })
+    .await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let answer = call_tool(
-        &client,
-        "search",
-        json!({"query": BODY_MATCH_QUERY, "scope": "global"}),
-    )
-    .await?;
-    let package_hits: Vec<&Value> = answer["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|hit| hit["unit"] == COLLECTED_UNIT)
+    let parameters = serde_json::from_value(json!({"query": BODY_MATCH_QUERY, "scope": "global"}))?;
+    let query = workspace_client::query::projected_retrieval(
+        &parameters,
+        "?matched",
+        "?hit :matched_by/:value ?matched .",
+    )?;
+    let answer = call_tool(&client, "search", serde_json::to_value(query)?).await?;
+    let package_hits: Vec<&Value> = workspace_client::query::rows(&answer)?
+        .iter()
+        .filter(|hit| {
+            workspace_client::query::iri(hit, "unit").is_ok_and(|unit| unit == COLLECTED_UNIT)
+        })
         .collect();
     assert_eq!(package_hits.len(), 1, "{answer:#}");
     assert_eq!(
-        package_hits[0]["matched_by"],
-        json!(["content"]),
+        workspace_client::query::literal(package_hits[0], "matched")?,
+        "content",
         "{answer:#}"
     );
     assert!(
@@ -2329,30 +2341,32 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
         "query":"searchHit", "limit":1, "include":["source"]
     }))?)?;
     let answer = workspace_client::search_after_population(&client, &request).await?;
+    let row = workspace_client::query::rows(&answer)?
+        .first()
+        .ok_or("exact original spelling")?;
     assert_eq!(
-        answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
+        workspace_client::query::literal(row, "name")?,
+        "searchHit",
         "{answer:#}"
     );
     assert_eq!(
-        answer["results"][0]["source"], "pub fn searchHit() {}",
+        workspace_client::query::literal(row, "source")?,
+        "pub fn searchHit() {}",
         "{answer:#}"
     );
-    let answer = call_tool(
-        &client,
-        "search",
-        json!({"query": "searchHit", "limit": 10}),
-    )
-    .await?;
-    let wrong_case = answer["results"]
-        .as_array()
-        .ok_or("search carries results")?
-        .iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == "SearchHit")
-        .ok_or("full-text search keeps the other spelling")?;
+    let parameters = serde_json::from_value(json!({"query": "searchHit", "limit": 10}))?;
+    let query = workspace_client::query::projected_retrieval(
+        &parameters,
+        "?matched",
+        "OPTIONAL { ?hit :matched_by/:value ?matched }",
+    )?;
+    let answer = call_tool(&client, "search", serde_json::to_value(query)?).await?;
     assert!(
-        wrong_case["matched_by"]
-            .as_array()
-            .is_some_and(|fields| fields.contains(&json!("documentation"))),
+        workspace_client::query::rows(&answer)?.iter().any(|hit| {
+            workspace_client::query::literal(hit, "name").is_ok_and(|name| name == "SearchHit")
+                && workspace_client::query::literal(hit, "matched")
+                    .is_ok_and(|matched| matched == "documentation")
+        }),
         "{answer:#}"
     );
     client.cancel().await?;
@@ -2363,11 +2377,15 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
 #[tokio::test]
 async fn global_service_query_view_retains_exact_provider_reads_and_refuses_changed_configuration()
 -> TestResult {
-    let first = GlobalFixture::start(SymbolFixture::Valid).await?;
-    let second = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let complete = FixtureOptions {
+        query_narrowed: false,
+        ..FixtureOptions::default()
+    };
+    let first = GlobalFixture::start_with(complete).await?;
+    let second = GlobalFixture::start_with(complete).await?;
     let configuration = |endpoint: &str| {
         format!(
-            "[global]\nenabled=true\nendpoint={endpoint:?}\nattempts=1\nrequest_timeout='1s'\nconnect_timeout='100ms'\n{DEMO_PACKAGE}"
+            "[global]\nenabled=true\nendpoint={endpoint:?}\nattempts=1\nrequest_timeout='1s'\nconnect_timeout='100ms'\n{DEMO_PACKAGE}\n[languages.rust]\nstdlib=false\n"
         )
     };
     let workspace = served_dependent_workspace(Some(&configuration(&first.endpoint))).await?;

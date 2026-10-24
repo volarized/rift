@@ -1675,13 +1675,17 @@ fn symbol_disagreement_warning(assembled: &rift_provider::AssembledSymbol) -> Op
 }
 
 pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> String {
+    excerpt_ref(file, range).to_owned()
+}
+
+pub(crate) fn excerpt_ref(file: &IndexedFile, range: ByteRange) -> &str {
     let start = usize::try_from(range.start)
         .unwrap_or(file.source().len())
         .min(file.source().len());
     let end = usize::try_from(range.end)
         .unwrap_or(file.source().len())
         .min(file.source().len());
-    file.source().get(start..end).unwrap_or_default().to_owned()
+    file.source().get(start..end).unwrap_or_default()
 }
 
 pub(crate) fn text_range(range: ByteRange) -> TextRange {

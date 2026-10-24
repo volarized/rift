@@ -21,7 +21,9 @@ use workspace_client::{await_workspace_ready, search_after_population};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let service = server

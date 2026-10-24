@@ -4,9 +4,11 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
+use crate::workspace_client::query;
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::search::{SearchHit, SearchHitTarget};
-use rift_protocol::search_read::SearchReadResult;
+use rift_protocol::query::{QueryAnswer, QueryLanguage, QueryParams};
+use rift_protocol::read::SymbolId;
+use rift_protocol::symbol_read::CapturedView;
 use rift_protocol::symbol_read::GetSymbolResult;
 use serde_json::{Value, json};
 
@@ -70,56 +72,48 @@ async fn configure_engine(root: &Path, profile: Option<&str>, script: &str) -> T
     require_success(&output, "configure profile engine")
 }
 
-fn search(page: u64, view: Option<&Value>) -> Value {
-    let mut arguments = json!({
-        "query":"beacon", "target":"symbol", "scope":"all",
-        "paths":{"include":["lib.rs"]},
-        "order":"path", "include":["source"], "limit":1, "page_index":page,
-    });
-    if let Some(view) = view {
-        arguments["view"] = view.clone();
-    }
-    arguments
+fn search() -> TestResult<Value> {
+    Ok(serde_json::to_value(query::retrieval(
+        &serde_json::from_value(json!({
+            "query":"beacon", "target":"symbol", "scope":"all",
+            "paths":{"include":["lib.rs"]}, "order":"path", "include":["source"],
+        }))?,
+    )?)?)
 }
 
-fn hit(answer: &Value) -> TestResult<SearchHit> {
-    let result: SearchReadResult = serde_json::from_value(answer.clone())
-        .map_err(|error| format!("invalid search result: {error}; {answer}"))?;
-    let SearchReadResult::Results(result) = result else {
-        return Err(format!("search unavailable: {answer}").into());
-    };
-    assert_eq!(
-        result.results.len(),
-        1,
-        "one globally paginated result: {answer}"
-    );
-    assert_eq!(result.pagination.total_pages, 2, "{answer}");
-    Ok(result
-        .results
-        .into_iter()
-        .next()
-        .expect("one search result"))
+#[derive(Debug)]
+struct ProfileSymbol {
+    id: SymbolId,
+    source: String,
+    view: CapturedView,
 }
 
-fn symbol_id(hit: &SearchHit) -> TestResult<&rift_protocol::read::SymbolId> {
-    let SearchHitTarget::Symbol { symbol } = &hit.hit else {
-        return Err(format!("expected symbol hit: {hit:?}").into());
-    };
-    symbol
-        .id
-        .as_ref()
-        .ok_or_else(|| format!("canonical symbol absent: {hit:?}").into())
+fn retained_page(answer: &Value, page: u64) -> TestResult<Value> {
+    let retained: QueryAnswer = serde_json::from_value(answer["answer"].clone())?;
+    let view: CapturedView = serde_json::from_value(answer["view"].clone())?;
+    let query = rift_search::sparql::continuation_query(&retained, &view.id, page)?;
+    Ok(serde_json::to_value(QueryParams {
+        query,
+        language: QueryLanguage::Sparql,
+    })?)
+}
+
+fn hit(answer: &Value) -> TestResult<ProfileSymbol> {
+    let rows = query::rows(answer)?;
+    assert_eq!(rows.len(), 1, "one projected symbol: {answer}");
+    Ok(ProfileSymbol {
+        id: serde_json::from_value(json!(query::iri(&rows[0], "symbol")?))?,
+        source: query::literal(&rows[0], "source")?.to_owned(),
+        view: serde_json::from_value(answer["view"].clone())?,
+    })
 }
 
 async fn symbol_read(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    hit: &SearchHit,
+    hit: &ProfileSymbol,
 ) -> TestResult<Value> {
-    let id = symbol_id(hit)?;
-    let view = hit
-        .view
-        .as_ref()
-        .ok_or_else(|| format!("symbol view absent: {hit:?}"))?;
+    let id = &hit.id;
+    let view = &hit.view;
     let arguments = json!({
         "id":id, "view":view.id, "include":["source"],
     });
@@ -138,7 +132,11 @@ async fn symbol_read(
     assert_eq!(symbol.id.as_ref(), Some(id), "{answer}");
     assert_eq!(&selected, view, "{answer}");
     assert_eq!(declarations.len(), 1, "{answer}");
-    assert_eq!(declarations[0].source, hit.source, "{answer}");
+    assert_eq!(
+        declarations[0].source.as_deref(),
+        Some(hit.source.as_str()),
+        "{answer}"
+    );
     assert_eq!(
         declarations[0].path.as_ref().map(|path| path.0.as_str()),
         Some("lib.rs"),
@@ -149,9 +147,9 @@ async fn symbol_read(
 
 async fn named_missing_read(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    hit: &SearchHit,
+    hit: &ProfileSymbol,
 ) -> TestResult {
-    let found = symbol_id(hit)?;
+    let found = &hit.id;
     let identity = SymbolIdentity::parse(found.as_str())?;
     let mut path = identity.qualified_path().to_vec();
     "beacpn".clone_into(path.last_mut().ok_or("symbol path absent")?);
@@ -215,44 +213,34 @@ async fn named_missing_read(
 
 async fn caller_read(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
-    hit: &SearchHit,
+    hit: &ProfileSymbol,
     logs: &Path,
 ) -> TestResult {
-    let arguments = json!({"traversal":{
-        "seed":symbol_id(hit)?, "direction":"incoming", "depth":1,
-    }, "target":"symbol", "include":["source"], "limit":5});
+    let seed = oxigraph::model::NamedNode::new(hit.id.as_str())?;
+    let service =
+        oxigraph::model::NamedNode::new(format!("urn:rift:result:{}", hit.view.id.as_str()))?;
+    let arguments = json!({"query":format!(
+        "SELECT ?symbol ?path ?source {{ {{ SELECT (COUNT(*) AS ?context) WHERE {{ SERVICE {service} {{}} }} }} ?symbol :references {seed}; :declarations ?declaration . ?declaration :path ?path; :source ?source }}"
+    )});
     let answer = match proxied_call(client, "search", &arguments).await {
         Ok(answer) => answer,
         Err(error) => {
             let main_requests = fs::read_to_string(logs.join("main.requests"));
             let docs_requests = fs::read_to_string(logs.join("docs.requests"));
-            return Err(format!(
-            "profile traversal failed: {error}; main requests: {main_requests:?}; docs requests: {docs_requests:?}"
-        )
-            .into());
+            return Err(format!("profile query failed: {error}; main requests: {main_requests:?}; docs requests: {docs_requests:?}").into());
         }
     };
-    let result: SearchReadResult = serde_json::from_value(answer.clone())
-        .map_err(|error| format!("invalid traversal result: {error}; {answer}"))?;
-    let SearchReadResult::Results(result) = result else {
-        return Err(format!("profile traversal unavailable: {answer}").into());
-    };
-    assert!(result.warnings.is_empty(), "{answer}");
-    assert_eq!(result.results.len(), 1, "{answer}");
-    let caller = &result.results[0];
+    let rows = query::rows(&answer)?;
+    assert_eq!(rows.len(), 1, "{answer}");
+    assert_eq!(query::literal(&rows[0], "path")?, "caller.rs", "{answer}");
     assert_eq!(
-        caller.path.as_ref().map(|path| path.0.as_str()),
-        Some("caller.rs"),
+        query::literal(&rows[0], "source")?,
+        "pub fn caller() -> u32 {\n    beacon()\n}",
         "{answer}"
     );
     assert_eq!(
-        caller.source.as_deref(),
-        Some("pub fn caller() -> u32 {\n    beacon()\n}"),
-        "{answer}"
-    );
-    assert_eq!(
-        SymbolIdentity::parse(symbol_id(caller)?.as_str())?.owner(),
-        SymbolIdentity::parse(symbol_id(hit)?.as_str())?.owner(),
+        SymbolIdentity::parse(query::iri(&rows[0], "symbol")?)?.owner(),
+        SymbolIdentity::parse(hit.id.as_str())?.owner(),
         "{answer}"
     );
     Ok(())
@@ -277,34 +265,27 @@ async fn require_engine_root(logs: &Path, name: &str, root: &Path) -> TestResult
 async fn require_profile_scope(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult {
-    let scoped = proxied_call(
-        client,
-        "search",
-        &json!({
-            "query":"beacon", "target":"symbol", "scope":"local#docs",
-            "paths":{"include":["lib.rs"]}, "include":["source"],
-        }),
-    )
-    .await?;
-    let scoped: SearchReadResult = serde_json::from_value(scoped)?;
-    let SearchReadResult::Results(scoped) = scoped else {
-        return Err("profile scope unavailable".into());
-    };
-    assert_eq!(scoped.results.len(), 1);
+    let arguments = query::retrieval(&serde_json::from_value(json!({
+        "query":"beacon", "target":"symbol", "scope":"local#docs",
+        "paths":{"include":["lib.rs"]}, "include":["source"],
+    }))?)?;
+    let scoped = proxied_call(client, "search", &serde_json::to_value(arguments)?).await?;
     assert!(
-        symbol_id(&scoped.results[0])?
+        hit(&scoped)?
+            .id
             .as_str()
             .starts_with("rift://symbol/local%23docs/"),
-        "profile identities escape the scope separator"
+        "profile identities escape the scope separator: {scoped}"
     );
     require_profile_pattern(client).await?;
+    let extra_arguments = query::retrieval(&serde_json::from_value(json!({
+        "query":"beacon", "target":"symbol", "scope":"local@docs"
+    }))?)?;
     let extra = within(
         "unregistered extra scope",
         client.call_tool(
             rmcp::model::CallToolRequestParams::new("search").with_arguments(
-                serde_json::from_value(json!({
-                    "query":"beacon", "target":"symbol", "scope":"local@docs",
-                }))?,
+                serde_json::from_value(serde_json::to_value(extra_arguments)?)?,
             ),
         ),
     )
@@ -319,47 +300,19 @@ async fn require_profile_scope(
 async fn require_profile_pattern(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult {
-    let patterned = proxied_call(
-        client,
-        "search",
-        &json!({
-            "pattern":"pub fn beacon", "target":"symbol", "scope":"local#docs",
-            "paths":{"include":["lib.rs"]}, "include":["source"],
-        }),
-    )
-    .await?;
-    let patterned: SearchReadResult = serde_json::from_value(patterned)?;
-    let SearchReadResult::Results(patterned) = patterned else {
-        return Err("profile pattern unavailable".into());
-    };
-    assert_eq!(patterned.results.len(), 1);
+    let arguments = query::retrieval(&serde_json::from_value(json!({
+        "pattern":"pub fn beacon", "target":"symbol", "scope":"local#docs",
+        "paths":{"include":["lib.rs"]}, "include":["source"],
+    }))?)?;
+    let patterned = proxied_call(client, "search", &serde_json::to_value(arguments)?).await?;
+    let symbol = hit(&patterned)?;
     assert_eq!(
-        SymbolIdentity::parse(symbol_id(&patterned.results[0])?.as_str())?.owner(),
+        SymbolIdentity::parse(symbol.id.as_str())?.owner(),
         &SymbolOwner::ProfileLocal {
             name: "docs".to_owned()
-        },
+        }
     );
-    assert!(patterned.view.is_none());
-    assert!(patterned.results[0].view.is_none());
-    let id = symbol_id(&patterned.results[0])?;
-    let found = proxied_call(
-        client,
-        "get_symbol",
-        &json!({"id":id, "include":["source"]}),
-    )
-    .await?;
-    let found: GetSymbolResult = serde_json::from_value(found)?;
-    let GetSymbolResult::Found {
-        symbol,
-        declarations,
-        ..
-    } = found
-    else {
-        return Err("profile pattern symbol unavailable".into());
-    };
-    assert_eq!(symbol.id.as_ref(), Some(id));
-    assert_eq!(declarations.len(), 1);
-    assert_eq!(declarations[0].source, patterned.results[0].source);
+    symbol_read(client, &symbol).await?;
     Ok(())
 }
 
@@ -377,7 +330,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             ("docs/lib.rs", &docs_source),
             ("docs/caller.rs", CALLER_SOURCE),
         ],
-        "",
+        "[search.query]\npage_size = 1\n",
     )?;
     let root = directory.path();
     let docs = root.join("docs");
@@ -401,16 +354,24 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     await_workspace_ready(&docs_client).await?;
     docs_client.cancel().await?;
     require_profile_scope(&client).await?;
-    let first = proxied_call(&client, "search", &search(0, None)).await?;
+    let first = proxied_call(&client, "search", &search()?).await?;
+    assert_eq!(first["pagination"]["total_pages"], 2, "{first}");
     let view = first["view"].clone();
     let _: rift_protocol::symbol_read::CapturedView = serde_json::from_value(view.clone())
         .map_err(|error| format!("merged search view absent or invalid: {error}; {first}"))?;
-    let second = proxied_call(&client, "search", &search(1, Some(&view["id"]))).await?;
+    let second_arguments = serde_json::to_value(QueryParams {
+        query: first["pagination"]["next_query"]
+            .as_str()
+            .ok_or("second query absent")?
+            .to_owned(),
+        language: QueryLanguage::Sparql,
+    })?;
+    let second = proxied_call(&client, "search", &second_arguments).await?;
     assert_eq!(second["view"], view, "pagination keeps original expiry");
     let hits = [hit(&first)?, hit(&second)?];
     let mut owners = BTreeSet::new();
     for hit in &hits {
-        let id = symbol_id(hit)?;
+        let id = &hit.id;
         let identity = SymbolIdentity::parse(id.as_str())?;
         let expected = match identity.owner() {
             SymbolOwner::Local => {
@@ -423,7 +384,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             }
             owner => return Err(format!("unexpected profile owner: {owner:?}").into()),
         };
-        assert_eq!(hit.source.as_deref(), Some(expected), "{hit:?}");
+        assert_eq!(hit.source.as_str(), expected, "{hit:?}");
         symbol_read(&client, hit).await?;
         if matches!(identity.owner(), SymbolOwner::ProfileLocal { .. }) {
             named_missing_read(&client, hit).await?;
@@ -432,8 +393,8 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     assert_eq!(owners, BTreeSet::from(["main", "docs"]));
     fs::write(root.join("lib.rs"), main_source.replace("11", "33"))?;
     fs::write(docs.join("lib.rs"), docs_source.replace("22", "44"))?;
-    let held_first = proxied_call(&client, "search", &search(0, Some(&view["id"]))).await?;
-    let held_second = proxied_call(&client, "search", &search(1, Some(&view["id"]))).await?;
+    let held_first = proxied_call(&client, "search", &retained_page(&first, 0)?).await?;
+    let held_second = proxied_call(&client, "search", &second_arguments).await?;
     assert_eq!(held_first, first, "captured source and expiry stay fixed");
     assert_eq!(held_second, second, "both backend views stay fixed");
     for hit in &hits {

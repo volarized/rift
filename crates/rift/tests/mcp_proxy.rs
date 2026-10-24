@@ -48,6 +48,8 @@ mod lsp_profiles;
 #[cfg(unix)]
 #[path = "mcp_proxy/map_recommendations.rs"]
 mod map_recommendations;
+#[path = "mcp_proxy/query_process.rs"]
+mod query_process;
 mod rust_engine;
 #[path = "../../rift-mcp/tests/surface_corpus.rs"]
 mod surface_corpus;

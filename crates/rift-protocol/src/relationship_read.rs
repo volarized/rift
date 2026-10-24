@@ -130,11 +130,13 @@ pub struct RelationshipSearchPage {
     /// One authoritative group for every requested subject, in request order.
     #[schemars(length(min = 1, max = 64))]
     pub groups: Vec<RelationshipGroup>,
-    /// Exact symbols reached by this page, supplied once across the retained continuation.
+    /// Exact symbols reached by this page. Identical captured records may repeat across pages;
+    /// conflicting records are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 10000))]
     pub symbols: Vec<crate::query::QuerySymbol>,
     /// Physical source catalog and requested bytes for reached declarations and occurrences.
+    /// Identical captured records may repeat across pages; conflicting records are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 10000))]
     #[schemars(with = "Vec<RelationshipSourceSchema>")]
