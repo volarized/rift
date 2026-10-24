@@ -621,8 +621,11 @@ mod tests {
                     lsp: "rust".to_owned(),
                 },
                 slug: "rift.core.configuration_lsp_engine_selection_conflict",
-                message: "LSP table selects command and embedded engines",
-                evidence: &[("lsp", "rust"), ("fields", "command, embedded")],
+                message: "LSP table selects more than one engine",
+                evidence: &[
+                    ("lsp", "rust"),
+                    ("fields", "command, package_manager, embedded"),
+                ],
             },
             Case {
                 violation: ConfigurationViolation::LspEngineMissing {
@@ -630,7 +633,10 @@ mod tests {
                 },
                 slug: "rift.core.configuration_lsp_engine_missing",
                 message: "LSP table selects no engine",
-                evidence: &[("lsp", "rust"), ("fields", "command, embedded")],
+                evidence: &[
+                    ("lsp", "rust"),
+                    ("fields", "command, package_manager, embedded"),
+                ],
             },
             Case {
                 violation: ConfigurationViolation::LspEmbeddedExtras {

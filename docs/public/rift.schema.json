@@ -1155,6 +1155,11 @@
             },
             {
               "required": [
+                "package_manager"
+              ]
+            },
+            {
+              "required": [
                 "embedded"
               ]
             }
@@ -1172,7 +1177,7 @@
               "type": "null"
             }
           ],
-          "description": "Executable and literal arguments. Rift starts it directly without a\nshell. Exactly one of `command` and `embedded` is present."
+          "description": "Executable and literal arguments. Rift starts it directly without a\nshell. Exactly one of `command`, `package_manager`, and `embedded` is present."
         },
         "embedded": {
           "anyOf": [
@@ -1183,7 +1188,7 @@
               "type": "null"
             }
           ],
-          "description": "Engine linked into the server, run in process in place of a spawned\ncommand. Exactly one of `command` and `embedded` is present, and an\nembedded engine takes no `environment` and no\n`initialization_options`."
+          "description": "Engine linked into the server, run in process in place of a spawned\ncommand. Exactly one of `command`, `package_manager`, and `embedded` is present, and an\nembedded engine takes no `environment` and no\n`initialization_options`."
         },
         "environment": {
           "additionalProperties": {
@@ -1206,6 +1211,17 @@
             "max": "8mb",
             "min": "1kb"
           }
+        },
+        "package_manager": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LspPackageManager"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Installation layout that selects an installed language server: Cargo uses\nrust-analyzer, Bun and npm use native TypeScript or typescript-language-server, and uv uses ty\nor pyright. Rift starts the installed executable directly and installs nothing."
         },
         "request_timeout": {
           "$ref": "#/$defs/Duration",
@@ -1253,6 +1269,31 @@
         }
       },
       "type": "object"
+    },
+    "LspPackageManager": {
+      "description": "Installation layout used to find an installed language server.",
+      "oneOf": [
+        {
+          "const": "cargo",
+          "description": "Rust toolchain selected by the Cargo project.",
+          "type": "string"
+        },
+        {
+          "const": "bun",
+          "description": "JavaScript and TypeScript packages installed by Bun.",
+          "type": "string"
+        },
+        {
+          "const": "npm",
+          "description": "JavaScript and TypeScript packages installed by npm.",
+          "type": "string"
+        },
+        {
+          "const": "uv",
+          "description": "Python packages installed in the uv project environment.",
+          "type": "string"
+        }
+      ]
     },
     "McpConfiguration": {
       "additionalProperties": false,
@@ -1416,6 +1457,89 @@
       "required": [
         "min",
         "max"
+      ],
+      "type": "object"
+    },
+    "ProfileConfiguration": {
+      "additionalProperties": false,
+      "description": "One project folder served as `local#name` from the root `rift.toml`.",
+      "properties": {
+        "dependencies": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DependenciesConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Dependency settings for this folder. Absence inherits the root settings."
+        },
+        "execution": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExecutionConfiguration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Execution bounds for this folder. Absence inherits the root settings."
+        },
+        "languages": {
+          "additionalProperties": {
+            "$ref": "#/$defs/LanguageConfiguration"
+          },
+          "default": {},
+          "description": "Language entries for this folder, replacing the root language entries.",
+          "maxProperties": 64,
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$"
+          },
+          "type": "object"
+        },
+        "lsp": {
+          "additionalProperties": {
+            "$ref": "#/$defs/LspConfiguration"
+          },
+          "default": {},
+          "description": "Named LSP selections for this folder. An entry replaces the root selection of that name.",
+          "maxProperties": 16,
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9._-]*$"
+          },
+          "type": "object"
+        },
+        "root": {
+          "description": "Folder below the repository root, with at most 63 components and no `.` or `..` segments.",
+          "maxLength": 262144,
+          "minLength": 1,
+          "not": {
+            "pattern": "(^|/)(\\.|\\.\\.|~)(/|$)"
+          },
+          "pattern": "^[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f]+(?:/[^/\\\\:\\u0000-\\u001f\\u007f-\\u009f]+){0,62}$",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceConfiguration",
+          "default": {
+            "declarations": 1000000,
+            "directory_depth": 64,
+            "exclude": [],
+            "files": 100000,
+            "force_include": [],
+            "include": [],
+            "relationships": 10000000,
+            "respect_gitignore": true,
+            "workspace_size": "512mb"
+          },
+          "description": "Source selection relative to this profile's folder. Root source selection is not inherited."
+        }
+      },
+      "required": [
+        "root"
       ],
       "type": "object"
     },
@@ -2229,6 +2353,26 @@
         "warnings": 256
       },
       "description": "Exact-package publication and archive admission bounds."
+    },
+    "profiles": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProfileConfiguration"
+      },
+      "default": {},
+      "description": "Named profiles below this root. Each profile uses this file and its own project folder.",
+      "maxProperties": 64,
+      "propertyNames": {
+        "maxLength": 8186,
+        "not": {
+          "enum": [
+            "local",
+            "global",
+            "all"
+          ]
+        },
+        "pattern": "^[a-z][a-z0-9_-]*$"
+      },
+      "type": "object"
     },
     "providers": {
       "$ref": "#/$defs/ProvidersConfiguration",

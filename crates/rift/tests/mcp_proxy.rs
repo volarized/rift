@@ -1937,7 +1937,11 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
 async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr() -> TestResult {
     let held = held_port_in_range()?;
     let port = held.local_addr()?.port();
-    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], &format!("port = {port}\n"))?;
+    // Keep startup diagnostics below the capture limit for this untruncated refusal case.
+    let directory = laid_out_workspace(
+        &[("lib.rs", LIBRARY)],
+        &format!("port = {port}\n[logs]\nstderr_limit = '1kb'\n"),
+    )?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);

@@ -1926,7 +1926,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -1938,7 +1938,7 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolUnavailableReason": {
@@ -2184,7 +2184,7 @@
             "type": "string"
           },
           "SymbolIdentity": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -2196,7 +2196,7 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           }
         },
@@ -5153,7 +5153,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -5165,11 +5165,11 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolIdentity": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -5181,7 +5181,7 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolMatchContext": {
@@ -7802,7 +7802,7 @@
             "type": "string"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -7814,7 +7814,7 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SyntaxFramework": {
@@ -7992,7 +7992,7 @@
       }
     },
     {
-      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. `pattern` matches a\nregex against the text of every indexed file, line by line as ripgrep reads it, and\nanswers each match and each declaration holding one, in place of `query` and\n`traversal`. `change` answers the declarations a committed revision and another\nrevision, or the working tree, hold differently, in place of `query` and `traversal`.\n`rev` searches a version-control revision instead of the current tree, and never\ncombines with `pattern`, `traversal`, or `change`. `scope` reaches past the project\ntree: `global` answers collected package and runtime facts selected by the project's\ndependency context. Explicit `packages` replaces versions of named packages or adds\npackages the context lacks. `local@name` selects an accepted extra project; `all` merges the primary\nproject, accepted extra projects, and global results. `target: \"commit\"` matches\n`query` alone against the messages of the commits the history store holds.\nUse `get_symbol` with an exact canonical identity returned by search.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
+      "description": "Searches indexed declarations and source lines by lexical `query`, merged with\nfull-text matches from included `[search.text]` files and declaration bodies, and by a\nbounded relationship `traversal` from one seed symbol: `incoming` reaches the\ndeclarations referencing it, `outgoing` the declarations it calls. `pattern` matches a\nregex against the text of every indexed file, line by line as ripgrep reads it, and\nanswers each match and each declaration holding one, in place of `query` and\n`traversal`. `change` answers the declarations a committed revision and another\nrevision, or the working tree, hold differently, in place of `query` and `traversal`.\n`rev` searches a version-control revision instead of the current tree, and never\ncombines with `pattern`, `traversal`, or `change`. `scope` reaches past the project\ntree: `global` answers collected package and runtime facts selected by the project's\ndependency context. Explicit `packages` replaces versions of named packages or adds\npackages the context lacks. `local@name` selects an accepted extra project; `local#name` selects a root-defined profile.\n`all` merges the primary project, profiles, accepted extra projects, and global results. `target: \"commit\"` matches\n`query` alone against the messages of the commits the history store holds.\nUse `get_symbol` with an exact canonical identity returned by search.\nFor a current-tree search, the published workspace is resolved exactly once and\nthreaded through both the search index's revision check and the executed\n`ReadService::search` call: a concurrent rebuild between two separate resolutions\ncould otherwise validate ranked units against one snapshot and merge them into\nresults computed from another.",
       "input_schema": {
         "$defs": {
           "CapturedViewId": {
@@ -8401,13 +8401,16 @@
                   "enum": [
                     "local@local",
                     "local@global",
-                    "local@all"
+                    "local@all",
+                    "local#local",
+                    "local#global",
+                    "local#all"
                   ]
                 },
-                "pattern": "^local(?:@[a-z][a-z0-9_-]*)?$"
+                "pattern": "^local(?:[@#][a-z][a-z0-9_-]*)?$"
               }
             ],
-            "description": "Which corpus a read searches. A named local scope requires an extra project accepted by the current connection.",
+            "description": "Which corpus a read searches. local@name selects an accepted extra project; local#name selects a root-defined profile.",
             "maxLength": 8192,
             "type": "string"
           },
@@ -8455,7 +8458,7 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -8467,7 +8470,7 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "TraversalDirection": {
@@ -8693,7 +8696,7 @@
           "scope": {
             "$ref": "#/$defs/SearchScope",
             "default": "local",
-            "description": "Which corpus is selected. Omitted, `local`, the primary project. `local@name`\nselects an extra project accepted by the connection. `global` reaches collected\npackage and runtime facts selected by the dependency context; `all` merges the primary\nproject, accepted extra projects, and global results. Explicit `packages` replaces\nversions of named packages or adds packages the context lacks.\nThe server refuses a scope beyond `local` together with `rev`, and `global`\ntogether with `traversal`, since a walk runs over local declarations."
+            "description": "Which corpus is selected. Omitted, `local`, the primary project. `local@name`\nselects an extra project accepted by the connection. `local#name` selects a profile\ndefined in the root configuration. `global` reaches collected package and runtime\nfacts selected by the dependency context; `all` merges the primary project, profiles,\naccepted extra projects, and global results. Explicit `packages` replaces\nversions of named packages or adds packages the context lacks.\nThe server refuses a scope beyond `local` together with `rev`, and `global`\ntogether with `traversal`, since a walk runs over local declarations."
           },
           "target": {
             "$ref": "#/$defs/SearchParamsTarget",
@@ -12076,7 +12079,7 @@
             ]
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
@@ -12088,7 +12091,7 @@
             "not": {
               "pattern": "/\\.{1,2}(?:/|~|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
             "type": "string"
           },
           "SymbolOrigin": {

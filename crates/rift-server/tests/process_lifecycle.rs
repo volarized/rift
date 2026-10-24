@@ -78,6 +78,7 @@ fn table(script: String, languages: &[&str]) -> ProcessFixture {
             script,
         ])),
         embedded: None,
+        package_manager: None,
         environment: BTreeMap::new(),
         initialization_options: None,
         startup_timeout: Duration::from_millis(10_000),

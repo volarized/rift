@@ -40,7 +40,9 @@ use rift_core::ProjectPath;
 use rift_error::{RiftError, errors};
 use rift_index::{PathChange, PathChanges};
 use rift_lsp::session::{EngineLaunch, EngineSession};
-use rift_protocol::configuration::{CommandInput, EmbeddedEngine, LspConfiguration};
+use rift_protocol::configuration::{
+    CommandInput, EmbeddedEngine, LspConfiguration, LspPackageManager,
+};
 use rift_protocol::read::Language;
 use rift_protocol::retry::{RETRY_ATTEMPTS_MAX, RestartPolicy, RetryPolicy};
 use rift_protocol::workspace::LspState;
@@ -1447,13 +1449,32 @@ impl EngineSlot {
                 })
             }
             (None, None) => {
-                unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
+                let manager = self
+                    .configuration
+                    .package_manager
+                    .expect("acceptance requires one engine selector");
+                let launch = self.package_manager_launch(manager);
+                let program_name = launch
+                    .as_ref()
+                    .map(|launch| launch.program.clone())
+                    .unwrap_or(program_name);
+                tokio::spawn(async move {
+                    rift_tracing::traced!(
+                        parent: &parent,
+                        component = "engine",
+                        operation = "engine.start",
+                        engine = engine_name,
+                        program = program_name,
+                        async move { Box::pin(EngineSession::start(launch?, &root)).await }
+                    )
+                    .await
+                })
             }
         }
     }
 
-    /// The program this slot starts, for a record naming what could not run. An embedded
-    /// engine has no command line of its own, so it is named by the program it stands for.
+    /// Configured executable or package manager named in start failure records.
+    /// The start span records the installed executable selected for a package manager.
     fn program(&self) -> &str {
         match (
             self.configuration.embedded,
@@ -1461,9 +1482,11 @@ impl EngineSlot {
         ) {
             (Some(EmbeddedEngine::Ty), _) => "ty",
             (None, Some(command)) => command.program(),
-            (None, None) => {
-                unreachable!("acceptance refuses an LSP table naming neither command nor embedded")
-            }
+            (None, None) => self
+                .configuration
+                .package_manager
+                .expect("acceptance requires one engine selector")
+                .as_str(),
         }
     }
 
@@ -1483,6 +1506,46 @@ impl EngineSlot {
             cause = start_cause(failure),
             "language engine did not start"
         );
+    }
+
+    /// Resolves an installed server before spawning. An absent Windows batch file
+    /// otherwise starts cmd.exe and fails only during the LSP handshake.
+    fn package_manager_launch(
+        &self,
+        manager: LspPackageManager,
+    ) -> Result<EngineLaunch, RiftError> {
+        let search = self
+            .configuration
+            .environment
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"));
+        let command = crate::package_manager::installed_command(
+            manager,
+            &self.workspace_root,
+            search.as_deref(),
+        )
+        .ok_or_else(|| {
+            errors::lsp::engine_launch_failed()
+                .source(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "installed language server for package manager {} is unavailable",
+                        manager.as_str()
+                    ),
+                ))
+                .error()
+        })?;
+        let mut launch = self.launch(&command);
+        if manager == LspPackageManager::Cargo {
+            launch
+                .environment
+                .insert("RUSTUP_AUTO_INSTALL".to_owned(), "0".to_owned());
+            launch
+                .environment
+                .insert("MISE_AUTO_INSTALL".to_owned(), "0".to_owned());
+        }
+        Ok(launch)
     }
 
     /// The launch derived from this accepted LSP process configuration;
@@ -1636,6 +1699,111 @@ mod tests {
         drop(recorder);
         pool.shutdown().await;
         (failure, drain.queued_records())
+    }
+
+    #[tokio::test]
+    async fn missing_package_manager_server_preserves_typed_launch_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
+            "package_manager": "bun", "environment": { "PATH": "" }, "restart": { "attempts": 1 }
+        }))?;
+        let key = LspProcessKey::named("typescript");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("typescript".to_owned(), key.clone())]),
+        );
+        let (recorder, mut drain) = rift_tracing::ScopedRecorder::builder().install()?;
+        let failure = pool
+            .engine_by_key(&key)
+            .ok_or("missing slot")?
+            .request(|session| Box::pin(async move { Ok(session.document_version()) }))
+            .await
+            .expect_err("the local server is not installed");
+        assert_eq!(failure.slug(), errors::lsp::engine_launch_failed::SLUG);
+        drop(recorder);
+        let records = drain.queued_records();
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.message().contains("engine child spawned"))
+        );
+
+        pool.shutdown().await;
+        Ok(())
+    }
+
+    #[test]
+    fn cargo_package_manager_launch_preserves_environment_and_disables_installation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let bin = directory.path().join("bin");
+        std::fs::create_dir(&bin)?;
+        let executable = bin.join(if cfg!(windows) {
+            "rust-analyzer.exe"
+        } else {
+            "rust-analyzer"
+        });
+        std::fs::write(&executable, "installed executable")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        }
+        let configuration: LspConfiguration = serde_json::from_value(serde_json::json!({
+            "package_manager":"cargo",
+            "environment":{"PATH":bin,"RUSTUP_AUTO_INSTALL":"1","MISE_AUTO_INSTALL":"1","ENGINE_TEST":"retained"}
+        }))?;
+        let key = LspProcessKey::named("rust");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("rust".to_owned(), key.clone())]),
+        );
+        let launch = pool
+            .engine_by_key(&key)
+            .ok_or("missing slot")?
+            .package_manager_launch(LspPackageManager::Cargo)?;
+        assert_eq!(launch.program, "rust-analyzer");
+        assert!(launch.arguments.is_empty());
+        assert_eq!(launch.environment["RUSTUP_AUTO_INSTALL"], "0");
+        assert_eq!(launch.environment["MISE_AUTO_INSTALL"], "0");
+        assert_eq!(launch.environment["ENGINE_TEST"], "retained");
+        assert_eq!(launch.environment["PATH"], bin.to_string_lossy());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn package_manager_starts_the_installed_project_server()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir()?;
+        let mut configuration = analyzing_engine(directory.path(), 1);
+        let executable = directory
+            .path()
+            .join("node_modules/.bin/typescript-language-server");
+        std::fs::create_dir_all(executable.parent().ok_or("executable has no parent")?)?;
+        let script = std::fs::read_to_string(directory.path().join("engine.sh"))?;
+        std::fs::write(&executable, format!("#!/bin/sh\n{script}"))?;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))?;
+        configuration.command = None;
+        configuration.package_manager = Some(LspPackageManager::Npm);
+        let key = LspProcessKey::named("typescript");
+        let pool = EnginePool::new(
+            directory.path(),
+            BTreeMap::from([(key.clone(), configuration)]),
+            BTreeMap::from([("typescript".to_owned(), key.clone())]),
+        );
+        let version = pool
+            .engine_by_key(&key)
+            .ok_or("missing slot")?
+            .request(|session| Box::pin(async move { Ok(session.document_version()) }))
+            .await?;
+        assert_eq!(version, 0);
+        pool.shutdown().await;
+        Ok(())
     }
 
     /// An embedded engine is named by the program it stands for. It has no command line, and
@@ -2141,6 +2309,7 @@ done
         LspConfiguration {
             command: Some(CommandInput::Program(program.to_owned())),
             embedded: None,
+            package_manager: None,
             environment: BTreeMap::new(),
             initialization_options: Some(serde_json::json!({ "engine": "fake" })),
             startup_timeout: ConfiguredDuration::from_millis(10_000),

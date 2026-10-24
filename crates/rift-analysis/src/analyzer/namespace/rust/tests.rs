@@ -113,7 +113,7 @@ fn selected_anchors_for_context(
         .collect::<Vec<_>>();
     let limits = ExactPackageLimits::new(21, 16 * 1024 * 1024);
     let input = match owner {
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } => {
+        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. } => {
             NamespaceInput::project(owner, &language, &files, &context, &[], limits)
                 .expect("bounded project context")
         }
@@ -237,7 +237,8 @@ fn physical_unit(
 ) -> rift_core::SourceUnitId {
     match owner {
         rift_protocol::identity::SymbolOwner::Local
-        | rift_protocol::identity::SymbolOwner::NamedLocal { .. } => {
+        | rift_protocol::identity::SymbolOwner::NamedLocal { .. }
+        | rift_protocol::identity::SymbolOwner::ProfileLocal { .. } => {
             rift_syntax::source_unit_for_path(path).expect("physical project unit")
         }
         _ => rift_core::SourceUnitId::for_owner(owner.clone(), path.as_str())

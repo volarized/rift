@@ -7,7 +7,7 @@ include = []
 # `just generate` exports from the Rust models and from `rift --help`, so every hit in them
 # restates something the same answer already carries; the generated plugin skill under
 # `plugins/claude` restates the served tool descriptions the same way.
-exclude = [".claude/**", ".agents/**", "docs/public/**", "plugins/claude/skills/**"]
+exclude = [".claude/**", ".agents/**", ".codex/**", "docs/public/**", "plugins/claude/skills/**", "dev/**", "docs/**"]
 # `.gitignore` keeps `.plans/` out of version control on purpose: campaign documents live
 # outside the tree until they become code. They are still what a reader of this repository
 # asks about, so the index reaches them here.
@@ -28,7 +28,40 @@ include = ["**/*.mdx", "**/*.py", "**/*.mjs", "**/*.css", "**/*.jsonc", "justfil
 # Each process serves one exact language, so its table belongs to that language entry.
 # The toolchain pin keeps rust-analyzer on the version `rust-toolchain.toml` names.
 [languages.rust.lsp]
-command = ["rustup", "run", "1.98", "rust-analyzer"]
+package_manager = "cargo"
 
 [languages.toml.lsp]
 command = ["tombi", "lsp"]
+
+[profiles.dev]
+root = "dev"
+
+[profiles.dev.source]
+exclude = [".venv/**"]
+
+[profiles.dev.languages.python.lsp]
+package_manager = "uv"
+
+[profiles.docs]
+root = "docs"
+
+[profiles.docs.execution]
+max_code = "16kb"
+max_timeout = "30s"
+max_output = "8kb"
+max_concurrent = 2
+
+[profiles.docs.source]
+exclude = ["public/**", "node_modules/**", ".next/**", ".source/**"]
+
+[profiles.docs.lsp.typescript]
+package_manager = "bun"
+
+[profiles.docs.languages.javascript]
+lsp = "typescript"
+
+[profiles.docs.languages.typescript]
+lsp = "typescript"
+
+[profiles.docs.languages."typescript:tsx"]
+lsp = "typescript"

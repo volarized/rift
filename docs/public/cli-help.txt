@@ -35,16 +35,28 @@ Set request statistics or a language server in this project's rift.toml
 Usage: rift config set [OPTIONS]
 
 Options:
-      --telemetry.disabled=<BOOL>    Disable request statistics with true, or enable them with false [possible values: true, false]
-      --language <LANGUAGE>          Exact language identity, such as typescript or typescript:tsx
-      --profile <PROFILE>            Named local project registered in mcp.extra; absence selects the primary project
-      --profile-root <PROFILE_ROOT>  Workspace-relative folder for a new named local project
-      --include <INCLUDE>            Language path pattern within the selected project, repeated for additional patterns
-      --exclude <EXCLUDE>            Language path pattern to exclude within the selected project
-      --lsp-program <LSP_PROGRAM>    Executable name or relative path, started directly without a shell
-      --lsp-argument=<LSP_ARGUMENT>  Literal process argument, repeated for additional arguments
-      --user                         Write ~/.rift/config.toml; a user disable applies to every project
-  -h, --help                         Print help
+      --telemetry.disabled=<BOOL>
+          Disable request statistics with true, or enable them with false [possible values: true, false]
+      --language <LANGUAGE>
+          Exact language identity, such as typescript or typescript:tsx
+      --profile <PROFILE>
+          Named profile in this project; absence selects the primary project
+      --profile-root <PROFILE_ROOT>
+          Workspace-relative folder for a new named profile
+      --include <INCLUDE>
+          Language path pattern within the selected project, repeated for additional patterns
+      --exclude <EXCLUDE>
+          Language path pattern to exclude within the selected project
+      --lsp-program <LSP_PROGRAM>
+          Executable name or relative path, started directly without a shell
+      --lsp-package-manager <LSP_PACKAGE_MANAGER>
+          Installation layout selecting an installed language server without an executable path [possible values: cargo, bun, npm, uv]
+      --lsp-argument=<LSP_ARGUMENT>
+          Literal process argument, repeated for additional arguments
+      --user
+          Write ~/.rift/config.toml; a user disable applies to every project
+  -h, --help
+          Print help
 
 $ rift mcp --help
 Serve agents over stdio MCP by proxying this workspace's rift server

@@ -6,11 +6,14 @@ use std::path::{Path, PathBuf};
 
 use rift_error::{RiftError, errors};
 use rift_index::WorkspaceSourcePolicy;
-use rift_protocol::configuration::{CONFIGURATION_FILE_BYTES_MAX, WorkspaceConfiguration};
+use rift_protocol::configuration::{
+    CONFIGURATION_FILE_BYTES_MAX, LspPackageManager, WorkspaceConfiguration,
+};
 use rift_protocol::map::{
     MAP_RECOMMENDATION_COMMAND_CHARS_MAX, MAP_RECOMMENDATION_ROOT_CHARS_MAX,
     MAP_RECOMMENDATIONS_MAX,
 };
+use rift_protocol::read::SearchScope;
 
 /// One detected language and project, with the existing selection or an apply command.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,8 +46,8 @@ pub enum LspRecommendationStatus {
         program: String,
         /// Native shell command that applies the recommendation.
         command: String,
-        /// Named local project, when the source belongs below another project root.
-        profile: Option<String>,
+        /// Primary project, root-defined profile, or extra workspace selected by the command.
+        scope: SearchScope,
     },
 }
 
@@ -247,6 +250,15 @@ fn registration_roots(
         }
         roots.insert(name.clone(), project);
     }
+    for (name, project) in crate::profile_roots(root, configuration)? {
+        if !seen.insert(project.clone()) {
+            return Err(invalid(
+                &path,
+                "profiles and extra projects must name distinct folders",
+            ));
+        }
+        roots.insert(format!("#{name}"), project);
+    }
     Ok(roots)
 }
 
@@ -313,52 +325,42 @@ fn nearest_root(path: &Path, manifest: &str, roots: &BTreeSet<(String, PathBuf)>
 }
 
 struct Candidate {
+    language: &'static str,
     program: &'static str,
     manifest: &'static str,
-    local: &'static str,
-    arguments: &'static [&'static str],
 }
 
 impl Candidate {
     fn for_language(language: &str) -> Option<Self> {
         match language {
             "rust" => Some(Self {
+                language: "rust",
                 program: "rust-analyzer",
                 manifest: "Cargo.toml",
-                local: "",
-                arguments: &[],
             }),
             "python" => Some(Self {
-                program: "pyright-langserver",
+                language: "python",
+                program: "ty",
                 manifest: "pyproject.toml",
-                local: if cfg!(windows) {
-                    ".venv/Scripts/pyright-langserver.exe"
-                } else {
-                    ".venv/bin/pyright-langserver"
-                },
-                arguments: &["--stdio"],
             }),
             "typescript" | "typescript:tsx" | "javascript" => Some(Self {
+                language: "typescript",
                 program: "typescript-language-server",
                 manifest: "package.json",
-                local: if cfg!(windows) {
-                    "node_modules/.bin/typescript-language-server.cmd"
-                } else {
-                    "node_modules/.bin/typescript-language-server"
-                },
-                arguments: &["--stdio"],
             }),
             _ => None,
         }
     }
 
-    fn installed(&self, root: &Path, search: Option<&OsStr>) -> Option<String> {
-        if !self.local.is_empty() && which::which_in(self.local, None::<&OsStr>, root).is_ok() {
-            return Some(self.local.to_owned());
-        }
-        which::which_in(self.program, search, root)
-            .ok()
-            .map(|_| self.program.to_owned())
+    fn installed(
+        &self,
+        root: &Path,
+        search: Option<&OsStr>,
+        dependencies: &rift_protocol::dependencies::DependenciesConfiguration,
+    ) -> Option<(LspPackageManager, String)> {
+        let manager = crate::package_manager::detect(self.language, root)?;
+        crate::package_manager::recommended_command(manager, root, search, dependencies)
+            .map(|command| (manager, command.program().to_owned()))
     }
 }
 
@@ -372,7 +374,10 @@ fn decisions(
     let search = std::env::var_os("PATH");
     let mut registrations = registered
         .iter()
-        .map(|(name, project)| (name.clone(), project_name(root, project)))
+        .filter_map(|(name, project)| {
+            name.strip_prefix('#')
+                .map(|name| (name.to_owned(), project_name(root, project)))
+        })
         .collect();
     let mut recommendations = LspRecommendationBatch {
         items: Vec::new(),
@@ -407,23 +412,37 @@ fn decisions(
             })
         {
             LspRecommendationStatus::Overlapping
-        } else if let Some(program) = candidate.installed(&project, search.as_deref()) {
-            let profile = if relative == "." {
-                None
+        } else if let Some((manager, program)) =
+            candidate.installed(&project, search.as_deref(), &configuration.dependencies)
+        {
+            let extra = registered
+                .iter()
+                .find(|(name, path)| !name.starts_with('#') && **path == project);
+            let scope = if relative == "." {
+                SearchScope::Local
+            } else if let Some((name, _)) = extra {
+                SearchScope::NamedLocal { name: name.clone() }
             } else {
-                Some(profile_name(&relative, &mut registrations))
+                SearchScope::ProfileLocal {
+                    name: profile_name(&relative, &mut registrations),
+                }
             };
-            let command = command(
+            let mut command = command(
                 &language,
                 &relative,
-                profile.as_deref(),
-                &program,
-                candidate.arguments,
+                match &scope {
+                    SearchScope::ProfileLocal { name } => Some(name.as_str()),
+                    _ => None,
+                },
+                manager,
             );
+            if extra.is_some() {
+                command = format!("cd {} && {command}", quote(&project.to_string_lossy()));
+            }
             LspRecommendationStatus::Available {
                 program,
                 command,
-                profile,
+                scope,
             }
         } else {
             LspRecommendationStatus::Unavailable {
@@ -521,41 +540,24 @@ fn command(
     language: &str,
     root: &str,
     profile: Option<&str>,
-    program: &str,
-    arguments: &[&str],
+    manager: LspPackageManager,
 ) -> String {
-    let arguments_out = command_arguments(language, root, profile, program, arguments);
+    let mut arguments = vec![
+        format!("--language={language}"),
+        format!("--lsp-package-manager={}", manager.as_str()),
+    ];
+    if let Some(profile) = profile {
+        arguments.push(format!("--profile={profile}"));
+        arguments.push(format!("--profile-root={root}"));
+    }
     format!(
         "rift config set {}",
-        arguments_out
+        arguments
             .iter()
             .map(|argument| quote(argument))
             .collect::<Vec<_>>()
             .join(" ")
     )
-}
-
-fn command_arguments(
-    language: &str,
-    root: &str,
-    profile: Option<&str>,
-    program: &str,
-    arguments: &[&str],
-) -> Vec<String> {
-    let mut arguments_out = vec![
-        format!("--language={language}"),
-        format!("--lsp-program={program}"),
-    ];
-    if let Some(profile) = profile {
-        arguments_out.push(format!("--profile={profile}"));
-        arguments_out.push(format!("--profile-root={root}"));
-    }
-    arguments_out.extend(
-        arguments
-            .iter()
-            .map(|argument| format!("--lsp-argument={argument}")),
-    );
-    arguments_out
 }
 
 fn profile_name(root: &str, registrations: &mut BTreeMap<String, String>) -> String {
@@ -605,6 +607,66 @@ fn quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recommendation_inputs_refuse_overlapping_profile_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("docs/api"))?;
+        let configuration: WorkspaceConfiguration = serde_json::from_value(serde_json::json!({
+            "profiles":{"docs":{"root":"docs"},"api":{"root":"docs/api"}}
+        }))?;
+        let error = LspRecommendationInputs::new(root.path(), configuration)
+            .err()
+            .ok_or("overlapping profile roots must be refused")?;
+        assert_eq!(error.slug(), errors::core::configuration_invalid::SLUG);
+        let context: BTreeMap<_, _> = error.context().collect();
+        assert_eq!(context.get("field").map(String::as_str), Some("profiles"));
+        assert_eq!(
+            context.get("detail").map(String::as_str),
+            Some("profile roots overlap; select separate project folders")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_and_extra_registration_keep_same_name_distinct_and_refuse_shared_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        let profile_root = root.path().join("docs").canonicalize()?;
+        let extra_root = extra.path().canonicalize()?;
+        let mut configuration: WorkspaceConfiguration =
+            serde_json::from_value(serde_json::json!({
+                "profiles":{"docs":{"root":"docs"}},
+                "mcp":{"extra":{"docs":extra_root.to_string_lossy()}}
+            }))?;
+        configuration
+            .validate()
+            .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
+        let inputs = LspRecommendationInputs::new(root.path(), configuration.clone())?;
+        assert_eq!(
+            inputs.registered_projects().get("#docs"),
+            Some(&profile_root)
+        );
+        assert_eq!(inputs.registered_projects().get("docs"), Some(&extra_root));
+        assert_eq!(inputs.registered_projects().len(), 2);
+        configuration.mcp.extra.insert(
+            "docs".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        );
+        let error = LspRecommendationInputs::new(root.path(), configuration)
+            .err()
+            .ok_or("profile and extra must not share one root")?;
+        assert_eq!(error.slug(), errors::core::configuration_invalid::SLUG);
+        let context: BTreeMap<_, _> = error.context().collect();
+        assert_eq!(
+            context.get("detail").map(String::as_str),
+            Some("profiles and extra projects must name distinct folders")
+        );
+        Ok(())
+    }
 
     fn project_entries(
         root: &Path,
@@ -773,7 +835,7 @@ mod tests {
             status: LspRecommendationStatus::Available {
                 program: "rust-analyzer".to_owned(),
                 command,
-                profile: None,
+                scope: SearchScope::Local,
             },
         }
     }
@@ -942,22 +1004,17 @@ mod tests {
     }
 
     #[test]
-    fn test_recommendation_command_preserves_literal_arguments_and_profile_root() {
+    fn test_recommendation_command_selects_manager_and_profile_root() {
         let command = command(
             "typescript:tsx",
             "docs",
             Some("docs"),
-            "node_modules/.bin/typescript-language-server",
-            &["--stdio", "argument's value"],
+            LspPackageManager::Bun,
         );
         assert!(command.contains("'--profile=docs'"));
         assert!(command.contains("'--profile-root=docs'"));
         assert!(command.contains("'--language=typescript:tsx'"));
-        if cfg!(windows) {
-            assert!(command.contains("argument''s value"));
-        } else {
-            assert!(command.contains("argument'\"'\"'s value"));
-        }
+        assert!(command.contains("'--lsp-package-manager=bun'"));
     }
 
     #[cfg(unix)]
@@ -974,13 +1031,22 @@ mod tests {
         let candidate = Candidate::for_language("typescript").expect("supported language");
         assert_eq!(
             candidate
-                .installed(root.path(), Some(OsStr::new("/missing")))
+                .installed(
+                    root.path(),
+                    Some(OsStr::new("/missing")),
+                    &rift_protocol::dependencies::DependenciesConfiguration::default()
+                )
+                .map(|(_, program)| program)
                 .as_deref(),
             Some("node_modules/.bin/typescript-language-server")
         );
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o644))?;
         assert_eq!(
-            candidate.installed(root.path(), Some(OsStr::new("/missing"))),
+            candidate.installed(
+                root.path(),
+                Some(OsStr::new("/missing")),
+                &rift_protocol::dependencies::DependenciesConfiguration::default()
+            ),
             None
         );
         Ok(())

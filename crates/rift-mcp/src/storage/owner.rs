@@ -35,7 +35,10 @@ pub(crate) fn validated_root(root: &Path, owner: &SymbolOwner) -> Result<PathBuf
             io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}")),
         )
     })?;
-    if !matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }) {
+    if !matches!(
+        owner,
+        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. }
+    ) {
         return Err(invalid(
             root,
             io::Error::new(io::ErrorKind::InvalidInput, "owner is not local"),
@@ -121,6 +124,52 @@ mod tests {
             workspace_identity(&first.path().join("."), &cloud).expect("same root")
         );
         assert!(!state.exists(), "selection must not allocate storage");
+    }
+
+    #[test]
+    fn profile_storage_is_distinct_and_released_owners_are_refused() {
+        let root = tempfile::tempdir().expect("workspace");
+        let profile = SymbolOwner::ProfileLocal {
+            name: "docs".to_owned(),
+        };
+        let extra = SymbolOwner::NamedLocal {
+            name: "docs".to_owned(),
+        };
+        assert_ne!(
+            workspace_state_directory(root.path(), &profile).expect("profile storage"),
+            workspace_state_directory(root.path(), &extra).expect("extra storage"),
+        );
+        assert_ne!(
+            workspace_identity(root.path(), &profile).expect("profile history"),
+            workspace_identity(root.path(), &extra).expect("extra history"),
+        );
+        for owner in [
+            SymbolOwner::Runtime {
+                runtime: "rust".to_owned(),
+                version: "1.98.0".to_owned(),
+            },
+            SymbolOwner::Package {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "serde".to_owned(),
+                version: "1.0.0".to_owned(),
+            },
+        ] {
+            owner.validate().expect("valid released owner");
+            let error = workspace_state_directory(root.path(), &owner)
+                .expect_err("storage requires a local owner");
+            assert_eq!(
+                error.slug(),
+                rift_error::errors::mcp::election_storage_failed::SLUG
+            );
+            assert!(
+                std::error::Error::source(&error)
+                    .expect("storage cause")
+                    .to_string()
+                    .contains("owner is not local")
+            );
+        }
+        assert!(!root.path().join(".rift").exists());
     }
 
     #[test]

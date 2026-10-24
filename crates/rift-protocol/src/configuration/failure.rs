@@ -21,7 +21,8 @@ pub fn configuration_violation_error(violation: &ConfigurationViolation) -> Rift
         }};
     }
     match violation {
-        ConfigurationViolation::McpRegistrationInvalid { .. } => mcp_error(violation),
+        ConfigurationViolation::McpRegistrationInvalid { .. }
+        | ConfigurationViolation::LspPackageManagerLanguageInvalid { .. } => mcp_error(violation),
         ConfigurationViolation::LimitOutOfRange { .. } => {
             build!(errors::core::configuration_limit_out_of_range())
         }

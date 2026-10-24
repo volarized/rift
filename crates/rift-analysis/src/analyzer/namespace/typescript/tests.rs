@@ -754,7 +754,10 @@ fn ambient_prepared(
         .expect("captured owner origin");
     let language = ShippedLanguage::TypeScript.language();
     let limits = ExactPackageLimits::new(20, 16 * 1024 * 1024);
-    let input = if matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }) {
+    let input = if matches!(
+        owner,
+        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. }
+    ) {
         crate::NamespaceInput::project(owner, &language, &files, &context, &[], limits)
             .expect("captured local input")
     } else {

@@ -476,6 +476,7 @@ impl RiftMcp {
                 params.scope,
                 rift_protocol::read::SearchScope::Local
                     | rift_protocol::read::SearchScope::NamedLocal { .. }
+                    | rift_protocol::read::SearchScope::ProfileLocal { .. }
             )
         {
             return Ok((None, Vec::new()));

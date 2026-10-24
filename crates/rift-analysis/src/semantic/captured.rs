@@ -42,7 +42,7 @@ impl WorkspaceSemantics {
     ) -> Result<PreparedSemantics, RiftError> {
         if !matches!(
             input.owner(),
-            SymbolOwner::Local | SymbolOwner::NamedLocal { .. }
+            SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. }
         ) {
             return errors::analysis::package_input_identity_invalid().fail();
         }

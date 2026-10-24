@@ -125,10 +125,6 @@ async fn installed_map_advice_matches_cli_and_disappears_on_same_connection() ->
 
 #[tokio::test]
 async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> TestResult {
-    let child_configuration = format!(
-        "[search.vector]\ndisabled=true\n[server]\nidle_timeout=\"60s\"\n{}",
-        assigned_port_key()?
-    );
     let directory = laid_out_workspace(
         &[
             (
@@ -136,9 +132,8 @@ async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> T
                 "{\"name\":\"map-profile-fixture\",\"version\":\"1.0.0\",\"types\":\"./page.ts\"}",
             ),
             ("docs/page.ts", "export function beacon() { return 1; }\n"),
-            ("docs/rift.toml", &child_configuration),
         ],
-        &assigned_port_key()?,
+        "",
     )?;
     let root = directory.path();
     let docs = root.join("docs");
@@ -150,14 +145,21 @@ async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> T
     let recommendation = recommendation(&map(&client).await?, "docs");
     assert!(recommendation.command.contains("--profile=docs"));
     apply(root, &recommendation).await?;
+    assert!(
+        !docs.join("rift.toml").exists(),
+        "applying profile advice writes only the root configuration"
+    );
+    let configuration = rift_server::load_configuration(root)?;
+    assert!(configuration.mcp.extra.is_empty());
+    assert_eq!(configuration.profiles["docs"].root, "docs");
     wait_until_configured(&client).await?;
     let query = json!({
-        "query":"beacon", "target":"symbol", "scope":"local@docs",
+        "query":"beacon", "target":"symbol", "scope":"local#docs",
         "paths":{"include":["page.ts"]},
     });
     let refused = proxied_call(&client, "search", &query)
         .await
-        .expect_err("the existing connection has no docs registration");
+        .expect_err("the existing connection has no docs profile");
     let Some(rmcp::ServiceError::McpError(error)) = refused.downcast_ref::<rmcp::ServiceError>()
     else {
         return Err(format!("expected a named scope refusal: {refused:?}").into());
@@ -183,7 +185,7 @@ async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> T
         .ok_or_else(|| format!("symbol ID absent: {answer}"))?;
     assert_eq!(
         SymbolIdentity::parse(id.as_str())?.owner(),
-        &SymbolOwner::NamedLocal {
+        &SymbolOwner::ProfileLocal {
             name: "docs".to_owned()
         },
         "{answer}"

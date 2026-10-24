@@ -4790,6 +4790,9 @@ pub fn validate_project_owner(owner: &SymbolOwner) -> Result<(), RiftError> {
                 .map_err(|_| errors::analysis::package_input_identity_invalid().error())?;
             format!("local@{name}")
         }
+        SymbolOwner::ProfileLocal { .. } => owner
+            .local_scope()
+            .map_err(|_| errors::analysis::package_input_identity_invalid().error())?,
         _ => return errors::analysis::package_input_identity_invalid().fail(),
     };
     if rift_protocol::identity::parse_local_scope(&scope)
@@ -4814,6 +4817,10 @@ fn captured_semantic_revision(
         SymbolOwner::Local => hasher.update(b"local"),
         SymbolOwner::NamedLocal { name } => {
             hasher.update(b"local@");
+            hasher.update(name.as_bytes());
+        }
+        SymbolOwner::ProfileLocal { name } => {
+            hasher.update(b"local#");
             hasher.update(name.as_bytes());
         }
         _ => return errors::analysis::package_input_identity_invalid().fail(),
@@ -12587,6 +12594,19 @@ mod tests {
 
     #[test]
     fn fixed_named_owner_survives_capture_rescan_and_incremental_rebuild() {
+        fixed_owner_survives_capture_rescan_and_incremental_rebuild(&SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        });
+    }
+
+    #[test]
+    fn fixed_profile_owner_survives_capture_rescan_and_incremental_rebuild() {
+        fixed_owner_survives_capture_rescan_and_incremental_rebuild(&SymbolOwner::ProfileLocal {
+            name: "cloud".to_owned(),
+        });
+    }
+
+    fn fixed_owner_survives_capture_rescan_and_incremental_rebuild(owner: &SymbolOwner) {
         let root = tempfile::tempdir().expect("workspace");
         fs::create_dir(root.path().join("src")).expect("source directory");
         fs::write(root.path().join("src/lib.rs"), "pub fn beacon_0() {}").expect("source bytes");
@@ -12599,9 +12619,6 @@ mod tests {
         let visibility = SourceVisibility::default();
         let text = TextFileInclusion::default();
         let languages = LanguageFileSelections::default();
-        let owner = SymbolOwner::NamedLocal {
-            name: "cloud".to_owned(),
-        };
         let named = WorkspaceIndex::build_with_owner(
             (root.path(), owner.clone()),
             limits,
@@ -12624,8 +12641,8 @@ mod tests {
             .clone();
         let parsed = rift_protocol::identity::SymbolIdentity::parse(identity.as_str())
             .expect("canonical named identity");
-        assert_eq!(parsed.owner(), &owner);
-        assert_eq!(named.owner(), &owner);
+        assert_eq!(parsed.owner(), owner);
+        assert_eq!(named.owner(), owner);
         assert_ne!(
             primary
                 .semantics
@@ -12642,7 +12659,7 @@ mod tests {
             .rescanned_cancellable(&visibility, &|| false)
             .expect("rescan");
         for held in [&named, &rebuilt, &rescanned] {
-            assert_eq!(held.owner(), &owner);
+            assert_eq!(held.owner(), owner);
             assert_eq!(
                 held.semantics
                     .assembled(&provider)
@@ -12671,7 +12688,7 @@ mod tests {
                 .empty_snapshot()
                 .expect("empty captured view")
                 .owner(),
-            &owner
+            owner
         );
         assert!(!preparation.accepts_previous(&primary));
     }
@@ -12684,6 +12701,9 @@ mod tests {
         let languages = LanguageFileSelections::default();
         for owner in [
             SymbolOwner::NamedLocal {
+                name: "Invalid".to_owned(),
+            },
+            SymbolOwner::ProfileLocal {
                 name: "Invalid".to_owned(),
             },
             SymbolOwner::Runtime {
@@ -13577,7 +13597,17 @@ mod tests {
             },
         )
         .expect("named context");
+        let profile = captured_semantic_revision(
+            &fingerprint,
+            root.path(),
+            &SymbolOwner::ProfileLocal {
+                name: "cloud".to_owned(),
+            },
+        )
+        .expect("profile context");
         assert_ne!(primary, named);
+        assert_ne!(primary, profile);
+        assert_ne!(named, profile);
         assert_ne!(
             primary,
             captured_semantic_revision(

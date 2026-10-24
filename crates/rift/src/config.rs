@@ -37,10 +37,6 @@ pub(super) enum ConfigCommand {
 pub(super) enum ConfigOutcome {
     Written(PathBuf),
     Recommendations(String),
-    Profile {
-        registration: PathBuf,
-        configuration: PathBuf,
-    },
 }
 
 impl std::fmt::Display for ConfigOutcome {
@@ -48,15 +44,6 @@ impl std::fmt::Display for ConfigOutcome {
         match self {
             Self::Written(path) => write!(formatter, "configuration written: {}", path.display()),
             Self::Recommendations(recommendations) => formatter.write_str(recommendations),
-            Self::Profile {
-                registration,
-                configuration,
-            } => write!(
-                formatter,
-                "configuration written: {}\nregistration written: {}",
-                configuration.display(),
-                registration.display()
-            ),
         }
     }
 }

@@ -856,7 +856,9 @@ fn tagged_union_arm<'schema>(
 
 /// A workspace configuration states entry caps on its language and LSP maps.
 pub fn declare_workspace_contract(schema: &mut Schema) {
-    use crate::configuration::{LANGUAGES_MAX, LSP_CONFIGURATIONS_MAX, WorkspaceConfiguration};
+    use crate::configuration::{
+        LANGUAGES_MAX, LSP_CONFIGURATIONS_MAX, PROFILE_COUNT_MAX, WorkspaceConfiguration,
+    };
     for (name, accepted) in [
         (
             property!(WorkspaceConfiguration, languages),
@@ -865,6 +867,10 @@ pub fn declare_workspace_contract(schema: &mut Schema) {
         (
             property!(WorkspaceConfiguration, lsp),
             LSP_CONFIGURATIONS_MAX as u64,
+        ),
+        (
+            property!(WorkspaceConfiguration, profiles),
+            PROFILE_COUNT_MAX as u64,
         ),
     ] {
         annotate_property(schema, name, keyword::MAX_PROPERTIES, json!(accepted));
@@ -883,6 +889,12 @@ pub fn declare_workspace_contract(schema: &mut Schema) {
             json!({ keyword::PATTERN: pattern }),
         );
     }
+    annotate_property(
+        schema,
+        property!(WorkspaceConfiguration, profiles),
+        keyword::PROPERTY_NAMES,
+        json!({"pattern": "^[a-z][a-z0-9_-]*$", "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX - "local#".len(), "not": {"enum": ["local", "global", "all"]}}),
+    );
 }
 
 /// An [`ExecutionConfiguration`](crate::configuration::ExecutionConfiguration)
@@ -1511,16 +1523,21 @@ fn require_one_selector(schema: &mut Schema, version: &str, requirement: &str) {
 }
 
 /// An [`LspConfiguration`](crate::configuration::LspConfiguration) selects
-/// exactly one engine: a spawned `command`, or an `embedded` engine served
+/// exactly one engine: a spawned `command`, an installed `package_manager` server, or an `embedded` engine served
 /// in process. Acceptance enforces the same rule, together with the
 /// embedded exclusions the field docs state.
 pub fn lsp_selects_one_engine(schema: &mut Schema) {
     use crate::configuration::LspConfiguration;
     let command = property!(LspConfiguration, command);
     let embedded = property!(LspConfiguration, embedded);
+    let package_manager = property!(LspConfiguration, package_manager);
     append(
         schema,
-        one_of(vec![requires(&[command]), requires(&[embedded])]),
+        one_of(vec![
+            requires(&[command]),
+            requires(&[package_manager]),
+            requires(&[embedded]),
+        ]),
     );
 }
 
@@ -2368,8 +2385,7 @@ mod tests {
         }
     }
 
-    /// Acceptance takes exactly one of `command` and `embedded` per LSP
-    /// table, so the schema refuses both, neither, and admits each alone.
+    /// Acceptance takes exactly one engine selector per LSP table.
     #[test]
     fn test_lsp_schema_selects_exactly_one_engine() {
         use crate::configuration::LspConfiguration;
@@ -2378,6 +2394,12 @@ mod tests {
         let validator = jsonschema::validator_for(&schema).expect("lsp validator");
         assert!(validator.is_valid(&json!({ "command": "tool" })));
         assert!(validator.is_valid(&json!({ "embedded": "ty" })));
+        for manager in ["cargo", "bun", "npm", "uv"] {
+            assert!(validator.is_valid(&json!({ "package_manager": manager })));
+            assert!(!validator.is_valid(&json!({ "package_manager": manager, "command": "tool" })));
+            assert!(!validator.is_valid(&json!({ "package_manager": manager, "embedded": "ty" })));
+        }
+        assert!(!validator.is_valid(&json!({ "package_manager": "pnpm" })));
         assert!(!validator.is_valid(&json!({ "command": "tool", "embedded": "ty" })));
         assert!(!validator.is_valid(&json!({})));
         assert!(

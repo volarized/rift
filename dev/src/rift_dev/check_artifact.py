@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from dulwich.repo import Repo
+
 from rift_dev.local_index_read import settled_local
 from rift_dev.nextest_run import retained_collector
 from rift_dev.rift_test_client import (
@@ -30,6 +32,8 @@ SOURCE = "pub fn beacon_one() -> u8 { 1 }\npub fn beacon_two() -> u8 { 2 }\n"
 
 def lay_out_workspace(root: Path) -> None:
     """Use source-only files so language package resolution reaches no network."""
+    with Repo.init(root):
+        pass
     (root / "rift.toml").write_text(CONFIGURATION, encoding="utf-8", newline="")
     (root / "lib.rs").write_text(SOURCE, encoding="utf-8", newline="")
     (root / "Cargo.toml").write_text(

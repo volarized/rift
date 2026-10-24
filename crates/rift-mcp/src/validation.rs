@@ -1050,7 +1050,7 @@ impl ConfigurationFingerprint {
 /// The current `rift.toml` file state, or null when the file is absent or
 /// unreadable - either way the next acceptance decides what that means.
 pub(crate) fn configuration_fingerprint(root: &Path) -> ConfigurationFingerprint {
-    let path = root.join(WORKSPACE_CONFIGURATION_FILE);
+    let path = rift_server::configuration_file(root);
     let Ok(metadata) = std::fs::metadata(&path) else {
         return ConfigurationFingerprint::MissingOrUnreadable;
     };
@@ -5770,6 +5770,24 @@ pub(crate) mod tests {
     use rift_error::errors;
     use rift_protocol::error as wire;
     use rift_server::LspProcessKey;
+    #[test]
+    fn profile_configuration_fingerprint_tracks_root_edits() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::create_dir(directory.path().join("docs"))?;
+        let path = directory.path().join("rift.toml");
+        fs::write(&path, "[profiles.docs]\nroot = 'docs'\n")?;
+        let root = directory.path().join("docs");
+        let before = super::configuration_fingerprint(&root);
+        fs::write(
+            &path,
+            "[profiles.docs]\nroot = 'docs'\n[profiles.docs.languages.typescript]\nenabled = false\n",
+        )?;
+        let after = super::configuration_fingerprint(&root);
+        assert_ne!(before, after);
+        assert_eq!(after, super::configuration_fingerprint(directory.path()));
+        Ok(())
+    }
+
     #[test]
     fn configuration_capture_covers_content_invalid_policy_and_oversize() -> TestResult {
         let directory = tempfile::tempdir()?;

@@ -97,7 +97,12 @@ impl ServerLock {
             (None, None) => true,
             (Some(root), Some(owner)) => {
                 root.is_absolute()
-                    && matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. })
+                    && matches!(
+                        owner,
+                        SymbolOwner::Local
+                            | SymbolOwner::NamedLocal { .. }
+                            | SymbolOwner::ProfileLocal { .. }
+                    )
                     && owner.validate().is_ok()
             }
             _ => false,

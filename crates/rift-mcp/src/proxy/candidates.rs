@@ -294,6 +294,13 @@ impl RiftProxy {
                 .get(name)
                 .map(|backend| vec![(name.as_str(), backend)])
                 .ok_or_else(|| self.extra.refusal(name, "search", "scope")),
+            SearchScope::ProfileLocal { name } => {
+                let key = format!("#{name}");
+                self.backends
+                    .get_key_value(&key)
+                    .map(|(name, backend)| vec![(name.as_str(), backend)])
+                    .ok_or_else(|| self.extra.refusal(&key, "search", "scope"))
+            }
             SearchScope::All => Ok(std::iter::once(("local", self))
                 .chain(
                     self.backends
@@ -388,6 +395,11 @@ impl RiftProxy {
     ) -> Result<bool, RiftError> {
         if let SearchScope::NamedLocal { name } = &params.scope
             && !self.backends.contains_key(name)
+        {
+            return Ok(false);
+        }
+        if let SearchScope::ProfileLocal { name } = &params.scope
+            && !self.backends.contains_key(&format!("#{name}"))
         {
             return Ok(false);
         }

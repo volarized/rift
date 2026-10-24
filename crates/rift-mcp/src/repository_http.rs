@@ -1081,25 +1081,20 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn repository_http_routes_each_workspace_root() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let _log = diagnostic_log()?;
-        let directory = tempfile::tempdir()?;
-        let authority = directory.path();
-        let idle_configuration = "[server]\nidle_timeout = \"10s\"\n";
-        crate::server::hermetic_workspace(authority, idle_configuration)?;
-        let fixtures = [
-            ("first", "amber"),
-            ("second", "cedar"),
-            ("third", "indigo"),
-            ("fourth", "quartz"),
-        ];
+    fn profile_workspaces(
+        authority: &Path,
+        fixtures: &[(&str, &str)],
+    ) -> Result<Vec<std::path::PathBuf>, Box<dyn std::error::Error>> {
+        use std::fmt::Write as _;
+        let mut configuration = "[server]\nidle_timeout = \"10s\"\n".to_owned();
         let mut roots = Vec::new();
-        for (directory_name, symbol) in fixtures {
+        for &(directory_name, symbol) in fixtures {
             let root = authority.join(directory_name);
             std::fs::create_dir_all(&root)?;
-            crate::server::hermetic_workspace(&root, idle_configuration)?;
+            writeln!(
+                configuration,
+                "\n[profiles.{directory_name}]\nroot = '{directory_name}'"
+            )?;
             std::fs::write(root.join("lib.rs"), format!("pub fn {symbol}() {{}}\n"))?;
             std::fs::write(
                 root.join("Cargo.toml"),
@@ -1107,15 +1102,42 @@ mod tests {
             )?;
             roots.push(root);
         }
+        crate::server::hermetic_workspace(authority, &configuration)?;
         rift_history::fixture::init(authority);
         rift_history::fixture::commit_all(authority, "add workspace sources");
+        Ok(roots)
+    }
+
+    #[tokio::test]
+    async fn repository_http_routes_each_workspace_root() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let _log = diagnostic_log()?;
+        let directory = tempfile::tempdir()?;
+        let authority = directory.path();
+        let fixtures = [
+            ("first", "amber"),
+            ("second", "cedar"),
+            ("third", "indigo"),
+            ("fourth", "quartz"),
+        ];
+        let roots = profile_workspaces(authority, &fixtures)?;
+        let server_configuration =
+            crate::validation::ConfigurationState::accept(authority).server_configuration();
+        for root in &roots {
+            assert!(!root.join("rift.toml").exists());
+            assert_eq!(
+                crate::validation::ConfigurationState::accept(root).server_configuration(),
+                server_configuration,
+                "profile uses the root server settings"
+            );
+        }
         let repository = rift_history::Repository::open(authority)?;
         let common_directory = repository.common_directory().to_path_buf();
         let shutdown = CancellationToken::new();
         let server = serve_repository_http(
             authority,
             &common_directory,
-            crate::validation::ConfigurationState::accept(authority).server_configuration(),
+            server_configuration,
             shutdown.clone(),
             WorkspaceIndexLimits::default(),
             TokenCheck::Required,

@@ -2235,7 +2235,7 @@
       ]
     },
     "SymbolId": {
-      "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+      "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
       "examples": [
         "rift://symbol/local/rust/app/parser/parse",
         "rift://symbol/local@cloud/rust/app/load",
@@ -2247,7 +2247,7 @@
       "not": {
         "pattern": "/\\.{1,2}(?:/|~|$)"
       },
-      "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+      "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
       "type": "string"
     },
     "SymbolOrigin": {
@@ -2302,6 +2302,25 @@
             },
             "name": {
               "description": "Accepted registration name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One profile defined in the root workspace configuration.",
+          "properties": {
+            "kind": {
+              "const": "profile_local",
+              "type": "string"
+            },
+            "name": {
+              "description": "Accepted profile name.",
               "type": "string"
             }
           },

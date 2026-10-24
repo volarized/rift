@@ -11,8 +11,8 @@ use rift_protocol::symbol_read::GetSymbolResult;
 use serde_json::{Value, json};
 
 use crate::harness::{
-    StopOnDrop, TestResult, assigned_port_key, await_workspace_ready, laid_out_workspace,
-    proxied_call, proxy_client, require_success, run_rift, within,
+    StopOnDrop, TestResult, await_workspace_ready, laid_out_workspace, proxied_call, proxy_client,
+    require_success, run_rift, within,
 };
 
 #[path = "../../../rift-mcp/tests/fake_engine/script.rs"]
@@ -274,7 +274,96 @@ async fn require_engine_root(logs: &Path, name: &str, root: &Path) -> TestResult
     Ok(())
 }
 
-/// Issue #592: a nested profile keeps one owner and one configured engine.
+async fn require_profile_scope(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult {
+    let scoped = proxied_call(
+        client,
+        "search",
+        &json!({
+            "query":"beacon", "target":"symbol", "scope":"local#docs",
+            "paths":{"include":["lib.rs"]}, "include":["source"],
+        }),
+    )
+    .await?;
+    let scoped: SearchReadResult = serde_json::from_value(scoped)?;
+    let SearchReadResult::Results(scoped) = scoped else {
+        return Err("profile scope unavailable".into());
+    };
+    assert_eq!(scoped.results.len(), 1);
+    assert!(
+        symbol_id(&scoped.results[0])?
+            .as_str()
+            .starts_with("rift://symbol/local%23docs/"),
+        "profile identities escape the scope separator"
+    );
+    require_profile_pattern(client).await?;
+    let extra = within(
+        "unregistered extra scope",
+        client.call_tool(
+            rmcp::model::CallToolRequestParams::new("search").with_arguments(
+                serde_json::from_value(json!({
+                    "query":"beacon", "target":"symbol", "scope":"local@docs",
+                }))?,
+            ),
+        ),
+    )
+    .await?;
+    assert!(
+        extra.is_err(),
+        "a profile does not register an extra workspace"
+    );
+    Ok(())
+}
+
+async fn require_profile_pattern(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult {
+    let patterned = proxied_call(
+        client,
+        "search",
+        &json!({
+            "pattern":"pub fn beacon", "target":"symbol", "scope":"local#docs",
+            "paths":{"include":["lib.rs"]}, "include":["source"],
+        }),
+    )
+    .await?;
+    let patterned: SearchReadResult = serde_json::from_value(patterned)?;
+    let SearchReadResult::Results(patterned) = patterned else {
+        return Err("profile pattern unavailable".into());
+    };
+    assert_eq!(patterned.results.len(), 1);
+    assert_eq!(
+        SymbolIdentity::parse(symbol_id(&patterned.results[0])?.as_str())?.owner(),
+        &SymbolOwner::ProfileLocal {
+            name: "docs".to_owned()
+        },
+    );
+    assert!(patterned.view.is_none());
+    assert!(patterned.results[0].view.is_none());
+    let id = symbol_id(&patterned.results[0])?;
+    let found = proxied_call(
+        client,
+        "get_symbol",
+        &json!({"id":id, "include":["source"]}),
+    )
+    .await?;
+    let found: GetSymbolResult = serde_json::from_value(found)?;
+    let GetSymbolResult::Found {
+        symbol,
+        declarations,
+        ..
+    } = found
+    else {
+        return Err("profile pattern symbol unavailable".into());
+    };
+    assert_eq!(symbol.id.as_ref(), Some(id));
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0].source, patterned.results[0].source);
+    Ok(())
+}
+
+/// A root-defined profile keeps one owner and one configured engine.
 #[tokio::test]
 async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engine() -> TestResult {
     let main_source = format!("{MAIN_SOURCE}mod caller;\n");
@@ -288,20 +377,22 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             ("docs/lib.rs", &docs_source),
             ("docs/caller.rs", CALLER_SOURCE),
         ],
-        &assigned_port_key()?,
+        "",
     )?;
     let root = directory.path();
     let docs = root.join("docs");
     let logs = tempfile::tempdir()?;
-    let configuration = format!(
-        "[search.vector]\ndisabled=true\n[server]\nidle_timeout=\"60s\"\n{}",
-        assigned_port_key()?
-    );
-    fs::write(docs.join("rift.toml"), configuration)?;
     let main_script = engine_script(root, logs.path(), "main")?;
     let docs_script = engine_script(&docs, logs.path(), "docs")?;
     configure_engine(root, None, &main_script).await?;
     configure_engine(root, Some("docs"), &docs_script).await?;
+    assert!(
+        !docs.join("rift.toml").exists(),
+        "profiles use the root configuration"
+    );
+    let configuration = rift_server::load_configuration(root)?;
+    assert!(configuration.mcp.extra.is_empty());
+    assert_eq!(configuration.profiles["docs"].root, "docs");
     let _main_stop = StopOnDrop::new(root);
     let _docs_stop = StopOnDrop::new(&docs);
     let client = proxy_client(root).await?;
@@ -309,6 +400,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     let docs_client = proxy_client(&docs).await?;
     await_workspace_ready(&docs_client).await?;
     docs_client.cancel().await?;
+    require_profile_scope(&client).await?;
     let first = proxied_call(&client, "search", &search(0, None)).await?;
     let view = first["view"].clone();
     let _: rift_protocol::symbol_read::CapturedView = serde_json::from_value(view.clone())
@@ -325,7 +417,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
                 owners.insert("main");
                 MAIN_SOURCE.trim()
             }
-            SymbolOwner::NamedLocal { name } if name == "docs" => {
+            SymbolOwner::ProfileLocal { name } if name == "docs" => {
                 owners.insert("docs");
                 DOCS_SOURCE.trim()
             }
@@ -333,7 +425,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
         };
         assert_eq!(hit.source.as_deref(), Some(expected), "{hit:?}");
         symbol_read(&client, hit).await?;
-        if matches!(identity.owner(), SymbolOwner::NamedLocal { .. }) {
+        if matches!(identity.owner(), SymbolOwner::ProfileLocal { .. }) {
             named_missing_read(&client, hit).await?;
         }
     }

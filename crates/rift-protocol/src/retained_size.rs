@@ -13,7 +13,9 @@ impl GetSize for crate::identity::SymbolOwner {
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         match self {
             Self::Local => (0, tracker),
-            Self::NamedLocal { name } => name.get_heap_size_with_tracker(tracker),
+            Self::NamedLocal { name } | Self::ProfileLocal { name } => {
+                name.get_heap_size_with_tracker(tracker)
+            }
             Self::Package {
                 manager,
                 registry,
@@ -515,6 +517,28 @@ impl GetSize for crate::read::RelationshipFacet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_owner_material_counts_name_capacity() {
+        for profile in [false, true] {
+            let mut name = String::with_capacity(512);
+            name.push_str("docs");
+            let capacity = name.capacity();
+            let owner = if profile {
+                crate::identity::SymbolOwner::ProfileLocal { name }
+            } else {
+                crate::identity::SymbolOwner::NamedLocal { name }
+            };
+            assert_eq!(owner.get_heap_size(), capacity);
+            assert_eq!(owner.get_size(), std::mem::size_of_val(&owner) + capacity);
+            assert_eq!(
+                owner
+                    .get_size_with_tracker(get_size2::StandardTracker::new())
+                    .0,
+                std::mem::size_of_val(&owner) + capacity
+            );
+        }
+    }
 
     #[test]
     fn retained_relationship_material_counts_capacity_and_refuses_unmeasured_facts() {

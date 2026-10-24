@@ -113,7 +113,8 @@ pub async fn serve_proxy(
         "MCP proxy starting"
     );
     let configuration = rift_server::load_configuration(root)?;
-    let registrations = extra::Registrations::accept(root, &configuration.mcp, extra, home)?;
+    let registrations = extra::Registrations::accept(root, &configuration.mcp, extra, home)?
+        .with_profiles(root, &configuration)?;
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
@@ -421,10 +422,7 @@ impl RiftProxy {
                     .and_then(|arguments| arguments.get("id"))
                     .and_then(serde_json::Value::as_str)
                     .and_then(|id| rift_protocol::identity::SymbolIdentity::parse(id).ok())
-                    .and_then(|identity| match identity.owner() {
-                        SymbolOwner::NamedLocal { name } => Some(name.clone()),
-                        _ => None,
-                    })
+                    .and_then(|identity| identity::backend_key(identity.owner()))
                     .unwrap_or_else(|| "local".to_owned())
             },
             |selected| {
@@ -455,7 +453,14 @@ impl RiftProxy {
             .map(rift_protocol::identity::SymbolIdentity::parse)
             .transpose()?
             .map(|identity| identity.owner().clone())
-            .filter(|owner| matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }));
+            .filter(|owner| {
+                matches!(
+                    owner,
+                    SymbolOwner::Local
+                        | SymbolOwner::NamedLocal { .. }
+                        | SymbolOwner::ProfileLocal { .. }
+                )
+            });
         let scope = arguments
             .get("scope")
             .map(|value| serde_json::from_value::<rift_protocol::read::SearchScope>(value.clone()))
@@ -465,6 +470,9 @@ impl RiftProxy {
             Some(rift_protocol::read::SearchScope::Local) => Some(SymbolOwner::Local),
             Some(rift_protocol::read::SearchScope::NamedLocal { name }) => {
                 Some(SymbolOwner::NamedLocal { name: name.clone() })
+            }
+            Some(rift_protocol::read::SearchScope::ProfileLocal { name }) => {
+                Some(SymbolOwner::ProfileLocal { name: name.clone() })
             }
             _ => None,
         };
@@ -484,7 +492,9 @@ impl RiftProxy {
         }
         let selected = scope_owner.or(identity_owner);
         match selected {
-            Some(SymbolOwner::NamedLocal { name }) => {
+            Some(owner @ (SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. })) => {
+                let name =
+                    identity::backend_key(&owner).expect("named local owner has backend key");
                 if matches!(scope, Some(rift_protocol::read::SearchScope::Global))
                     || (traversal.is_none()
                         && matches!(scope, Some(rift_protocol::read::SearchScope::All)))
@@ -3415,6 +3425,37 @@ mod tests {
                     )
                     .into())
                 }
+                "search"
+                    if request
+                        .arguments
+                        .as_ref()
+                        .and_then(|arguments| arguments.get("pattern"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("plain") =>
+                {
+                    Ok(
+                        CallToolResult::success(vec![rmcp::model::ContentBlock::text("plain")])
+                            .into(),
+                    )
+                }
+                "search" => {
+                    let arguments = request.arguments.expect("search arguments");
+                    assert_eq!(arguments["scope"], "local");
+                    assert_eq!(arguments["pattern"], "beacon");
+                    let answer: rift_protocol::search_read::SearchReadResult = serde_json::from_value(json!({
+                        "results": [{"hit":{"target":"symbol", "symbol":{
+                            "id":"rift://symbol/local/rust/app/beacon", "language":"rust", "name":"beacon", "kind":"function"
+                        }}, "path":"lib.rs", "source":"fn beacon() {}", "range":{"start":0,"end":14}, "line":1}],
+                        "pagination":{"page_index":0,"total_pages":1}
+                    })).expect("typed latest search result");
+                    let mut meta = rmcp::model::MetaObject::new();
+                    meta.insert("traceparent".to_owned(), json!("selected-search"));
+                    Ok(CallToolResult::structured(
+                        serde_json::to_value(answer).expect("search result"),
+                    )
+                    .with_meta(Some(meta))
+                    .into())
+                }
                 "failing" => Ok(CallToolResult::structured_error(json!({"code": "failed"})).into()),
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool {other}"),
@@ -3745,6 +3786,204 @@ mod tests {
             &rift_protocol::configuration::ServerConfiguration::default(),
             extra,
         ))
+    }
+
+    fn profile_proxy(root: &std::path::Path) -> TestResult<RiftProxy> {
+        std::fs::create_dir(root.join("docs"))?;
+        let configuration: rift_protocol::configuration::WorkspaceConfiguration =
+            serde_json::from_value(json!({"profiles":{"docs":{"root":"docs"}}}))?;
+        let extra = super::extra::Registrations::accept(root, &configuration.mcp, &[], None)?
+            .with_profiles(root, &configuration)?;
+        Ok(RiftProxy::with_configuration(
+            root,
+            test_identity(),
+            OutputPolicy::All,
+            &configuration.server,
+            extra,
+        ))
+    }
+
+    async fn connect_selected_upstream(
+        proxy: &RiftProxy,
+        key: &str,
+    ) -> TestResult<RunningService<RoleServer, StructuredUpstream>> {
+        use rmcp::ServiceExt as _;
+        let backend = proxy.backends.get(key).ok_or("accepted backend")?;
+        let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+        let (running, upstream) = tokio::join!(
+            Box::pin(().serve(client_half)),
+            Box::pin(
+                StructuredUpstream {
+                    root: backend.root.to_string_lossy().into_owned()
+                }
+                .serve(server_half)
+            )
+        );
+        let mut slot = backend.upstream.lock().await;
+        slot.connected = Some(Upstream {
+            running: running?,
+            generation: 0,
+        });
+        slot.generation_next = 1;
+        Ok(upstream?)
+    }
+
+    #[tokio::test]
+    async fn selected_pattern_search_refuses_invalid_arguments_before_forwarding() -> TestResult {
+        let primary = tempfile::tempdir()?;
+        let proxy = profile_proxy(primary.path())?;
+        let invalid = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
+            json!({"pattern":7, "scope":"local#docs"}),
+        )?);
+        let error = proxy
+            .captured_read(&invalid)
+            .await
+            .expect_err("pattern must be text");
+        assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
+        let context: std::collections::BTreeMap<_, _> = error.context().collect();
+        assert_eq!(context.get("field").map(String::as_str), Some("arguments"));
+        let revision = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
+            json!({"pattern":"beacon", "scope":"local#docs", "rev":"HEAD"}),
+        )?);
+        assert!(proxy.captured_read(&revision).await?.is_none());
+        assert_eq!(
+            proxy.backends["#docs"]
+                .upstream
+                .lock()
+                .await
+                .generation_next,
+            0
+        );
+        assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extra_pattern_search_preserves_identity_source_and_metadata_without_captured_view()
+    -> TestResult {
+        let primary = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        let proxy = named_proxy(primary.path(), extra.path())?;
+        let upstream = connect_selected_upstream(&proxy, "cloud").await?;
+        let request = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
+            json!({"pattern":"beacon", "scope":"local@cloud", "target":"symbol"}),
+        )?);
+        let CallToolResponse::Complete(answer) = proxy
+            .captured_read(&request)
+            .await?
+            .ok_or("selected search")??
+        else {
+            return Err("complete selected search".into());
+        };
+        assert_eq!(
+            answer.meta.as_ref().ok_or("metadata")?["traceparent"],
+            "selected-search"
+        );
+        let result: rift_protocol::search_read::SearchReadResult =
+            serde_json::from_value(answer.structured_content.ok_or("typed result")?)?;
+        let rift_protocol::search_read::SearchReadResult::Results(result) = result else {
+            return Err("search results".into());
+        };
+        assert!(result.view.is_none());
+        assert_eq!(result.results.len(), 1);
+        let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &result.results[0].hit else {
+            return Err("symbol hit".into());
+        };
+        assert_eq!(
+            symbol
+                .id
+                .as_ref()
+                .map(rift_protocol::read::SymbolId::as_str),
+            Some("rift://symbol/local@cloud/rust/app/beacon")
+        );
+        assert_eq!(result.results[0].source.as_deref(), Some("fn beacon() {}"));
+        assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        upstream.cancel().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn extra_pattern_search_refuses_successful_text_without_structured_result() -> TestResult
+    {
+        let primary = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        let proxy = named_proxy(primary.path(), extra.path())?;
+        let upstream = connect_selected_upstream(&proxy, "cloud").await?;
+        let request = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
+            json!({"pattern":"plain", "scope":"local@cloud", "target":"symbol"}),
+        )?);
+        let error = proxy
+            .captured_read(&request)
+            .await
+            .expect_err("successful search requires structured content");
+        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
+        let context: std::collections::BTreeMap<_, _> = error.context().collect();
+        assert_eq!(
+            context.get("field").map(String::as_str),
+            Some("structuredContent")
+        );
+        assert_eq!(
+            context.get("violation").map(String::as_str),
+            Some("search response has no structured result")
+        );
+        assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+        upstream.cancel().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn named_and_profile_search_views_refuse_removed_backend_without_forwarding() -> TestResult
+    {
+        for (scope, key) in [("local@cloud", "cloud"), ("local#docs", "#docs")] {
+            let primary = tempfile::tempdir()?;
+            let extra = tempfile::tempdir()?;
+            let mut proxy = if key == "cloud" {
+                named_proxy(primary.path(), extra.path())?
+            } else {
+                profile_proxy(primary.path())?
+            };
+            let upstream = connect_selected_upstream(&proxy, key).await?;
+            let mut arguments = json!({"query":"beacon", "scope":scope});
+            let request = CallToolRequestParams::new("search")
+                .with_arguments(serde_json::from_value(arguments.clone())?);
+            let CallToolResponse::Complete(answer) = proxy
+                .captured_search(&request)
+                .await?
+                .ok_or("initial search")??
+            else {
+                return Err("complete search".into());
+            };
+            arguments["view"] =
+                answer.structured_content.ok_or("typed result")?["view"]["id"].clone();
+            proxy.backends = Arc::new(std::collections::BTreeMap::new());
+            let request = CallToolRequestParams::new("search")
+                .with_arguments(serde_json::from_value(arguments)?);
+            let CallToolResponse::Complete(answer) = proxy
+                .captured_search(&request)
+                .await?
+                .ok_or("held search")??
+            else {
+                return Err("complete held search".into());
+            };
+            let result: rift_protocol::search_read::SearchReadResult = serde_json::from_value(
+                answer
+                    .structured_content
+                    .ok_or("typed unavailable result")?,
+            )?;
+            let rift_protocol::search_read::SearchReadResult::Unavailable(
+                rift_protocol::search_read::SearchUnavailable::Unavailable { reason, .. },
+            ) = result
+            else {
+                return Err("removed backend must refuse held view".into());
+            };
+            assert_eq!(
+                reason,
+                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext
+            );
+            assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+            upstream.cancel().await?;
+        }
+        Ok(())
     }
 
     #[tokio::test]

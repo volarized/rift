@@ -23,6 +23,7 @@ use crate::source::SourceConfiguration;
 mod archive;
 mod mcp;
 mod package;
+mod profiles;
 
 #[cfg(test)]
 mod collection_tests;
@@ -30,6 +31,9 @@ mod collection_tests;
 pub use archive::*;
 pub use mcp::McpConfiguration;
 pub use package::PackageConfiguration;
+pub use profiles::{
+    PROFILE_COUNT_MAX, PROFILE_ROOT_DEPTH_MAX, ProfileConfiguration, subtree_pattern,
+};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
@@ -513,6 +517,8 @@ pub struct WorkspaceConfiguration {
     pub global: GlobalConfiguration,
     /// Named local projects registered by the primary project's MCP connection.
     pub mcp: McpConfiguration,
+    /// Named profiles below this root. Each profile uses this file and its own project folder.
+    pub profiles: BTreeMap<String, ProfileConfiguration>,
     /// Bounds and switches for the built-in providers.
     pub providers: ProvidersConfiguration,
     /// Enablement and limits for caller-provided code.
@@ -588,6 +594,7 @@ impl WorkspaceConfiguration {
             .violation()
             .or_else(|| self.global.violation())
             .or_else(|| self.mcp.violation())
+            .or_else(|| profiles::violation(self))
             .or_else(|| self.execution.violation())
             .or_else(|| self.providers.history.violation())
             .or_else(|| self.providers.syntax.violation())
@@ -2936,6 +2943,9 @@ impl CommandInput {
     }
 }
 
+mod package_manager;
+pub use package_manager::LspPackageManager;
+
 /// One external LSP process Rift may start.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -2943,11 +2953,16 @@ impl CommandInput {
 #[schemars(transform = crate::schema::lsp_selects_one_engine)]
 pub struct LspConfiguration {
     /// Executable and literal arguments. Rift starts it directly without a
-    /// shell. Exactly one of `command` and `embedded` is present.
+    /// shell. Exactly one of `command`, `package_manager`, and `embedded` is present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<CommandInput>,
+    /// Installation layout that selects an installed language server: Cargo uses
+    /// rust-analyzer, Bun and npm use native TypeScript or typescript-language-server, and uv uses ty
+    /// or pyright. Rift starts the installed executable directly and installs nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_manager: Option<LspPackageManager>,
     /// Engine linked into the server, run in process in place of a spawned
-    /// command. Exactly one of `command` and `embedded` is present, and an
+    /// command. Exactly one of `command`, `package_manager`, and `embedded` is present, and an
     /// embedded engine takes no `environment` and no
     /// `initialization_options`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3218,17 +3233,22 @@ pub enum ConfigurationViolation {
         /// The LSP process declaring the options.
         lsp: String,
     },
-    /// An LSP table names both `command` and `embedded`, so it selects the
-    /// engine twice.
+    /// An LSP table names more than one engine selector.
     LspEngineSelectionConflict {
         /// The LSP table selecting twice.
         lsp: String,
     },
-    /// An LSP table names neither `command` nor `embedded`, so it selects
-    /// nothing runnable.
+    /// An LSP table names no engine selector.
     LspEngineMissing {
         /// The LSP table selecting nothing.
         lsp: String,
+    },
+    /// A language selects a package manager that serves a different language.
+    LspPackageManagerLanguageInvalid {
+        /// Exact language selecting the process.
+        language: String,
+        /// Package manager selected by that process.
+        package_manager: LspPackageManager,
     },
     /// An embedded engine runs in process, so a spawned-process key beside
     /// it cannot take effect.
@@ -3364,11 +3384,9 @@ impl ConfigurationViolation {
                 vec![("field", (*field).to_owned()), ("program", program.clone())]
             }
             Self::CommandArgumentOversized { field, bytes }
-            | Self::CommandProgramOversized { field, bytes } => vec![
-                ("field", (*field).to_owned()),
-                ("bytes", bytes.to_string()),
-                ("bytes_max", COMMAND_ARGUMENT_BYTES_MAX.to_string()),
-            ],
+            | Self::CommandProgramOversized { field, bytes } => {
+                command_size_evidence(field, *bytes)
+            }
 
             Self::LspNameInvalid { name } => vec![("name", name.clone())],
             Self::LspEnvironmentKeyInvalid { lsp, key } => {
@@ -3376,11 +3394,12 @@ impl ConfigurationViolation {
             }
             Self::LspInitializationOptionsNotObject { lsp } => vec![("lsp", lsp.clone())],
             Self::LspEngineSelectionConflict { lsp } | Self::LspEngineMissing { lsp } => {
-                vec![
-                    ("lsp", lsp.clone()),
-                    ("fields", "command, embedded".to_owned()),
-                ]
+                lsp_engine_evidence(lsp)
             }
+            Self::LspPackageManagerLanguageInvalid {
+                language,
+                package_manager,
+            } => package_manager.language_evidence(language),
             Self::LspEmbeddedExtras { lsp, field } => {
                 vec![("lsp", lsp.clone()), ("field", (*field).to_owned())]
             }
@@ -3420,6 +3439,21 @@ impl ConfigurationViolation {
             ],
         }
     }
+}
+
+fn command_size_evidence(field: &str, bytes: u64) -> Vec<(&'static str, String)> {
+    vec![
+        ("field", field.to_owned()),
+        ("bytes", bytes.to_string()),
+        ("bytes_max", COMMAND_ARGUMENT_BYTES_MAX.to_string()),
+    ]
+}
+
+fn lsp_engine_evidence(lsp: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("lsp", lsp.to_owned()),
+        ("fields", "command, package_manager, embedded".to_owned()),
+    ]
 }
 
 /// The bound check every numeric configuration key runs through.
@@ -3555,8 +3589,25 @@ fn language_violation(
         }
         Some(LanguageLspConfiguration::Inline(configuration)) => {
             lsp_violation("languages.lsp", identity, configuration)
+                .or_else(|| package_manager_language_violation(identity, configuration))
         }
+        Some(LanguageLspConfiguration::Named(name)) => lsp
+            .get(name)
+            .and_then(|configuration| package_manager_language_violation(identity, configuration)),
         _ => None,
+    })
+}
+
+fn package_manager_language_violation(
+    identity: &str,
+    configuration: &LspConfiguration,
+) -> Option<ConfigurationViolation> {
+    let package_manager = configuration.package_manager?;
+    (!package_manager.supports(identity)).then(|| {
+        ConfigurationViolation::LspPackageManagerLanguageInvalid {
+            language: identity.to_owned(),
+            package_manager,
+        }
     })
 }
 
@@ -3634,22 +3685,23 @@ fn lsp_violation(
         .or_else(|| lsp_restart_violation(&lsp.restart))
 }
 
-/// One engine per table: `command` spawns one, `embedded` links one in.
-/// A table naming both selects the engine twice; one naming neither
-/// selects nothing runnable.
+/// One engine selector per table. Package managers select an installed executable.
 fn engine_selection_violation(
     name: &str,
     lsp: &LspConfiguration,
 ) -> Option<ConfigurationViolation> {
-    match (&lsp.command, lsp.embedded) {
-        (Some(_), Some(_)) => Some(ConfigurationViolation::LspEngineSelectionConflict {
+    let selected = usize::from(lsp.command.is_some())
+        + usize::from(lsp.package_manager.is_some())
+        + usize::from(lsp.embedded.is_some());
+    match selected {
+        0 => Some(ConfigurationViolation::LspEngineMissing {
             lsp: name.to_owned(),
         }),
-        (None, None) => Some(ConfigurationViolation::LspEngineMissing {
+        1 if lsp.embedded.is_some() => embedded_extras_violation(name, lsp),
+        1 => None,
+        _ => Some(ConfigurationViolation::LspEngineSelectionConflict {
             lsp: name.to_owned(),
         }),
-        (None, Some(_)) => embedded_extras_violation(name, lsp),
-        (Some(_), None) => None,
     }
 }
 
@@ -3754,6 +3806,7 @@ mod tests {
                 "server".to_owned(),
             ])),
             embedded: None,
+            package_manager: None,
             environment: BTreeMap::new(),
             initialization_options: None,
             startup_timeout: Duration::from_millis(LSP_STARTUP_TIMEOUT_MS_DEFAULT),
@@ -6764,7 +6817,7 @@ mod tests {
             conflict.evidence(),
             vec![
                 ("lsp", "ty".to_owned()),
-                ("fields", "command, embedded".to_owned()),
+                ("fields", "command, package_manager, embedded".to_owned()),
             ]
         );
         let missing = ConfigurationViolation::LspEngineMissing {

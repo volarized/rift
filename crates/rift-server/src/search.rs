@@ -1003,7 +1003,7 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
     }
     if !matches!(
         params.scope,
-        SearchScope::Local | SearchScope::NamedLocal { .. }
+        SearchScope::Local | SearchScope::NamedLocal { .. } | SearchScope::ProfileLocal { .. }
     ) {
         return errors::server::read_invalid()
             .field("scope")
