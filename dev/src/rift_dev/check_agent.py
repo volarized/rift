@@ -228,8 +228,8 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
         ):
             try:
                 async with server.connect() as client:
-                    await check_resources(client)
                     await check_reads(client)
+                    await check_resources(client)
                     await check_external_change(client, root)
                     await check_embedded_references(client, root)
                     await declaration_node(client, "beacon_one")
