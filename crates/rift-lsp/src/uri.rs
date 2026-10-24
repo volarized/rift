@@ -343,6 +343,8 @@ impl EngineRoots {
                 let path = package.package_path(relative?)?;
                 let unit = SourceUnitId::for_origin(&package.origin, &path)?;
                 Ok(EngineAddress::Package(Box::new(PackageFile {
+                    root: package.root.clone(),
+                    import_root: package.within.clone(),
                     origin: package.origin.clone(),
                     path,
                     unit,
@@ -377,12 +379,26 @@ pub enum EngineAddress {
 /// One file of a cataloged package: the package, the file's path in it, and its unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageFile {
+    root: TreeRoot,
+    import_root: Option<ProjectPath>,
     origin: SourceLocation,
     path: ProjectPath,
     unit: SourceUnitId,
 }
 
 impl PackageFile {
+    /// Installed Python import folder or module established by dependency discovery.
+    #[must_use]
+    pub const fn import_root(&self) -> Option<&ProjectPath> {
+        self.import_root.as_ref()
+    }
+
+    /// Admitted physical root holding this source file.
+    #[must_use]
+    pub const fn root(&self) -> &TreeRoot {
+        &self.root
+    }
+
     /// The defining package or runtime origin that holds the file.
     #[must_use]
     pub const fn origin(&self) -> &SourceLocation {

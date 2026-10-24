@@ -3,7 +3,7 @@ use rift_core::{SourceVisibility, TextFileInclusion};
 use rift_index::WorkspaceIndexLimits;
 use rift_protocol::configuration::HistoryConfiguration;
 
-fn fixture(metadata: bool) -> (tempfile::TempDir, Arc<ReadService>, SymbolId) {
+pub(super) fn fixture(metadata: bool) -> (tempfile::TempDir, Arc<ReadService>, SymbolId) {
     let directory = tempfile::tempdir().expect("workspace");
     if metadata {
         std::fs::write(

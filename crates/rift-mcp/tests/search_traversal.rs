@@ -1,14 +1,12 @@
-//! Drives `search`'s `traversal` block through a live rmcp client over a fixture workspace:
-//! a callers walk, an indirect-caller walk, a path query, a hit reached both lexically and
-//! by the walk, outgoing walks through call hierarchy, the refusals a walk with no edge
-//! source draws, the warnings a walk carries when an engine could not answer in full, and
-//! the changed files a publication hands the engines.
+//! Public SPARQL relationship queries through a live MCP client.
 //!
-//! A configured language engine resolves the references and calls the walk follows. Most
-//! fixtures select the embedded `ty` engine over a Python workspace: no external process,
-//! and the same lane a real read uses. Fake `sh` engines script the answers a real engine
-//! gives while it loads or after an edit, and two suites drive rust-analyzer and
-//! typescript-language-server themselves under `RIFT_ENGINE_LIVE`.
+//! Covers incoming and outgoing paths, repeated and recursive physical usages,
+//! retrieval joins, required-fact refusals, retained dependency source reads, and
+//! changed files delivered to the configured engines.
+//!
+//! Most fixtures select the embedded `ty` engine over a Python workspace. Scripted
+//! `sh` engines cover readiness, cancellation and invalid source positions; live
+//! rust-analyzer and TypeScript suites use `RIFT_ENGINE_LIVE`.
 
 #[cfg(unix)]
 mod fake_engine;
@@ -26,6 +24,7 @@ mod hermetic_search;
 mod live_engine_gate;
 #[path = "python_runtime/environment.rs"]
 mod python_runtime_environment;
+mod query;
 #[cfg(unix)]
 #[path = "../../rift-lsp/tests/typescript_install.rs"]
 mod typescript_install;
@@ -37,8 +36,8 @@ mod workspace_client;
 use rift_protocol::error::{ErrorCode, RetryDirective};
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, captured_seed, failed_call, search_after_population,
-    served_workspace, tool_request,
+    TestResult, call_retrying_acceptance, captured_seed, failed_call, served_workspace,
+    tool_request,
 };
 
 /// `root` calls `branch_a` and `branch_b`, each of which calls `leaf`:
@@ -78,37 +77,15 @@ const ENGINELESS_FILES: &[(&str, &str)] = &[
 async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({ "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? } }),
-        ),
-    )
-    .await?;
-
-    let reached = symbol_names(&structured);
-    assert_eq!(
-        reached,
-        ["branch_a", "branch_b"],
-        "a walk with no explicit depth reaches exactly leaf's direct callers: {structured}"
-    );
-    for hit in results(&structured) {
-        assert_eq!(hit["distance"], json!(1), "{hit}");
-        assert_eq!(
-            hit["traversal_path"].as_array().map(Vec::len),
-            Some(1),
-            "{hit}"
-        );
-        assert!(
-            hit["matched_by"]
-                .as_array()
-                .is_some_and(|matched| matched.contains(&json!("relationship"))),
-            "{hit}"
-        );
-    }
-
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let parameters = serde_json::to_value(query::path(&seed, "^:references")?)?;
+    let request = tool_request("search", &parameters);
+    let structured = call_retrying_acceptance(&client, request).await?;
+    assert_eq!(projected_names(&structured)?, ["branch_a", "branch_b"]);
+    let parameters = serde_json::to_value(query::usages(&seed)?)?;
+    let request = tool_request("search", &parameters);
+    let usages = call_retrying_acceptance(&client, request).await?;
+    assert_eq!(query::rows(&usages)?.len(), 2);
     client.cancel().await?;
     Ok(())
 }
@@ -117,39 +94,17 @@ async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> Te
 async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
-                    "direction": "incoming",
-                    "depth": 2
-                }
-            }),
-        ),
-    )
-    .await?;
-
-    let reached = symbol_names(&structured);
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let parameters = serde_json::to_value(query::path(
+        &seed,
+        "(^:references|^:references/^:references)",
+    )?)?;
+    let request = tool_request("search", &parameters);
+    let structured = call_retrying_acceptance(&client, request).await?;
     assert_eq!(
-        reached,
-        ["branch_a", "branch_b", "root"],
-        "an incoming walk from leaf reaches both direct callers and root, its indirect one: \
-         {structured}"
+        projected_names(&structured)?,
+        ["branch_a", "branch_b", "root"]
     );
-    let root_hit = results(&structured)
-        .into_iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == json!("root"))
-        .ok_or("root must be a hit")?;
-    assert_eq!(
-        root_hit["distance"],
-        json!(2),
-        "root reaches leaf through one intermediate caller: {root_hit}"
-    );
-
     client.cancel().await?;
     Ok(())
 }
@@ -158,212 +113,321 @@ async fn search_traversal_impact_incoming_depth_two_reaches_every_caller() -> Te
 async fn search_traversal_to_keeps_only_the_path_query_target() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
-                    "depth": 2,
-                    "to": captured_seed(&client, "root", "graph.py").await?
-                }
-            }),
-        ),
-    )
-    .await?;
-
-    let reached = results(&structured);
-    assert_eq!(reached.len(), 1, "{structured}");
-    assert_eq!(reached[0]["hit"]["symbol"]["name"], json!("root"));
-    assert_eq!(
-        reached[0]["distance"],
-        json!(2),
-        "root's shortest path from leaf is two hops: {structured}"
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let target = captured_seed(&client, "root", "graph.py").await?;
+    let statement = format!(
+        "SELECT ?symbol ?name {{ <{seed}> ^:references/^:references ?symbol . ?symbol :name ?name . FILTER(?symbol = <{target}>) }} ORDER BY ?name"
     );
-
+    let request = tool_request("search", &json!({"query":statement}));
+    let structured = call_retrying_acceptance(&client, request).await?;
+    assert_eq!(projected_names(&structured)?, ["root", "root"]);
+    for row in query::rows(&structured)? {
+        assert_eq!(query::iri(row, "symbol")?, target);
+    }
     client.cancel().await?;
     Ok(())
 }
 
-/// A hit both `query` and `traversal` reach carries every field either lane placed: the
-/// lexical `matched_by` entry stays beside the traversal's, and the hit keeps its walked path.
+fn projected_names(structured: &Value) -> TestResult<Vec<String>> {
+    query::rows(structured)?
+        .iter()
+        .map(|row| query::literal(row, "name").map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn search_query_counts_and_pages_more_than_ten_thousand_occurrences() -> TestResult {
+    let source = format!("def leaf(): pass\n{}", "leaf()\n".repeat(10_001));
+    let (directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", GRAPH_METADATA), ("graph.py", &source)],
+        Some(ENGINE.to_owned()),
+    )
+    .await?;
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let parameters = serde_json::to_value(query::usages(&seed)?)?;
+    let started = std::time::Instant::now();
+    eprintln!("10001 occurrences: query started");
+    let first = call_retrying_acceptance(&client, tool_request("search", &parameters)).await?;
+    eprintln!("10001 occurrences: query {:?}", started.elapsed());
+    assert_eq!(query::rows(&first)?.len(), 1_000);
+    assert_eq!(first["pagination"]["total_pages"], 11);
+    let view = first["view"]["id"]
+        .as_str()
+        .ok_or("retained occurrence execution")?;
+    let service = format!("{}{view}", rift_search::sparql::RESULT_SERVICE_PREFIX);
+    std::fs::write(
+        directory.path().join("graph.py"),
+        "# changed after capture\n",
+    )?;
+    let count = format!("SELECT (COUNT(*) AS ?count) {{ SERVICE <{service}> {{}} }}");
+    let started = std::time::Instant::now();
+    let answer =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":count}))).await?;
+    assert_eq!(query::literal(&query::rows(&answer)?[0], "count")?, "10001");
+    eprintln!("10001 occurrences: count {:?}", started.elapsed());
+    let mut occurrences = std::collections::BTreeSet::new();
+    let mut offsets = Vec::new();
+    let started = std::time::Instant::now();
+    let mut answer = first;
+    for page in 0..11 {
+        assert_eq!(answer["pagination"]["page_index"], page);
+        for row in query::rows(&answer)? {
+            assert_eq!(row["usage"]["type"], "blank_node");
+            assert_eq!(query::iri(row, "unit")?, "rift://source/project/graph.py");
+            assert!(
+                occurrences.insert(
+                    row["usage"]["value"]
+                        .as_str()
+                        .ok_or("retained occurrence identity")?
+                        .to_owned()
+                )
+            );
+            let start: usize = query::literal(row, "start")?.parse()?;
+            let end: usize = query::literal(row, "end")?.parse()?;
+            assert_eq!(&source[start..end], "leaf");
+            offsets.push(start);
+        }
+        let next = answer["pagination"]["next_query"].as_str();
+        if page == 10 {
+            assert!(next.is_none(), "{answer}");
+        } else {
+            let statement = next.ok_or("retained occurrence continuation")?.to_owned();
+            let page_started = std::time::Instant::now();
+            answer = call_retrying_acceptance(
+                &client,
+                tool_request("search", &json!({"query":statement})),
+            )
+            .await?;
+            eprintln!(
+                "10001 occurrences: continuation {} {:?}",
+                page + 1,
+                page_started.elapsed()
+            );
+        }
+    }
+    eprintln!(
+        "10001 occurrences: all continuations {:?}",
+        started.elapsed()
+    );
+    assert_eq!(occurrences.len(), 10_001);
+    let expected = source
+        .match_indices("leaf")
+        .skip(1)
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert_eq!(offsets, expected);
+    // A separate SPARQL query evaluates ordering and slicing over the full result.
+    let statement = format!(
+        "SELECT ?usage ?unit ?start ?end {{ SERVICE <{service}> {{}} }} ORDER BY ?start LIMIT 2 OFFSET 9000"
+    );
+    let started = std::time::Instant::now();
+    let answer =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let selected = query::rows(&answer)?
+        .iter()
+        .map(|row| {
+            let start: usize = query::literal(row, "start")?.parse()?;
+            Ok(start)
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(selected, expected[9000..9002]);
+    eprintln!(
+        "10001 occurrences: ordered offset control {:?}",
+        started.elapsed()
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_query_preserves_recursive_and_file_level_occurrences() -> TestResult {
+    let source = "def recur() -> int:\n    return recur() + recur()\n\nrecur()\n";
+    let (_directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", GRAPH_METADATA), ("graph.py", source)],
+        Some(ENGINE.to_owned()),
+    )
+    .await?;
+    let seed = captured_seed(&client, "recur", "graph.py").await?;
+    let parameters = serde_json::to_value(query::usages(&seed)?)?;
+    let answer = call_retrying_acceptance(&client, tool_request("search", &parameters)).await?;
+    let rows = query::rows(&answer)?;
+    assert_eq!(rows.len(), 3, "{answer}");
+    let mut actual = Vec::new();
+    for row in rows {
+        assert_eq!(query::iri(row, "unit")?, "rift://source/project/graph.py");
+        let start: usize = query::literal(row, "start")?.parse()?;
+        let end: usize = query::literal(row, "end")?.parse()?;
+        assert_eq!(&source[start..end], "recur");
+        actual.push(start);
+    }
+    let expected = source
+        .match_indices("recur")
+        .skip(1)
+        .map(|(offset, _)| offset)
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected);
+    let parameters = serde_json::to_value(query::path(&seed, "^:references")?)?;
+    let answer = call_retrying_acceptance(&client, tool_request("search", &parameters)).await?;
+    assert_eq!(projected_names(&answer)?, ["recur"]);
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_query_inverse_calls_preserves_recursive_and_module_call_sites() -> TestResult {
+    let source = "def recur():\r\n    return recur() + recur()\r\n\r\ndef caller():\r\n    '😀'; recur(); recur()\r\n\r\nrecur()\r\n";
+    let (directory, client, _server_task) = served_workspace(
+        &[("pyproject.toml", GRAPH_METADATA), ("graph.py", source)],
+        Some(ENGINE.to_owned()),
+    )
+    .await?;
+    let seed = captured_seed(&client, "recur", "graph.py").await?;
+    let answer = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &serde_json::to_value(query::path(&seed, "^:calls")?)?,
+        ),
+    )
+    .await?;
+    assert_eq!(projected_names(&answer)?, ["caller", "recur"]);
+    let statement = format!(
+        "SELECT DISTINCT ?usage ?unit ?start ?end {{ <{seed}> ^:calls ?caller . <{seed}> :usages ?usage . ?usage :facets :calls; :unit ?unit; :start ?start; :end ?end }} ORDER BY ?start"
+    );
+    let answer =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let starts = query::rows(&answer)?
+        .iter()
+        .map(|row| {
+            assert_eq!(query::iri(row, "unit")?, "rift://source/project/graph.py");
+            let start: usize = query::literal(row, "start")?.parse()?;
+            let end: usize = query::literal(row, "end")?.parse()?;
+            assert_eq!(&source[start..end], "recur");
+            Ok(start)
+        })
+        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(
+        starts,
+        source
+            .match_indices("recur")
+            .skip(1)
+            .map(|(start, _)| start)
+            .collect::<Vec<_>>()
+    );
+    let view = answer["view"]["id"]
+        .as_str()
+        .ok_or("retained incoming calls")?;
+    std::fs::write(
+        directory.path().join("graph.py"),
+        "# changed after capture\n",
+    )?;
+    let held = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_source",
+            &json!({"unit":"rift://source/project/graph.py","view":view}),
+        ),
+    )
+    .await?;
+    assert_eq!(held["source"]["text"], source);
+    client.cancel().await?;
+    Ok(())
+}
+
+/// Retrieval results join graph facts through their canonical symbol identities.
 #[tokio::test]
 async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_walked_path()
 -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "query": "branch_a",
-                "target": "symbol",
-                "traversal": { "seed": captured_seed(&client, "leaf", "graph.py").await? }
-            }),
-        ),
-    )
-    .await?;
-
-    let hit = results(&structured)
-        .into_iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == json!("branch_a"))
-        .ok_or("branch_a must be a hit")?;
-    let matched_by = hit["matched_by"]
-        .as_array()
-        .ok_or("matched_by must be an array")?;
-    assert!(matched_by.contains(&json!("name")), "{hit}");
-    assert!(matched_by.contains(&json!("relationship")), "{hit}");
-    assert_eq!(
-        hit["traversal_path"].as_array().map(Vec::len),
-        Some(1),
-        "{hit}"
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let statement = format!(
+        "SELECT DISTINCT ?symbol ?name {{ SERVICE :search {{ ?hit :query 'branch_a'; :target 'symbol'; :symbol ?symbol }} <{seed}> ^:references ?symbol . ?symbol :name ?name FILTER(?name = 'branch_a') }} ORDER BY ?name"
     );
-
+    let request = serde_json::from_value(json!({"query":statement}))?;
+    let answer = workspace_client::search_after_population(&client, &request).await?;
+    assert_eq!(projected_names(&answer)?, ["branch_a"]);
     client.cancel().await?;
     Ok(())
 }
 
-/// The engine lane resolves references alone, so an `implements` asked for beside them has
-/// no lane and the served answer says so instead of leaving the caller to read the walk's
-/// hits as the whole coverage.
+/// Every requested relationship must have complete provider coverage before evaluation.
 #[tokio::test]
 async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
-                    "facets": ["implements", "references"]
-                }
-            }),
-        ),
-    )
-    .await?;
-
-    assert_eq!(symbol_names(&structured), ["branch_a", "branch_b"]);
-    let warnings = structured["warnings"]
-        .as_array()
-        .ok_or("the answer must carry warnings")?;
-    assert_eq!(warnings.len(), 1, "{structured}");
-    assert_eq!(
-        warnings[0]["code"],
-        json!("relationship_coverage_missing"),
-        "{structured}"
-    );
-    assert_eq!(warnings[0]["facets"], json!(["implements"]), "{structured}");
-
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let request = serde_json::to_value(query::path(&seed, "(^:implements|^:references)")?)?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
     client.cancel().await?;
     Ok(())
 }
 
-/// A facets list naming no facet the engine lane populates leaves the walk no edge source
-/// at all, so the read refuses instead of answering an empty page.
 #[tokio::test]
 async fn search_traversal_over_only_unproduced_facets_refuses() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let code = refusal_code(
-        &client,
-        &json!({"traversal": {"seed": captured_seed(&client, "leaf", "graph.py").await?, "facets": ["implements"]}}),
-    )
-    .await?;
-
-    assert_eq!(code, ErrorCode::CapabilityUnavailable);
-
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let request = serde_json::to_value(query::path(&seed, "^:implements")?)?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
     client.cancel().await?;
     Ok(())
 }
 
-/// The same walk narrowed to the produced facet carries no warning, so the code keeps
-/// naming an absent lane rather than an empty answer.
 #[tokio::test]
 async fn search_traversal_over_a_produced_facet_serves_no_coverage_warning() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "leaf", "graph.py").await?,
-                    "facets": ["references"]
-                }
-            }),
-        ),
-    )
-    .await?;
-
-    assert_eq!(symbol_names(&structured), ["branch_a", "branch_b"]);
-    assert!(
-        structured["warnings"].is_null(),
-        "a walk the engine lane covers carries no warning: {structured}"
-    );
-
+    let seed = captured_seed(&client, "leaf", "graph.py").await?;
+    let request = serde_json::to_value(query::path(&seed, "^:references")?)?;
+    let answer = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
+    assert_eq!(projected_names(&answer)?, ["branch_a", "branch_b"]);
+    assert!(answer["warnings"].is_null(), "{answer}");
     client.cancel().await?;
     Ok(())
 }
 
-/// A walk names its starting declaration through `seed`, so a request naming none refuses.
+/// Removed selectors fail request validation; graph bindings are expressed in SPARQL.
 #[tokio::test]
 async fn search_traversal_without_a_seed_refuses() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-
-    let code = refusal_code(&client, &json!({"traversal": {"direction": "incoming"}})).await?;
-
-    assert_eq!(code, ErrorCode::InvalidRequest);
-
+    assert_eq!(
+        refusal_code(
+            &client,
+            &json!({"query":"ASK {}", "traversal":{"direction":"incoming"}})
+        )
+        .await?,
+        ErrorCode::InvalidRequest
+    );
     client.cancel().await?;
     Ok(())
 }
 
-/// No configured engine serves Rust in this workspace, so nothing resolves a reference for
-/// the seed and the walk has no edge source at all.
 #[tokio::test]
 async fn search_traversal_without_an_engine_refuses_capability_unavailable() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;
-
-    let code = refusal_code(
-        &client,
-        &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
-    )
-    .await?;
-
-    assert_eq!(code, ErrorCode::CapabilityUnavailable);
-
+    let seed = captured_seed(&client, "beacon", "lib.rs").await?;
+    let request = serde_json::to_value(query::path(&seed, "^:references")?)?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
     client.cancel().await?;
     Ok(())
 }
 
-/// The walk from a comparison's changed declarations is not served, so a walk beside one
-/// refuses.
+/// An unavailable change input prevents evaluation of a graph join over that input.
 #[tokio::test]
 async fn search_traversal_beside_a_change_refuses_capability_unavailable() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;
-
-    let code = refusal_code(
-        &client,
-        &json!({
-            "change": {"base": "baseline"},
-            "traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}
-        }),
-    )
-    .await?;
-
-    assert_eq!(code, ErrorCode::CapabilityUnavailable);
-
+    let seed = captured_seed(&client, "beacon", "lib.rs").await?;
+    let statement = format!(
+        "SELECT ?symbol {{ SERVICE :search {{ ?hit :change '{{\"base\":\"baseline\"}}'^^rdf:JSON; :symbol ?symbol }} <{seed}> :calls ?symbol }}"
+    );
+    assert_eq!(
+        refusal_code(&client, &json!({"query":statement})).await?,
+        ErrorCode::CapabilityUnavailable
+    );
     client.cancel().await?;
     Ok(())
 }
@@ -506,7 +570,7 @@ async fn incoming_walks_past_the_readiness_timeout(
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("beacon"))).await?;
     let started_lines = || {
         std::fs::read_to_string(&log).map_or(0, |text| {
             text.lines().filter(|line| *line == "start").count()
@@ -514,28 +578,17 @@ async fn incoming_walks_past_the_readiness_timeout(
     };
     let mut starts_after = Vec::new();
     for _walk in 0..3 {
-        let structured = call_retrying_acceptance(
-            &client,
-            tool_request(
-                "search",
-                &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
-            ),
-        )
-        .await?;
-        eprintln!("incoming walk: answer={structured}");
-        assert!(results(&structured).is_empty(), "{structured}");
-        let warning = &structured["warnings"][0];
+        let request = path_arguments(
+            &captured_seed(&client, "beacon", "lib.rs").await?,
+            "incoming",
+        )?;
+        let failure = failed_call(client.call_tool(tool_request("search", &request)).await)?;
         assert_eq!(
-            warning["code"],
-            json!("engine_analysis_unavailable"),
-            "{structured}"
+            failure.code,
+            ErrorCode::TemporarilyUnavailable,
+            "{failure:?}"
         );
-        assert!(
-            warning["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("readiness_timeout")),
-            "{structured}"
-        );
+        assert_eq!(failure.retry, RetryDirective::SameRequest, "{failure:?}");
         starts_after.push(started_lines());
     }
     let log = std::fs::read_to_string(&log)?;
@@ -603,11 +656,11 @@ async fn search_traversal_tells_the_engine_of_files_changed_outside_the_walk() -
     )
     .await?;
     let seed = captured_seed(&client, "beacon", "lib.rs").await?;
-    let walk = || {
-        call_retrying_acceptance(
-            &client,
-            tool_request("search", &json!({"traversal": {"seed": seed}})),
-        )
+    let request = tool_request("search", &path_arguments(&seed, "incoming")?);
+    let walk = || async {
+        let failed = failed_call(client.call_tool(request.clone()).await)?;
+        assert_eq!(failed.code, ErrorCode::TemporarilyUnavailable, "{failed:?}");
+        Ok::<_, Box<dyn std::error::Error>>(())
     };
     walk().await?;
     assert!(!notified.exists(), "a new session is told nothing");
@@ -708,10 +761,7 @@ async fn live_walk(
         let started = std::time::Instant::now();
         let structured = call_retrying_acceptance(
             client,
-            tool_request(
-                "search",
-                &json!({"traversal": {"seed": seed, "direction": direction}}),
-            ),
+            tool_request("search", &path_arguments(&seed, direction)?),
         )
         .await?;
         let reached = symbol_names(&structured);
@@ -733,28 +783,17 @@ async fn live_seed(
     name: &str,
     language: &str,
 ) -> TestResult<String> {
-    let answer = call_retrying_acceptance(
-        client,
-        tool_request(
-            "search",
-            &json!({"query": name, "target": "symbol", "include": ["source"], "limit": 1000}),
-        ),
-    )
-    .await?;
-    let hits = answer["results"].as_array().ok_or("captured symbol hits")?;
-    let mut exact = hits.iter().filter(|hit| {
-        hit["hit"]["symbol"]["name"] == name && hit["hit"]["symbol"]["language"] == language
-    });
-    let hit = exact.next().ok_or("captured seed declaration")?;
-    assert!(exact.next().is_none(), "one exact fixture seed: {answer}");
-    let identity = hit["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("captured seed has an established identity")?;
+    let answer =
+        call_retrying_acceptance(client, tool_request("search", &name_arguments(name))).await?;
+    let [row] = query::rows(&answer)? else {
+        return Err(format!("one exact fixture seed: {answer}").into());
+    };
+    let identity = query::iri(row, "symbol")?;
     let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
-    assert_eq!(
-        parsed.owner(),
-        &rift_protocol::identity::SymbolOwner::Local,
-        "fixture owner: {answer}"
+    assert_eq!(parsed.owner(), &rift_protocol::identity::SymbolOwner::Local);
+    assert!(
+        identity.starts_with(&format!("rift://symbol/local/{language}/")),
+        "{identity}"
     );
     assert_eq!(parsed.wire_identity(), identity);
     Ok(identity.to_owned())
@@ -775,37 +814,38 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         return Ok(());
     }
     let started = std::time::Instant::now();
+    let initial_walk = format!(
+        "{}\npub fn local(value: i32) -> i32 {{ crate::hub::beacon(value) }}\n",
+        include_str!("../../rift-lsp/tests/fixtures/rust/walk.rs")
+    );
+    let files = LIVE_RUST_FILES
+        .iter()
+        .map(|(path, source)| {
+            (
+                *path,
+                if *path == "walk.rs" {
+                    initial_walk.as_str()
+                } else {
+                    *source
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let (directory, client, _server_task) =
-        served_workspace(LIVE_RUST_FILES, Some(LIVE_RUST_ENGINE.to_owned())).await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+        served_workspace(&files, Some(LIVE_RUST_ENGINE.to_owned())).await?;
     let larger = live_seed(&client, "larger", "rust").await?;
     let beacon = live_seed(&client, "beacon", "rust").await?;
-    let (cold, answer) =
-        live_walk(&client, "outgoing before", &larger, "outgoing", &["beacon"]).await?;
-    assert_eq!(
-        cold, 1,
-        "the first walk waits out rust-analyzer's load instead of taking the empty prepare \
-         it answers while loading as final"
-    );
-    let dropped = answer["warnings"]
-        .as_array()
-        .and_then(|warnings| {
-            warnings
-                .iter()
-                .find(|warning| warning["code"] == json!("callees_dropped"))
-        })
-        .ok_or("the walk counts the callees it dropped")?;
-    assert_eq!(
-        dropped["callees"],
-        json!(2),
-        "`max` and `len` sit in the standard library: {answer}"
-    );
+    let request = path_arguments(&larger, "outgoing")?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+    let local = live_seed(&client, "local", "rust").await?;
+    let (cold, _) = live_walk(&client, "outgoing before", &local, "outgoing", &["beacon"]).await?;
+    assert_eq!(cold, 1);
     live_walk(
         &client,
         "incoming before",
         &beacon,
         "incoming",
-        &["larger", "total"],
+        &["larger", "local", "total"],
     )
     .await?;
     eprintln!("live: warm after {:?}", started.elapsed());
@@ -816,7 +856,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     )?;
     std::fs::write(
         directory.path().join("walk.rs"),
-        include_str!("../../rift-lsp/tests/fixtures/rust/walk.rs").replace("beacon", "beacon2"),
+        initial_walk.replace("beacon", "beacon2"),
     )?;
     std::fs::write(
         directory.path().join("caller.rs"),
@@ -829,7 +869,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     }
     eprintln!("live: published after {:?}", edited.elapsed());
     let (outgoing, _) =
-        live_walk(&client, "outgoing after", &larger, "outgoing", &["beacon2"]).await?;
+        live_walk(&client, "outgoing after", &local, "outgoing", &["beacon2"]).await?;
     eprintln!("live: outgoing fresh after {:?}", edited.elapsed());
     let beacon2 = live_seed(&client, "beacon2", "rust").await?;
     let (incoming, _) = live_walk(
@@ -837,7 +877,7 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
         "incoming after",
         &beacon2,
         "incoming",
-        &["again", "larger", "total"],
+        &["again", "larger", "local", "total"],
     )
     .await?;
     eprintln!("live: incoming fresh after {:?}", edited.elapsed());
@@ -932,36 +972,20 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
         install_captured_typescript_engine,
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("beacon"))).await?;
     let larger = live_seed(&client, "larger", "typescript").await?;
     let beacon = live_seed(&client, "beacon", "typescript").await?;
-    let (outgoing, answer) = live_walk(
+    let request = path_arguments(&larger, "outgoing")?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+    let total = live_seed(&client, "total", "typescript").await?;
+    let (outgoing, _) = live_walk(
         &client,
         "typescript outgoing",
-        &larger,
+        &total,
         "outgoing",
         &["beacon"],
     )
     .await?;
-    eprintln!("live typescript: outgoing after {:?}", started.elapsed());
-    let hop = &results(&answer)[0]["traversal_path"][0];
-    assert_eq!(hop["direction"], json!("outgoing"), "{answer}");
-    assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{answer}");
-    let warnings = answer["warnings"]
-        .as_array()
-        .ok_or("the walk counts the callee it dropped")?;
-    assert_eq!(warnings.len(), 2, "{answer}");
-    assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{answer}");
-    assert_eq!(
-        warnings[0]["callees"],
-        json!(1),
-        "`Math.max` sits in TypeScript's own lib: {answer}"
-    );
-    assert_eq!(
-        warnings[1],
-        json!({"code": "global_access_disabled"}),
-        "the lib is a package file the global API names: {answer}"
-    );
     let (incoming, answer) = live_walk(
         &client,
         "typescript incoming",
@@ -971,15 +995,6 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     )
     .await?;
     eprintln!("live typescript: incoming after {:?}", started.elapsed());
-    for hit in results(&answer) {
-        let hop = &hit["traversal_path"][0];
-        assert_eq!(hop["direction"], json!("incoming"), "{hit}");
-        assert_eq!(
-            hop["relationship"]["facets"],
-            json!(["references"]),
-            "{hit}"
-        );
-    }
     assert!(answer["warnings"].is_null(), "{answer}");
     assert_eq!(
         (outgoing, incoming),
@@ -1005,12 +1020,19 @@ async fn published_holds(
     edited: std::time::Instant,
 ) -> TestResult {
     let mut searches = 0_u32;
+    let declaration = oxigraph::model::Literal::from(format!("fn {name}("));
+    let statement = format!(
+        "ASK {{ ?unit a :SourceUnitId; :source ?source FILTER(CONTAINS(?source, {declaration})) }}"
+    );
     loop {
         let structured =
-            call_retrying_acceptance(client, tool_request("search", &json!({"query": name})))
+            call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
                 .await?;
         searches += 1;
-        if symbol_names(&structured).iter().any(|held| held == name) == present {
+        if structured["answer"]["result"] != "boolean" {
+            return Err(format!("publication source query must answer ASK: {structured}").into());
+        }
+        if structured["answer"]["value"].as_bool() == Some(present) {
             return Ok(());
         }
         if edited.elapsed() >= PUBLICATION_WAIT {
@@ -1053,36 +1075,10 @@ const OUTGOING_FILES: &[(&str, &str)] = &[
 async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
-
-    let started = std::time::Instant::now();
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing" } }),
-        ),
-    )
-    .await?;
-    eprintln!("outgoing depth 1: {:?}", started.elapsed());
-
-    assert_eq!(
-        symbol_names(&structured),
-        ["branch_a", "branch_b"],
-        "{structured}"
-    );
-    for hit in results(&structured) {
-        assert_eq!(hit["distance"], json!(1), "{hit}");
-        let hop = &hit["traversal_path"][0];
-        assert_eq!(hop["direction"], json!("outgoing"), "{hit}");
-        assert_eq!(
-            hop["relationship"]["from"],
-            json!(captured_seed(&client, "root", "graph.py").await?),
-            "{hit}"
-        );
-        assert_eq!(hop["relationship"]["facets"], json!(["calls"]), "{hit}");
-    }
-    assert!(structured["warnings"].is_null(), "{structured}");
-
+    let seed = captured_seed(&client, "root", "graph.py").await?;
+    let answer = graph(&client, &seed, ":calls").await?;
+    assert_eq!(projected_names(&answer)?, ["branch_a", "branch_b"]);
+    assert!(answer["warnings"].is_null(), "{answer}");
     client.cancel().await?;
     Ok(())
 }
@@ -1091,159 +1087,78 @@ async fn search_traversal_outgoing_depth_one_reaches_the_direct_callees() -> Tes
 async fn search_traversal_outgoing_depth_two_reaches_the_callees_of_the_callees() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
-
-    let started = std::time::Instant::now();
-    let structured = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({ "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "depth": 2 } }),
-        ),
-    )
-    .await?;
-    eprintln!("outgoing depth 2: {:?}", started.elapsed());
-
-    assert_eq!(
-        symbol_names(&structured),
-        ["branch_a", "branch_b", "leaf"],
-        "{structured}"
+    let seed = captured_seed(&client, "root", "graph.py").await?;
+    let answer = graph(&client, &seed, "(:calls|:calls/:calls)").await?;
+    assert_eq!(projected_names(&answer)?, ["branch_a", "branch_b", "leaf"]);
+    let leaf = captured_seed(&client, "leaf", "graph.py").await?;
+    let statement = format!(
+        "SELECT ?symbol ?name {{ <{seed}> :calls/:calls ?symbol . ?symbol :name ?name . FILTER(?symbol = <{leaf}>) }} ORDER BY ?name"
     );
-    let leaf = results(&structured)
-        .into_iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == json!("leaf"))
-        .ok_or("leaf must be a hit")?;
-    assert_eq!(leaf["distance"], json!(2), "{leaf}");
-    assert_eq!(
-        leaf["traversal_path"][1]["relationship"]["to"],
-        json!(captured_seed(&client, "leaf", "graph.py").await?),
-        "{leaf}"
-    );
-
-    let only_leaf = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "depth": 2, "to": captured_seed(&client, "leaf", "graph.py").await? }
-            }),
-        ),
-    )
-    .await?;
-    assert_eq!(symbol_names(&only_leaf), ["leaf"], "{only_leaf}");
-
+    let answer =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    assert_eq!(projected_names(&answer)?, ["leaf", "leaf"]);
     client.cancel().await?;
     Ok(())
 }
 
-/// `query` and an outgoing walk merge as an incoming walk does, and facets filter on
-/// `calls`: `references` has no outgoing lane, so asking for it alone refuses and beside
-/// `calls` it warns.
+/// Retrieval joins calls; unsupported required relationships refuse the complete query.
 #[tokio::test]
 async fn search_traversal_outgoing_merges_with_query_and_filters_on_calls() -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(CALL_GRAPH_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
-
-    let merged = search_after_population(
-        &client,
-        &json!({
-            "query": "branch_a",
-            "target": "symbol",
-            "traversal": { "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["calls"] }
-        }),
-    )
-    .await?;
-    let hit = results(&merged)
-        .into_iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == json!("branch_a"))
-        .ok_or("branch_a must be a hit")?;
-    let matched_by = hit["matched_by"].as_array().ok_or("matched_by")?;
-    assert!(matched_by.contains(&json!("name")), "{hit}");
-    assert!(matched_by.contains(&json!("relationship")), "{hit}");
-    assert!(merged["warnings"].is_null(), "{merged}");
-
-    let warned = search_after_population(
-        &client,
-        &json!({
-            "traversal": {
-                "seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["references", "calls"]
-            }
-        }),
-    )
-    .await?;
-    assert_eq!(symbol_names(&warned), ["branch_a", "branch_b"], "{warned}");
-    assert_eq!(
-        warned["warnings"][0]["code"],
-        json!("relationship_coverage_missing")
+    let seed = captured_seed(&client, "root", "graph.py").await?;
+    let statement = format!(
+        "SELECT DISTINCT ?symbol ?name {{ SERVICE :search {{ ?hit :query 'branch_a'; :target 'symbol'; :symbol ?symbol }} <{seed}> :calls ?symbol . ?symbol :name ?name FILTER(?name = 'branch_a') }} ORDER BY ?name"
     );
-    assert_eq!(warned["warnings"][0]["facets"], json!(["references"]));
-
-    let code = refusal_code(
-        &client,
-        &json!({"traversal": {"seed": captured_seed(&client, "root", "graph.py").await?, "direction": "outgoing", "facets": ["references"]}}),
-    )
-    .await?;
-    assert_eq!(code, ErrorCode::CapabilityUnavailable);
-
+    let request = serde_json::from_value(json!({"query":statement}))?;
+    let answer = workspace_client::search_after_population(&client, &request).await?;
+    assert_eq!(projected_names(&answer)?, ["branch_a"]);
+    let request = serde_json::to_value(query::path(&seed, "(:calls|:implements)")?)?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+    let request = serde_json::to_value(query::path(&seed, ":implements")?)?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
     client.cancel().await?;
     Ok(())
 }
 
-/// With `[global] enabled = false`, a standard library callee (`len`, answered in ty's
-/// vendored `builtins.pyi`) is named by no declaration, so its edge drops, the answer counts
-/// it in `callees_dropped` beside the warning naming the global API off, and the project
-/// callee stays; a class seed answers the calls in its own body alone (`counted`, not
-/// `root_call` inside `grow`).
+/// A missing required runtime contribution refuses; class calls still use their own body.
 #[tokio::test]
 async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_class_body()
 -> TestResult {
     let (_directory, client, _server_task) =
         served_workspace(OUTGOING_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
-
-    let counted = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
-                }
-            }),
-        ),
-    )
-    .await?;
-    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
-    let warnings = counted["warnings"]
-        .as_array()
-        .ok_or("a dropped callee warns")?;
-    assert_eq!(warnings.len(), 2, "{counted}");
-    assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
-    assert_eq!(warnings[0]["callees"], json!(1), "{counted}");
-    assert_eq!(
-        warnings[1],
-        json!({"code": "global_access_disabled"}),
-        "{counted}"
-    );
-
-    let holder = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "Holder", "extra.py").await?, "direction": "outgoing"
-                }
-            }),
-        ),
-    )
-    .await?;
-    assert_eq!(symbol_names(&holder), ["counted"], "{holder}");
-    assert!(
-        holder["warnings"].is_null(),
-        "every callee the class body names is in the project: {holder}"
-    );
-
+    let seed = captured_seed(&client, "counted", "extra.py").await?;
+    let request = serde_json::to_value(query::path(&seed, ":calls")?)?;
+    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+    let seed = captured_seed(&client, "Holder", "extra.py").await?;
+    let answer = graph(&client, &seed, ":calls").await?;
+    assert_eq!(projected_names(&answer)?, ["counted"]);
     client.cancel().await?;
     Ok(())
+}
+
+fn name_arguments(name: &str) -> Value {
+    let name = oxigraph::model::Literal::from(name);
+    json!({"query":format!("SELECT ?symbol ?name {{ ?symbol :name ?name FILTER(?name = {name}) }} ORDER BY ?symbol")})
+}
+
+fn path_arguments(seed: &str, direction: &str) -> TestResult<Value> {
+    let expression = match direction {
+        "incoming" => "^:references",
+        "outgoing" => ":calls",
+        _ => return Err("fixture direction must be incoming or outgoing".into()),
+    };
+    Ok(serde_json::to_value(query::path(seed, expression)?)?)
+}
+
+async fn graph(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    seed: &str,
+    expression: &str,
+) -> TestResult<Value> {
+    let request = serde_json::to_value(query::path(seed, expression)?)?;
+    call_retrying_acceptance(client, tool_request("search", &request)).await
 }
 
 /// Once the engine reads ready, an empty prepare at the seed refuses, naming the seed's
@@ -1261,35 +1176,22 @@ async fn search_traversal_outgoing_from_a_seed_without_a_call_hierarchy_item_ref
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "Beacon"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("Beacon"))).await?;
 
-    let failure = failed_call(
-        client
-            .call_tool(tool_request(
-                "search",
-                &json!({
-                    "traversal": { "seed": captured_seed(&client, "Beacon", "lib.rs").await?, "direction": "outgoing" }
-                }),
-            ))
-            .await,
+    let request = path_arguments(
+        &captured_seed(&client, "Beacon", "lib.rs").await?,
+        "outgoing",
     )?;
+    let failure = failed_call(client.call_tool(tool_request("search", &request)).await)?;
     assert_eq!(
         failure.code,
-        ErrorCode::CapabilityUnavailable,
+        ErrorCode::TemporarilyUnavailable,
         "{failure:?}"
     );
-    assert!(failure.message.contains("of kind `struct`"), "{failure:?}");
-
-    let code = refusal_code(
-        &client,
-        &json!({
-            "change": {"base": "baseline"},
-            "traversal": {"seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"}
-        }),
-    )
-    .await?;
-    assert_eq!(code, ErrorCode::CapabilityUnavailable);
-
+    assert!(
+        failure.text.contains("prepared no call hierarchy item"),
+        "{failure:?}"
+    );
     client.cancel().await?;
     Ok(())
 }
@@ -1332,10 +1234,7 @@ async fn search_traversal_over_an_engine_that_announces_nothing_warns_readiness_
     ] {
         let structured = call_retrying_acceptance(
             &client,
-            tool_request(
-                "search",
-                &json!({"traversal": {"seed": seed, "direction": direction}}),
-            ),
+            tool_request("search", &path_arguments(&seed, direction)?),
         )
         .await?;
         assert_eq!(symbol_names(&structured), [reached], "{structured}");
@@ -1374,36 +1273,13 @@ async fn search_traversal_over_an_unmappable_engine_answer_warns_in_both_directi
             "incoming",
         ),
     ] {
-        let structured = call_retrying_acceptance(
-            &client,
-            tool_request(
-                "search",
-                &json!({"traversal": {"seed": seed, "direction": direction}}),
-            ),
-        )
-        .await?;
-        assert!(results(&structured).is_empty(), "{structured}");
-        let warnings = structured["warnings"]
-            .as_array()
-            .ok_or("the dropped contribution warns")?;
-        assert_eq!(warnings.len(), 1, "{structured}");
-        assert_eq!(
-            warnings[0]["code"],
-            json!("engine_analysis_unavailable"),
-            "{structured}"
-        );
-        assert_eq!(warnings[0]["language"], json!("rust"), "{structured}");
-        let operation = if direction == "outgoing" {
-            "engine calls"
-        } else {
-            "engine references"
-        };
-        assert_eq!(
-            warnings[0]["detail"],
-            json!(format!(
-                "the addressed content exists but its bytes cannot be served: operation {operation}, detail position line 50 is outside document line count 6"
-            )),
-            "the engine answer is outside the served document: {structured}"
+        let request = path_arguments(&seed, direction)?;
+        let failure = failed_call(client.call_tool(tool_request("search", &request)).await)?;
+        assert!(
+            failure
+                .text
+                .contains("position line 50 is outside document line count 6"),
+            "{failure:?}"
         );
     }
 
@@ -1476,12 +1352,16 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("beacon"))).await?;
     let walk = tool_request(
         "search",
-        &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
+        &path_arguments(
+            &captured_seed(&client, "beacon", "lib.rs").await?,
+            "incoming",
+        )?,
     );
 
+    let started = std::time::Instant::now();
     let refused = failed_call(client.call_tool(walk.clone()).await)?;
     assert_eq!(
         refused.code,
@@ -1489,17 +1369,12 @@ async fn search_traversal_refused_at_the_request_deadline_keeps_the_engine() -> 
         "{refused:?}"
     );
     assert_eq!(refused.retry, RetryDirective::SameRequest, "{refused:?}");
-    assert!(
-        refused.message.contains("request deadline exceeded"),
-        "{}",
-        refused.message
-    );
-
-    let structured = call_retrying_acceptance(&client, walk).await?;
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    let refused = failed_call(client.call_tool(walk).await)?;
     assert_eq!(
-        structured["warnings"][0]["code"],
-        json!("engine_analysis_unavailable"),
-        "{structured}"
+        refused.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{refused:?}"
     );
     client.cancel().await?;
     let recorded = std::fs::read_to_string(&log)?;
@@ -1565,10 +1440,13 @@ async fn search_traversal_refused_while_the_engine_starts_keeps_the_start() -> T
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("beacon"))).await?;
     let walk = tool_request(
         "search",
-        &json!({"traversal": {"seed": captured_seed(&client, "beacon", "lib.rs").await?}}),
+        &path_arguments(
+            &captured_seed(&client, "beacon", "lib.rs").await?,
+            "incoming",
+        )?,
     );
 
     let refused = failed_call(client.call_tool(walk.clone()).await)?;
@@ -1579,11 +1457,11 @@ async fn search_traversal_refused_while_the_engine_starts_keeps_the_start() -> T
     );
     assert_eq!(refused.retry, RetryDirective::SameRequest, "{refused:?}");
 
-    let structured = call_retrying_acceptance(&client, walk).await?;
+    let refused = failed_call(client.call_tool(walk).await)?;
     assert_eq!(
-        structured["warnings"][0]["code"],
-        json!("engine_analysis_unavailable"),
-        "{structured}"
+        refused.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{refused:?}"
     );
     client.cancel().await?;
     let recorded = std::fs::read_to_string(&log)?;
@@ -1642,35 +1520,21 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
         Some(configuration),
     )
     .await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "caller"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("caller"))).await?;
     let started_lines = || std::fs::read_to_string(&starts).map_or(0, |text| text.lines().count());
     let mut starts_after = Vec::new();
     for _walk in 0..2 {
         let started = std::time::Instant::now();
-        let structured = call_retrying_acceptance(
-            &client,
-            tool_request(
-                "search",
-                &json!({"traversal": {
-                    "seed": captured_seed(&client, "caller", "lib.rs").await?, "direction": "outgoing"
-                }}),
-            ),
-        )
-        .await?;
+        let request = path_arguments(
+            &captured_seed(&client, "caller", "lib.rs").await?,
+            "outgoing",
+        )?;
+        let failure = failed_call(client.call_tool(tool_request("search", &request)).await)?;
         let elapsed = started.elapsed();
-        eprintln!("outgoing walk: elapsed={elapsed:?} answer={structured}");
-        assert!(results(&structured).is_empty(), "{structured}");
-        let warning = &structured["warnings"][0];
         assert_eq!(
-            warning["code"],
-            json!("engine_analysis_unavailable"),
-            "{structured}"
-        );
-        assert!(
-            warning["detail"]
-                .as_str()
-                .is_some_and(|detail| detail.contains("readiness_timeout")),
-            "{structured}"
+            failure.code,
+            ErrorCode::TemporarilyUnavailable,
+            "{failure:?}"
         );
         assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
         starts_after.push(started_lines());
@@ -1691,7 +1555,7 @@ async fn search_traversal_outgoing_past_the_readiness_timeout_warns_and_keeps_th
 #[tokio::test]
 async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult {
     let (_directory, client, _server_task) = served_workspace(ENGINELESS_FILES, None).await?;
-    call_retrying_acceptance(&client, tool_request("search", &json!({"query": "beacon"}))).await?;
+    call_retrying_acceptance(&client, tool_request("search", &name_arguments("beacon"))).await?;
 
     let failure = failed_call(
         client
@@ -1746,47 +1610,41 @@ async fn declaration_requests(fixture: &global_api::GlobalFixture) -> Vec<Value>
         .collect()
 }
 
-/// The hit whose symbol `name` names, with its identity, unit, and the edge reaching it.
+/// The projected row naming one reached canonical declaration.
 fn callee_hit(structured: &Value, name: &str) -> TestResult<Value> {
-    results(structured)
-        .into_iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == json!(name))
-        .ok_or_else(|| format!("{name} must be a hit: {structured}").into())
+    query::rows(structured)?
+        .iter()
+        .find(|row| query::literal(row, "name").ok() == Some(name))
+        .cloned()
+        .ok_or_else(|| format!("{name} must be a projected symbol: {structured}").into())
 }
 
 async fn read_dependency_hit(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    hit: &Value,
-) -> TestResult {
-    let selected = &hit["view"];
+    answer: &Value,
+    name: &str,
+) -> TestResult<Value> {
+    let row = callee_hit(answer, name)?;
+    let identity = query::iri(&row, "symbol")?;
+    let selected = &answer["view"];
     let symbol = call_retrying_acceptance(
         client,
         tool_request(
             "get_symbol",
             &json!({
-                "id":hit["hit"]["symbol"]["id"], "view":selected["id"],
-                "include":["source"]
+                "id":identity,"view":selected["id"],"include":["source"]
             }),
         ),
     )
     .await?;
     assert_eq!(symbol["outcome"], "found", "{symbol}");
     assert_eq!(symbol["view"], *selected, "{symbol}");
-    assert_eq!(symbol["declarations"][0]["unit"], hit["unit"], "{symbol}");
-    assert!(
-        symbol["declarations"][0]["source"]
-            .as_str()
-            .is_some_and(|source| source.starts_with("def greet(")),
-        "{symbol}"
-    );
+    let unit = symbol["declarations"][0]["unit"]
+        .as_str()
+        .ok_or("dependency declaration source unit")?;
     let source = call_retrying_acceptance(
         client,
-        tool_request(
-            "get_source",
-            &json!({
-                "unit":hit["unit"], "view":selected["id"]
-            }),
-        ),
+        tool_request("get_source", &json!({"unit":unit,"view":selected["id"]})),
     )
     .await?;
     assert_eq!(source["outcome"], "found", "{source}");
@@ -1796,26 +1654,27 @@ async fn read_dependency_hit(
         global_api::GREETING_SOURCE,
         "{source}"
     );
-    Ok(())
+    Ok(symbol)
 }
 
 async fn held_dependency_graph(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    mut request: Value,
     original: &Value,
-    endpoint: &str,
 ) -> TestResult {
-    request["view"] = original["view"]["id"].clone();
-    let held = client.call_tool(tool_request("search", &request)).await?;
-    assert_ne!(held.is_error, Some(true), "{held:?}");
-    let body = held.structured_content.ok_or("held traversal result")?;
-    assert_eq!(&body, original, "captured graph and hit views stay fixed");
-    let greet = callee_hit(&body, "greet")?;
-    let meta = held.meta.ok_or("held dependency backend")?;
-    assert_eq!(meta.get("backend"), Some(&json!("global")));
-    assert_eq!(meta.get("root"), Some(&json!(endpoint)));
-    assert_eq!(meta.get("view"), Some(&greet["view"]));
-    read_dependency_hit(client, &greet).await
+    let view = original["view"]["id"]
+        .as_str()
+        .ok_or("retained dependency execution")?;
+    let statement = format!(
+        "SELECT ?symbol ?name {{ SERVICE <{}{view}> {{}} }} ORDER BY ?name",
+        rift_search::sparql::RESULT_SERVICE_PREFIX
+    );
+    let held =
+        call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    assert_eq!(held["answer"], original["answer"]);
+    assert_eq!(held["view"]["expires_at"], original["view"]["expires_at"]);
+    read_dependency_hit(client, original, "greet").await?;
+    Ok(())
 }
 
 /// A standard library callee's position goes to the global API as `stdlib/python` at the
@@ -1837,41 +1696,39 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         &client,
         tool_request(
             "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
-                }
-            }),
+            &path_arguments(
+                &captured_seed(&client, "counted", "extra.py").await?,
+                "outgoing",
+            )?,
         ),
     )
     .await?;
     assert_eq!(symbol_names(&counted), ["leaf", "len"], "{counted}");
     let len = callee_hit(&counted, "len")?;
     let id = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
-    assert_eq!(len["hit"]["symbol"]["id"], json!(id), "{len}");
-    assert_eq!(len["hit"]["symbol"]["kind"], json!("function"), "{len}");
+    assert_eq!(query::iri(&len, "symbol")?, id);
+    let exact = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({
+                "id":id,"view":counted["view"]["id"],"include":["source"]
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(exact["symbol"]["kind"], "function");
     assert_eq!(
-        len["hit"]["symbol"]["origin"],
+        exact["symbol"]["origin"],
         json!({
-            "location": "stdlib", "source_kind": "authored",
-            "runtime": {"runtime": "cpython", "version": global_api::python_runtime::VERSION}
-        }),
-        "{len}"
+            "location":"stdlib","source_kind":"authored",
+            "runtime":{"runtime":"cpython","version":global_api::python_runtime::VERSION}
+        })
     );
     assert_eq!(
-        len["unit"],
-        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0])),
-        "{len}"
+        exact["declarations"][0]["unit"],
+        global_api::named_unit(&global_api::NAMED_POSITIONS[0])
     );
-    assert!(len["path"].is_null() && len["range"].is_null(), "{len}");
-    assert_eq!(len["distance"], json!(1), "{len}");
-    let hop = &len["traversal_path"][0]["relationship"];
-    assert_eq!(
-        hop["from"],
-        json!(captured_seed(&client, "counted", "extra.py").await?)
-    );
-    assert_eq!(hop["to"], json!(id), "{len}");
-    assert_eq!(hop["facets"], json!(["calls"]), "{len}");
     assert!(counted["warnings"].is_null(), "{counted}");
 
     let requests = declaration_requests(&fixture).await;
@@ -1945,66 +1802,88 @@ const INSTALLED_FILES: &[(&str, &str)] = &[
     ),
 ];
 
-/// A dependency callee's file below the package's import folder in `.venv` addresses the
-/// package at its locked version, at its installed path, so the global API names `greet`;
-/// `quiet`, a position it answers no declaration at, drops and is counted.
+/// A capable admitted engine continues beyond a package entry when global operations
+/// explicitly report unsupported capabilities.
 #[cfg(unix)]
 #[tokio::test]
-async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answered_none()
--> TestResult {
+async fn search_query_continues_three_calls_through_an_installed_dependency() -> TestResult {
+    let fixture = global_api::GlobalFixture::start_with(global_api::FixtureOptions {
+        python_collection: true,
+        withheld_features: &["declarations", "relationships"],
+        ..global_api::FixtureOptions::default()
+    })
+    .await?;
+    let source = "def greet(name: str) -> str:\n    return _helper(name)\n\ndef _helper(name: str) -> str:\n    return _inner(name)\n\ndef _inner(name: str) -> str:\n    return name\n";
+    let files = INSTALLED_FILES.iter().map(|(path, original)| (*path, match *path {
+        "app.py" => "from greeting.core import greet\n\ndef hello() -> str:\n    return greet('rift')\n",
+        ".venv/lib/python3.12/site-packages/greeting/core.py" => source,
+        _ => *original,
+    })).collect::<Vec<_>>();
+    let configuration = format!(
+        "[source]\nexclude = [\".venv/**\"]\n\n{}\n{OUTGOING_ENGINE}",
+        global_table(&fixture.endpoint)
+    );
+    let (directory, client, _server_task) = served_workspace(&files, Some(configuration)).await?;
+    let seed = captured_seed(&client, "hello", "app.py").await?;
+    let answer = graph(&client, &seed, ":calls/:calls/:calls").await?;
+    assert_eq!(projected_names(&answer)?, ["_inner"]);
+    let row = &query::rows(&answer)?[0];
+    let identity = query::iri(row, "symbol")?;
+    let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
+    assert!(
+        matches!(parsed.owner(), rift_protocol::identity::SymbolOwner::Package { manager, registry, name, version } if manager == "pypi" && registry == "pypi.org" && name == "greeting" && version == "1.0.0")
+    );
+    let view = answer["view"]["id"]
+        .as_str()
+        .ok_or("retained dependency execution")?;
+    let exact = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({"id":identity,"view":view,"include":["source"]}),
+        ),
+    )
+    .await?;
+    assert_eq!(exact["symbol"]["name"], "_inner");
+    let unit = exact["declarations"][0]["unit"]
+        .as_str()
+        .ok_or("retained dependency source unit")?;
+    let path = directory
+        .path()
+        .join(".venv/lib/python3.12/site-packages/greeting/core.py");
+    std::fs::write(&path, source.replace("_inner", "_changed"))?;
+    let retained = call_retrying_acceptance(
+        &client,
+        tool_request("get_source", &json!({"unit":unit,"view":view})),
+    )
+    .await?;
+    assert_eq!(retained["source"]["text"], source);
+    let changed = graph(&client, &seed, ":calls/:calls/:calls").await?;
+    assert_eq!(projected_names(&changed)?, ["_changed"]);
+    assert!(declaration_requests(&fixture).await.is_empty());
+    client.cancel().await?;
+    Ok(())
+}
+
+/// One unnamed required dependency callee refuses the complete query. A complete
+/// sibling query retains the named declaration, exact package owner and original bytes.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_query_refuses_an_unnamed_required_dependency_callee() -> TestResult {
     let fixture = python_global_api().await?;
     let configuration = format!(
         "[source]\nexclude = [\".venv/**\"]\n\n{}\n{OUTGOING_ENGINE}",
         global_table(&fixture.endpoint)
     );
     let (_directory, client, _server_task) =
-        served_workspace(INSTALLED_FILES, Some(configuration)).await?;
-
-    let request = json!({"include":["source"], "limit":1,
-        "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
-    });
-    let hello = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
-    held_dependency_graph(&client, request, &hello, &fixture.endpoint).await?;
-    assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
-    let greet = callee_hit(&hello, "greet")?;
-    read_dependency_hit(&client, &greet).await?;
-    assert_eq!(
-        greet["hit"]["symbol"]["id"],
-        json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),
-        "{greet}"
-    );
-    assert_eq!(greet["hit"]["symbol"]["kind"], json!("function"), "{greet}");
-    assert_eq!(
-        greet["hit"]["symbol"]["origin"],
-        json!({
-            "location": "dependency",
-            "package": {"manager": "pypi", "registry": "pypi.org", "name": "greeting", "version": "1.0.0"},
-            "source_kind": "authored"
-        }),
-        "{greet}"
-    );
-    assert_eq!(
-        greet["unit"],
-        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[1])),
-        "{greet}"
-    );
-    let warnings = hello["warnings"]
-        .as_array()
-        .ok_or("a dropped callee warns")?;
-    assert_eq!(
-        warnings.as_slice(),
-        [json!({
-            "code": "callees_dropped",
-            "callees": 1,
-            "detail": "the language engine named callees outside the project and every \
-                       installed package, or at a position the global index answered no \
-                       declaration at, so the walk carries no edge to them"
-        })],
-        "{hello}"
-    );
-
+        served_workspace(INSTALLED_FILES, Some(configuration.clone())).await?;
+    let request = path_arguments(
+        &captured_seed(&client, "hello", "app.py").await?,
+        "outgoing",
+    )?;
+    required_facts_unavailable(&client, &request, ErrorCode::TemporarilyUnavailable).await?;
     let requests = declaration_requests(&fixture).await;
-    let mut asked: Vec<(String, u64)> = requests
+    let mut asked = requests
         .iter()
         .flat_map(|request| request["positions"].as_array().cloned().unwrap_or_default())
         .map(|position| {
@@ -2013,18 +1892,35 @@ async fn search_traversal_outgoing_names_a_dependency_callee_and_counts_one_answ
                 position["line"].as_u64().unwrap_or(u64::MAX),
             )
         })
-        .collect();
+        .collect::<Vec<_>>();
     asked.sort();
     assert_eq!(
         asked,
         [
             (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 0),
-            (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 4),
-        ],
-        "each callee's position at its installed path, in one request: {requests:?}"
+            (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 4)
+        ]
     );
-    assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
+    assert_eq!(requests.len(), 1);
+    client.cancel().await?;
 
+    let files = INSTALLED_FILES.iter().map(|(path, source)| (*path, if *path == "app.py" {
+        "from greeting.core import greet\n\ndef hello() -> str:\n    return greet('rift')\n"
+    } else { *source })).collect::<Vec<_>>();
+    let (_directory, client, _server_task) = served_workspace(&files, Some(configuration)).await?;
+    let seed = captured_seed(&client, "hello", "app.py").await?;
+    let answer = graph(&client, &seed, ":calls").await?;
+    assert_eq!(projected_names(&answer)?, ["greet"]);
+    let row = callee_hit(&answer, "greet")?;
+    assert_eq!(
+        query::iri(&row, "symbol")?,
+        global_api::named_identity(&global_api::NAMED_POSITIONS[1])
+    );
+    let exact = read_dependency_hit(&client, &answer, "greet").await?;
+    assert_eq!(exact["symbol"]["kind"], "function");
+    assert_eq!(exact["symbol"]["origin"]["location"], "dependency");
+    assert_eq!(exact["symbol"]["origin"]["package"]["version"], "1.0.0");
+    held_dependency_graph(&client, &answer).await?;
     client.cancel().await?;
     Ok(())
 }
@@ -2050,14 +1946,15 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
     );
     let mut before: Vec<(&str, &str)> = INSTALLED_FILES
         .iter()
-        .copied()
+        .map(|(path, source)| (*path, if *path == "app.py" { "from greeting.core import greet\n\ndef hello() -> str:\n    return greet('rift')\n" } else { *source }))
         .filter(|(path, _)| !installed_after(path))
         .collect();
     before.push((".venv/lib/python3.12/site-packages/_virtualenv.py", ""));
     let (directory, client, _server_task) = served_workspace(&before, Some(configuration)).await?;
-    let walk = json!({
-        "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
-    });
+    let walk = path_arguments(
+        &captured_seed(&client, "hello", "app.py").await?,
+        "outgoing",
+    )?;
 
     let first = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
     assert!(
@@ -2077,25 +1974,19 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
     assert_eq!(symbol_names(&second), ["greet"], "{second}");
     let greet = callee_hit(&second, "greet")?;
     assert_eq!(
-        greet["hit"]["symbol"]["id"],
-        json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),
-        "{greet}"
+        query::iri(&greet, "symbol")?,
+        global_api::named_identity(&global_api::NAMED_POSITIONS[1])
     );
-    assert_eq!(
-        greet["hit"]["symbol"]["origin"]["location"],
-        json!("dependency"),
-        "{greet}"
-    );
+    let exact = read_dependency_hit(&client, &second, "greet").await?;
+    assert_eq!(exact["symbol"]["origin"]["location"], "dependency");
 
     client.cancel().await?;
     Ok(())
 }
 
-/// A global API that refuses the connection names no callee: every package callee drops,
-/// and the answer carries the typed warning naming the failure.
+/// An unavailable global API refuses the required dependency contribution.
 #[tokio::test]
-async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_callees()
--> TestResult {
+async fn search_query_refuses_an_unavailable_required_global_api() -> TestResult {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     drop(listener);
@@ -2110,44 +2001,23 @@ async fn search_traversal_outgoing_over_an_unavailable_global_api_drops_package_
     )
     .await?;
 
-    let counted = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
-                }
-            }),
-        ),
-    )
-    .await?;
-    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
-    let codes: Vec<&Value> = counted["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|warning| &warning["code"])
-        .collect();
-    assert_eq!(
-        codes,
-        [&json!("callees_dropped"), &json!("global_api_unavailable")],
-        "{counted}"
-    );
+    let request = path_arguments(
+        &captured_seed(&client, "counted", "extra.py").await?,
+        "outgoing",
+    )?;
+    required_facts_unavailable(&client, &request, ErrorCode::TemporarilyUnavailable).await?;
 
     client.cancel().await?;
     Ok(())
 }
 
-/// A global API whose capabilities leave out the declarations feature names no callee:
-/// every package callee drops, the answer names the feature the global API lacks, and no
-/// declarations request is sent.
+/// Explicitly unsupported global operations permit the independently admitted runtime
+/// source and its capable local engine. No declaration request is sent.
 #[tokio::test]
-async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_package_callees()
--> TestResult {
+async fn search_query_uses_admitted_runtime_when_global_operations_are_unsupported() -> TestResult {
     let fixture = global_api::GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
-        withheld_features: &["declarations"],
+        withheld_features: &["declarations", "relationships"],
         ..global_api::FixtureOptions::default()
     })
     .await?;
@@ -2163,24 +2033,19 @@ async fn search_traversal_outgoing_over_a_global_api_without_declarations_drops_
         &client,
         tool_request(
             "search",
-            &json!({
-                "traversal": {
-                    "seed": captured_seed(&client, "counted", "extra.py").await?, "direction": "outgoing"
-                }
-            }),
+            &path_arguments(
+                &captured_seed(&client, "counted", "extra.py").await?,
+                "outgoing",
+            )?,
         ),
     )
     .await?;
-    assert_eq!(symbol_names(&counted), ["leaf"], "{counted}");
-    let warnings = &counted["warnings"];
-    assert_eq!(warnings[0]["code"], json!("callees_dropped"), "{counted}");
-    assert_eq!(
-        warnings[1]["warning_code"],
-        json!("capability_unavailable"),
-        "{counted}"
+    assert_eq!(projected_names(&counted)?, ["leaf", "len"]);
+    let row = callee_hit(&counted, "len")?;
+    let identity = rift_protocol::identity::SymbolIdentity::parse(query::iri(&row, "symbol")?)?;
+    assert!(
+        matches!(identity.owner(), rift_protocol::identity::SymbolOwner::Runtime { runtime, .. } if runtime == "cpython")
     );
-    let detail = warnings[1]["detail"].as_str().unwrap_or_default();
-    assert!(detail.contains("`declarations`"), "{counted}");
     assert!(declaration_requests(&fixture).await.is_empty());
 
     client.cancel().await?;
@@ -2239,17 +2104,18 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
         &client,
         tool_request(
             "search",
-            &json!({
-                "traversal": { "seed": captured_seed(&client, "hello", "app.py").await?, "direction": "outgoing" }
-            }),
+            &path_arguments(
+                &captured_seed(&client, "hello", "app.py").await?,
+                "outgoing",
+            )?,
         ),
     )
     .await?;
     assert_eq!(symbol_names(&hello), ["greet"], "{hello}");
     let greet = callee_hit(&hello, "greet")?;
     assert_eq!(
-        greet["hit"]["symbol"]["id"],
-        json!(global_api::named_identity(&global_api::NAMED_POSITIONS[1])),
+        query::iri(&greet, "symbol")?,
+        global_api::named_identity(&global_api::NAMED_POSITIONS[1]),
         "{greet}"
     );
     let requests = declaration_requests(&fixture).await;
@@ -2268,6 +2134,36 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
     Ok(())
 }
 
+/// Required facts may be refused at provider acquisition or by captured selection coverage.
+async fn required_facts_unavailable(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: &Value,
+    expected_wire_code: ErrorCode,
+) -> TestResult {
+    let result = client.call_tool(tool_request("search", arguments)).await?;
+    if result.is_error == Some(true) {
+        let failure = workspace_client::tool_failure(&result)?;
+        assert_eq!(failure.code, expected_wire_code, "{failure:?}");
+        return Ok(());
+    }
+    let body = result
+        .structured_content
+        .ok_or("typed query unavailability")?;
+    let answer: rift_protocol::query::QueryReadResult = serde_json::from_value(body.clone())?;
+    let rift_protocol::query::QueryReadResult::Unavailable(
+        rift_protocol::search_read::SearchUnavailable::Unavailable { reason, .. },
+    ) = answer
+    else {
+        return Err(format!("required facts must refuse complete query: {body}").into());
+    };
+    assert_eq!(
+        reason,
+        rift_protocol::symbol_read::SymbolUnavailableReason::InsufficientCoverage,
+        "{body}"
+    );
+    Ok(())
+}
+
 /// The `code` the server refuses `arguments` with.
 async fn refusal_code(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -2276,20 +2172,75 @@ async fn refusal_code(
     Ok(failed_call(client.call_tool(tool_request("search", arguments)).await)?.code)
 }
 
-fn results(structured: &Value) -> Vec<Value> {
-    structured["results"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+fn symbol_names(structured: &Value) -> Vec<String> {
+    projected_names(structured).expect("fixture query projects endpoint names")
 }
 
-/// Every symbol hit's `name`, sorted, so a walk's discovery order never makes an assertion
-/// flaky.
-fn symbol_names(structured: &Value) -> Vec<String> {
-    let mut names: Vec<String> = results(structured)
-        .iter()
-        .filter_map(|hit| hit["hit"]["symbol"]["name"].as_str().map(str::to_owned))
-        .collect();
-    names.sort();
-    names
+/// Missing offline Cargo metadata leaves local facts usable and preserves its typed
+/// failure when the engine requires a foreign source owner.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_query_keeps_local_rust_facts_when_cargo_metadata_is_unavailable() -> TestResult {
+    let progress = r#"frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"ready","value":{"kind":"begin","title":"analysis"}}}'
+frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"ready","value":{"kind":"end"}}}'"#;
+    let script = fake_engine::SCRIPTED_CALLS_ENGINE
+        .replace("PROGRESS", progress)
+        .replace("CALLEE_LINE", "0")
+        .replace("CALLER_LINE", "3");
+    let (engine, mut configuration) = fake_engine::rust_engine(&script)?;
+    let tools = engine.path().join("bin");
+    std::fs::create_dir(&tools)?;
+    for (name, target) in [
+        ("sh", "/bin/sh"),
+        ("dd", "/bin/dd"),
+        ("grep", "/usr/bin/grep"),
+        ("head", "/usr/bin/head"),
+        ("tr", "/usr/bin/tr"),
+        ("cut", "/usr/bin/cut"),
+        ("cat", "/bin/cat"),
+    ] {
+        std::os::unix::fs::symlink(target, tools.join(name))?;
+    }
+    let marker = engine.path().join("caller-uri");
+    std::fs::write(&marker, "")?;
+    let script = script.replace(
+        "caller_uri=${CALLER_URI:-$uri}",
+        &format!(
+            "caller_uri=$(cat '{}')\n  caller_uri=${{caller_uri:-$uri}}",
+            marker.display()
+        ),
+    );
+    std::fs::write(engine.path().join("engine.sh"), script)?;
+    configuration.push_str(&format!(
+        "[languages.rust.lsp.environment]\nPATH={}\n",
+        serde_json::to_string(&tools)?
+    ));
+    let lock = "version=4\n[[package]]\nname='helper'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n";
+    let source = "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n";
+    let (_directory, client, _server_task) = served_workspace(
+        &[
+            ("Cargo.toml", RUST_LIBRARY),
+            ("Cargo.lock", lock),
+            ("lib.rs", source),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let seed = captured_seed(&client, "beacon", "lib.rs").await?;
+    let arguments = path_arguments(&seed, "incoming")?;
+    let local = call_retrying_acceptance(&client, tool_request("search", &arguments)).await?;
+    assert_eq!(projected_names(&local)?, ["caller"]);
+    std::fs::write(&marker, "file:///unadmitted/lib.rs")?;
+    let failure = failed_call(client.call_tool(tool_request("search", &arguments)).await)?;
+    assert_eq!(failure.code, ErrorCode::TemporarilyUnavailable);
+    assert!(
+        failure.text.contains("Cargo metadata failed"),
+        "{failure:?}"
+    );
+    assert!(
+        failure.text.contains("dependency query source"),
+        "{failure:?}"
+    );
+    client.cancel().await?;
+    Ok(())
 }

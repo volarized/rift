@@ -16,6 +16,7 @@ pub(super) enum SavedRead {
     Search(Box<SavedResponse>),
     Symbol(SavedSymbol),
     Traversal(Box<super::traversal::SavedTraversal>),
+    Query(Box<super::query::SavedQuery>),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -91,6 +92,7 @@ impl RiftMcp {
                 view: saved.response.view,
             },
             SavedRead::Symbol(saved) => saved,
+            SavedRead::Query(saved) => saved.context,
             SavedRead::Traversal(saved) => SavedSymbol {
                 root: saved.root,
                 owner: saved.owner,
@@ -122,6 +124,9 @@ impl RiftMcp {
             &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
         >,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
+        if let Some(result) = self.query_global_symbol(&params, context).await? {
+            return Ok(Json(result));
+        }
         let owner = SymbolIdentity::parse(params.id.as_str())
             .map_err(read_failure)?
             .owner()

@@ -82,7 +82,9 @@ async fn search_symbols(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     args: Value,
 ) -> TestResult<Value> {
-    call_tool(client, "search", args).await
+    let request = serde_json::from_value::<rift_protocol::read::SearchParams>(args)?;
+    let query = workspace_client::query::retrieval(&request)?;
+    call_tool(client, "search", serde_json::to_value(query)?).await
 }
 
 /// The configured package list naming the collected `demo` release. The fixture tables
@@ -150,7 +152,8 @@ async fn refused_global_api_returns_typed_warning_and_no_package_facts() -> Test
     let rendered = serde_json::to_string(warning)?;
     assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     assert!(!rendered.contains("local_beacon"));
-    assert_eq!(answer["results"], json!([]));
+    assert_eq!(answer["outcome"], "unavailable");
+    assert!(answer.get("answer").is_none());
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -785,17 +788,32 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
             "limit": limit,
             "include": ["source", "score"]
         });
-        let answer = call_tool(&client, "search", request).await?;
-        let results = answer["results"]
-            .as_array()
-            .ok_or("search carries results")?;
+        let answer = search_symbols(&client, request).await?;
+        let results = workspace_client::query::rows(&answer)?;
         assert_eq!(results.len(), limit, "{answer:#}");
         for (hit, name) in results.iter().zip(["helper_beacon", "beacon"]) {
-            assert_eq!(hit["hit"]["symbol"]["name"], name, "{answer:#}");
+            assert_eq!(
+                workspace_client::query::literal(hit, "name")?,
+                name,
+                "{answer:#}"
+            );
             let identity = global_api::collected_identity(SymbolFixture::Valid, name);
-            assert_eq!(hit["hit"]["symbol"]["id"], identity, "{answer:#}");
-            assert_eq!(hit["source"], format!("pub fn {name}() {{}}"), "{answer:#}");
-            assert!(hit["score"].is_number(), "{answer:#}");
+            assert_eq!(
+                workspace_client::query::iri(hit, "symbol")?,
+                identity.as_str(),
+                "{answer:#}"
+            );
+            assert_eq!(
+                workspace_client::query::literal(hit, "source")?,
+                format!("pub fn {name}() {{}}"),
+                "{answer:#}"
+            );
+            assert!(
+                workspace_client::query::literal(hit, "score")?
+                    .parse::<f64>()
+                    .is_ok(),
+                "{answer:#}"
+            );
         }
     }
     let requests = search_requests(&fixture).await;
@@ -2307,7 +2325,9 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
     let source = "/// searchHit searchHit searchHit searchHit\npub fn SearchHit() {}\npub fn searchHit() {}\n";
     let (_directory, client, server_task) =
         served_workspace(&[("src/lib.rs", source)], None).await?;
-    let request = json!({"query": "searchHit", "limit": 1, "include": ["source"]});
+    let request = workspace_client::query::retrieval(&serde_json::from_value(json!({
+        "query":"searchHit", "limit":1, "include":["source"]
+    }))?)?;
     let answer = workspace_client::search_after_population(&client, &request).await?;
     assert_eq!(
         answer["results"][0]["hit"]["symbol"]["name"], "searchHit",
@@ -2334,6 +2354,101 @@ async fn test_identifier_case_precedes_documentation_frequency() -> TestResult {
             .as_array()
             .is_some_and(|fields| fields.contains(&json!("documentation"))),
         "{answer:#}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_service_query_view_retains_exact_provider_reads_and_refuses_changed_configuration()
+-> TestResult {
+    let first = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let second = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = |endpoint: &str| {
+        format!(
+            "[global]\nenabled=true\nendpoint={endpoint:?}\nattempts=1\nrequest_timeout='1s'\nconnect_timeout='100ms'\n{DEMO_PACKAGE}"
+        )
+    };
+    let workspace = served_dependent_workspace(Some(&configuration(&first.endpoint))).await?;
+    let (directory, client, server_task) = workspace.served;
+    let parameters =
+        serde_json::from_value(json!({"query":"beacon","scope":"global","include":["source"]}))?;
+    let request = workspace_client::query::retrieval(&parameters)?;
+    let answer = workspace_client::search_after_population(&client, &request).await?;
+    let row = workspace_client::query::rows(&answer)?
+        .first()
+        .ok_or("global projected hit")?;
+    let identity = workspace_client::query::iri(row, "symbol")?.to_owned();
+    let view = answer["view"]["id"]
+        .as_str()
+        .ok_or("query serving view")?
+        .to_owned();
+    assert_ne!(view, "a".repeat(64));
+    let exact = call_tool(
+        &client,
+        "get_symbol",
+        json!({"id":identity,"view":view,"include":["source"]}),
+    )
+    .await?;
+    assert_eq!(exact["outcome"], "found", "{exact}");
+    assert_eq!(exact["view"], answer["view"]);
+    let source = call_tool(
+        &client,
+        "get_source",
+        json!({"unit":COLLECTED_UNIT,"view":view}),
+    )
+    .await?;
+    assert_eq!(source["outcome"], "found", "{source}");
+    assert_eq!(source["view"], answer["view"]);
+    assert!(
+        source["source"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("pub fn beacon()"))
+    );
+    for request in first
+        .requests()
+        .await
+        .iter()
+        .filter(|request| request.uri.contains("/symbols") || request.uri.contains("/source"))
+    {
+        assert_eq!(
+            request.body.as_ref().ok_or("exact request body")?["view"],
+            "a".repeat(64)
+        );
+    }
+    fs::write(
+        directory.path().join("rift.toml"),
+        format!(
+            "{}\n{}",
+            hermetic_search::HERMETIC_TABLES,
+            configuration(&second.endpoint)
+        ),
+    )?;
+    call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({
+                "query":"ASK { ?symbol :name 'local_beacon' }"
+            }),
+        ),
+    )
+    .await?;
+    let refused = call_tool(
+        &client,
+        "get_source",
+        json!({"unit":COLLECTED_UNIT,"view":view}),
+    )
+    .await?;
+    assert_eq!(refused["outcome"], "unavailable", "{refused}");
+    assert_eq!(refused["reason"], "view_context");
+    assert!(
+        !second
+            .requests()
+            .await
+            .iter()
+            .any(|request| request.uri.contains("/source") || request.uri.contains("/symbols"))
     );
     client.cancel().await?;
     server_task.await?;

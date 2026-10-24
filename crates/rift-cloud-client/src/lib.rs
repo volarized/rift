@@ -4,6 +4,7 @@ mod cache;
 pub mod contract;
 mod failure;
 mod pattern;
+pub mod relationships;
 mod response;
 pub mod search;
 mod source;
@@ -293,7 +294,10 @@ pub struct ResponseMeta {
 #[derive(Clone)]
 pub struct GlobalClient {
     inner: Arc<Inner>,
+    request_admission: Option<Arc<RequestAdmission>>,
 }
+
+type RequestAdmission = dyn Fn() -> Result<(), RiftError> + Send + Sync;
 
 /// The name the capabilities flight's waits and holds are recorded under: one
 /// capabilities request at a time, held across the request.
@@ -468,7 +472,19 @@ impl GlobalClient {
                 _cache_entry_reading: cache_entry_reading,
                 config,
             }),
+            request_admission: None,
         })
+    }
+
+    /// Applies request-owned admission before each HTTP attempt, including retries.
+    /// Cached answers keep their existing owner and do not spend an HTTP request.
+    #[must_use]
+    pub fn with_request_admission(
+        mut self,
+        admission: impl Fn() -> Result<(), RiftError> + Send + Sync + 'static,
+    ) -> Self {
+        self.request_admission = Some(Arc::new(admission));
+        self
     }
 
     /// Configured endpoint, normalized as a URL.
@@ -908,6 +924,9 @@ impl GlobalClient {
         span.instrument(async move {
             let mut attempt = 0;
             loop {
+                if let Some(admission) = &self.request_admission {
+                    admission()?;
+                }
                 attempt += 1;
                 let result = timeout_at(
                     deadline,

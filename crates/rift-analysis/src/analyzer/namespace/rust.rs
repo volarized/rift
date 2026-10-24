@@ -747,14 +747,15 @@ pub(super) fn namespace_paths(
 ) -> Result<std::collections::BTreeSet<ProjectPath>, rift_error::RiftError> {
     let mut paths = std::collections::BTreeSet::new();
     let reaches = |path: &str, directory: &str| {
-        selected.iter().any(|selected| {
-            selected.as_str() == path
-                || directory.is_empty()
-                || selected
-                    .as_str()
-                    .strip_prefix(directory)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        })
+        selected.is_empty()
+            || selected.iter().any(|selected| {
+                selected.as_str() == path
+                    || directory.is_empty()
+                    || selected
+                        .as_str()
+                        .strip_prefix(directory)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
     };
     let mut insert = |path: String| -> Result<(), rift_error::RiftError> {
         let Ok(path) = ProjectPath::new(path) else {

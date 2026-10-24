@@ -1,6 +1,8 @@
+mod query;
 mod source;
 mod symbol;
 mod traversal;
+pub(in crate::server) use query::QueryGlobalSelection;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use symbol::SavedRead;
@@ -697,7 +699,7 @@ mod captured_search_startup_tests {
             "query": "beacon", "scope": "local", "include": ["source"]
         }))?;
         let initial = server
-            .search(
+            .discovery_search(
                 super::super::Parameters(params.clone()),
                 rmcp::model::Extensions::default(),
             )
@@ -721,7 +723,7 @@ mod captured_search_startup_tests {
         std::fs::write(directory.path().join("lib.rs"), "pub fn replacement() {}\n")?;
         params.view = Some(view.id.clone());
         let later = server
-            .search(
+            .discovery_search(
                 super::super::Parameters(params.clone()),
                 rmcp::model::Extensions::default(),
             )
@@ -734,7 +736,7 @@ mod captured_search_startup_tests {
         assert_eq!(later, initial);
         params.page_index = 1;
         let page = server
-            .search(
+            .discovery_search(
                 super::super::Parameters(params.clone()),
                 rmcp::model::Extensions::default(),
             )
@@ -749,7 +751,7 @@ mod captured_search_startup_tests {
         params.query = Some("replacement".to_owned());
         assert!(matches!(
             server
-                .search(
+                .discovery_search(
                     super::super::Parameters(params),
                     rmcp::model::Extensions::default()
                 )
@@ -997,7 +999,7 @@ mod tests {
         }))?;
         let failure = assembled
             .server
-            .search(
+            .discovery_search(
                 super::super::Parameters(params),
                 rmcp::model::Extensions::default(),
             )
@@ -1056,7 +1058,7 @@ mod tests {
                 }))?;
                 let direct = assembled
                     .server
-                    .search(
+                    .discovery_search(
                         super::super::Parameters(params),
                         rmcp::model::Extensions::default(),
                     )

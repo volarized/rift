@@ -178,10 +178,11 @@ fn registry_folder(
     package: &LockedPackage,
     availability: PackageAvailability,
 ) -> Option<InstallFolder> {
+    let source = package.source.clone()?;
     let (package, folder) = registry_package(package, availability)?;
     Some(InstallFolder {
         origin: rift_protocol::read::SourceLocation::Dependency { package },
-        location: InstallLocation::CargoRegistry(folder),
+        location: InstallLocation::CargoRegistry { folder, source },
     })
 }
 
@@ -620,11 +621,17 @@ source = \"git+https://github.com/astral-sh/ruff?rev=2b0d21#2b0d210\"
             [
                 (
                     "serde",
-                    &InstallLocation::CargoRegistry("serde-1.0.228".to_owned())
+                    &InstallLocation::CargoRegistry {
+                        folder: "serde-1.0.228".to_owned(),
+                        source: "registry+https://github.com/rust-lang/crates.io-index".to_owned()
+                    }
                 ),
                 (
                     "internal-tool",
-                    &InstallLocation::CargoRegistry("internal-tool-2.0.0".to_owned())
+                    &InstallLocation::CargoRegistry {
+                        folder: "internal-tool-2.0.0".to_owned(),
+                        source: "registry+https://example.test/index".to_owned()
+                    }
                 ),
             ],
             "a registry package records its unpacked folder; a git checkout records none"

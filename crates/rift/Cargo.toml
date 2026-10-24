@@ -60,6 +60,8 @@ windows-sys.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+spargebra.workspace = true
+oxigraph.workspace = true
 rift-tracing = { workspace = true, features = ["fixtures"] }
 axum.workspace = true
 jsonschema.workspace = true

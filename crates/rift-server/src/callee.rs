@@ -30,13 +30,11 @@ use rift_protocol::read::{
 use crate::engine::EnginePool;
 use crate::read::ReadService;
 
+mod cargo;
+
 /// The scheme and authority the embedded ty engine names a typeshed stub by, before the
 /// stub's path below typeshed's `stdlib` folder.
 const VENDORED_STDLIB_PREFIX: &str = "vendored://stdlib/";
-
-/// Most registry source folders below `$CARGO_HOME/registry/src` the roots read. Cargo
-/// keeps one per registry the machine fetched from, so a machine holds a handful.
-const REGISTRY_SOURCES_MAX: usize = 64;
 
 /// Bytes one `typescript` `package.json` may hold before the roots leave it unread.
 const PACKAGE_MANIFEST_BYTES_MAX: u64 = 1 << 20;
@@ -63,9 +61,109 @@ const PACKAGE_MANIFEST_FILE_NAME: &str = "package.json";
 pub struct CalleeRoots {
     packages: Arc<[PackageRoot]>,
     registry_unresolved: bool,
+    registry_unavailable: Option<Arc<RiftError>>,
 }
 
 impl CalleeRoots {
+    pub(crate) fn capture_query_source(
+        &self,
+        callee: &PackageCallee,
+        trees: &[&Path],
+        bytes_max: u64,
+    ) -> Result<PackageCallee, RiftError> {
+        let uri = callee
+            .query_uri()
+            .ok_or_else(|| query_source_error("dependency target has no document URI"))?;
+        let source = if let Some(stub) = uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
+            let path = ProjectPath::new(stub)?;
+            if &path != callee.path() {
+                return query_source_failure(
+                    "runtime source path differs from the selected target",
+                );
+            }
+            let mut captures = trees
+                .iter()
+                .filter_map(|root| crate::embedded::python_standard_library(root, &path));
+            let Some((runtime, source)) = captures.next() else {
+                return query_source_failure("the selected runtime source has no admitted owner");
+            };
+            if captures.any(|other| other != (runtime.clone(), Arc::clone(&source))) {
+                return query_source_failure(
+                    "the selected runtime source has conflicting captured owners",
+                );
+            }
+            let origin = rift_core::SourceLocation::Stdlib {
+                runtime: Some(runtime),
+            };
+            if callee.query_origin().as_ref() != Some(&origin) {
+                return query_source_failure(
+                    "runtime source owner differs from the selected target",
+                );
+            }
+            source
+        } else {
+            let (file, text) = self.capture_query_file(uri, trees, bytes_max)?;
+            if Some(file.origin()) != callee.query_origin().as_ref() {
+                return query_source_failure(
+                    "dependency source owner differs from the selected target",
+                );
+            }
+            Arc::from(text)
+        };
+        if source.len() as u64 > bytes_max {
+            return query_source_failure("dependency source exceeds the accepted byte bound");
+        }
+        if callee
+            .captured_source()
+            .is_some_and(|held| held.as_bytes() != source.as_bytes())
+        {
+            return query_source_failure("dependency source changed during query acquisition");
+        }
+        let mut captured = callee.clone();
+        captured.captured_source = Some(source);
+        Ok(captured)
+    }
+
+    pub(crate) fn capture_query_file(
+        &self,
+        uri: &Uri,
+        trees: &[&Path],
+        bytes_max: u64,
+    ) -> Result<(rift_lsp::uri::PackageFile, String), RiftError> {
+        let Some(EngineAddress::Package(file)) = self.address(trees, uri)? else {
+            return query_source_failure("dependency target has no admitted package source");
+        };
+        let root_uri = file.root().root_uri()?;
+        let root = query_file_path(&root_uri)?;
+        let path = query_file_path(uri)?;
+        let root =
+            fs::canonicalize(&root).map_err(|error| query_source_error(error.to_string()))?;
+        let path =
+            fs::canonicalize(&path).map_err(|error| query_source_error(error.to_string()))?;
+        if !path.starts_with(&root) {
+            return query_source_failure(
+                "dependency source resolves outside its admitted package root",
+            );
+        }
+        let mut source =
+            fs::File::open(&path).map_err(|error| query_source_error(error.to_string()))?;
+        let maximum = bytes_max
+            .checked_add(1)
+            .ok_or_else(|| query_source_error("source byte bound cannot be represented"))?;
+        let mut bytes = Vec::new();
+        source
+            .by_ref()
+            .take(maximum)
+            .read_to_end(&mut bytes)
+            .map_err(|error| query_source_error(error.to_string()))?;
+        if bytes.len() as u64 > bytes_max {
+            return query_source_failure("dependency source exceeds the accepted byte bound");
+        }
+        let text =
+            String::from_utf8(bytes).map_err(|error| query_source_error(error.to_string()))?;
+        Ok((*file, text))
+    }
+
     /// Reads where this machine installed the packages `reads`' dependency context names,
     /// blocking.
     ///
@@ -76,7 +174,7 @@ impl CalleeRoots {
     /// A TypeScript engine adds the `typescript` package its program resolves when an
     /// accepted install folder establishes its owner.
     ///
-    /// The work is one directory listing, one program lookup and at most one ancestor walk
+    /// The work is one program lookup and at most one ancestor walk
     /// per TypeScript engine, and one pass over the context's install folders, which the
     /// context bounds.
     #[must_use]
@@ -94,19 +192,19 @@ impl CalleeRoots {
             index_root,
             engine_roots: &engine_roots,
         };
-        let registries = registry_sources(cargo_home().as_deref());
         let mut packages: Vec<PackageRoot> = context
             .install_folders()
-            .flat_map(|folder| folder_roots(folder, &registries, spellings))
+            .flat_map(|folder| folder_roots(folder, spellings))
             .collect();
         packages.extend(engine_typescript_roots(engines, &packages));
         packages.sort_by(|left, right| root_order(left).cmp(&root_order(right)));
         packages.dedup();
         Self {
             packages: packages.into(),
+            registry_unavailable: None,
             registry_unresolved: context
                 .install_folders()
-                .any(|folder| matches!(folder.location, InstallLocation::CargoRegistry(_))),
+                .any(|folder| matches!(folder.location, InstallLocation::CargoRegistry { .. })),
         }
     }
 
@@ -115,6 +213,7 @@ impl CalleeRoots {
     pub(crate) fn from_packages(packages: Vec<PackageRoot>) -> Self {
         Self {
             packages: packages.into(),
+            registry_unavailable: None,
             registry_unresolved: false,
         }
     }
@@ -144,8 +243,39 @@ impl CalleeRoots {
                 Err(error) => return error.fail(),
             }
         }
+        if let Some(source) = &self.registry_unavailable {
+            return errors::server::read_unavailable()
+                .operation("dependency source acquisition")
+                .detail("the engine target has no admitted owner after Cargo metadata failed")
+                .error()
+                .with(rift_error::ErrorContext::new(
+                    "cause",
+                    rift_error::ErrorValue::cause(source.as_ref().clone()),
+                ))
+                .fail();
+        }
         Ok(None)
     }
+}
+
+pub(crate) fn query_file_path(uri: &Uri) -> Result<PathBuf, RiftError> {
+    url::Url::parse(uri.as_str())
+        .map_err(|error| query_source_error(error.to_string()))?
+        .to_file_path()
+        .map_err(|()| query_source_error("dependency URI does not name a local file"))
+}
+
+fn query_source_error(detail: impl std::fmt::Display) -> RiftError {
+    errors::server::read_unavailable()
+        .operation("dependency query source")
+        .detail(format!(
+            "{detail}; select an admitted dependency source and retry"
+        ))
+        .error()
+}
+
+fn query_source_failure<T>(detail: impl std::fmt::Display) -> Result<T, RiftError> {
+    query_source_error(detail).fail()
 }
 
 /// The order source roots keep: root, then defining origin.
@@ -174,11 +304,7 @@ impl RootSpellings<'_> {
 }
 
 /// The package roots an accepted install folder names, one per spelling.
-fn folder_roots(
-    folder: &InstallFolder,
-    _registries: &[PathBuf],
-    spellings: RootSpellings<'_>,
-) -> Vec<PackageRoot> {
+fn folder_roots(folder: &InstallFolder, spellings: RootSpellings<'_>) -> Vec<PackageRoot> {
     let origin = &folder.origin;
     match &folder.location {
         InstallLocation::Path(path) => spellings
@@ -202,45 +328,8 @@ fn folder_roots(
                 .collect()
         }
         // Cache folder presence does not establish its defining registry endpoint.
-        InstallLocation::CargoRegistry(_) => Vec::new(),
+        InstallLocation::CargoRegistry { .. } => Vec::new(),
     }
-}
-
-/// `$CARGO_HOME`, or `.cargo` below the home folder when it is unset, as Cargo reads it.
-fn cargo_home() -> Option<PathBuf> {
-    std::env::var_os("CARGO_HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
-}
-
-/// The registry source folders below `cargo_home`, in name order, at most
-/// `REGISTRY_SOURCES_MAX`. Cargo unpacks a registry package below one per registry,
-/// `registry/src/index.crates.io-<hash>` for crates.io.
-fn registry_sources(cargo_home: Option<&Path>) -> Vec<PathBuf> {
-    let Some(sources) = cargo_home.map(|home| home.join("registry").join("src")) else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(&sources) else {
-        return Vec::new();
-    };
-    let mut folders: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
-        .collect();
-    folders.sort();
-    let listed = folders.len();
-    if listed > REGISTRY_SOURCES_MAX {
-        rift_tracing::warn!(
-            component = "engine",
-            folders = listed,
-            bound = REGISTRY_SOURCES_MAX,
-            "Cargo registry source folders past the bound address no callee"
-        );
-        folders.truncate(REGISTRY_SOURCES_MAX);
-    }
-    folders
 }
 
 /// The `typescript` package each engine serving JavaScript or TypeScript runs, as a root.
@@ -346,6 +435,9 @@ pub struct PackageCallee {
     encoding: PositionEncoding,
     name: String,
     captured_source: Option<Arc<str>>,
+    query_sources: Option<Vec<rift_protocol::read::SourceUnitSpan>>,
+    query_uri: Option<Uri>,
+    query_provider: Option<rift_protocol::read::Language>,
 }
 
 /// The declaration the global API named at one package callee's position.
@@ -363,6 +455,40 @@ pub struct CalleeDeclaration {
 }
 
 impl PackageCallee {
+    pub(crate) fn with_query_sources(
+        mut self,
+        sources: Vec<rift_protocol::read::SourceUnitSpan>,
+        provider: rift_protocol::read::Language,
+    ) -> Self {
+        self.query_sources = Some(sources);
+        self.query_provider = Some(provider);
+        self
+    }
+
+    pub(crate) fn query_sources(&self) -> Option<&[rift_protocol::read::SourceUnitSpan]> {
+        self.query_sources.as_deref()
+    }
+
+    pub(crate) fn query_uri(&self) -> Option<&Uri> {
+        self.query_uri.as_ref()
+    }
+
+    pub(crate) fn query_provider(&self) -> Option<&rift_protocol::read::Language> {
+        self.query_provider.as_ref()
+    }
+
+    pub(crate) fn query_origin(&self) -> Option<rift_core::SourceLocation> {
+        match &self.package {
+            CalleePackage::Installed(package) => Some(rift_core::SourceLocation::Dependency {
+                package: package.clone(),
+            }),
+            CalleePackage::Runtime(runtime) => Some(rift_core::SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            }),
+            CalleePackage::StandardLibrary(_) => None,
+        }
+    }
+
     /// Complete embedded stub bytes held with the observed runtime owner.
     #[must_use]
     pub fn captured_source(&self) -> Option<&str> {
@@ -506,6 +632,9 @@ pub(crate) fn callee_file(
             encoding: call.encoding,
             name: call.name.to_owned(),
             captured_source: None,
+            query_sources: None,
+            query_uri: Some(call.uri.clone()),
+            query_provider: None,
         })
     };
     if let Some(stub) = call.uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
@@ -573,7 +702,6 @@ mod tests {
     use super::{
         CalleeDeclaration, CalleeFile, CalleePackage, CalleeRoots, NamedCallee, PackageCallee,
         RootSpellings, callee_file, folder_roots, node_package_root, package_version,
-        registry_sources,
     };
     use crate::{EnginePool, LspProcessKey};
 
@@ -653,7 +781,7 @@ mod tests {
             InstallLocation::Path(PathBuf::from("/toolchain/lib/rustlib/src/rust/library")),
         );
         assert_eq!(
-            spelled(&folder_roots(&npm, &[], spellings)),
+            spelled(&folder_roots(&npm, spellings)),
             [
                 (
                     "file:///private/var/ws/node_modules/nanoid".to_owned(),
@@ -666,7 +794,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            spelled(&folder_roots(&sysroot, &[], spellings)),
+            spelled(&folder_roots(&sysroot, spellings)),
             [(
                 "file:///toolchain/lib/rustlib/src/rust/library".to_owned(),
                 "stdlib/rustc@1.98.1".to_owned()
@@ -681,16 +809,15 @@ mod tests {
             index_root: Path::new("/ws"),
             engine_roots: &[],
         };
-        let registries = [
-            PathBuf::from("/cargo/registry/src/index.crates.io-1949cf8c6b5b557f"),
-            PathBuf::from("/cargo/registry/src/mirror-0123"),
-        ];
         let serde = installed(
             identity("cargo", "serde", "1.0.228"),
-            InstallLocation::CargoRegistry("serde-1.0.228".to_owned()),
+            InstallLocation::CargoRegistry {
+                folder: "serde-1.0.228".to_owned(),
+                source: "registry+https://github.com/rust-lang/crates.io-index".to_owned(),
+            },
         );
         assert!(
-            folder_roots(&serde, &registries, spellings).is_empty(),
+            folder_roots(&serde, spellings).is_empty(),
             "cache folders do not establish registry ownership"
         );
         let mut private = serde.clone();
@@ -703,7 +830,7 @@ mod tests {
             },
         };
         assert!(
-            folder_roots(&private, &registries, spellings).is_empty(),
+            folder_roots(&private, spellings).is_empty(),
             "same name and version establish no shared owner"
         );
         let verified = installed(
@@ -711,7 +838,7 @@ mod tests {
             InstallLocation::Path(PathBuf::from("/verified/serde")),
         );
         assert_eq!(
-            folder_roots(&verified, &[], spellings).len(),
+            folder_roots(&verified, spellings).len(),
             1,
             "accepted path origin serves its root"
         );
@@ -722,7 +849,7 @@ mod tests {
                 root: "jwt".to_owned(),
             },
         );
-        let roots = folder_roots(&jwt, &registries, spellings);
+        let roots = folder_roots(&jwt, spellings);
         assert_eq!(
             spelled(&roots),
             [(
@@ -738,7 +865,7 @@ mod tests {
             },
         );
         assert!(
-            folder_roots(&unrooted, &registries, spellings).is_empty(),
+            folder_roots(&unrooted, spellings).is_empty(),
             "an import root the path rules refuse roots nothing"
         );
     }
@@ -802,39 +929,6 @@ mod tests {
                 ),
             ]
         );
-        Ok(())
-    }
-
-    #[test]
-    fn registry_sources_list_the_folders_below_registry_src_in_name_order() -> TestResult {
-        let home = tempfile::tempdir()?;
-        let sources = home.path().join("registry").join("src");
-        for folder in ["mirror-b", "index.crates.io-1949cf8c6b5b557f"] {
-            std::fs::create_dir_all(sources.join(folder))?;
-        }
-        std::fs::write(sources.join("stray-file"), "")?;
-        assert_eq!(
-            registry_sources(Some(home.path())),
-            [
-                sources.join("index.crates.io-1949cf8c6b5b557f"),
-                sources.join("mirror-b")
-            ]
-        );
-        assert!(registry_sources(Some(&home.path().join("absent"))).is_empty());
-        assert!(registry_sources(None).is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn registry_sources_stop_at_their_bound() -> TestResult {
-        let home = tempfile::tempdir()?;
-        let sources = home.path().join("registry").join("src");
-        for index in 0..=super::REGISTRY_SOURCES_MAX {
-            std::fs::create_dir_all(sources.join(format!("registry-{index:03}")))?;
-        }
-        let listed = registry_sources(Some(home.path()));
-        assert_eq!(listed.len(), super::REGISTRY_SOURCES_MAX);
-        assert_eq!(listed[0], sources.join("registry-000"));
         Ok(())
     }
 
@@ -948,6 +1042,9 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             name: "greet".to_owned(),
             captured_source: None,
+            query_sources: None,
+            query_uri: None,
+            query_provider: None,
         }
     }
 
@@ -1166,7 +1263,7 @@ mod tests {
         let roots = CalleeRoots::from_packages(
             installs
                 .iter()
-                .flat_map(|folder| folder_roots(folder, &[], spellings))
+                .flat_map(|folder| folder_roots(folder, spellings))
                 .collect(),
         );
         let caller = CoreSymbolId::new("rift://symbol/rust/src/lib.rs/run")?;

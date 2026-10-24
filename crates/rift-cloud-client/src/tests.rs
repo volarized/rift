@@ -83,6 +83,10 @@ enum FixtureMode {
 
 #[derive(Clone)]
 enum OperationFixture {
+    Relationships {
+        pages: Vec<serde_json::Value>,
+        advertised: bool,
+    },
     Valid,
     ExactSymbol(serde_json::Value),
     ExactSource(serde_json::Value, StatusCode),
@@ -439,6 +443,16 @@ const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
 
 fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
+        OperationFixture::Relationships {
+            advertised: true, ..
+        } => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
+            value["relationship_capabilities"] = serde_json::json!([
+                {"direction":"outgoing","facets":["calls"]},
+                {"direction":"incoming","facets":["references"]}
+            ]);
+        }
         OperationFixture::Documentation { .. } | OperationFixture::DocumentationBounds { .. } => {
             value["supported_features"] = serde_json::json!([
                 "resolutions",
@@ -574,6 +588,12 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
+    if let OperationFixture::Relationships { pages, .. } = mode {
+        let index = query_cursor(query)
+            .and_then(|cursor| cursor.parse::<usize>().ok())
+            .unwrap_or(0);
+        return json_response(pages.get(index).unwrap_or(&serde_json::Value::Null), None);
+    }
     if matches!(mode, OperationFixture::PartialFailure) && request_number > 1 {
         return problem_response(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -3317,3 +3337,6 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
         .is_err()
     );
 }
+
+#[path = "relationships/tests.rs"]
+mod relationship_tests;

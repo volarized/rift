@@ -59,7 +59,14 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
             json!({ "path": "lib.rs", "position": 0, "rev": "HEAD~1" }),
         ),
     ];
-    for (tool, request) in failing_requests {
+    for (tool, producer) in failing_requests {
+        let request = if tool == "search" && producer["query"] != "" {
+            serde_json::to_value(workspace_client::query::retrieval(
+                &serde_json::from_value(producer)?,
+            )?)?
+        } else {
+            producer
+        };
         let arguments = request
             .as_object()
             .cloned()
@@ -119,25 +126,27 @@ async fn failing_observed_symbol_error(
         "[package]\nname = \"history-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
     )?;
     let (client, server_task) = workspace_client::served_root(root).await?;
-    let answer = workspace_client::search_after_population(
+    let answer = workspace_client::call_retrying_acceptance(
         &client,
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        workspace_client::tool_request(
+            "search",
+            &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
+        ),
     )
     .await?;
-    let results = answer["results"]
-        .as_array()
-        .ok_or("fixture symbol results")?;
+    let results = workspace_client::query::rows(&answer)?;
     let mut exact = results.iter().filter(|row| {
-        row["hit"]["symbol"]["name"] == "beacon"
-            && row["hit"]["symbol"]["language"] == "rust"
-            && row["path"] == "lib.rs"
+        workspace_client::query::literal(row, "name").ok() == Some("beacon")
+            && workspace_client::query::literal(row, "language").ok() == Some("rust")
+            && workspace_client::query::literal(row, "path").ok() == Some("lib.rs")
     });
     let declaration = exact.next().ok_or("original beacon declaration")?;
     assert!(exact.next().is_none(), "one fixture declaration: {answer}");
-    assert_eq!(declaration["hit"]["symbol"]["kind"], "function");
-    let identity = declaration["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("original beacon identity")?;
+    assert_eq!(
+        workspace_client::query::literal(declaration, "kind")?,
+        "function"
+    );
+    let identity = workspace_client::query::iri(declaration, "symbol")?;
     let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
     assert_eq!(parsed.owner(), &rift_protocol::identity::SymbolOwner::Local);
     assert_eq!(parsed.wire_identity(), identity);
@@ -243,8 +252,14 @@ async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure =
-        failing_tool_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;
+    let failure = failing_tool_error(
+        directory.path(),
+        "search",
+        serde_json::to_value(workspace_client::query::retrieval(
+            &serde_json::from_value(json!({ "query": "\"beacon" }))?,
+        )?)?,
+    )
+    .await?;
     assert_eq!(failure.code, ErrorCode::InvalidRequest);
     assert_eq!(failure.retry, RetryDirective::Never);
     let message = &failure.message;

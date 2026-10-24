@@ -59,6 +59,7 @@ tower-service = "0.3.3"
 windows-spawn.workspace = true
 
 [dev-dependencies]
+oxigraph.workspace = true
 ty_vendored = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
 stats_alloc = "=0.1.10"
 rift-history = { workspace = true, features = ["fixtures"] }
@@ -127,6 +128,10 @@ path = "tests/source_exclusion.rs"
 [[test]]
 name = "surface_validation"
 path = "tests/surface_validation.rs"
+
+[[test]]
+name = "query_surface"
+path = "tests/query_surface.rs"
 
 [[test]]
 name = "workspace_resource"

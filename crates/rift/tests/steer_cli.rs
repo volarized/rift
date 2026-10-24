@@ -244,9 +244,11 @@ fn a_grep_pattern_holding_a_quote_and_a_backslash_suggests_valid_json() -> TestR
 
     let output = run_steer(root, &payload, &[])?;
     assert_eq!(output.status.code(), Some(0));
+    let producer = suggested_producer(&output)?;
+    assert_eq!(producer.pattern.as_deref(), Some(pattern));
     assert_eq!(
-        suggested_call(&output)?,
-        serde_json::json!({"pattern": pattern})
+        producer.target,
+        rift_protocol::read::SearchParamsTarget::All
     );
     Ok(())
 }
@@ -281,9 +283,11 @@ fn a_bash_grep_from_a_subdirectory_denies_with_its_search_call() -> TestResult {
 
     let output = run_steer(root, &payload, &[])?;
     assert_eq!(output.status.code(), Some(0));
+    let producer = suggested_producer(&output)?;
+    assert_eq!(producer.pattern.as_deref(), Some(r"cfg\(test\)"));
     assert_eq!(
-        suggested_call(&output)?,
-        serde_json::json!({"pattern": r"cfg\(test\)", "paths": {"include": ["src/**"]}})
+        serde_json::to_value(&producer.paths)?["include"],
+        serde_json::json!(["src/**"])
     );
     assert!(
         root.join(".rift")
@@ -306,13 +310,15 @@ fn a_glob_call_from_a_subdirectory_denies_with_the_listing_call() -> TestResult 
 
     let output = run_steer(root, &payload, &[])?;
     assert_eq!(output.status.code(), Some(0));
+    let producer = suggested_producer(&output)?;
+    assert_eq!(producer.pattern.as_deref(), Some(r"\A"));
     assert_eq!(
-        suggested_call(&output)?,
-        serde_json::json!({
-            "pattern": r"\A",
-            "paths": {"include": ["src/**/*.rs"]},
-            "target": "file"
-        })
+        producer.target,
+        rift_protocol::read::SearchParamsTarget::File
+    );
+    assert_eq!(
+        serde_json::to_value(&producer.paths)?["include"],
+        serde_json::json!(["src/**/*.rs"])
     );
     Ok(())
 }
@@ -339,4 +345,29 @@ fn a_bash_pipeline_or_other_command_answers_allow_and_creates_no_marker() -> Tes
     }
     assert!(!root.join(".rift").join("steer").exists());
     Ok(())
+}
+
+/// Validates actual public arguments and inspects the library-parsed producer selection.
+fn suggested_producer(output: &Output) -> TestResult<rift_protocol::read::SearchParams> {
+    let arguments = suggested_call(output)?;
+    let request: rift_protocol::query::QueryParams = serde_json::from_value(arguments.clone())?;
+    let listing = rift_mcp::schema::tool_listing();
+    let search = listing
+        .iter()
+        .find(|tool| tool.name == "search")
+        .ok_or("served search")?;
+    let schema = serde_json::Value::Object(search.input_schema.as_ref().clone());
+    assert!(jsonschema::validator_for(&schema)?.is_valid(&arguments));
+    let limits = rift_search::query::QueryLimits {
+        query_bytes_max: 16_384,
+        algebra_nodes_max: 4096,
+        quads_max: 1,
+        rdf_bytes_max: 1,
+        result_items_max: 1,
+        result_bytes_max: 1,
+    };
+    let prepared = rift_search::sparql::PreparedQuery::parse(&request.query, limits)?;
+    assert_eq!(prepared.retrievals().len(), 1);
+    assert_eq!(prepared.retrievals()[0].page_index, 0);
+    Ok(prepared.retrievals()[0].clone())
 }

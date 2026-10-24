@@ -23,13 +23,14 @@ use lsp_types::notification::{
     Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
-    CallHierarchyOutgoingCalls, CallHierarchyPrepare, DocumentDiagnosticRequest, Initialize,
-    References, RegisterCapability, Request, Shutdown, WorkDoneProgressCreate,
-    WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
+    DocumentDiagnosticRequest, Initialize, References, RegisterCapability, Request, Shutdown,
+    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
-    CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
-    CallHierarchyPrepareParams, ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
@@ -465,7 +466,7 @@ pub struct EngineSession {
     empty_answers: EmptyAnswers,
     watched_file_watchers: Vec<FileSystemWatcher>,
     document_version: i32,
-    open_documents: BTreeSet<ProjectPath>,
+    open_documents: BTreeSet<lsp_types::Uri>,
     open_documents_unrecorded: bool,
     frame_in_flight: bool,
     ended: bool,
@@ -782,28 +783,49 @@ impl EngineSession {
         text: String,
     ) -> Result<(), RiftError> {
         let uri = self.document_uri(path)?;
+        self.open_uri(&uri, language_id, text).await
+    }
+
+    /// Opens selected source bytes at an admitted document URI.
+    ///
+    /// The caller validates ownership and source bytes before opening the document.
+    /// The session owns cleanup for project and dependency documents together.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the session ended or the notification fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// A partial frame invalidates the session. A completed frame records its URI.
+    pub async fn open_uri(
+        &mut self,
+        uri: &lsp_types::Uri,
+        language_id: &str,
+        text: String,
+    ) -> Result<(), RiftError> {
         self.document_version += 1;
         let params = DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
-                uri,
+                uri: uri.clone(),
                 language_id: language_id.to_owned(),
                 version: self.document_version,
                 text,
             },
         };
         self.notify::<DidOpenTextDocument>(&params).await?;
-        self.record_open(path);
+        self.record_open(uri);
         Ok(())
     }
 
     /// Records `path` as opened, or marks the record incomplete past
     /// [`OPEN_DOCUMENTS_MAX`].
-    fn record_open(&mut self, path: &ProjectPath) {
-        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX && !self.open_documents.contains(path) {
+    fn record_open(&mut self, uri: &lsp_types::Uri) {
+        if self.open_documents.len() >= OPEN_DOCUMENTS_MAX && !self.open_documents.contains(uri) {
             self.open_documents_unrecorded = true;
             return;
         }
-        self.open_documents.insert(path.clone());
+        self.open_documents.insert(uri.clone());
     }
 
     /// Closes one previously opened document.
@@ -820,13 +842,25 @@ impl EngineSession {
     /// ([`EngineSession::is_intact`]); the document stays recorded open until the
     /// frame is written, so [`EngineSession::close_open_documents`] closes it again.
     pub async fn close(&mut self, path: &ProjectPath) -> Result<(), RiftError> {
+        let uri = self.document_uri(path)?;
+        self.close_uri(&uri).await
+    }
+
+    /// Closes one document opened through its admitted URI.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the session ended or the notification fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// A partial frame invalidates the session. Its URI remains recorded until completion.
+    pub async fn close_uri(&mut self, uri: &lsp_types::Uri) -> Result<(), RiftError> {
         let params = DidCloseTextDocumentParams {
-            text_document: TextDocumentIdentifier {
-                uri: self.document_uri(path)?,
-            },
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
         };
         self.notify::<DidCloseTextDocument>(&params).await?;
-        self.open_documents.remove(path);
+        self.open_documents.remove(uri);
         Ok(())
     }
 
@@ -849,9 +883,9 @@ impl EngineSession {
     /// later call closes it; one dropped while a frame is being written leaves the
     /// session not intact ([`EngineSession::is_intact`]).
     pub async fn close_open_documents(&mut self) -> Result<(), RiftError> {
-        let open: Vec<ProjectPath> = self.open_documents.iter().cloned().collect();
-        for path in &open {
-            self.close(path).await?;
+        let open: Vec<lsp_types::Uri> = self.open_documents.iter().cloned().collect();
+        for uri in &open {
+            self.close_uri(uri).await?;
         }
         Ok(())
     }
@@ -879,9 +913,29 @@ impl EngineSession {
         path: &ProjectPath,
         position: Position,
     ) -> Result<Vec<Location>, RiftError> {
+        let uri = self.document_uri(path)?;
+        self.references_uri(&uri, position).await
+    }
+
+    /// Reads references to a position in an admitted document URI.
+    ///
+    /// Declaration inclusion preserves the existing readiness check for dependency subjects.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when references are unavailable or the exchange fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// A later exchange discards a completed stale response. Partial frames invalidate the session.
+    pub async fn references_uri(
+        &mut self,
+        uri: &lsp_types::Uri,
+        position: Position,
+    ) -> Result<Vec<Location>, RiftError> {
         require(self.capabilities.references, References::METHOD)?;
         let params = ReferenceParams {
-            text_document_position: self.position_params(path, position)?,
+            text_document_position: Self::position_params(uri, position),
             work_done_progress_params: WorkDoneProgressParams::default(),
             partial_result_params: PartialResultParams::default(),
             context: ReferenceContext {
@@ -913,12 +967,32 @@ impl EngineSession {
         path: &ProjectPath,
         position: Position,
     ) -> Result<Vec<CallHierarchyItem>, RiftError> {
+        let uri = self.document_uri(path)?;
+        self.prepare_call_hierarchy_uri(&uri, position).await
+    }
+
+    /// Prepares complete call hierarchy items for an admitted document URI.
+    ///
+    /// Items retain their opaque engine data within the owning session exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when call hierarchy is unavailable or the exchange fails.
+    ///
+    /// # Cancel safety
+    ///
+    /// A later exchange discards a completed stale response. Partial frames invalidate the session.
+    pub async fn prepare_call_hierarchy_uri(
+        &mut self,
+        uri: &lsp_types::Uri,
+        position: Position,
+    ) -> Result<Vec<CallHierarchyItem>, RiftError> {
         require(
             self.capabilities.call_hierarchy,
             CallHierarchyPrepare::METHOD,
         )?;
         let params = CallHierarchyPrepareParams {
-            text_document_position_params: self.position_params(path, position)?,
+            text_document_position_params: Self::position_params(uri, position),
             work_done_progress_params: WorkDoneProgressParams::default(),
         };
         let items = self.request::<CallHierarchyPrepare>(params).await?;
@@ -953,6 +1027,32 @@ impl EngineSession {
         };
         let calls = self.request::<CallHierarchyOutgoingCalls>(params).await?;
         Ok(calls.unwrap_or_default())
+    }
+
+    /// Resolves callers of the complete item returned by this session.
+    ///
+    /// # Errors
+    /// Returns the engine refusal or session failure.
+    ///
+    /// # Cancel safety
+    /// Dropping this request leaves its response for the owning session to discard.
+    pub async fn incoming_calls(
+        &mut self,
+        item: CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyIncomingCall>, RiftError> {
+        require(
+            self.capabilities.call_hierarchy,
+            CallHierarchyIncomingCalls::METHOD,
+        )?;
+        let params = CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        Ok(self
+            .request::<CallHierarchyIncomingCalls>(params)
+            .await?
+            .unwrap_or_default())
     }
 
     /// Reads engine output until `until`, or until `settled` holds: the wait
@@ -1552,17 +1652,11 @@ impl EngineSession {
     }
 
     /// The document-and-position parameters for one addressed position.
-    fn position_params(
-        &self,
-        path: &ProjectPath,
-        position: Position,
-    ) -> Result<TextDocumentPositionParams, RiftError> {
-        Ok(TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier {
-                uri: self.document_uri(path)?,
-            },
+    fn position_params(uri: &lsp_types::Uri, position: Position) -> TextDocumentPositionParams {
+        TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
             position,
-        })
+        }
     }
 
     /// Refuses every operation after the engine was killed.

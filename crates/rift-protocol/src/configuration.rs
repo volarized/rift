@@ -1502,6 +1502,8 @@ impl ExecutionConfiguration {
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_search_ranges)]
 pub struct SearchConfiguration {
+    /// Admission, evaluation, and retained-result bounds for query search.
+    pub query: crate::query::QueryConfiguration,
     /// Most results one local search or symbol lookup collects, 1 to 10000.
     /// An answer that reaches this bound warns `results_truncated`.
     #[schemars(range(min = 1, max = 10_000))]
@@ -1569,6 +1571,7 @@ impl Default for SearchConfiguration {
             symbol_alternatives_work: SEARCH_SYMBOL_ALTERNATIVES_WORK_DEFAULT,
             symbol_alternatives_lowercase_work: SEARCH_SYMBOL_ALTERNATIVES_LOWERCASE_WORK_DEFAULT,
             text: TextSearchConfiguration::default(),
+            query: crate::query::QueryConfiguration::default(),
             lexical: LexicalSearchConfiguration::default(),
             ranking: RankingConfiguration::default(),
             vector: VectorSearchConfiguration::default(),
@@ -1590,6 +1593,7 @@ impl SearchConfiguration {
     fn violation(&self) -> Option<ConfigurationViolation> {
         self.lexical
             .violation()
+            .or_else(|| self.query.violation())
             .or_else(|| self.ranking.violation())
             .or_else(|| self.vector.violation())
             .or_else(|| self.text.violation())

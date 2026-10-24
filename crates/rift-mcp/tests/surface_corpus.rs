@@ -89,7 +89,28 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
     requests.extend(lexical_search_corpus());
     requests.extend(pattern_search_corpus());
     requests.extend(traversal_search_corpus());
+    requests.extend([
+        ("search", json!({"language":"sparql", "query":"ASK { ?symbol a :Symbol; :name 'beacon_one' }"})),
+        ("search", json!({"language":"sparql", "query":"CONSTRUCT { ?symbol :name 'beacon_one' } WHERE { ?symbol a :Symbol; :name 'beacon_one' }"})),
+        ("search", json!({"language":"sparql", "query":"SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"})),
+        ("search", json!({"language":"sparql", "query":format!("SELECT ?index {{ VALUES ?index {{ {} }} }} ORDER BY ?index", (0..1001).map(|index| index.to_string()).collect::<Vec<_>>().join(" "))})),
+    ]);
     requests
+        .into_iter()
+        .map(|(name, request)| {
+            if name != "search" || request["language"] == "sparql" {
+                return (name, request);
+            }
+            let producer =
+                serde_json::from_value(request).expect("static retrieval fixture parameters");
+            let request = crate::workspace_client::query::retrieval(&producer)
+                .expect("static retrieval query");
+            (
+                name,
+                serde_json::to_value(request).expect("query parameters serialize"),
+            )
+        })
+        .collect()
 }
 
 /// Resolves the corpus's original declarations through discovery before issuing exact reads.
@@ -117,24 +138,23 @@ pub(crate) async fn prepared_corpus(
             }
             object.insert("id".to_owned(), json!(id));
         }
-        for field in ["seed", "to"] {
-            let selected = request["traversal"][field].as_str();
-            let declaration = match selected {
-                Some(TRAVERSAL_CALLEE) => Some(("callee", "traversal_callee.py")),
-                Some(TRAVERSAL_CALLER) => Some(("calls_callee", "traversal_caller.py")),
-                _ => None,
-            };
-            if let Some((name, path)) = declaration {
-                request["traversal"][field] = json!(
-                    discovered_id(
-                        client,
-                        &json!({"query": name, "target": "symbol", "include": ["source"]}),
-                        name,
-                        Some(path)
-                    )
-                    .await?
-                );
+        if *tool == "search" {
+            let query = request["query"]
+                .as_str()
+                .ok_or("query statement")?
+                .to_owned();
+            let mut expanded = query;
+            for (placeholder, name, path) in [
+                (TRAVERSAL_CALLEE, "callee", "traversal_callee.py"),
+                (TRAVERSAL_CALLER, "calls_callee", "traversal_caller.py"),
+            ] {
+                if expanded.contains(placeholder) {
+                    let identity =
+                        crate::workspace_client::captured_seed(client, name, path).await?;
+                    expanded = expanded.replace(placeholder, &identity);
+                }
             }
+            request["query"] = json!(expanded);
         }
     }
     Ok(requests)
@@ -146,6 +166,17 @@ async fn discovered_id(
     name: &str,
     path: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    if request["scope"]
+        .as_str()
+        .is_none_or(|scope| scope == "local")
+    {
+        if let Some(path) = path.or((name == "beacon_one").then_some("lib.rs")) {
+            return crate::workspace_client::captured_seed(client, name, path).await;
+        }
+    }
+    let producer = serde_json::from_value(request.clone())?;
+    let request = crate::workspace_client::query::retrieval(&producer)?;
+    let request = serde_json::to_value(request)?;
     let result = client
         .call_tool(
             rmcp::model::CallToolRequestParams::new("search")
@@ -157,12 +188,13 @@ async fn discovered_id(
         "discovery refused: {result:?}"
     );
     let answer = result.structured_content.ok_or("discovery content")?;
-    let mut rows = answer["results"]
-        .as_array()
-        .ok_or("discovery rows")?
+    let mut rows = crate::workspace_client::query::rows(&answer)?
         .iter()
         .filter(|row| {
-            row["hit"]["symbol"]["name"] == name && path.is_none_or(|path| row["path"] == path)
+            crate::workspace_client::query::literal(row, "name").ok() == Some(name)
+                && path.is_none_or(|path| {
+                    crate::workspace_client::query::literal(row, "path").ok() == Some(path)
+                })
         });
     let row = rows
         .next()
@@ -172,21 +204,15 @@ async fn discovered_id(
         "one original declaration {name}: {answer}"
     );
     assert!(
-        row["source"]
-            .as_str()
-            .is_some_and(|source| !source.is_empty()),
+        !crate::workspace_client::query::literal(row, "source")?.is_empty(),
         "original source: {row}"
     );
     assert!(
-        row["range"]["start"]
-            .as_u64()
-            .zip(row["range"]["end"].as_u64())
-            .is_some_and(|(start, end)| start < end),
+        crate::workspace_client::query::literal(row, "start")?.parse::<u64>()?
+            < crate::workspace_client::query::literal(row, "end")?.parse::<u64>()?,
         "original range: {row}"
     );
-    let id = row["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("established declaration ID")?;
+    let id = crate::workspace_client::query::iri(row, "symbol")?;
     let _ = rift_protocol::identity::SymbolIdentity::parse(id)?;
     Ok(id.to_owned())
 }
@@ -307,95 +333,18 @@ fn package_argument_corpus() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// `traversal` requests over the one real call edge the fixture already carries -
-/// `traversal_caller.py`'s `calls_callee` calling `traversal_callee.py`'s `callee` - so
-/// this corpus proves the params without perturbing any other corpus entry's fixture
-/// source. Incoming walks start at the callee and outgoing walks at the caller. The walks
-/// the server refuses are proven by `traversal_refusal_corpus` below; a refusal has no
-/// structured content to validate against this corpus's output schema.
+/// Physical usages, incoming references and outgoing calls use standard graph patterns.
 fn traversal_search_corpus() -> Vec<(&'static str, Value)> {
-    vec![
-        (
-            "search",
-            json!({
-                "traversal": { "seed": TRAVERSAL_CALLEE }
-            }),
-        ),
-        (
-            "search",
-            json!({
-                "traversal": {
-                    "seed": TRAVERSAL_CALLEE,
-                    "direction": "incoming",
-                    "depth": 2
-                }
-            }),
-        ),
-        (
-            "search",
-            json!({
-                "traversal": {
-                    "seed": TRAVERSAL_CALLEE,
-                    "to": TRAVERSAL_CALLER
-                }
-            }),
-        ),
-        // The engine lane resolves references alone, so `implements` beside them has no
-        // lane: this answer carries the `relationship_coverage_missing` warning and
-        // validates the schema arm serving it.
-        (
-            "search",
-            json!({
-                "traversal": {
-                    "seed": TRAVERSAL_CALLEE,
-                    "facets": ["implements", "references"]
-                }
-            }),
-        ),
-        // The caller's call hierarchy names `callee` in the project and `len` in the
-        // standard library the local index does not analyze, so the answer carries the
-        // `callees_dropped` warning and validates the schema arm serving it.
-        (
-            "search",
-            json!({
-                "traversal": { "seed": TRAVERSAL_CALLER, "direction": "outgoing" }
-            }),
-        ),
-        (
-            "search",
-            json!({
-                "traversal": {
-                    "seed": TRAVERSAL_CALLER,
-                    "direction": "outgoing",
-                    "depth": 2,
-                    "to": TRAVERSAL_CALLEE
-                }
-            }),
-        ),
-        (
-            "search",
-            json!({
-                "query": "callee",
-                "traversal": {
-                    "seed": TRAVERSAL_CALLER,
-                    "direction": "outgoing",
-                    "facets": ["calls"]
-                }
-            }),
-        ),
-        // Call hierarchy names calls alone, so `references` beside them has no lane on an
-        // outgoing walk.
-        (
-            "search",
-            json!({
-                "traversal": {
-                    "seed": TRAVERSAL_CALLER,
-                    "direction": "outgoing",
-                    "facets": ["references", "calls"]
-                }
-            }),
-        ),
-    ]
+    [
+        format!("SELECT ?usage ?unit ?start ?end {{ <{TRAVERSAL_CALLEE}> :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end }} ORDER BY ?unit ?start"),
+        format!("SELECT DISTINCT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> }}"),
+        format!("SELECT DISTINCT ?caller {{ ?caller :references+ <{TRAVERSAL_CALLEE}> }}"),
+        format!("SELECT ?caller {{ ?caller :references <{TRAVERSAL_CALLEE}> FILTER(?caller = <{TRAVERSAL_CALLER}>) }}"),
+        format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls ?callee }}"),
+        format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls/:calls ?callee }}"),
+        format!("SELECT ?callee {{ <{TRAVERSAL_CALLER}> :calls ?callee FILTER(?callee = <{TRAVERSAL_CALLEE}>) }}"),
+        format!("SELECT ?callee {{ SERVICE :search {{ ?hit :query 'callee'; :symbol ?callee }} <{TRAVERSAL_CALLER}> :calls ?callee }}"),
+    ].into_iter().map(|query| ("search", json!({"query":query, "language":"sparql"}))).collect()
 }
 
 /// The declaration every walk in this corpus starts at.
@@ -524,7 +473,7 @@ impl SurfaceFixture {
         fs::write(
             directory.path().join("traversal_caller.py"),
             "from traversal_callee import callee\n\n\n\
-             def calls_callee() -> int:\n    return callee() + len(\"callee\")\n",
+             def calls_callee() -> int:\n    return callee()\n",
         )?;
         fs::write(
             directory.path().join("pyproject.toml"),

@@ -85,6 +85,7 @@ mod keyword {
     pub(super) const PATTERN: &str = "pattern";
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
     pub(super) const TYPE: &str = "type";
+    pub(super) const OBJECT: &str = "object";
     pub(super) const DEFAULT: &str = "default";
 
     pub(super) const DEFS: &str = "$defs";
@@ -97,6 +98,14 @@ mod keyword {
     pub(super) const NULL: &str = "null";
     pub(super) const STRING: &str = "string";
     pub(super) const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
+}
+
+/// Declares the object root shared by every complete or unavailable query result.
+pub fn require_query_result_object(schema: &mut Schema) {
+    schema.insert(
+        keyword::TYPE.to_owned(),
+        Value::String(keyword::OBJECT.to_owned()),
+    );
 }
 
 /// References and unions one schema walk follows before it answers with what

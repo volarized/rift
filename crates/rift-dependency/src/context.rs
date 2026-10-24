@@ -103,7 +103,12 @@ pub enum InstallLocation {
     /// registry source folder, `~/.cargo/registry/src/<index>/`. Cargo names the index
     /// folder by a hash of the registry's URL, so the pass mints the folder name from the
     /// lockfile's name and version and reads no package cache to find the index.
-    CargoRegistry(String),
+    CargoRegistry {
+        /// Expected unpacked folder name from the selected lock entry.
+        folder: String,
+        /// Original Cargo Source ID, compared opaquely with Cargo metadata.
+        source: String,
+    },
 }
 
 /// What one resolver read from a workspace's manifests and lockfiles.

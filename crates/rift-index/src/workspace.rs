@@ -4095,12 +4095,12 @@ impl WorkspaceIndex {
                     .or_default()
                     .push((file.path().clone(), index));
                 let assembled = self.assembled_symbol(matched)?;
+                let declaration =
+                    self.declaration_facts(matched, &provider, &assembled, &starts)?;
+                declarations
+                    .facts
+                    .insert((file.path().clone(), index), declaration);
                 if let Some(identity) = assembled.identity() {
-                    let declaration =
-                        self.declaration_facts(matched, &provider, &assembled, &starts)?;
-                    declarations
-                        .facts
-                        .insert((file.path().clone(), index), declaration);
                     declarations
                         .canonical
                         .entry(identity.clone())

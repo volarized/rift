@@ -2,6 +2,9 @@
 
 mod context;
 mod lockfile;
+mod metadata;
+
+pub use metadata::CargoMetadataError;
 
 pub(crate) use context::vendored_folders;
 

@@ -18,7 +18,9 @@ mod embedding;
 mod encoder;
 mod fusion;
 mod index;
+pub mod query;
 mod similarity;
+pub mod sparql;
 
 pub use acquisition::{AcquisitionLimits, FetchedFile, ModelSource, acquire};
 pub use document::{

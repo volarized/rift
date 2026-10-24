@@ -1,4 +1,5 @@
 pub(crate) mod candidates;
+mod query;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -2342,6 +2343,22 @@ impl RiftMcp {
         result
     }
 
+    /// Evaluates SPARQL Query over selected workspace facts.
+    ///
+    /// The server supplies `:` and `r:` vocabulary prefixes and standard RDF prefixes.
+    /// `SELECT`, `ASK`, `CONSTRUCT`, and `DESCRIBE` preserve RDF terms and projected fields.
+    /// For example, `SELECT ?symbol { ?symbol :name "ReadService" }` finds declarations.
+    /// `SELECT ?usage { <rift://symbol/local/rust/rift_server/read/ReadService> :usages ?usage }`
+    /// selects every reference occurrence. Required unavailable facts prevent evaluation.
+    #[tool]
+    async fn search(
+        &self,
+        Parameters(params): Parameters<rift_protocol::query::QueryParams>,
+        _extensions: rmcp::model::Extensions,
+    ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
+        self.graph_query(params).await
+    }
+
     /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
     /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
@@ -2364,8 +2381,7 @@ impl RiftMcp {
     /// `ReadService::search` call: a concurrent rebuild between two separate resolutions
     /// could otherwise validate ranked units against one snapshot and merge them into
     /// results computed from another.
-    #[tool]
-    async fn search(
+    async fn discovery_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
         extensions: rmcp::model::Extensions,
@@ -2918,18 +2934,36 @@ impl RiftMcp {
         references: &mut EngineReferences,
         deadline: RequestDeadline,
     ) -> Vec<ReadWarning> {
-        if references.package_callees().is_empty() {
-            return Vec::new();
+        let (named, warnings) = self
+            .package_callee_names(resolved, references.package_callees(), deadline)
+            .await;
+        match named {
+            Some(named) => references.name_package_callees(|callee| named.declaration(callee)),
+            None => references.drop_package_callees(),
+        }
+        warnings
+    }
+
+    async fn package_callee_names(
+        &self,
+        resolved: &ResolvedWorkspace,
+        callees: &[rift_server::PackageCallee],
+        deadline: RequestDeadline,
+    ) -> (Option<crate::global::CalleeDeclarations>, Vec<ReadWarning>) {
+        if callees.is_empty() {
+            return (
+                Some(crate::global::CalleeDeclarations::default()),
+                Vec::new(),
+            );
         }
         let read_context = ReadContext::snapshot(&resolved.published.reads);
         let configuration = resolved.published.configuration.global_configuration();
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.global.callee_route(
-                &configuration,
-                &read_context,
-                references.package_callees(),
-            )),
+            Box::pin(
+                self.global
+                    .callee_route(&configuration, &read_context, callees),
+            ),
         )
         .await
         {
@@ -2937,19 +2971,14 @@ impl RiftMcp {
             Err(source) => self.global.deadline_exceeded(&read_context, source),
         };
         let Some(client) = route.client.clone() else {
-            references.drop_package_callees();
-            return route.service_warnings();
+            return (None, route.service_warnings());
         };
-        let asked = callee_declarations(
-            &client,
-            references.package_callees(),
-            &route.remote_packages,
-        );
-        match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
-            Ok(Ok(named)) => references.name_package_callees(|callee| named.declaration(callee)),
+        let asked = callee_declarations(&client, callees, &route.remote_packages);
+        let named = match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
+            Ok(Ok(named)) => Some(named),
             Ok(Err(error)) => {
                 route.discard_remote(&error);
-                references.drop_package_callees();
+                None
             }
             Err(source) => {
                 route.discard_remote(
@@ -2959,10 +2988,10 @@ impl RiftMcp {
                         .source(source)
                         .error(),
                 );
-                references.drop_package_callees();
+                None
             }
-        }
-        route.service_warnings()
+        };
+        (named, route.service_warnings())
     }
 
     /// Whether the captured source and configuration still match the publication.
@@ -6060,7 +6089,7 @@ done
             params: Parameters<SearchParams>,
         ) -> Result<super::Json<SearchResult>, super::ToolFailure> {
             let super::Json(answer) = self
-                .search(params, rmcp::model::Extensions::default())
+                .discovery_search(params, rmcp::model::Extensions::default())
                 .await?;
             match answer {
                 rift_protocol::search_read::SearchReadResult::Results(answer) => {

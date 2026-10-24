@@ -565,7 +565,10 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/PackageSearchRequest"
+                "oneOf": [
+                  { "$ref": "#/components/schemas/PackageSearchRequest" },
+                  { "$ref": "#/components/schemas/RelationshipSearchRequest" }
+                ]
               },
               "examples": {
                 "valid": {
@@ -627,7 +630,10 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/PackageSearchPage"
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/PackageSearchPage" },
+                    { "$ref": "#/components/schemas/RelationshipSearchPage" }
+                  ]
                 },
                 "examples": {
                   "valid": {

@@ -201,6 +201,16 @@ impl WorkspaceSymbolView {
             .or_else(|| self.text_files.get(path).map(|file| file.content()))
     }
 
+    /// Iterates accepted source bytes from the captured syntax and text catalogs.
+    pub fn sources(&self) -> impl Iterator<Item = (&ProjectPath, &str)> {
+        self.files
+            .iter()
+            .map(|(path, file)| (path, file.source()))
+            .chain(self.text_files.iter().filter_map(|(path, file)| {
+                (!self.files.contains_key(path)).then_some((path, file.content()))
+            }))
+    }
+
     /// Parses captured bytes with their admitted language, framework context and bounds.
     ///
     /// No path matcher or filesystem read selects the provider. Temporary node material
@@ -306,6 +316,56 @@ impl WorkspaceSymbolView {
             .get(identity)
             .map(|object| object.as_ref().cloned().map_err(Clone::clone))
             .transpose()
+    }
+
+    /// Iterates established objects without cloning their captured presentation.
+    pub fn objects(&self) -> impl Iterator<Item = (&SymbolId, Result<&ReadableSymbol, RiftError>)> {
+        self.declarations
+            .assembled
+            .iter()
+            .map(|(identity, object)| (identity, object.as_ref().map_err(Clone::clone)))
+    }
+
+    /// Iterates captured declarations whose normalized object has no canonical identity.
+    ///
+    /// # Errors
+    /// Returns the original provider failure when captured facts cannot be assembled.
+    pub fn unestablished_declarations(
+        &self,
+    ) -> impl Iterator<
+        Item = Result<
+            (
+                ReadableSymbol,
+                SymbolMatch<'_>,
+                &rift_protocol::symbol_read::SymbolDeclaration,
+            ),
+            RiftError,
+        >,
+    > {
+        self.declarations
+            .provider
+            .iter()
+            .flat_map(move |(provider, bindings)| {
+                bindings
+                    .iter()
+                    .filter(|binding| !self.identities.contains_key(*binding))
+                    .map(move |(path, index)| {
+                        let missing = || errors::index::workspace_provider().error();
+                        let file = self.file(path).ok_or_else(missing)?;
+                        let symbol = file.syntax().symbols().get(*index).ok_or_else(missing)?;
+                        let rank =
+                            symbol_rank(symbol, &IdentifierMatcher::new(&symbol.qualified_name))
+                                .ok_or_else(missing)?;
+                        let object = ReadableSymbol::assembled_by(&self.semantics, provider)
+                            .ok_or_else(missing)?;
+                        let declaration = self
+                            .declarations
+                            .facts
+                            .get(&(path.clone(), *index))
+                            .ok_or_else(missing)?;
+                        Ok((object, SymbolMatch { file, symbol, rank }, declaration))
+                    })
+            })
     }
 
     /// Whether the captured facts establish exact absence for this language.

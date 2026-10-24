@@ -95,7 +95,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
     DecisionRow {
         situation: "Every match of a regex in the project's text is needed.",
         tools: &["search"],
-        note: Some("with `pattern`"),
+        note: Some("with `:pattern` in `SERVICE :search`"),
     },
     DecisionRow {
         situation: "The exact symbol identity is known.",
@@ -106,7 +106,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
         situation: "A package or runtime declaration is needed.",
         tools: &["search"],
         note: Some(
-            "with `scope: \"global\"` or `\"all\"`; read the returned `id` with `get_symbol`",
+            "with `:scope \"global\"` or `\"all\"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`",
         ),
     },
     DecisionRow {
@@ -114,8 +114,7 @@ const DECISION_TABLE: &[DecisionRow] = &[
                     needed.",
         tools: &["search"],
         note: Some(
-            "with `packages` and `scope: \"global\"` or `\"all\"`; read the returned `id` with \
-                    `get_symbol`",
+            "with `:packages` and `:scope \"global\"` or `\"all\"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`",
         ),
     },
     DecisionRow {
@@ -127,18 +126,18 @@ const DECISION_TABLE: &[DecisionRow] = &[
         situation: "The declarations that reference a symbol, its impact (what changes when \
                     it does), or a path between two symbols is needed.",
         tools: &["search"],
-        note: Some("with a `traversal` block"),
+        note: Some("with SPARQL property paths"),
     },
     DecisionRow {
         situation: "The declarations two revisions, or a revision and the working tree, hold \
                     differently are needed.",
         tools: &["search"],
-        note: Some("with a `change` block"),
+        note: Some("with `:change` in `SERVICE :search`"),
     },
     DecisionRow {
         situation: "The commit that made a change, found by its message, is needed.",
         tools: &["search"],
-        note: Some("with `target: \"commit\"`"),
+        note: Some("with `:target \"commit\"` in `SERVICE :search`"),
     },
 ];
 
@@ -210,8 +209,8 @@ fn skill_markdown(form: SkillForm) -> String {
         "Read `rift://map` first for served languages, workspace layout, and language server \
          recommendations. When configuring language servers, run listed `rift config set` \
          commands from the workspace root. After creating a named profile, reconnect MCP to \
-         use its `local#name` scope. Profiles are defined in the root `rift.toml`; \
-         `local@name` selects an extra workspace registered through `[mcp.extra]`.\n\n",
+         select it in the SPARQL statement. Profiles are defined in the root `rift.toml`; \
+         accepted datasets and services select extra workspaces registered through `[mcp.extra]`.\n\n",
     );
     rendered.push_str("## Which tool\n\n");
     rendered.push_str("| Situation | Tool |\n");
@@ -220,6 +219,26 @@ fn skill_markdown(form: SkillForm) -> String {
         rendered.push_str(&decision_row_markdown(row));
     }
     rendered.push('\n');
+    rendered.push_str(
+        "## Query recipes\n\n\
+         `search` takes required SPARQL `query` and optional `language`, default `sparql`. \
+         Prefixes `:`, `r:`, `rdf:`, `rdfs:`, and `xsd:` are supplied. Replace `<symbol-id>` \
+         below with an observed canonical symbol IRI.\n\n\
+         - Names: `SELECT ?symbol {?symbol a :Symbol; :name \"load_config\"}`\n\
+         - Usage identities: `SELECT ?usage {<symbol-id> :usages ?usage}`\n\
+         - Usage locations: `SELECT * {<symbol-id> :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end}`\n\
+         - Distinct callers: `SELECT DISTINCT ?caller {?caller :references <symbol-id>}`\n\
+         - Direct callees: `SELECT ?callee {<symbol-id> :calls ?callee}`\n\
+         - Third-level callees: `SELECT ?callee {<symbol-id> :calls/:calls/:calls ?callee}`\n\
+         - Substring: `SELECT ?symbol {?symbol a :Symbol; :name ?name FILTER(CONTAINS(?name, \"config\"))}`\n\
+         - Regex: `SELECT ?path ?start {SERVICE :search {?hit :pattern \"TODO|FIXME\"; :target \"file\"; :path ?path; :start ?start}}`\n\
+         - Count: `SELECT (COUNT(?usage) AS ?count) {<symbol-id> :usages ?usage}`\n\n\
+         Ranking uses `SERVICE :search {?hit :query \"project settings\"; :symbol ?symbol}`. \
+         Use outer projection, `ORDER BY`, `LIMIT`, and `OFFSET`. Follow returned \
+         `pagination.next_query` unchanged for transport pages. Carry the returned `view` \
+         with exact symbol and source reads. Missing required facts return unavailability, \
+         never a false boolean or empty complete answer.\n\n",
+    );
     rendered.push_str("## When a call refuses\n\n");
     rendered.push_str(
         "Read `rift server logs` when a refusal alone does not say why; it carries the \
@@ -454,11 +473,7 @@ mod tests {
         for form in [SkillForm::Installed, SkillForm::Plugin] {
             let rendered = skill_markdown(form);
             assert!(
-                rendered.contains(
-                    "| A package version the project does not use, or a package it lacks, is \
-                     needed. | `search` (with `packages` and `scope: \"global\"` \
-                     or `\"all\"`; read the returned `id` with `get_symbol`) |"
-                ),
+                rendered.contains("`:packages`") && rendered.contains("`SERVICE :search`"),
                 "{rendered}"
             );
         }
@@ -479,7 +494,7 @@ mod tests {
             assert_eq!(row.tools, &["search"]);
             let note = row.note.expect("discovery must select its search scope");
             assert!(note.contains("scope"));
-            assert!(note.contains("returned `id` with `get_symbol`"));
+            assert!(note.contains("returned symbol IRI with `get_symbol`"));
         }
     }
 
@@ -490,7 +505,7 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| The declarations two revisions, or a revision and the working tree, hold \
-                     differently are needed. | `search` (with a `change` block) |"
+                     differently are needed. | `search` (with `:change` in `SERVICE :search`) |"
                 ),
                 "{rendered}"
             );
@@ -504,7 +519,7 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| The commit that made a change, found by its message, is needed. | \
-                     `search` (with `target: \"commit\"`) |"
+                     `search` (with `:target \"commit\"` in `SERVICE :search`) |"
                 ),
                 "{rendered}"
             );
@@ -518,7 +533,7 @@ mod tests {
             assert!(
                 rendered.contains(
                     "| Every match of a regex in the project's text is needed. | `search` (with \
-                     `pattern`) |"
+                     `:pattern` in `SERVICE :search`) |"
                 ),
                 "{rendered}"
             );

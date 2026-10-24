@@ -250,7 +250,7 @@ into one answer, while this table's `force_include` puts them in the index every
 <VersionBadge version="v0.0.46" />
 
 `documentation` describes which documentation files the index collects for
-[`search`](/docs/mcp#tool-search) with `target: "documentation"` and for the `documentation`
+[`search`](/docs/mcp#tool-search) with `SERVICE :search` and `:target "documentation"`, and for the `documentation`
 field of a [`get_symbol`](/docs/mcp#tool-get_symbol) hit. By default the index collects every
 visible Markdown, MDX, reStructuredText, and notebook file, and the `.txt` files
 `[search.text].include` selects, except:
@@ -781,9 +781,9 @@ installation. Profile source paths and language `include` and `exclude` patterns
 to `docs/`. The primary project leaves the profile directory to that profile, so `all` returns
 each source once.
 
-Search selects the profile with `scope: "local#docs"`. Its symbol identities carry the
+A retrieval service selects the profile with `:scope "local#docs"`; a SPARQL dataset can select the same accepted context. Its symbol identities carry the
 `local%23docs` owner, for example `rift://symbol/local%23docs/typescript/page/beacon`.
-The primary project's symbols keep the `local` owner. A `query` search with `scope: "all"`
+The primary project's symbols keep the `local` owner. A retrieval service with `:scope "all"`
 includes the primary project, profiles, registered extra projects, and global facts.
 
 After creating a named profile, reconnect the MCP client before searching its scope or
@@ -802,10 +802,10 @@ range; the root's `server.port` and `server.port_range` apply to the primary pro
 
 ```toml
 [mcp.extra]
-cloud = "../rift-cloud"
+web = "../web"
 ```
 
-Search selects that workspace with `scope: "local@cloud"`; its symbols carry `local@cloud`.
+A retrieval service selects that workspace with `:scope "local@web"`; its symbols carry `local@web`.
 Extra registrations do not define profiles. Rift imports direct extra registrations only.
 
 ### Language engines
@@ -1048,9 +1048,33 @@ in `warnings` naming the two tree revision digests.
 
 ## Search
 
+`search` accepts SPARQL. `[search.query]` bounds its parser, required-fact acquisition,
+evaluation admission, retained answers, and transport pages:
+
+```toml
+[search.query]
+statement_size = "64kb"
+algebra_nodes = 8192
+requests = 20000
+statements = 2000000
+fact_size = "256mb"
+results = 1000000
+result_size = "128mb"
+page_size = 1000
+page_limit = "4mb"
+```
+
+`statement_size` bounds UTF-8 query bytes; `algebra_nodes` bounds parsed algebra work.
+`requests`, `statements`, and `fact_size` bound required acquisitions and admitted domain
+records and bytes. `results` and `result_size` bound the complete retained answer, while
+`page_size` and `page_limit` bound each transport page. A required incomplete acquisition
+refuses before evaluation. A page contains complete RDF terms and valid JSON, and a returned
+`next_query` continues the same captured execution. Existing server deadlines and worker
+admission also apply during lazy result iteration.
+
 <VersionBadge version="v0.0.9" />
 
-[`search`](/docs/mcp#tool-search) runs on a lexical index. `[search.text]` selects the
+`SERVICE :search` uses a lexical index. `[search.text]` selects the
 plain-text files that join it through `include` and bounds their chunks. The lexical index
 lives in the index database at `.rift/index`, and the vector ranking's rows in the vectors
 database at `.rift/vectors`. `pool_slots`, `busy_timeout`, and `journal_size_limit` bound each
@@ -1083,7 +1107,7 @@ journal_size_limit = "64mb"
 - `max_chunk` bounds how large a selected text file may grow before it's split into several
   indexed chunks, 1kb to 16mb
 - `results` caps results collected by one local search or symbol lookup, 1 to 10000, default
-  `1000`; an answer that reaches it reports `results_truncated`
+  `1000`; a producer that reaches it reports `results_truncated`, and a query requiring the missing records returns unavailability
 - `symbol_alternatives_work` bounds one complete closest-declaration ranking, 1 to 1073741824,
   default `16777216`. Every visited file and declaration costs one work unit, including
   language exclusions. Lowercase allocation reserves the configured weight per input byte;
@@ -1293,8 +1317,7 @@ mmap_size = "1gb"
 ```
 
 A workspace past it publishes its index without the lexical ranking: the store refuses the
-commit, and `search` answers from identifier matching with a `lexical_ranking_unavailable`
-warning naming `units_max`, the observed count, and the maximum. Raise the key, or narrow
+commit, and the retrieval producer records `lexical_ranking_unavailable` naming `units_max`, the observed count, and the maximum. A SPARQL query requiring that incomplete ranking returns typed unavailability. Queries over published declaration names remain available independently. Raise the key, or narrow
 [`[source]`](/docs/developer/configuration#source) so fewer files reach the index.
 
 `transaction_units`, 100 to 1000000, and `transaction_size`, 1mb to 1gb, bound one

@@ -113,46 +113,31 @@ greatly required in the codebase. For instance, we won't be able to say what the
 
 ### Semantics
 
-Syntax tells us how code is constructed, but it doesn't tell us what names refer to or what a
-language engine concludes about them. That missing meaning belongs to semantics. In Rift today,
-semantic facts come through language engines.
-
-A [language engine](/docs/developer/configuration#languages-and-lsp) runs the language's own
-analysis and returns facts the parse does not contain. Rift currently asks language engines for
-references, call hierarchy, and diagnostics through LSP.
-
-For [relationship traversal](/docs/mcp#search-traversal), Rift asks the engine for references to
-the requested declaration, or for the calls it makes, and uses syntax to map the returned source
-locations back to indexed declarations. These engine facts belong to that read; they do not enter
-the index.
-
-In some cases, Rift embeds a language engine when it is available as a Rust library. Other
-configured language engines run as separate LSP processes.
+Syntax describes how code is constructed. Semantic facts describe what names refer to and what
+a language engine resolves. Rift requests references, call hierarchy, and diagnostics through
+[LSP](/docs/developer/configuration#languages-and-lsp), using configured processes or the
+embedded engine through the same session contract.
 
 #### Relationship traversal [#relationship-graph]
 
-<VersionBadge version="v0.0.35" languages={["Rust", "TypeScript", "Python"]} />
+`search` expresses relationship questions as SPARQL. Physical usages retain every source
+location, including repeated uses inside one caller, recursion, and file-level references.
+An enclosing declaration is a separate optional fact. Symbol adjacency exposes references and
+calls without replacing those physical occurrences.
 
-For reads over the local index, Rift supports incoming traversal within the current project. A
-language engine returns the source locations that reference the requested declaration, and syntax
-identifies the declaration containing each location. Together they establish a relationship from
-each caller to the requested declaration for that read.
+Property paths express direct calls, exact depth, alternatives, and closure. The library owns
+path and binding semantics. Acquisition reuses selected published records and existing engine
+sessions, and can continue through admitted dependency sources. A fixed three-step path can
+reach a symbol also reachable by a shorter path.
 
-At the next depth, each caller becomes the declaration whose references Rift requests. This gives
-Rift bounded traversal within the project without indexing every relationship in advance.
+Each query captures a complete required dataset before evaluation. Unsupported or missing
+required facts return typed unavailability; an incomplete graph cannot establish a false
+boolean, zero count, or empty result. Captured answers retain source selection, blank nodes,
+and expiry across transport pages and source edits.
 
-<VersionBadge version="v0.0.46" languages={["Rust", "TypeScript", "Python"]} inline /> Outgoing
-traversal walks the other way, from a declaration to the declarations it calls. Rift asks the
-engine for the declaration's
-[call hierarchy](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_prepareCallHierarchy),
-and syntax identifies the declaration that holds each callee's name.
-
-A callee in a standard library or an OSS package has no declaration in the local index, so the
-walk stops there and the answer counts the callees it dropped. At the next depth, each callee in
-the project becomes the declaration whose calls Rift requests.
-
-<VersionBadge version="planned" inline /> The global index will hold relationships within and
-between OSS packages, allowing similar traversal.
+The global index serves existing collected records through the public client/server contract.
+Query serving does not collect or backfill language-engine facts. Local request-owned engine
+facts remain local to that request and do not enter global collection.
 
 ### Documentation
 

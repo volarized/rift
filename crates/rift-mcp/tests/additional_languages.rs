@@ -11,7 +11,7 @@ use rift_protocol::error::ErrorCode;
 use serde_json::{Value, json};
 use workspace_client::{
     TestResult, call_retrying_acceptance, failed_call, search_after_population,
-    served_relative_workspace, tool_request,
+    served_relative_workspace, served_workspace, tool_request,
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
@@ -171,72 +171,78 @@ async fn assert_workspace_nodes(client: &Client, case: &SourceCase) -> TestResul
 async fn assert_workspace_search(client: &Client, case: &SourceCase) -> TestResult {
     let output = search_after_population(
         client,
-        &json!({
+        &workspace_client::query::retrieval(&serde_json::from_value(json!({
             "pattern":"灯", "target":"file", "paths":{"include":[case.path]},
             "include":["source"],
-        }),
+        }))?)?,
     )
     .await?;
-    let hits = output["results"].as_array().ok_or("search results")?;
+    let hits = workspace_client::query::rows(&output)?;
     let hit = hits
         .iter()
-        .find(|hit| hit["path"] == case.path)
+        .find(|hit| workspace_client::query::literal(hit, "path").ok() == Some(case.path))
         .ok_or_else(|| format!("{} missing from search: {output}", case.path))?;
-    assert!(
-        hit["source"]
-            .as_str()
-            .is_some_and(|source| source.contains('灯'))
-    );
+    assert!(workspace_client::query::literal(hit, "source")?.contains('灯'));
     Ok(())
 }
 
 async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str) -> TestResult {
     let output = search_after_population(
         client,
-        &json!({
+        &workspace_client::query::retrieval(&serde_json::from_value(json!({
             "query":name, "target":"symbol", "paths":{"include":[case.path]},
             "include":["source"],
-        }),
+        }))?)?,
     )
     .await?;
-    let results = output["results"]
-        .as_array()
-        .ok_or("symbol search results")?;
+    let results = workspace_client::query::rows(&output)?;
     let matching = results
         .iter()
-        .filter(|hit| hit["path"] == case.path && hit["hit"]["symbol"]["name"] == name)
+        .filter(|hit| {
+            workspace_client::query::literal(hit, "path").ok() == Some(case.path)
+                && workspace_client::query::literal(hit, "name").ok() == Some(name)
+        })
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1, "{name} physical declaration: {output}");
     let hit = matching[0];
-    let symbol = &hit["hit"]["symbol"];
     assert!(
-        symbol["id"].is_null(),
+        hit["symbol"]["type"] == "blank_node",
         "fixture has no captured namespace context: {hit}"
     );
-    assert_eq!(symbol["language"], case.language, "{hit}");
+    assert_eq!(
+        workspace_client::query::literal(hit, "language")?,
+        case.language,
+        "{hit}"
+    );
     if case.path == "default.h" {
-        assert_eq!(symbol["kind"], "function", "C function prototype: {hit}");
+        assert_eq!(
+            workspace_client::query::literal(hit, "kind")?,
+            "function",
+            "C function prototype: {hit}"
+        );
     }
-    let start = usize::try_from(hit["range"]["start"].as_u64().ok_or("range start")?)?;
-    let end = usize::try_from(hit["range"]["end"].as_u64().ok_or("range end")?)?;
-    assert_eq!(hit["source"], Value::from(&case.text[start..end]));
-    assert_workspace_symbol_node(client, case, name, hit, start, end).await?;
+    let start = workspace_client::query::literal(hit, "start")?.parse::<usize>()?;
+    let end = workspace_client::query::literal(hit, "end")?.parse::<usize>()?;
+    assert_eq!(
+        workspace_client::query::literal(hit, "source")?,
+        &case.text[start..end]
+    );
+    assert_workspace_symbol_node(client, case, name, &output, start, end).await?;
     let search = search_after_population(
         client,
-        &json!({
+        &workspace_client::query::retrieval(&serde_json::from_value(json!({
             "query":name, "target":"symbol", "paths":{"include":[case.path]},
-        }),
+        }))?)?,
     )
     .await?;
-    let results = search["results"]
-        .as_array()
-        .ok_or("symbol search results")?;
+    let results = workspace_client::query::rows(&search)?;
     assert!(
         results.iter().any(|result| {
-            result["path"] == case.path
-                && result["hit"]["symbol"]["name"] == name
-                && result["hit"]["symbol"]["id"] == symbol["id"]
-                && result["range"] == hit["range"]
+            workspace_client::query::literal(result, "path").ok() == Some(case.path)
+                && workspace_client::query::literal(result, "name").ok() == Some(name)
+                && result["symbol"]["type"] == "blank_node"
+                && result["start"] == hit["start"]
+                && result["end"] == hit["end"]
         }),
         "{name} declaration missing from search: {search}"
     );
@@ -292,5 +298,42 @@ async fn assert_workspace_symbol_node(
         sources[index],
         Value::from(&case.text[node_start..node_end])
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn published_symbols_without_canonical_identities_remain_queryable() -> TestResult {
+    let (_directory, client, _server_task) = served_workspace(
+        &[(
+            "client.c",
+            "int a_other(void) { return 2; }\nint c_beacon(void) { return 1; }\n",
+        )],
+        None,
+    )
+    .await?;
+    let answer = call_retrying_acceptance(
+        &client,
+        tool_request("search", &serde_json::json!({"query":"SELECT ?symbol { ?symbol a :Symbol; :name \"c_beacon\" }"})),
+    ).await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(rows.len(), 1, "{answer}");
+    assert_eq!(rows[0]["symbol"]["type"], "blank_node", "{answer}");
+    let generic = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":"SELECT ?symbol { ?symbol a :Symbol; :name ?name . FILTER(?name = \"c_beacon\") }"})),
+    ).await?;
+    assert_eq!(workspace_client::query::rows(&generic)?, rows, "{generic}");
+    let source = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":"SELECT ?source { ?symbol a :Symbol; :name \"c_beacon\"; :declarations ?declaration . ?declaration :source ?source }"})),
+    ).await?;
+    let source_rows = workspace_client::query::rows(&source)?;
+    assert_eq!(source_rows.len(), 1, "{source}");
+    assert!(
+        workspace_client::query::literal(&source_rows[0], "source")?
+            .contains("int c_beacon(void) { return 1; }"),
+        "{source}"
+    );
+    client.cancel().await?;
     Ok(())
 }

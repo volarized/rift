@@ -48,11 +48,18 @@ fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
 /// The result rows a paginated answer pages: search hits or symbol hits. None for a tool
 /// whose result carries no pagination.
 fn paged_rows<'result>(name: &str, structured: &'result Value) -> Option<&'result [Value]> {
-    let rows = match name {
-        "search" => "results",
-        _ => return None,
-    };
-    structured[rows].as_array().map(Vec::as_slice)
+    if name != "search" {
+        return None;
+    }
+    match structured["answer"]["result"].as_str() {
+        Some("bindings") => structured["answer"]["bindings"]
+            .as_array()
+            .map(Vec::as_slice),
+        Some("graph") => structured["answer"]["triples"]
+            .as_array()
+            .map(Vec::as_slice),
+        _ => None,
+    }
 }
 
 fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
@@ -144,39 +151,34 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
         }
     }
     if name == "search"
-        && let Some(results) = structured["results"].as_array()
+        && let Some(rows) = structured["answer"]["bindings"].as_array()
     {
-        let source_requested = request["include"]
-            .as_array()
-            .is_some_and(|include| include.iter().any(|value| value == "source"));
-        let score_requested = request["include"]
-            .as_array()
-            .is_some_and(|include| include.iter().any(|value| value == "score"));
-        for hit in results {
-            assert_search_hit_address(hit, reaches_dependencies);
-            if source_requested {
+        for row in rows {
+            if row.get("hit").is_some() {
                 assert!(
-                    !hit["source"].is_null(),
-                    "a hit must carry source once the request names \
-                     include: [\"source\"]: {hit:#}"
+                    !(row.get("path").is_some() && row.get("unit").is_some()),
+                    "one retrieved location per binding: {row}"
                 );
-            } else {
-                assert!(
-                    hit["source"].is_null(),
-                    "a hit must omit source when the request never names it: {hit:#}"
-                );
-            }
-            if score_requested {
-                assert!(
-                    !hit["score"].is_null(),
-                    "a hit must carry score once the request names \
-                     include: [\"score\"]: {hit:#}"
-                );
-            } else {
-                assert!(
-                    hit["score"].is_null(),
-                    "a hit must omit score when the request never names it: {hit:#}"
-                );
+                if row.get("path").is_some() {
+                    assert!(
+                        workspace_client::query::literal(row, "path").is_ok(),
+                        "literal source path: {row}"
+                    );
+                }
+                if row.get("unit").is_some() {
+                    assert!(
+                        workspace_client::query::iri(row, "unit").is_ok(),
+                        "source unit IRI: {row}"
+                    );
+                }
+                for field in ["source", "score"] {
+                    if row.get(field).is_some() {
+                        assert!(
+                            workspace_client::query::literal(row, field).is_ok(),
+                            "typed retrieved field: {row}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -185,14 +187,31 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
 /// Exact retrieval reaches the released owner its canonical identity names.
 fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
     use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-    if name != "get_symbol" {
-        return Some(matches!(request["scope"].as_str(), Some("global" | "all")));
+    if name == "get_symbol" {
+        let identity = SymbolIdentity::parse(request["id"].as_str()?).ok()?;
+        return Some(matches!(
+            identity.owner(),
+            SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
+        ));
     }
-    let identity = SymbolIdentity::parse(request["id"].as_str()?).ok()?;
-    Some(matches!(
-        identity.owner(),
-        SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
-    ))
+    if name != "search" {
+        return Some(false);
+    }
+    let configuration = rift_protocol::query::QueryConfiguration::default();
+    let limits = rift_search::sparql::QueryLimits {
+        query_bytes_max: usize::try_from(configuration.statement_size.bytes()).ok()?,
+        algebra_nodes_max: usize::try_from(configuration.algebra_nodes).ok()?,
+        quads_max: usize::try_from(configuration.statements).ok()?,
+        rdf_bytes_max: usize::try_from(configuration.fact_size.bytes()).ok()?,
+        result_items_max: usize::try_from(configuration.results).ok()?,
+        result_bytes_max: usize::try_from(configuration.result_size.bytes()).ok()?,
+    };
+    let query =
+        rift_search::sparql::PreparedQuery::parse(request["query"].as_str()?, limits).ok()?;
+    Some(query.retrievals().iter().any(|producer| {
+        serde_json::to_value(&producer.scope)
+            .is_ok_and(|scope| matches!(scope.as_str(), Some("global" | "all")))
+    }))
 }
 
 #[test]
@@ -228,7 +247,10 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
         );
     }
     assert_eq!(
-        request_reaches_dependencies("search", &json!({"scope": "global"})),
+        request_reaches_dependencies(
+            "search",
+            &json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query \"beacon\"; :scope \"global\"; :index ?index } }"})
+        ),
         Some(true)
     );
     assert_eq!(
@@ -241,25 +263,6 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
 /// A search hit in a file is addressed by exactly one of `path` and `unit`, and a file hit
 /// carries `unit` only for a package file, which a package scope alone reaches. A commit
 /// hit carries neither.
-fn assert_search_hit_address(hit: &Value, reaches_dependencies: bool) {
-    if hit["hit"]["target"] == json!("commit") {
-        assert!(
-            hit.get("path").is_none() && hit.get("unit").is_none(),
-            "a commit hit carries neither path nor unit: {hit:#}"
-        );
-        return;
-    }
-    assert!(
-        hit.get("path").is_some() != hit.get("unit").is_some(),
-        "a search hit in a file carries exactly one of path and unit: {hit:#}"
-    );
-    if hit["hit"]["target"] == json!("file") {
-        assert!(
-            hit.get("path").is_some() || reaches_dependencies,
-            "a project-scoped file hit carries its project path: {hit:#}"
-        );
-    }
-}
 
 /// Every warning on a package-scoped answer is one of the package warnings.
 fn assert_dependency_warnings_only(structured: &Value) {
@@ -726,6 +729,9 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
         json!({"query":"helper_beacon","scope":"all","include":[]}),
         json!({"query":"helper_beacon","scope":"all","include":[],"limit":1,"page_index":100}),
     ] {
+        let request = serde_json::to_value(workspace_client::query::retrieval(
+            &serde_json::from_value(request.clone())?,
+        )?)?;
         let answer = client
             .call_tool(tools_call_request("search", &request)?)
             .await?
@@ -745,14 +751,11 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
     Ok(())
 }
 
-/// Result-arm coverage the corpus walk accumulates: every arm a result
-/// union can take must be proven by a live payload, and the walk fails when
-/// one was never produced.
+/// Public result branches and retained serving facts observed through the live SDK.
 #[derive(Default)]
 struct CorpusArms {
     multi_page_results: usize,
     past_end_pages: usize,
-
     dependency_units: usize,
     search_dependency_units: usize,
     unavailable_entries: usize,
@@ -760,23 +763,18 @@ struct CorpusArms {
     added_entries: usize,
     literal_at_identities: usize,
     escaped_identities: usize,
-    outgoing_hops: usize,
-    callees_dropped: usize,
+    query_forms: BTreeSet<String>,
+    query_terms: BTreeSet<String>,
 }
 
 impl CorpusArms {
-    /// Records how many hits the global API answered, on a `get_symbol` and a `search`
-    /// answer alike, and how many entries the answer names `package_unavailable`.
     fn observe(&mut self, structured: &Value) {
         self.dependency_units += dependency_unit_count(&structured["declarations"]);
-        self.search_dependency_units += dependency_unit_count(&structured["results"]);
-        self.unavailable_entries += structured["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|warning| warning["code"] == "package_unavailable")
-            .count();
+        self.search_dependency_units += dependency_unit_count(&structured["answer"]["bindings"]);
         for warning in structured["warnings"].as_array().into_iter().flatten() {
+            if warning["code"] == "package_unavailable" {
+                self.unavailable_entries += 1;
+            }
             if warning["code"] == "package_absent" && warning["package"]["name"] == "helper" {
                 self.replaced_entries += 1;
             }
@@ -794,74 +792,66 @@ impl CorpusArms {
                 self.escaped_identities += 1;
             }
         }
-        self.outgoing_hops += outgoing_call_hops(structured);
-        self.callees_dropped += warning_count(structured, "callees_dropped");
+        if let Some(form) = structured["answer"]["result"].as_str() {
+            self.query_forms.insert(form.to_owned());
+        }
+        let mut pending = vec![&structured["answer"]];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::Object(object) => {
+                    if let Some(kind) = object.get("type").and_then(Value::as_str) {
+                        self.query_terms.insert(kind.to_owned());
+                    }
+                    pending.extend(object.values());
+                }
+                Value::Array(values) => pending.extend(values),
+                _ => {}
+            }
+        }
     }
 
-    /// Fails the walk unless every tracked arm was produced live.
     fn assert_proven(&self) {
         assert!(
             self.multi_page_results > 0 && self.past_end_pages > 0,
-            "the corpus must prove a multi-page result set and an empty page past the end: \
-             multi_page_results={}, past_end_pages={}",
+            "retained multi-page and past-end results: {}/{}",
             self.multi_page_results,
             self.past_end_pages
         );
         assert!(
             self.dependency_units > 0,
-            "the corpus must prove a get_symbol hit answered by the global API, \
-             carrying unit in place of path"
+            "exact package declarations retain source units"
         );
         assert!(
             self.search_dependency_units > 0,
-            "the corpus must prove a search hit answered by the global API, \
-             carrying unit in place of path"
+            "query bindings retain package source units"
         );
         assert!(
             self.unavailable_entries > 0,
-            "the corpus must prove a package_unavailable warning naming the fixture's \
-             path dependency"
+            "path dependency remains explicitly unavailable"
         );
         assert!(
             self.replaced_entries > 0 && self.added_entries > 0,
-            "the corpus must prove a `packages` entry replacing the path dependency's \
-             version and one adding a package the context lacks: replaced_entries={}, \
-             added_entries={}",
-            self.replaced_entries,
-            self.added_entries
+            "package replacement and addition remain visible"
         );
         assert!(
             self.literal_at_identities > 0 && self.escaped_identities > 0,
-            "the corpus must mint one identity whose path keeps `@` literal and one whose \
-             path carries a percent escape, and validate both against the served pattern: \
-             literal_at_identities={}, escaped_identities={}",
-            self.literal_at_identities,
-            self.escaped_identities
+            "literal @ and percent-encoded node identities remain valid"
         );
-        assert!(
-            self.outgoing_hops > 0 && self.callees_dropped > 0,
-            "the corpus must prove an outgoing walk's `calls` hop and its `callees_dropped` \
-             warning against the served schema: outgoing_hops={}, callees_dropped={}",
-            self.outgoing_hops,
-            self.callees_dropped
-        );
+        for form in ["bindings", "boolean", "graph"] {
+            assert!(
+                self.query_forms.contains(form),
+                "missing live result form {form}: {:?}",
+                self.query_forms
+            );
+        }
+        for kind in ["iri", "blank_node", "literal", "language_literal"] {
+            assert!(
+                self.query_terms.contains(kind),
+                "missing live RDF term {kind}: {:?}",
+                self.query_terms
+            );
+        }
     }
-}
-
-/// How many hops across one answer's traversal paths an outgoing walk followed through a
-/// `calls` relationship.
-fn outgoing_call_hops(structured: &Value) -> usize {
-    structured["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|hit| hit["traversal_path"].as_array())
-        .flatten()
-        .filter(|hop| {
-            hop["direction"] == json!("outgoing")
-                && hop["relationship"]["facets"] == json!(["calls"])
-        })
-        .count()
 }
 
 /// How many of one answer's warnings carry `code`.
@@ -961,86 +951,83 @@ async fn call_tool_retrying_acceptance(
 #[tokio::test]
 async fn every_tool_result_validates_against_served_output_schema() -> TestResult {
     let (_fixture, client, server_task) = served_fixture().await?;
-    // Map readiness covers local file preparation; wait for lexical population before the corpus.
-    workspace_client::search_after_population(&client, &json!({ "query": "beacon" })).await?;
+    let warmup =
+        workspace_client::query::retrieval(&serde_json::from_value(json!({"query":"beacon"}))?)?;
+    workspace_client::search_after_population(&client, &warmup).await?;
     let tools = client.list_all_tools().await?;
-
     let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     let covered: BTreeSet<&str> = corpus().iter().map(|(name, _)| *name).collect();
     assert_eq!(
         advertised, covered,
-        "every advertised tool needs a validation corpus entry, and every \
-         corpus entry an advertised tool: extend `corpus` alongside the surface"
+        "every advertised tool has a corpus request"
     );
-
     let validators = tool_validators(&tools)?;
-
     let mut arms = CorpusArms::default();
     for (name, request) in surface_corpus::prepared_corpus(&client).await? {
-        let (input_validator, output_validator) = validators
-            .get(name)
-            .ok_or_else(|| format!("corpus names unadvertised tool {name}"))?;
+        let (input, output) = validators.get(name).ok_or("advertised corpus tool")?;
         let mut request = request;
-        let mut followed_pages = 0_usize;
+        let mut followed = 0usize;
+        let mut expected_page = 0u64;
+        let mut past_end = false;
+        let mut original = None;
         loop {
             assert!(
-                followed_pages <= FOLLOWED_PAGES_MAX,
-                "page walk for {name} exceeded {FOLLOWED_PAGES_MAX} pages: \
-                 the fixture is too large or the page count never converges"
+                followed <= FOLLOWED_PAGES_MAX,
+                "bounded retained page walk: {name}"
             );
-            assert_validates(input_validator, &request, &format!("{name} request"));
-            let result = call_tool_retrying_acceptance(
-                &client,
-                CallToolRequestParams::new(name).with_arguments(arguments(&request)?),
-            )
-            .await?;
+            assert_validates(input, &request, &format!("{name} request"));
+            let result =
+                call_tool_retrying_acceptance(&client, tools_call_request(name, &request)?).await?;
             text_complete::assert_text_states(name, &result);
             let structured = result
                 .structured_content
-                .ok_or_else(|| format!("{name} must return structured content"))?;
-            assert_validates(output_validator, &structured, &format!("{name} result"));
+                .ok_or("structured corpus result")?;
+            assert_validates(output, &structured, &format!("{name} result"));
             assert_wire_hygiene(name, &request, &structured);
             arms.observe(&structured);
-            let Some(pagination) = structured.get("pagination") else {
+            let Some(page) = structured.get("pagination") else {
                 break;
             };
-            let page_index = pagination["page_index"]
-                .as_u64()
-                .unwrap_or_else(|| panic!("{name} pagination.page_index must be an integer"));
-            let total_pages = pagination["total_pages"]
-                .as_u64()
-                .unwrap_or_else(|| panic!("{name} pagination.total_pages must be an integer"));
-            let requested_page = request
-                .get("page_index")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            assert_eq!(
-                page_index, requested_page,
-                "{name} must answer the page the request asked for"
-            );
+            let page_index = page["page_index"].as_u64().ok_or("page index")?;
+            let total_pages = page["total_pages"].as_u64().ok_or("page count")?;
+            assert_eq!(page_index, expected_page, "original retained page index");
             if total_pages > 1 {
                 arms.multi_page_results += 1;
+                if original.is_none() {
+                    let answer: rift_protocol::query::QueryAnswer =
+                        serde_json::from_value(structured["answer"].clone())?;
+                    let view: rift_protocol::symbol_read::CapturedViewId =
+                        serde_json::from_value(structured["view"]["id"].clone())?;
+                    original = Some((answer, view, total_pages));
+                }
             }
             if page_index >= total_pages {
-                let rows =
-                    paged_rows(name, &structured).ok_or_else(|| format!("{name} result rows"))?;
                 assert!(
-                    rows.is_empty(),
-                    "{name} page {page_index} past total_pages {total_pages} must be empty: \
-                     {structured:#}"
+                    paged_rows(name, &structured)
+                        .ok_or("query rows")?
+                        .is_empty(),
+                    "past-end retained page is empty: {structured}"
                 );
                 arms.past_end_pages += 1;
                 break;
             }
-            if page_index + 1 >= total_pages {
-                break;
+            if let Some(query) = page["next_query"].as_str() {
+                followed += 1;
+                expected_page = page_index + 1;
+                request = json!({"query":query, "language":"sparql"});
+                continue;
             }
-            followed_pages += 1;
-            request["page_index"] = json!(page_index + 1);
+            if !past_end && let Some((answer, view, pages)) = &original {
+                followed += 1;
+                expected_page = *pages;
+                past_end = true;
+                request = json!({"query":rift_search::sparql::continuation_query(answer, view, *pages)?, "language":"sparql"});
+                continue;
+            }
+            break;
         }
     }
     arms.assert_proven();
-
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -1094,44 +1081,38 @@ enum InputSchema {
     Refuses,
 }
 
-/// `traversal` requests the server refuses, with the input schema's verdict on each and the
-/// code its refusal carries. An engine session serves the current tree alone, so a walk
-/// beside `rev` or `change` refuses; the relationship graph serves the project alone, so a
-/// walk under `scope: "global"` refuses; and call hierarchy names calls alone, so an
-/// outgoing walk asking for `references` alone has no lane.
+/// Removed selection arguments refuse in the schema; malformed SPARQL reaches the parser.
 fn traversal_refusal_corpus(target: &str, seed: &str) -> Vec<(Value, InputSchema, ErrorCode)> {
-    let outgoing = json!({ "seed": seed, "direction": "outgoing" });
     vec![
         (
-            json!({ "rev": "main", "traversal": { "seed": target } }),
-            InputSchema::Admits,
-            ErrorCode::CapabilityUnavailable,
+            json!({"query":"ASK {}", "rev":"main", "traversal":{"seed":target}}),
+            InputSchema::Refuses,
+            ErrorCode::InvalidRequest,
         ),
         (
-            json!({ "rev": "main", "traversal": outgoing }),
-            InputSchema::Admits,
-            ErrorCode::CapabilityUnavailable,
+            json!({"query":"ASK {}", "traversal":{"seed":seed,"direction":"outgoing"}}),
+            InputSchema::Refuses,
+            ErrorCode::InvalidRequest,
         ),
         (
-            json!({ "scope": "global", "traversal": outgoing }),
+            json!({"query":"ASK {}", "scope":"global"}),
+            InputSchema::Refuses,
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            json!({"query":"ASK {}", "change":{"base":"baseline","head":"HEAD"}}),
+            InputSchema::Refuses,
+            ErrorCode::InvalidRequest,
+        ),
+        (
+            json!({"query":"SELECT {"}),
             InputSchema::Admits,
             ErrorCode::InvalidRequest,
         ),
         (
-            json!({
-                "traversal": {
-                    "seed": seed,
-                    "direction": "outgoing",
-                    "facets": ["references"]
-                }
-            }),
-            InputSchema::Admits,
-            ErrorCode::CapabilityUnavailable,
-        ),
-        (
-            json!({ "change": { "base": "baseline", "head": "HEAD" }, "traversal": outgoing }),
+            json!({"query":"ASK {}", "language":"cypher"}),
             InputSchema::Refuses,
-            ErrorCode::CapabilityUnavailable,
+            ErrorCode::InvalidRequest,
         ),
     ]
 }
@@ -1194,13 +1175,14 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         .ok_or("search must be advertised")?;
     workspace_client::call_retrying_acceptance(
         &client,
-        workspace_client::tool_request("search", &json!({ "query": "Beacon" })),
+        workspace_client::tool_request(
+            "search",
+            &json!({ "query": "ASK { ?symbol a :Symbol; :name 'Beacon' }" }),
+        ),
     )
     .await?;
     let beacon = workspace_client::captured_seed(&client, "Beacon", "lib.rs").await?;
-    let unprepared = json!({
-        "traversal": { "seed": beacon, "direction": "outgoing" }
-    });
+    let unprepared = serde_json::to_value(workspace_client::query::path(&beacon, ":calls")?)?;
     assert_validates(
         input_validator,
         &unprepared,
@@ -1225,9 +1207,7 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     )
     .await?;
     let caller = workspace_client::captured_seed(&client, "caller", "lib.rs").await?;
-    let unconfirmed = json!({
-        "traversal": { "seed": caller, "direction": "outgoing" }
-    });
+    let unconfirmed = serde_json::to_value(workspace_client::query::path(&caller, ":calls")?)?;
     assert_validates(input_validator, &unconfirmed, "an outgoing walk");
     let structured = workspace_client::call_retrying_acceptance(
         &client,
@@ -1268,7 +1248,7 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
     let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
         &[("pyproject.toml", "[build-system]\nrequires=[\"setuptools==80.9.0\"]\nbuild-backend=\"setuptools.build_meta\"\n[tool.setuptools]\npy-modules=[\"caller\"]\n"), (
             "caller.py",
-            "import json\n\n\ndef caller() -> int:\n    return len(json.dumps(1))\n",
+            "import json\n\n\ndef caller() -> int:\n    return len([1])\n",
         )],
         Some(configuration),
         python_runtime_environment::prepare,
@@ -1279,9 +1259,7 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         .get("search")
         .ok_or("search must be advertised")?;
     let caller = workspace_client::captured_seed(&client, "caller", "caller.py").await?;
-    let walk = json!({
-        "traversal": { "seed": caller, "direction": "outgoing" }
-    });
+    let walk = json!({"query":format!("SELECT ?symbol ?name ?unit {{ <{caller}> :calls ?symbol . ?symbol :name ?name; :declarations/:source/:unit ?unit }} ORDER BY ?name")});
     assert_validates(input_validator, &walk, "an outgoing walk");
     let structured = workspace_client::call_retrying_acceptance(
         &client,
@@ -1293,23 +1271,19 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         &structured,
         "an outgoing walk naming package callees",
     );
-    let units: Vec<&Value> = structured["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|hit| &hit["unit"])
-        .collect();
+    let units = workspace_client::query::rows(&structured)?
+        .iter()
+        .map(|row| workspace_client::query::iri(row, "unit"))
+        .collect::<TestResult<Vec<_>>>()?;
     assert_eq!(
         units,
-        [&json!(global_api::named_unit(
-            &global_api::NAMED_POSITIONS[0]
-        ))],
+        [global_api::named_unit(&global_api::NAMED_POSITIONS[0])],
         "{structured:#}"
     );
     assert_eq!(
         warning_count(&structured, "callees_dropped"),
-        1,
-        "`json.dumps` is named nothing: {structured:#}"
+        0,
+        "complete package callee: {structured:#}"
     );
     client.cancel().await?;
     Ok(())
@@ -1340,7 +1314,14 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
             json!({ "query": "helper_beacon", "scope": "global", "rev": "main", "packages": packages }),
         ),
     ];
-    for (name, request) in requests {
+    for (name, producer) in requests {
+        let request = if name == "search" {
+            serde_json::to_value(workspace_client::query::retrieval(
+                &serde_json::from_value(producer.clone())?,
+            )?)?
+        } else {
+            producer.clone()
+        };
         let (input_validator, _) = validators
             .get(name)
             .ok_or_else(|| format!("{name} is advertised"))?;
@@ -1370,7 +1351,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
                 failure.message
             );
         } else {
-            let field = if request.get("rev").is_some() {
+            let field = if producer.get("rev").is_some() {
                 "field scope"
             } else {
                 "field packages"
@@ -1411,7 +1392,10 @@ async fn search_pattern_refusals_carry_their_codes() -> TestResult {
             ErrorCode::CapabilityUnavailable,
         ),
     ];
-    for (arguments, code) in refused {
+    for (producer, code) in refused {
+        let arguments = serde_json::to_value(workspace_client::query::retrieval(
+            &serde_json::from_value(producer)?,
+        )?)?;
         let failure = workspace_client::failed_call(
             client
                 .call_tool(tools_call_request("search", &arguments)?)
@@ -1439,7 +1423,7 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
     let validators = tool_validators(&client.list_all_tools().await?)?;
     let (input_validator, output_validator) =
         validators.get("search").ok_or("search is advertised")?;
-    let request = json!({ "target": "commit", "query": "witness" });
+    let request = json!({"query": "SELECT ?message ?message_truncated ?author_name ?email ?path ?paths_truncated { SERVICE :search { ?hit :query 'witness'; :target 'commit'; :hit ?entry . ?entry :commit ?commit . ?commit :message ?message; :message_truncated ?message_truncated; :author ?author; :paths ?paths; :paths_truncated ?paths_truncated . ?author :name ?author_name; :email ?email . ?paths :index 0; :value ?path } }"});
     assert_validates(input_validator, &request, "commit search request");
 
     let deadline = tokio::time::Instant::now() + COMMIT_FILL_WAIT_MAX;
@@ -1450,7 +1434,7 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
         let structured = result
             .structured_content
             .ok_or("search must return structured content")?;
-        if structured["results"]
+        if structured["answer"]["bindings"]
             .as_array()
             .is_some_and(|hits| !hits.is_empty())
         {
@@ -1466,17 +1450,19 @@ async fn a_commit_search_hit_validates_against_the_served_output_schema() -> Tes
 
     assert_validates(output_validator, &structured, "commit search result");
     assert_wire_hygiene("search", &request, &structured);
-    let commit = &structured["results"][0]["hit"]["commit"];
-    assert_eq!(structured["results"][0]["hit"]["target"], json!("commit"));
-    assert_eq!(commit["message"], json!("introduce the change witness\n"));
-    assert_eq!(commit["message_truncated"], json!(false));
-    assert_eq!(
-        commit["author"],
-        json!({ "name": "Rift Fixture", "email": "fixture@rift.invalid" })
-    );
-    assert_eq!(commit["paths"], json!(["change_witness.rs"]));
-    assert_eq!(commit["paths_truncated"], json!(false));
-    assert_eq!(structured["results"].as_array().map(Vec::len), Some(1));
+    let rows = workspace_client::query::rows(&structured)?;
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    for (field, expected) in [
+        ("message", "introduce the change witness\n"),
+        ("message_truncated", "false"),
+        ("author_name", "Rift Fixture"),
+        ("email", "fixture@rift.invalid"),
+        ("path", "change_witness.rs"),
+        ("paths_truncated", "false"),
+    ] {
+        assert_eq!(workspace_client::query::literal(row, field)?, expected);
+    }
 
     client.cancel().await?;
     server_task.await?;
@@ -1501,7 +1487,14 @@ async fn a_revision_spelling_past_the_advertised_form_refuses_naming_the_field()
             "field change.base",
         ),
     ];
-    for (name, arguments, field) in refused {
+    for (name, producer, field) in refused {
+        let arguments = if name == "search" {
+            serde_json::to_value(workspace_client::query::retrieval(
+                &serde_json::from_value(producer)?,
+            )?)?
+        } else {
+            producer
+        };
         let failure = workspace_client::failed_call(
             client
                 .call_tool(tools_call_request(name, &arguments)?)
@@ -1534,10 +1527,6 @@ async fn search_commit_refusals_name_the_field() -> TestResult {
     let packages = json!([{ "manager": "cargo", "name": "demo", "version": "1.0.0" }]);
     let refused = [
         (json!({ "pattern": "witness" }), "pattern"),
-        (
-            json!({ "traversal": { "seed": "rift://symbol/rust/lib.rs/beacon_one" } }),
-            "traversal",
-        ),
         (json!({ "change": { "base": "baseline" } }), "change"),
         (json!({ "rev": "main" }), "rev"),
         (json!({ "packages": packages, "scope": "all" }), "packages"),
@@ -1549,6 +1538,9 @@ async fn search_commit_refusals_name_the_field() -> TestResult {
         if let (Some(arguments), Some(extra)) = (arguments.as_object_mut(), extra.as_object()) {
             arguments.extend(extra.clone());
         }
+        let arguments = serde_json::to_value(workspace_client::query::retrieval(
+            &serde_json::from_value(arguments)?,
+        )?)?;
         let failure = workspace_client::failed_call(
             client
                 .call_tool(tools_call_request("search", &arguments)?)

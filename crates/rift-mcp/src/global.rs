@@ -210,7 +210,18 @@ impl GlobalState {
         configuration: &GlobalConfiguration,
         read: &ReadContext<'_>,
     ) -> GlobalRoute {
-        let route = self.route_inner(configuration, read).await;
+        let route = self.route_inner(configuration, read, None).await;
+        route.record_observation();
+        route
+    }
+
+    pub(crate) async fn route_with_client(
+        &self,
+        configuration: &GlobalConfiguration,
+        read: &ReadContext<'_>,
+        client: GlobalClient,
+    ) -> GlobalRoute {
+        let route = self.route_inner(configuration, read, Some(client)).await;
         route.record_observation();
         route
     }
@@ -313,6 +324,7 @@ impl GlobalState {
         &self,
         configuration: &GlobalConfiguration,
         read: &ReadContext<'_>,
+        client: Option<GlobalClient>,
     ) -> GlobalRoute {
         let context = &read.context;
         if !configuration.enabled {
@@ -329,7 +341,10 @@ impl GlobalState {
                 Arc::clone(&self.observation),
             );
         }
-        let client = match self.client(configuration).await {
+        let client = match match client {
+            Some(client) => Ok(client),
+            None => self.client(configuration).await,
+        } {
             Ok(client) => client,
             Err(error) => {
                 return GlobalRoute::unanswered(
@@ -420,7 +435,10 @@ impl GlobalState {
         self.client(configuration).await?.get_symbol(params).await
     }
 
-    async fn client(&self, configuration: &GlobalConfiguration) -> Result<GlobalClient, RiftError> {
+    pub(crate) async fn client(
+        &self,
+        configuration: &GlobalConfiguration,
+    ) -> Result<GlobalClient, RiftError> {
         let mut config = Config::try_from(configuration)?;
         config.telemetry = self.telemetry.clone();
         let credential = std::env::var_os(&config.token_env);

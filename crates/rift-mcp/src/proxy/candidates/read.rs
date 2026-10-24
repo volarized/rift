@@ -13,6 +13,62 @@ use std::time::SystemTime;
 mod dependency;
 
 impl RiftProxy {
+    pub(super) async fn capture_query_read(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
+        let backend = self.call_backend(request)?;
+        let root = accepted_root(backend)?;
+        let response = backend.forward_read(request.clone()).await?;
+        if let Ok(CallToolResponse::Complete(result)) = &response
+            && result.is_error != Some(true)
+        {
+            super::super::encode_bounded(result, CANDIDATE_BYTES_MAX)
+                .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+            let value = result.structured_content.as_ref().ok_or_else(|| {
+                invalid(
+                    "structuredContent",
+                    "query response has no structured result",
+                )
+            })?;
+            let decoded: rift_protocol::query::QueryReadResult =
+                serde_json::from_value(value.clone())
+                    .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+            if let rift_protocol::query::QueryReadResult::Results(answer) = decoded
+                && let Some(view) = answer.view
+            {
+                let selected = SavedCandidateBackend {
+                    backend: "local".to_owned(),
+                    root: root.to_owned(),
+                    owner: None,
+                    view,
+                    project: None,
+                    upstream_view: None,
+                };
+                match self
+                    .candidate_views
+                    .backend(&selected.view.id, SystemTime::now())?
+                    .map_err(|reason| view_refusal(&selected.view.id, reason))?
+                {
+                    Some(held) if held != selected => {
+                        return Err(invalid("view", "captured backend context does not match"));
+                    }
+                    Some(_) => {}
+                    None => {
+                        let mut pending = self.candidate_views.reserve_backend(
+                            &selected.backend,
+                            &selected.root,
+                            None,
+                            SystemTime::now(),
+                        )?;
+                        pending.finalize(&selected, SystemTime::now())?;
+                    }
+                }
+            }
+        }
+        Ok(Some(response))
+    }
+
     pub(in crate::proxy) async fn captured_read(
         &self,
         request: &CallToolRequestParams,

@@ -30,6 +30,7 @@ pub enum ArchiveMemberKind {
 }
 
 mod import_root;
+#[cfg(feature = "collector")]
 pub(crate) use import_root::{validate_roots, validate_runtime_roots};
 #[cfg(feature = "collector")]
 mod namespace;
@@ -360,6 +361,7 @@ impl<'source> PackageSource<'source> {
         Ok(self)
     }
 
+    #[cfg(any(feature = "collector", test))]
     pub(crate) fn source_digest(self) -> rift_core::FileDigest {
         self.source_digest
             .unwrap_or_else(|| rift_core::FileDigest::of(self.text.as_bytes()))

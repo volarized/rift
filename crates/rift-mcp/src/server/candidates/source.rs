@@ -29,6 +29,9 @@ impl RiftMcp {
                     .error(),
             ));
         }
+        if let Some(result) = self.query_global_source(&params, context).await? {
+            return Ok(Json(result));
+        }
         if let Some(view) = &params.view
             && (params.unit.is_project() || self.has_captured_context(view))
         {

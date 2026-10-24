@@ -21,9 +21,21 @@ use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use workspace_client::{await_workspace_ready, search_after_population};
+use workspace_client::{await_workspace_ready, query, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+fn retrieval(arguments: Value) -> TestResult<Value> {
+    Ok(serde_json::to_value(query::retrieval(
+        &serde_json::from_value(arguments)?,
+    )?)?)
+}
+
+fn reaches(answer: &Value, path: &str) -> TestResult<bool> {
+    Ok(query::rows(answer)?
+        .iter()
+        .any(|row| query::literal(row, "path").ok() == Some(path)))
+}
 
 async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
     let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
@@ -82,33 +94,34 @@ async fn source_exclude_drops_an_already_indexed_file_from_symbol_search_and_the
     let client = client_for(directory.path()).await?;
 
     // Baseline: both files are indexed before the exclusion lands.
-    let symbol_arguments = json!({
+    let symbol_arguments = query::retrieval(&serde_json::from_value(json!({
         "query": "phantom_generated", "target": "symbol", "include": ["source"],
         "paths": {"include": ["phantom_symbol.rs"]},
-    });
+    }))?)?;
     let symbol = search_after_population(&client, &symbol_arguments).await?;
-    let declarations = symbol["results"]
-        .as_array()
-        .ok_or("symbol search results")?;
+    let declarations = query::rows(&symbol)?;
     assert_eq!(
         declarations.len(),
         1,
         "symbol indexed before exclusion: {symbol:#}"
     );
     let declaration = &declarations[0];
-    assert_eq!(declaration["path"], "phantom_symbol.rs");
-    assert_eq!(declaration["hit"]["symbol"]["name"], "phantom_generated");
-    assert!(declaration["hit"]["symbol"]["id"].is_null());
-    assert_eq!(declaration["source"], "pub fn phantom_generated() {}");
-    assert_eq!(declaration["range"]["start"], 0);
-    assert_eq!(declaration["range"]["end"], 29);
+    assert_eq!(query::literal(declaration, "path")?, "phantom_symbol.rs");
+    assert_eq!(query::literal(declaration, "name")?, "phantom_generated");
+    assert_eq!(declaration["symbol"]["type"], "blank_node");
+    assert_eq!(
+        query::literal(declaration, "source")?,
+        "pub fn phantom_generated() {}"
+    );
+    assert_eq!(query::literal(declaration, "start")?, "0");
+    assert_eq!(query::literal(declaration, "end")?, "29");
 
-    let prose_arguments = json!({ "query": "wandering falcon migrations" });
+    let prose_arguments = query::retrieval(&serde_json::from_value(
+        json!({ "query": "wandering falcon migrations" }),
+    )?)?;
     let prose = search_after_population(&client, &prose_arguments).await?;
     assert!(
-        prose["results"].as_array().is_some_and(|results| results
-            .iter()
-            .any(|hit| hit["path"] == json!("phantom_notes.txt"))),
+        reaches(&prose, "phantom_notes.txt")?,
         "the text file must answer a lexical-store-only prose query before exclusion: \
          {prose:#}"
     );
@@ -123,14 +136,14 @@ async fn source_exclude_drops_an_already_indexed_file_from_symbol_search_and_the
     // One request each proves the file left both stores, with no restart.
     let symbol_after = search_after_population(&client, &symbol_arguments).await?;
     assert_eq!(
-        symbol_after["results"].as_array().map(Vec::len),
-        Some(0),
+        query::rows(&symbol_after)?.len(),
+        0,
         "an excluded symbol must leave symbol search on the next request: {symbol_after:#}"
     );
 
     let prose_after = search_after_population(&client, &prose_arguments).await?;
     assert!(
-        prose_after["results"].as_array().is_some_and(Vec::is_empty),
+        query::rows(&prose_after)?.is_empty(),
         "an excluded text file must leave the lexical store on the next request: \
          {prose_after:#}"
     );
@@ -164,30 +177,26 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
     let plain = call(
         &client,
         "search",
-        json!({ "query": "phantom_generated", "target": "symbol" }),
+        retrieval(json!({ "query": "phantom_generated", "target": "symbol" }))?,
     )
     .await?;
     assert!(
-        plain["results"].as_array().is_some_and(|results| !results
-            .iter()
-            .any(|hit| hit["path"] == json!("phantom_symbol.rs"))),
+        !reaches(&plain, "phantom_symbol.rs")?,
         "an excluded file must not answer a plain search: {plain:#}"
     );
 
     let forced = call(
         &client,
         "search",
-        json!({
+        retrieval(json!({
             "query": "phantom_generated",
             "target": "symbol",
             "paths": { "force_include": ["phantom_symbol.rs"] }
-        }),
+        }))?,
     )
     .await?;
     assert!(
-        forced["results"].as_array().is_some_and(|results| results
-            .iter()
-            .any(|hit| hit["path"] == json!("phantom_symbol.rs"))),
+        reaches(&forced, "phantom_symbol.rs")?,
         "force_include must still reach a source-excluded file: {forced:#}"
     );
 
@@ -216,12 +225,12 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
     )?;
     let client = client_for(directory.path()).await?;
 
-    let search_arguments = json!({ "query": "wandering falcon migrations" });
+    let search_arguments = query::retrieval(&serde_json::from_value(
+        json!({ "query": "wandering falcon migrations" }),
+    )?)?;
     let hidden = search_after_population(&client, &search_arguments).await?;
     assert!(
-        hidden["results"].as_array().is_some_and(|results| !results
-            .iter()
-            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+        !reaches(&hidden, "notes/plan.txt")?,
         "a gitignored file must stay out of the index before force_include names it: \
          {hidden:#}"
     );
@@ -234,9 +243,7 @@ async fn source_force_include_reaches_a_gitignored_file_on_the_next_request() ->
 
     let reached = search_after_population(&client, &search_arguments).await?;
     assert!(
-        reached["results"].as_array().is_some_and(|results| results
-            .iter()
-            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+        reaches(&reached, "notes/plan.txt")?,
         "force_include must put the gitignored file in the index the next request reads: \
          {reached:#}"
     );
@@ -263,16 +270,12 @@ async fn source_exclude_wins_over_source_force_include() -> TestResult {
     fs::write(directory.path().join("rift.toml"), configuration)?;
     let client = client_for(directory.path()).await?;
 
-    let answer = call(
-        &client,
-        "search",
+    let request = query::retrieval(&serde_json::from_value(
         json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    )?)?;
+    let answer = search_after_population(&client, &request).await?;
     assert!(
-        answer["results"].as_array().is_some_and(|results| !results
-            .iter()
-            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+        !reaches(&answer, "notes/plan.txt")?,
         "an excluded path stays out although force_include also names it: {answer:#}"
     );
 

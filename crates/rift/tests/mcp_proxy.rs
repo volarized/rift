@@ -28,6 +28,9 @@
 //! `end_to_end.rs`; this file's own tests prove election, adoption,
 //! sharing, and re-election, and add the few helpers only they use.
 
+#[cfg(unix)]
+#[path = "mcp_proxy/dependency_query.rs"]
+mod dependency_query;
 mod engine_fixture;
 #[path = "../../rift-mcp/tests/global_api.rs"]
 #[allow(
@@ -51,6 +54,12 @@ mod surface_corpus;
 mod test_case;
 #[path = "../../rift-mcp/tests/text_complete/mod.rs"]
 mod text_complete;
+#[path = "../../rift-mcp/tests/workspace_client.rs"]
+#[allow(
+    dead_code,
+    reason = "shared fixture helpers serve several integration suites"
+)]
+mod workspace_client;
 
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -185,15 +194,17 @@ async fn beacon_lookup(
     proxied_call(
         client,
         "search",
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
     )
     .await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
+    let rows = workspace_client::query::rows(lookup).expect("beacon query returns bindings");
+    assert_eq!(rows.len(), 1, "{lookup}");
     assert_eq!(
-        lookup["results"][0]["hit"]["symbol"]["name"],
-        json!("beacon")
+        workspace_client::query::literal(&rows[0], "name").expect("beacon name"),
+        "beacon"
     );
 }
 
@@ -301,12 +312,12 @@ async fn repository_workspace_reads(
     let lookup = proxied_call(
         client,
         "search",
-        &json!({"query": name, "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration(name, "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("positive search: {error:?}"))?;
     assert_eq!(
-        lookup["results"][0]["hit"]["symbol"]["name"], name,
+        lookup["answer"]["bindings"][0]["name"]["value"], name,
         "{lookup}"
     );
     let other = names
@@ -316,12 +327,12 @@ async fn repository_workspace_reads(
     let absent = proxied_call(
         client,
         "search",
-        &json!({"query": other, "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration(other, "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("negative search: {error:?}"))?;
     assert!(
-        absent["results"]
+        absent["answer"]["bindings"]
             .as_array()
             .ok_or("search carries results")?
             .is_empty(),
@@ -330,16 +341,16 @@ async fn repository_workspace_reads(
     let search = proxied_call(
         client,
         "search",
-        &json!({"query": name, "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration(name, "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("search: {error:?}"))?;
     assert!(
-        search["results"]
+        search["answer"]["bindings"]
             .as_array()
             .ok_or("search carries results")?
             .iter()
-            .any(|hit| hit["hit"]["symbol"]["name"] == name),
+            .any(|hit| hit["name"]["value"] == name),
         "{search}"
     );
     let nodes = proxied_call(client, "nodes", &json!({"path": "lib.rs", "position": 8}))
@@ -629,12 +640,12 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let pinned = proxied_call(
         &clients[3],
         "search",
-        &json!({"query": "quartz", "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration("quartz", "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
     assert_eq!(
-        pinned["results"][0]["hit"]["symbol"]["name"], "quartz",
+        pinned["answer"]["bindings"][0]["name"]["value"], "quartz",
         "{pinned}"
     );
     require_success(
@@ -753,7 +764,7 @@ async fn beacon_result(
     proxied_result(
         client,
         "search",
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
     )
     .await
 }
@@ -968,11 +979,11 @@ async fn await_search_population(
 async fn await_commit_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult {
-    let request = json!({"target": "commit", "query": "witness"});
+    let request = json!({"query":"SELECT ?hit { SERVICE :search { ?hit :target 'commit'; :query 'witness' } }"});
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let answer = proxied_call(client, "search", &request).await?;
-        if answer["results"]
+        if answer["answer"]["bindings"]
             .as_array()
             .is_some_and(|hits| !hits.is_empty())
         {
@@ -996,16 +1007,22 @@ fn stated_identities<'value>(
     if name == "get_symbol" {
         return structured["symbol"]["id"].as_str().into_iter().collect();
     }
-    let (key, pointer) = match name {
-        "search" => ("results", "/hit/symbol/id"),
-        _ => ("nodes", "/id"),
-    };
-    structured
-        .get(key)
-        .and_then(serde_json::Value::as_array)
+    if name == "search" {
+        return structured["answer"]["bindings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_object)
+            .flat_map(|row| row.values())
+            .filter(|term| term["type"] == "iri")
+            .filter_map(|term| term["value"].as_str())
+            .collect();
+    }
+    structured["nodes"]
+        .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|item| item.pointer(pointer)?.as_str())
+        .filter_map(|node| node["id"].as_str())
         .collect()
 }
 
@@ -1246,7 +1263,11 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
     );
     let (all, text) = (all?, text?);
     await_workspace_ready(&all).await?;
-    await_search_population(&all, &json!({"query": "beacon"})).await?;
+    await_search_population(
+        &all,
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
+    )
+    .await?;
     await_commit_population(&all).await?;
 
     'cases: for (name, initial_request) in surface_corpus::prepared_corpus(&all).await? {
@@ -1259,7 +1280,9 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
                 // XFAIL: https://github.com/volarized/rift/issues/583
                 // Only this traversal refusal with the recorded upstream panic is expected.
                 let message = error.to_string();
-                if request.get("traversal").is_some()
+                if request["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains(":calls") || query.contains(":references"))
                     && message.contains("the embedded ty database cache is poisoned")
                     && message.contains("rift.lsp.engine_refused_terminal")
                 {
@@ -1321,7 +1344,11 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
                 .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
             for identity in stated_identities(name, structured) {
                 assert!(
-                    all_text.split_whitespace().any(|token| token == identity),
+                    (if name == "search" {
+                        all_text.contains(&serde_json::to_string(identity)?)
+                    } else {
+                        all_text.split_whitespace().any(|token| token == identity)
+                    }),
                     "{name}: identity {identity} is no bare token of the text:\n{all_text}"
                 );
             }
@@ -1329,6 +1356,13 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
             let Some(pagination) = structured.get("pagination") else {
                 break;
             };
+            if name == "search" {
+                let Some(next_query) = pagination["next_query"].as_str() else {
+                    break;
+                };
+                request = json!({"query":next_query});
+                continue;
+            }
             let total_pages = pagination["total_pages"]
                 .as_u64()
                 .ok_or_else(|| format!("{name}: pagination.total_pages must be an integer"))?;
@@ -1751,8 +1785,9 @@ async fn assert_refused_without_a_stop(version: &str) -> TestResult {
     let refusal = within(
         "the refusal from a server this proxy does not replace",
         client.call_tool(
-            CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+            CallToolRequestParams::new("search").with_arguments(arguments(&serde_json::to_value(
+                workspace_client::query::declaration("beacon", "lib.rs"),
+            )?)?),
         ),
     )
     .await?
@@ -1882,8 +1917,9 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     let refusal = within(
         "the unserved workspace's refusal",
         client.call_tool(
-            CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+            CallToolRequestParams::new("search").with_arguments(arguments(&serde_json::to_value(
+                workspace_client::query::declaration("beacon", "lib.rs"),
+            )?)?),
         ),
     )
     .await?
@@ -1950,8 +1986,9 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr
     let refusal = within(
         "the refusal from a server that could not bind its port",
         client.call_tool(
-            CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+            CallToolRequestParams::new("search").with_arguments(arguments(&serde_json::to_value(
+                workspace_client::query::declaration("beacon", "lib.rs"),
+            )?)?),
         ),
     )
     .await?
@@ -2037,31 +2074,31 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let declaration = proxied_call(
         &client,
         "search",
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
     )
     .await?;
-    let seed = declaration["results"][0]["hit"]["symbol"]["id"]
+    let seed = declaration["answer"]["bindings"][0]["symbol"]["value"]
         .as_str()
         .ok_or("beacon declaration must carry its symbol identity")?;
     let result = proxied_engine_call(
         &client,
         "search",
-        &json!({"traversal": {
-            "seed": seed, "direction": "incoming", "facets": ["references"], "depth": 1
-        }}),
+        &serde_json::to_value(workspace_client::query::incoming_references(seed)?)?,
     )
     .await?;
-    let caller = result["results"]
+    let caller = result["answer"]["bindings"]
         .as_array()
         .ok_or("search must return its results")?
         .iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == "total")
+        .find(|hit| hit["name"]["value"] == "total")
         .ok_or_else(|| format!("incoming references must reach the caller: {result:#}"))?;
-    assert_eq!(caller["traversal_path"][0]["direction"], "incoming");
-    assert_eq!(caller["traversal_path"][0]["relationship"]["to"], seed);
     assert_eq!(
-        caller["traversal_path"][0]["relationship"]["derivation"],
-        "resolution"
+        workspace_client::query::iri(caller, "facet")?,
+        format!("{}references", rift_search::sparql::VOCABULARY)
+    );
+    assert_eq!(
+        workspace_client::query::iri(caller, "derivation")?,
+        format!("{}resolution", rift_search::sparql::VOCABULARY)
     );
     let workspace = within(
         "workspace resource",

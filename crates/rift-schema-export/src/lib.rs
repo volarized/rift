@@ -248,6 +248,13 @@ pub fn run(request: &ExportRequest) -> Result<(), ExportError> {
         })?;
         println!("wrote {}", path.display());
     }
+    let contract = request
+        .output_dir
+        .join(rift_cloud_client::contract::DOCUMENT_PATH);
+    if contract.is_file() {
+        rift_cloud_client::contract::synchronize(&contract)
+            .map_err(|source| ExportError::GlobalContract { source })?;
+    }
     Ok(())
 }
 

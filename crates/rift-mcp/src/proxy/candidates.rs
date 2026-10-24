@@ -320,6 +320,25 @@ impl RiftProxy {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
+        let _: rift_protocol::query::QueryParams = serde_json::from_value(arguments.into())
+            .map_err(|source| {
+                errors::mcp::parameter_invalid()
+                    .tool("search")
+                    .field("arguments")
+                    .accepted(source.to_string())
+                    .error()
+            })?;
+        self.capture_query_read(request).await
+    }
+
+    pub(super) async fn captured_ranked_search(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<Option<Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>, RiftError> {
+        if request.name != "search" {
+            return Ok(None);
+        }
+        let arguments = request.arguments.clone().unwrap_or_default();
         super::encode_bounded(&arguments, CANDIDATE_BYTES_MAX)
             .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         let params: SearchParams = serde_json::from_value(arguments.into()).map_err(|source| {

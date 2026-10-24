@@ -118,6 +118,14 @@ macro_rules! heap_fields {
 }
 
 heap_fields!(crate::read::Digest, 0);
+heap_fields!(crate::relationship_read::RelationshipRecordId, 0);
+heap_fields!(
+    crate::relationship_read::RelationshipRecord,
+    id,
+    relationship
+);
+heap_fields!(crate::query::QuerySymbol, symbol, declarations => vector);
+heap_fields!(crate::query::QuerySource, unit, digest, text);
 heap_fields!(crate::read::ProjectPath, 0);
 heap_fields!(crate::documentation::DocumentationDigest, 0);
 heap_fields!(crate::documentation::NotebookCell, identity);

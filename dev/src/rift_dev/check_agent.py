@@ -16,6 +16,7 @@ from rift_dev.check_artifact import (
 )
 from rift_dev.log_records import parse_line
 from rift_dev.nextest_run import retained_collector
+from rift_dev.query import bindings, declaration_request, iri, literal
 from rift_dev.rift_test_client import (
     Client,
     Server,
@@ -57,32 +58,21 @@ async def check_embedded_references(client: Client, root: Path) -> None:
     seed = symbol_id(await symbol_hit(client, "serve", "python"))
     caller = symbol_id(await symbol_hit(client, "caller", "python"))
     answer = await incoming_references(client, seed)
-    resolved = []
-    for value in array_value(answer.get("results"), "search.results"):
-        hit = object_value(value, "search hit")
-        symbol = object_value(
-            object_value(hit.get("hit"), "hit").get("symbol"), "symbol"
-        )
-        if symbol.get("id") == caller:
-            resolved.append(hit)
+    resolved = [row for row in bindings(answer) if iri(row, "caller") == caller]
     require(len(resolved) == 1, f"engine references omitted caller: {answer}")
-    hops = array_value(resolved[0].get("traversal_path"), "traversal_path")
-    require(len(hops) == 1, f"expected one reference step: {hops}")
-    hop = object_value(hops[0], "hop")
-    relationship = object_value(hop.get("relationship"), "relationship")
+    relationship = resolved[0]
     require(
-        relationship.get("from") == caller and relationship.get("to") == seed,
+        iri(relationship, "caller") == caller and iri(relationship, "target") == seed,
         f"reference endpoints differ: {relationship}",
     )
     require(
-        relationship.get("derivation") == "resolution",
+        iri(relationship, "derivation") == "urn:rift:vocabulary:resolution",
         f"reference was not resolved by the engine: {relationship}",
     )
     require(
-        relationship.get("facets") == ["references"],
+        iri(relationship, "facet") == "urn:rift:vocabulary:references",
         f"reference facets differ: {relationship}",
     )
-    require(hop.get("direction") == "incoming", f"reference direction differs: {hop}")
     require(
         (root / "service.py").read_bytes() == PYTHON_SOURCE.encode(),
         "reference read changed source bytes",
@@ -121,23 +111,16 @@ async def declaration_node(client: Client, name: str) -> str:
     """Prove nodes retains the captured declaration and original source."""
     search = await client.call(
         "search",
-        {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
+        declaration_request(name),
     )
-    matches = []
-    for value in array_value(search.get("results"), "search.results"):
-        row = object_value(value, "hit")
-        target = object_value(row.get("hit"), "hit")
-        if target.get("target") != "symbol":
-            continue
-        symbol = object_value(target.get("symbol"), "symbol")
-        if symbol.get("name") == name and symbol.get("language") == "rust":
-            matches.append(row)
+    matches = [
+        row
+        for row in bindings(search)
+        if literal(row, "name") == name and literal(row, "language") == "rust"
+    ]
     require(len(matches) == 1, f"expected one {name} declaration: {search}")
     hit = matches[0]
-    selected_view = hit.get("view")
-    if selected_view is None:
-        selected_view = search.get("view")
-    captured = object_value(selected_view, "search.view")
+    captured = object_value(search.get("view"), "search.view")
     identity = symbol_id(hit)
     answer = await client.call(
         "get_symbol",
@@ -155,11 +138,16 @@ async def declaration_node(client: Client, name: str) -> str:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path", "range", "source"):
+    for field in ("path", "source"):
         require(
-            declaration.get(field) == hit.get(field),
+            declaration.get(field) == literal(hit, field),
             f"symbol declaration changed {field}: {answer}",
         )
+    require(
+        declaration.get("range")
+        == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
+        f"symbol declaration changed range: {answer}",
+    )
     span = object_value(declaration.get("range"), "declaration.range")
     start, end = span.get("start"), span.get("end")
     require(

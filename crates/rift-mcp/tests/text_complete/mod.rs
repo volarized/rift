@@ -47,6 +47,11 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
         .as_ref()
         .ok_or("the result must carry structured content")?;
     let verdict = match tool {
+        SEARCH_TOOL
+            if structured.get("answer").is_some() || structured["outcome"] == "unavailable" =>
+        {
+            query_text_states(text, structured)
+        }
         SEARCH_TOOL => layout::text_states(Tool::Search, text, structured),
         GET_SYMBOL_TOOL if structured.get("outcome").is_some() => {
             canonical_text_states(text, structured)
@@ -242,4 +247,110 @@ mod tests {
         assert_eq!(text_states(NODES_TOOL, &nodes), Ok(()));
         assert!(text_states(SEARCH_TOOL, &nodes).is_err());
     }
+}
+
+/// Checks independently parsed JSON rows and the published query result metadata.
+fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+    if structured["outcome"] == "unavailable" {
+        if !text.contains("unavailable") {
+            return Err("$.outcome unavailable".into());
+        }
+    } else {
+        let answer = &structured["answer"];
+        match answer["result"].as_str() {
+            Some("boolean") => {
+                let value = text
+                    .lines()
+                    .next()
+                    .ok_or("boolean text")?
+                    .trim()
+                    .parse::<bool>()
+                    .map_err(|_| "boolean text value")?;
+                if Some(value) != answer["value"].as_bool() {
+                    return Err("$.answer.value".into());
+                }
+            }
+            Some(form @ ("bindings" | "graph")) => {
+                let key = if form == "bindings" {
+                    "bindings"
+                } else {
+                    "triples"
+                };
+                let expected = answer[key].as_array().ok_or("query result array")?;
+                let parsed = text
+                    .lines()
+                    .filter(|line| line.trim_start().starts_with('{'))
+                    .map(|line| {
+                        serde_json::from_str::<serde_json::Value>(line.trim())
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if &parsed != expected {
+                    return Err(format!("$.answer.{key}: text rows differ"));
+                }
+                let title = text.lines().next().ok_or("query title")?;
+                let count = title
+                    .split_whitespace()
+                    .next()
+                    .ok_or("query item count")?
+                    .parse::<usize>()
+                    .map_err(|_| "query item count")?;
+                if count != expected.len() {
+                    return Err("query item count differs".into());
+                }
+                let page = title.split_whitespace().last().ok_or("query page title")?;
+                let (index, pages) = page.split_once('/').ok_or("query page title")?;
+                if index
+                    .parse::<u64>()
+                    .map_err(|_| "query page index")?
+                    .checked_sub(1)
+                    != structured["pagination"]["page_index"].as_u64()
+                    || pages.parse::<u64>().map_err(|_| "query page count")?
+                        != structured["pagination"]["total_pages"]
+                            .as_u64()
+                            .ok_or("query page count")?
+                {
+                    return Err("query pagination differs".into());
+                }
+                if form == "bindings" {
+                    let variables = answer["variables"]
+                        .as_array()
+                        .ok_or("query variables")?
+                        .iter()
+                        .map(|value| value.as_str().ok_or("query variable"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !variables.is_empty()
+                        && !text
+                            .lines()
+                            .any(|line| line.split_whitespace().collect::<Vec<_>>() == variables)
+                    {
+                        return Err("query variable order differs".into());
+                    }
+                }
+            }
+            _ => return Err("$.answer.result".into()),
+        }
+    }
+    let continuations = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("next_query "))
+        .collect::<Vec<_>>();
+    match (
+        structured["pagination"]["next_query"].as_str(),
+        continuations.as_slice(),
+    ) {
+        (Some(expected), [encoded]) => {
+            let actual =
+                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())?;
+            if actual != expected {
+                return Err("$.pagination.next_query differs".into());
+            }
+        }
+        (None, []) => {}
+        _ => return Err("$.pagination.next_query missing or repeated".into()),
+    }
+    for warning in structured["warnings"].as_array().into_iter().flatten() {
+        token(text, &warning["code"], "$.warnings.code")?;
+    }
+    view_text(text, structured)
 }

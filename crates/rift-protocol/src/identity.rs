@@ -129,6 +129,21 @@ pub enum SymbolOwner {
 #[serde(transparent)]
 pub struct SourceDigest(String);
 
+impl get_size2::GetSize for SourceDigest {
+    fn get_size(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
+    }
+
+    fn get_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        let (heap, tracker) = get_size2::GetSize::get_heap_size_with_tracker(self, tracker);
+        (std::mem::size_of::<Self>().saturating_add(heap), tracker)
+    }
+
+    fn get_heap_size_with_tracker<T: get_size2::GetSizeTracker>(&self, tracker: T) -> (usize, T) {
+        get_size2::GetSize::get_heap_size_with_tracker(&self.0, tracker)
+    }
+}
+
 impl SourceDigest {
     /// Accepts the complete immutable source digest.
     ///
