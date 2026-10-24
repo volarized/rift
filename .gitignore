@@ -47,3 +47,6 @@ CLAUDE.md
 .pytest_cache/
 .mypy_cache/
 *.profraw
+
+# Local build cache cleanup
+/dev/cleanup_build_cache.py
