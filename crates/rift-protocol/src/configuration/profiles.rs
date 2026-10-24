@@ -204,6 +204,94 @@ mod tests {
     use super::*;
 
     #[test]
+    fn profiles_enforce_entry_bound_in_model_and_schema() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let schema = serde_json::to_value(schemars::schema_for!(WorkspaceConfiguration))?;
+        let validator = jsonschema::validator_for(&schema)?;
+        let profiles: serde_json::Map<_, _> = (0..PROFILE_COUNT_MAX)
+            .map(|index| {
+                let name = format!("project-{index}");
+                (name.clone(), serde_json::json!({"root": name}))
+            })
+            .collect();
+        let mut input = serde_json::json!({"profiles": profiles});
+        let configuration: WorkspaceConfiguration = serde_json::from_value(input.clone())?;
+        assert!(configuration.validate().is_ok());
+        assert!(validator.is_valid(&input));
+        input["profiles"]
+            .as_object_mut()
+            .expect("profile declarations")
+            .insert("extra".to_owned(), serde_json::json!({"root": "extra"}));
+        let configuration: WorkspaceConfiguration = serde_json::from_value(input.clone())?;
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "profiles",
+                value: 65,
+                max: 64,
+                ..
+            })
+        ));
+        assert!(!validator.is_valid(&input));
+        Ok(())
+    }
+
+    #[test]
+    fn profile_overrides_dependencies_and_merges_named_processes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut configuration: WorkspaceConfiguration = serde_json::from_value(
+            serde_json::json!({
+                "dependencies": {"resolution":"static"},
+                "lsp": {"shared":{"command":"root-server"}, "retained":{"command":"retained-server"}},
+                "profiles": {"docs": {"root":"docs", "dependencies":{"resolution":"auto", "command_timeout":"3s"},
+                    "languages":{"typescript":{"lsp":"shared"}}, "lsp":{"shared":{"command":"profile-server"}}}}
+            }),
+        )?;
+        assert!(configuration.validate().is_ok());
+        let selected = configuration
+            .for_profile("docs")
+            .ok_or("missing docs profile")?;
+        assert_eq!(selected.dependencies.command_timeout.milliseconds(), 3_000);
+        assert_ne!(
+            selected.dependencies.resolution,
+            configuration.dependencies.resolution
+        );
+        assert_eq!(
+            selected
+                .resolve_language_lsp("typescript")
+                .ok_or("missing shared process")?
+                .configuration
+                .command
+                .as_ref()
+                .map(super::super::CommandInput::program),
+            Some("profile-server")
+        );
+        assert_eq!(
+            selected.lsp["retained"]
+                .command
+                .as_ref()
+                .map(super::super::CommandInput::program),
+            Some("retained-server")
+        );
+        configuration
+            .profiles
+            .get_mut("docs")
+            .ok_or("missing docs profile")?
+            .dependencies
+            .as_mut()
+            .ok_or("missing profile dependencies")?
+            .command_timeout = super::super::Duration::from_millis(0);
+        assert!(matches!(
+            configuration.validate(),
+            Err(ConfigurationViolation::LimitOutOfRange {
+                field: "dependencies.command_timeout",
+                ..
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn profile_execution_preserves_child_configuration_and_inherits_when_absent()
     -> Result<(), Box<dyn std::error::Error>> {
         let expected = serde_json::json!({"max_code":"16kb", "max_timeout":"30s", "max_output":"8kb", "max_concurrent":2});

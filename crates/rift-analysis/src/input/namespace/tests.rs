@@ -14,7 +14,7 @@ fn aggregate_byte_overflow_refuses_even_at_u64_bound() {
 }
 
 #[test]
-fn local_and_named_context_preserve_captured_paths_and_metadata() {
+fn local_named_and_profile_context_preserve_captured_paths_and_metadata() {
     let language = Language::from_identity_segment("rust").expect("Rust language");
     let path = ProjectPath::new("src/lib.rs").expect("source path");
     let metadata_path = ProjectPath::new("Cargo.toml").expect("metadata path");
@@ -28,6 +28,9 @@ fn local_and_named_context_preserve_captured_paths_and_metadata() {
     for owner in [
         SymbolOwner::Local,
         SymbolOwner::NamedLocal {
+            name: "cloud".to_owned(),
+        },
+        SymbolOwner::ProfileLocal {
             name: "cloud".to_owned(),
         },
     ] {

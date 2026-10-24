@@ -499,12 +499,18 @@ download_timeout = "5m"
         let message = error.to_string();
         let expected_path = directory
             .path()
+            .canonicalize()
+            .expect("fixture root must resolve")
             .join(WORKSPACE_CONFIGURATION_FILE)
             .display()
             .to_string();
-        assert!(
-            message.contains(&expected_path),
-            "the refusal must name the offending path: {message}"
+        let actual_path = error
+            .context()
+            .find_map(|(key, value)| (key == "path").then_some(value))
+            .expect("directory refusal carries its path");
+        assert_eq!(
+            actual_path, expected_path,
+            "the refusal must name the resolved configuration path"
         );
         assert!(
             message.contains("directory"),

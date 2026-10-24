@@ -61,6 +61,36 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn incompatible_manager_refusals_keep_language_and_manager()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for (manager, language) in [
+            ("cargo", "python"),
+            ("bun", "rust"),
+            ("npm", "python"),
+            ("uv", "typescript"),
+        ] {
+            let configuration: WorkspaceConfiguration = serde_json::from_value(
+                json!({"languages": {language: {"lsp": {"package_manager": manager}}}}),
+            )?;
+            let violation = configuration
+                .validate()
+                .expect_err("manager cannot serve this language");
+            let error = crate::configuration::configuration_violation_error(&violation);
+            let context: std::collections::BTreeMap<_, _> = error.context().collect();
+            assert_eq!(
+                context.get("field").map(String::as_str),
+                Some("languages.lsp.package_manager")
+            );
+            assert_eq!(context.get("language").map(String::as_str), Some(language));
+            assert_eq!(
+                context.get("package_manager").map(String::as_str),
+                Some(manager)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn package_managers_select_installed_servers_without_commands()
     -> Result<(), Box<dyn std::error::Error>> {
         for (manager, language) in [

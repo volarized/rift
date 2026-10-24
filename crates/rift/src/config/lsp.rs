@@ -165,6 +165,72 @@ pub(super) fn invalid(path: &Path, detail: &str) -> RiftError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn profile_manager_replaces_embedded_and_preserves_root_process() -> Result<(), RiftError> {
+        let raw = "[languages.python.lsp]\ncommand = 'root-server'\n[profiles.docs]\nroot = 'docs'\n[profiles.docs.languages.python.lsp]\nembedded = 'ty'\nrequest_timeout = '2s'\n";
+        let mut selected = options(Some("docs"));
+        selected.language = Some("python".to_owned());
+        selected.lsp_program = None;
+        selected.lsp_argument.clear();
+        selected.lsp_package_manager = Some("uv".to_owned());
+        selected.include = vec!["src/**/*.py".to_owned()];
+        let rendered =
+            selected.edit_with_prefix(Path::new("rift.toml"), raw, &["profiles", "docs"])?;
+        let accepted = accept_configuration::<WorkspaceConfiguration>(
+            Some(&rendered),
+            &ConfigurationEnvironment::default(),
+        )?;
+        let root = accepted
+            .configuration()
+            .resolve_language_lsp("python")
+            .expect("root process")
+            .configuration;
+        assert_eq!(
+            root.command
+                .as_ref()
+                .map(rift_protocol::configuration::CommandInput::program),
+            Some("root-server")
+        );
+        let profile = accepted
+            .configuration()
+            .for_profile("docs")
+            .expect("docs profile");
+        let process = profile
+            .resolve_language_lsp("python")
+            .expect("profile process")
+            .configuration;
+        assert_eq!(
+            process.package_manager,
+            Some(rift_protocol::configuration::LspPackageManager::Uv)
+        );
+        assert!(process.command.is_none());
+        assert!(process.embedded.is_none());
+        assert_eq!(process.request_timeout.milliseconds(), 2_000);
+        assert_eq!(
+            profile.languages["python"]
+                .include
+                .as_ref()
+                .expect("profile patterns")[0]
+                .0,
+            "src/**/*.py"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lsp_selection_requires_language_and_one_selector() {
+        let path = Path::new("rift.toml");
+        assert!(LspSetOptions::default().edit(path, "").is_err());
+        let mut selected = options(None);
+        selected.lsp_package_manager = Some("bun".to_owned());
+        assert!(selected.edit(path, "").is_err());
+        selected.lsp_program = None;
+        assert!(selected.edit(path, "").is_err());
+        selected.lsp_argument.clear();
+        selected.lsp_package_manager = None;
+        assert!(selected.edit(path, "").is_err());
+    }
+
     fn options(profile: Option<&str>) -> LspSetOptions {
         LspSetOptions {
             language: Some("typescript".to_owned()),

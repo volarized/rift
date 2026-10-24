@@ -608,6 +608,66 @@ fn quote(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn recommendation_inputs_refuse_overlapping_profile_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("docs/api"))?;
+        let configuration: WorkspaceConfiguration = serde_json::from_value(serde_json::json!({
+            "profiles":{"docs":{"root":"docs"},"api":{"root":"docs/api"}}
+        }))?;
+        let error = LspRecommendationInputs::new(root.path(), configuration)
+            .err()
+            .ok_or("overlapping profile roots must be refused")?;
+        assert_eq!(error.slug(), errors::core::configuration_invalid::SLUG);
+        let context: BTreeMap<_, _> = error.context().collect();
+        assert_eq!(context.get("field").map(String::as_str), Some("profiles"));
+        assert_eq!(
+            context.get("detail").map(String::as_str),
+            Some("profile roots overlap; select separate project folders")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_and_extra_registration_keep_same_name_distinct_and_refuse_shared_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        let profile_root = root.path().join("docs").canonicalize()?;
+        let extra_root = extra.path().canonicalize()?;
+        let mut configuration: WorkspaceConfiguration =
+            serde_json::from_value(serde_json::json!({
+                "profiles":{"docs":{"root":"docs"}},
+                "mcp":{"extra":{"docs":extra_root.to_string_lossy()}}
+            }))?;
+        configuration
+            .validate()
+            .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
+        let inputs = LspRecommendationInputs::new(root.path(), configuration.clone())?;
+        assert_eq!(
+            inputs.registered_projects().get("#docs"),
+            Some(&profile_root)
+        );
+        assert_eq!(inputs.registered_projects().get("docs"), Some(&extra_root));
+        assert_eq!(inputs.registered_projects().len(), 2);
+        configuration.mcp.extra.insert(
+            "docs".to_owned(),
+            profile_root.to_string_lossy().into_owned(),
+        );
+        let error = LspRecommendationInputs::new(root.path(), configuration)
+            .err()
+            .ok_or("profile and extra must not share one root")?;
+        assert_eq!(error.slug(), errors::core::configuration_invalid::SLUG);
+        let context: BTreeMap<_, _> = error.context().collect();
+        assert_eq!(
+            context.get("detail").map(String::as_str),
+            Some("profiles and extra projects must name distinct folders")
+        );
+        Ok(())
+    }
+
     fn project_entries(
         root: &Path,
         entries: &[(&str, &str, &str)],

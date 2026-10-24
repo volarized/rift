@@ -39,6 +39,54 @@ fn parsed_file_preserves_source_path_digest_and_declarations() {
     assert_eq!(file.syntax().source_digest(), Some(&file.digest()));
 }
 
+#[test]
+fn unavailable_syntax_keeps_local_profile_and_extra_error_labels_distinct() {
+    use rift_protocol::identity::SymbolOwner;
+    let path = ProjectPath::new("source.unknown").expect("source path");
+    let language = Language::from_identity_segment("unknown").expect("language identity");
+    for (owner, expected) in [
+        (SymbolOwner::Local, "local"),
+        (
+            SymbolOwner::NamedLocal {
+                name: "docs".to_owned(),
+            },
+            "local@docs",
+        ),
+        (
+            SymbolOwner::ProfileLocal {
+                name: "docs".to_owned(),
+            },
+            "local#docs",
+        ),
+        (
+            SymbolOwner::Runtime {
+                runtime: "rust".to_owned(),
+                version: "1.98.0".to_owned(),
+            },
+            "stdlib/rust@1.98.0",
+        ),
+    ] {
+        owner.validate().expect("valid owner");
+        let error = super::parsed_file(
+            PackageSource::new(&path, "source"),
+            &owner,
+            &language,
+            SyntaxLimits::default(),
+        )
+        .expect_err("no syntax provider serves this language");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::analysis::package_syntax_unavailable::SLUG
+        );
+        let context: std::collections::BTreeMap<_, _> = error.context().collect();
+        assert_eq!(context.get("package").map(String::as_str), Some(expected));
+        assert_eq!(
+            context.get("path").map(String::as_str),
+            Some("source.unknown")
+        );
+    }
+}
+
 pub(super) fn language(shipped: ShippedLanguage) -> Language {
     shipped.language()
 }

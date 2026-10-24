@@ -82,7 +82,8 @@ fn project_root(root: &Path, relative: &str, path: &Path) -> Result<String, Rift
         ));
     }
     let primary = fs::canonicalize(root).map_err(|error| write_failure(path, error))?;
-    let project = registered_root(&primary, relative, path)?;
+    let project =
+        fs::canonicalize(primary.join(relative)).map_err(|error| write_failure(path, error))?;
     if project == primary || !project.starts_with(&primary) || !project.is_dir() {
         return Err(super::lsp::invalid(
             path,
@@ -96,25 +97,6 @@ fn project_root(root: &Path, relative: &str, path: &Path) -> Result<String, Rift
         .map(|component| component.as_os_str().to_string_lossy())
         .collect::<Vec<_>>()
         .join("/"))
-}
-
-pub(super) fn registered_root(
-    root: &Path,
-    saved: &str,
-    path: &Path,
-) -> Result<std::path::PathBuf, RiftError> {
-    let selected = if saved == "~" || saved.starts_with("~/") {
-        let home = std::env::home_dir().ok_or_else(|| {
-            super::lsp::invalid(
-                path,
-                "home directory is unavailable; use a project path without home expansion",
-            )
-        })?;
-        home.join(saved.strip_prefix("~/").unwrap_or(""))
-    } else {
-        root.join(saved)
-    };
-    fs::canonicalize(selected).map_err(|error| write_failure(path, error))
 }
 
 #[cfg(test)]
@@ -163,6 +145,12 @@ mod tests {
         let mut next = options();
         next.profile_root = None;
         set(root.path(), &next)?;
+        next.profile_root = Some("./docs/".to_owned());
+        set(root.path(), &next)?;
+        assert_eq!(
+            rift_server::load_configuration(root.path())?.profiles["docs"].root,
+            "docs"
+        );
         Ok(())
     }
 
@@ -172,7 +160,11 @@ mod tests {
         let root = tempfile::tempdir()?;
         fs::create_dir_all(root.path().join("docs/api"))?;
         fs::create_dir(root.path().join("other"))?;
-        for relative in [".", "../outside", "/tmp", "docs\\outside"] {
+        let mut unnamed_root = options();
+        unnamed_root.profile_root = None;
+        assert!(set(root.path(), &unnamed_root).is_err());
+        assert!(!root.path().join("rift.toml").exists());
+        for relative in ["", ".", "../outside", "/tmp", "docs\\outside", "missing"] {
             let mut options = options();
             options.profile_root = Some(relative.to_owned());
             assert!(set(root.path(), &options).is_err());
@@ -195,7 +187,10 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         use rift_core::{SourceVisibility, TextFileInclusion};
         use rift_index::{WorkspaceIndexLimits, WorkspaceSourcePolicy};
-        for folder in ["docs[1]", "#docs", "!docs", "docs{a,b}", "docs space"] {
+        let folders = ["docs[1]", "#docs", "!docs", "docs{a,b}", "docs space"];
+        #[cfg(unix)]
+        let folders = folders.into_iter().chain(["docs*", "docs?"]);
+        for folder in folders {
             let root = tempfile::tempdir()?;
             fs::create_dir(root.path().join(folder))?;
             fs::write(
