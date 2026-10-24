@@ -658,15 +658,16 @@ one with no git repository.
 ### Package scope [#search-scope]
 
 `scope` selects where `query` and `pattern` run. `local`, the default, selects the primary
-project. `local@name` selects one extra project accepted by the connection. `global` selects
-collected package and runtime facts named by the dependency context. Explicit `packages`
-replaces versions of named packages or adds packages the context lacks. `all`
-merges the primary project, accepted extra projects, and global facts. Search returns each
+project. `local#name` selects one profile defined in the root `rift.toml`. `local@name`
+selects one extra project accepted by the connection. `global` selects collected package and
+runtime facts named by the dependency context. Explicit `packages` replaces versions of named
+packages or adds packages the context lacks. `all` merges the primary project, profiles,
+accepted extra projects, and global facts. Search returns each
 logical owner in the canonical identity, preserving physical declaration locations separately:
 
 <ReadExample name="all-search" />
 
-The caller **MUST** use `query` to combine registered project results under `all`.
+The caller **MUST** use `query` to combine profile and registered project results under `all`.
 The server returns one combined page; each hit retains its captured view for exact reads.
 
 Local search runs the indexed declarations and lines, `paths.force_include`, ranked tier,
@@ -768,7 +769,11 @@ open, the server walks Git per request instead.
 
 ### Symbol ownership [#get_symbol-scope]
 
-A `local@name` identity selects an extra project accepted by the connection:
+A `local%23name` owner in a symbol identity selects a profile defined in the root configuration.
+For example, `rift://symbol/local%23docs/typescript/page/beacon` selects the `docs` profile.
+The scope uses `local#docs`; the symbol URI encodes `#` as `%23`.
+
+A `local@name` owner selects an extra project accepted by the connection:
 
 <ReadExample name="named-symbol" />
 

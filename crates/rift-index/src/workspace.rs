@@ -4790,6 +4790,9 @@ pub fn validate_project_owner(owner: &SymbolOwner) -> Result<(), RiftError> {
                 .map_err(|_| errors::analysis::package_input_identity_invalid().error())?;
             format!("local@{name}")
         }
+        SymbolOwner::ProfileLocal { .. } => owner
+            .local_scope()
+            .map_err(|_| errors::analysis::package_input_identity_invalid().error())?,
         _ => return errors::analysis::package_input_identity_invalid().fail(),
     };
     if rift_protocol::identity::parse_local_scope(&scope)
@@ -4814,6 +4817,10 @@ fn captured_semantic_revision(
         SymbolOwner::Local => hasher.update(b"local"),
         SymbolOwner::NamedLocal { name } => {
             hasher.update(b"local@");
+            hasher.update(name.as_bytes());
+        }
+        SymbolOwner::ProfileLocal { name } => {
+            hasher.update(b"local#");
             hasher.update(name.as_bytes());
         }
         _ => return errors::analysis::package_input_identity_invalid().fail(),

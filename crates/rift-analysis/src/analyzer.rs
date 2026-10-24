@@ -80,6 +80,7 @@ pub(super) fn package_label(owner: &SymbolOwner) -> String {
         SymbolOwner::Runtime { runtime, version } => format!("stdlib/{runtime}@{version}"),
         SymbolOwner::Local => "local".to_owned(),
         SymbolOwner::NamedLocal { name } => format!("local@{name}"),
+        SymbolOwner::ProfileLocal { name } => format!("local#{name}"),
     }
 }
 

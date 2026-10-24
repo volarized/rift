@@ -183,3 +183,43 @@ fn primary_root_keeps_accepted_target_after_symlink_changes() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn profile_and_extra_with_same_name_select_distinct_roots() -> TestResult {
+    use rift_protocol::configuration::{ProfileConfiguration, WorkspaceConfiguration};
+    let directory = tempfile::tempdir()?;
+    let primary = directory.path().join("primary");
+    let profile = primary.join("docs");
+    let extra = directory.path().join("extra");
+    std::fs::create_dir_all(&profile)?;
+    std::fs::create_dir(&extra)?;
+    let mut configuration = WorkspaceConfiguration::default();
+    configuration
+        .mcp
+        .extra
+        .insert("docs".to_owned(), "../extra".to_owned());
+    configuration.profiles.insert(
+        "docs".to_owned(),
+        ProfileConfiguration {
+            root: "docs".to_owned(),
+            ..ProfileConfiguration::default()
+        },
+    );
+    let accepted = Registrations::accept(&primary, &configuration.mcp, &[], None)?
+        .with_profiles(&primary, &configuration)?;
+    assert_eq!(
+        accepted.root("#docs"),
+        Some(profile.canonicalize()?.as_path())
+    );
+    assert_eq!(accepted.root("docs"), Some(extra.canonicalize()?.as_path()));
+    assert_eq!(accepted.entries().count(), 2);
+    configuration
+        .mcp
+        .extra
+        .insert("docs".to_owned(), "docs".to_owned());
+    let refused = Registrations::accept(&primary, &configuration.mcp, &[], None)?
+        .with_profiles(&primary, &configuration)
+        .expect_err("one root cannot select both models");
+    assert_eq!(refused.slug().as_str(), "rift.core.configuration_invalid");
+    Ok(())
+}

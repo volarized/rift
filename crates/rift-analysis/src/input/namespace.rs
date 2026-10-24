@@ -101,6 +101,7 @@ impl<'input> NamespaceInput<'input> {
                 owner.validate().map_err(|_| invalid())?;
                 format!("local@{name}")
             }
+            SymbolOwner::ProfileLocal { .. } => owner.local_scope().map_err(|_| invalid())?,
             _ => return Err(invalid()),
         };
         if parse_local_scope(&scope).map_err(|_| invalid())? != *owner {

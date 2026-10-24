@@ -704,108 +704,109 @@ useSyntaxServer = "never"
 
 ### LSP recommendations
 
-<VersionBadge version="v0.0.70" languages={["Rust", "Python", "JavaScript", "TypeScript"]} />
+<VersionBadge version="v0.0.71" languages={["Rust", "Python", "JavaScript", "TypeScript"]} />
 
-Rift can recommend installed language servers for the source and package directories in the
-project:
+Rift recommends language servers for the source and package directories in the project:
 
 ```sh
 rift config recommend
 ```
 
-For each selected project, the command checks that project's local executables before `PATH`
-for `rust-analyzer`, `pyright-langserver`, and `typescript-language-server`. It prints `rift config set` commands
-for selections the configuration does not already provide. The command reads the project's
-visible files and leaves `rift.toml` unchanged.
+The command identifies Cargo, Bun, npm, and uv projects from their manifests and lockfiles.
+It prints `rift config set` commands for languages the configuration does not already provide.
+The command reads visible files and installed executables, leaves `rift.toml` unchanged, and
+starts no language server or package installation.
+
+Cargo selects `rust-analyzer`, using the project's pinned Rust toolchain when available.
+Bun and npm select the installed native TypeScript language server, then
+`typescript-language-server` from `node_modules/.bin` before `PATH`. uv selects `ty`, then
+`pyright-langserver`, from the project's `.venv` before `PATH`. A missing executable leaves
+the recommendation unavailable.
 
 The recommendation command reads each directly registered project's own configuration and
 visible files. Registered names must resolve to distinct directories, each different from the
 primary project root.
 
-The [map](/docs/mcp#resource-map) also lists actionable recommendations in `recommendations`,
+The [map](/docs/mcp#resource-map) lists actionable recommendations in `recommendations`,
 with each entry's `language`, `root`, and `command`. Once the matching configuration is accepted,
 the next map publication leaves that recommendation out.
 
-Apply a process selection for a language:
+Select a package manager for a language:
+
+```sh
+rift config set --language=rust --lsp-package-manager=cargo
+```
+
+The command writes `package_manager` in the language's inline `lsp` table. Add `--profile` and
+`--profile-root` to select a language server for one directory:
+
+```sh
+rift config set --language=typescript --profile=docs --profile-root=docs --lsp-package-manager=bun
+```
+
+A profile accepts repeated `--include` and `--exclude` patterns relative to its root. Omitted
+patterns preserve the profile's existing language filters. The command writes the profile in
+the root `rift.toml`. Each repository uses one configuration file.
+
+A custom process remains available through `--lsp-program`. Repeat `--lsp-argument` for each
+literal argument:
 
 ```sh
 rift config set --language=typescript --lsp-program=node_modules/.bin/typescript-language-server --lsp-argument=--stdio
 ```
 
-The command writes an inline `lsp` process table in the language entry. Add `--profile` and
-`--profile-root` to select a process for one directory:
-
-```sh
-rift config set --language=typescript --profile=docs --profile-root=docs --lsp-program=node_modules/.bin/typescript-language-server --lsp-argument=--stdio
-```
-
-Repeat `--lsp-argument` for each literal argument. A profile also accepts repeated `--include`
-and `--exclude` patterns relative to its root. Omitted patterns preserve the child's existing
-language filters.
-
-The profile command writes the child project's `rift.toml`, adds its registration to the primary
-project, and appends the profile directory to the primary project's `[source] exclude` list.
-The primary project leaves that directory to the registered project. An existing profile name
-keeps its registered root; changing that root is refused.
-
-The profile command refuses a root that overlaps another registered project's root. A new
-profile root stays below the primary project; an existing external registration can receive
-language settings by profile name.
-
 ### LSP profiles
 
-<VersionBadge version="v0.0.70" />
+<VersionBadge version="v0.0.71" />
 
-A project can keep separate package installations in its root and in `docs/`. Named profiles
-use registered projects so each directory has its own language configuration and symbol identities:
+A project can keep separate package installations in its root and in `docs/`. Define both
+language selections in the root `rift.toml`:
 
-<Tabs items={["rift.toml", "docs/rift.toml"]}>
+```toml
+[languages.rust.lsp]
+package_manager = "cargo"
 
-<Tab value="rift.toml">
+[profiles.docs]
+root = "docs"
 
-Register the documentation project in the primary project's configuration:
+[profiles.docs.languages.typescript.lsp]
+package_manager = "bun"
+
+[profiles.docs.languages."typescript:tsx".lsp]
+package_manager = "bun"
+```
+
+The `docs` profile starts its language server in `docs/`, using that directory's package
+installation. Profile source paths and language `include` and `exclude` patterns are relative
+to `docs/`. The primary project leaves the profile directory to that profile, so `all` returns
+each source once.
+
+Search selects the profile with `scope: "local#docs"`. Its symbol identities carry the
+`local%23docs` owner, for example `rift://symbol/local%23docs/typescript/page/beacon`.
+The primary project's symbols keep the `local` owner. A `query` search with `scope: "all"`
+includes the primary project, profiles, registered extra projects, and global facts.
+
+After creating a named profile, reconnect the MCP client before searching its scope or
+including it in `all` results. Existing profiles accept language selections on later requests.
+
+Profile roots stay below the root project and cannot overlap another profile root. Each profile
+selects its own languages and can refer to shared top-level `lsp` definitions. Rift reads the
+profile from the root configuration when serving that directory. A profile can override
+dependency and execution settings. Profile roots hold at most 63 path segments and cannot cross
+a Git repository boundary; register a separate repository through `[mcp.extra]`.
+
+Profiles inherit shared server and provider settings. Profile servers use the default port
+range; the root's `server.port` and `server.port_range` apply to the primary project.
+
+`[mcp.extra]` registers additional workspaces, each with its own root configuration:
 
 ```toml
 [mcp.extra]
-docs = "docs"
-
-[source]
-exclude = ["docs/**"]
-
-[languages.typescript]
-lsp.command = ["node_modules/.bin/typescript-language-server", "--stdio"]
+cloud = "../rift-cloud"
 ```
 
-</Tab>
-
-<Tab value="docs/rift.toml">
-
-Select the documentation project's language server from its own configuration:
-
-```toml
-[languages.typescript]
-lsp.command = ["node_modules/.bin/typescript-language-server", "--stdio"]
-```
-
-</Tab>
-
-</Tabs>
-
-The `docs` registration starts a server rooted at `docs/`, whose language server reads that
-directory's package installation. Its symbols carry the `local@docs` owner, while the primary
-project's symbols carry `local`.
-
-Search selects the registered project with `scope: "local@docs"`.
-A `query` search with `scope: "all"` includes both projects and global facts.
-
-After creating a named profile, reconnect the MCP client before searching its registered scope
-or including it in `all` results. Existing projects accept language selections on later requests.
-
-Relative registration paths start at the primary project root. Each registered project reads its
-own `rift.toml`; its `include` and `exclude` patterns are relative to its own root. Registrations
-in that file are not imported recursively.
-
-The primary project's `[source] exclude` entry leaves `docs/` to its registered project.
+Search selects that workspace with `scope: "local@cloud"`; its symbols carry `local@cloud`.
+Extra registrations do not define profiles. Rift imports direct extra registrations only.
 
 ### Language engines
 
@@ -819,10 +820,10 @@ engine in, so nothing is installed or started beside the server:
 embedded = "ty"
 ```
 
-`embedded` names an engine this build carries; `ty` serves Python. Exactly one of `command`
-and `embedded` is present, and an embedded engine takes no `environment` and no
+`embedded` names an engine this build carries; `ty` serves Python. Exactly one of `command`,
+`package_manager`, and `embedded` is present. An embedded engine takes no `environment` and no
 `initialization_options`: both configure a spawned process, so a table naming them beside
-`embedded` is refused rather than silently ignored.
+`embedded` is refused.
 
 The embedded engine reads ty's configuration from the served tree alone: the root's own `ty.toml`,
 or the `[tool.ty]` table in its `pyproject.toml`. A `ty.toml` or `pyproject.toml` in a directory
@@ -903,9 +904,17 @@ command = ["tombi", "lsp"]
 
 `lsp` is the subcommand that starts tombi's language server over stdio.
 
-A language server that ships as a package runs from workspace-installed bytes. Pin both packages
-in `package.json`, install from its lockfile, and point `command` at the local executable, the way
-`[lsp.typescript]` above does. This avoids paying package runner resolution at startup.
+`package_manager` selects an installed language server for that manager's language family:
+
+- `cargo` serves Rust through `rust-analyzer`. When `rustup` and a toolchain pin are available,
+  Rift runs `rustup run <channel> rust-analyzer` with automatic installation disabled.
+- `bun` and `npm` serve JavaScript, TypeScript, and `typescript:tsx` through the installed native
+  TypeScript executable with `--lsp --stdio`, falling back to `typescript-language-server --stdio`.
+- `uv` serves Python through `ty server`, falling back to `pyright-langserver --stdio`.
+
+Rift resolves these executables from the selected project's installation and then `PATH`, and
+starts them directly. The selection installs no packages. Pin the language server and its runtime
+packages in the project's manifest and install them before using the language server.
 
 typescript-language-server refuses its initialize request unless a `typescript` package resolves
 from the workspace root, answering `Could not find a valid TypeScript installation`. Install that

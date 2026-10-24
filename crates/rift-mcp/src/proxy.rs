@@ -113,7 +113,8 @@ pub async fn serve_proxy(
         "MCP proxy starting"
     );
     let configuration = rift_server::load_configuration(root)?;
-    let registrations = extra::Registrations::accept(root, &configuration.mcp, extra, home)?;
+    let registrations = extra::Registrations::accept(root, &configuration.mcp, extra, home)?
+        .with_profiles(root, &configuration)?;
     let identity = crate::identity::product_identity(checkout)
         .await
         .map_err(|error| errors::mcp::proxy_identity_failed().source(error).error())?;
@@ -421,10 +422,7 @@ impl RiftProxy {
                     .and_then(|arguments| arguments.get("id"))
                     .and_then(serde_json::Value::as_str)
                     .and_then(|id| rift_protocol::identity::SymbolIdentity::parse(id).ok())
-                    .and_then(|identity| match identity.owner() {
-                        SymbolOwner::NamedLocal { name } => Some(name.clone()),
-                        _ => None,
-                    })
+                    .and_then(|identity| identity::backend_key(identity.owner()))
                     .unwrap_or_else(|| "local".to_owned())
             },
             |selected| {
@@ -455,7 +453,14 @@ impl RiftProxy {
             .map(rift_protocol::identity::SymbolIdentity::parse)
             .transpose()?
             .map(|identity| identity.owner().clone())
-            .filter(|owner| matches!(owner, SymbolOwner::Local | SymbolOwner::NamedLocal { .. }));
+            .filter(|owner| {
+                matches!(
+                    owner,
+                    SymbolOwner::Local
+                        | SymbolOwner::NamedLocal { .. }
+                        | SymbolOwner::ProfileLocal { .. }
+                )
+            });
         let scope = arguments
             .get("scope")
             .map(|value| serde_json::from_value::<rift_protocol::read::SearchScope>(value.clone()))
@@ -465,6 +470,9 @@ impl RiftProxy {
             Some(rift_protocol::read::SearchScope::Local) => Some(SymbolOwner::Local),
             Some(rift_protocol::read::SearchScope::NamedLocal { name }) => {
                 Some(SymbolOwner::NamedLocal { name: name.clone() })
+            }
+            Some(rift_protocol::read::SearchScope::ProfileLocal { name }) => {
+                Some(SymbolOwner::ProfileLocal { name: name.clone() })
             }
             _ => None,
         };
@@ -484,7 +492,9 @@ impl RiftProxy {
         }
         let selected = scope_owner.or(identity_owner);
         match selected {
-            Some(SymbolOwner::NamedLocal { name }) => {
+            Some(owner @ (SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. })) => {
+                let name =
+                    identity::backend_key(&owner).expect("named local owner has backend key");
                 if matches!(scope, Some(rift_protocol::read::SearchScope::Global))
                     || (traversal.is_none()
                         && matches!(scope, Some(rift_protocol::read::SearchScope::All)))

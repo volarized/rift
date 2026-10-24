@@ -1,23 +1,24 @@
 //! Typed language server configuration edits.
 
-use std::fmt::Write as _;
 use std::path::Path;
 
 use clap::Args;
 use rift_core::acceptance::{ConfigurationEnvironment, accept_configuration};
 use rift_error::{RiftError, errors};
-use rift_protocol::configuration::{CONFIGURATION_FILE_BYTES_MAX, WorkspaceConfiguration};
+use rift_protocol::configuration::{
+    CONFIGURATION_FILE_BYTES_MAX, WorkspaceConfiguration, subtree_pattern,
+};
 use toml_edit::{Array, Document, InlineTable, Item, TableLike, Value};
 
 #[derive(Debug, Default, Args)]
 pub(crate) struct LspSetOptions {
     /// Exact language identity, such as typescript or typescript:tsx.
-    #[arg(long, requires = "lsp_program")]
+    #[arg(long)]
     pub(super) language: Option<String>,
-    /// Named local project registered in mcp.extra; absence selects the primary project.
+    /// Named profile in this project; absence selects the primary project.
     #[arg(long, requires = "language")]
     pub(super) profile: Option<String>,
-    /// Workspace-relative folder for a new named local project.
+    /// Workspace-relative folder for a new named profile.
     #[arg(long, requires = "profile")]
     pub(super) profile_root: Option<String>,
     /// Language path pattern within the selected project, repeated for additional patterns.
@@ -29,6 +30,9 @@ pub(crate) struct LspSetOptions {
     /// Executable name or relative path, started directly without a shell.
     #[arg(long, requires = "language")]
     pub(super) lsp_program: Option<String>,
+    /// Installation layout selecting an installed language server without an executable path.
+    #[arg(long, requires = "language", conflicts_with = "lsp_program", value_parser = ["cargo", "bun", "npm", "uv"])]
+    pub(super) lsp_package_manager: Option<String>,
     /// Literal process argument, repeated for additional arguments.
     #[arg(long, require_equals = true, requires = "lsp_program")]
     pub(super) lsp_argument: Vec<String>,
@@ -36,26 +40,49 @@ pub(crate) struct LspSetOptions {
 
 impl LspSetOptions {
     pub(super) fn edit(&self, path: &Path, raw: &str) -> Result<String, RiftError> {
+        self.edit_with_prefix(path, raw, &[])
+    }
+
+    pub(super) fn edit_with_prefix(
+        &self,
+        path: &Path,
+        raw: &str,
+        prefix: &[&str],
+    ) -> Result<String, RiftError> {
         let identity = self.language.as_deref().ok_or_else(|| {
             invalid(
                 path,
                 "select --language and --lsp-program, or --telemetry.disabled",
             )
         })?;
-        let program = self
-            .lsp_program
-            .as_deref()
-            .ok_or_else(|| invalid(path, "supply --lsp-program with --language"))?;
+        let (selector, value) = match (
+            self.lsp_program.as_deref(),
+            self.lsp_package_manager.as_deref(),
+        ) {
+            (Some(program), None) => {
+                let mut command = Array::new();
+                command.push(program);
+                for argument in &self.lsp_argument {
+                    command.push(argument.as_str());
+                }
+                ("command", Value::Array(command))
+            }
+            (None, Some(manager)) if self.lsp_argument.is_empty() => {
+                ("package_manager", Value::from(manager))
+            }
+            _ => {
+                return Err(invalid(
+                    path,
+                    "supply exactly one of --lsp-program and --lsp-package-manager with --language",
+                ));
+            }
+        };
         if raw.len() as u64 > CONFIGURATION_FILE_BYTES_MAX {
             return Err(invalid(path, "configuration exceeds the file byte limit"));
         }
         let document = Document::parse(raw).map_err(|error| invalid(path, &error.to_string()))?;
-        let mut command = Array::new();
-        command.push(program);
-        for argument in &self.lsp_argument {
-            command.push(argument.as_str());
-        }
-        let keys = ["languages", identity, "lsp"];
+        let mut keys = prefix.to_vec();
+        keys.extend(["languages", identity, "lsp"]);
         let selected = super::editing::lookup(&document, &keys);
         let mut rendered = if selected.is_some_and(|item| item.as_value().is_some()) {
             let mut lsp = selected
@@ -63,18 +90,22 @@ impl LspSetOptions {
                 .cloned()
                 .unwrap_or_else(InlineTable::new);
             let table = &mut lsp as &mut dyn TableLike;
-            table.insert("command", Item::Value(Value::Array(command)));
-            table.remove("embedded");
+            for key in ["command", "package_manager", "embedded"] {
+                table.remove(key);
+            }
+            table.insert(selector, Item::Value(value));
             super::editing::set(path, raw, &keys, Value::InlineTable(lsp))?
         } else {
-            let rendered =
-                super::editing::remove(path, raw, &["languages", identity, "lsp", "embedded"])?;
-            super::editing::set(
-                path,
-                &rendered,
-                &["languages", identity, "lsp", "command"],
-                Value::Array(command),
-            )?
+            let mut rendered = raw.to_owned();
+            for key in ["command", "package_manager", "embedded"] {
+                if key != selector {
+                    let mut removed = keys.clone();
+                    removed.push(key);
+                    rendered = super::editing::remove(path, &rendered, &removed)?;
+                }
+            }
+            keys.push(selector);
+            super::editing::set(path, &rendered, &keys, value)?
         };
         for (key, patterns) in [("include", &self.include), ("exclude", &self.exclude)] {
             if !patterns.is_empty() {
@@ -82,40 +113,17 @@ impl LspSetOptions {
                 for pattern in patterns {
                     array.push(pattern.as_str());
                 }
-                rendered = super::editing::set(
-                    path,
-                    &rendered,
-                    &["languages", identity, key],
-                    Value::Array(array),
-                )?;
+                let mut keys = prefix.to_vec();
+                keys.extend(["languages", identity, key]);
+                rendered = super::editing::set(path, &rendered, &keys, Value::Array(array))?;
             }
-        }
-        validate(&rendered)?;
-        Ok(rendered)
-    }
-
-    pub(super) fn register(
-        &self,
-        path: &Path,
-        raw: &str,
-        root: &str,
-        exclusion: Option<&str>,
-    ) -> Result<String, RiftError> {
-        let profile = self
-            .profile
-            .as_deref()
-            .ok_or_else(|| invalid(path, "supply --profile for a named local project"))?;
-        let mut rendered =
-            super::editing::set(path, raw, &["mcp", "extra", profile], Value::from(root))?;
-        if let Some(root) = exclusion {
-            rendered = exclude_project(&rendered, path, root)?;
         }
         validate(&rendered)?;
         Ok(rendered)
     }
 }
 
-fn exclude_project(raw: &str, path: &Path, root: &str) -> Result<String, RiftError> {
+pub(super) fn exclude_project(raw: &str, path: &Path, root: &str) -> Result<String, RiftError> {
     let document = Document::parse(raw).map_err(|error| invalid(path, &error.to_string()))?;
     let mut excluded = match super::editing::lookup(&document, &["source", "exclude"]) {
         Some(item) => item
@@ -132,27 +140,6 @@ fn exclude_project(raw: &str, path: &Path, root: &str) -> Result<String, RiftErr
         excluded.push(pattern);
     }
     super::editing::set(path, raw, &["source", "exclude"], Value::Array(excluded))
-}
-
-/// Quotes each ignore metacharacter before selecting the directory's descendants.
-fn subtree_pattern(root: &str) -> String {
-    let mut pattern = String::with_capacity(root.len());
-    for character in root.chars() {
-        match character {
-            '!' | '#' if pattern.is_empty() => {
-                let _ = write!(pattern, "{{{character},{character}}}");
-            }
-            '*' => pattern.push_str("[*]"),
-            '?' => pattern.push_str("[?]"),
-            '[' => pattern.push_str("[[]"),
-            ']' => pattern.push_str("[]]"),
-            '{' => pattern.push_str("[{]"),
-            '}' => pattern.push_str("[}]"),
-            _ => pattern.push(character),
-        }
-    }
-    pattern.push_str("/**");
-    pattern
 }
 
 fn validate(raw: &str) -> Result<(), RiftError> {
@@ -290,22 +277,6 @@ mod tests {
     }
 
     #[test]
-    fn test_registration_keeps_unrelated_crlf_bytes() -> Result<(), RiftError> {
-        let raw = "# retained\r\n[source]\r\nexclude = ['cache/**'] # source\r\n[languages.rust]\r\nlsp.command = 'rust-analyzer'";
-        let rendered =
-            options(Some("docs")).register(Path::new("rift.toml"), raw, "docs", Some("docs"))?;
-        assert!(
-            rendered.contains("# retained\r\n[source]\r\n"),
-            "{rendered:?}"
-        );
-        assert!(
-            rendered.contains(" # source\r\n[languages.rust]\r\nlsp.command = 'rust-analyzer'"),
-            "{rendered:?}"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn test_inline_process_replacement_retains_environment_and_timeouts() -> Result<(), RiftError> {
         let raw = "[languages.typescript]\nlsp = { command = ['old'], environment = { TRACE = 'literal # value' }, request_timeout = '2s' }\n";
         let rendered = options(None).edit(Path::new("rift.toml"), raw)?;
@@ -323,6 +294,34 @@ mod tests {
             lsp.request_timeout,
             rift_protocol::configuration::Duration::from_millis(2_000)
         );
+        Ok(())
+    }
+    #[test]
+    fn package_manager_replaces_command_and_preserves_process_settings() -> Result<(), RiftError> {
+        let raw = "[languages.typescript]\nlsp = { command = ['old'], environment = { TRACE = 'yes' }, request_timeout = '2s' }\n";
+        let mut options = options(None);
+        options.lsp_program = None;
+        options.lsp_argument.clear();
+        options.lsp_package_manager = Some("bun".to_owned());
+        let rendered = options.edit(Path::new("rift.toml"), raw)?;
+        let accepted = accept_configuration::<WorkspaceConfiguration>(
+            Some(&rendered),
+            &ConfigurationEnvironment::default(),
+        )?;
+        let lsp = accepted
+            .configuration()
+            .resolve_language_lsp("typescript")
+            .expect("configured process")
+            .configuration;
+        assert_eq!(
+            lsp.package_manager,
+            Some(rift_protocol::configuration::LspPackageManager::Bun)
+        );
+        assert!(lsp.command.is_none());
+        assert_eq!(lsp.environment["TRACE"], "yes");
+        assert_eq!(lsp.request_timeout.milliseconds(), 2_000);
+        let rendered = self::options(None).edit(Path::new("rift.toml"), &rendered)?;
+        assert!(!rendered.contains("package_manager"));
         Ok(())
     }
 }

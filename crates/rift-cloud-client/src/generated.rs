@@ -58,7 +58,7 @@ static REGEX_PARAMETER_NODE: std::sync::LazyLock<regex::Regex> = std::sync::Lazy
 });
 static REGEX_SYMBOL_ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-            "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+            "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
         )
         .expect("invalid regex")
 });
@@ -94,7 +94,7 @@ pub struct PackageIdentity {
 }
 /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
 pub type SourceUnitId = String;
-/// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+/// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolId = String;
 /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
 /// and is connected through Relationship.
@@ -110,7 +110,7 @@ pub type SymbolId = String;
 )]
 #[serde(default)]
 pub struct Symbol {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: Option<String>,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
@@ -133,7 +133,7 @@ pub struct Symbol {
     /// package.
     #[validate(nested)]
     pub origin: Option<SymbolOrigin>,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub container: Option<String>,
     /// Language keywords qualifying the declaration: `export`, `async`, `const`. Absent
@@ -862,7 +862,7 @@ pub struct TypeExpression {
     /// The type as it is written: `Optional[Config]`, `&mut [u8]`, `string | null`.
     #[validate(length(min = 1u64))]
     pub source: String,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub resolved: Option<String>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
@@ -889,7 +889,7 @@ pub struct SignatureLink {
     /// validation tests instead.
     #[validate(nested)]
     pub range: TextRange,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub symbol: String,
 }
@@ -1480,7 +1480,7 @@ pub struct DocumentationBlock {
     /// Existing ranked documents intersecting this block, in source order.
     #[validate(nested)]
     pub chunks: Option<Vec<DocumentationChunk>>,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub symbol: Option<String>,
 }
@@ -1667,7 +1667,7 @@ pub struct DocumentationReference {
     pub identity: String,
     /// Full lowercase SHA-256 digest for documentation content and identity.
     pub block: String,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub target: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts
     /// from whatever its toolchain counts in at its own boundary, so two toolchains' column
@@ -2244,7 +2244,7 @@ pub struct SearchHit {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchTraversal {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub seed: Option<String>,
     /// Which edge direction a search traversal walks from each visited symbol. A language
@@ -2259,7 +2259,7 @@ pub struct SearchTraversal {
     #[validate(range(min = 1, max = 2))]
     #[default(Some(1u64))]
     pub depth: Option<u64>,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: Option<String>,
 }
@@ -2581,7 +2581,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct Relationship {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub from: String,
     /// A provider-local kind preserving the construct name used by that language implementation.
@@ -2591,7 +2591,7 @@ pub struct Relationship {
     /// and `use` alike.
     #[validate(length(min = 1u64))]
     pub facets: Vec<RelationshipFacet>,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
     /// The nodes this edge was read from. Absent when empty.
@@ -2912,7 +2912,7 @@ impl<'de> serde::Deserialize<'de> for GetSymbolInclude {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolParams {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: String,
     /// Requested projections. Omitted defaults to source; an empty list requests none.
@@ -3176,7 +3176,7 @@ pub struct ReadWarning {
     pub files: Option<Vec<String>>,
     /// The files past `max_chunk` the request's `paths` reach.
     pub skipped: Option<u64>,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: Option<String>,
     /// Providers whose Contribution carries a differing value for at least one
     /// presentation field, sorted and deduplicated.
@@ -3493,7 +3493,7 @@ pub struct SourceUnitSpan {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolAlternative {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// The candidate's displayed name.
     pub name: String,
@@ -3550,7 +3550,7 @@ pub struct SymbolDeclaration {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: String,
     /// Revisions that touched the symbol, newest first.
     pub versions: Vec<SymbolVersion>,
@@ -3560,7 +3560,7 @@ pub struct SymbolHistory {
     /// revision, so revisions older than the listed ones may have touched the symbol.
     pub complete: bool,
 }
-/// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+/// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolIdentity = String;
 /// The structural parts compared when an alternative was selected.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
@@ -3631,7 +3631,7 @@ impl<'de> serde::Deserialize<'de> for SymbolMatchContext {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolNotFound {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// Actual structural candidates, never substitutions for the requested object.
     pub alternatives: Vec<SymbolAlternative>,
@@ -5299,7 +5299,7 @@ pub struct PackageSearchItemVariant2 {
 pub struct DeclarationPositionResultObject {
     /// One exact position in a project, package or runtime source unit.
     pub position: SourcePosition,
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// A provider-local kind preserving the construct name used by that language implementation.
     pub kind: String,
@@ -5420,7 +5420,7 @@ pub struct GetSymbolResultObject2 {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct GetSymbolResultObject3 {
-    /// Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
+    /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,

@@ -6,7 +6,7 @@
 //! the file and treating a missing one as no document, and the workspace's
 //! own value bounds.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use rift_core::acceptance::CONFIGURATION_FILE_BYTES_MAX;
 use rift_core::acceptance::{ConfigurationEnvironment, NamedMembers, accept_configuration_naming};
@@ -16,9 +16,12 @@ use rift_protocol::configuration::{ConfigurationViolation, WorkspaceConfiguratio
 
 use crate::history_fill::release_matcher;
 
-/// Reads `<root>/rift.toml` and the process's `RIFT_*` variables into the
-/// validated configuration. A missing file is no document: the defaults, and
-/// any variable overriding them.
+pub(crate) const CONFIGURATION_PARENTS_MAX: usize =
+    rift_protocol::configuration::PROFILE_ROOT_DEPTH_MAX + 1;
+
+/// Reads the repository root's `rift.toml` and the process's `RIFT_*` variables
+/// into the selected project's configuration. A profile uses its root-file
+/// settings. A missing file uses defaults and any variable overriding them.
 ///
 /// # Errors
 ///
@@ -27,11 +30,123 @@ use crate::history_fill::release_matcher;
 /// variable naming a key is malformed or names no key; or when a value breaks
 /// a documented bound.
 pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, RiftError> {
-    let document = read_document(root)?;
-    accept_workspace(
+    let normalized = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = normalized.as_path();
+    let file = configuration_file(root);
+    let configuration_root = file.parent().unwrap_or(root);
+    let document = read_document(configuration_root)?;
+    let configuration = accept_workspace(
         document.as_deref(),
         &ConfigurationEnvironment::from_process(),
-    )
+    )?;
+    if configuration_root == root {
+        validate_profile_roots(root, &configuration)?;
+        let configuration = configuration.with_profile_exclusions();
+        configuration
+            .validate()
+            .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
+        return Ok(configuration);
+    }
+    let selected =
+        std::fs::canonicalize(root).map_err(|error| profile_invalid("", &error.to_string()))?;
+    let profiles = profile_roots(configuration_root, &configuration)?;
+    profiles
+        .into_iter()
+        .find(|(_, path)| *path == selected)
+        .and_then(|(name, _)| configuration.for_profile(&name))
+        .map_or_else(
+            || accept_workspace(None, &ConfigurationEnvironment::from_process()),
+            Ok,
+        )
+}
+
+/// Returns the repository root configuration file for one selected project.
+/// At most 64 parent folders are inspected. Without Git metadata, the nearest
+/// configuration file defines the root; an absent file uses the project defaults.
+#[must_use]
+pub fn configuration_file(root: &Path) -> PathBuf {
+    let normalized = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let root = normalized.as_path();
+    let mut configuration = None;
+    for candidate in root.ancestors().take(CONFIGURATION_PARENTS_MAX) {
+        let path = candidate.join(WORKSPACE_CONFIGURATION_FILE);
+        if candidate.join(".git").exists() {
+            return path;
+        }
+        if configuration.is_none() && path.exists() {
+            configuration = Some(path);
+        }
+    }
+    configuration.unwrap_or_else(|| root.join(WORKSPACE_CONFIGURATION_FILE))
+}
+
+/// Resolves profiles to distinct folders below the root. Canonical paths cannot overlap.
+///
+/// # Errors
+/// Returns a configuration refusal for an unavailable, escaping, or overlapping folder.
+pub fn profile_roots(
+    root: &Path,
+    configuration: &WorkspaceConfiguration,
+) -> Result<std::collections::BTreeMap<String, PathBuf>, RiftError> {
+    if configuration.profiles.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+    let primary =
+        std::fs::canonicalize(root).map_err(|error| profile_invalid("", &error.to_string()))?;
+    let mut roots = std::collections::BTreeMap::<String, PathBuf>::new();
+    for (name, profile) in &configuration.profiles {
+        let path = std::fs::canonicalize(primary.join(&profile.root))
+            .map_err(|error| profile_invalid(name, &error.to_string()))?;
+        if path == primary || !path.starts_with(&primary) || !path.is_dir() {
+            return Err(profile_invalid(
+                name,
+                "profile root must name a folder below this project",
+            ));
+        }
+        if path != primary.join(&profile.root) {
+            return Err(profile_invalid(
+                name,
+                "profile root must use its canonical folder path",
+            ));
+        }
+        if path
+            .ancestors()
+            .take(CONFIGURATION_PARENTS_MAX)
+            .take_while(|folder| *folder != primary)
+            .any(|folder| folder.join(".git").exists())
+        {
+            return Err(profile_invalid(
+                name,
+                "profile root crosses a repository boundary; register the project in mcp.extra",
+            ));
+        }
+        if roots
+            .values()
+            .any(|other| other.starts_with(&path) || path.starts_with(other))
+        {
+            return Err(profile_invalid(
+                name,
+                "profile roots overlap; select separate project folders",
+            ));
+        }
+        roots.insert(name.clone(), path);
+    }
+    Ok(roots)
+}
+
+fn validate_profile_roots(
+    root: &Path,
+    configuration: &WorkspaceConfiguration,
+) -> Result<(), RiftError> {
+    profile_roots(root, configuration).map(|_| ())
+}
+
+fn profile_invalid(name: &str, detail: &str) -> RiftError {
+    errors::core::configuration_invalid()
+        .field("profiles")
+        .name(name)
+        .detail(detail)
+        .error()
 }
 
 /// The file's text, or `None` when the workspace has no `rift.toml`.
@@ -143,18 +258,19 @@ mod tests {
             [
                 ".claude/**",
                 ".agents/**",
+                ".codex/**",
                 "docs/public/**",
-                "plugins/claude/skills/**"
+                "plugins/claude/skills/**",
+                "dev/**",
+                "docs/**"
             ]
         );
         assert!(configuration.source.respect_gitignore);
     }
 
     /// Every `rift.toml` the repository keeps, by its path from the repository root.
-    const REPOSITORY_CONFIGURATIONS: [(&str, &str); 2] = [
-        ("docs/rift.toml", include_str!("../../../docs/rift.toml")),
-        ("rift.toml", include_str!("../../../rift.toml")),
-    ];
+    const REPOSITORY_CONFIGURATIONS: [(&str, &str); 1] =
+        [("rift.toml", include_str!("../../../rift.toml"))];
 
     /// A server started in any directory of this repository that holds a `rift.toml` reads
     /// it under the model this module validates against, so each one accepts cleanly.
@@ -472,5 +588,170 @@ download_timeout = "5m"
             accept_workspace(Some("[providers.syntax]\nmax_nodes = 1000\n"), &environment)
                 .expect("the variable's value is in bounds");
         assert_eq!(configuration.providers.syntax.max_nodes, 5_000_000);
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    #[test]
+    fn profiles_refuse_nested_repository_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("docs/.git"))?;
+        std::fs::write(
+            root.path().join("rift.toml"),
+            "[profiles.docs]\nroot = 'docs'\n",
+        )?;
+        let error =
+            load_configuration(root.path()).expect_err("nested repository must use mcp.extra");
+        assert!(error.to_string().contains("repository boundary"), "{error}");
+        Ok(())
+    }
+
+    #[test]
+    fn deepest_accepted_profile_loads_its_root_file() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        let relative =
+            std::iter::repeat_n("d", rift_protocol::configuration::PROFILE_ROOT_DEPTH_MAX)
+                .collect::<Vec<_>>()
+                .join("/");
+        std::fs::create_dir_all(root.path().join(&relative))?;
+        std::fs::write(
+            root.path().join("rift.toml"),
+            format!("[telemetry]\ndisabled = true\n[profiles.docs]\nroot = '{relative}'\n"),
+        )?;
+        assert!(
+            load_configuration(&root.path().join(&relative))?
+                .telemetry
+                .disabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derived_profile_exclusions_refuse_source_pattern_overflow()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        let patterns = (0..rift_protocol::source::SOURCE_PATTERNS_MAX)
+            .map(|index| format!("'cache-{index}/**'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            root.path().join("rift.toml"),
+            format!("[source]\nexclude = [{patterns}]\n[profiles.docs]\nroot = 'docs'\n"),
+        )?;
+        let error = load_configuration(root.path())
+            .expect_err("derived exclusions must stay within source bounds");
+        let context: std::collections::BTreeMap<_, _> = error.context().collect();
+        assert_eq!(
+            context.get("field").map(String::as_str),
+            Some("source.exclude")
+        );
+        assert_eq!(context.get("value").map(String::as_str), Some("513"));
+        Ok(())
+    }
+
+    #[test]
+    fn profiles_load_root_configuration_without_child_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join(".git"))?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        std::fs::write(
+            root.path().join("rift.toml"),
+            "[server]\nport = 39123\n[profiles.docs]\nroot = 'docs'\n[profiles.docs.languages.typescript]\nlsp.command = ['typescript-language-server', '--stdio']\n",
+        )?;
+        let primary = load_configuration(root.path())?;
+        assert!(
+            primary
+                .source
+                .exclude
+                .iter()
+                .any(|pattern| pattern.0 == "docs/**")
+        );
+        let profile = load_configuration(&root.path().join("docs"))?;
+        assert!(profile.languages["typescript"].lsp.is_some());
+        assert!(profile.source.exclude.is_empty());
+        assert_eq!(profile.server.port, None);
+        assert_eq!(profile.server.port_range, None);
+        assert!(profile.profiles.is_empty());
+        assert!(!root.path().join("docs/rift.toml").exists());
+        assert_eq!(
+            configuration_file(&root.path().join("docs")),
+            root.path().canonicalize()?.join("rift.toml")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_configuration_changes_follow_root_file() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        let path = root.path().join("rift.toml");
+        for disabled in [true, false] {
+            std::fs::write(
+                &path,
+                format!("[telemetry]\ndisabled = {disabled}\n[profiles.docs]\nroot = 'docs'\n"),
+            )?;
+            assert_eq!(
+                load_configuration(&root.path().join("docs"))?
+                    .telemetry
+                    .disabled,
+                disabled
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_child_folders_keep_defaults() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("docs/src"))?;
+        std::fs::write(
+            root.path().join("rift.toml"),
+            "[telemetry]\ndisabled = true\n[profiles.docs]\nroot = 'docs'\n",
+        )?;
+        assert_eq!(
+            load_configuration(&root.path().join("docs/src"))?,
+            WorkspaceConfiguration::default()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profiles_refuse_symlink_escapes_and_alias_overlap() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::create_dir(root.path().join("docs"))?;
+        symlink(outside.path(), root.path().join("escape"))?;
+        symlink(root.path().join("docs"), root.path().join("alias"))?;
+        for text in [
+            "[profiles.docs]\nroot = 'escape'\n",
+            "[profiles.docs]\nroot = 'docs'\n[profiles.alias]\nroot = 'alias'\n",
+        ] {
+            std::fs::write(root.path().join("rift.toml"), text)?;
+            assert!(load_configuration(root.path()).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn profile_search_stops_at_repository_boundary() -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::create_dir_all(root.path().join("nested/.git"))?;
+        std::fs::write(
+            root.path().join("rift.toml"),
+            "[telemetry]\ndisabled = true\n",
+        )?;
+        assert_eq!(
+            load_configuration(&root.path().join("nested"))?,
+            WorkspaceConfiguration::default()
+        );
+        Ok(())
     }
 }

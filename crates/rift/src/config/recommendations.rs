@@ -84,14 +84,20 @@ fn render(root: &Path, recommendations: Vec<LspRecommendation>) -> Result<String
             LspRecommendationStatus::Available {
                 program,
                 command,
-                profile,
+                scope,
             } => {
                 let _ = writeln!(output, "  executable: {program}\n  {command}");
-                if let Some(profile) = profile {
-                    let _ = writeln!(output, "  scope: local@{profile}");
-                    if root.join(&relative).starts_with(root) {
-                        let _ = writeln!(output, "  primary source excludes this project folder");
+                match scope {
+                    rift_protocol::read::SearchScope::ProfileLocal { name } => {
+                        let _ = writeln!(
+                            output,
+                            "  scope: local#{name}\n  primary source excludes this project folder"
+                        );
                     }
+                    rift_protocol::read::SearchScope::NamedLocal { name } => {
+                        let _ = writeln!(output, "  scope: local@{name}");
+                    }
+                    _ => {}
                 }
             }
         }
@@ -190,8 +196,8 @@ mod tests {
             output.contains("executable: .venv/bin/pyright-langserver"),
             "{output}"
         );
-        assert!(output.contains("scope: local@docs"), "{output}");
-        assert!(output.contains("scope: local@project-2"), "{output}");
+        assert!(output.contains("scope: local#docs"), "{output}");
+        assert!(output.contains("scope: local#project-1"), "{output}");
         assert!(output.contains("'--profile-root=docs space'"), "{output}");
         let commands: Vec<_> = output
             .lines()
@@ -204,8 +210,8 @@ mod tests {
         }
         let primary = rift_server::load_configuration(root.path())?;
         assert_eq!(primary.mcp.extra["project-1"], "reserved");
-        assert_eq!(primary.mcp.extra["docs"], "docs");
-        assert_eq!(primary.mcp.extra["project-2"], "docs space");
+        assert_eq!(primary.profiles["docs"].root, "docs");
+        assert_eq!(primary.profiles["project-1"].root, "docs space");
         assert!(primary.languages["python"].lsp.is_some());
         assert!(primary.languages["typescript"].lsp.is_some());
         for folder in ["docs", "docs space"] {
@@ -348,11 +354,75 @@ mod tests {
         };
         super::super::run(&command, root.path(), None)?;
         let primary = rift_server::load_configuration(root.path())?;
-        assert_eq!(primary.mcp.extra["docs"], "docs");
+        assert_eq!(primary.profiles["docs"].root, "docs");
         assert!(
             rift_server::load_configuration(&root.path().join("docs"))?.languages["typescript"]
                 .lsp
                 .is_some()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_same_name_extra_and_profile_recommendations_keep_owners_and_write_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use clap::Parser as _;
+        let root = tempfile::tempdir()?;
+        let external = tempfile::tempdir()?;
+        let extra = external.path().join("extra ' workspace");
+        let profile = root.path().join("docs");
+        for project in [&profile, &extra] {
+            std::fs::create_dir(project)?;
+            std::fs::write(project.join("package.json"), "{}")?;
+            std::fs::write(project.join("page.ts"), "export const page = 1;")?;
+            local_executable(project, "node_modules/.bin/typescript-language-server")?;
+        }
+        let saved = toml_edit::Value::from(extra.to_string_lossy().as_ref());
+        let primary_path = root.path().join("rift.toml");
+        let original = format!("[mcp.extra]\ndocs = {saved}\n[profiles.docs]\nroot = 'docs'\n");
+        std::fs::write(&primary_path, &original)?;
+        let output = recommend(root.path())?;
+        assert!(output.contains("scope: local@docs"), "{output}");
+        assert!(output.contains("scope: local#docs"), "{output}");
+        let command = output
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with("cd "))
+            .ok_or("extra recommendation missing")?;
+        assert!(!command.contains("--profile"), "{command}");
+        let parsed = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!("rift() {{ pwd; printf '%s\\0' \"$@\"; }}; {command}"),
+            ])
+            .current_dir(root.path())
+            .output()?;
+        assert!(parsed.status.success(), "{parsed:?}");
+        let parsed = String::from_utf8(parsed.stdout)?;
+        let (directory, arguments) = parsed.split_once('\n').ok_or("missing extra cwd")?;
+        assert_eq!(
+            std::fs::canonicalize(directory)?,
+            std::fs::canonicalize(&extra)?
+        );
+        let cli = crate::Cli::try_parse_from(
+            std::iter::once("rift").chain(arguments.split('\0').filter(|value| !value.is_empty())),
+        )?;
+        let Some(crate::CliCommand::Config { command }) = cli.command else {
+            panic!("extra command must parse as config set");
+        };
+        super::super::run(&command, std::path::Path::new(directory), None)?;
+        assert_eq!(std::fs::read_to_string(primary_path)?, original);
+        assert!(!profile.join("rift.toml").exists());
+        assert!(
+            rift_server::load_configuration(&extra)?.languages["typescript"]
+                .lsp
+                .is_some()
+        );
+        assert!(
+            rift_server::load_configuration(root.path())?.profiles["docs"]
+                .languages
+                .is_empty()
         );
         Ok(())
     }

@@ -1946,20 +1946,20 @@
         ]
       },
       "SymbolId": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 8192,
-        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
-        "not": {
-          "pattern": "/\\.{1,2}(?:/|~|$)"
-        },
-        "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+        "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://symbol/local/rust/app/parser/parse",
           "rift://symbol/local@cloud/rust/app/load",
           "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
           "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
-        ]
+        ],
+        "maxLength": 8192,
+        "minLength": 1,
+        "not": {
+          "pattern": "/\\.{1,2}(?:/|~|$)"
+        },
+        "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+        "type": "string"
       },
       "Symbol": {
         "type": "object",
@@ -2938,8 +2938,6 @@
         "type": "object"
       },
       "SearchScope": {
-        "type": "string",
-        "maxLength": 8192,
         "anyOf": [
           {
             "enum": [
@@ -2949,17 +2947,22 @@
             ]
           },
           {
-            "pattern": "^local(?:@[a-z][a-z0-9_-]*)?$",
             "not": {
               "enum": [
                 "local@local",
                 "local@global",
-                "local@all"
+                "local@all",
+                "local#local",
+                "local#global",
+                "local#all"
               ]
-            }
+            },
+            "pattern": "^local(?:[@#][a-z][a-z0-9_-]*)?$"
           }
         ],
-        "description": "Which corpus a read searches. A named local scope requires an extra project accepted by the current connection."
+        "description": "Which corpus a read searches. local@name selects an accepted extra project; local#name selects a root-defined profile.",
+        "maxLength": 8192,
+        "type": "string"
       },
       "PackageSearchRequest": {
         "additionalProperties": false,
@@ -6786,20 +6789,20 @@
         "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The timeline follows first parents from the served revision, or the selected\nreleases in version order, through the revisions the history store holds, and follows\nthe declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary."
       },
       "SymbolIdentity": {
-        "type": "string",
-        "minLength": 1,
-        "maxLength": 8192,
-        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
-        "not": {
-          "pattern": "/\\.{1,2}(?:/|~|$)"
-        },
-        "description": "Canonical logical symbol identity with local, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+        "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://symbol/local/rust/app/parser/parse",
           "rift://symbol/local@cloud/rust/app/load",
           "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
           "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
-        ]
+        ],
+        "maxLength": 8192,
+        "minLength": 1,
+        "not": {
+          "pattern": "/\\.{1,2}(?:/|~|$)"
+        },
+        "pattern": "^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
+        "type": "string"
       },
       "SymbolMatchContext": {
         "description": "The structural parts compared when an alternative was selected.",

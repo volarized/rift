@@ -49,6 +49,24 @@ impl Registrations {
         })
     }
 
+    pub(super) fn with_profiles(
+        mut self,
+        root: &Path,
+        configuration: &rift_protocol::configuration::WorkspaceConfiguration,
+    ) -> Result<Self, RiftError> {
+        for (name, path) in rift_server::profile_roots(root, configuration)? {
+            if self.roots.values().any(|extra| extra == &path) {
+                return errors::core::configuration_invalid()
+                    .field("profiles")
+                    .name(name)
+                    .detail("profile and extra workspace name the same canonical root")
+                    .fail();
+            }
+            self.roots.insert(format!("#{name}"), path);
+        }
+        Ok(self)
+    }
+
     pub(super) fn primary_root(&self) -> Option<&Path> {
         self.primary.as_deref()
     }
@@ -74,7 +92,13 @@ impl Registrations {
                 .field(field)
                 .accepted(
                     self.names()
-                        .map(|name| format!("local@{name}"))
+                        .map(|name| {
+                            if name.starts_with('#') {
+                                format!("local{name}")
+                            } else {
+                                format!("local@{name}")
+                            }
+                        })
                         .collect::<Vec<_>>()
                         .join(", "),
                 )

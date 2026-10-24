@@ -5,6 +5,9 @@ use rift_protocol::symbol_read::GetSymbolResult;
 
 pub(super) fn public_owner(owner: &SymbolOwner, backend: &str) -> Result<SymbolOwner, RiftError> {
     let owner = match owner {
+        SymbolOwner::Local if backend.starts_with('#') => SymbolOwner::ProfileLocal {
+            name: backend[1..].to_owned(),
+        },
         SymbolOwner::Local if backend != "local" && backend != "global" => {
             SymbolOwner::NamedLocal {
                 name: backend.to_owned(),
@@ -14,6 +17,14 @@ pub(super) fn public_owner(owner: &SymbolOwner, backend: &str) -> Result<SymbolO
     };
     owner.validate()?;
     Ok(owner)
+}
+
+pub(super) fn backend_key(owner: &SymbolOwner) -> Option<String> {
+    match owner {
+        SymbolOwner::NamedLocal { name } => Some(name.clone()),
+        SymbolOwner::ProfileLocal { name } => Some(format!("#{name}")),
+        _ => None,
+    }
 }
 
 fn with_owner(identity: &SymbolIdentity, owner: SymbolOwner) -> Result<SymbolId, RiftError> {
@@ -34,10 +45,15 @@ pub(super) fn dispatch_id(id: &SymbolId, backend: &str) -> Result<SymbolId, Rift
         SymbolOwner::NamedLocal { name } if name == backend => {
             with_owner(&identity, SymbolOwner::Local)
         }
-        SymbolOwner::NamedLocal { .. } => errors::server::read_invalid()
-            .field("id")
-            .violation("symbol owner does not match the accepted project")
-            .fail(),
+        SymbolOwner::ProfileLocal { name } if backend.strip_prefix('#') == Some(name.as_str()) => {
+            with_owner(&identity, SymbolOwner::Local)
+        }
+        SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. } => {
+            errors::server::read_invalid()
+                .field("id")
+                .violation("symbol owner does not match the accepted project")
+                .fail()
+        }
         _ => Ok(id.clone()),
     }
 }
@@ -226,6 +242,28 @@ mod tests {
         assert!(qualified.as_str().starts_with("rift://symbol/local@cloud/"));
         assert_eq!(dispatch_id(&qualified, "cloud")?, original);
         assert!(dispatch_id(&qualified, "other").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn profile_identity_roundtrip_keeps_extra_with_same_name_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = SymbolId::parse(&format!(
+            "rift://symbol/local/rust/app/name%2Fpart~2?rev={}",
+            "a".repeat(64)
+        ))?;
+        let mut profile = original.clone();
+        let mut extra = original.clone();
+        qualify_id(&mut profile, "#docs")?;
+        qualify_id(&mut extra, "docs")?;
+        assert!(profile.as_str().starts_with("rift://symbol/local%23docs/"));
+        assert!(extra.as_str().starts_with("rift://symbol/local@docs/"));
+        assert_ne!(profile, extra);
+        assert_eq!(dispatch_id(&profile, "#docs")?, original);
+        assert_eq!(dispatch_id(&extra, "docs")?, original);
+        assert!(dispatch_id(&profile, "docs").is_err());
+        assert!(dispatch_id(&extra, "#docs").is_err());
+        assert!(dispatch_id(&profile, "#other").is_err());
         Ok(())
     }
 

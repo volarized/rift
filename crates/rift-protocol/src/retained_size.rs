@@ -13,7 +13,9 @@ impl GetSize for crate::identity::SymbolOwner {
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         match self {
             Self::Local => (0, tracker),
-            Self::NamedLocal { name } => name.get_heap_size_with_tracker(tracker),
+            Self::NamedLocal { name } | Self::ProfileLocal { name } => {
+                name.get_heap_size_with_tracker(tracker)
+            }
             Self::Package {
                 manager,
                 registry,

@@ -369,6 +369,12 @@ pub(crate) fn rustc_version(stdout: &str) -> Option<String> {
 /// the TOML form or one bare channel line.
 #[must_use]
 pub(crate) fn rust_toolchain_pin(text: &str, legacy: bool) -> Option<Pin> {
+    rust_toolchain_channel(text, legacy).map(|channel| rust_channel_pin(&channel))
+}
+
+/// The unmodified channel selected by a TOML or legacy Rust toolchain file.
+#[must_use]
+pub fn rust_toolchain_channel(text: &str, legacy: bool) -> Option<String> {
     let channel = match text.parse::<toml::Table>() {
         Ok(table) => table
             .get("toolchain")?
@@ -379,7 +385,7 @@ pub(crate) fn rust_toolchain_pin(text: &str, legacy: bool) -> Option<Pin> {
         Err(_) if legacy => first_line(text).trim().to_owned(),
         Err(_) => return None,
     };
-    Some(rust_channel_pin(&channel))
+    Some(channel)
 }
 
 /// A rustup channel sorted, its host suffix dropped: `1.98-aarch64-apple-darwin` is `1.98`.

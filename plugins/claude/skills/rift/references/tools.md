@@ -66,8 +66,8 @@ revision, or the working tree, hold differently, in place of `query` and `traver
 combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
 tree: `global` answers collected package and runtime facts selected by the project's
 dependency context. Explicit `packages` replaces versions of named packages or adds
-packages the context lacks. `local@name` selects an accepted extra project; `all` merges the primary
-project, accepted extra projects, and global results. `target: "commit"` matches
+packages the context lacks. `local@name` selects an accepted extra project; `local#name` selects a root-defined profile.
+`all` merges the primary project, profiles, accepted extra projects, and global results. `target: "commit"` matches
 `query` alone against the messages of the commits the history store holds.
 Use `get_symbol` with an exact canonical identity returned by search.
 For a current-tree search, the published workspace is resolved exactly once and

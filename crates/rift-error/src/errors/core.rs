@@ -270,7 +270,7 @@ __rift_error_definition!(
 __rift_error_definition!(
     configuration_lsp_engine_selection_conflict,
     slug = "rift.core.configuration_lsp_engine_selection_conflict",
-    message = "LSP table selects command and embedded engines",
+    message = "LSP table selects more than one engine",
     action = "correct the reported configuration field, then retry",
     fields = {
         fields: optional(string),
