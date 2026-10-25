@@ -19,7 +19,7 @@ from rift_dev.check_artifact import (
 )
 from rift_dev.log_records import parse_line
 from rift_dev.nextest_run import retained_collector
-from rift_dev.query import bindings, declaration_request, iri, literal
+from rift_dev.query import bindings, declaration_request, iri, literal, quoted
 from rift_dev.rift_test_client import (
     Client,
     Server,
@@ -58,16 +58,40 @@ retry = { attempts = 12, delay = "250ms", delay_limit = "2s" }
 
 
 async def check_embedded_references(client: Client, root: Path) -> None:
-    """Require the embedded engine to resolve a caller through a read request."""
-    seed = symbol_id(await symbol_hit(client, "serve", "python"))
-    caller = symbol_id(await symbol_hit(client, "caller", "python"))
-    answer = await incoming_references(client, seed)
-    resolved = [row for row in bindings(answer) if iri(row, "caller") == caller]
+    """Require Python references with original RDF endpoints and declaration spans."""
+    target_name = quoted("serve")
+    caller_name = quoted("caller")
+    language = quoted("python")
+    path = quoted("service.py")
+    target_lookup = string_value(declaration_request("serve").get("query"), "query")
+    caller_lookup = string_value(declaration_request("caller").get("query"), "query")
+    answer = await client.call(
+        "search",
+        {
+            "query": f"SELECT ?caller ?target ?derivation ?facet ?caller_source ?caller_start ?caller_end ?caller_unit ?target_source ?target_start ?target_end ?target_unit ?target_count ?caller_count {{ {{ SELECT (COUNT(*) AS ?target_count) {{ {{ {target_lookup} }} FILTER(?language = {language}) }} }} {{ SELECT (COUNT(*) AS ?caller_count) {{ {{ {caller_lookup} }} FILTER(?language = {language}) }} }} ?target a :Symbol; :name {target_name}; :language {language}; :declarations ?target_declaration . ?target_declaration :path {path}; :source ?target_source; :unit ?target_unit; :range ?target_range . ?target_range :start ?target_start; :end ?target_end . ?caller a :Symbol; :name {caller_name}; :language {language}; :declarations ?caller_declaration; :references ?target . ?caller_declaration :path {path}; :source ?caller_source; :unit ?caller_unit; :range ?caller_range . ?caller_range :start ?caller_start; :end ?caller_end . ?relationship a :Relationship; :from ?caller; :to ?target; :derivation ?derivation; :facets :references . BIND(:references AS ?facet) }} ORDER BY ?caller"
+        },
+    )
+    resolved = bindings(answer)
     require(len(resolved) == 1, f"engine references omitted caller: {answer}")
     relationship = resolved[0]
     require(
-        iri(relationship, "caller") == caller and iri(relationship, "target") == seed,
-        f"reference endpoints differ: {relationship}",
+        literal(relationship, "target_count") == "1"
+        and literal(relationship, "caller_count") == "1",
+        f"expected one serve and one caller declaration: {answer}",
+    )
+    endpoints = {
+        field: object_value(relationship.get(field), field)
+        for field in ("caller", "target")
+    }
+    for field, endpoint in endpoints.items():
+        require(
+            endpoint.get("type") in {"iri", "blank_node"}
+            and bool(string_value(endpoint.get("value"), field)),
+            f"reference endpoint is not an RDF resource: {relationship}",
+        )
+    require(
+        endpoints["caller"] != endpoints["target"],
+        f"reference endpoints are the same: {relationship}",
     )
     require(
         iri(relationship, "derivation") == "urn:rift:vocabulary:resolution",
@@ -77,8 +101,21 @@ async def check_embedded_references(client: Client, root: Path) -> None:
         iri(relationship, "facet") == "urn:rift:vocabulary:references",
         f"reference facets differ: {relationship}",
     )
+    original = PYTHON_SOURCE.encode()
+    target_source, caller_source = PYTHON_SOURCE.removesuffix("\n").split("\n\n\n")
+    for field, text in (("caller", caller_source), ("target", target_source)):
+        expected = text.encode()
+        start = original.index(expected)
+        require(
+            literal(relationship, f"{field}_source") == text
+            and literal(relationship, f"{field}_start") == str(start)
+            and literal(relationship, f"{field}_end") == str(start + len(expected))
+            and iri(relationship, f"{field}_unit")
+            == "rift://source/project/service.py",
+            f"reference declaration changed its original source or range: {relationship}",
+        )
     require(
-        (root / "service.py").read_bytes() == PYTHON_SOURCE.encode(),
+        (root / "service.py").read_bytes() == original,
         "reference read changed source bytes",
     )
 
@@ -109,7 +146,9 @@ async def check_python_references(
     with Repo.init(root):
         pass
     (root / "rift.toml").write_text(
-        CONFIGURATION + PYTHON_CONFIGURATION, encoding="utf-8", newline=""
+        CONFIGURATION + "[source]\ninclude=['service.py']\n" + PYTHON_CONFIGURATION,
+        encoding="utf-8",
+        newline="",
     )
     (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
     (root / "pyproject.toml").write_text(PYTHON_METADATA, encoding="utf-8", newline="")
