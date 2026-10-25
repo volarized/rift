@@ -363,6 +363,26 @@ async fn served_fixture_with_setup(
 )> {
     let fixture = if complete_selection {
         let fixture = surface_corpus::SurfaceFixture::start().await?;
+        // Positive remote queries select only the collected release. The default fixture
+        // keeps its unavailable path dependency and unserved standard-library requirements.
+        let manifest_path = fixture.root().join("Cargo.toml");
+        let manifest = std::fs::read_to_string(&manifest_path)?;
+        let dependency = "\n[dependencies]\nhelper = { path = \"../helper\" }\n";
+        assert!(manifest.contains(dependency));
+        std::fs::write(manifest_path, manifest.replacen(dependency, "\n", 1))?;
+        std::fs::write(
+            fixture.root().join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+        )?;
+        let configuration_path = fixture.root().join("rift.toml");
+        let configuration = std::fs::read_to_string(&configuration_path)?;
+        let language = "[languages.python.lsp]";
+        assert!(configuration.contains(language));
+        let selected = "[languages.rust]\nstdlib = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]";
+        std::fs::write(
+            configuration_path,
+            configuration.replacen(language, selected, 1),
+        )?;
         let path = fixture.root().join("lib.rs");
         let original = std::fs::read_to_string(&path)?;
         assert!(fixture.root().join("change_witness.rs").is_file());
@@ -1029,6 +1049,41 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             break;
         }
     }
+    // The incomplete default context above proves refusals. This separately accepted
+    // context proves a positive remote binding without claiming those missing facts.
+    let (_complete, complete_client, complete_task) =
+        served_fixture_with_setup(None, None, false, true).await?;
+    let request = workspace_client::query::retrieval(&serde_json::from_value(json!({
+        "query":"helper_beacon", "scope":"global", "include":["source"]
+    }))?)?;
+    let request = serde_json::to_value(request)?;
+    let (input, output) = validators.get("search").ok_or("search validators")?;
+    assert_validates(input, &request, "complete remote query request");
+    let result =
+        call_tool_retrying_acceptance(&complete_client, tools_call_request("search", &request)?)
+            .await?;
+    text_complete::assert_text_states("search", &result);
+    let structured = result
+        .structured_content
+        .ok_or("complete remote bindings")?;
+    assert_validates(output, &structured, "complete remote query result");
+    let rows = workspace_client::query::rows(&structured)?;
+    assert!(
+        !rows.is_empty(),
+        "complete collected release supplies bindings: {structured}"
+    );
+    for row in rows {
+        let unit = workspace_client::query::iri(row, "unit")?;
+        let (owner, _) = rift_protocol::identity::parse_source_unit_identity(unit)?;
+        assert!(
+            matches!(owner, Some(rift_protocol::identity::SymbolOwner::Package { name, version, .. })
+            if name == "demo" && version == "1.0.0"),
+            "original collected source owner: {unit}"
+        );
+    }
+    arms.observe(&structured);
+    complete_client.cancel().await?;
+    complete_task.await?;
     arms.assert_proven();
     client.cancel().await?;
     server_task.await?;

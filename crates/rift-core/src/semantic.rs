@@ -1244,7 +1244,7 @@ mod tests {
         assert!(source.node().is_none());
         assert!(contribution.identity_anchor().is_some());
         assert!(contribution.equivalence().is_empty());
-        assert!(contribution.namespaced().0.is_empty());
+        assert!(contribution.namespaced().is_empty());
     }
 
     #[test]

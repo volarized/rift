@@ -113,7 +113,7 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
         .collect()
 }
 
-/// Resolves the corpus's original declarations through discovery before issuing exact reads.
+/// Builds exact requests from local discovery and the original collected fixture declarations.
 pub(crate) async fn prepared_corpus(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> Result<Vec<(&'static str, Value)>, Box<dyn std::error::Error>> {
@@ -131,7 +131,17 @@ pub(crate) async fn prepared_corpus(
                     discovery[field] = value.clone();
                 }
             }
-            let id = discovered_id(client, &discovery, &name, None).await?;
+            let id = if request["scope"] == "global"
+                && request.get("packages").is_none()
+                && crate::global_api::DECLARATIONS.contains(&name.as_str())
+            {
+                crate::global_api::collected_identity(
+                    crate::global_api::SymbolFixture::Valid,
+                    &name,
+                )
+            } else {
+                discovered_id(client, &discovery, &name, None).await?
+            };
             let object = request.as_object_mut().ok_or("corpus request object")?;
             for field in ["name", "scope", "packages"] {
                 object.remove(field);

@@ -139,7 +139,6 @@ mod tests {
         }));
         let newest = facts[0]
             .namespaced()
-            .0
             .get(&rift_core::ExtensionKey("org.rift.history".to_owned()))
             .expect("history fact");
         assert_eq!(newest.data["path"], "lib.rs");

@@ -119,13 +119,6 @@ fn literals<'a>(answer: &'a Value, field: &str) -> TestResult<Vec<&'a str>> {
         .collect()
 }
 
-fn iris<'a>(answer: &'a Value, field: &str) -> TestResult<Vec<&'a str>> {
-    workspace_client::query::rows(answer)?
-        .iter()
-        .map(|row| workspace_client::query::iri(row, field))
-        .collect()
-}
-
 fn assert_unavailable(answer: &Value) {
     assert_eq!(answer["outcome"], "unavailable", "{answer:#}");
     assert!(answer.get("answer").is_none(), "{answer:#}");

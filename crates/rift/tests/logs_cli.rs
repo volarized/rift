@@ -552,60 +552,78 @@ async fn stop_repository_foreground(root: &Path, child: &mut RepositoryForegroun
 async fn repository_beacon(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult {
+    use rift_protocol::query::{QueryAnswer, RdfTerm};
     let answer = proxied_call(
         client,
         "search",
-        &serde_json::json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &serde_json::json!({"query":r#"
+        SELECT ?symbol ?name ?kind ?language ?path ?start ?end ?source {
+          ?symbol a :Symbol; :name "beacon"; :name ?name; :kind ?kind;
+            :language ?language; :declarations ?declaration .
+          ?declaration :path ?path; :range ?range; :source ?source .
+          ?range :start ?start; :end ?end .
+          FILTER(?language = "rust" && ?path = "lib.rs")
+        }
+    "#}),
     )
     .await?;
-    let hits = answer["results"].as_array().ok_or("captured symbol hits")?;
-    let mut exact = hits.iter().filter(|hit| {
-        hit["hit"]["symbol"]["name"] == "beacon"
-            && hit["hit"]["symbol"]["language"] == "rust"
-            && hit["path"] == "lib.rs"
-    });
-    let hit = exact.next().ok_or("captured seed declaration")?;
-    assert!(exact.next().is_none(), "one exact fixture seed: {answer}");
-    let identity = hit["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("captured seed has an established identity")?;
+    let QueryAnswer::Bindings { bindings, .. } = serde_json::from_value(answer["answer"].clone())?
+    else {
+        return Err("captured declaration SELECT bindings".into());
+    };
+    assert_eq!(bindings.len(), 1, "one exact fixture seed: {answer}");
+    let row = &bindings[0];
+    let Some(RdfTerm::Iri { value: identity }) = row.get("symbol") else {
+        return Err("captured canonical identity".into());
+    };
     let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
     assert_eq!(
         parsed.owner(),
         &rift_protocol::identity::SymbolOwner::Local,
         "fixture owner: {answer}"
     );
-    assert_eq!(parsed.wire_identity(), identity);
+    assert_eq!(parsed.wire_identity(), identity.as_str());
     assert_eq!(parsed.language().name, "rust", "{answer}");
-    assert_eq!(hit["hit"]["symbol"]["kind"], "function", "{answer}");
-    let view = hit["view"]["id"]
-        .as_str()
-        .ok_or("the seed retains its captured view")?;
+    assert!(
+        matches!(row.get("kind"), Some(RdfTerm::Literal { value, .. }) if value == "function"),
+        "{answer}"
+    );
+    let view = answer["view"]["id"].as_str().ok_or("captured seed view")?;
     let lookup = proxied_call(
         client,
         "get_symbol",
-        &serde_json::json!({"id": identity, "view": view, "include": ["source"]}),
+        &serde_json::json!({"id":identity,"view":view,"include":["source"]}),
     )
     .await?;
     assert_eq!(lookup["outcome"], "found", "{lookup}");
-    assert_eq!(lookup["symbol"]["id"], identity, "{lookup}");
+    assert_eq!(lookup["symbol"]["id"], identity.as_str(), "{lookup}");
     assert_eq!(lookup["symbol"]["name"], "beacon", "{lookup}");
-    assert_eq!(lookup["view"], hit["view"], "{lookup}");
+    assert_eq!(lookup["view"], answer["view"], "{lookup}");
     let declarations = lookup["declarations"]
         .as_array()
-        .ok_or("the seed has source declarations")?;
+        .ok_or("source declarations")?;
     let mut matching = declarations
         .iter()
         .filter(|declaration| declaration["path"] == "lib.rs");
-    let declaration = matching
-        .next()
-        .ok_or("the seed preserves its original source path")?;
+    let declaration = matching.next().ok_or("original source path")?;
     assert!(
         matching.next().is_none(),
         "one original seed binding: {lookup}"
     );
-    assert_eq!(declaration["range"], hit["range"], "{lookup}");
-    assert_eq!(declaration["source"], hit["source"], "{lookup}");
+    for field in ["start", "end"] {
+        let Some(RdfTerm::Literal { value, .. }) = row.get(field) else {
+            return Err("captured byte range".into());
+        };
+        assert_eq!(
+            declaration["range"][field],
+            value.parse::<u64>()?,
+            "{lookup}"
+        );
+    }
+    let Some(RdfTerm::Literal { value: source, .. }) = row.get("source") else {
+        return Err("captured source bytes".into());
+    };
+    assert_eq!(declaration["source"], source.as_str(), "{lookup}");
     assert_eq!(declaration["source_complete"], true, "{lookup}");
     Ok(())
 }

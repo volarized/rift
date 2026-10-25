@@ -403,3 +403,212 @@ fn resource_key(resource: &Term) -> &str {
         Term::Literal(value) => value.value(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::query::{QueryFacts, QueryLimits, QueryProviderEdge, QueryProviderTarget};
+    use crate::sparql::{PreparedQuery, QueryCancellation, VOCABULARY};
+    use rift_protocol::query::{QueryAnswer, QueryOccurrence, RdfTerm};
+    use rift_protocol::read::{
+        RelationshipDerivation, RelationshipFacet, SourceUnitId, SourceUnitSpan, SymbolId,
+        TextRange,
+    };
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn provider_and_canonical_usages_share_location_but_keep_relationship_evidence() -> TestResult {
+        let limits = QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())?;
+        let caller = SymbolId("rift://symbol/local/rust/fixture/caller".to_owned());
+        let target = SymbolId("rift://symbol/local/rust/fixture/target".to_owned());
+        let text = "fn caller() { target(); }\r\n";
+        let start = u64::try_from(text.find("target").ok_or("fixture occurrence")?)?;
+        let source = SourceUnitSpan {
+            unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
+            range: TextRange {
+                start,
+                end: start + 6,
+            },
+        };
+        let mut facts = QueryFacts::default();
+        let from = facts
+            .provider_endpoint(&QueryProviderTarget::canonical(&caller)?)
+            .ok_or("canonical caller")?;
+        let to = facts
+            .provider_endpoint(&QueryProviderTarget::canonical(&target)?)
+            .ok_or("canonical target")?;
+        facts.provider_edges = vec![
+            QueryProviderEdge {
+                from: Some(from.clone()),
+                to: to.clone(),
+                facet: RelationshipFacet::Calls,
+                occurrence: Some(source.clone()),
+                derivation: Some(RelationshipDerivation::Resolution),
+            },
+            QueryProviderEdge {
+                from: Some(from),
+                to,
+                facet: RelationshipFacet::References,
+                occurrence: Some(source.clone()),
+                derivation: None,
+            },
+        ];
+        facts.occurrences.push(QueryOccurrence {
+            target: target.clone(),
+            enclosing: Some(caller.clone()),
+            source: source.clone(),
+            facet: RelationshipFacet::Reads,
+        });
+        let statement = format!(
+            "SELECT ?usage ?unit ?start ?end ?path ?enclosing ?facet {{ <{}> :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end; :path ?path; :enclosing ?enclosing; :facets ?facet }} ORDER BY ?facet",
+            target.as_str()
+        );
+        let answer = PreparedQuery::parse(&statement, limits)?.evaluate(
+            facts.clone(),
+            limits,
+            QueryCancellation::default(),
+        )?;
+        let QueryAnswer::Bindings { bindings, .. } = answer else {
+            panic!("SELECT bindings");
+        };
+        assert_eq!(bindings.len(), 3);
+        let usage = bindings[0].get("usage").ok_or("physical usage")?;
+        for row in &bindings {
+            assert_eq!(row.get("usage"), Some(usage));
+            assert_eq!(
+                row.get("unit"),
+                Some(&RdfTerm::Iri {
+                    value: source.unit.as_str().to_owned()
+                })
+            );
+            assert_eq!(
+                row.get("enclosing"),
+                Some(&RdfTerm::Iri {
+                    value: caller.as_str().to_owned()
+                })
+            );
+            assert!(
+                matches!(row.get("path"), Some(RdfTerm::Literal { value, .. }) if value == "src/lib.rs")
+            );
+            assert!(
+                matches!(row.get("start"), Some(RdfTerm::Literal { value, .. }) if value == &start.to_string())
+            );
+            assert!(
+                matches!(row.get("end"), Some(RdfTerm::Literal { value, .. }) if value == &(start + 6).to_string())
+            );
+        }
+        let facets = bindings
+            .iter()
+            .filter_map(|row| match row.get("facet") {
+                Some(RdfTerm::Iri { value }) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            facets,
+            std::collections::BTreeSet::from([
+                format!("{VOCABULARY}calls"),
+                format!("{VOCABULARY}references"),
+                format!("{VOCABULARY}reads")
+            ])
+            .iter()
+            .map(String::as_str)
+            .collect()
+        );
+        let statement = format!(
+            "SELECT ?relationship ?facet ?derivation {{ ?relationship a :Relationship; :from <{}>; :to <{}>; :facets ?facet; :occurrence ?usage OPTIONAL {{ ?relationship :derivation ?derivation }} }}",
+            caller.as_str(),
+            target.as_str()
+        );
+        let answer = PreparedQuery::parse(&statement, limits)?.evaluate(
+            facts,
+            limits,
+            QueryCancellation::default(),
+        )?;
+        let QueryAnswer::Bindings { bindings, .. } = answer else {
+            panic!("SELECT bindings");
+        };
+        assert_eq!(
+            bindings.len(),
+            2,
+            "parallel facets retain separate relationship evidence"
+        );
+        assert_ne!(
+            bindings[0].get("relationship"),
+            bindings[1].get("relationship")
+        );
+        assert_eq!(
+            bindings
+                .iter()
+                .filter(|row| row.contains_key("derivation"))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+    #[test]
+    fn provider_location_projection_preserves_all_10001_ranges() -> TestResult {
+        let limits = QueryLimits {
+            query_bytes_max: 16_384,
+            algebra_nodes_max: 4096,
+            quads_max: 100_000,
+            rdf_bytes_max: 16_777_216,
+            result_items_max: 20_000,
+            result_bytes_max: 16_777_216,
+        };
+        let caller = SymbolId("rift://symbol/local/rust/fixture/caller".to_owned());
+        let target = SymbolId("rift://symbol/local/rust/fixture/target".to_owned());
+        let source = "target();\n".repeat(10_001);
+        let mut facts = QueryFacts::default();
+        let from = facts
+            .provider_endpoint(&QueryProviderTarget::canonical(&caller)?)
+            .ok_or("canonical caller")?;
+        let to = facts
+            .provider_endpoint(&QueryProviderTarget::canonical(&target)?)
+            .ok_or("canonical target")?;
+        for (start, _) in source.match_indices("target") {
+            let start = u64::try_from(start)?;
+            facts.provider_edges.push(QueryProviderEdge {
+                from: Some(from.clone()),
+                to: to.clone(),
+                facet: RelationshipFacet::Calls,
+                occurrence: Some(SourceUnitSpan {
+                    unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
+                    range: TextRange {
+                        start,
+                        end: start + 6,
+                    },
+                }),
+                derivation: Some(RelationshipDerivation::Resolution),
+            });
+        }
+        let statement = format!(
+            "SELECT ?usage ?start ?end {{ <{}> :usages ?usage . ?usage :start ?start; :end ?end }} ORDER BY ?start",
+            target.as_str()
+        );
+        let answer = PreparedQuery::parse(&statement, limits)?.evaluate(
+            facts,
+            limits,
+            QueryCancellation::default(),
+        )?;
+        let QueryAnswer::Bindings { bindings, .. } = answer else {
+            panic!("SELECT bindings");
+        };
+        assert_eq!(bindings.len(), 10_001);
+        let mut usages = std::collections::BTreeSet::new();
+        for (row, (start, _)) in bindings.iter().zip(source.match_indices("target")) {
+            let start = u64::try_from(start)?;
+            assert!(
+                matches!(row.get("start"), Some(RdfTerm::Literal { value, .. }) if value == &start.to_string())
+            );
+            assert!(
+                matches!(row.get("end"), Some(RdfTerm::Literal { value, .. }) if value == &(start + 6).to_string())
+            );
+            let Some(RdfTerm::BlankNode { value }) = row.get("usage") else {
+                panic!("physical usage blank node");
+            };
+            assert!(usages.insert(value));
+        }
+        Ok(())
+    }
+}

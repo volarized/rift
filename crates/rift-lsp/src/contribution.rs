@@ -628,7 +628,6 @@ mod tests {
         assert_eq!(
             contribution
                 .namespaced()
-                .0
                 .get(&rift_core::ExtensionKey("org.lsp.symbol".to_owned()))
                 .expect("LSP data")
                 .data["container_name"],

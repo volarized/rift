@@ -396,7 +396,6 @@ mod tests {
         );
         let generated = contribution
             .namespaced()
-            .0
             .get(&ExtensionKey("org.rift.generated_source".to_owned()))
             .expect("generated fact");
         assert_eq!(generated.data["generator"], "build-script");

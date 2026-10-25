@@ -1571,8 +1571,8 @@ async fn a_global_search_with_traversal_refuses_invalid_request() -> TestResult 
     )?;
     assert_eq!(failure.code, ErrorCode::InvalidRequest, "{}", failure.text);
     assert!(
-        failure.message.contains("traversal"),
-        "the refusal names the field: {}",
+        failure.message.contains("query") && failure.message.contains("language"),
+        "the refusal names the accepted query fields: {}",
         failure.message
     );
 

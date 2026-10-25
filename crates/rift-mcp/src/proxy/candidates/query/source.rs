@@ -374,20 +374,11 @@ fn qualify_response(
                 &mut symbol
         {
             for declaration in declarations {
-                let original = if let Some(unit) = &declaration.unit {
-                    unit.clone()
-                } else if let Some(path) = &declaration.path {
-                    let unit = rift_core::SourceUnitId::new(
-                        rift_core::SourceResolverId::new("project")?,
-                        rift_core::SourcePath::new(path.0.as_str())?,
-                    )?;
-                    rift_protocol::read::SourceUnitId::parse(&unit.to_string())?
-                } else {
-                    return Err(retained::unavailable());
+                let Some(original) = declaration.unit.as_ref() else {
+                    continue;
                 };
-                if let Some((_, public)) = source_units.iter().find(|(unit, _)| unit == &original) {
-                    if public != &original {
-                        declaration.path = None;
+                if let Some((_, public)) = source_units.iter().find(|(unit, _)| unit == original) {
+                    if public != original {
                         declaration.unit = Some(public.clone());
                     }
                 } else if rift_protocol::identity::parse_source_unit_identity(original.as_str())?
