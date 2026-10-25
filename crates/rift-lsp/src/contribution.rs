@@ -223,7 +223,7 @@ impl LspContributionAdapter {
                 })?,
             )
             .source(binding)
-            .namespaced(Extensions(extensions));
+            .namespaced(Extensions::from(extensions));
             if let Some(target) = syntax_matches.get(&symbol.address) {
                 builder = builder.equivalence(vec![EquivalenceEvidence::Explicit(target.clone())]);
             }

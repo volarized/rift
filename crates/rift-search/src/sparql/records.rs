@@ -1,7 +1,9 @@
 //! Original records, graph adjacency and physical usages have separate identities.
 
 use rift_protocol::query::{QueryAnswer, QueryOccurrence, RdfTerm};
-use rift_protocol::relationship_read::{RelationshipRecord, RelationshipRecordId};
+use rift_protocol::relationship_read::{
+    RelationshipOccurrence, RelationshipRecord, RelationshipRecordId,
+};
 
 use super::super::{PreparedQuery, QueryCancellation, QueryFacts, QueryLimits};
 
@@ -110,5 +112,68 @@ fn replayed_record_identity_refuses_even_when_payload_changes() -> TestResult {
         );
     }
     assert!(RelationshipRecordId::parse("12345678").is_err());
+    Ok(())
+}
+
+#[test]
+fn original_usage_evidence_keeps_equal_payload_ids_and_shared_physical_locations() -> TestResult {
+    let mut facts = facts()?;
+    let usage = facts.occurrences.pop().ok_or("physical usage")?;
+    for record in &facts.relationship_records {
+        facts.occurrence_records.push(RelationshipOccurrence {
+            id: record.id.clone(),
+            relationship: Some(record.id.clone()),
+            occurrence: usage.clone(),
+        });
+    }
+    assert!(facts.occurrences.is_empty());
+    assert_eq!(
+        count(
+            "SELECT (COUNT(?usage) AS ?count) { ?target :usages ?usage }",
+            facts.clone()
+        )?,
+        "1"
+    );
+    assert_eq!(
+        count(
+            "SELECT (COUNT(DISTINCT ?record) AS ?count) { ?usage :evidence ?record . ?record :id ?id }",
+            facts.clone()
+        )?,
+        "2"
+    );
+    let mut another_facet = facts.occurrence_records[0].clone();
+    another_facet.occurrence.facet = rift_protocol::read::RelationshipFacet::References;
+    facts.occurrence_records.push(another_facet);
+    assert_eq!(
+        count(
+            "SELECT (COUNT(?usage) AS ?count) { ?target :usages ?usage }",
+            facts.clone()
+        )?,
+        "1"
+    );
+    let mut another_location = facts.occurrence_records[0].clone();
+    another_location.occurrence.source.range.start = 1;
+    facts.occurrence_records.push(another_location);
+    assert_eq!(
+        count(
+            "SELECT (COUNT(?usage) AS ?count) { ?target :usages ?usage }",
+            facts.clone()
+        )?,
+        "2"
+    );
+    assert_eq!(
+        count(
+            "SELECT (COUNT(DISTINCT ?record) AS ?count) { ?usage :evidence ?record . ?record :id ?id }",
+            facts.clone()
+        )?,
+        "2"
+    );
+    let mut bounded = limits();
+    bounded.rdf_bytes_max = 1;
+    assert!(
+        PreparedQuery::parse("ASK { ?target :usages ?usage }", bounded)?
+            .evaluate(facts, bounded, QueryCancellation::default())
+            .is_err()
+    );
     Ok(())
 }

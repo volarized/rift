@@ -2,10 +2,11 @@ mod query;
 mod source;
 mod symbol;
 mod traversal;
-pub(in crate::server) use query::QueryGlobalSelection;
+pub(crate) use query::{QueryGlobalSelection, SavedQuery};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use symbol::SavedRead;
+pub(crate) use symbol::SavedSymbol;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::read::{ReadWarning, SearchParams};
@@ -410,6 +411,10 @@ impl RiftMcp {
             return Ok(SearchCandidateResult::Unavailable(answer));
         }
         let ready = resolved.published.preparation.is_none();
+        let accepted = resolved
+            .published
+            .configuration
+            .accepted_for_tool(wire::ErrorPhase::Read)?;
         let params = requested.params.clone();
         let (mut inputs, material) = self
             .current_captured_read(&resolved, true, move |reads, capture_warnings| {
@@ -417,6 +422,8 @@ impl RiftMcp {
                     reads.search_candidate_view_input(&params, &answer, &references, ready)?;
                 inputs.warnings.extend(capture_warnings.iter().cloned());
                 let material = material.with_warnings(capture_warnings)?;
+                let selection = material.provider_selection(&accepted)?;
+                let material = material.with_provider_selection(selection)?;
                 Ok((inputs, material))
             })
             .await?

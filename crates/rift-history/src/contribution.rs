@@ -65,7 +65,7 @@ impl HistoryContributionAdapter {
                         "path": blob.path(),
                     })
                 });
-                let namespaced = Extensions(BTreeMap::from([(
+                let namespaced = Extensions::from(BTreeMap::from([(
                     ExtensionKey("org.rift.history".to_owned()),
                     ExtensionValue {
                         version: 1,

@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn namespaced(key: &str, data: serde_json::Value) -> Extensions {
-        Extensions(BTreeMap::from([(
+        Extensions::from(BTreeMap::from([(
             ExtensionKey(key.to_owned()),
             ExtensionValue { version: 1, data },
         )]))

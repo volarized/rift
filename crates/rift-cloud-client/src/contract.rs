@@ -173,8 +173,7 @@ impl fmt::Display for ContractError {
 impl Error for ContractError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Write { source, .. } => Some(source),
-            Self::Read { source, .. } => Some(source),
+            Self::Write { source, .. } | Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::Invalid { .. } => None,
         }

@@ -1,5 +1,6 @@
 //! Domain acquisition requirements derived from the library's parsed algebra.
 
+use crate::query::FactRequirement;
 use rift_protocol::read::{RelationshipFacet, SymbolId, TraversalDirection};
 use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
@@ -52,7 +53,7 @@ fn uniform_path(
                     });
                 }
                 PropertyPathExpression::Reverse(inner) => {
-                    pending.push(PathPending::Visit(inner, !incoming))
+                    pending.push(PathPending::Visit(inner, !incoming));
                 }
                 PropertyPathExpression::Sequence(left, right) => {
                     pending.extend([
@@ -73,7 +74,7 @@ fn uniform_path(
                     pending.extend([PathPending::Closure, PathPending::Visit(inner, incoming)]);
                 }
                 PropertyPathExpression::ZeroOrOne(inner) => {
-                    pending.push(PathPending::Visit(inner, incoming))
+                    pending.push(PathPending::Visit(inner, incoming));
                 }
                 PropertyPathExpression::NegatedPropertySet(_) => return Ok(None),
             },
@@ -121,11 +122,11 @@ impl FactRequirements {
         };
         let mut result = Self::default();
         if matches!(query, Query::Describe { .. }) {
-            result.domain = true;
-            result.description = true;
-            result.source = true;
+            result.require(FactRequirement::Domain);
+            result.require(FactRequirement::Description);
+            result.require(FactRequirement::Source);
         }
-        if !result.description {
+        if !result.requires(FactRequirement::Description) {
             result.symbol_name = single_name_pattern(pattern);
             result.symbol_ids = single_usage_pattern(pattern);
         }
@@ -168,7 +169,9 @@ impl FactRequirements {
     ) -> Result<(), QueryError> {
         match pattern {
             GraphPattern::Bgp { patterns } => {
-                self.domain |= !patterns.is_empty();
+                if !patterns.is_empty() {
+                    self.require(FactRequirement::Domain);
+                }
                 if patterns.len() > nodes_max {
                     return Err(failure::bound("algebra_nodes_max"));
                 }
@@ -176,7 +179,7 @@ impl FactRequirements {
                 if let Some(requirement) = &chain {
                     for facet in &requirement.facets {
                         if !self.facets.contains(facet) {
-                            self.facets.push(facet.clone());
+                            self.facets.push(*facet);
                         }
                     }
                     self.adjacency.push(requirement.clone());
@@ -193,11 +196,11 @@ impl FactRequirements {
                             {
                                 continue;
                             }
-                            self.triple(&triple.subject, predicate.as_str(), &triple.object)
+                            self.triple(&triple.subject, predicate.as_str(), &triple.object);
                         }
                         NamedNodePattern::Variable(_) => {
-                            self.complete_domain = true;
-                            self.all_occurrences = true;
+                            self.require(FactRequirement::CompleteDomain);
+                            self.require(FactRequirement::AllOccurrences);
                             self.all_families();
                         }
                     }
@@ -208,14 +211,14 @@ impl FactRequirements {
                 path,
                 object,
             } => {
-                self.domain = true;
+                self.require(FactRequirement::Domain);
                 self.path(subject, path, object, nodes_max)?;
             }
             GraphPattern::Join { left, right }
             | GraphPattern::Union { left, right }
             | GraphPattern::Minus { left, right }
             | GraphPattern::Lateral { left, right } => {
-                pending.extend([Pending::Pattern(left), Pending::Pattern(right)])
+                pending.extend([Pending::Pattern(left), Pending::Pattern(right)]);
             }
             GraphPattern::LeftJoin {
                 left,
@@ -226,7 +229,7 @@ impl FactRequirements {
                 pending.extend(expression.iter().map(Pending::Expression));
             }
             GraphPattern::Filter { expr, inner } => {
-                pending.extend([Pending::Pattern(inner), Pending::Expression(expr)])
+                pending.extend([Pending::Pattern(inner), Pending::Expression(expr)]);
             }
             GraphPattern::Extend {
                 expression, inner, ..
@@ -271,7 +274,7 @@ impl FactRequirements {
                 self.services.push(name.as_str().to_owned())
             }
             NamedNodePattern::NamedNode(name) => self.datasets.push(name.as_str().to_owned()),
-            NamedNodePattern::Variable(_) => self.complete_domain = true,
+            NamedNodePattern::Variable(_) => self.require(FactRequirement::CompleteDomain),
         }
     }
 
@@ -282,12 +285,12 @@ impl FactRequirements {
         nodes_max: usize,
     ) -> Result<(), QueryError> {
         self.selection(name, true);
-        if let NamedNodePattern::NamedNode(name) = name {
-            if name.as_str() == super::SEARCH_SERVICE {
-                let request = super::services::request(inner, nodes_max)?;
-                if !self.retrievals.contains(&request) {
-                    self.retrievals.push(request);
-                }
+        if let NamedNodePattern::NamedNode(name) = name
+            && name.as_str() == super::SEARCH_SERVICE
+        {
+            let request = super::services::request(inner, nodes_max)?;
+            if !self.retrievals.contains(&request) {
+                self.retrievals.push(request);
             }
         }
         Ok(())
@@ -302,40 +305,48 @@ impl FactRequirements {
             return;
         };
         match name {
-            "usages" => match symbol(subject) {
-                Some(identity) => self.occurrences.push(identity),
-                None => {
-                    self.complete_domain = true;
-                    self.all_occurrences = true;
+            "usages" => {
+                if let Some(identity) = symbol(subject) {
+                    self.occurrences.push(identity);
+                } else {
+                    self.require(FactRequirement::CompleteDomain);
+                    self.require(FactRequirement::AllOccurrences);
                 }
-            },
-            "source" | "text" => self.source = true,
-            "parent" | "regions" => self.nodes = true,
+            }
+            "source" | "text" => self.require(FactRequirement::Source),
+            "parent" | "regions" => self.require(FactRequirement::Nodes),
             "history" => {
-                self.history = true;
+                self.require(FactRequirement::History);
                 if let Some(identity) = symbol(subject) {
                     if !self.history_symbols.contains(&identity) {
                         self.history_symbols.push(identity);
                     }
                 } else {
-                    self.all_histories = true;
+                    self.require(FactRequirement::AllHistories);
                 }
             }
-            "versions" | "complete" => self.history = true,
+            "versions" | "complete" => self.require(FactRequirement::History),
             "documentation_revision"
             | "selection_digest"
             | "content_digest"
             | "media_type"
             | "unresolved_references"
             | "resolution"
-            | "references_to" => self.documentation = true,
-            "format" | "target" => self.documentation = true,
-            "heading_path" | "chunks" | "authored" | "block" | "selection" | "physical_ranges"
-            | "byte_length" | "license" => self.documentation = true,
+            | "references_to"
+            | "format"
+            | "target"
+            | "heading_path"
+            | "chunks"
+            | "authored"
+            | "block"
+            | "selection"
+            | "physical_ranges"
+            | "byte_length"
+            | "license" => self.require(FactRequirement::Documentation),
             "from" | "to" | "derivation" | "evidence" | "occurrence" | "confidence" => {
-                self.complete_domain = true;
+                self.require(FactRequirement::CompleteDomain);
                 if name == "evidence" {
-                    self.documentation = true;
+                    self.require(FactRequirement::Documentation);
                 }
             }
             _ => self.relationship(subject, name, object),
@@ -344,17 +355,17 @@ impl FactRequirements {
 
     fn type_requirement(&mut self, object: &TermPattern) {
         let TermPattern::NamedNode(name) = object else {
-            self.complete_domain = true;
-            self.all_occurrences = true;
+            self.require(FactRequirement::CompleteDomain);
+            self.require(FactRequirement::AllOccurrences);
             self.all_families();
             return;
         };
         match name.as_str().strip_prefix(VOCABULARY) {
-            Some("Relationship") => self.complete_domain = true,
-            Some("Node" | "NodeRegion") => self.nodes = true,
+            Some("Relationship") => self.require(FactRequirement::CompleteDomain),
+            Some("Node" | "NodeRegion") => self.require(FactRequirement::Nodes),
             Some("SymbolHistory" | "SymbolVersion") => {
-                self.history = true;
-                self.all_histories = true;
+                self.require(FactRequirement::History);
+                self.require(FactRequirement::AllHistories);
             }
             Some(
                 "DocumentationSource"
@@ -362,21 +373,21 @@ impl FactRequirements {
                 | "DocumentationLink"
                 | "DocumentationReference"
                 | "DocumentationReferenceCandidate",
-            ) => self.documentation = true,
+            ) => self.require(FactRequirement::Documentation),
             Some("SourceUnitSpan") => {
-                self.complete_domain = true;
-                self.all_occurrences = true;
+                self.require(FactRequirement::CompleteDomain);
+                self.require(FactRequirement::AllOccurrences);
             }
             _ => {}
         }
     }
 
     fn all_families(&mut self) {
-        self.nodes = true;
-        self.history = true;
-        self.all_histories = true;
-        self.documentation = true;
-        self.source = true;
+        self.require(FactRequirement::Nodes);
+        self.require(FactRequirement::History);
+        self.require(FactRequirement::AllHistories);
+        self.require(FactRequirement::Documentation);
+        self.require(FactRequirement::Source);
     }
 
     fn relationship(&mut self, subject: &TermPattern, name: &str, object: &TermPattern) {
@@ -384,7 +395,7 @@ impl FactRequirements {
             return;
         };
         if !self.facets.contains(&facet) {
-            self.facets.push(facet.clone());
+            self.facets.push(facet);
         }
         let anchored = symbol(subject)
             .map(|seed| (seed, TraversalDirection::Outgoing))
@@ -396,7 +407,7 @@ impl FactRequirements {
                 facets: vec![facet],
                 depth: Some(1),
             }),
-            None => self.complete_domain = true,
+            None => self.require(FactRequirement::CompleteDomain),
         }
     }
 
@@ -413,7 +424,7 @@ impl FactRequirements {
                 .or_else(|| symbol(object).map(|seed| (seed, !summary.incoming)));
             if let Some((seed, incoming)) = anchored {
                 if !self.facets.contains(&summary.facet) {
-                    self.facets.push(summary.facet.clone());
+                    self.facets.push(summary.facet);
                 }
                 self.adjacency.push(AdjacencyRequirement {
                     seed,
@@ -442,7 +453,7 @@ impl FactRequirements {
             match path {
                 PropertyPathExpression::NamedNode(name) => {
                     let Some(value) = name.as_str().strip_prefix(VOCABULARY).and_then(facet) else {
-                        self.complete_domain = true;
+                        self.require(FactRequirement::CompleteDomain);
                         self.triple(subject, name.as_str(), object);
                         continue;
                     };
@@ -458,7 +469,7 @@ impl FactRequirements {
                 }
                 PropertyPathExpression::Sequence(left, right)
                 | PropertyPathExpression::Alternative(left, right) => {
-                    pending.extend([left.as_ref(), right.as_ref()])
+                    pending.extend([left.as_ref(), right.as_ref()]);
                 }
                 PropertyPathExpression::ZeroOrMore(inner)
                 | PropertyPathExpression::OneOrMore(inner) => {
@@ -467,32 +478,32 @@ impl FactRequirements {
                 }
                 PropertyPathExpression::ZeroOrOne(inner) => pending.push(inner),
                 PropertyPathExpression::NegatedPropertySet(_) => {
-                    self.complete_domain = true;
-                    self.all_occurrences = true;
+                    self.require(FactRequirement::CompleteDomain);
+                    self.require(FactRequirement::AllOccurrences);
                     self.all_families();
                 }
             }
         }
         for value in &facets {
             if !self.facets.contains(value) {
-                self.facets.push(value.clone());
+                self.facets.push(*value);
             }
         }
         if facets.len() > 1 {
-            self.complete_domain = true;
+            self.require(FactRequirement::CompleteDomain);
         }
         let anchored = symbol(subject)
             .map(|seed| (seed, reverse))
             .or_else(|| symbol(object).map(|seed| (seed, !reverse)));
         let Some((seed, incoming)) = anchored else {
-            self.complete_domain = true;
+            self.require(FactRequirement::CompleteDomain);
             return Ok(());
         };
         if facets.is_empty() {
             return Ok(());
         }
         if mixed {
-            self.complete_domain = true;
+            self.require(FactRequirement::CompleteDomain);
         }
         let direction = if incoming {
             TraversalDirection::Incoming
@@ -523,7 +534,7 @@ impl FactRequirements {
             | Expression::Subtract(left, right)
             | Expression::Multiply(left, right)
             | Expression::Divide(left, right) => {
-                pending.extend([Pending::Expression(left), Pending::Expression(right)])
+                pending.extend([Pending::Expression(left), Pending::Expression(right)]);
             }
             Expression::UnaryPlus(inner)
             | Expression::UnaryMinus(inner)
@@ -538,7 +549,7 @@ impl FactRequirements {
                 Pending::Expression(no),
             ]),
             Expression::Coalesce(values) | Expression::FunctionCall(_, values) => {
-                pending.extend(values.iter().map(Pending::Expression))
+                pending.extend(values.iter().map(Pending::Expression));
             }
             Expression::NamedNode(_)
             | Expression::Literal(_)

@@ -19,6 +19,38 @@ pub const QUERY_CHILD_COMMAND: &str = "__query";
 const PROCESS_OVERHEAD_BYTES: usize = 32 * 1024 * 1024;
 /// Diagnostic prefix retained from either child stream; query data uses owned files.
 const DIAGNOSTIC_BYTES_MAX: usize = 8 * 1024;
+// Change the version when the query snapshot contract changes. Zero is not a supported version.
+const QUERY_EXCHANGE_VERSION: u32 = 5;
+
+/// Versioned query data shared by the child and authoritative fact reads.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryExchange<T> {
+    version: u32,
+    payload: T,
+}
+
+impl<T> QueryExchange<T> {
+    /// Carries one payload under the current query snapshot contract.
+    #[must_use]
+    pub fn new(payload: T) -> Self {
+        Self {
+            version: QUERY_EXCHANGE_VERSION,
+            payload,
+        }
+    }
+
+    /// Accepts the payload only when its query snapshot contract matches.
+    ///
+    /// # Errors
+    /// Returns the registered unsupported failure for an incompatible version.
+    pub fn into_payload(self) -> Result<T, RiftError> {
+        if self.version != QUERY_EXCHANGE_VERSION {
+            return Err(incompatible("query exchange version is incompatible"));
+        }
+        Ok(self.payload)
+    }
+}
 
 /// Finite byte ceilings derived from the accepted statement, fact and result bounds.
 #[derive(Clone, Copy, Debug)]
@@ -61,11 +93,19 @@ impl QueryProcessLimits {
 
 /// Additional admission for owned query records before exchange serialization.
 ///
-/// This counts each complete record with the exchange codec before collection.
+/// Producer handles share one remaining byte count and the first request failure.
+/// Records debit encoded bytes or their owner's retained material before collection.
 /// The evaluator separately enforces the accepted projected RDF term byte bound.
+#[derive(Clone)]
 pub struct QueryFactBudget<'a> {
-    writer: BoundedWriter<std::io::Sink>,
+    state: std::sync::Arc<std::sync::Mutex<QueryFactAdmission>>,
     cancelled: &'a (dyn Fn() -> bool + Sync),
+    deadline: Option<Instant>,
+}
+
+struct QueryFactAdmission {
+    writer: BoundedWriter<std::io::Sink>,
+    failure: Option<QueryFailure>,
 }
 
 impl<'a> QueryFactBudget<'a> {
@@ -78,12 +118,43 @@ impl<'a> QueryFactBudget<'a> {
         cancelled: &'a (dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
         Ok(Self {
-            writer: BoundedWriter {
-                writer: std::io::sink(),
-                remaining: QueryProcessLimits::from_query(limits)?.bytes_max,
-            },
+            state: std::sync::Arc::new(std::sync::Mutex::new(QueryFactAdmission {
+                writer: BoundedWriter {
+                    writer: std::io::sink(),
+                    remaining: QueryProcessLimits::from_query(limits)?.bytes_max,
+                },
+                failure: None,
+            })),
             cancelled,
+            deadline: None,
         })
+    }
+
+    /// Creates one request admission with an unchanged deadline across producer handles.
+    ///
+    /// # Errors
+    /// Returns unavailable when accepted sizes exceed platform arithmetic.
+    pub fn for_request(
+        limits: QueryLimits,
+        deadline: Instant,
+        cancelled: &'a (dyn Fn() -> bool + Sync),
+    ) -> Result<Self, RiftError> {
+        let mut budget = Self::new(limits, cancelled)?;
+        budget.deadline = Some(deadline);
+        Ok(budget)
+    }
+
+    /// Preserves accumulated admission while changing the active worker's cancellation check.
+    #[must_use]
+    pub fn with_cancellation<'next>(
+        &self,
+        cancelled: &'next (dyn Fn() -> bool + Sync),
+    ) -> QueryFactBudget<'next> {
+        QueryFactBudget {
+            state: std::sync::Arc::clone(&self.state),
+            cancelled,
+            deadline: self.deadline,
+        }
     }
 
     /// Admits one borrowed record before its owned copy joins the query snapshot.
@@ -91,18 +162,41 @@ impl<'a> QueryFactBudget<'a> {
     /// # Errors
     /// Returns cancellation, encoding failure or exhausted record admission.
     pub fn charge(&mut self, value: &impl Serialize) -> Result<(), RiftError> {
-        self.check()?;
-        let active = || !(self.cancelled)();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_state(&mut state)?;
+        let observed = std::cell::RefCell::new(None);
+        let active = || {
+            if let Some(failure) = self.observed_failure() {
+                observed.borrow_mut().get_or_insert(failure);
+                false
+            } else {
+                true
+            }
+        };
         let result = serde_json::to_writer(
             RequestWriter {
-                writer: &mut self.writer,
+                writer: &mut state.writer,
                 active: &active,
             },
             value,
         );
-        self.check()?;
-        result.map_err(process_error)?;
-        self.writer.write_all(b",").map_err(process_error)
+        if let Err(error) = result {
+            let failure = observed
+                .into_inner()
+                .unwrap_or_else(|| admission_failure(error));
+            state.failure = Some(failure.clone());
+            return Err(failure.into_error());
+        }
+        self.check_state(&mut state)?;
+        if let Err(error) = state.writer.write_all(b",") {
+            let failure = admission_failure(error);
+            state.failure = Some(failure.clone());
+            return Err(failure.into_error());
+        }
+        Ok(())
     }
 
     /// Admits already encoded material before decoding an owned record.
@@ -110,8 +204,38 @@ impl<'a> QueryFactBudget<'a> {
     /// # Errors
     /// Returns cancellation or exhausted record admission.
     pub fn charge_bytes(&mut self, bytes: &[u8]) -> Result<(), RiftError> {
-        self.check()?;
-        self.writer.write_all(bytes).map_err(process_error)
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_state(&mut state)?;
+        if let Err(error) = state.writer.write_all(bytes) {
+            let failure = admission_failure(error);
+            state.failure = Some(failure.clone());
+            return Err(failure.into_error());
+        }
+        Ok(())
+    }
+
+    /// Debits a retained material quantity measured by the existing producer owner.
+    ///
+    /// This quantity is distinct from encoded JSON bytes and projected RDF term bytes.
+    ///
+    /// # Errors
+    /// Returns the first admission failure, cancellation or expired request deadline.
+    pub fn charge_material(&mut self, bytes: usize) -> Result<(), RiftError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_state(&mut state)?;
+        let Some(remaining) = state.writer.remaining.checked_sub(bytes) else {
+            let failure = admission_failure("query retained material exceeds its byte limit");
+            state.failure = Some(failure.clone());
+            return Err(failure.into_error());
+        };
+        state.writer.remaining = remaining;
+        Ok(())
     }
 
     /// Checks cancellation between records, including records excluded by selection.
@@ -119,14 +243,44 @@ impl<'a> QueryFactBudget<'a> {
     /// # Errors
     /// Returns the registered cancellation failure.
     pub fn check(&self) -> Result<(), RiftError> {
-        if (self.cancelled)() {
-            return Err(errors::server::read_cancelled().error());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.check_state(&mut state)
+    }
+
+    fn check_state(&self, state: &mut QueryFactAdmission) -> Result<(), RiftError> {
+        if let Some(failure) = &state.failure {
+            return Err(failure.clone().into_error());
+        }
+        if let Some(failure) = self.observed_failure() {
+            state.failure = Some(failure.clone());
+            return Err(failure.into_error());
         }
         Ok(())
+    }
+
+    fn observed_failure(&self) -> Option<QueryFailure> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Some(admission_failure("query acquisition exceeded its deadline"));
+        }
+        (self.cancelled)().then_some(QueryFailure::Cancelled)
+    }
+}
+
+fn admission_failure(detail: impl std::fmt::Display) -> QueryFailure {
+    QueryFailure::Unavailable {
+        operation: "query acquisition".to_owned(),
+        detail: detail.to_string(),
     }
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 enum QueryTask {
     Prepare {
         statement: String,
@@ -141,14 +295,17 @@ enum QueryTask {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 enum QueryOutput {
     Plan(Box<QueryPlan>),
     Answer(QueryAnswer),
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 enum QueryFailure {
     Invalid { violation: String },
+    Unsupported { capability: String },
     Unavailable { operation: String, detail: String },
     Cancelled,
 }
@@ -165,6 +322,9 @@ impl QueryFailure {
                 violation: field("violation").unwrap_or_else(|| error.to_string()),
             },
             "rift.server.read_cancelled" => Self::Cancelled,
+            "rift.server.read_unsupported" => Self::Unsupported {
+                capability: field("capability").unwrap_or_else(|| error.to_string()),
+            },
             _ => Self::Unavailable {
                 operation: field("operation").unwrap_or_else(|| "query child".to_owned()),
                 detail: field("detail").unwrap_or_else(|| error.to_string()),
@@ -181,6 +341,9 @@ impl QueryFailure {
             Self::Unavailable { operation, detail } => errors::server::read_unavailable()
                 .operation(operation)
                 .detail(detail)
+                .error(),
+            Self::Unsupported { capability } => errors::server::read_unsupported()
+                .capability(capability)
                 .error(),
             Self::Cancelled => errors::server::read_cancelled().error(),
         }
@@ -250,6 +413,7 @@ fn execute(
     let mut request = tempfile::NamedTempFile::new_in(directory.path()).map_err(process_error)?;
     let response = tempfile::NamedTempFile::new_in(directory.path()).map_err(process_error)?;
     let active = || !cancelled() && Instant::now() < deadline;
+    let task = QueryExchange::new(task);
     let written = write_json(
         RequestWriter {
             writer: &mut request,
@@ -296,6 +460,7 @@ fn collect_response(
         RunEnding::Exited => {}
     }
     let exit = run.exit.map_err(process_error)?;
+    decode_acknowledgment(run.stdout.text.as_bytes())?;
     if !exit.success() {
         return Err(unavailable(format!(
             "query child exited unsuccessfully: {exit}"
@@ -303,9 +468,21 @@ fn collect_response(
     }
     let bytes = read_request(response.reopen().map_err(process_error)?, bytes_max)?;
     check_request(deadline, cancelled)?;
-    let response: QueryResponse = serde_json::from_slice(&bytes).map_err(process_error)?;
+    let response = decode_response(&bytes);
     check_request(deadline, cancelled)?;
-    response.map_err(QueryFailure::into_error)
+    response
+}
+
+fn decode_response(bytes: &[u8]) -> Result<QueryOutput, RiftError> {
+    let response: QueryExchange<QueryResponse> = serde_json::from_slice(bytes)
+        .map_err(|_| incompatible("query response schema is incompatible"))?;
+    response.into_payload()?.map_err(QueryFailure::into_error)
+}
+
+fn decode_acknowledgment(bytes: &[u8]) -> Result<(), RiftError> {
+    let acknowledgment: QueryExchange<()> = serde_json::from_slice(bytes)
+        .map_err(|_| incompatible("query protocol acknowledgment is missing or invalid"))?;
+    acknowledgment.into_payload()
 }
 
 fn check_request(
@@ -343,11 +520,18 @@ pub fn run_query_child(
     response_path: &Path,
     bytes_max: usize,
 ) -> Result<(), RiftError> {
+    write_json(
+        std::io::stdout(),
+        &QueryExchange::new(()),
+        DIAGNOSTIC_BYTES_MAX,
+    )?;
     let request = std::fs::File::open(request_path).map_err(process_error)?;
     let bytes = read_request(request, bytes_max)?;
-    let task: QueryTask = serde_json::from_slice(&bytes).map_err(process_error)?;
+    let request = serde_json::from_slice::<QueryExchange<QueryTask>>(&bytes)
+        .map_err(|_| incompatible("query request schema is incompatible"))
+        .and_then(QueryExchange::into_payload);
     drop(bytes);
-    let response = run_task(task).map_err(QueryFailure::capture);
+    let response = QueryExchange::new(request.and_then(run_task).map_err(QueryFailure::capture));
     let output = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
@@ -449,6 +633,12 @@ fn unavailable(detail: impl Into<String>) -> RiftError {
     errors::server::read_unavailable()
         .operation("query child")
         .detail(detail.into())
+        .error()
+}
+
+fn incompatible(capability: &'static str) -> RiftError {
+    errors::server::read_unsupported()
+        .capability(capability)
         .error()
 }
 

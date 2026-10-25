@@ -71,12 +71,12 @@ pub use generated::{
     PackageSearchRequest, PackageSearchRequestPhase, PackageSearchRequestTarget, Parameter,
     PositionEncoding as PackageDeclarationRequestPositionEncoding, ProblemDetails,
     PublicationFormat, QueryTerm, RelationshipFacet, ResolvePackageContextRequest,
-    ResolvePackageContextResponse, ResolvedRequirement, SearchPackagePatternsRequest,
-    SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse, SearchPackagesRequest,
-    SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal, Signature, SignatureLink,
-    SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
-    TextRange, TraversalDirection, TypeBinding, TypeBindingOrigin, TypeBindingRole, TypeExpression,
-    Warning, WarningCode,
+    ResolvePackageContextResponse, ResolvedRequirement, Search200Response,
+    SearchPackagePatternsRequest, SearchPackagePatternsRequestQuery, SearchPackagePatternsResponse,
+    SearchPackagesRequest, SearchPackagesRequestQuery, SearchPackagesResponse, SearchTraversal,
+    Signature, SignatureLink, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet,
+    SymbolId, SymbolOrigin, TextRange, TraversalDirection, TypeBinding, TypeBindingOrigin,
+    TypeBindingRole, TypeExpression, Warning, WarningCode,
 };
 pub mod domain;
 pub use domain::{PackagePatternMatch, PackageSearchCandidate};
@@ -971,7 +971,10 @@ impl GlobalClient {
                 let exact_outcome = operation == contract::Endpoint::Symbols
                     && response.status == StatusCode::SERVICE_UNAVAILABLE
                     && is_media(&response.meta, "application/json");
-                if !exact_outcome && should_retry(response.status, attempt, attempts) {
+                if !exact_outcome
+                    && !terminal_search_outcome(operation, &response)
+                    && should_retry(response.status, attempt, attempts)
+                {
                     rift_tracing::debug!(
                         operation = operation.operation_id(),
                         attempt,
@@ -3052,6 +3055,23 @@ fn is_media(meta: &ResponseMeta, expected: &str) -> bool {
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case(expected))
 }
+fn terminal_search_outcome(operation: contract::Endpoint, response: &RawResponse) -> bool {
+    if operation != contract::Endpoint::Search || response.status != StatusCode::SERVICE_UNAVAILABLE
+    {
+        return false;
+    }
+    if is_media(&response.meta, "application/json") {
+        return serde_json::from_slice::<rift_protocol::search_read::SearchUnavailable>(
+            &response.body,
+        )
+        .is_ok();
+    }
+    is_media(&response.meta, "application/problem+json")
+        && serde_json::from_slice::<ProblemDetails>(&response.body).is_ok_and(|problem| {
+            failure::unsupported_operation(operation.operation_id(), &response.meta, Some(&problem))
+        })
+}
+
 fn should_retry(status: StatusCode, attempt: u32, attempts: u32) -> bool {
     attempt < attempts
         && (status == StatusCode::TOO_MANY_REQUESTS

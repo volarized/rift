@@ -106,7 +106,8 @@ pub(super) fn validate_complete(
                 require_source(&source.unit, &source.range, &sources, request)?;
             }
         }
-        for occurrence in &group.occurrences {
+        for record in &group.occurrences {
+            let occurrence = &record.occurrence;
             require_symbol(&occurrence.target, &symbols)?;
             if let Some(enclosing) = &occurrence.enclosing {
                 require_symbol(enclosing, &symbols)?;

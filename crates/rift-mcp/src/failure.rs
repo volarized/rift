@@ -646,6 +646,37 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_query_worker_requires_operator_action_while_deadline_is_retryable() {
+        let program = std::env::current_exe().expect("owned incompatible test executable");
+        let limits = rift_search::sparql::QueryLimits::try_from(
+            &rift_protocol::query::QueryConfiguration::default(),
+        )
+        .expect("accepted query configuration");
+        let incompatible = rift_server::prepare_query(
+            &program,
+            "ASK {}".to_owned(),
+            limits,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+            &|| false,
+        )
+        .expect_err("test harness has no query protocol acknowledgment");
+        let failure = incompatible.mcp().wire_error(wire::ErrorPhase::Read);
+        assert_eq!(failure.code, wire::ErrorCode::CapabilityUnavailable);
+        assert_eq!(failure.retry, wire::RetryDirective::OperatorAction);
+        let expired = rift_server::prepare_query(
+            &program,
+            "ASK {}".to_owned(),
+            limits,
+            std::time::Instant::now(),
+            &|| false,
+        )
+        .expect_err("expired request does not start a worker");
+        let failure = expired.mcp().wire_error(wire::ErrorPhase::Read);
+        assert_eq!(failure.code, wire::ErrorCode::TemporarilyUnavailable);
+        assert_eq!(failure.retry, wire::RetryDirective::SameRequest);
+    }
+
+    #[test]
     fn client_failures_keep_distinct_wire_guidance() {
         use wire::{ErrorCode as Code, RetryDirective as Retry};
         for (slug, code, retry) in [

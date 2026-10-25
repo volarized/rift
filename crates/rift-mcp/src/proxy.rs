@@ -125,6 +125,7 @@ pub async fn serve_proxy(
         &configuration.server,
     )?);
     proxy.query_configuration = configuration.search.query;
+    let _ = proxy.query_views.set(crate::server::captured_views()?);
     let warmup = tokio::spawn(warm_up(proxy.clone()));
     let outcome = Box::pin(serve_connection(proxy, crate::transport::guarded_stdio())).await;
     warmup.abort();
@@ -228,6 +229,7 @@ struct RiftProxy {
     /// processes each apply their accepted worker count; this is not a host-wide cap.
     query_worker: Option<crate::server::BlockingExecutor>,
     query_configuration: rift_protocol::query::QueryConfiguration,
+    query_views: Arc<std::sync::OnceLock<rift_server::LocalSymbolViews>>,
 }
 
 /// The proxy's one upstream connection and the generation counter that
@@ -373,6 +375,9 @@ impl RiftProxy {
                 crate::server::BlockingExecutor::for_configuration(server)
                     .expect("accepted fixture worker bounds"),
             );
+            let _ = proxy
+                .query_views
+                .set(crate::server::captured_views().expect("accepted fixture captured views"));
         }
         proxy
     }
@@ -404,6 +409,7 @@ impl RiftProxy {
             query_program: None,
             query_worker: None,
             query_configuration: rift_protocol::query::QueryConfiguration::default(),
+            query_views: Arc::default(),
         }
     }
 
@@ -1806,10 +1812,30 @@ impl ServerHandler for RiftProxy {
                     if let Err(error) = &registered {
                         operation.record("error.type", error.slug().as_str());
                     }
-                    let result = registered
-                        .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
-                        .and_then(std::convert::identity);
-                    rift_tracing::debug!(is_error = result.is_err(), "tool forward completed");
+                    let result = match registered {
+                        Err(error)
+                            if matches!(
+                                error.slug().as_str(),
+                                "rift.server.read_invalid"
+                                    | "rift.server.read_unsupported"
+                                    | "rift.server.read_unavailable"
+                                    | "rift.server.read_cancelled"
+                            ) =>
+                        {
+                            use rmcp::handler::server::tool::IntoCallToolResult as _;
+                            error
+                                .mcp()
+                                .tool_failure(wire::ErrorPhase::Read)
+                                .into_call_tool_result()
+                        }
+                        other => other
+                            .map_err(|error| error.mcp().tool_error(wire::ErrorPhase::Read))
+                            .and_then(std::convert::identity),
+                    };
+                    rift_tracing::debug!(
+                        is_error = Ending::of_tool_call(&result) != Ending::Answered,
+                        "tool forward completed"
+                    );
                     result
                 })
                 .await;
@@ -1991,7 +2017,7 @@ mod tests {
         }
     }
 
-    fn test_identity() -> ProductIdentity {
+    pub(in crate::proxy) fn test_identity() -> ProductIdentity {
         identity(BUILD_A, SCHEMA_DIGEST_A)
     }
 
@@ -3160,7 +3186,9 @@ mod tests {
         let forwarding = forwarding?;
         let client = client?;
         let params = super::CallToolRequestParams::new("search").with_arguments(
-            serde_json::from_value(json!({"query": "zzdiagnosticsecret", "scope": "local"}))?,
+            retrieval_request("zzdiagnosticsecret", "local")?
+                .arguments
+                .ok_or("query arguments")?,
         );
         let request = super::ClientRequest::CallToolRequest(super::CallToolRequest::new(params));
         let handle = client
@@ -3186,6 +3214,7 @@ mod tests {
                 .is_some_and(|block| block.text.contains("invalid_request")),
             "invalid paths retain the refusal code: {invalid:?}"
         );
+        rift_tracing::publish_in_flight("forward completed");
         assert_tool_diagnostics(&drain.queued_records(), &request_id)?;
         client.cancel().await?;
         forwarding.cancel().await?;
@@ -3194,7 +3223,7 @@ mod tests {
     }
 
     /// Whether `record` was emitted inside the `span` that served `request_id` for the
-    /// internal `search_candidates` tool: its `root_span` member names that span and
+    /// `search` tool: its `root_span` member names that span and
     /// carries both fields.
     ///
     /// The member is the span the record was emitted in, read from the subscriber's span
@@ -3205,7 +3234,7 @@ mod tests {
             let root = &fields["root_span"];
             root["name"] == span
                 && root["fields"]["request_id"] == request_id
-                && root["fields"]["tool"] == "search_candidates"
+                && root["fields"]["tool"] == "search"
         })
     }
 
@@ -3357,6 +3386,16 @@ mod tests {
     #[derive(Clone)]
     struct StructuredUpstream {
         root: String,
+        view: rift_protocol::symbol_read::CapturedView,
+    }
+
+    fn upstream_view() -> TestResult<rift_protocol::symbol_read::CapturedView> {
+        Ok(rift_protocol::symbol_read::CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse("claims.primary")?,
+            expires_at: jiff::Timestamp::now()
+                .checked_add(std::time::Duration::from_secs(600))?
+                .to_string(),
+        })
     }
 
     const SECOND_PAGE_CURSOR: &str = "second-page";
@@ -3371,6 +3410,25 @@ mod tests {
         };
         Tool::new(name, "an upstream tool", object(json!({"type": "object"})))
             .with_raw_output_schema(object(json!({"type": "object"})).into())
+    }
+
+    fn primary_query() -> CallToolRequestParams {
+        CallToolRequestParams::new("search").with_arguments(
+            serde_json::from_value(json!({"query": "SELECT ?symbol { ?symbol a :Symbol }"}))
+                .expect("query arguments"),
+        )
+    }
+
+    fn retrieval_request(query: &str, scope: &str) -> TestResult<CallToolRequestParams> {
+        let query = oxigraph::model::Literal::from(query);
+        let scope = oxigraph::model::Literal::from(scope);
+        let parameters = json!({"query": format!(
+            "SELECT ?hit {{ SERVICE :search {{ ?hit :query {query}; :scope {scope}; :index ?index }} }} ORDER BY ?index LIMIT 20"
+        )});
+        Ok(
+            CallToolRequestParams::new("search")
+                .with_arguments(serde_json::from_value(parameters)?),
+        )
     }
 
     impl rmcp::ServerHandler for StructuredUpstream {
@@ -3435,11 +3493,7 @@ mod tests {
                     let response = crate::server::candidates::SearchCandidateResponse {
                         root: self.root.clone(),
                         owner: rift_protocol::identity::SymbolOwner::Local,
-                        view: rift_protocol::symbol_read::CapturedView {
-                            id: rift_protocol::symbol_read::CapturedViewId::parse("claims.primary")
-                                .expect("a captured fixture view"),
-                            expires_at: "2099-01-01T00:00:00Z".to_owned(),
-                        },
+                        view: self.view.clone(),
                         inputs: rift_server::SearchCandidateInputs::default(),
                         ranking: rift_protocol::configuration::RankingConfiguration::default(),
                         results_max: 100,
@@ -3447,6 +3501,23 @@ mod tests {
                     };
                     Ok(CallToolResult::structured(
                         serde_json::to_value(response).expect("typed candidate response"),
+                    )
+                    .into())
+                }
+                "search"
+                    if request
+                        .arguments
+                        .as_ref()
+                        .is_some_and(|arguments| arguments.contains_key("query")) =>
+                {
+                    let answer: rift_protocol::query::QueryResult = serde_json::from_value(json!({
+                        "answer":{"result":"bindings","variables":["symbol"],"bindings":[]},
+                        "pagination":{"page_index":0,"total_pages":0},
+                        "view":self.view
+                    }))
+                    .expect("typed query answer");
+                    Ok(CallToolResult::structured(
+                        serde_json::to_value(answer).expect("query answer"),
                     )
                     .into())
                 }
@@ -3493,6 +3564,7 @@ mod tests {
     /// A downstream client talking to a proxy under `output`, whose upstream
     /// is [`StructuredUpstream`]. The fields keep the connection tasks alive.
     struct ProxiedClient {
+        view: rift_protocol::symbol_read::CapturedView,
         client: RunningService<RoleClient, ()>,
         _upstream: RunningService<RoleServer, StructuredUpstream>,
         _connection: tokio::task::JoinHandle<Result<(), rift_error::RiftError>>,
@@ -3502,6 +3574,7 @@ mod tests {
     async fn proxied_client(output: OutputPolicy) -> TestResult<ProxiedClient> {
         use rmcp::ServiceExt as _;
         let directory = tempfile::tempdir()?;
+        let view = upstream_view()?;
         let proxy = RiftProxy::new(directory.path(), test_identity(), output);
         let (upstream_client_half, upstream_server_half) = tokio::io::duplex(64 * 1024);
         // Each rmcp handshake future is about 4,900 bytes on aarch64; boxed, the three of
@@ -3515,6 +3588,7 @@ mod tests {
                         .canonicalize()?
                         .to_string_lossy()
                         .into_owned(),
+                    view: view.clone(),
                 }
                 .serve(upstream_server_half),
             )
@@ -3530,6 +3604,7 @@ mod tests {
         let (proxy_half, client_half) = tokio::io::duplex(64 * 1024);
         let connection = tokio::spawn(serve_connection(proxy, proxy_half));
         Ok(ProxiedClient {
+            view,
             client: Box::pin(().serve(client_half)).await?,
             _upstream: upstream?,
             _connection: connection,
@@ -3549,10 +3624,7 @@ mod tests {
             "text output must list no output schema on any page: {tools:?}"
         );
 
-        let result = proxied
-            .client
-            .call_tool(CallToolRequestParams::new("search"))
-            .await?;
+        let result = proxied.client.call_tool(primary_query()).await?;
         assert_eq!(result.structured_content, None);
         assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
         assert_eq!(result.is_error, Some(false));
@@ -3568,10 +3640,7 @@ mod tests {
         let (recorder, _drain) = rift_tracing::ScopedRecorder::builder().install()?;
         let proxied = proxied_client(OutputPolicy::Text).await?;
         proxied.client.list_all_tools().await?;
-        proxied
-            .client
-            .call_tool(CallToolRequestParams::new("search"))
-            .await?;
+        proxied.client.call_tool(primary_query()).await?;
         let failing = proxied
             .client
             .call_tool(CallToolRequestParams::new("failing"))
@@ -3730,18 +3799,47 @@ mod tests {
         )
         .expect("a canonical named fixture identity")
         .wire_identity();
-        for (tool, arguments) in [
+        for (index, (tool, arguments)) in [
             ("get_symbol", json!({"id": identity})),
-            ("search", json!({"query": "beacon", "scope": "local@cloud"})),
-            ("search", json!({"query": "beacon", "scope": "local@Cloud"})),
-        ] {
+            (
+                "search",
+                serde_json::to_value(retrieval_request("beacon", "local@cloud")?.arguments)?,
+            ),
+            (
+                "search",
+                serde_json::to_value(retrieval_request("beacon", "local@Cloud")?.arguments)?,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let request =
                 CallToolRequestParams::new(tool).with_arguments(serde_json::from_value(arguments)?);
-            let refused = proxied
-                .client
-                .call_tool(request)
-                .await
-                .expect_err("an unknown named project never reaches the primary upstream");
+            let answer = proxied.client.call_tool(request).await;
+            if index == 2 {
+                let refused = answer?;
+                assert_eq!(refused.is_error, Some(true), "{refused:?}");
+                assert!(refused.structured_content.is_none(), "{refused:?}");
+                let text = refused
+                    .content
+                    .first()
+                    .and_then(|content| content.as_text())
+                    .ok_or("invalid service scope carries its refusal")?;
+                assert!(
+                    text.text
+                        .starts_with("1 error\n\tinvalid_request · retry never\n"),
+                    "{}",
+                    text.text
+                );
+                assert!(
+                    text.text.contains("rift.server.read_invalid"),
+                    "{}",
+                    text.text
+                );
+                continue;
+            }
+            let refused =
+                answer.expect_err("an unknown named project never reaches the primary upstream");
             let ServiceError::McpError(error) = refused else {
                 return Err("a named refusal retains its JSON-RPC error".into());
             };
@@ -3750,26 +3848,22 @@ mod tests {
             assert_eq!(error.code, wire::ErrorCode::InvalidRequest);
             assert_eq!(error.retry, wire::RetryDirective::Never);
         }
-        let primary =
-            proxied
-                .client
-                .call_tool(CallToolRequestParams::new("search").with_arguments(
-                    serde_json::from_value(json!({"query": "beacon", "scope": "local"}))?,
-                ))
-                .await?;
-        let primary: rift_protocol::search::SearchResult = serde_json::from_value(
+        let primary = proxied.client.call_tool(primary_query()).await?;
+        let primary: rift_protocol::query::QueryResult = serde_json::from_value(
             primary
                 .structured_content
                 .ok_or("primary search returns structured content")?,
         )?;
-        assert!(primary.results.is_empty());
-        assert_eq!(primary.pagination.page_index, 0);
-        assert_eq!(primary.pagination.total_pages, 0);
+        assert!(
+            matches!(primary.answer, rift_protocol::query::QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
+        );
+        assert_eq!(primary.pagination.page.page_index, 0);
+        assert_eq!(primary.pagination.page.total_pages, 0);
         let view = primary
             .view
             .ok_or("primary search retains its captured view")?;
         assert_eq!(view.id.as_str(), "claims.primary");
-        assert_eq!(view.expires_at, "2099-01-01T00:00:00Z");
+        assert_eq!(view, proxied.view);
         let records = drain.queued_records();
         let completed = records
             .iter()
@@ -3777,9 +3871,10 @@ mod tests {
             .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
             .collect::<Result<Vec<_>, _>>()?;
         assert_eq!(completed.len(), 4);
-        for (fields, tool) in completed[..3]
+        for (index, (fields, tool)) in completed[..3]
             .iter()
             .zip(["get_symbol", "search", "search"])
+            .enumerate()
         {
             let operation = &fields["root_span"];
             assert_eq!(operation["name"], "mcp.forward");
@@ -3788,7 +3883,11 @@ mod tests {
             assert!(!operation["fields"]["caller_request_id"].is_null());
             assert_eq!(
                 operation["fields"]["error.type"],
-                errors::mcp::parameter_invalid::SLUG.as_str()
+                if index == 2 {
+                    errors::server::read_invalid::SLUG.as_str()
+                } else {
+                    errors::mcp::parameter_invalid::SLUG.as_str()
+                }
             );
             assert_eq!(fields["is_error"], "true");
         }
@@ -3839,7 +3938,8 @@ mod tests {
             Box::pin(().serve(client_half)),
             Box::pin(
                 StructuredUpstream {
-                    root: backend.root.to_string_lossy().into_owned()
+                    root: backend.root.to_string_lossy().into_owned(),
+                    view: upstream_view()?,
                 }
                 .serve(server_half)
             )
@@ -4386,7 +4486,7 @@ mod tests {
         let forwarding = forwarding?;
         let client = client?;
         let error = client
-            .call_tool(CallToolRequestParams::new("search"))
+            .call_tool(CallToolRequestParams::new("nodes"))
             .await
             .expect_err("a silent upstream refuses at the forwarding budget");
         let ServiceError::McpError(error) = error else {
@@ -4405,7 +4505,7 @@ mod tests {
         let operation = &fields["root_span"];
         assert_eq!(operation["name"], "mcp.forward");
         assert_eq!(operation["fields"]["operation"], "tools/call");
-        assert_eq!(operation["fields"]["tool"], "search");
+        assert_eq!(operation["fields"]["tool"], "nodes");
         assert!(!operation["fields"]["caller_request_id"].is_null());
         assert!(!operation["fields"]["request_id"].is_null());
         assert_eq!(
@@ -4468,21 +4568,20 @@ mod tests {
             "all output must list the output schema on every page: {tools:?}"
         );
 
-        let result = proxied
-            .client
-            .call_tool(CallToolRequestParams::new("search"))
-            .await?;
+        let result = proxied.client.call_tool(primary_query()).await?;
         let value = result
             .structured_content
             .as_ref()
             .ok_or("structured search result")?;
-        let result_view: rift_protocol::read::SearchResult = serde_json::from_value(value.clone())?;
-        assert!(result_view.results.is_empty());
+        let result_view: rift_protocol::query::QueryResult = serde_json::from_value(value.clone())?;
+        assert!(
+            matches!(&result_view.answer, rift_protocol::query::QueryAnswer::Bindings { bindings, .. } if bindings.is_empty())
+        );
         let view = result_view
             .view
             .ok_or("search preserves its captured view")?;
         assert_eq!(view.id.as_str(), "claims.primary");
-        assert_eq!(view.expires_at, "2099-01-01T00:00:00Z");
+        assert_eq!(view, proxied.view);
         assert_eq!(result.content.len(), 1, "content must stay: {result:?}");
         Ok(())
     }
@@ -4992,13 +5091,7 @@ mod tests {
         let client = &answered.client;
         let refusals = [
             format!("{:?}", client.list_tools(None).await.err()),
-            format!(
-                "{:?}",
-                client
-                    .call_tool(CallToolRequestParams::new("search"))
-                    .await
-                    .err()
-            ),
+            format!("{:?}", client.call_tool(primary_query()).await.err()),
             format!("{:?}", client.list_resources(None).await.err()),
             format!("{:?}", client.list_resource_templates(None).await.err()),
             format!(

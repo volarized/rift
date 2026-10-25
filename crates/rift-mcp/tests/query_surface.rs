@@ -26,6 +26,189 @@ const FILES: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
+async fn query_worker_without_protocol_acknowledgment_requires_operator_action() -> TestResult {
+    use rmcp::ServiceExt as _;
+
+    let directory = tempfile::tempdir()?;
+    std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+    std::fs::write(
+        directory.path().join("rift.toml"),
+        hermetic_search::HERMETIC_TABLES,
+    )?;
+    let server = rift_mcp::RiftMcp::build(
+        directory.path(),
+        rift_index::WorkspaceIndexLimits::default(),
+    )
+    .await?
+    .with_query_program(std::env::current_exe()?);
+    let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        let service = server.serve(server_transport).await?;
+        service.waiting().await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    });
+    let client = ().serve(client_transport).await?;
+    let result = client
+        .call_tool(tool_request("search", &json!({"query":"ASK {}"})))
+        .await?;
+    assert_eq!(result.is_error, Some(true), "{result:?}");
+    assert!(result.structured_content.is_none(), "{result:?}");
+    let text = result
+        .content
+        .first()
+        .and_then(|content| content.as_text())
+        .ok_or("worker refusal carries text")?;
+    assert!(
+        text.text
+            .contains("capability_unavailable · retry operator_action"),
+        "{}",
+        text.text
+    );
+    assert!(
+        text.text
+            .contains("query protocol acknowledgment is missing or invalid"),
+        "{}",
+        text.text
+    );
+    assert!(
+        text.text.contains("rift.server.read_unsupported"),
+        "{}",
+        text.text
+    );
+    client.cancel().await?;
+    server_task.await?.map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -> TestResult {
+    use rift_search::query::{FactRequirement, FactRequirements};
+
+    let (_directory, client, server_task) = served_workspace(FILES, None).await?;
+    let identity = "rift://symbol/local/rust/query_fixture/beacon";
+    let original = call_retrying_acceptance(
+        &client,
+        tool_request("get_symbol", &json!({"id":identity,"include":[]})),
+    )
+    .await?;
+    assert_eq!(original["outcome"], "found");
+    let program = std::path::PathBuf::from(
+        std::env::var_os("CARGO_BIN_EXE_rift").ok_or("matching query executable")?,
+    );
+    let limits = rift_search::query::QueryLimits::try_from(
+        &rift_protocol::query::QueryConfiguration::default(),
+    )?;
+    let prepared = tokio::task::spawn_blocking(move || {
+        rift_server::prepare_query(
+            &program,
+            "SELECT ?symbol ?unit ?text { ?symbol :name 'beacon'; :declarations ?declaration. ?declaration :unit ?unit. ?unit :source ?text }".to_owned(),
+            limits,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &|| false,
+        )
+    })
+    .await??;
+    let requirements = prepared.requirements();
+    requirements.validate_selection()?;
+    assert!(requirements.requires(FactRequirement::Domain));
+    assert!(requirements.requires(FactRequirement::Source));
+    let request = serde_json::to_value(rift_server::QueryExchange::new(json!({
+        "requirements":requirements,"view":null,"requests":1000
+    })))?;
+    let selected = call_retrying_acceptance(&client, tool_request("query_facts", &request)).await?;
+    assert_eq!(selected["payload"]["outcome"], "facts", "{selected}");
+    let selected = &selected["payload"]["response"];
+    let facts: rift_search::query::QueryFacts = serde_json::from_value(selected["facts"].clone())?;
+    assert!(
+        facts
+            .symbols
+            .iter()
+            .any(|item| item.symbol.name == "beacon")
+    );
+    use sha2::Digest as _;
+    let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(FILES[1].1.as_bytes()));
+    assert!(facts.sources.iter().any(|source| {
+        source.unit.as_str() == "rift://source/project/src/lib.rs"
+            && source.text.as_deref() == Some(FILES[1].1)
+            && source
+                .digest
+                .as_ref()
+                .is_some_and(|value| value.as_str() == digest)
+    }));
+    let held = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({
+                "id":identity,"view":selected["view"]["id"],"include":[]
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(held["symbol"], original["symbol"]);
+    assert_eq!(held["view"], selected["view"]);
+    for requirement in [
+        FactRequirement::Source,
+        FactRequirement::Nodes,
+        FactRequirement::History,
+    ] {
+        let mut malformed = FactRequirements::default();
+        malformed.require(requirement);
+        let malformed = serde_json::to_value(rift_server::QueryExchange::new(json!({
+            "requirements":malformed,"view":null,"requests":1000
+        })))?;
+        let refused = client
+            .call_tool(tool_request("query_facts", &malformed))
+            .await?;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        assert!(refused.structured_content.is_none(), "{refused:?}");
+        assert!(
+            serde_json::to_string(&refused)?
+                .contains("required fact families must include the domain selection")
+        );
+    }
+    let mut supplied = request.clone();
+    supplied["payload"]["facts"] = json!({"symbols":[{"name":"changed"}]});
+    supplied["payload"]["view"] = selected["view"]["id"].clone();
+    let invalid = client
+        .call_tool(tool_request("query_facts", &supplied))
+        .await?;
+    assert_eq!(invalid.is_error, Some(true), "{invalid:?}");
+    assert!(serde_json::to_string(&invalid)?.contains("invalid_request"));
+    let mut incompatible = request.clone();
+    incompatible["version"] = json!(0);
+    let incompatible = client
+        .call_tool(tool_request("query_facts", &incompatible))
+        .await?;
+    assert_eq!(incompatible.is_error, Some(true), "{incompatible:?}");
+    let incompatible = serde_json::to_string(&incompatible)?;
+    assert!(incompatible.contains("capability_unavailable · retry operator_action"));
+    assert!(incompatible.contains("rift.server.read_unsupported"));
+    let mut forged = request;
+    forged["payload"]["view"] = json!("0".repeat(64));
+    let expired = client
+        .call_tool(tool_request("query_facts", &forged))
+        .await?;
+    assert_eq!(expired.is_error, Some(true), "{expired:?}");
+    assert!(serde_json::to_string(&expired)?.contains("view_expired"));
+    let held_again = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({
+                "id":identity,"view":selected["view"]["id"],"include":[]
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(held_again["symbol"], held["symbol"]);
+    assert_eq!(held_again["view"], held["view"]);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn captured_view_does_not_authorize_supplied_query_records() -> TestResult {
     let (_directory, client, server_task) = served_workspace(FILES, None).await?;
     let identity = "rift://symbol/local/rust/query_fixture/beacon";

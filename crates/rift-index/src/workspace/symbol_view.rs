@@ -3,7 +3,8 @@ use super::{
     DocumentationSourceIdentity, IdentifierMatcher, IndexDocument, IndexedFile, Language,
     NormalizedGraph, NotebookFiles, Path, PathBuf, ProjectPath, ReadableSymbol, RelationshipStore,
     RiftError, SymbolDeclarations, SymbolId, SymbolMatch, SymbolOwner, TextSourceFile,
-    WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSemantics, errors, symbol_rank,
+    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSemantics, errors,
+    symbol_rank,
 };
 
 mod retained_size;
@@ -18,6 +19,7 @@ mod tests;
 pub struct WorkspaceSymbolView {
     root: PathBuf,
     owner: SymbolOwner,
+    fingerprint: WorkspaceFingerprint,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     frameworks: BTreeMap<ProjectPath, rift_analysis::ResolvedFramework>,
     identities: BTreeMap<(ProjectPath, usize), SymbolId>,
@@ -54,6 +56,7 @@ impl WorkspaceIndex {
         let mut view = WorkspaceSymbolView {
             root: self.root.clone(),
             owner: self.owner.clone(),
+            fingerprint: self.fingerprint.clone(),
             files: self.files.clone(),
             frameworks: self
                 .files
@@ -106,6 +109,12 @@ impl SymbolDeclarations {
 }
 
 impl WorkspaceSymbolView {
+    /// Returns the source identity captured with this immutable publication.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &WorkspaceFingerprint {
+        &self.fingerprint
+    }
+
     /// Retains already captured source bytes without adding semantic facts.
     ///
     /// # Errors

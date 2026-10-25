@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from rift_dev.corpus_assertions import warnings
-from rift_dev.rift_test_client import Client, JsonObject, gate_deadline
+from rift_dev.rift_test_client import Client, JsonObject, ToolFailure, gate_deadline
 
 
 def preparing_local(answer: JsonObject) -> bool:
@@ -29,6 +29,26 @@ def preparing_local(answer: JsonObject) -> bool:
     )
 
 
+def retry_local_failure(failure: ToolFailure) -> bool:
+    """Recognize registered failures that permit resending the same request.
+
+    >>> failure = ToolFailure("search", "read", "temporarily_unavailable", "read", "same_request")
+    >>> retry_local_failure(failure)
+    True
+    >>> failure.retry = "correct_input"
+    >>> retry_local_failure(failure)
+    False
+    >>> failure.retry = "same_request"
+    >>> failure.code = "capability_unavailable"
+    >>> retry_local_failure(failure)
+    False
+    >>> failure.code = "invalid_request"
+    >>> retry_local_failure(failure)
+    False
+    """
+    return failure.code == "temporarily_unavailable" and failure.retry == "same_request"
+
+
 async def settled_local(
     client: Client,
     name: str,
@@ -41,12 +61,17 @@ async def settled_local(
 
     A `local_index_preparing` answer covers only prepared files. A query can
     instead refuse with `index_preparing` until its required facts are ready. One inherited
-    deadline bounds every call and poll together; a settled answer keeps the
+    deadline bounds every call, advertised retry, and poll together; a settled answer keeps the
     caller's result checks and every other warning.
     """
     async with gate_deadline("local index preparation", seconds):
         while True:
-            answer = await client.call(name, request)
-            if not preparing_local(answer):
-                return answer
+            try:
+                answer = await client.call(name, request)
+            except ToolFailure as failure:
+                if not retry_local_failure(failure):
+                    raise
+            else:
+                if not preparing_local(answer):
+                    return answer
             await asyncio.sleep(poll_seconds)

@@ -155,7 +155,7 @@ impl AssembledSymbol {
     pub fn to_protocol_symbol(&self, facts: &PortableSymbolFacts) -> Symbol {
         let mut extension_values = BTreeMap::new();
         for (_, extensions) in &self.namespaced {
-            for (key, value) in &extensions.0 {
+            for (key, value) in extensions.iter() {
                 extension_values
                     .entry(key.clone())
                     .or_insert_with(|| value.clone());
@@ -170,7 +170,7 @@ impl AssembledSymbol {
             .container
             .as_ref()
             .map(|container| WireSymbolId(container.as_str().to_owned()));
-        symbol.extensions = Extensions(extension_values);
+        symbol.extensions = Extensions::from(extension_values);
         symbol
     }
 
@@ -621,7 +621,7 @@ mod tests {
             )
             .expect("origin"),
         )
-        .namespaced(Extensions(BTreeMap::default()));
+        .namespaced(Extensions::from(BTreeMap::default()));
         if let Some(identity) = identity {
             builder = builder
                 .source(rift_core::DeclarationBinding::new(
@@ -825,7 +825,7 @@ mod tests {
         };
         assembled.namespaced.push((
             provider("git"),
-            Extensions(BTreeMap::from([(key.clone(), value.clone())])),
+            Extensions::from(BTreeMap::from([(key.clone(), value.clone())])),
         ));
         assembled.origin =
             ContributionOrigin::new(Some(SourceLocation::External {}), SourceKind::Authored)
@@ -833,7 +833,7 @@ mod tests {
 
         let symbol = assembled.to_protocol_symbol(assembled.facts().expect("portable facts"));
 
-        assert_eq!(symbol.extensions.0.get(&key), Some(&value));
+        assert_eq!(symbol.extensions.get(&key), Some(&value));
         assert_eq!(
             symbol.origin.location,
             Some(rift_protocol::read::SourceLocationKind::External)
@@ -843,7 +843,7 @@ mod tests {
 
     #[test]
     fn assembly_retains_namespaced_fact_without_portable_fields() {
-        let namespaced = Extensions(BTreeMap::from([(
+        let namespaced = Extensions::from(BTreeMap::from([(
             rift_core::ExtensionKey("org.rift.history".to_owned()),
             rift_core::ExtensionValue {
                 version: 1,

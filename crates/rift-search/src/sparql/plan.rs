@@ -7,6 +7,7 @@ use super::{FactRequirements, PageSelection, PreparedQuery, QueryError, QueryLim
 
 /// Query metadata that the serving owner can use without parsing the statement.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryPlan {
     statement: String,
     expanded: String,

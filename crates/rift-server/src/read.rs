@@ -33,7 +33,9 @@ use sha2::{Digest as _, Sha256};
 use crate::history::{StoredHistory, SymbolTimelines};
 
 mod canonical;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+pub use canonical::{
+    CapturedQueryView, LocalSymbolViewInput, LocalSymbolViews, QueryMaterial, QueryViewInput,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -1579,7 +1581,7 @@ fn wire_node_facts(
         range: text_range(range),
         regions: Vec::new(),
         parent: None,
-        extensions: Extensions(BTreeMap::new()),
+        extensions: Extensions::from(BTreeMap::new()),
     })
 }
 

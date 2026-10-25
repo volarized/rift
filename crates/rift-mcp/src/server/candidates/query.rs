@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 #[derive(Deserialize, Serialize)]
-pub(super) struct SavedQuery {
-    pub(super) context: SavedSymbol,
+pub(crate) struct SavedQuery {
+    pub(crate) context: SavedSymbol,
     template_end: usize,
     pages: Vec<QueryPage>,
     warnings: Vec<ReadWarning>,
@@ -24,10 +24,10 @@ mod global;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(in crate::server) struct QueryGlobalSelection {
-    pub(in crate::server) owners: Vec<rift_protocol::identity::SymbolOwner>,
-    pub(in crate::server) view: CapturedView,
-    pub(in crate::server) configuration: rift_protocol::configuration::GlobalConfiguration,
+pub(crate) struct QueryGlobalSelection {
+    pub(crate) owners: Vec<rift_protocol::identity::SymbolOwner>,
+    pub(crate) view: CapturedView,
+    pub(crate) configuration: rift_protocol::configuration::GlobalConfiguration,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -100,26 +100,50 @@ impl RiftMcp {
         &self,
         view: &CapturedViewId,
         page: Option<u64>,
+        budget: rift_server::QueryFactBudget<'static>,
+        deadline: crate::server::RequestDeadline,
     ) -> Result<Result<RetainedQuery, SymbolUnavailableReason>, super::ToolFailure> {
         let responses = Arc::clone(&self.candidate_responses);
         let views = Arc::clone(&self.local_views);
         let view = view.clone();
-        self.blocking
-            .run("retained query result", move || {
-                let (saved, material) = match retained(&responses, &views, &view)? {
-                    Ok(value) => value,
-                    Err(reason) => return Ok(Err(reason)),
-                };
-                let answer = saved.decode(&material, page)?;
-                Ok(Ok(RetainedQuery {
-                    material,
-                    answer,
-                    warnings: saved.warnings,
-                    upstream: saved.upstream,
-                }))
-            })
-            .await
-            .map_err(read_failure)
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let result = tokio::time::timeout_at(
+            deadline.at(),
+            self.blocking.run_with_cancellation(
+                "retained query result",
+                cancellation,
+                move |cancelled| {
+                    let cancelled = || cancelled.is_cancelled();
+                    let mut budget = budget.with_cancellation(&cancelled);
+                    budget.check()?;
+                    let (saved, material) = match retained(&responses, &views, &view)? {
+                        Ok(value) => value,
+                        Err(reason) => return Ok(Err(reason)),
+                    };
+                    if let Some(bytes) = material.query_result() {
+                        budget.charge_bytes(&bytes)?;
+                    }
+                    let answer = saved.decode(&material, page)?;
+                    budget.check()?;
+                    Ok(Ok(RetainedQuery {
+                        material,
+                        answer,
+                        warnings: saved.warnings,
+                        upstream: saved.upstream,
+                    }))
+                },
+            ),
+        )
+        .await
+        .map_err(|_| {
+            read_failure(crate::server::query::acquisition_failure(
+                "query acquisition exceeded its deadline",
+            ))
+        })?
+        .map_err(read_failure);
+        drop(guard);
+        result
     }
 
     pub(in crate::server) async fn retained_query_page(
@@ -398,12 +422,64 @@ fn first_page(answer: &QueryAnswer, page: Option<&QueryPage>, offsets: &[usize])
 }
 
 impl SavedQuery {
+    pub(crate) fn at_view(mut self, view: CapturedView) -> Self {
+        self.context.view = view;
+        self
+    }
+
+    pub(crate) fn validate_pages(
+        &self,
+        bytes: &[u8],
+        maximum: usize,
+        check: impl Fn() -> Result<(), RiftError>,
+    ) -> Result<(), RiftError> {
+        for page in 0..self.pages.len().max(1) {
+            check()?;
+            let page = u64::try_from(page).map_err(|_| page_failure())?;
+            let response = self.response(self.decode_bytes(bytes, Some(page))?, page)?;
+            if encoded_size(&response)? > maximum {
+                return Err(page_failure());
+            }
+        }
+        check()
+    }
+
+    pub(crate) fn encoded(
+        context: SavedSymbol,
+        answer: &QueryAnswer,
+        configuration: &QueryConfiguration,
+        warnings: Vec<ReadWarning>,
+        upstream: Vec<QueryGlobalSelection>,
+    ) -> Result<(Self, Vec<u8>, QueryReadResult), RiftError> {
+        let maximum =
+            usize::try_from(configuration.result_size.bytes()).map_err(|_| page_failure())?;
+        let (bytes, template_end, offsets) = encode_records(answer, maximum)?;
+        let mut saved = Self {
+            context,
+            template_end,
+            pages: Vec::new(),
+            warnings,
+            upstream,
+        };
+        saved.pages = plan_pages(answer, &offsets, &saved, configuration)?;
+        let response = saved.response(first_page(answer, saved.pages.first(), &offsets), 0)?;
+        Ok((saved, bytes, response))
+    }
+
     fn decode(
         &self,
         material: &rift_server::LocalSymbolViewInput,
         page: Option<u64>,
     ) -> Result<QueryAnswer, RiftError> {
         let bytes = material.query_result().ok_or_else(retention_failure)?;
+        self.decode_bytes(&bytes, page)
+    }
+
+    pub(crate) fn decode_bytes(
+        &self,
+        bytes: &[u8],
+        page: Option<u64>,
+    ) -> Result<QueryAnswer, RiftError> {
         let template = bytes
             .get(..self.template_end)
             .ok_or_else(retention_failure)?;
@@ -425,7 +501,11 @@ impl SavedQuery {
         Ok(answer)
     }
 
-    fn response(&self, answer: QueryAnswer, page_index: u64) -> Result<QueryReadResult, RiftError> {
+    pub(crate) fn response(
+        &self,
+        answer: QueryAnswer,
+        page_index: u64,
+    ) -> Result<QueryReadResult, RiftError> {
         let total_pages = u64::try_from(self.pages.len()).map_err(|_| page_failure())?;
         let next = page_index.checked_add(1).filter(|next| *next < total_pages);
         let mut pagination = rift_protocol::query::QueryPagination::from(Pagination {

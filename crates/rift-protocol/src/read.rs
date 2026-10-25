@@ -9,7 +9,6 @@ use crate::dependencies::RequestedPackage;
 use crate::schema;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Most characters a public symbol name or declaration lookup name carries.
 pub const SYMBOL_NAME_CHARACTERS_MAX: usize = 4096;
@@ -250,21 +249,8 @@ pub struct ExtensionValue {
     pub data: serde_json::Value,
 }
 
-/// Facts a provider carries that the model has no field for, under a reverse-domain key.
-/// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
-/// implement.
-#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct Extensions(pub BTreeMap<ExtensionKey, ExtensionValue>);
-
-impl Extensions {
-    /// Whether this holds no entries.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-}
+mod extensions;
+pub use extensions::Extensions;
 
 /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
 /// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path

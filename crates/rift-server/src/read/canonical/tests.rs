@@ -87,6 +87,59 @@ fn captured_input(reads: &ReadService) -> LocalSymbolViewInput {
 }
 
 #[test]
+fn provider_selection_storage_preserves_original_configuration_and_expiry() {
+    let (_directory, reads, _) = fixture(true);
+    let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+    let input = captured_input(&reads);
+    let selection = input
+        .provider_selection(&configuration)
+        .expect("original selection");
+    let mut changed = configuration;
+    changed.search.query.results += 1;
+    let different = input
+        .provider_selection(&changed)
+        .expect("changed configuration");
+    assert_ne!(selection.configuration, different.configuration);
+    let input = input
+        .with_provider_selection(selection.clone())
+        .expect("original scope");
+    assert_eq!(input.captured_provider_selection(), Some(&selection));
+    let before = input.retained_bytes;
+    let input = input
+        .with_query_result(vec![1, 2, 3])
+        .with_sources(&reads.index)
+        .expect("original captured source");
+    assert_eq!(input.captured_provider_selection(), Some(&selection));
+    assert!(input.retained_bytes >= before + 3);
+    assert_eq!(
+        input
+            .with_provider_selection(different)
+            .expect_err("a captured configuration cannot change")
+            .slug()
+            .as_str(),
+        "rift.server.read_invalid"
+    );
+    let input = captured_input(&reads)
+        .with_provider_selection(selection)
+        .expect("original scope");
+    let store = LocalSymbolViews::new(1 << 20, [81; 32]);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let view = store
+        .capture_at(input, now)
+        .expect("capture")
+        .expect("view");
+    assert!(matches!(
+        store.captured_view_at(
+            &view.id,
+            reads.index.root(),
+            reads.index.owner(),
+            now + VIEW_LIFETIME
+        ),
+        Err(SymbolUnavailableReason::ViewExpired)
+    ));
+}
+
+#[test]
 fn search_view_input_retains_nonempty_material_and_truthful_history_coverage() {
     let (_directory, reads, id) = fixture(true);
     let store = LocalSymbolViews::new(1 << 20, [8; 32]);
@@ -278,7 +331,11 @@ fn captured_nonempty_material_refuses_uncaptured_history_without_live_lookup() {
     let store = LocalSymbolViews::new(1 << 20, [9; 32]);
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
     let view = capture(&store, &reads, now);
-    let material = Arc::clone(&store.state.lock().expect("state").views[view.id.as_str()].material);
+    let held = store.state.lock().expect("state").views[view.id.as_str()]
+        .clone()
+        .into_local()
+        .expect("captured local material");
+    let material = held.material;
     assert!(!material.index.index_documents().is_empty());
     assert!(material.index.retained_material_bytes() > material.metadata.len());
     std::fs::remove_file(directory.path().join("index.js")).expect("remove current source");
@@ -1651,6 +1708,7 @@ fn assert_measured_held_source(
         .clone();
     assert_eq!(held.view, *view);
     assert!(held.expires > SystemTime::now());
+    let held = held.into_local().expect("retained local material");
     assert_eq!(held.material.index.root(), reads.index.root());
     assert_eq!(held.material.index.owner(), reads.index.owner());
     assert!(Arc::ptr_eq(&held.material, material));

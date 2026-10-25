@@ -22,6 +22,9 @@ use super::{IndexedFile, TRAVERSAL_NODES_MAX, resolve_graph_symbol};
 mod package;
 pub use package::{QueryPackageTarget, QuerySourceRequest};
 
+#[path = "engine_query_provider.rs"]
+mod provider;
+
 #[derive(Debug)]
 enum RetainedTarget {
     Global(super::PackageCallee),
@@ -36,7 +39,9 @@ pub struct ProviderRequests {
 }
 
 impl ProviderRequests {
-    fn new(maximum: u64) -> Self {
+    /// Starts one shared request count under the accepted query limit.
+    #[must_use]
+    pub fn new(maximum: u64) -> Self {
         Self {
             used: Arc::new(AtomicU64::new(0)),
             maximum,
@@ -59,12 +64,98 @@ impl ProviderRequests {
         self.maximum
             .saturating_sub(self.used.load(Ordering::Relaxed))
     }
+
+    /// Reserves a delegated allowance before its boundary request starts.
+    ///
+    /// An unanswered or canceled delegation keeps its complete reservation.
+    ///
+    /// # Errors
+    /// Refuses an allowance larger than the remaining accepted count.
+    pub fn reserve(&self, maximum: u64) -> Result<ProviderRequestAllowance, RiftError> {
+        self.used.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(maximum).filter(|used| *used <= self.maximum)
+        }).map_err(|_| unavailable("query exceeds search.query.requests; narrow the query or increase the accepted bound"))?;
+        Ok(ProviderRequestAllowance {
+            requests: self.clone(),
+            maximum,
+        })
+    }
+}
+
+/// A delegated count retained until a complete compatible response reports use.
+#[derive(Debug)]
+pub struct ProviderRequestAllowance {
+    requests: ProviderRequests,
+    maximum: u64,
+}
+
+#[cfg(test)]
+mod request_allowance_tests {
+    use super::ProviderRequests;
+
+    #[test]
+    fn delegated_requests_share_counts_and_keep_failed_work() {
+        let requests = ProviderRequests::new(12);
+        let first = requests.reserve(8).expect("first delegated allowance");
+        requests.claim().expect("first boundary send");
+        first.complete(2).expect("validated actual nested use");
+        assert_eq!(requests.remaining(), 9);
+        let second = requests.reserve(7).expect("second owner allowance");
+        requests.claim().expect("second boundary send");
+        drop(second);
+        assert_eq!(requests.remaining(), 1);
+        requests.claim().expect("one retry send remains charged");
+        assert!(requests.claim().is_err());
+        assert!(requests.reserve(1).is_err());
+    }
+
+    #[test]
+    fn incompatible_usage_never_releases_reserved_requests() {
+        let requests = ProviderRequests::new(4);
+        let allowance = requests.reserve(3).expect("delegated allowance");
+        requests.claim().expect("boundary send");
+        assert!(allowance.complete(4).is_err());
+        assert_eq!(requests.remaining(), 0);
+    }
+}
+
+impl ProviderRequestAllowance {
+    /// Returns the count reserved for the delegated owner.
+    #[must_use]
+    pub const fn maximum(&self) -> u64 {
+        self.maximum
+    }
+
+    /// Releases only unused requests from a validated complete response.
+    ///
+    /// # Errors
+    /// Refuses reported use beyond the original delegated allowance.
+    pub fn complete(self, used: u64) -> Result<(), RiftError> {
+        let unused = self
+            .maximum
+            .checked_sub(used)
+            .ok_or_else(|| unavailable("query response exceeds its accepted request allowance"))?;
+        self.requests.used.fetch_sub(unused, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn deduplicate_occurrence_records(
+    records: &mut Vec<rift_protocol::relationship_read::RelationshipOccurrence>,
+) {
+    records.sort_by(|left, right| {
+        (&left.id, &left.relationship)
+            .cmp(&(&right.id, &right.relationship))
+            .then_with(|| compare_occurrences(&left.occurrence, &right.occurrence))
+    });
+    records.dedup();
 }
 
 pub(crate) fn merge_package_facts(
     held: &mut rift_search::query::QueryFacts,
     added: rift_search::query::QueryFacts,
 ) -> Result<(), RiftError> {
+    added.validate_providers()?;
     let mut records = held
         .relationship_records
         .iter()
@@ -86,17 +177,84 @@ pub(crate) fn merge_package_facts(
             }
         }
     }
+    let mut links = held
+        .occurrence_records
+        .iter()
+        .map(|record| (record.id.clone(), record.relationship.clone()))
+        .collect::<BTreeMap<_, _>>();
+    for record in added.occurrence_records {
+        if let Some(previous) = links.insert(record.id.clone(), record.relationship.clone())
+            && previous != record.relationship
+        {
+            return unavailable("original usage record has conflicting relationship links").fail();
+        }
+        held.occurrence_records.push(record);
+    }
+    deduplicate_occurrence_records(&mut held.occurrence_records);
+    // The array selector scopes original contribution keys to one checked captured graph.
+    let mut provider_remap = Vec::with_capacity(added.providers.len());
+    for snapshot in &added.providers {
+        let index = match held
+            .providers
+            .iter()
+            .position(|previous| previous.context == snapshot.context)
+        {
+            Some(index) => index,
+            None => {
+                let index = held.providers.len();
+                held.providers
+                    .push(rift_search::query::QueryProviderSnapshot {
+                        context: snapshot.context.clone(),
+                        records: Vec::new(),
+                        source_indices: Vec::new(),
+                        references: Vec::new(),
+                        relationships: Vec::new(),
+                    });
+                index
+            }
+        };
+        provider_remap.push(index);
+    }
+    let mut associations = BTreeMap::new();
+    for (provider, snapshot) in held.providers.iter().enumerate() {
+        for record in &snapshot.records {
+            for key in &record.contributions {
+                associations.insert((provider, key.clone()), record.symbol_index);
+            }
+        }
+    }
+    let mut supplied_associations = BTreeMap::new();
+    for (provider, snapshot) in added.providers.iter().enumerate() {
+        let provider = provider_remap[provider];
+        for record in &snapshot.records {
+            for key in &record.contributions {
+                if let Some(index) = associations.get(&(provider, key.clone())) {
+                    match supplied_associations.insert(record.symbol_index, *index) {
+                        Some(previous) if previous != *index => {
+                            return unavailable(
+                                "captured provider contributions select conflicting records",
+                            )
+                            .fail();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    let mut source_remap = Vec::with_capacity(added.sources.len());
+    let mut source_units = held
+        .sources
+        .iter()
+        .enumerate()
+        .map(|(index, source)| (source.unit.clone(), index))
+        .collect::<BTreeMap<_, _>>();
     for mut source in added.sources {
         complete_source_digest(&mut source)?;
-        match held
-            .sources
-            .iter_mut()
-            .find(|previous| previous.unit == source.unit)
-        {
-            Some(previous) => {
-                if previous.digest.is_none() {
-                    complete_source_digest(previous)?;
-                }
+        let index = match source_units.get(&source.unit).copied() {
+            Some(index) => {
+                let previous = &mut held.sources[index];
+                complete_source_digest(previous)?;
                 if previous
                     .digest
                     .as_ref()
@@ -119,27 +277,32 @@ pub(crate) fn merge_package_facts(
                     (missing @ None, Some(captured)) => *missing = Some(captured),
                     _ => {}
                 }
+                index
             }
-            None => held.sources.push(source),
-        }
+            None => {
+                let index = held.sources.len();
+                source_units.insert(source.unit.clone(), index);
+                held.sources.push(source);
+                index
+            }
+        };
+        source_remap.push(index);
     }
-    let mut identities: BTreeMap<_, _> = held
+    let mut identities = held
         .symbols
         .iter()
         .enumerate()
-        .filter_map(|(position, symbol)| {
-            symbol
-                .symbol
-                .id
-                .clone()
-                .map(|identity| (identity, position))
-        })
-        .collect();
-    for symbol in added.symbols {
-        let Some(identity) = symbol.symbol.id.clone() else {
-            continue;
-        };
-        match identities.get(&identity).copied() {
+        .filter_map(|(index, symbol)| symbol.symbol.id.clone().map(|identity| (identity, index)))
+        .collect::<BTreeMap<_, _>>();
+    let mut symbol_remap = Vec::with_capacity(added.symbols.len());
+    for (supplied_index, symbol) in added.symbols.into_iter().enumerate() {
+        let previous = symbol
+            .symbol
+            .id
+            .as_ref()
+            .and_then(|identity| identities.get(identity).copied())
+            .or_else(|| supplied_associations.get(&supplied_index).copied());
+        let (position, declarations) = match previous {
             Some(position) => {
                 let previous = &mut held.symbols[position];
                 if previous.symbol != symbol.symbol {
@@ -148,23 +311,165 @@ pub(crate) fn merge_package_facts(
                     )
                     .fail();
                 }
+                let mut declarations = Vec::with_capacity(symbol.declarations.len());
                 for declaration in symbol.declarations {
-                    if !previous.declarations.contains(&declaration) {
-                        previous.declarations.push(declaration);
-                    }
+                    let index = match previous
+                        .declarations
+                        .iter()
+                        .position(|held| held == &declaration)
+                    {
+                        Some(index) => index,
+                        None => {
+                            let index = previous.declarations.len();
+                            previous.declarations.push(declaration);
+                            index
+                        }
+                    };
+                    declarations.push(index);
                 }
+                (position, declarations)
             }
             None => {
-                identities.insert(identity, held.symbols.len());
+                let position = held.symbols.len();
+                if let Some(identity) = &symbol.symbol.id {
+                    identities.insert(identity.clone(), position);
+                }
+                let declarations = (0..symbol.declarations.len()).collect();
                 held.symbols.push(symbol);
+                (position, declarations)
+            }
+        };
+        symbol_remap.push((position, declarations));
+    }
+    for (supplied_index, mut snapshot) in added.providers.into_iter().enumerate() {
+        let index = provider_remap[supplied_index];
+        for source in &mut snapshot.source_indices {
+            *source = *source_remap
+                .get(*source)
+                .ok_or_else(|| unavailable("captured provider source selector is absent"))?;
+        }
+        for record in &mut snapshot.records {
+            let (symbol, declarations) = symbol_remap
+                .get(record.symbol_index)
+                .ok_or_else(|| unavailable("captured provider symbol selector is absent"))?;
+            record.symbol_index = *symbol;
+            for declaration in &mut record.declarations {
+                declaration.declaration_index = *declarations
+                    .get(declaration.declaration_index)
+                    .ok_or_else(|| {
+                        unavailable("captured provider declaration selector is absent")
+                    })?;
             }
         }
+        let previous = &mut held.providers[index];
+        for source in snapshot.source_indices {
+            if !previous.source_indices.contains(&source) {
+                previous.source_indices.push(source);
+            }
+        }
+        for record in snapshot.records {
+            if let Some(original) = previous.records.iter().find(|original| {
+                original
+                    .contributions
+                    .iter()
+                    .any(|key| record.contributions.contains(key))
+            }) {
+                if original != &record {
+                    return unavailable(
+                        "captured provider record differs within its original source context",
+                    )
+                    .fail();
+                }
+            } else {
+                previous.records.push(record);
+            }
+        }
+        if previous.references.is_empty() {
+            previous.references = snapshot.references;
+        } else if previous.references != snapshot.references {
+            return unavailable("captured references differ within their original source context")
+                .fail();
+        }
+        if previous.relationships.is_empty() {
+            previous.relationships = snapshot.relationships;
+        } else if previous.relationships != snapshot.relationships {
+            return unavailable(
+                "captured relationships differ within their original source context",
+            )
+            .fail();
+        }
     }
+    for mut edge in added.provider_edges {
+        for endpoint in edge.from.iter_mut().chain(std::iter::once(&mut edge.to)) {
+            if let Some(provider) = endpoint.provider {
+                endpoint.provider =
+                    Some(*provider_remap.get(provider).ok_or_else(|| {
+                        unavailable("captured provider endpoint selector is absent")
+                    })?);
+            }
+        }
+        held.provider_edges.push(edge);
+    }
+    deduplicate_provider_edges(&mut held.provider_edges);
     held.relationships.extend(added.relationships);
     held.occurrences.extend(added.occurrences);
+    for source in added.nodes {
+        source.validate()?;
+        match held
+            .nodes
+            .iter()
+            .find(|previous| previous.unit == source.unit)
+        {
+            Some(previous) if previous != &source => {
+                return unavailable(
+                    "captured syntax tree differs within its original source context",
+                )
+                .fail();
+            }
+            Some(_) => {}
+            None => held.nodes.push(source),
+        }
+    }
+    held.histories.extend(added.histories);
+    held.documentation_sources
+        .extend(added.documentation_sources);
+    held.documentation_blocks.extend(added.documentation_blocks);
+    held.documentation_links.extend(added.documentation_links);
+    held.documentation_references
+        .extend(added.documentation_references);
+    held.documentation_reference_candidates
+        .extend(added.documentation_reference_candidates);
+    for family in added.unavailable_families {
+        if !held.unavailable_families.contains(&family) {
+            held.unavailable_families.push(family);
+        }
+    }
     deduplicate_relationships(&mut held.relationships);
     deduplicate_occurrences(&mut held.occurrences);
     Ok(())
+}
+
+fn deduplicate_provider_edges(edges: &mut Vec<rift_search::query::QueryProviderEdge>) {
+    let compare = |left: &rift_search::query::QueryProviderEdge,
+                   right: &rift_search::query::QueryProviderEdge| {
+        left.from
+            .cmp(&right.from)
+            .then_with(|| left.to.cmp(&right.to))
+            .then_with(|| left.facet.cmp(&right.facet))
+            .then_with(|| match (&left.occurrence, &right.occurrence) {
+                (Some(left), Some(right)) => left
+                    .unit
+                    .cmp(&right.unit)
+                    .then_with(|| left.range.start.cmp(&right.range.start))
+                    .then_with(|| left.range.end.cmp(&right.range.end)),
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+            })
+            .then_with(|| left.derivation.cmp(&right.derivation))
+    };
+    edges.sort_by(compare);
+    edges.dedup();
 }
 
 fn complete_source_digest(source: &mut rift_search::query::QuerySource) -> Result<(), RiftError> {
@@ -196,6 +501,13 @@ struct AcquiredSubject {
 
 /// Request-owned engine facts and admitted dependency targets.
 pub struct EngineQuery<'request> {
+    provider_targets: Vec<Arc<QueryPackageTarget>>,
+    resolved_providers: BTreeSet<(
+        rift_search::query::QueryProviderEndpoint,
+        RelationshipFacet,
+        bool,
+    )>,
+    provider_selection: Option<Arc<rift_search::query::QueryProviderSelection>>,
     reads: &'request ReadService,
     engines: &'request EnginePool,
     configuration: &'request rift_protocol::configuration::WorkspaceConfiguration,
@@ -205,6 +517,7 @@ pub struct EngineQuery<'request> {
     targets: BTreeMap<CoreSymbolId, RetainedTarget>,
     resolved: BTreeSet<(SymbolId, Option<RelationshipFacet>, bool)>,
     provider_requests: ProviderRequests,
+    query_budget: Option<crate::QueryFactBudget<'static>>,
 }
 
 impl std::fmt::Debug for EngineQuery<'_> {
@@ -228,6 +541,9 @@ impl<'request> EngineQuery<'request> {
         roots: &'request CalleeRoots,
     ) -> Self {
         Self {
+            provider_targets: Vec::new(),
+            resolved_providers: BTreeSet::new(),
+            provider_selection: None,
             reads,
             engines,
             configuration,
@@ -240,7 +556,44 @@ impl<'request> EngineQuery<'request> {
             targets: BTreeMap::new(),
             resolved: BTreeSet::new(),
             provider_requests: ProviderRequests::new(configuration.search.query.requests),
+            query_budget: None,
         }
+    }
+
+    /// Shares the request's retained material admission across provider batches.
+    #[must_use]
+    pub fn with_query_budget(mut self, budget: crate::QueryFactBudget<'static>) -> Self {
+        self.query_budget = Some(budget);
+        self
+    }
+
+    /// Shares actual request admission with retrieval and delegated provider owners.
+    #[must_use]
+    pub fn with_provider_requests(mut self, requests: ProviderRequests) -> Self {
+        self.provider_requests = requests;
+        self
+    }
+
+    /// Binds provider acquisition to the original immutable serving publication.
+    #[must_use]
+    pub fn with_provider_selection(
+        mut self,
+        selection: rift_search::query::QueryProviderSelection,
+    ) -> Self {
+        self.provider_selection = Some(Arc::new(selection));
+        self
+    }
+
+    /// Original serving selection shared with bounded source preparation.
+    #[must_use]
+    pub fn provider_selection(&self) -> Option<Arc<rift_search::query::QueryProviderSelection>> {
+        self.provider_selection.as_ref().map(Arc::clone)
+    }
+
+    /// Shares the same request admission with a provider preparation worker.
+    #[must_use]
+    pub fn query_budget(&self) -> Option<crate::QueryFactBudget<'static>> {
+        self.query_budget.clone()
     }
 
     /// Complete facts and pending dependency names acquired by this request.
@@ -350,6 +703,7 @@ impl<'request> EngineQuery<'request> {
                 ..AcquiredSubject::default()
             },
             maximum,
+            self.query_budget.as_ref(),
         )?;
         self.resolved.insert(key);
         self.references.validate_revision(self.reads)
@@ -382,7 +736,7 @@ impl<'request> EngineQuery<'request> {
         direction: TraversalDirection,
         facets: &[RelationshipFacet],
         records: Vec<rift_protocol::relationship_read::RelationshipRecord>,
-        mut occurrences: Vec<QueryOccurrence>,
+        mut occurrences: Vec<rift_protocol::relationship_read::RelationshipOccurrence>,
     ) -> Result<(), RiftError> {
         if self.relationships_complete(seed, direction, facets) {
             return Ok(());
@@ -411,16 +765,21 @@ impl<'request> EngineQuery<'request> {
                     .iter()
                     .filter(|facet| facets.is_empty() || facets.contains(facet))
                 {
-                    occurrences.push(QueryOccurrence {
-                        target: relationship.to.clone(),
-                        enclosing: Some(relationship.from.clone()),
-                        source: source.clone(),
-                        facet: *facet,
+                    occurrences.push(rift_protocol::relationship_read::RelationshipOccurrence {
+                        id: record.id.clone(),
+                        relationship: Some(record.id.clone()),
+                        occurrence: QueryOccurrence {
+                            target: relationship.to.clone(),
+                            enclosing: Some(relationship.from.clone()),
+                            source: source.clone(),
+                            facet: *facet,
+                        },
                     });
                 }
             }
         }
-        for occurrence in &occurrences {
+        for record in &occurrences {
+            let occurrence = &record.occurrence;
             let anchored = match direction {
                 TraversalDirection::Incoming => &occurrence.target == seed,
                 TraversalDirection::Outgoing => occurrence.enclosing.as_ref() == Some(seed),
@@ -432,7 +791,7 @@ impl<'request> EngineQuery<'request> {
                 return unavailable("the remote occurrence differs from its selected subject, facet or source range").fail();
             }
         }
-        deduplicate_occurrences(&mut occurrences);
+        deduplicate_occurrence_records(&mut occurrences);
         let maximum = usize::try_from(self.configuration.search.query.statements)
             .map_err(|_| unavailable("the accepted query statement bound cannot be represented"))?;
         let count = self
@@ -441,22 +800,18 @@ impl<'request> EngineQuery<'request> {
             .relationship_records
             .len()
             .checked_add(records.len())
+            .and_then(|count| {
+                count.checked_add(self.references.query_package_facts.occurrence_records.len())
+            })
             .and_then(|count| count.checked_add(occurrences.len()));
         if count.is_none_or(|count| count > maximum) {
             return unavailable("query exceeds search.query.statements; narrow the query or increase the accepted bound").fail();
         }
         self.admit_package_facts(rift_search::query::QueryFacts {
             relationship_records: records,
+            occurrence_records: occurrences,
             ..rift_search::query::QueryFacts::default()
         })?;
-        append_batch(
-            &mut self.references,
-            AcquiredSubject {
-                occurrences,
-                ..AcquiredSubject::default()
-            },
-            maximum,
-        )?;
         let outgoing = direction == TraversalDirection::Outgoing;
         if facets.is_empty() {
             self.resolved.insert((seed.clone(), None, outgoing));
@@ -475,8 +830,12 @@ impl<'request> EngineQuery<'request> {
         &mut self,
         facts: rift_search::query::QueryFacts,
     ) -> Result<(), RiftError> {
+        let incoming_bytes = retained_package_bytes(&facts);
+        if let Some(budget) = &mut self.query_budget {
+            budget.charge_material(incoming_bytes)?;
+        }
         let bytes = retained_package_bytes(&self.references.query_package_facts)
-            .checked_add(retained_package_bytes(&facts));
+            .checked_add(incoming_bytes);
         if bytes
             .is_none_or(|bytes| bytes as u64 > self.configuration.search.query.fact_size.bytes())
         {
@@ -523,7 +882,8 @@ impl<'request> EngineQuery<'request> {
                     | QuerySourceRequest::IncomingCall { caller: callee, .. } => {
                         (callee.query_uri(), callee.query_provider())
                     }
-                    QuerySourceRequest::Reference { uri, provider, .. } => {
+                    QuerySourceRequest::Reference { uri, provider, .. }
+                    | QuerySourceRequest::Provider { uri, provider, .. } => {
                         (Some(uri), Some(provider))
                     }
                 };
@@ -538,18 +898,25 @@ impl<'request> EngineQuery<'request> {
     /// Unique admitted dependency sources requiring final worker validation.
     #[must_use]
     pub fn validation_targets(&self) -> Vec<Arc<QueryPackageTarget>> {
-        let mut units = BTreeSet::new();
-        self.targets
+        let mut targets: Vec<_> = self
+            .targets
             .values()
             .filter_map(|target| {
                 let RetainedTarget::Admitted(target) = target else {
                     return None;
                 };
-                units
-                    .insert(target.source_unit().clone())
-                    .then(|| Arc::clone(target))
+                Some(Arc::clone(target))
             })
-            .collect()
+            .collect();
+        targets.extend(self.provider_targets.iter().map(Arc::clone));
+        let mut seen = BTreeSet::new();
+        let mut held: Vec<Arc<QueryPackageTarget>> = Vec::new();
+        for target in targets {
+            if seen.insert(Arc::as_ptr(&target)) {
+                held.push(target);
+            }
+        }
+        held
     }
 
     /// Adds facts prepared from admitted bytes before resuming the engine acquisition.
@@ -565,7 +932,9 @@ impl<'request> EngineQuery<'request> {
                 matches!(held, RetainedTarget::Global(previous) if previous == callee)
                     .then_some(identity)
             }),
-            QuerySourceRequest::Reference { .. } | QuerySourceRequest::IncomingCall { .. } => None,
+            QuerySourceRequest::Reference { .. }
+            | QuerySourceRequest::IncomingCall { .. }
+            | QuerySourceRequest::Provider { .. } => None,
         };
         if named_global.is_some_and(|identity| {
             target.selected.as_ref().map(|selected| selected.0.as_str()) != Some(identity.as_str())
@@ -576,8 +945,12 @@ impl<'request> EngineQuery<'request> {
             .fail();
         }
         let replaces_global = named_global.is_some();
+        let incoming_bytes = retained_package_bytes(&target.facts);
+        if let Some(budget) = &mut self.query_budget {
+            budget.charge_material(incoming_bytes)?;
+        }
         let bytes = retained_package_bytes(&self.references.query_package_facts)
-            .checked_add(retained_package_bytes(&target.facts));
+            .checked_add(incoming_bytes);
         if bytes
             .is_none_or(|bytes| bytes as u64 > self.configuration.search.query.fact_size.bytes())
         {
@@ -589,6 +962,7 @@ impl<'request> EngineQuery<'request> {
             .package_callees
             .len()
             .saturating_add(self.references.query_source_requests.len());
+        let physical_edges = self.name_physical_package_sources(&target, &facts)?;
         let mut waiting_calls = Vec::new();
         let mut caller_positions = BTreeMap::new();
         for request in std::mem::take(&mut self.references.query_source_requests) {
@@ -634,6 +1008,7 @@ impl<'request> EngineQuery<'request> {
         drop(caller_positions);
         self.references.query_source_requests = waiting_calls;
         match &target.request {
+            QuerySourceRequest::Provider { .. } => {}
             QuerySourceRequest::IncomingCall { .. } => {}
             QuerySourceRequest::Call(callee) => {
                 let mut waiting = Vec::new();
@@ -723,7 +1098,9 @@ impl<'request> EngineQuery<'request> {
         deduplicate_occurrences(&mut self.references.query_occurrences);
         deduplicate_relationships(&mut self.references.query_relationships);
         merge_package_facts(&mut self.references.query_package_facts, facts)?;
+        self.admit_prepared_edges(physical_edges)?;
         let held = Arc::new(target);
+        self.provider_targets.push(Arc::clone(&held));
         for identity in held.name_ranges.keys() {
             let identity = CoreSymbolId::new(identity.0.clone())?;
             self.targets
@@ -735,6 +1112,20 @@ impl<'request> EngineQuery<'request> {
     /// Existing naming operations for facts retained by this request.
     pub fn references_mut(&mut self) -> &mut EngineReferences {
         &mut self.references
+    }
+
+    /// Canonical identity already selected by an upstream declaration read.
+    ///
+    /// Physical engine locations do not require namespace enrichment merely to retain a target.
+    #[must_use]
+    pub fn package_identity(&self, request: &QuerySourceRequest) -> Option<SymbolId> {
+        let QuerySourceRequest::Call(callee) = request else {
+            return None;
+        };
+        self.targets.iter().find_map(|(identity, held)| {
+            matches!(held, RetainedTarget::Global(previous) if previous == callee)
+                .then(|| SymbolId(identity.as_str().to_owned()))
+        })
     }
 
     /// Admitted source target retained when the global API named a declaration.
@@ -825,7 +1216,12 @@ impl<'request> EngineQuery<'request> {
                 }
                 None => Box::pin(acquisition.project(&identity, direction, facet)).await?,
             };
-            append_batch(&mut self.references, batch, maximum)?;
+            append_batch(
+                &mut self.references,
+                batch,
+                maximum,
+                self.query_budget.as_ref(),
+            )?;
             self.resolved.insert(key);
         }
         self.references.validate_revision(self.reads)
@@ -904,6 +1300,7 @@ fn append_batch(
     result: &mut EngineReferences,
     batch: AcquiredSubject,
     maximum: usize,
+    budget: Option<&crate::QueryFactBudget<'static>>,
 ) -> Result<(), RiftError> {
     let counts = [
         result.query_occurrences.len(),
@@ -918,6 +1315,15 @@ fn append_batch(
     let count = counts.into_iter().try_fold(0usize, usize::checked_add);
     if count.is_none_or(|count| count > maximum) {
         return unavailable("query exceeds search.query.statements; narrow the query or increase the accepted bound").fail();
+    }
+    if let Some(budget) = budget {
+        let mut budget = budget.clone();
+        let (relationships, _) = rift_protocol::retained_vector_material(
+            &batch.relationships,
+            get_size2::StandardTracker::default(),
+        );
+        budget.charge_material(relationships)?;
+        budget.charge_material(retained_occurrence_bytes(&batch.occurrences))?;
     }
     result.query_relationships.extend(batch.relationships);
     result.query_occurrences.extend(batch.occurrences);
@@ -1764,25 +2170,27 @@ pub(super) fn name_package_occurrences(
 }
 
 fn deduplicate_occurrences(occurrences: &mut Vec<QueryOccurrence>) {
-    occurrences.sort_by(|left, right| {
-        (
-            &left.source.unit,
-            left.source.range.start,
-            left.source.range.end,
-            &left.target,
-            left.facet,
-            &left.enclosing,
-        )
-            .cmp(&(
-                &right.source.unit,
-                right.source.range.start,
-                right.source.range.end,
-                &right.target,
-                right.facet,
-                &right.enclosing,
-            ))
-    });
+    occurrences.sort_by(compare_occurrences);
     occurrences.dedup();
+}
+
+fn compare_occurrences(left: &QueryOccurrence, right: &QueryOccurrence) -> std::cmp::Ordering {
+    (
+        &left.source.unit,
+        left.source.range.start,
+        left.source.range.end,
+        &left.target,
+        left.facet,
+        &left.enclosing,
+    )
+        .cmp(&(
+            &right.source.unit,
+            right.source.range.start,
+            right.source.range.end,
+            &right.target,
+            right.facet,
+            &right.enclosing,
+        ))
 }
 
 fn deduplicate_relationships(relationships: &mut Vec<Relationship>) {
@@ -1879,11 +2287,19 @@ pub(crate) fn retained_package_bytes(facts: &rift_search::query::QueryFacts) -> 
     }
     let (relationships, tracker) =
         rift_protocol::retained_vector_material(&facts.relationships, tracker);
-    let (records, _) =
+    let (records, tracker) =
         rift_protocol::retained_vector_material(&facts.relationship_records, tracker);
+    let (usages, tracker) =
+        rift_protocol::retained_vector_material(&facts.occurrence_records, tracker);
+    let (providers, tracker) = rift_protocol::retained_vector_material(&facts.providers, tracker);
+    let (provider_edges, _) =
+        rift_protocol::retained_vector_material(&facts.provider_edges, tracker);
     bytes
         .saturating_add(relationships)
         .saturating_add(records)
+        .saturating_add(usages)
+        .saturating_add(providers)
+        .saturating_add(provider_edges)
         .saturating_add(retained_occurrence_bytes(&facts.occurrences))
 }
 
@@ -1897,6 +2313,19 @@ mod tests {
     use rift_lsp::capabilities::PositionEncoding;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn retained_package_material_counts_provider_array_capacity() {
+        let mut facts = rift_search::query::QueryFacts::default();
+        let before = super::retained_package_bytes(&facts);
+        facts.providers.reserve_exact(32);
+        facts.provider_edges.reserve_exact(16);
+        let expected = facts.providers.capacity()
+            * std::mem::size_of::<rift_search::query::QueryProviderSnapshot>()
+            + facts.provider_edges.capacity()
+                * std::mem::size_of::<rift_search::query::QueryProviderEdge>();
+        assert_eq!(super::retained_package_bytes(&facts), before + expected);
+    }
 
     #[test]
     fn references_keep_recursive_and_repeated_occurrences() -> TestResult {
@@ -1982,7 +2411,7 @@ mod tests {
             .search
             .query
             .statements;
-        super::append_batch(&mut references, batch, usize::try_from(maximum)?)?;
+        super::append_batch(&mut references, batch, usize::try_from(maximum)?, None)?;
         assert_eq!(references.query_occurrences().len(), 10_001);
         assert!(references.is_complete());
         Ok(())
@@ -2307,6 +2736,56 @@ mod tests {
         same.claim()?;
         assert!(requests.claim().is_err());
         assert_eq!(requests.used.load(std::sync::atomic::Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn original_usage_records_keep_identity_locations_and_measured_material() -> TestResult {
+        use rift_protocol::relationship_read::{RelationshipOccurrence, RelationshipRecordId};
+        let occurrence = serde_json::from_value(serde_json::json!({
+            "target":"rift://symbol/cargo/crates.io/demo@1.0.0/rust/target",
+            "source":{"unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs","range":{"start":0,"end":3}},
+            "facet":"references"
+        }))?;
+        let first = RelationshipOccurrence {
+            id: RelationshipRecordId::parse(&"a".repeat(64))?,
+            relationship: None,
+            occurrence,
+        };
+        let mut second = first.clone();
+        second.id = RelationshipRecordId::parse(&"b".repeat(64))?;
+        let mut another_location = first.clone();
+        another_location.occurrence.source.range.start = 1;
+        let mut facts = rift_search::query::QueryFacts::default();
+        super::merge_package_facts(
+            &mut facts,
+            rift_search::query::QueryFacts {
+                occurrence_records: vec![first.clone(), second, another_location],
+                ..rift_search::query::QueryFacts::default()
+            },
+        )?;
+        super::merge_package_facts(
+            &mut facts,
+            rift_search::query::QueryFacts {
+                occurrence_records: vec![first.clone()],
+                ..rift_search::query::QueryFacts::default()
+            },
+        )?;
+        assert!(facts.occurrences.is_empty());
+        assert_eq!(facts.occurrence_records.len(), 3);
+        assert!(super::retained_package_bytes(&facts) > std::mem::size_of_val(&facts));
+        let mut changed = first;
+        changed.relationship = Some(RelationshipRecordId::parse(&"c".repeat(64))?);
+        assert!(
+            super::merge_package_facts(
+                &mut facts,
+                rift_search::query::QueryFacts {
+                    occurrence_records: vec![changed],
+                    ..rift_search::query::QueryFacts::default()
+                }
+            )
+            .is_err()
+        );
         Ok(())
     }
     #[test]

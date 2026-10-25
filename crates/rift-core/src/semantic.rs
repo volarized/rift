@@ -640,7 +640,7 @@ impl Contribution {
                 equivalence: Vec::new(),
                 references: Vec::new(),
                 relationships: Vec::new(),
-                namespaced: Extensions(std::collections::BTreeMap::new()),
+                namespaced: Extensions::from(std::collections::BTreeMap::new()),
                 namespaced_material_bytes: 0,
             },
         }
@@ -664,7 +664,7 @@ impl Contribution {
                 equivalence: Vec::new(),
                 references: Vec::new(),
                 relationships: Vec::new(),
-                namespaced: Extensions(std::collections::BTreeMap::new()),
+                namespaced: Extensions::from(std::collections::BTreeMap::new()),
                 namespaced_material_bytes: 0,
             },
         }
@@ -1006,12 +1006,12 @@ fn validate_evidence(contribution: &Contribution) -> Result<(), RiftError> {
 }
 
 fn validate_namespaced(namespaced: &Extensions) -> Result<(), RiftError> {
-    if namespaced.0.len() > CONTRIBUTION_NAMESPACES_MAX {
+    if namespaced.len() > CONTRIBUTION_NAMESPACES_MAX {
         return errors::core::contribution_too_many_namespaced_facts()
             .field("namespaced")
             .fail();
     }
-    for (key, value) in &namespaced.0 {
+    for (key, value) in namespaced.iter() {
         validate_namespace(key)?;
         if value.version == 0 {
             return errors::core::contribution_invalid_namespace_version()
@@ -1417,7 +1417,7 @@ mod tests {
 
     #[test]
     fn namespaced_fact_does_not_require_portable_facts() {
-        let namespaced = Extensions(BTreeMap::from([(
+        let namespaced = Extensions::from(BTreeMap::from([(
             ExtensionKey("org.rift.history".to_owned()),
             ExtensionValue {
                 version: 1,
@@ -1549,7 +1549,7 @@ mod tests {
                 facts(),
                 ContributionOrigin::new(None, SourceKind::Synthetic).expect("synthetic origin"),
             )
-            .namespaced(Extensions(map))
+            .namespaced(Extensions::from(map))
             .build()
         };
 

@@ -3933,7 +3933,10 @@ pub struct RelationshipGroup {
     /// Original records, preserving parallel edges, evidence and occurrences.
     pub relationships: Vec<RelationshipRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
-    pub occurrences: Option<Vec<QueryOccurrence>>,
+    /// Page limits count distinct original record identities across relationships and usages.
+    /// Multiple projections of one original record consume one slot; independent records
+    /// consume separate slots even when their payloads or locations are equal.
+    pub occurrences: Option<Vec<RelationshipOccurrence>>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
@@ -4024,6 +4027,17 @@ pub struct RelationshipCapability {
     pub direction: TraversalDirection,
     /// Facets whose complete selected-domain reads the reader supports.
     pub facets: Vec<RelationshipFacet>,
+}
+/// One physical usage projected from an original selected-publication record.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipOccurrence {
+    /// Opaque full identity of one original relationship record within its selected publication.
+    pub id: String,
+    /// Opaque full identity of one original relationship record within its selected publication.
+    pub relationship: Option<String>,
+    /// One physical reference or call supplied by a selected provider.
+    pub occurrence: QueryOccurrence,
 }
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]

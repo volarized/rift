@@ -65,6 +65,7 @@ impl LocalSymbolViewInput {
             traversal: self.material.traversal.clone(),
             query_result: self.material.query_result.clone(),
             package_facts: facts,
+            provider_selection: self.material.provider_selection.clone(),
         });
         self
     }
@@ -77,6 +78,7 @@ fn retained_bytes(facts: &QueryFacts) -> usize {
 }
 
 fn validate(facts: &QueryFacts) -> Result<(), RiftError> {
+    facts.validate_providers()?;
     if !facts.nodes.is_empty()
         || !facts.histories.is_empty()
         || !facts.documentation_sources.is_empty()
@@ -110,26 +112,37 @@ fn validate(facts: &QueryFacts) -> Result<(), RiftError> {
             ));
         }
     }
-    for symbol in &facts.symbols {
-        let id = symbol
-            .symbol
-            .id
-            .as_ref()
-            .ok_or_else(|| invalid("id", "dependency facts require a canonical identity"))?;
-        let identity = SymbolIdentity::parse(id.as_str())?;
-        let synthetic = symbol.declarations.is_empty()
-            && symbol.symbol.origin.source_kind == rift_protocol::read::SourceKind::Synthetic
-            && symbol.symbol.origin.location.is_none()
-            && symbol.symbol.origin.package.is_none()
-            && symbol.symbol.origin.runtime.is_none();
-        if !released_owner(identity.owner())
-            || identity.language() != &symbol.symbol.language
-            || (!synthetic && &origin_owner(&symbol.symbol.origin)? != identity.owner())
-        {
-            return Err(invalid(
-                "id",
-                "dependency symbol ownership or language differs from its identity",
-            ));
+    for (symbol_index, symbol) in facts.symbols.iter().enumerate() {
+        if let Some(id) = &symbol.symbol.id {
+            let identity = SymbolIdentity::parse(id.as_str())?;
+            let synthetic = symbol.declarations.is_empty()
+                && symbol.symbol.origin.source_kind == rift_protocol::read::SourceKind::Synthetic
+                && symbol.symbol.origin.location.is_none()
+                && symbol.symbol.origin.package.is_none()
+                && symbol.symbol.origin.runtime.is_none();
+            if !released_owner(identity.owner())
+                || identity.language() != &symbol.symbol.language
+                || (!synthetic && &origin_owner(&symbol.symbol.origin)? != identity.owner())
+            {
+                return Err(invalid(
+                    "id",
+                    "dependency symbol ownership or language differs from its identity",
+                ));
+            }
+        } else {
+            let owner = origin_owner(&symbol.symbol.origin)?;
+            let captured = facts.providers.iter().any(|snapshot| {
+                snapshot.context.owner == owner
+                    && snapshot.records.iter().any(|record| {
+                        record.symbol_index == symbol_index && !record.declarations.is_empty()
+                    })
+            });
+            if !captured {
+                return Err(invalid(
+                    "query",
+                    "dependency declaration has no captured provider association",
+                ));
+            }
         }
         for declaration in &symbol.declarations {
             if !declaration.is_valid_for(&symbol.symbol) {

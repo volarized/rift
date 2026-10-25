@@ -1,9 +1,13 @@
 //! Virtual RDF projection over the selected domain records.
 
+mod identity;
+mod nodes;
+mod provider;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use oxigraph::model::{BlankNode, Literal, NamedNode, Term};
+use oxigraph::model::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
 use oxigraph::sparql::CancellationToken;
 use serde::Serialize;
 use serde_json::Value;
@@ -19,10 +23,14 @@ const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 pub(super) struct VirtualDataset {
     facts: Arc<QueryFacts>,
     occurrences: Arc<OccurrenceIndex>,
+    providers: Arc<provider::ProviderIndex>,
     limits: QueryLimits,
     cancellation: CancellationToken,
     retrieval: Option<Arc<super::services::QueryServiceData>>,
     retained_graph: Option<Arc<Vec<rift_protocol::query::RdfTriple>>>,
+    datasets: Arc<Vec<(Term, Self)>>,
+    identities: Arc<identity::IdentityMap>,
+    default_graph: bool,
 }
 
 #[derive(Default)]
@@ -39,7 +47,17 @@ impl OccurrenceIndex {
     ) -> Result<Self, QueryError> {
         let mut result = Self::default();
         let mut bytes = 0usize;
-        for (index, occurrence) in facts.occurrences.iter().enumerate() {
+        for (index, occurrence) in facts
+            .occurrences
+            .iter()
+            .chain(
+                facts
+                    .occurrence_records
+                    .iter()
+                    .map(|record| &record.occurrence),
+            )
+            .enumerate()
+        {
             if cancellation.is_cancelled() {
                 return Err(failure::cancelled());
             }
@@ -80,24 +98,11 @@ impl VirtualDataset {
         limits: QueryLimits,
         cancellation: CancellationToken,
     ) -> Result<Self, QueryError> {
-        let count = facts
-            .symbols
-            .len()
-            .checked_add(facts.relationships.len())
-            .and_then(|count| count.checked_add(facts.relationship_records.len()))
-            .and_then(|count| count.checked_add(facts.occurrences.len()))
-            .and_then(|count| count.checked_add(facts.sources.len()))
-            .and_then(|count| count.checked_add(facts.nodes.len()))
-            .and_then(|count| count.checked_add(facts.histories.len()))
-            .and_then(|count| count.checked_add(facts.documentation_sources.len()))
-            .and_then(|count| count.checked_add(facts.documentation_blocks.len()))
-            .and_then(|count| count.checked_add(facts.documentation_links.len()))
-            .and_then(|count| count.checked_add(facts.documentation_references.len()))
-            .and_then(|count| count.checked_add(facts.documentation_reference_candidates.len()))
-            .ok_or_else(|| failure::bound("quads_max"))?;
+        let count = fact_count(&facts)?;
         if count > limits.quads_max {
             return Err(failure::bound("quads_max"));
         }
+        nodes::validate(&facts)?;
         let mut records = HashSet::new();
         for record in &facts.relationship_records {
             if !records.insert(record.id.as_str()) {
@@ -107,26 +112,107 @@ impl VirtualDataset {
             }
         }
         let occurrences = Arc::new(OccurrenceIndex::new(&facts, limits, &cancellation)?);
+        let providers = Arc::new(provider::ProviderIndex::new(&facts, limits, &cancellation)?);
         Ok(Self {
             facts: Arc::new(facts),
             occurrences,
+            providers,
             limits,
             cancellation,
             retrieval: None,
             retained_graph: None,
+            datasets: Arc::new(Vec::new()),
+            identities: Arc::new(identity::IdentityMap::default()),
+            default_graph: true,
         })
     }
 
     fn project(&self, pattern: Pattern) -> Result<Vec<InternalQuad<Term>>, QueryError> {
-        let mut output = Projection::new(pattern, self.limits, self.cancellation.clone())?;
-        self.symbols(&mut output)?;
-        self.relationships(&mut output)?;
-        self.occurrences(&mut output)?;
-        self.sources(&mut output)?;
-        self.other_records(&mut output)?;
-        self.retrieval(&mut output)?;
-        self.retained_graph(&mut output)?;
+        let mut output = Projection::new(pattern.clone(), self.limits, self.cancellation.clone())?;
+        self.project_owner(&mut output, &pattern, iri(super::LOCAL_GRAPH)?)?;
+        for (graph, selected) in self.datasets.iter() {
+            if pattern.graph_name != Some(GraphName::DefaultGraph) || selected.default_graph {
+                selected.project_owner(&mut output, &pattern, graph.clone())?;
+            }
+        }
         Ok(output.quads)
+    }
+
+    fn project_owner(
+        &self,
+        output: &mut Projection,
+        pattern: &Pattern,
+        graph: Term,
+    ) -> Result<(), QueryError> {
+        let Some(pattern) = self.identities.lookup_pattern(pattern) else {
+            return Ok(());
+        };
+        output.pattern = pattern;
+        output.graph = graph;
+        output.identities = Arc::clone(&self.identities);
+        if output.graph_selected() {
+            self.project_into(output)?;
+        }
+        Ok(())
+    }
+
+    fn project_into(&self, output: &mut Projection) -> Result<(), QueryError> {
+        self.symbols(output)?;
+        self.relationships(output)?;
+        self.providers.project(&self.facts, output)?;
+        self.occurrences(output)?;
+        self.occurrence_evidence(output)?;
+        self.sources(output)?;
+        self.other_records(output)?;
+        self.retrieval(output)?;
+        self.retained_graph(output)
+    }
+
+    pub(super) fn with_datasets(
+        mut self,
+        datasets: Vec<super::services::QueryDataset>,
+    ) -> Result<Self, QueryError> {
+        if datasets.len() > self.limits.quads_max {
+            return Err(failure::bound("quads_max"));
+        }
+        let mut names = HashSet::from([iri(super::LOCAL_GRAPH)?]);
+        let mut selected = Vec::with_capacity(datasets.len());
+        let mut count = fact_count(&self.facts)?;
+        for dataset in datasets {
+            if self.cancellation.is_cancelled() {
+                return Err(failure::cancelled());
+            }
+            let graph = iri(&dataset.graph)?;
+            if !names.insert(graph.clone()) {
+                return Err(failure::invalid(
+                    "selected graph identities must be distinct",
+                ));
+            }
+            count = count
+                .checked_add(fact_count(&dataset.facts)?)
+                .ok_or_else(|| failure::bound("quads_max"))?;
+            if count > self.limits.quads_max {
+                return Err(failure::bound("quads_max"));
+            }
+            let mut owner = Self::new(dataset.facts, self.limits, self.cancellation.clone())?;
+            owner.identities = Arc::new(identity::IdentityMap::new(dataset.identities)?);
+            owner.default_graph = dataset.default;
+            selected.push((graph, owner));
+        }
+        crate::query::validate_source_selections_by_unit(
+            std::iter::once(&self)
+                .chain(selected.iter().map(|(_, owner)| owner))
+                .flat_map(|owner| {
+                    owner.facts.sources.iter().map(move |source| {
+                        owner
+                            .identities
+                            .source_unit(source)
+                            .map(|unit| (unit, source))
+                    })
+                }),
+        )?;
+        self.datasets = Arc::new(selected);
+        Ok(self)
     }
 
     pub(super) fn with_retrieval(
@@ -180,7 +266,7 @@ impl VirtualDataset {
                 };
                 output.push(resource, vocabulary("symbol")?, subject.clone())?;
                 output.symbol(
-                    subject,
+                    &subject,
                     &QuerySymbol {
                         symbol: symbol.as_ref().clone(),
                         declarations: Vec::new(),
@@ -209,12 +295,8 @@ impl VirtualDataset {
         if output.relationship_predicate() {
             return Ok(());
         }
-        for symbol in &self.facts.symbols {
-            let subject = match &symbol.symbol.id {
-                Some(identity) => iri(identity.as_str())?,
-                None => blank(&serde_json::to_vec(symbol).map_err(invalid)?)?,
-            };
-            output.symbol(subject, symbol)?;
+        for (symbol, subject) in self.facts.symbols.iter().zip(&self.providers.symbols) {
+            output.symbol(&subject, symbol)?;
         }
         Ok(())
     }
@@ -280,16 +362,20 @@ impl VirtualDataset {
                 .map_or(&[][..], Vec::as_slice)
         });
         let all = if selected.is_none() {
-            0..self.facts.occurrences.len()
+            0..self.occurrences.resources.len()
         } else {
             0..0
         };
         for index in selected.unwrap_or(&[]).iter().copied().chain(all) {
-            let occurrence = &self.facts.occurrences[index];
-            if let Some(Term::NamedNode(subject)) = &output.pattern.subject {
-                if subject.as_str() != occurrence.target.as_str() {
-                    continue;
-                }
+            let occurrence = if index < self.facts.occurrences.len() {
+                &self.facts.occurrences[index]
+            } else {
+                &self.facts.occurrence_records[index - self.facts.occurrences.len()].occurrence
+            };
+            if let Some(Term::NamedNode(subject)) = &output.pattern.subject
+                && subject.as_str() != occurrence.target.as_str()
+            {
+                continue;
             }
             let resource = self.occurrences.resources[index].clone();
             output.push(
@@ -297,38 +383,39 @@ impl VirtualDataset {
                 vocabulary("usages")?,
                 resource.clone(),
             )?;
-            output.class(resource.clone(), "SourceUnitSpan")?;
-            output.push(
-                resource.clone(),
-                vocabulary("unit")?,
-                iri(occurrence.source.unit.as_str())?,
+            output.usage(
+                resource,
+                &occurrence.source,
+                occurrence.facet,
+                occurrence
+                    .enclosing
+                    .as_ref()
+                    .map(|identity| iri(identity.as_str()))
+                    .transpose()?,
             )?;
+        }
+        Ok(())
+    }
+
+    fn occurrence_evidence(&self, output: &mut Projection) -> Result<(), QueryError> {
+        if output.relationship_predicate() {
+            return Ok(());
+        }
+        for (index, record) in self.facts.occurrence_records.iter().enumerate() {
+            let usage = self.occurrences.resources[self.facts.occurrences.len() + index].clone();
+            let evidence = blank(record.id.as_str().as_bytes())?;
+            output.push(usage, vocabulary("evidence")?, evidence.clone())?;
             output.push(
-                resource.clone(),
-                vocabulary("start")?,
-                Literal::from(occurrence.source.range.start).into(),
+                evidence.clone(),
+                vocabulary("id")?,
+                Literal::from(record.id.as_str()).into(),
             )?;
-            output.push(
-                resource.clone(),
-                vocabulary("end")?,
-                Literal::from(occurrence.source.range.end).into(),
-            )?;
-            output.push(
-                resource.clone(),
-                vocabulary("facets")?,
-                vocabulary(occurrence.facet.as_ref())?,
-            )?;
-            let (_, path) = rift_protocol::identity::parse_source_unit_identity(
-                occurrence.source.unit.as_str(),
-            )
-            .map_err(invalid)?;
-            output.push(
-                resource.clone(),
-                vocabulary("path")?,
-                Literal::from(path).into(),
-            )?;
-            if let Some(enclosing) = &occurrence.enclosing {
-                output.push(resource, vocabulary("enclosing")?, iri(enclosing.as_str())?)?;
+            if let Some(relationship) = &record.relationship {
+                output.push(
+                    evidence,
+                    vocabulary("relationship")?,
+                    blank(relationship.as_str().as_bytes())?,
+                )?;
             }
         }
         Ok(())
@@ -371,11 +458,7 @@ impl VirtualDataset {
         if output.relationship_predicate() {
             return Ok(());
         }
-        for node in &self.facts.nodes {
-            let subject = iri(node.id.0.as_str())?;
-            output.class(subject.clone(), "Node")?;
-            output.fields(subject, node)?;
-        }
+        nodes::project(&self.facts, output)?;
         for history in &self.facts.histories {
             let resource = child(&iri(history.symbol.as_str())?, "history", 0)?;
             output.push(
@@ -405,7 +488,7 @@ struct Pattern {
     subject: Option<Term>,
     predicate: Option<Term>,
     object: Option<Term>,
-    graph_name: Option<Option<Term>>,
+    graph_name: Option<GraphName>,
 }
 
 struct Projection {
@@ -413,9 +496,10 @@ struct Projection {
     graph: Term,
     limits: QueryLimits,
     bytes: usize,
-    distinct: HashSet<(Term, Term, Term)>,
+    distinct: HashSet<(Option<Term>, Term, Term, Term)>,
     quads: Vec<InternalQuad<Term>>,
     cancellation: CancellationToken,
+    identities: Arc<identity::IdentityMap>,
 }
 
 impl Projection {
@@ -432,6 +516,7 @@ impl Projection {
             distinct: HashSet::new(),
             quads: Vec::new(),
             cancellation,
+            identities: Arc::new(identity::IdentityMap::default()),
         })
     }
 
@@ -457,7 +542,20 @@ impl Projection {
         if !self.matches(&subject, &predicate, &object) {
             return Ok(());
         }
-        let key = (subject.clone(), predicate.clone(), object.clone());
+        let subject = self.identities.public(subject)?;
+        let predicate = self.identities.public(predicate)?;
+        let object = self.identities.public(object)?;
+        let graph_name = if self.pattern.graph_name == Some(GraphName::DefaultGraph) {
+            None
+        } else {
+            Some(self.graph.clone())
+        };
+        let key = (
+            graph_name.clone(),
+            subject.clone(),
+            predicate.clone(),
+            object.clone(),
+        );
         if self.distinct.contains(&key) {
             return Ok(());
         }
@@ -467,6 +565,7 @@ impl Projection {
         let bytes = term_bytes(&subject)
             .checked_add(term_bytes(&predicate))
             .and_then(|bytes| bytes.checked_add(term_bytes(&object)))
+            .and_then(|bytes| bytes.checked_add(graph_name.as_ref().map_or(0, term_bytes)))
             .and_then(|bytes| self.bytes.checked_add(bytes))
             .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
         if bytes > self.limits.rdf_bytes_max {
@@ -474,11 +573,6 @@ impl Projection {
         }
         self.bytes = bytes;
         self.distinct.insert(key);
-        let graph_name = if self.pattern.graph_name == Some(None) {
-            None
-        } else {
-            Some(self.graph.clone())
-        };
         self.quads.push(InternalQuad {
             subject,
             predicate,
@@ -489,12 +583,7 @@ impl Projection {
     }
 
     fn matches(&self, subject: &Term, predicate: &Term, object: &Term) -> bool {
-        let graph_matches = self
-            .pattern
-            .graph_name
-            .as_ref()
-            .is_none_or(|graph| graph.as_ref().is_none_or(|graph| *graph == self.graph));
-        graph_matches
+        self.graph_selected()
             && self
                 .pattern
                 .subject
@@ -512,8 +601,64 @@ impl Projection {
                 .is_none_or(|value| value == object)
     }
 
+    fn graph_selected(&self) -> bool {
+        self.pattern
+            .graph_name
+            .as_ref()
+            .is_none_or(|graph| match graph {
+                GraphName::DefaultGraph => true,
+                GraphName::NamedNode(selected) => {
+                    matches!(&self.graph, Term::NamedNode(graph) if selected == graph)
+                }
+                GraphName::BlankNode(selected) => {
+                    matches!(&self.graph, Term::BlankNode(graph) if selected == graph)
+                }
+            })
+    }
+
     fn class(&mut self, subject: Term, name: &str) -> Result<(), QueryError> {
         self.push(subject, iri(RDF_TYPE)?, vocabulary(name)?)
+    }
+
+    fn usage(
+        &mut self,
+        resource: Term,
+        source: &rift_protocol::read::SourceUnitSpan,
+        facet: rift_protocol::read::RelationshipFacet,
+        enclosing: Option<Term>,
+    ) -> Result<(), QueryError> {
+        self.class(resource.clone(), "SourceUnitSpan")?;
+        self.push(
+            resource.clone(),
+            vocabulary("unit")?,
+            iri(source.unit.as_str())?,
+        )?;
+        self.push(
+            resource.clone(),
+            vocabulary("start")?,
+            Literal::from(source.range.start).into(),
+        )?;
+        self.push(
+            resource.clone(),
+            vocabulary("end")?,
+            Literal::from(source.range.end).into(),
+        )?;
+        self.push(
+            resource.clone(),
+            vocabulary("facets")?,
+            vocabulary(facet.as_ref())?,
+        )?;
+        let (_, path) = rift_protocol::identity::parse_source_unit_identity(source.unit.as_str())
+            .map_err(invalid)?;
+        self.push(
+            resource.clone(),
+            vocabulary("path")?,
+            Literal::from(path).into(),
+        )?;
+        if let Some(enclosing) = enclosing {
+            self.push(resource, vocabulary("enclosing")?, enclosing)?;
+        }
+        Ok(())
     }
 
     fn records<T: Serialize>(&mut self, class: &str, records: &[T]) -> Result<(), QueryError> {
@@ -525,7 +670,7 @@ impl Projection {
         Ok(())
     }
 
-    fn symbol(&mut self, subject: Term, symbol: &QuerySymbol) -> Result<(), QueryError> {
+    fn symbol(&mut self, subject: &Term, symbol: &QuerySymbol) -> Result<(), QueryError> {
         self.class(subject.clone(), "Symbol")?;
         self.push(
             subject.clone(),
@@ -541,7 +686,7 @@ impl Projection {
             Literal::from(symbol.symbol.document_local).into(),
         )?;
         for (index, declaration) in symbol.declarations.iter().enumerate() {
-            let resource = child(&subject, "declarations", index)?;
+            let resource = child(subject, "declarations", index)?;
             self.push(
                 subject.clone(),
                 vocabulary("declarations")?,
@@ -549,7 +694,7 @@ impl Projection {
             )?;
             self.class(resource.clone(), "SymbolDeclaration")?;
             self.fields(resource.clone(), declaration)?;
-            self.declaration_entries(&subject, &resource, symbol, declaration)?;
+            self.declaration_entries(subject, &resource, symbol, declaration)?;
             if let Some(path) = &declaration.path {
                 self.push(
                     subject.clone(),
@@ -753,6 +898,26 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
     type InternalTerm = Term;
     type Error = QueryError;
 
+    fn internal_named_graphs(&self) -> impl Iterator<Item = Result<Term, QueryError>> + use<'a> {
+        if self.cancellation.is_cancelled() {
+            return vec![Err(failure::cancelled())].into_iter();
+        }
+        std::iter::once(iri(super::LOCAL_GRAPH))
+            .chain(self.datasets.iter().map(|(graph, _)| Ok(graph.clone())))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    fn contains_internal_graph_name(&self, graph: &Term) -> Result<bool, QueryError> {
+        if self.cancellation.is_cancelled() {
+            return Err(failure::cancelled());
+        }
+        Ok(
+            matches!(graph, Term::NamedNode(value) if value.as_str() == super::LOCAL_GRAPH)
+                || self.datasets.iter().any(|(name, _)| name == graph),
+        )
+    }
+
     fn internal_quads_for_pattern(
         &self,
         subject: Option<&Term>,
@@ -760,11 +925,21 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
         object: Option<&Term>,
         graph_name: Option<Option<&Term>>,
     ) -> impl Iterator<Item = Result<InternalQuad<Term>, QueryError>> + use<'a> {
+        let graph_name = match graph_name {
+            None => None,
+            Some(None) => Some(GraphName::DefaultGraph),
+            Some(Some(term)) => {
+                let Ok(graph) = NamedOrBlankNode::try_from(term.clone()) else {
+                    return Vec::new().into_iter();
+                };
+                Some(GraphName::from(graph))
+            }
+        };
         let pattern = Pattern {
             subject: subject.cloned(),
             predicate: predicate.cloned(),
             object: object.cloned(),
-            graph_name: graph_name.map(|graph| graph.cloned()),
+            graph_name,
         };
         match self.project(pattern) {
             Ok(quads) => quads.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
@@ -778,6 +953,26 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
     fn externalize_term(&self, term: Term) -> Result<Term, QueryError> {
         Ok(term)
     }
+}
+
+fn fact_count(facts: &QueryFacts) -> Result<usize, QueryError> {
+    let nodes = nodes::count(facts)?;
+    facts
+        .symbols
+        .len()
+        .checked_add(facts.relationships.len())
+        .and_then(|count| count.checked_add(facts.relationship_records.len()))
+        .and_then(|count| count.checked_add(facts.occurrences.len()))
+        .and_then(|count| count.checked_add(facts.occurrence_records.len()))
+        .and_then(|count| count.checked_add(facts.sources.len()))
+        .and_then(|count| count.checked_add(nodes))
+        .and_then(|count| count.checked_add(facts.histories.len()))
+        .and_then(|count| count.checked_add(facts.documentation_sources.len()))
+        .and_then(|count| count.checked_add(facts.documentation_blocks.len()))
+        .and_then(|count| count.checked_add(facts.documentation_links.len()))
+        .and_then(|count| count.checked_add(facts.documentation_references.len()))
+        .and_then(|count| count.checked_add(facts.documentation_reference_candidates.len()))
+        .ok_or_else(|| failure::bound("quads_max"))
 }
 
 fn iri(value: &str) -> Result<Term, QueryError> {
@@ -831,13 +1026,11 @@ fn invalid(error: impl std::fmt::Display) -> QueryError {
 fn record_class(key: &str) -> Option<&'static str> {
     match key {
         "signatures" => Some("Signature"),
-        "parameters" => Some("Parameter"),
-        "types" => Some("TypeBinding"),
+        "parameters" | "receiver" => Some("Parameter"),
+        "types" | "returns" => Some("TypeBinding"),
         "documentation" => Some("Documentation"),
         "versions" => Some("SymbolVersion"),
-        "receiver" => Some("Parameter"),
         "links" => Some("SignatureLink"),
-        "returns" => Some("TypeBinding"),
         "expression" | "throws" => Some("TypeExpression"),
         "regions" => Some("NodeRegion"),
         "range" | "physical_ranges" => Some("TextRange"),

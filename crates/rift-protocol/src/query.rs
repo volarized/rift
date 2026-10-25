@@ -40,6 +40,7 @@ pub enum QueryLanguage {
 /// A query over the accepted workspace and explicitly selected datasets.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(extend("rift:since" = "v0.0.6"))]
 #[schemars(extend("examples" = [
     { "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } LIMIT 20" },
     { "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }", "language": "sparql" }

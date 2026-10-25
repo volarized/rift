@@ -481,6 +481,8 @@ fn accepted_members(node: &Value) -> Vec<String> {
             properties.keys().cloned().collect()
         } else if let Some(values) = node.get(keyword::ENUM).and_then(Value::as_array) {
             string_values(values.iter())
+        } else if let Some(value) = node.get(keyword::CONST) {
+            string_values(std::iter::once(value))
         } else {
             string_values(
                 value_branches(node)
@@ -2332,6 +2334,17 @@ mod tests {
         assert_eq!(by_const.accepted(), ["file", "symbol"]);
         let by_enum = expected_shape(&addressed_schema(), &[DocumentStep::Member("order")]);
         assert_eq!(by_enum.accepted(), ["path", "relevance"]);
+        for schema in [
+            json!({"const":"sparql"}),
+            json!({"oneOf":[{"const":"sparql"}]}),
+        ] {
+            assert_eq!(expected_shape(&schema, &[]).accepted(), ["sparql"]);
+        }
+        assert!(
+            expected_shape(&json!({"const":0}), &[])
+                .accepted()
+                .is_empty()
+        );
     }
 
     /// A step the schema does not declare stops the walk, and `followed`

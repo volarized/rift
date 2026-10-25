@@ -21,14 +21,14 @@ pub(super) enum SavedRead {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SavedSymbol {
-    pub(super) root: String,
-    pub(super) owner: SymbolOwner,
-    pub(super) view: CapturedView,
+pub(crate) struct SavedSymbol {
+    pub(crate) root: String,
+    pub(crate) owner: SymbolOwner,
+    pub(crate) view: CapturedView,
 }
 
 impl CandidateResponses {
-    pub(super) fn save_symbol(
+    pub(in crate::server) fn save_symbol(
         &self,
         root: &Path,
         owner: &SymbolOwner,
@@ -68,7 +68,7 @@ impl RiftMcp {
             .any(|row| row.id == view.as_str())
     }
 
-    pub(super) fn captured_context(
+    pub(in crate::server) fn captured_context(
         &self,
         view: &CapturedViewId,
         operation: &str,

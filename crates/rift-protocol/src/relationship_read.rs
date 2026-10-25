@@ -68,6 +68,19 @@ pub struct RelationshipRecord {
     pub relationship: Relationship,
 }
 
+/// One physical usage projected from an original selected-publication record.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipOccurrence {
+    /// Complete original record identity. Projections of the same record share this value.
+    pub id: RelationshipRecordId,
+    /// Related original relationship, only when the stored record establishes that link.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<RelationshipRecordId>,
+    /// Physical usage. Equal locations do not establish equal original record identities.
+    pub occurrence: crate::query::QueryOccurrence,
+}
+
 /// One incoming or outgoing adjacency selection, without ranking or path projection.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -116,9 +129,12 @@ pub struct RelationshipGroup {
     #[schemars(length(max = 1000))]
     pub relationships: Vec<RelationshipRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
+    /// Page limits count distinct original record identities across relationships and usages.
+    /// Multiple projections of one original record consume one slot; independent records
+    /// consume separate slots even when their payloads or locations are equal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 1000))]
-    pub occurrences: Vec<crate::query::QueryOccurrence>,
+    pub occurrences: Vec<RelationshipOccurrence>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
 }
@@ -160,6 +176,9 @@ pub struct RelationshipSearchPage {
 }
 
 /// Complete raw page or the existing typed unavailable outcome.
+/// An unsupported operation uses the declared `503 application/problem+json` response
+/// with the registered `rift.server.read_unsupported` value in `code`. Missing required
+/// facts use the typed unavailable outcome, including `insufficient_coverage`.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum RelationshipSearchResult {

@@ -642,7 +642,7 @@ mod tests {
             type_parameters: Vec::new(),
             throws: Vec::new(),
             effects: Vec::new(),
-            extensions: Extensions(std::collections::BTreeMap::from([(
+            extensions: Extensions::from(std::collections::BTreeMap::from([(
                 ExtensionKey("example.org.fact".to_owned()),
                 ExtensionValue {
                     version: 1,
@@ -698,7 +698,7 @@ mod tests {
         use get_size2::GetSize;
         use rift_protocol::read::{ExtensionKey, ExtensionValue, Extensions};
 
-        let namespaced = Extensions(std::collections::BTreeMap::from([(
+        let namespaced = Extensions::from(std::collections::BTreeMap::from([(
             ExtensionKey("example.org.fact".to_owned()),
             ExtensionValue {
                 version: 1,

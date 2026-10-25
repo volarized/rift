@@ -1,6 +1,6 @@
 pub(crate) mod candidates;
 mod query;
-pub(crate) use query::QueryCandidateRequest;
+pub(crate) use query::{QueryFactRequest, QueryFactResult, QueryFactSelection};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -114,6 +114,15 @@ const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 
 /// The lock a blocking operation's worker permit is recorded under, waits and holds alike.
 pub(crate) const WORKER_PERMIT_LOCK: &str = "worker.permit";
+
+pub(crate) fn captured_views() -> Result<rift_server::LocalSymbolViews, RiftError> {
+    let material_bytes_max = usize::try_from(8_u64 * 1024 * 1024 * 1024)
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    Ok(rift_server::LocalSymbolViews::new(
+        material_bytes_max,
+        crate::http::token_entropy("captured view key")?,
+    ))
+}
 
 /// One admitted blocking operation's worker permit, recorded as [`WORKER_PERMIT_LOCK`].
 type WorkerPermit = rift_tracing::Held<tokio::sync::OwnedSemaphorePermit>;
@@ -2115,12 +2124,7 @@ impl RiftMcp {
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
         validation.feed_engines(Arc::clone(&engines));
-        let material_bytes_max = usize::try_from(8_u64 * 1024 * 1024 * 1024)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let local_views = std::sync::OnceLock::from(rift_server::LocalSymbolViews::new(
-            material_bytes_max,
-            crate::http::token_entropy("captured view key")?,
-        ));
+        let local_views = std::sync::OnceLock::from(captured_views()?);
         let server = Self {
             root: root.clone(),
             identity,
@@ -4310,6 +4314,8 @@ impl ServerHandler for RiftMcp {
                         self.search_candidates_call(request, &operation).await
                     } else if request.name == "query_candidates" {
                         Self::query_candidates_call(request)
+                    } else if request.name == "query_facts" {
+                        self.query_facts_call(request).await
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
                         match self.tool_router.call(routed).await {
@@ -5217,21 +5223,7 @@ done
         request: &CallToolRequestParams,
     ) -> TestResult {
         let answer = client.call_tool(request.clone()).await?;
-        let empty: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured symbol answer")?,
-        )?;
-        assert!(empty.results.is_empty());
-        assert!(empty.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: None,
-                ready_in: None,
-                ..
-            }
-        )));
+        assert_query_preparing(&answer)?;
         for uri in ["rift://map", "rift://workspace"] {
             let value = preparation_resource(client, uri).await?;
             assert_eq!(value["warnings"][0]["code"], "local_index_preparing");
@@ -5268,8 +5260,20 @@ done
         Ok(())
     }
 
+    fn assert_query_preparing(answer: &rmcp::model::CallToolResult) -> TestResult {
+        let structured = answer
+            .structured_content
+            .as_ref()
+            .ok_or("structured query refusal")?;
+        assert_eq!(structured["outcome"], "unavailable", "{structured}");
+        assert_eq!(structured["reason"], "index_preparing", "{structured}");
+        assert!(structured.get("answer").is_none(), "{structured}");
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn preparation_serves_empty_answers_before_discovery_then_complete_facts() -> TestResult {
+    async fn preparation_refuses_queries_before_discovery_then_serves_complete_facts() -> TestResult
+    {
         let (_directory, assembled) = starting_fixture().await?;
         let server = assembled.server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
@@ -5282,7 +5286,7 @@ done
         });
         let client = ().serve(client_transport).await?;
         let request = CallToolRequestParams::new("search").with_arguments(arguments(
-            &json!({"pattern": "beacon", "target": "symbol", "scope": "local"}),
+            &json!({"query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name . FILTER(?name = \"beacon\") }"}),
         )?);
         assert_answers_before_discovery(&client, &request).await?;
         let initial = crate::validation::discover_initial_workspace(&assembled.context)
@@ -5310,11 +5314,14 @@ done
         )));
 
         let answer = client.call_tool(request.clone()).await?;
-        let partial: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured partial symbol answer")?,
-        )?;
+        assert_query_preparing(&answer)?;
+        let partial = assembled
+            .server
+            .answered_search(Parameters(serde_json::from_value(
+                json!({"pattern": "beacon", "target": "symbol", "scope": "local"}),
+            )?))
+            .await?
+            .0;
         assert!(partial.results.is_empty());
         assert!(partial.warnings.iter().any(|warning| matches!(
             warning,
@@ -5331,12 +5338,15 @@ done
         assert_eq!(nodes.source, complete_nodes.source);
         assert!(complete_nodes.warnings.is_empty());
         let answer = client.call_tool(request).await?;
-        let complete: SearchResult = serde_json::from_value(
+        let complete: rift_protocol::query::QueryResult = serde_json::from_value(
             answer
                 .structured_content
                 .ok_or("structured symbol answer")?,
         )?;
-        assert_eq!(complete.results.len(), 1);
+        let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } = complete.answer else {
+            return Err("complete query must return bindings".into());
+        };
+        assert_eq!(bindings.len(), 1);
         assert!(
             !complete
                 .warnings
@@ -5424,15 +5434,19 @@ done
             service.waiting().await.expect("server stops")
         });
         let client = ().serve(client_transport).await?;
-        let request = CallToolRequestParams::new("search").with_arguments(arguments(&json!({
+        let parameters: SearchParams = serde_json::from_value(json!({
             "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
+        }))?;
+        let request = CallToolRequestParams::new("search").with_arguments(arguments(&json!({
+            "query": "SELECT ?symbol ?name ?path ?source { ?symbol a :Symbol; :name ?name; :declarations ?declaration . ?declaration :path ?path; :source ?source . FILTER(?name = \"beacon\") } ORDER BY ?path"
         }))?);
         let answer = client.call_tool(request.clone()).await?;
-        let partial: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured partial symbol answer")?,
-        )?;
+        assert_query_preparing(&answer)?;
+        let partial = assembled
+            .server
+            .answered_search(Parameters(parameters.clone()))
+            .await?
+            .0;
         assert_eq!(partial.results.len(), 1);
         assert_eq!(
             partial.results[0].path.as_ref().map(|path| path.0.as_str()),
@@ -5466,11 +5480,20 @@ done
             RebuildOutcome::Published
         );
         let answer = client.call_tool(request).await?;
-        let complete: SearchResult = serde_json::from_value(
+        let projected: rift_protocol::query::QueryResult = serde_json::from_value(
             answer
                 .structured_content
                 .ok_or("structured complete symbol answer")?,
         )?;
+        let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } = projected.answer else {
+            return Err("complete query must return bindings".into());
+        };
+        assert_eq!(bindings.len(), 2);
+        let complete = assembled
+            .server
+            .answered_search(Parameters(parameters))
+            .await?
+            .0;
         let mut paths: Vec<_> = complete
             .results
             .iter()
@@ -7262,16 +7285,17 @@ done
 
         let search = client
             .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "beacon"}))?),
+                CallToolRequestParams::new("search").with_arguments(arguments(
+                    &json!({"query": "SELECT ?symbol { ?symbol a :Symbol; :name \"beacon\" }"}),
+                )?),
             )
             .await?;
         assert!(
             !search
                 .structured_content
-                .ok_or("search must return structured content")?["results"]
+                .ok_or("search must return structured content")?["answer"]["bindings"]
                 .as_array()
-                .ok_or("search results must be an array")?
+                .ok_or("SELECT bindings must be an array")?
                 .is_empty()
         );
 
@@ -7394,7 +7418,7 @@ done
         // returned before the tier could answer. Poll for the file hit under a bound: the
         // same pass carries the symbol hit asserted below.
         let structured = search_until_hit(client.peer(), "replace all units", "guide.txt").await?;
-        let results = structured["results"]
+        let results = structured["answer"]["bindings"]
             .as_array()
             .ok_or("results must be an array")?;
 
@@ -7403,10 +7427,17 @@ done
         let file_hit = results
             .iter()
             .find(|hit| {
-                hit["hit"]["target"] == "documentation" && hit["path"] == json!("guide.txt")
+                hit["target"]["value"] == "documentation" && hit["path"]["value"] == "guide.txt"
             })
             .ok_or_else(|| format!("guide.txt documentation hit missing: {structured:#}"))?;
-        assert_eq!(file_hit["matched_by"], json!(["content"]));
+        assert_eq!(file_hit["matched_by"]["value"], "content");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|row| row["path"]["value"] == "guide.txt")
+                .count(),
+            1
+        );
 
         // "units" appears in `scale_value`'s doc comment and in no name of its own, so the
         // documentation column is what carried the query into this declaration. Its source
@@ -7414,24 +7445,27 @@ done
         // declaration already placed, so `content` does not ride along.
         let symbol_hit = results
             .iter()
-            .find(|hit| {
-                hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
-            })
+            .find(|hit| hit["target"]["value"] == "symbol" && hit["name"]["value"] == "scale_value")
             .ok_or_else(|| format!("scale_value doc-comment hit missing: {structured:#}"))?;
-        assert_eq!(symbol_hit["matched_by"], json!(["documentation"]));
+        assert_eq!(symbol_hit["matched_by"]["value"], "documentation");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|row| row["name"]["value"] == "scale_value")
+                .count(),
+            1
+        );
 
         // The declaration's own name places the same declaration under a name hit.
         let named = search_until_hit(client.peer(), "scale_value", "lib.rs").await?;
-        let name_hit = named["results"]
+        let name_hit = named["answer"]["bindings"]
             .as_array()
             .ok_or("results must be an array")?
             .iter()
-            .find(|hit| {
-                hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
-            })
+            .find(|hit| hit["target"]["value"] == "symbol" && hit["name"]["value"] == "scale_value")
             .ok_or_else(|| format!("scale_value name hit missing: {named:#}"))?;
         assert_eq!(
-            name_hit["matched_by"][0],
+            name_hit["matched_by"]["value"],
             json!("name"),
             "the declaration's own name places it first among the matched columns: \
              {name_hit:#}"
@@ -7654,7 +7688,7 @@ done
             text,
             "1 error\n\tinvalid_request · retry never\n\
              \t\tthe request does not match the documented form: field query, \
-             violation query is empty: subject query; \
+             violation error at 1:1: expected [_]; \
              correct the reported field and resend the request\n\
              \t\trift.server.read_invalid\n"
         );
@@ -7694,23 +7728,20 @@ done
     /// A member sent in the wrong shape is refused by the member's own name,
     /// with an example of the value it takes.
     ///
-    /// The refusal never names a Rust type: `PathSelector` is a name only this
-    /// repository holds, and a caller reading it has nothing to look up. The
-    /// example comes from the same schema the caller lists, so it can be sent
-    /// back verbatim.
+    /// The refusal names the query field and shows the same example the caller lists.
     #[tokio::test]
     async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
         let result = failing_call(
-            &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
+            &json!({"query": ["SELECT ?symbol { ?symbol a :Symbol }"]}),
             "search",
         )
         .await?;
         let text = assert_error_result(&result, "invalid_request")?;
         assert!(
             text.contains(
-                "tool arguments do not match the served schema: accepted exclude, force_include, \
-                 include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
-                 field paths, tool search; \
+                "tool arguments do not match the served schema: \
+                 example {\"query\":\"SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } LIMIT 20\"}, \
+                 field query, tool search; \
                  correct the reported field and resend the request"
             ),
             "{text}"
@@ -7730,7 +7761,7 @@ done
             "{text}"
         );
         assert!(text.contains("tool search"), "{text}");
-        assert!(text.contains("paths"), "{text}");
+        assert!(text.contains("accepted language, query"), "{text}");
         assert!(text.contains("example {"), "{text}");
         assert!(
             !text.contains("unknown field") && !text.contains("struct"),
@@ -7742,13 +7773,10 @@ done
     /// A closed set's member is refused by listing the values it takes.
     #[tokio::test]
     async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
-        let result = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let result = failing_call(&json!({"query": "ASK {}", "language": "sql"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(
-            text.contains("accepted all, commit, documentation, file, symbol"),
-            "{text}"
-        );
-        assert!(text.contains("field target"), "{text}");
+        assert!(text.contains("accepted sparql"), "{text}");
+        assert!(text.contains("field language"), "{text}");
         assert!(text.contains("tool search"), "{text}");
         assert!(
             !text.contains("unknown variant"),
@@ -8492,8 +8520,7 @@ done
         Ok(())
     }
 
-    /// One commit search for `beacon`, validated against the output schema the router serves
-    /// for `search`.
+    /// One commit retrieval for `beacon`, validated against its internal result schema.
     async fn beacon_commits(server: &RiftMcp) -> TestResult<SearchResult> {
         let params = serde_json::from_value(json!({"target": "commit", "query": "beacon"}))?;
         let answer = tokio::time::timeout(
@@ -8503,14 +8530,8 @@ done
         .await
         .map_err(|_| "a commit search waits on no fill")??
         .0;
-        let output_schema = RiftMcp::tool_router()
-            .list_all()
-            .into_iter()
-            .find(|tool| tool.name == "search")
-            .and_then(|tool| tool.output_schema)
-            .ok_or("search serves an output schema")?;
-        let validator =
-            jsonschema::validator_for(&serde_json::Value::Object(output_schema.as_ref().clone()))?;
+        let schema = serde_json::to_value(schemars::schema_for!(SearchResult))?;
+        let validator = jsonschema::validator_for(&schema)?;
         let wire = serde_json::to_value(&answer)?;
         let errors: Vec<String> = validator
             .iter_errors(&wire)
@@ -9966,18 +9987,7 @@ done
             "the index holds no row to verify: {:?}",
             held.results
         );
-        let tools = RiftMcp::tool_router().list_all();
-        let search = tools
-            .iter()
-            .find(|tool| tool.name == "search")
-            .ok_or("search is served")?;
-        let schema = serde_json::Value::Object(
-            search
-                .output_schema
-                .as_deref()
-                .ok_or("search declares an output schema")?
-                .clone(),
-        );
+        let schema = serde_json::to_value(schemars::schema_for!(SearchResult))?;
         let validator = jsonschema::validator_for(&schema)?;
         let instance = serde_json::to_value(&held)?;
         let failures: Vec<String> = validator
@@ -12007,21 +12017,30 @@ done
         query: &str,
         path: &str,
     ) -> TestResult<serde_json::Value> {
+        let literal = oxigraph::model::Literal::from(query);
+        let statement = format!(
+            "SELECT ?hit ?path ?target ?symbol ?name ?matched_by ?matched_index {{ SERVICE :search {{ ?hit :query {literal}; :index ?index; :path ?path; :hit/:target ?target; :matched_by ?match . ?match :value ?matched_by; :index ?matched_index . OPTIONAL {{ ?hit :symbol ?symbol . ?symbol :name ?name }} }} }} ORDER BY ?index ?matched_index LIMIT 100"
+        );
         let mut last_answer = json!(null);
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             let answer = peer
                 .call_tool(
                     CallToolRequestParams::new("search")
-                        .with_arguments(arguments(&json!({"query": query}))?),
+                        .with_arguments(arguments(&json!({"query": statement}))?),
                 )
                 .await?;
             let structured = answer
                 .structured_content
                 .ok_or("search must return structured content")?;
-            let results = structured["results"]
+            if structured["outcome"] == "unavailable" && structured["reason"] == "index_preparing" {
+                last_answer = structured;
+                tokio::time::sleep(SEARCH_TIER_POLL).await;
+                continue;
+            }
+            let results = structured["answer"]["bindings"]
                 .as_array()
                 .ok_or("results must be an array")?;
-            if results.iter().any(|hit| hit["path"] == json!(path)) {
+            if results.iter().any(|hit| hit["path"]["value"] == path) {
                 return Ok(structured);
             }
             last_answer = structured;

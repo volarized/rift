@@ -8073,7 +8073,7 @@
             "description": "Required relationship facts cannot be established."
           }
         ],
-        "description": "Complete raw page or the existing typed unavailable outcome."
+        "description": "Complete raw page or the existing typed unavailable outcome.\nAn unsupported operation uses the declared `503 application/problem+json` response\nwith the registered `rift.server.read_unsupported` value in `code`. Missing required\nfacts use the typed unavailable outcome, including `insufficient_coverage`."
       },
       "RelationshipSearchPage": {
         "type": "object",
@@ -8161,9 +8161,9 @@
           "occurrences": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/QueryOccurrence"
+              "$ref": "#/components/schemas/RelationshipOccurrence"
             },
-            "description": "Physical usages, including recursive and file-level locations without a caller symbol.",
+            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct original record identities across relationships and usages.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal.",
             "maxItems": 1000
           },
           "complete": {
@@ -8321,6 +8321,29 @@
           "facets"
         ],
         "description": "One relationship operation the reader establishes from its existing collected facts."
+      },
+      "RelationshipOccurrence": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/RelationshipRecordId",
+            "description": "Complete original record identity. Projections of the same record share this value."
+          },
+          "relationship": {
+            "description": "Related original relationship, only when the stored record establishes that link.",
+            "$ref": "#/components/schemas/RelationshipRecordId"
+          },
+          "occurrence": {
+            "$ref": "#/components/schemas/QueryOccurrence",
+            "description": "Physical usage. Equal locations do not establish equal original record identities."
+          }
+        },
+        "required": [
+          "id",
+          "occurrence"
+        ],
+        "description": "One physical usage projected from an original selected-publication record."
       }
     },
     "headers": {

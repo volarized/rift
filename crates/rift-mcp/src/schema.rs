@@ -111,7 +111,9 @@ mod tests {
                 .expect("declared output")
                 .clone();
             rift_protocol::schema::strip_optional_null_arms(&mut expected);
-            assert!(!expected.contains_key("type"));
+            if let Some(root_type) = expected.remove("type") {
+                assert_eq!(root_type, json!("object"), "{name} returns an object");
+            }
             let mut actual = current
                 .output_schema
                 .as_deref()

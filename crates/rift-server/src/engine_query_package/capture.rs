@@ -1,4 +1,4 @@
-//! Rust namespace witnesses captured through admitted package roots.
+//! Captured package sources and optional namespace witnesses under shared admission.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -13,7 +13,10 @@ use rift_core::{ContributionOrigin, FileDigest, ProjectPath, SourceKind};
 use rift_protocol::configuration::WorkspaceConfiguration;
 use sha2::{Digest as _, Sha256};
 
-use super::{CalleeRoots, RiftError, SelectedSource, captured_revision, source_owner, unavailable};
+use super::{
+    CalleeRoots, RiftError, SelectedSource, admitted_import_roots, captured_revision, source_owner,
+    unavailable,
+};
 
 type CapturedSource = (Uri, ProjectPath, String);
 
@@ -24,13 +27,15 @@ pub(super) fn analyze(
     trees: &[&Path],
     configuration: &WorkspaceConfiguration,
     cancelled: &(dyn Fn() -> bool + Sync),
+    namespace: bool,
 ) -> Result<(PackageAnalysis, Vec<CapturedSource>), RiftError> {
     let owner = source_owner(&source.origin)?;
     let origin = ContributionOrigin::new(Some(source.origin.clone()), SourceKind::Authored)?;
     let limits = ExactPackageLimits::from_configuration(configuration)?;
+    let import_roots = admitted_import_roots(source, roots, trees)?;
     let Some(rift_lsp::uri::EngineAddress::Package(file)) = roots.address(trees, &source.uri)?
     else {
-        return unavailable("the Rust source has no admitted package root").fail();
+        return unavailable("the source has no admitted package root").fail();
     };
     let root = file.root();
     let mut sources = BTreeMap::from([(
@@ -54,8 +59,10 @@ pub(super) fn analyze(
             .map(|(_, path, text)| PackageSource::new(path, text))
             .collect::<Vec<_>>();
         let mut input = ExactPackageInput::new(&owner, &source.provider, &origin, &files, limits)?
-            .with_framework_context(&metadata, &[])?;
-        if let Some((target, _)) = input.namespace_input().library_target()
+            .with_framework_context(&metadata, &[])?
+            .with_import_roots(&import_roots)?;
+        if namespace
+            && let Some((target, _)) = input.namespace_input().library_target()
             && let Some(library) = files.iter().find(|file| file.path() == &target)
             && let Some(manifest) = metadata
                 .iter()
@@ -87,6 +94,15 @@ pub(super) fn analyze(
             return rift_error::errors::server::read_cancelled().fail();
         }
         let analysis = analysis?;
+        if !namespace {
+            return Ok((
+                analysis,
+                sources
+                    .into_iter()
+                    .map(|(path, (uri, text))| (uri, path, text))
+                    .collect(),
+            ));
+        }
         let documents = analysis
             .files()
             .iter()
@@ -121,8 +137,7 @@ pub(super) fn analyze(
         }
         let paths = paths?;
         if overflow.get() {
-            return unavailable("Rust namespace observations exceed the accepted file bound")
-                .fail();
+            return unavailable("namespace observations exceed the accepted file bound").fail();
         }
         let requested = paths
             .into_iter()
@@ -143,7 +158,7 @@ pub(super) fn analyze(
             .saturating_add(requested.len())
             > maximum
         {
-            return unavailable("Rust namespace sources exceed the accepted file bound").fail();
+            return unavailable("namespace sources exceed the accepted file bound").fail();
         }
         let mut bytes = sources
             .values()
@@ -161,17 +176,15 @@ pub(super) fn analyze(
                 configuration.providers.syntax.max_file.bytes(),
             )?;
             if file.origin() != &source.origin {
-                return unavailable(
-                    "Rust namespace source owner differs from the selected package",
-                )
-                .fail();
+                return unavailable("namespace source owner differs from the selected package")
+                    .fail();
             }
             bytes = bytes.saturating_add(text.len() as u64);
             if bytes > limits.bytes_max() {
-                return unavailable("Rust namespace sources exceed the accepted byte bound").fail();
+                return unavailable("namespace sources exceed the accepted byte bound").fail();
             }
             sources.insert(path, (uri, text));
         }
     }
-    unavailable("Rust namespace acquisition exceeded the accepted file bound").fail()
+    unavailable("namespace acquisition exceeded the accepted file bound").fail()
 }

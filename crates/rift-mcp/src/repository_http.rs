@@ -942,28 +942,48 @@ mod tests {
         );
         let service = ().serve(StreamableHttpClientTransport::from_config(config)).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let literal = oxigraph::model::Literal::from(name);
+        let query = format!(
+            "SELECT ?symbol ?name {{ ?symbol a :Symbol; :name ?name . FILTER(?name = {literal}) }}"
+        );
         let selected = loop {
             let response = service
                 .call_tool(
                     CallToolRequestParams::new("search").with_arguments(
-                        serde_json::json!({"pattern": name, "target": "symbol", "scope": "local"})
+                        serde_json::json!({"query": query})
                             .as_object()
                             .cloned()
                             .ok_or("tool arguments must be an object")?,
                     ),
                 )
                 .await?;
+            let content = response.structured_content.as_ref().ok_or_else(|| {
+                format!("workspace query must return structured content: {response:?}")
+            })?;
+            if response.is_error == Some(true)
+                || (content["outcome"] == "unavailable" && content["reason"] != "index_preparing")
+            {
+                return Err(format!("workspace query refused: {response:?}").into());
+            }
             let ids = response
                 .structured_content
                 .as_ref()
-                .and_then(|content| content["results"].as_array())
+                .and_then(|content| content["answer"]["bindings"].as_array())
                 .into_iter()
                 .flatten()
-                .filter(|hit| hit["hit"]["symbol"]["name"] == name)
-                .filter_map(|hit| hit["hit"]["symbol"]["id"].as_str())
+                .filter(|row| row["name"]["value"] == name && row["symbol"]["type"] == "iri")
+                .filter_map(|row| row["symbol"]["value"].as_str())
                 .collect::<Vec<_>>();
             if let [id] = ids.as_slice() {
-                break rift_protocol::read::SymbolId::parse(id)?;
+                let view = response
+                    .structured_content
+                    .as_ref()
+                    .and_then(|content| content["view"]["id"].as_str())
+                    .ok_or("query retains its selected workspace view")?;
+                break (
+                    rift_protocol::read::SymbolId::parse(id)?,
+                    rift_protocol::symbol_read::CapturedViewId::parse(view)?,
+                );
             }
             if ids.len() > 1 || tokio::time::Instant::now() >= deadline {
                 return Err(format!(
@@ -976,7 +996,7 @@ mod tests {
         let response = service
             .call_tool(
                 CallToolRequestParams::new("get_symbol").with_arguments(
-                    serde_json::json!({"id": selected})
+                    serde_json::json!({"id": selected.0, "view": selected.1})
                         .as_object()
                         .cloned()
                         .ok_or("tool arguments must be an object")?,

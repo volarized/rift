@@ -18,6 +18,9 @@ impl RiftProxy {
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
         let forwarded = self.query_forward(request).await?;
+        if forwarded.owned {
+            return Ok(Some(forwarded.response));
+        }
         let name = forwarded.backend.as_str();
         let backend = if name == "local" {
             self
@@ -120,6 +123,9 @@ impl RiftProxy {
         &self,
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
+        if let Some(response) = self.query_material_read(request).await? {
+            return Ok(Some(response));
+        }
         let arguments = request.arguments.clone().unwrap_or_default();
         match request.name.as_ref() {
             "get_symbol" => self.captured_symbol(request).await,

@@ -5,14 +5,18 @@ use rift_protocol::read::{Pagination, SearchParams, SearchResult};
 use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
 use rift_protocol::symbol_read::SymbolUnavailableReason;
 
-use super::{RiftMcp, ToolFailure, acquisition_failure, failure, incomplete_retrieval};
+use super::{
+    QueryBudget, RiftMcp, ToolFailure, acquisition_failure, failure, incomplete_retrieval,
+};
 
 impl RiftMcp {
     pub(super) async fn complete_retrieval(
         &self,
         request: &SearchParams,
         configuration: &QueryConfiguration,
-        requests: &mut u64,
+        requests: &rift_server::ProviderRequests,
+        budget: &QueryBudget,
+        deadline: super::super::RequestDeadline,
     ) -> Result<SearchReadResult, ToolFailure> {
         if request.page_index != 0 {
             return Err(failure(
@@ -27,16 +31,8 @@ impl RiftMcp {
         let mut paging = request.clone();
         paging.limit = Some(request.limit.unwrap_or(rift_protocol::read::PAGE_LIMIT_MAX));
         let mut selected: Option<Box<SearchResult>> = None;
-        let mut bytes = 0_u64;
         loop {
-            *requests = requests
-                .checked_add(1)
-                .filter(|count| *count <= configuration.requests)
-                .ok_or_else(|| {
-                    failure(acquisition_failure(
-                        "retrieval acquisition exceeds search.query.requests",
-                    ))
-                })?;
+            requests.claim().map_err(failure)?;
             let result = self
                 .discovery_search(
                     crate::parameters::Parameters(paging.clone()),
@@ -62,36 +58,12 @@ impl RiftMcp {
             {
                 return Ok(unavailable(SymbolUnavailableReason::ViewContext, *page));
             }
-            let (admitted, size) = self
-                .blocking
-                .run("query retrieval page", move || {
-                    let size = page.results.iter().try_fold(0_u64, |size, hit| {
-                        let encoded = serde_json::to_vec(hit).map_err(|source| {
-                            rift_error::errors::mcp::forward_failed()
-                                .source(source)
-                                .error()
-                        })?;
-                        let next = u64::try_from(encoded.len())
-                            .ok()
-                            .and_then(|bytes| size.checked_add(bytes))
-                            .ok_or_else(|| {
-                                acquisition_failure("retrieval bytes exceed the platform bound")
-                            })?;
-                        Ok::<_, rift_error::RiftError>(next)
-                    })?;
-                    Ok((page, size))
+            page = self
+                .query_work(budget, deadline, move |budget| {
+                    budget.charge(&page)?;
+                    Ok(page)
                 })
-                .await
-                .map_err(failure)?;
-            page = admitted;
-            bytes = bytes
-                .checked_add(size)
-                .filter(|bytes| *bytes <= configuration.fact_size.bytes())
-                .ok_or_else(|| {
-                    failure(acquisition_failure(
-                        "retrieval acquisition exceeds search.query.fact_size",
-                    ))
-                })?;
+                .await?;
             let next = paging.page_index.checked_add(1).ok_or_else(|| {
                 failure(acquisition_failure(
                     "retrieval page exceeds the platform bound",
@@ -101,6 +73,18 @@ impl RiftMcp {
             if more && (page.view.is_none() || page.results.is_empty()) {
                 return Err(failure(acquisition_failure(
                     "retrieval page cannot continue without its original context and rows",
+                )));
+            }
+            let count = selected
+                .as_ref()
+                .map_or(0, |held| held.results.len())
+                .checked_add(page.results.len());
+            if count
+                .and_then(|count| u64::try_from(count).ok())
+                .is_none_or(|count| count > configuration.results)
+            {
+                return Err(failure(acquisition_failure(
+                    "retrieval acquisition exceeds search.query.results",
                 )));
             }
             match &mut selected {
@@ -120,12 +104,6 @@ impl RiftMcp {
             let held = selected.as_mut().ok_or_else(|| {
                 failure(acquisition_failure("retrieval selection is unavailable"))
             })?;
-            if u64::try_from(held.results.len()).map_or(true, |count| count > configuration.results)
-            {
-                return Err(failure(acquisition_failure(
-                    "retrieval acquisition exceeds search.query.results",
-                )));
-            }
             if !more {
                 held.pagination = Pagination {
                     page_index: 0,

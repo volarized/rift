@@ -58,7 +58,7 @@ pub(super) fn dispatch_id(id: &SymbolId, backend: &str) -> Result<SymbolId, Rift
     }
 }
 
-fn qualify_id(id: &mut SymbolId, backend: &str) -> Result<(), RiftError> {
+pub(super) fn qualify_id(id: &mut SymbolId, backend: &str) -> Result<(), RiftError> {
     let identity = SymbolIdentity::parse(id.as_str())?;
     if matches!(identity.owner(), SymbolOwner::Local) {
         *id = with_owner(&identity, public_owner(identity.owner(), backend)?)?;

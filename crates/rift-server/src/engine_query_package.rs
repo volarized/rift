@@ -4,11 +4,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use lsp_types::{Range, Uri};
-use rift_analysis::{
-    ExactPackageInput, ExactPackageLimits, PackageAnalyzer, PackageImportRoot,
-    PackageImportRootOrigin, PackageSource,
-};
-use rift_core::{ContributionOrigin, FileDigest, ProjectPath, SourceKind, SourceLocation};
+use rift_analysis::{PackageImportRoot, PackageImportRootOrigin};
+use rift_core::{FileDigest, ProjectPath, SourceLocation};
 use rift_lsp::capabilities::PositionEncoding;
 use rift_lsp::position::LineIndex;
 use rift_protocol::configuration::WorkspaceConfiguration;
@@ -23,6 +20,31 @@ use crate::PackageCallee;
 /// A dependency source that must be admitted before completing an engine answer.
 #[derive(Clone, Debug, PartialEq)]
 pub enum QuerySourceRequest {
+    /// A provider-supplied physical location whose normalized declaration is not canonical.
+    Provider {
+        /// Original caller or referenced target, retained in its captured source context.
+        subject: rift_search::query::QueryProviderTarget,
+        /// Direction established by the provider response.
+        direction: rift_protocol::read::TraversalDirection,
+        /// Relationship established by this location.
+        facet: rift_protocol::read::RelationshipFacet,
+        /// Original supplied URI.
+        uri: Uri,
+        /// Original declaration selection or reference occurrence.
+        range: Range,
+        /// Negotiated position encoding.
+        encoding: PositionEncoding,
+        /// Accepted provider supplying this location.
+        provider: Language,
+        /// Actual supplied target name, absent for a reference occurrence.
+        name: Option<String>,
+        /// Original caller ranges in the supplied source's encoding.
+        ranges: Vec<Range>,
+        /// Already converted outgoing occurrences in the original caller source.
+        sources: Vec<SourceUnitSpan>,
+        /// The provider established a file-level occurrence.
+        file_level: bool,
+    },
     /// An outgoing target whose exact package declaration has not been named.
     Call(PackageCallee),
     /// A caller whose original source must be admitted before mapping its call ranges.
@@ -67,7 +89,9 @@ impl QuerySourceRequest {
             Self::Call(callee) | Self::IncomingCall { caller: callee, .. } => callee
                 .query_origin()
                 .ok_or_else(|| unavailable("dependency runtime version is unavailable")),
-            Self::Reference { uri, .. } => match roots.address(trees, uri)? {
+            Self::Reference { uri, .. } | Self::Provider { uri, .. } => match roots
+                .address(trees, uri)?
+            {
                 Some(rift_lsp::uri::EngineAddress::Package(file)) => Ok(file.origin().clone()),
                 _ => unavailable("the reference source has no admitted dependency owner").fail(),
             },
@@ -75,8 +99,10 @@ impl QuerySourceRequest {
     }
 }
 
-#[path = "engine_query_package/rust.rs"]
-mod rust;
+#[path = "engine_query_package/capture.rs"]
+mod capture;
+#[path = "engine_query_package/provider.rs"]
+mod provider;
 
 #[derive(Debug)]
 pub(super) struct DeclarationLocation {
@@ -94,7 +120,18 @@ pub struct QueryPackageTarget {
     pub(super) name_ranges: BTreeMap<SymbolId, DeclarationLocation>,
     pub(super) digest: FileDigest,
     pub(super) selected: Option<SymbolId>,
+    pub(super) provider_names: Vec<(rift_search::query::QueryProviderTarget, DeclarationLocation)>,
     context: Vec<(Uri, FileDigest)>,
+}
+
+struct Preparation<'input, 'budget> {
+    request: QuerySourceRequest,
+    roots: &'input CalleeRoots,
+    trees: &'input [&'input Path],
+    configuration: &'input WorkspaceConfiguration,
+    cancelled: &'input (dyn Fn() -> bool + Sync),
+    budget: Option<&'input mut crate::QueryFactBudget<'budget>>,
+    selection: Option<&'input rift_search::query::QueryProviderSelection>,
 }
 
 struct SelectedSource {
@@ -203,6 +240,99 @@ impl QueryPackageTarget {
         configuration: &WorkspaceConfiguration,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<Self, RiftError> {
+        Self::prepare_with_budget(request, roots, trees, configuration, cancelled, None)
+    }
+
+    /// Captures provider facts within the existing request admission.
+    ///
+    /// # Errors
+    /// Returns cancellation, changed ownership, unavailable source or exhausted admission.
+    pub fn prepare_with_budget(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_with_selection(
+            request,
+            roots,
+            trees,
+            configuration,
+            cancelled,
+            budget,
+            None,
+        )
+    }
+
+    /// Captures provider facts under the original serving selection.
+    ///
+    /// # Errors
+    /// Returns changed ownership, unavailable source or exhausted request admission.
+    pub fn prepare_with_selection(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selection: Option<&rift_search::query::QueryProviderSelection>,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_captured(
+            Preparation {
+                request,
+                roots,
+                trees,
+                configuration,
+                cancelled,
+                budget,
+                selection,
+            },
+            true,
+        )
+    }
+
+    /// Captures the supplied physical target without requiring namespace expansion.
+    ///
+    /// Canonical identity remains available when the captured selected sources establish it.
+    /// The explicit canonical preparation path retains bounded namespace enrichment.
+    ///
+    /// # Errors
+    /// Refuses missing source ownership, invalid physical declarations, cancellation or bounds.
+    pub fn prepare_selected_with_selection(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selection: Option<&rift_search::query::QueryProviderSelection>,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_captured(
+            Preparation {
+                request,
+                roots,
+                trees,
+                configuration,
+                cancelled,
+                budget,
+                selection,
+            },
+            false,
+        )
+    }
+
+    fn prepare_captured(input: Preparation<'_, '_>, namespace: bool) -> Result<Self, RiftError> {
+        let Preparation {
+            request,
+            roots,
+            trees,
+            configuration,
+            cancelled,
+            mut budget,
+            selection,
+        } = input;
         if cancelled() {
             return rift_error::errors::server::read_cancelled().fail();
         }
@@ -213,29 +343,17 @@ impl QueryPackageTarget {
             configuration.providers.syntax.max_file.bytes(),
         )?;
         let owner = source_owner(&source.origin)?;
-        let origin = ContributionOrigin::new(Some(source.origin.clone()), SourceKind::Authored)?;
         let context = package_context(&source, roots, trees, configuration)?;
         let digest = FileDigest::of(source.text.as_bytes());
-        let (analysis, captured) = if matches!(&source.origin, SourceLocation::Dependency { package } if package.manager == "cargo")
-            && source.provider.name == "rust"
-        {
-            rust::analyze(&source, &context, roots, trees, configuration, cancelled)?
-        } else {
-            let files = [PackageSource::new(&source.path, &source.text)];
-            let context_sources = context
-                .iter()
-                .map(|(_, path, text)| PackageSource::new(path, text))
-                .collect::<Vec<_>>();
-            let limits = ExactPackageLimits::from_configuration(configuration)?;
-            let import_roots = admitted_import_roots(&source, roots, trees)?;
-            let input = ExactPackageInput::new(&owner, &source.provider, &origin, &files, limits)?
-                .with_framework_context(&context_sources, &[])?
-                .with_import_roots(&import_roots)?;
-            (
-                PackageAnalyzer::analyze(input, captured_revision(digest))?,
-                vec![(source.uri.clone(), source.path.clone(), source.text.clone())],
-            )
-        };
+        let (analysis, captured) = capture::analyze(
+            &source,
+            &context,
+            roots,
+            trees,
+            configuration,
+            cancelled,
+            namespace,
+        )?;
         let unit = SourceUnitId(
             rift_core::SourceUnitId::for_origin(&source.origin, &source.path)?.to_string(),
         );
@@ -246,7 +364,7 @@ impl QueryPackageTarget {
             .collect::<BTreeMap<_, _>>();
         let uris = captured
             .iter()
-            .map(|(uri, path, _)| (path.as_str(), uri))
+            .map(|(uri, path, _)| (path.as_str().to_owned(), uri.clone()))
             .collect::<BTreeMap<_, _>>();
         let mut name_ranges = BTreeMap::new();
         for declaration in &analysis.publication().declarations {
@@ -268,7 +386,7 @@ impl QueryPackageTarget {
                             end: range.end,
                         },
                     },
-                    uri: (*uri).clone(),
+                    uri: uri.clone(),
                 };
                 if declaration.unit == unit
                     && declaration.range.start <= source.offset as u64
@@ -293,34 +411,43 @@ impl QueryPackageTarget {
             })
             .min_by_key(|declaration| declaration.range.end - declaration.range.start)
             .map(|declaration| declaration.symbol.clone());
-        if matches!(
-            request,
-            QuerySourceRequest::Call(_) | QuerySourceRequest::IncomingCall { .. }
-        ) && selected.is_none()
-        {
-            #[cfg(test)]
-            eprintln!(
-                "admitted target {} offset {} captured {} files {:?}; physical declarations {:?}",
-                source.path.as_str(),
-                source.offset,
-                captured.len(),
-                captured
-                    .iter()
-                    .take(32)
-                    .map(|(_, path, _)| path.as_str())
-                    .collect::<Vec<_>>(),
-                analysis
-                    .publication()
-                    .declarations
-                    .iter()
-                    .filter(|declaration| declaration.unit == unit)
-                    .take(16)
-                    .map(|declaration| (&declaration.symbol, &declaration.range))
-                    .collect::<Vec<_>>()
-            );
-            return unavailable("the admitted call target has no canonical declaration").fail();
-        }
+        drop(files);
         let mut facts = publication_facts(analysis.publication());
+        let Some(rift_lsp::uri::EngineAddress::Package(admitted)) =
+            roots.address(trees, &source.uri)?
+        else {
+            return unavailable("the captured provider source has no admitted root").fail();
+        };
+        let providers = provider::capture(
+            analysis,
+            &mut facts,
+            provider::ProviderCapture {
+                source: &source,
+                owner,
+                root: admitted.root().root_uri()?,
+                digest,
+                inputs: &context,
+                captured: &captured,
+                enclosing: matches!(
+                    &request,
+                    QuerySourceRequest::Reference { .. }
+                        | QuerySourceRequest::Provider { name: None, .. }
+                ),
+                uris: &uris,
+                configuration,
+                selection,
+            },
+            cancelled,
+            budget.as_deref_mut(),
+        )?;
+        if matches!(
+            &request,
+            QuerySourceRequest::Call(_) | QuerySourceRequest::IncomingCall { .. }
+        ) && providers.selected.is_none()
+        {
+            return unavailable("the admitted call target has no original declaration binding")
+                .fail();
+        }
         let mut context = context
             .into_iter()
             .map(|(uri, _, text)| (uri, FileDigest::of(text.as_bytes())))
@@ -339,6 +466,9 @@ impl QueryPackageTarget {
                 text: Some(text),
             });
         }
+        for snapshot in &mut facts.providers {
+            snapshot.source_indices = (0..facts.sources.len()).collect();
+        }
         if cancelled() {
             return rift_error::errors::server::read_cancelled().fail();
         }
@@ -350,6 +480,7 @@ impl QueryPackageTarget {
             name_ranges,
             digest,
             selected,
+            provider_names: providers.names,
             context,
         })
     }
@@ -483,6 +614,13 @@ fn selected_source(
             })
         }
         QuerySourceRequest::Reference {
+            uri,
+            range,
+            encoding,
+            provider,
+            ..
+        }
+        | QuerySourceRequest::Provider {
             uri,
             range,
             encoding,

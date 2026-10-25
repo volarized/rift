@@ -83,6 +83,10 @@ enum FixtureMode {
 
 #[derive(Clone)]
 enum OperationFixture {
+    RelationshipRefusal {
+        value: serde_json::Value,
+        problem: bool,
+    },
     Relationships {
         pages: Vec<serde_json::Value>,
         advertised: bool,
@@ -445,7 +449,8 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     capabilities_response_with(|value| match mode {
         OperationFixture::Relationships {
             advertised: true, ..
-        } => {
+        }
+        | OperationFixture::RelationshipRefusal { .. } => {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
             value["relationship_capabilities"] = serde_json::json!([
@@ -588,6 +593,21 @@ fn operation_search_response(
     query: Option<&str>,
     request_number: usize,
 ) -> Response {
+    if let OperationFixture::RelationshipRefusal { value, problem } = mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(
+                header::CONTENT_TYPE,
+                if *problem {
+                    "application/problem+json"
+                } else {
+                    "application/json"
+                },
+            )],
+            Body::from(value.to_string()),
+        )
+            .into_response();
+    }
     if let OperationFixture::Relationships { pages, .. } = mode {
         let index = query_cursor(query)
             .and_then(|cursor| cursor.parse::<usize>().ok())

@@ -221,7 +221,7 @@ fn captured_symbol_material_refuses_unmeasured_portable_facts_without_overflow()
     let mut object = index.assembled_symbol(matched).expect("canonical facts");
     let identity = object.identity().expect("established identity").clone();
     let mut signatures = object.facts.signatures_slice().to_vec();
-    signatures[0].extensions = rift_protocol::read::Extensions(BTreeMap::from([(
+    signatures[0].extensions = rift_protocol::read::Extensions::from(BTreeMap::from([(
         rift_protocol::read::ExtensionKey("example.org.fact".to_owned()),
         rift_protocol::read::ExtensionValue {
             version: 1,

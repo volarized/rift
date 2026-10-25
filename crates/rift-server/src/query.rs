@@ -5,9 +5,18 @@ use crate::read::{LocalSymbolViewInput, ReadService};
 use rift_error::{RiftError, errors};
 use rift_index::WorkspaceSymbolView;
 use rift_protocol::read::SourceUnitId;
+use rift_search::query::FactRequirement;
 use rift_search::query::{
     FactRequirements, QueryFactFamily, QueryFacts, QueryLimits, QuerySource, QuerySymbol,
 };
+
+/// Combines admitted facts while preserving their original source and provider associations.
+///
+/// # Errors
+/// Refuses conflicting source bytes, record identities or captured selectors.
+pub fn merge_query_facts(held: &mut QueryFacts, added: QueryFacts) -> Result<(), RiftError> {
+    crate::engine_read::merge_package_facts(held, added)
+}
 
 impl ReadService {
     /// Projects selected published facts without reading or analyzing source again.
@@ -21,19 +30,86 @@ impl ReadService {
         limits: QueryLimits,
     ) -> Result<QueryFacts, RiftError> {
         let view = self.index().symbol_view()?;
-        project_query_facts(
-            &view,
-            &FactRequirements {
-                source,
-                complete_domain: relationships,
-                ..FactRequirements::default()
-            },
-            limits,
-        )
+        let mut requirements = FactRequirements::default();
+        if source {
+            requirements.require(FactRequirement::Source);
+        }
+        if relationships {
+            requirements.require(FactRequirement::CompleteDomain);
+        }
+        project_query_facts(&view, &requirements, limits)
     }
 }
 
 impl LocalSymbolViewInput {
+    /// Captures provider context from this original immutable source selection.
+    ///
+    /// The caller runs configuration encoding on its existing bounded worker.
+    ///
+    /// # Errors
+    /// Returns the original root, source identity or configuration encoding failure.
+    pub fn provider_selection(
+        &self,
+        configuration: &rift_protocol::configuration::WorkspaceConfiguration,
+    ) -> Result<rift_search::query::QueryProviderSelection, RiftError> {
+        let graph = self.index().normalized_graph();
+        let root = rift_lsp::uri::TreeRoot::new(self.root())?.root_uri()?;
+        Ok(rift_search::query::QueryProviderSelection {
+            root: rift_core::WorkspaceId::new(root.as_str())?,
+            owner: self.owner().clone(),
+            index_revision: graph.index_revision(),
+            source_revision: graph.source_revision(),
+            tree_revision: graph.tree_revision(),
+            fingerprint: rift_protocol::identity::SourceDigest::parse(
+                &data_encoding::HEXLOWER.encode(self.index().fingerprint().as_bytes()),
+            )?,
+            configuration: rift_search::query::QueryProviderSelection::configuration_digest(
+                configuration,
+            )?,
+        })
+    }
+
+    /// Validates a provider selection against this original immutable publication.
+    ///
+    /// # Errors
+    /// Refuses a different root, owner, source fingerprint or normalized revision.
+    pub fn validate_provider_selection(
+        &self,
+        selection: &rift_search::query::QueryProviderSelection,
+    ) -> Result<(), RiftError> {
+        let graph = self.index().normalized_graph();
+        let root = rift_lsp::uri::TreeRoot::new(self.root())?.root_uri()?;
+        if selection.root.as_str() != root.as_str()
+            || &selection.owner != self.owner()
+            || selection.index_revision != graph.index_revision()
+            || selection.source_revision != graph.source_revision()
+            || selection.tree_revision != graph.tree_revision()
+            || selection.fingerprint.as_str()
+                != data_encoding::HEXLOWER.encode(self.index().fingerprint().as_bytes())
+        {
+            return errors::server::read_unavailable()
+                .operation("query provider selection")
+                .detail("captured provider selection differs from its original publication")
+                .fail();
+        }
+        Ok(())
+    }
+
+    /// Projects facts under their original captured provider selection.
+    ///
+    /// # Errors
+    /// Refuses a different selection, missing facts or exhausted request admission.
+    pub fn query_facts_with_selection(
+        &self,
+        requirements: &FactRequirements,
+        limits: QueryLimits,
+        budget: &mut QueryFactBudget<'_>,
+        selection: &rift_search::query::QueryProviderSelection,
+    ) -> Result<QueryFacts, RiftError> {
+        self.validate_provider_selection(selection)?;
+        self.query_facts_with_budget(requirements, limits, budget)
+    }
+
     /// Projects facts from this input's original publication and source selection.
     ///
     /// # Errors
@@ -56,22 +132,35 @@ impl LocalSymbolViewInput {
         limits: QueryLimits,
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> Result<QueryFacts, RiftError> {
-        if requirements.domain && !self.ready {
+        let mut budget = QueryFactBudget::new(limits, cancelled)?;
+        self.query_facts_with_budget(requirements, limits, &mut budget)
+    }
+
+    /// Projects selected facts using the caller's remaining request admission.
+    ///
+    /// # Errors
+    /// Returns cancellation, unavailable facts or exhausted acquisition admission.
+    pub fn query_facts_with_budget(
+        &self,
+        requirements: &FactRequirements,
+        limits: QueryLimits,
+        budget: &mut QueryFactBudget<'_>,
+    ) -> Result<QueryFacts, RiftError> {
+        if requirements.requires(FactRequirement::Domain) && !self.ready {
             return errors::server::read_unavailable()
                 .operation("query acquisition")
                 .detail("selected workspace publication is not ready")
                 .fail();
         }
-        let mut budget = QueryFactBudget::new(limits, cancelled)?;
         let mut facts =
-            project_query_facts_with_budget(self.index(), requirements, limits, &mut budget)?;
+            project_query_facts_with_budget(self.index(), requirements, limits, budget)?;
         budget.check()?;
         if let Some(bytes) = self.captured_history_bytes() {
             budget.charge_bytes(bytes)?;
         }
         if let Some(history) = self.captured_history()? {
             if history.complete
-                && !requirements.all_histories
+                && !requirements.requires(FactRequirement::AllHistories)
                 && !requirements.history_symbols.is_empty()
                 && requirements
                     .history_symbols
@@ -145,7 +234,7 @@ fn project_query_facts_with_budget(
                 return query_bound("search.results");
             };
             budget.charge(&declaration)?;
-            if requirements.source {
+            if requirements.requires(FactRequirement::Source) {
                 let (bindings, _) = view.symbols_by_identity_page(identity, offset, 1)?;
                 if let Some(matched) = bindings.first() {
                     budget.charge(&crate::read::excerpt_ref(
@@ -163,7 +252,9 @@ fn project_query_facts_with_budget(
             symbol,
             declarations,
         });
-        if requirements.complete_domain || requirements.description {
+        if requirements.requires(FactRequirement::CompleteDomain)
+            || requirements.requires(FactRequirement::Description)
+        {
             for edge in view.relationships().outgoing(identity) {
                 budget.check()?;
                 if facts.relationships.len() >= limits.quads_max {
@@ -193,7 +284,7 @@ fn project_query_facts_with_budget(
             let symbol = object.to_protocol_symbol();
             budget.charge(&symbol)?;
             let mut declaration = declaration.clone();
-            if requirements.source {
+            if requirements.requires(FactRequirement::Source) {
                 budget.charge(&crate::read::excerpt_ref(
                     matched.file,
                     matched.symbol.range,
@@ -216,7 +307,7 @@ fn project_query_facts_with_budget(
         if facts.sources.len() >= limits.quads_max {
             return query_bound("search.query.statements");
         }
-        if requirements.source {
+        if requirements.requires(FactRequirement::Source) {
             source_bytes = source_bytes
                 .checked_add(source.len())
                 .ok_or_else(|| query_bound_error("search.query.bytes"))?;
@@ -224,7 +315,7 @@ fn project_query_facts_with_budget(
                 return query_bound("search.query.bytes");
             }
         }
-        if requirements.source {
+        if requirements.requires(FactRequirement::Source) {
             budget.charge(&source)?;
         }
         let mut record = QuerySource {
@@ -236,7 +327,9 @@ fn project_query_facts_with_budget(
             text: None,
         };
         budget.charge(&record)?;
-        record.text = requirements.source.then(|| source.to_owned());
+        record.text = requirements
+            .requires(FactRequirement::Source)
+            .then(|| source.to_owned());
         facts.sources.push(record);
     }
     let documentation = view.documentation().index();
@@ -353,7 +446,7 @@ mod tests {
         let selected = project_query_facts(
             &view,
             &FactRequirements {
-                source: true,
+                required: [FactRequirement::Source].into(),
                 ..FactRequirements::default()
             },
             limits(),

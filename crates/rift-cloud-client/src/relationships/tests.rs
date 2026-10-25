@@ -5,8 +5,114 @@ use serde_json::{Value, json};
 const SEED: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/entry";
 const TARGET: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/helper";
 
+fn counted_client(
+    client: crate::GlobalClient,
+) -> (
+    crate::GlobalClient,
+    std::sync::Arc<std::sync::atomic::AtomicU64>,
+) {
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let observed = std::sync::Arc::clone(&attempts);
+    (
+        client.with_request_admission(move || {
+            observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }),
+        attempts,
+    )
+}
+
 fn request() -> RelationshipSearchRequest {
     serde_json::from_value(json!({"relationships":{"seeds":[SEED],"direction":"outgoing","facets":["calls"]},"packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]})).expect("strict request")
+}
+
+#[tokio::test]
+async fn cached_relationship_capability_does_not_retry_an_unsupported_operation() {
+    let problem = json!({
+        "type":"about:blank", "title":"Service unavailable", "status":503,
+        "detail":"Service unavailable", "code":"rift.server.read_unsupported"
+    });
+    let (server, client) = operation_client(OperationFixture::RelationshipRefusal {
+        value: problem,
+        problem: true,
+    })
+    .await;
+    let (client, attempts) = counted_client(client);
+    client
+        .get_capabilities()
+        .await
+        .expect("cached supported capability");
+    let error = client
+        .relationship_pages(&request(), limits())
+        .await
+        .expect_err("unsupported operation");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let requests = server.state.request_log.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with("/search"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn missing_relationship_coverage_keeps_its_typed_reason() {
+    let value = json!({"outcome":"unavailable", "reason":"insufficient_coverage"});
+    let (server, client) = operation_client(OperationFixture::RelationshipRefusal {
+        value: value.clone(),
+        problem: false,
+    })
+    .await;
+    let (client, attempts) = counted_client(client);
+    let answer = client
+        .relationship_pages(&request(), limits())
+        .await
+        .expect("typed unavailable");
+    assert_eq!(serde_json::to_value(answer).expect("typed result"), value);
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let requests = server.state.request_log.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with("/search"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unknown_problem_codes_and_non_problem_media_do_not_authorize_unsupported() {
+    for (code, problem, expected) in [
+        ("rift.server.other", true, "rift.client.remote_unavailable"),
+        (
+            "rift.server.read_unsupported",
+            false,
+            "rift.client.response_invalid",
+        ),
+    ] {
+        let (server, client) = operation_client(OperationFixture::RelationshipRefusal {
+            value: json!({"type":"about:blank", "title":"Service unavailable", "status":503,
+                "detail":"Service unavailable", "code":code}),
+            problem,
+        })
+        .await;
+        let error = client
+            .relationship_pages(&request(), limits())
+            .await
+            .expect_err("registered response boundary");
+        assert_eq!(error.slug().as_str(), expected);
+        let requests = server.state.request_log.lock().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.path.ends_with("/search"))
+                .count(),
+            usize::try_from(server.config().attempts).expect("configured attempt bound"),
+        );
+    }
 }
 
 fn page(start: u64, complete: bool, next: Option<&str>) -> Value {
@@ -18,6 +124,82 @@ fn page(start: u64, complete: bool, next: Option<&str>) -> Value {
 
 fn full_digest(text: &str) -> String {
     data_encoding::HEXLOWER.encode(rift_core::FileDigest::of(text.as_bytes()).as_bytes())
+}
+
+fn located_projection(identity: u64, relationship: Option<u64>, start: u64) -> Value {
+    json!({"id":format!("{identity:064x}"), "relationship":relationship.map(|id|format!("{id:064x}")),
+        "occurrence":{"target":TARGET,"enclosing":SEED,
+        "source":{"unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs","range":{"start":start,"end":start+1}},"facet":"calls"}})
+}
+
+#[tokio::test]
+async fn page_limit_counts_original_ids_and_preserves_every_physical_projection() {
+    let mut selected = page(0, true, None);
+    selected["groups"][0]["occurrences"] = json!([
+        located_projection(0, Some(0), 0),
+        located_projection(0, Some(0), 1)
+    ]);
+    let (_server, client) = operation_client(OperationFixture::Relationships {
+        pages: vec![selected.clone()],
+        advertised: true,
+    })
+    .await;
+    let RelationshipSearchResult::Page(answer) = client
+        .relationship_page(&request(), 1, None)
+        .await
+        .expect("one original record")
+    else {
+        panic!("page");
+    };
+    assert_eq!(answer.groups[0].occurrences.len(), 2);
+    selected["groups"][0]["occurrences"][1]["id"] = json!(format!("{:064x}", 1));
+    let (_server, client) = operation_client(OperationFixture::Relationships {
+        pages: vec![selected.clone()],
+        advertised: true,
+    })
+    .await;
+    assert!(client.relationship_page(&request(), 1, None).await.is_err());
+    let (_server, client) = operation_client(OperationFixture::Relationships {
+        pages: vec![selected],
+        advertised: true,
+    })
+    .await;
+    assert!(client.relationship_page(&request(), 2, None).await.is_ok());
+}
+
+#[tokio::test]
+async fn original_usage_replay_and_serialized_bytes_remain_bounded() {
+    let mut first = page(0, false, Some("1"));
+    first["groups"][0]["occurrences"] = json!([located_projection(0, Some(0), 0)]);
+    let mut second = page(1, true, None);
+    second["groups"][0]["relationships"] = json!([]);
+    second["groups"][0]["occurrences"] = json!([located_projection(0, Some(0), 1)]);
+    let (_server, client) = operation_client(OperationFixture::Relationships {
+        pages: vec![first.clone(), second],
+        advertised: true,
+    })
+    .await;
+    assert!(
+        client
+            .relationship_pages(&request(), limits())
+            .await
+            .is_err()
+    );
+    first["groups"][0]["complete"] = json!(true);
+    first["next_cursor"] = Value::Null;
+    let (_server, client) = operation_client(OperationFixture::Relationships {
+        pages: vec![first],
+        advertised: true,
+    })
+    .await;
+    let mut bounded = limits();
+    bounded.bytes_max = 1;
+    assert!(
+        client
+            .relationship_pages(&request(), bounded)
+            .await
+            .is_err()
+    );
 }
 
 fn symbol(id: &str, name: &str) -> Value {
@@ -443,7 +625,7 @@ async fn complete_empty_subject_is_authoritative_and_file_level_occurrence_survi
     assert!(result.groups[0].relationships.is_empty());
     let mut occurrence = page(0, true, None);
     occurrence["groups"][0]["relationships"] = json!([]);
-    occurrence["groups"][0]["occurrences"] = json!([{"target":SEED,"source":{"unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs","range":{"start":0,"end":1}},"facet":"references"}]);
+    occurrence["groups"][0]["occurrences"] = json!([{"id":"1".repeat(64),"occurrence":{"target":SEED,"source":{"unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs","range":{"start":0,"end":1}},"facet":"references"}}]);
     let mut incoming = request();
     incoming.relationships.direction = rift_protocol::read::TraversalDirection::Incoming;
     incoming.relationships.facets = vec![rift_protocol::read::RelationshipFacet::References];
@@ -460,7 +642,12 @@ async fn complete_empty_subject_is_authoritative_and_file_level_occurrence_survi
         panic!("page");
     };
     assert_eq!(result.groups[0].occurrences.len(), 1);
-    assert!(result.groups[0].occurrences[0].enclosing.is_none());
+    assert!(
+        result.groups[0].occurrences[0]
+            .occurrence
+            .enclosing
+            .is_none()
+    );
 }
 
 #[test]

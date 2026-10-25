@@ -43,7 +43,8 @@ impl LocalSymbolViewInput {
         )
         .with_expiry_limit(self.expiry_limit)
         .with_query_result_arc(self.material.query_result.clone())
-        .with_package_facts_arc(self.material.package_facts.clone()))
+        .with_package_facts_arc(self.material.package_facts.clone())
+        .with_provider_selection_arc(self.material.provider_selection.clone()))
     }
 
     /// Returns the warnings retained by this immutable input.
@@ -81,7 +82,8 @@ impl LocalSymbolViewInput {
         )
         .with_expiry_limit(self.expiry_limit)
         .with_query_result_arc(self.material.query_result.clone())
-        .with_package_facts_arc(self.material.package_facts.clone()))
+        .with_package_facts_arc(self.material.package_facts.clone())
+        .with_provider_selection_arc(self.material.provider_selection.clone()))
     }
 
     /// Root of the immutable publication admitted by this input.
@@ -143,6 +145,7 @@ impl LocalSymbolViewInput {
             traversal: self.material.traversal.clone(),
             query_result: bytes,
             package_facts: self.material.package_facts.clone(),
+            provider_selection: self.material.provider_selection.clone(),
         });
         self
     }
@@ -151,6 +154,59 @@ impl LocalSymbolViewInput {
     #[must_use]
     pub fn query_result(&self) -> Option<Arc<[u8]>> {
         self.material.query_result.clone()
+    }
+
+    /// Retains the original serving context after checking this immutable publication.
+    ///
+    /// # Errors
+    /// Refuses a different root, owner or captured revision.
+    pub fn with_provider_selection(
+        self,
+        selection: rift_search::query::QueryProviderSelection,
+    ) -> Result<Self, RiftError> {
+        self.validate_provider_selection(&selection)?;
+        if self
+            .captured_provider_selection()
+            .is_some_and(|captured| captured != &selection)
+        {
+            return Err(invalid(
+                "view",
+                "captured query provider selection does not match",
+            ));
+        }
+        Ok(self.with_provider_selection_arc(Some(Arc::new(selection))))
+    }
+
+    /// Returns the original serving context retained by this immutable publication.
+    #[must_use]
+    pub fn captured_provider_selection(
+        &self,
+    ) -> Option<&rift_search::query::QueryProviderSelection> {
+        self.material.provider_selection.as_deref()
+    }
+
+    fn with_provider_selection_arc(
+        mut self,
+        selection: Option<Arc<rift_search::query::QueryProviderSelection>>,
+    ) -> Self {
+        let bytes = |selection: &rift_search::query::QueryProviderSelection| {
+            get_size2::GetSize::get_size(selection).saturating_add(2 * std::mem::size_of::<usize>())
+        };
+        let previous = self.material.provider_selection.as_deref().map_or(0, bytes);
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_sub(previous)
+            .saturating_add(selection.as_deref().map_or(0, bytes));
+        self.material = Arc::new(LocalSymbolMaterial {
+            index: Arc::clone(&self.material.index),
+            metadata: Arc::clone(&self.material.metadata),
+            history: self.material.history.clone(),
+            traversal: self.material.traversal.clone(),
+            query_result: self.material.query_result.clone(),
+            package_facts: self.material.package_facts.clone(),
+            provider_selection: selection,
+        });
+        self
     }
 
     fn with_expiry_limit(mut self, expiry_limit: Option<SystemTime>) -> Self {
@@ -165,6 +221,18 @@ impl LocalSymbolViewInput {
     pub fn combine(mut self, other: Self) -> Result<Self, SymbolUnavailableReason> {
         if !Arc::ptr_eq(&self.material.index, &other.material.index) {
             return Err(SymbolUnavailableReason::ViewContext);
+        }
+        match (
+            &self.material.provider_selection,
+            &other.material.provider_selection,
+        ) {
+            (Some(left), Some(right)) if left != right => {
+                return Err(SymbolUnavailableReason::ViewContext);
+            }
+            (None, Some(selected)) => {
+                self = self.with_provider_selection_arc(Some(Arc::clone(selected)));
+            }
+            _ => {}
         }
         self.expiry_limit = match (self.expiry_limit, other.expiry_limit) {
             (Some(left), Some(right)) => Some(left.min(right)),
@@ -200,6 +268,7 @@ struct LocalSymbolMaterial {
     traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
     query_result: Option<Arc<[u8]>>,
     package_facts: Option<Arc<rift_search::query::QueryFacts>>,
+    provider_selection: Option<Arc<rift_search::query::QueryProviderSelection>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -210,11 +279,65 @@ struct CapturedMetadata {
 
 #[derive(Debug, Clone)]
 struct HeldView {
+    material: HeldMaterial,
+    ready: bool,
+    retained_bytes: usize,
+    view: CapturedView,
+    expires: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+enum HeldMaterial {
+    Local(Arc<LocalSymbolMaterial>),
+    Query(Arc<QueryMaterial>),
+}
+
+impl HeldMaterial {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Local(material) => material.index.root(),
+            Self::Query(material) => material.root(),
+        }
+    }
+
+    fn owner(&self) -> &SymbolOwner {
+        match self {
+            Self::Local(material) => material.index.owner(),
+            Self::Query(material) => material.owner(),
+        }
+    }
+}
+
+struct CaptureInput {
+    material: HeldMaterial,
+    ready: bool,
+    retained_bytes: usize,
+    expiry_limit: Option<SystemTime>,
+    index_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HeldLocalView {
     material: Arc<LocalSymbolMaterial>,
     ready: bool,
     retained_bytes: usize,
     view: CapturedView,
     expires: SystemTime,
+}
+
+impl HeldView {
+    fn into_local(self) -> Result<HeldLocalView, SymbolUnavailableReason> {
+        let HeldMaterial::Local(material) = self.material else {
+            return Err(SymbolUnavailableReason::ViewContext);
+        };
+        Ok(HeldLocalView {
+            material,
+            ready: self.ready,
+            retained_bytes: self.retained_bytes,
+            view: self.view,
+            expires: self.expires,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -308,19 +431,25 @@ impl State {
                 .saturating_add(std::mem::size_of::<HeldView>())
                 .saturating_add(held.view.id.get_heap_size())
                 .saturating_add(held.view.expires_at.capacity());
-            if charged.track(Arc::as_ptr(&held.material.index)) {
+            if let HeldMaterial::Local(material) = &held.material
+                && charged.track(Arc::as_ptr(&material.index))
+            {
                 let bytes = if shared {
-                    let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
+                    let (bytes, next) = material.index.as_ref().get_size_with_tracker(charged);
                     charged = next;
                     bytes
                 } else {
-                    held.material.index.retained_material_bytes()
+                    material.index.retained_material_bytes()
                 };
                 total = total
                     .saturating_add(bytes)
                     .saturating_add(2 * std::mem::size_of::<usize>());
             }
-            if charged.track(Arc::as_ptr(&held.material)) {
+            let first = match &held.material {
+                HeldMaterial::Local(material) => charged.track(Arc::as_ptr(material)),
+                HeldMaterial::Query(material) => charged.track(Arc::as_ptr(material)),
+            };
+            if first {
                 total = total.saturating_add(held.retained_bytes);
             }
         }
@@ -354,7 +483,9 @@ impl LocalSymbolViews {
         root: &Path,
         owner: &SymbolOwner,
     ) -> Result<LocalSymbolViewInput, SymbolUnavailableReason> {
-        let held = self.selected_view_at(id, root, owner, SystemTime::now())?;
+        let held = self
+            .selected_view_at(id, root, owner, SystemTime::now())?
+            .into_local()?;
         Ok(LocalSymbolViewInput {
             material: held.material,
             ready: held.ready,
@@ -409,6 +540,35 @@ impl LocalSymbolViews {
         now: SystemTime,
         admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
     ) -> Result<Option<CapturedView>, RiftError> {
+        let mut expiry_limit = input.expiry_limit;
+        if let Some((_, references)) = &input.material.traversal {
+            for selected in references.package_views() {
+                let selected = chrono::DateTime::parse_from_rfc3339(&selected.expires_at)
+                    .map_err(|error| material_error("read package view expiry", &error))?;
+                let selected = SystemTime::from(selected);
+                expiry_limit = Some(expiry_limit.map_or(selected, |limit| limit.min(selected)));
+            }
+        }
+        let index_bytes = input.material.index.retained_material_bytes();
+        self.capture_material_with_at(
+            CaptureInput {
+                material: HeldMaterial::Local(input.material),
+                ready: input.ready,
+                retained_bytes: input.retained_bytes,
+                expiry_limit,
+                index_bytes,
+            },
+            now,
+            admit,
+        )
+    }
+
+    fn capture_material_with_at(
+        &self,
+        input: CaptureInput,
+        now: SystemTime,
+        admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
+    ) -> Result<Option<CapturedView>, RiftError> {
         let mut state = self
             .state
             .lock()
@@ -420,7 +580,7 @@ impl LocalSymbolViews {
                 rows = state.views.len(),
                 views_max = VIEW_SLOTS,
                 incoming_bytes = input.retained_bytes,
-                index_bytes = input.material.index.retained_material_bytes(),
+                index_bytes = input.index_bytes,
                 ready = input.ready,
                 bytes_max = self.material_bytes_max,
                 "retained read material exceeds the byte or view bound"
@@ -428,7 +588,7 @@ impl LocalSymbolViews {
             return Ok(None);
         }
         let retained_bytes = input.retained_bytes;
-        let index_bytes = input.material.index.retained_material_bytes();
+        let index_bytes = input.index_bytes;
         let ready = input.ready;
         let id = self.next_key(&mut state)?;
         let mut expires = now
@@ -436,13 +596,6 @@ impl LocalSymbolViews {
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
         if let Some(limit) = input.expiry_limit {
             expires = expires.min(limit);
-        }
-        if let Some((_, references)) = &input.material.traversal {
-            for selected in references.package_views() {
-                let selected = chrono::DateTime::parse_from_rfc3339(&selected.expires_at)
-                    .map_err(|error| material_error("read package view expiry", &error))?;
-                expires = expires.min(SystemTime::from(selected));
-            }
         }
         if expires <= now {
             return Ok(None);
@@ -527,8 +680,11 @@ impl LocalSymbolViews {
         owner: &SymbolOwner,
         now: SystemTime,
     ) -> Result<CapturedView, SymbolUnavailableReason> {
-        self.held_view_at(id, root, owner, now)
-            .map(|held| held.view)
+        let held = self.selected_view_at(id, root, owner, now)?;
+        if !held.ready {
+            return Err(SymbolUnavailableReason::IndexPreparing);
+        }
+        Ok(held.view)
     }
 
     fn held_view_at(
@@ -537,12 +693,12 @@ impl LocalSymbolViews {
         root: &Path,
         owner: &SymbolOwner,
         now: SystemTime,
-    ) -> Result<HeldView, SymbolUnavailableReason> {
+    ) -> Result<HeldLocalView, SymbolUnavailableReason> {
         let held = self.selected_view_at(id, root, owner, now)?;
         if !held.ready {
             return Err(SymbolUnavailableReason::IndexPreparing);
         }
-        Ok(held)
+        held.into_local()
     }
 
     fn selected_view_at(
@@ -564,7 +720,7 @@ impl LocalSymbolViews {
                 SymbolUnavailableReason::ViewContext
             });
         };
-        if held.material.index.root() != root || held.material.index.owner() != owner {
+        if held.material.root() != root || held.material.owner() != owner {
             return Err(SymbolUnavailableReason::ViewContext);
         }
         Ok(held.clone())
@@ -635,6 +791,10 @@ impl LocalSymbolViews {
                     SymbolUnavailableReason::ViewContext
                 };
                 return Ok(unavailable(request, None, reason));
+            };
+            let held = match held.clone().into_local() {
+                Ok(held) => held,
+                Err(reason) => return Ok(unavailable(request, Some(held.view.clone()), reason)),
             };
             if held.material.index.root() != root
                 || held.material.index.owner() != owner
@@ -1026,6 +1186,7 @@ fn local_view_input(
         traversal,
         query_result: None,
         package_facts: None,
+        provider_selection: None,
     });
     let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
         .saturating_add(4 * std::mem::size_of::<usize>())
@@ -1056,6 +1217,8 @@ fn local_view_input(
 
 mod nodes;
 mod package;
+mod query;
+pub use query::{CapturedQueryView, QueryMaterial, QueryViewInput};
 mod source;
 mod traversal;
 

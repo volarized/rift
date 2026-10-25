@@ -97,20 +97,104 @@ fn record_admission_counts_complete_encoded_data_and_checks_cancellation() {
     let cancelled = AtomicBool::new(false);
     let check = || cancelled.load(Ordering::Relaxed);
     let mut budget = QueryFactBudget::new(limits(), &check).expect("record admission");
-    budget.writer.remaining = 9;
+    budget
+        .state
+        .lock()
+        .expect("record admission")
+        .writer
+        .remaining = 9;
     budget
         .charge(&"abc")
         .expect("five encoded bytes and separator");
     budget.charge_bytes(b"xyz").expect("exact remaining bytes");
     let error = budget.charge(&0).expect_err("complete record cannot fit");
     assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
+    let mut shared = budget.with_cancellation(&|| false);
+    let error = shared
+        .charge(&0)
+        .expect_err("the same failure remains retained");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
+    let mut budget = QueryFactBudget::new(limits(), &check).expect("record admission");
+    let mut shared = budget.with_cancellation(&|| false);
     cancelled.store(true, Ordering::Relaxed);
     let error = budget.charge(&0).expect_err("cancelled record");
     assert_eq!(error.slug().as_str(), "rift.server.read_cancelled");
-    let error = budget
+    let error = shared
         .charge_bytes(b"")
-        .expect_err("cancelled captured bytes");
+        .expect_err("another handle retains cancellation");
     assert_eq!(error.slug().as_str(), "rift.server.read_cancelled");
+}
+
+#[test]
+fn producer_pages_share_encoded_admission_with_owned_extensions() {
+    let page: rift_protocol::read::SearchResult = serde_json::from_value(serde_json::json!({
+        "results":[{"hit":{"target":"symbol","symbol":{
+            "language":"rust","kind":"function","name":"beacon",
+            "extensions":{"example.org.fact":{"version":1,"data":{"nested":{"text":"value"}}}}
+        }}}],
+        "pagination":{"page_index":0,"total_pages":1}
+    }))
+    .expect("ordinary Rust producer page");
+    let encoded = serde_json::to_vec(&page).expect("complete producer page");
+    let budget = QueryFactBudget::new(limits(), &|| false).expect("record admission");
+    budget
+        .state
+        .lock()
+        .expect("record admission")
+        .writer
+        .remaining = (encoded.len() + 1) * 2 - 1;
+    let mut first = budget.with_cancellation(&|| false);
+    let mut second = budget.with_cancellation(&|| false);
+    first.charge(&page).expect("one complete page fits");
+    let failure = second
+        .charge(&page)
+        .expect_err("the cumulative pages do not fit");
+    assert_eq!(failure.slug().as_str(), "rift.server.read_unavailable");
+    assert_eq!(
+        first
+            .check()
+            .expect_err("the first failure stays shared")
+            .to_string(),
+        failure.to_string()
+    );
+    let cancelled = budget.with_cancellation(&|| true);
+    assert_eq!(
+        cancelled
+            .check()
+            .expect_err("later cancellation does not replace the failure")
+            .to_string(),
+        failure.to_string()
+    );
+}
+
+#[test]
+fn shared_producers_keep_remaining_material_and_the_original_deadline() {
+    let budget = QueryFactBudget::new(limits(), &|| false).expect("record admission");
+    budget
+        .state
+        .lock()
+        .expect("record admission")
+        .writer
+        .remaining = 12;
+    let mut first = budget.with_cancellation(&|| false);
+    let mut second = budget.with_cancellation(&|| false);
+    first.charge(&"abc").expect("first producer");
+    second.charge_material(6).expect("second producer material");
+    assert!(first.charge_bytes(b"x").is_err());
+    assert!(second.check().is_err());
+
+    let mut expired = QueryFactBudget::for_request(limits(), Instant::now(), &|| false)
+        .expect("request admission");
+    let mut other = expired.with_cancellation(&|| false);
+    let error = expired.charge_material(0).expect_err("expired request");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
+    assert_eq!(
+        other
+            .charge_bytes(b"")
+            .expect_err("same deadline")
+            .to_string(),
+        error.to_string()
+    );
 }
 
 #[test]
@@ -194,10 +278,11 @@ fn typed_evaluation_collects_lazy_bindings_and_preserves_invalid_refusals() {
 }
 
 #[test]
-fn unavailable_and_cancelled_refusals_preserve_registered_identity() {
+fn registered_refusals_preserve_identity() {
     for original in [
         unavailable("query request exceeds its byte limit"),
         errors::server::read_cancelled().error(),
+        incompatible("query exchange version is incompatible"),
     ] {
         let slug = original.slug();
         let message = original.to_string();
@@ -205,4 +290,92 @@ fn unavailable_and_cancelled_refusals_preserve_registered_identity() {
         assert_eq!(captured.slug(), slug);
         assert_eq!(captured.to_string(), message);
     }
+}
+
+#[test]
+fn parent_refuses_unversioned_incompatible_and_unknown_response_fields() {
+    let answer = Ok::<_, QueryFailure>(QueryOutput::Answer(QueryAnswer::Boolean { value: true }));
+    let unversioned = serde_json::to_vec(&answer).expect("old response format");
+    assert!(decode_response(&unversioned).is_err());
+    let mut envelope = QueryExchange::new(answer);
+    envelope.version = 0;
+    let error = decode_response(&serde_json::to_vec(&envelope).expect("incompatible response"))
+        .err()
+        .expect("incompatible response cannot become an answer");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
+    envelope.version = QUERY_EXCHANGE_VERSION;
+    let mut value = serde_json::to_value(&envelope).expect("response object");
+    value["additional"] = serde_json::Value::Bool(true);
+    assert!(decode_response(&serde_json::to_vec(&value).expect("unknown field")).is_err());
+    let bytes = serde_json::to_vec(&envelope).expect("compatible response");
+    assert!(matches!(
+        decode_response(&bytes),
+        Ok(QueryOutput::Answer(QueryAnswer::Boolean { value: true }))
+    ));
+}
+
+#[test]
+fn child_refuses_old_tasks_and_incompatible_versions_before_execution() {
+    let directory = tempfile::tempdir().expect("exchange directory");
+    let request = directory.path().join("request.json");
+    let response = directory.path().join("response.json");
+    let task = QueryTask::Prepare {
+        statement: "ASK {}".to_owned(),
+        limits: limits(),
+    };
+    std::fs::write(&response, b"").expect("response file");
+    std::fs::write(&request, serde_json::to_vec(&task).expect("old task")).expect("request file");
+    run_query_child(&request, &response, 8192).expect("typed schema refusal");
+    let error = decode_response(&std::fs::read(&response).expect("complete refusal"))
+        .err()
+        .expect("old task cannot produce an answer");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
+    let mut envelope = QueryExchange::new(task);
+    envelope.version = 0;
+    std::fs::write(&request, serde_json::to_vec(&envelope).expect("new task"))
+        .expect("request file");
+    run_query_child(&request, &response, 8192).expect("typed version refusal");
+    let error = decode_response(&std::fs::read(&response).expect("complete refusal"))
+        .err()
+        .expect("incompatible version cannot produce an answer");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
+}
+
+#[test]
+fn acknowledgment_distinguishes_protocol_refusal_from_an_observed_child_failure() {
+    use crate::process::fixture::{FixtureMode, fixture_command};
+
+    for (acknowledged, slug) in [
+        (false, "rift.server.read_unsupported"),
+        (true, "rift.server.read_unavailable"),
+    ] {
+        let mut run = run_bounded(
+            &mut fixture_command(FixtureMode::Print),
+            std::time::Duration::from_secs(10),
+            DIAGNOSTIC_BYTES_MAX,
+            &|| false,
+        )
+        .expect("owned exit-status fixture");
+        assert!(!run.exit.as_ref().expect("observed child exit").success());
+        if acknowledged {
+            run.stdout.text =
+                serde_json::to_string(&QueryExchange::new(())).expect("acknowledgment");
+        }
+        let response = tempfile::NamedTempFile::new().expect("response file");
+        let error = collect_response(
+            run,
+            &response,
+            8192,
+            Instant::now() + std::time::Duration::from_secs(10),
+            &|| false,
+        )
+        .err()
+        .expect("failed child never returns an answer");
+        assert_eq!(error.slug().as_str(), slug);
+    }
+    let mut incompatible = QueryExchange::new(());
+    incompatible.version = 0;
+    let error = decode_acknowledgment(&serde_json::to_vec(&incompatible).expect("version marker"))
+        .expect_err("version mismatch");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
 }

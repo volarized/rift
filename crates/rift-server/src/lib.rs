@@ -35,13 +35,14 @@ pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,
 };
+pub use query::merge_query_facts;
 pub use query_process::{
-    QUERY_CHILD_COMMAND, QueryFactBudget, QueryProcessLimits, evaluate_query, prepare_query,
-    run_query_child,
+    QUERY_CHILD_COMMAND, QueryExchange, QueryFactBudget, QueryProcessLimits, evaluate_query,
+    prepare_query, run_query_child,
 };
 pub use read::{
-    LocalSymbolViewInput, LocalSymbolViews, ReadService, ReadServiceBuild, accepted_limit,
-    wire_digest,
+    CapturedQueryView, LocalSymbolViewInput, LocalSymbolViews, QueryMaterial, QueryViewInput,
+    ReadService, ReadServiceBuild, accepted_limit, wire_digest,
 };
 pub use recommendations::{
     LspRecommendation, LspRecommendationBatch, LspRecommendationInputs, LspRecommendationStatus,

@@ -136,7 +136,7 @@ def incoming_references_request(symbol: str) -> JsonObject:
     """Read reference endpoints and original relationship evidence."""
     _identity(symbol)
     return {
-        "query": f"SELECT ?caller ?target ?derivation ?facet {{ ?caller :references <{symbol}> . ?relationship a :Relationship; :from ?caller; :to <{symbol}>; :derivation ?derivation; :facets ?facet . BIND(<{symbol}> AS ?target) }} ORDER BY ?caller"
+        "query": f"SELECT ?caller ?target ?derivation ?facet {{ ?caller :references <{symbol}> . ?relationship a :Relationship; :from ?caller; :to <{symbol}>; :derivation ?derivation; :facets :references . BIND(<{symbol}> AS ?target) BIND(:references AS ?facet) }} ORDER BY ?caller"
     }
 
 

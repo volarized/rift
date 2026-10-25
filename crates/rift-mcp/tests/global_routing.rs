@@ -36,6 +36,15 @@ use workspace_client::{
 
 const LOCK_WITH_HELPER: &str = "version = 4\n\n[[package]]\nname = \"helper\"\nversion = \"0.1.0\"\n\n[[package]]\nname = \"probe\"\nversion = \"0.1.0\"\ndependencies = [\n \"helper\",\n]\n";
 
+async fn complete_fixture(symbol: SymbolFixture) -> TestResult<GlobalFixture> {
+    Ok(GlobalFixture::start_with(FixtureOptions {
+        symbol,
+        query_narrowed: false,
+        ..FixtureOptions::default()
+    })
+    .await?)
+}
+
 /// A served workspace whose manifest depends on `helper` by a path outside it.
 struct DependentWorkspace {
     /// Held for the life of the server: the directory the path dependency names.
@@ -73,9 +82,13 @@ async fn call_tool(
     args: Value,
 ) -> TestResult<Value> {
     let result = client.call_tool(tool_request(name, &args)).await?;
-    result
-        .structured_content
-        .ok_or_else(|| format!("{name} must return structured content").into())
+    result.structured_content.ok_or_else(|| {
+        format!(
+            "{name} returned no structured content: {:?}",
+            result.content
+        )
+        .into()
+    })
 }
 
 async fn search_symbols(
@@ -85,6 +98,43 @@ async fn search_symbols(
     let request = serde_json::from_value::<rift_protocol::read::SearchParams>(args)?;
     let query = workspace_client::query::retrieval(&request)?;
     call_tool(client, "search", serde_json::to_value(query)?).await
+}
+
+async fn read_producer(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &'static str,
+    args: Value,
+) -> TestResult<Value> {
+    if name == "search" {
+        search_symbols(client, args).await
+    } else {
+        call_tool(client, name, args).await
+    }
+}
+
+fn literals<'a>(answer: &'a Value, field: &str) -> TestResult<Vec<&'a str>> {
+    workspace_client::query::rows(answer)?
+        .iter()
+        .map(|row| workspace_client::query::literal(row, field))
+        .collect()
+}
+
+fn iris<'a>(answer: &'a Value, field: &str) -> TestResult<Vec<&'a str>> {
+    workspace_client::query::rows(answer)?
+        .iter()
+        .map(|row| workspace_client::query::iri(row, field))
+        .collect()
+}
+
+fn assert_unavailable(answer: &Value) {
+    assert_eq!(answer["outcome"], "unavailable", "{answer:#}");
+    assert!(answer.get("answer").is_none(), "{answer:#}");
+}
+
+fn has_unit(answer: &Value, unit: &str) -> TestResult<bool> {
+    Ok(workspace_client::query::rows(answer)?
+        .iter()
+        .any(|row| workspace_client::query::iri(row, "unit").is_ok_and(|value| value == unit)))
 }
 
 /// The configured package list naming the collected `demo` release. The fixture tables
@@ -234,18 +284,13 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let reads = [
         (
             "search",
-            "results",
             json!({"query": "beacon", "target": "symbol", "scope": "all"}),
         ),
-        (
-            "search",
-            "results",
-            json!({"query": "beacon", "scope": "all"}),
-        ),
+        ("search", json!({"query": "beacon", "scope": "all"})),
     ];
-    for (tool, member, args) in reads {
+    for (tool, args) in reads {
         let started = tokio::time::Instant::now();
-        let answer = call_tool(&client, tool, args).await?;
+        let answer = read_producer(&client, tool, args).await?;
         let elapsed = started.elapsed();
         assert!(
             elapsed < READ_DELAY,
@@ -258,14 +303,7 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
             .find(|warning| warning["code"] == "global_api_unavailable")
             .ok_or_else(|| format!("{tool}: missing deadline warning: {answer:#}"))?;
         assert_eq!(warning["failure_class"], "timeout", "{tool}");
-        let hits = answer[member]
-            .as_array()
-            .ok_or("the answer lists its hits")?;
-        assert!(!hits.is_empty(), "{tool}: {answer:#}");
-        assert!(
-            hits.iter().all(|hit| hit["path"] == "src/lib.rs"),
-            "{tool}: every hit is a project hit: {answer:#}"
-        );
+        assert_unavailable(&answer);
     }
     drop(directory);
     client.cancel().await?;
@@ -297,16 +335,16 @@ async fn await_local_caller(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     fixture: &GlobalFixture,
 ) -> TestResult {
-    let incoming = json!({
-        "traversal": { "seed": "rift://symbol/local/rust/walk/beacon", "direction": "incoming" }
-    });
+    let incoming = serde_json::to_value(workspace_client::query::path(
+        "rift://symbol/local/rust/walk/beacon",
+        "^:references",
+    )?)?;
     let answer = call_retrying_acceptance(client, tool_request("search", &incoming)).await?;
-    let results = answer["results"]
-        .as_array()
-        .ok_or("the local caller walk returns results")?;
+    let results = workspace_client::query::rows(&answer)?;
     assert_eq!(results.len(), 1, "{answer:#}");
     assert_eq!(
-        results[0]["hit"]["symbol"]["id"], "rift://symbol/local/rust/walk/caller",
+        workspace_client::query::iri(&results[0], "symbol")?,
+        "rift://symbol/local/rust/walk/caller",
         "{answer:#}"
     );
     if let Some(warnings) = answer.get("warnings") {
@@ -386,23 +424,22 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         })
         .await?;
     await_local_caller(&client, &fixture).await?;
-    let walk = json!({
-        "traversal": { "seed": "rift://symbol/local/rust/walk/caller", "direction": "outgoing" }
-    });
+    let walk = serde_json::to_value(workspace_client::query::path(
+        "rift://symbol/local/rust/walk/caller",
+        ":calls",
+    )?)?;
     let started = tokio::time::Instant::now();
-    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let failure = failed_call(client.call_tool(tool_request("search", &walk)).await)?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < CALLEE_HOLD,
         "the request deadline must end the wait: elapsed={elapsed:?}"
     );
-    let warnings = answer["warnings"].clone();
-    assert_eq!(warnings[0]["code"], "callees_dropped", "{answer:#}");
-    assert_eq!(warnings[0]["callees"], 1, "{answer:#}");
     assert_eq!(
-        warnings[1],
-        json!({"code": "global_api_unavailable", "failure_class": "timeout"}),
-        "{answer:#}"
+        failure.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{}",
+        failure.text
     );
     let held_route = if runtime {
         "/declarations"
@@ -414,7 +451,8 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         requests
             .iter()
             .any(|request| request.uri.ends_with(held_route)),
-        "the deadline ends an actual held {held_route} request: answer={answer:#}; requests={requests:#?}"
+        "the deadline ends an actual held {held_route} request: failure={}; requests={requests:#?}",
+        failure.text
     );
     rift_tracing::info!(stage = "client.cancel", "stop stage started");
     client.cancel().await?;
@@ -485,20 +523,16 @@ async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
     let mut files = CALLEE_FILES.to_vec();
     files.push((".python-version", "3.12.3\n"));
     let (_directory, client, server_task) = served_workspace(&files, Some(configuration)).await?;
-    let walk = json!({
-        "traversal": {"seed": "rift://symbol/local/python/app/counted", "direction": "outgoing"}
-    });
-    let answer = call_retrying_acceptance(&client, tool_request("search", &walk)).await?;
+    let walk = serde_json::to_value(workspace_client::query::path(
+        "rift://symbol/local/python/app/counted",
+        ":calls",
+    )?)?;
+    let failure = failed_call(client.call_tool(tool_request("search", &walk)).await)?;
     assert_eq!(
-        answer["warnings"][0]["code"], "callees_dropped",
-        "{answer:#}"
-    );
-    assert_eq!(answer["warnings"][0]["callees"], 1, "{answer:#}");
-    assert!(
-        answer["warnings"]
-            .as_array()
-            .is_some_and(|warnings| warnings.len() == 1),
-        "an unproved runtime owner does not become a global service failure: {answer:#}"
+        failure.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{}",
+        failure.text
     );
     assert!(
         fixture.requests().await.is_empty(),
@@ -528,14 +562,7 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         json!({"target":"symbol", "query":"\"helper_beacon\"","scope":"all"}),
     )
     .await?;
-    let hits = answer["results"].as_array().ok_or("hits are an array")?;
-    assert_eq!(
-        hits.iter()
-            .map(|hit| hit["unit"].clone())
-            .collect::<Vec<_>>(),
-        [json!(COLLECTED_UNIT)],
-        "the helper outside the workspace is analyzed nowhere: {answer:#}"
-    );
+    assert_unavailable(&answer);
     let (warnings, page_warnings): (Vec<&Value>, Vec<&Value>) = answer["warnings"]
         .as_array()
         .into_iter()
@@ -609,9 +636,8 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
     Ok(())
 }
 
-/// The collected `demo` release answers an entry the collection holds no release for, and
-/// the answer names the substitution: an exact version the collection lacks, and a
-/// requirement the collected release lies outside. The package hits still answer.
+/// A substituted release cannot answer the selected domain. The unavailable answer names
+/// both an absent exact version and a requirement the collected release lies outside.
 #[tokio::test]
 async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
     let cases = [
@@ -630,7 +656,7 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
         ),
     ];
     for (selector, entry) in cases {
-        let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+        let fixture = complete_fixture(SymbolFixture::Valid).await?;
         let configuration = format!(
             "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
              request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
@@ -657,16 +683,7 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
             json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
         )
         .await?;
-        assert_eq!(
-            answer["results"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|hit| &hit["unit"])
-                .collect::<Vec<_>>(),
-            [&json!(COLLECTED_UNIT)],
-            "{answer:#}"
-        );
+        assert_unavailable(&answer);
         let substituted: Vec<&Value> = answer["warnings"]
             .as_array()
             .into_iter()
@@ -690,8 +707,8 @@ async fn a_nearest_release_answers_and_names_the_substitution() -> TestResult {
 }
 
 #[tokio::test]
-async fn successful_search_uses_remote_phases_without_local_request_fields() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+async fn remote_phases_keep_request_fields_when_context_is_missing() -> TestResult {
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{THREE_PACKAGES}",
@@ -699,22 +716,16 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = call_tool(
+    let answer = search_symbols(
         &client,
-        "search",
         json!({"query":"helper_beacon demo","scope":"global"}),
     )
     .await?;
-    assert!(
-        answer["results"]
-            .as_array()
-            .is_some_and(|results| { results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT) }),
-        "{answer:#}"
-    );
+    assert_unavailable(&answer);
     assert!(answer["warnings"].as_array().is_some_and(|warnings| {
-        warnings.iter().any(|warning| {
-            warning["code"] == "global_page_warning" && warning["warning_code"] == "query_narrowed"
-        })
+        warnings
+            .iter()
+            .any(|warning| warning["code"] == "package_absent")
     }));
 
     let requests = fixture.requests().await;
@@ -895,13 +906,13 @@ async fn a_search_asks_one_page_per_phase_at_the_advertised_limit() -> TestResul
     Ok(())
 }
 
-/// A search page the service stopped at its response body bound answers what fit, with the
-/// page's `result_truncated` as a `global_page_warning`, and its cursor is not followed: the
-/// search stays at one request per phase.
+/// A search page stopped at its response body bound cannot answer a complete query. Its
+/// `result_truncated` warning remains, and its cursor is not followed.
 #[tokio::test]
 async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor() -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         stopped_at_body_bound: true,
+        query_narrowed: false,
         ..FixtureOptions::default()
     })
     .await?;
@@ -912,18 +923,12 @@ async fn a_page_stopped_at_the_body_bound_answers_without_following_its_cursor()
     );
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = call_tool(
+    let answer = search_symbols(
         &client,
-        "search",
         json!({"query":"helper_beacon demo","scope":"global","include":["source"]}),
     )
     .await?;
-    assert!(
-        answer["results"]
-            .as_array()
-            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
-        "{answer:#}"
-    );
+    assert_unavailable(&answer);
     let truncated: Vec<&Value> = answer["warnings"]
         .as_array()
         .into_iter()
@@ -968,38 +973,31 @@ async fn pattern_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRe
 
 /// What a `global` search for `fn helper_\w+` with `target: "all"` and `source` answers: the
 /// collected declaration holding the match, then the match itself, both addressed by `unit`.
-fn helper_beacon_pattern_hits() -> Value {
-    json!([
-        {
-            "hit": {
-                "target": "symbol",
-                "symbol": {
-                    "id": global_api::collected_identity(SymbolFixture::Valid, "helper_beacon"),
-                    "language": "rust",
-                    "name": "helper_beacon",
-                    "kind": "function",
-                    "origin": {
-                        "location": "dependency",
-                        "package": {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"},
-                        "source_kind": "authored"
-                    }
-                }
-            },
-            "matched_by": ["content"],
-            "source": "pub fn helper_beacon() {}",
-            "range": {"start": 0, "end": 25},
-            "line": 1,
-            "unit": COLLECTED_UNIT
-        },
-        {
-            "hit": {"target": "file", "size": 45},
-            "matched_by": ["content"],
-            "source": "pub fn helper_beacon() {}",
-            "range": {"start": 4, "end": 20},
-            "line": 1,
-            "unit": COLLECTED_UNIT
-        }
-    ])
+fn assert_helper_beacon_pattern_hits(answer: &Value) -> TestResult {
+    let rows = workspace_client::query::rows(answer)?;
+    assert_eq!(rows.len(), 2, "{answer:#}");
+    let identity = global_api::collected_identity(SymbolFixture::Valid, "helper_beacon");
+    assert_eq!(
+        workspace_client::query::iri(&rows[0], "symbol")?,
+        identity.as_str()
+    );
+    assert!(
+        !rows[1]
+            .as_object()
+            .ok_or("row is an object")?
+            .contains_key("symbol")
+    );
+    for (row, start, end) in [(&rows[0], "0", "25"), (&rows[1], "4", "20")] {
+        assert_eq!(workspace_client::query::iri(row, "unit")?, COLLECTED_UNIT);
+        assert_eq!(
+            workspace_client::query::literal(row, "source")?,
+            "pub fn helper_beacon() {}"
+        );
+        assert_eq!(workspace_client::query::literal(row, "start")?, start);
+        assert_eq!(workspace_client::query::literal(row, "end")?, end);
+        assert_eq!(workspace_client::query::literal(row, "line")?, "1");
+    }
+    Ok(())
 }
 
 /// A `pattern` whose `scope` reaches packages answers the package matches from one page of
@@ -1008,18 +1006,18 @@ fn helper_beacon_pattern_hits() -> Value {
 /// it, each with its source when the request includes it.
 #[tokio::test]
 async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
 
-    let global = call_tool(
+    let global = search_symbols(
         &client,
-        "search",
         json!({
             "pattern": r"fn helper_\w+",
             "scope": "global",
@@ -1028,44 +1026,33 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
         }),
     )
     .await?;
-    assert_eq!(
-        global["results"],
-        helper_beacon_pattern_hits(),
-        "{global:#}"
-    );
+    assert_helper_beacon_pattern_hits(&global)?;
 
-    let all = call_tool(
+    let all = search_symbols(
         &client,
-        "search",
         json!({"pattern": r"fn \w*beacon", "scope": "all", "target": "file"}),
     )
     .await?;
-    let addressed: Vec<(&Value, &Value)> = all["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|hit| (&hit["path"], &hit["unit"]))
+    let addressed: Vec<(Option<&str>, Option<&str>)> = workspace_client::query::rows(&all)?
+        .iter()
+        .map(|row| (row["path"]["value"].as_str(), row["unit"]["value"].as_str()))
         .collect();
-    let project = json!("src/lib.rs");
-    let package = json!(COLLECTED_UNIT);
     assert_eq!(
         addressed,
         [
-            (&project, &Value::Null),
-            (&project, &Value::Null),
-            (&Value::Null, &package),
-            (&Value::Null, &package),
+            (Some("src/lib.rs"), None),
+            (Some("src/lib.rs"), None),
+            (None, Some(COLLECTED_UNIT)),
+            (None, Some(COLLECTED_UNIT)),
         ],
         "the project's matches first, then the package's: {all:#}"
     );
 
-    let local = call_tool(&client, "search", json!({"pattern": r"fn \w*beacon"})).await?;
+    let local = search_symbols(&client, json!({"pattern": r"fn \w*beacon"})).await?;
     assert!(
-        local["results"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .all(|hit| hit["path"] == project),
+        workspace_client::query::rows(&local)?
+            .iter()
+            .all(|row| row["path"]["value"] == "src/lib.rs"),
         "{local:#}"
     );
 
@@ -1109,7 +1096,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
 /// refuses, before the package side is asked.
 #[tokio::test]
 async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
@@ -1121,7 +1108,9 @@ async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResul
         client
             .call_tool(tool_request(
                 "search",
-                &json!({"pattern": "beacon(", "scope": "global"}),
+                &serde_json::to_value(workspace_client::query::retrieval(
+                    &serde_json::from_value(json!({"pattern":"beacon(", "scope":"global"}))?,
+                )?)?,
             ))
             .await,
     )?;
@@ -1135,7 +1124,7 @@ async fn a_refused_package_scoped_pattern_makes_no_global_request() -> TestResul
 
 #[tokio::test]
 async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n",
@@ -1157,9 +1146,8 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
     )
     .await?;
     let _ = search_symbols(&client, json!({"target":"symbol", "query":"local_beacon"})).await?;
-    let _ = call_tool(
+    let _ = search_symbols(
         &client,
-        "search",
         json!({"query":"local_beacon","scope":"global","target":"file"}),
     )
     .await?;
@@ -1179,7 +1167,7 @@ async fn local_file_and_map_reads_make_no_global_request() -> TestResult {
 /// counts.
 #[tokio::test]
 async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::InvalidIdentity).await?;
+    let fixture = complete_fixture(SymbolFixture::InvalidIdentity).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
@@ -1202,20 +1190,7 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
         warning,
         &json!({"code": "global_response_invalid", "failure_class": "invalid_response"})
     );
-    let hits = answer["results"].as_array().ok_or("hits are an array")?;
-    let names: Vec<&Value> = hits
-        .iter()
-        .map(|hit| &hit["hit"]["symbol"]["name"])
-        .collect();
-    assert_eq!(
-        names,
-        [&json!("beacon"), &json!("local_beacon")],
-        "{answer:#}"
-    );
-    assert!(
-        hits.iter().all(|hit| hit["path"] == "src/lib.rs"),
-        "every hit is a project hit: {answer:#}"
-    );
+    assert_unavailable(&answer);
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -1225,7 +1200,7 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
     // invalid page.
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
-    let answer = call_tool(&client, "search", json!({"query":"beacon","scope":"all"})).await?;
+    let answer = search_symbols(&client, json!({"query":"beacon","scope":"all"})).await?;
     let warning = answer["warnings"]
         .as_array()
         .into_iter()
@@ -1233,12 +1208,7 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
         .find(|warning| warning["code"] == "global_response_invalid")
         .ok_or_else(|| format!("missing invalid-response warning: {answer:#}"))?;
     assert_eq!(warning["failure_class"], "invalid_response");
-    let results = answer["results"].as_array().ok_or("results are an array")?;
-    assert!(!results.is_empty(), "{answer:#}");
-    assert!(
-        results.iter().all(|hit| hit["path"] == "src/lib.rs"),
-        "every search hit is a project hit: {answer:#}"
-    );
+    assert_unavailable(&answer);
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -1250,7 +1220,7 @@ async fn invalid_remote_page_discards_the_lane_and_answers_project_hits() -> Tes
 /// the first read met, and sends the global API nothing.
 #[tokio::test]
 async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::InvalidIdentity).await?;
+    let fixture = complete_fixture(SymbolFixture::InvalidIdentity).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\nfailure_ttl = \"1h\"\n\n\
@@ -1286,9 +1256,8 @@ async fn a_read_after_an_invalid_page_repeats_its_failure_class() -> TestResult 
     );
     let sent = fixture.requests().await.len();
 
-    let later = call_tool(
+    let later = search_symbols(
         &client,
-        "search",
         json!({"query": "beacon", "scope": "all", "target": "symbol"}),
     )
     .await?;
@@ -1349,16 +1318,7 @@ async fn a_refused_resolution_answers_project_hits_with_its_failure_class() -> T
         warning,
         &json!({"code": "global_api_unavailable", "failure_class": "non_success_response"})
     );
-    let hits = answer["results"].as_array().ok_or("hits are an array")?;
-    let located: Vec<(&Value, &Value)> = hits
-        .iter()
-        .map(|hit| (&hit["hit"]["symbol"]["name"], &hit["path"]))
-        .collect();
-    assert_eq!(
-        located,
-        [(&json!("local_beacon"), &json!("src/lib.rs"))],
-        "{answer:#}"
-    );
+    assert_unavailable(&answer);
     let requested: Vec<String> = fixture
         .requests()
         .await
@@ -1386,13 +1346,17 @@ async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> Test
     fs::write(directory.path().join(".gitignore"), ".rift/\n")?;
     rift_history::fixture::init(directory.path());
     rift_history::fixture::commit_all(directory.path(), "fixture baseline");
-    call_tool(&client, "search", json!({"query": "local_beacon"})).await?;
+    search_symbols(&client, json!({"query": "local_beacon"})).await?;
 
     let failure = failed_call(
         client
             .call_tool(tool_request(
                 "search",
-                &json!({"query": "local_beacon", "scope": "all", "rev": "main"}),
+                &serde_json::to_value(workspace_client::query::retrieval(
+                    &serde_json::from_value(
+                        json!({"query":"local_beacon", "scope":"all", "rev":"main"}),
+                    )?,
+                )?)?,
             ))
             .await,
     )?;
@@ -1455,10 +1419,7 @@ async fn a_disabled_global_api_names_every_unserved_kind_and_leaves_project_sour
     )
     .await?;
 
-    assert_eq!(
-        answer["results"][0]["hit"]["symbol"]["name"],
-        "local_beacon"
-    );
+    assert_unavailable(&answer);
     assert_unserved_dependency_warnings(&answer)?;
     drop(directory);
     client.cancel().await?;
@@ -1636,12 +1597,12 @@ fn substituted_versions(answer: &Value) -> Vec<&Value> {
 }
 
 /// A `packages` entry naming a package the context holds replaces its version for that
-/// read alone: the context pins `demo` at a release the collection lacks, which answers
-/// from the nearest release with `package_substituted`, and the lookup naming the
-/// collected release sends that version in its place and answers from it exactly.
+/// read alone: the context pins `demo` at a release the collection lacks, which reports
+/// `package_substituted`, and the lookup naming the collected release sends that version
+/// in its place. Missing context still prevents a complete answer.
 #[tokio::test]
 async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
@@ -1655,6 +1616,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
     )
     .await?;
+    assert_unavailable(&pinned);
     assert_eq!(
         substituted_versions(&pinned),
         [&json!("0.9.0")],
@@ -1671,13 +1633,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         }),
     )
     .await?;
-    let units: Vec<&Value> = replaced["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|hit| &hit["unit"])
-        .collect();
-    assert_eq!(units, [&json!(COLLECTED_UNIT)], "{replaced:#}");
+    assert_unavailable(&replaced);
     assert!(
         substituted_versions(&replaced).is_empty(),
         "the requested release answers exactly: {replaced:#}"
@@ -1710,6 +1666,7 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         json!({"target":"symbol", "query":"helper_beacon","scope":"global"}),
     )
     .await?;
+    assert_unavailable(&again);
     assert_eq!(
         substituted_versions(&again),
         [&json!("0.9.0")],
@@ -1726,17 +1683,17 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
 /// resolves to its release.
 #[tokio::test]
 async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let answer = call_tool(
+    let answer = search_symbols(
         &client,
-        "search",
         json!({
             "query": "helper_beacon",
             "scope": "all",
@@ -1744,12 +1701,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
         }),
     )
     .await?;
-    assert!(
-        answer["results"]
-            .as_array()
-            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
-        "{answer:#}"
-    );
+    assert!(has_unit(&answer, COLLECTED_UNIT)?, "{answer:#}");
 
     let resolutions = resolution_entries(&fixture).await;
     assert_eq!(resolutions.len(), 1, "{resolutions:#?}");
@@ -1785,7 +1737,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
 /// a zero `limit` is refused, never paged.
 #[tokio::test]
 async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
@@ -1797,28 +1749,28 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     let refused = [
         (
             "search",
-            json!({"query": "beacon", "pattern": "beacon", "scope": "all"}),
-            "pattern",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :pattern 'beacon'; :scope 'all' } }"}),
+            "query",
         ),
         (
             "search",
-            json!({"query": "beacon", "scope": "all", "limit": 0}),
-            "limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all' } } LIMIT -1"}),
+            "query",
         ),
         (
             "search",
-            json!({"query": "beacon", "scope": "all", "traversal": {"depth": 1}}),
-            "seed",
+            json!({"query": "SELECT ?symbol { <rift://symbol/local/rust/walk/caller :calls ?symbol }"}),
+            "query",
         ),
         (
             "search",
-            json!({"pattern": "beacon", "scope": "all", "limit": 0}),
-            "limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 42; :scope 'all' } }"}),
+            "query",
         ),
         (
             "get_symbol",
             json!({"id": id, "declaration_limit": 0}),
-            "limit",
+            "declaration_limit",
         ),
     ];
     for (tool, request, field) in refused {
@@ -1843,7 +1795,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
 }
 
 /// A global API advertising a smaller `dependency_entries_max` than the client's own bound
-/// still answers a read: the resolution request holds that many entries, the requested
+/// cannot answer a complete query: the resolution request holds that many entries, the requested
 /// package among them, and the context entries sorted last leave with a
 /// `package_context_degraded` warning naming their package manager.
 #[tokio::test]
@@ -1853,6 +1805,7 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
     let advertised = 3;
     let fixture = GlobalFixture::start_with(FixtureOptions {
         dependency_entries_max: advertised,
+        query_narrowed: false,
         ..FixtureOptions::default()
     })
     .await?;
@@ -1888,13 +1841,8 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
         "scope": "global",
         "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
-    let answer = call_tool(&client, "search", request).await?;
-    assert!(
-        answer["results"]
-            .as_array()
-            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
-        "{answer:#}"
-    );
+    let answer = search_symbols(&client, request).await?;
+    assert_unavailable(&answer);
     let sent = resolution_entries(&fixture).await;
     assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
     assert_eq!(sent[0].len(), usize::try_from(advertised)?, "{sent:#?}");
@@ -1937,16 +1885,17 @@ async fn an_advertised_entry_bound_below_the_client_bound_cuts_the_context() -> 
     Ok(())
 }
 
-/// A global API advertising fewer entries than a read requests still answers it: every
+/// A global API advertising fewer entries than a read requests cannot answer it: every
 /// lockfile entry leaves first, then the requested entries sorted last, and
 /// `package_context_degraded` names the bound and the requested packages not reported. The
-/// read answers the requested package that stayed, and no global warning says the global
+/// read reports insufficient coverage, and no global warning says the global
 /// API failed.
 #[tokio::test]
 async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entries() -> TestResult
 {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         dependency_entries_max: 1,
+        query_narrowed: false,
         ..FixtureOptions::default()
     })
     .await?;
@@ -1982,13 +1931,8 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
             {"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}
         ]
     });
-    let answer = call_tool(&client, "search", request).await?;
-    assert!(
-        answer["results"]
-            .as_array()
-            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
-        "{answer:#}"
-    );
+    let answer = search_symbols(&client, request).await?;
+    assert_unavailable(&answer);
     let sent = resolution_entries(&fixture).await;
     assert_eq!(sent.len(), 1, "one resolution request: {sent:#?}");
     assert_eq!(
@@ -2045,15 +1989,15 @@ async fn an_advertised_entry_bound_below_the_requested_count_cuts_requested_entr
     Ok(())
 }
 
-/// A workspace whose lockfile fills the dependency context to its bound still answers a
-/// read naming one more package: the requested package goes out, the context entry sorted
+/// A workspace whose lockfile fills the dependency context cannot answer a complete
+/// query naming one more package: the requested package goes out, the context entry sorted
 /// last leaves with a `package_context_degraded` warning naming its package manager, and
 /// the resolution request stays within the entry bound the client holds it to.
 #[tokio::test]
 async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() -> TestResult {
     use std::fmt::Write as _;
 
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"10s\"\nconnect_timeout = \"100ms\"\n",
@@ -2087,13 +2031,8 @@ async fn a_requested_package_past_the_entry_bound_displaces_a_context_entry() ->
         "scope": "global",
         "packages": [{"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"}]
     });
-    let answer = call_tool(&client, "search", request).await?;
-    assert!(
-        answer["results"]
-            .as_array()
-            .is_some_and(|results| results.iter().any(|hit| hit["unit"] == COLLECTED_UNIT)),
-        "{answer:#}"
-    );
+    let answer = search_symbols(&client, request).await?;
+    assert_unavailable(&answer);
     let warnings = answer["warnings"]
         .as_array()
         .ok_or("warnings are an array")?;
@@ -2168,24 +2107,17 @@ async fn an_unadvertised_feature_answers_project_hits_with_capability_unavailabl
         (
             "search",
             json!({"pattern": "beacon", "scope": "all"}),
-            "results",
             "patterns",
         ),
         (
             "search",
             json!({"query": "beacon", "scope": "all"}),
-            "results",
             "documentation_search",
         ),
     ];
-    for (tool, request, hits, feature) in reads {
-        let answer = call_tool(&client, tool, request.clone()).await?;
-        let project_hits = answer[hits].as_array().ok_or("hits are an array")?;
-        assert!(!project_hits.is_empty(), "{request}: {answer:#}");
-        assert!(
-            project_hits.iter().all(|hit| hit.get("unit").is_none()),
-            "no package answers: {answer:#}"
-        );
+    for (tool, request, feature) in reads {
+        let answer = read_producer(&client, tool, request.clone()).await?;
+        assert_unavailable(&answer);
         let warnings = answer["warnings"]
             .as_array()
             .ok_or("warnings are an array")?;
@@ -2286,17 +2218,17 @@ async fn a_body_matched_package_declaration_answers_as_a_content_match() -> Test
 /// request carries it and answers its matches.
 #[tokio::test]
 async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let answer = call_tool(
+    let answer = search_symbols(
         &client,
-        "search",
         json!({
             "pattern": r"fn helper_\w+",
             "scope": "global",
@@ -2306,11 +2238,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
         }),
     )
     .await?;
-    assert_eq!(
-        answer["results"],
-        helper_beacon_pattern_hits(),
-        "{answer:#}"
-    );
+    assert_helper_beacon_pattern_hits(&answer)?;
 
     let bodies: Vec<Value> = pattern_requests(&fixture)
         .await
@@ -2476,11 +2404,12 @@ async fn global_service_query_view_retains_exact_provider_reads_and_refuses_chan
 /// Exact original spelling wins through MCP before a one-result page is selected (#597).
 #[tokio::test]
 async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::CasePairs).await?;
+    let fixture = complete_fixture(SymbolFixture::CasePairs).await?;
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let source = global_api::CASE_SOURCE;
     let (_directory, client, server_task) =
         served_workspace(
@@ -2509,14 +2438,8 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
         }
         let args =
             json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": ["source"]});
-        let answer = call_tool(&client, "search", args).await?;
-        let hits = answer["results"]
-            .as_array()
-            .ok_or("search carries results")?;
-        let names: Vec<_> = hits
-            .iter()
-            .filter_map(|hit| hit["hit"]["symbol"]["name"].as_str())
-            .collect();
+        let answer = search_symbols(&client, args).await?;
+        let names = literals(&answer, "name")?;
         assert!(
             names.contains(&"SearchHit") && names.contains(&"searchHit"),
             "{answer:#}"
@@ -2542,12 +2465,9 @@ async fn assert_identifier_request(
     expected: [&str; 2],
 ) -> TestResult {
     let args = json!({"query": query, "scope": "global", "limit": 10});
-    let answer = call_tool(client, "search", args).await?;
+    let answer = search_symbols(client, args).await?;
     assert_eq!(
-        answer["results"]
-            .as_array()
-            .ok_or("search carries results")?
-            .len(),
+        workspace_client::query::rows(&answer)?.len(),
         2,
         "{answer:#}"
     );
@@ -2568,18 +2488,22 @@ async fn assert_original_identifier(
     name: &str,
 ) -> TestResult {
     let args = json!({"query": name, "scope": scope, "limit": 1, "include": ["source"]});
-    let answer = call_tool(client, "search", args).await?;
-    let hits = answer["results"]
-        .as_array()
-        .ok_or("search carries results")?;
+    let answer = search_symbols(client, args).await?;
+    let hits = workspace_client::query::rows(&answer)?;
     assert_eq!(hits.len(), 1, "{scope}: {answer:#}");
     let hit = &hits[0];
-    assert_eq!(hit["hit"]["symbol"]["name"], name, "{scope}: {answer:#}");
+    assert_eq!(
+        workspace_client::query::literal(hit, "name")?,
+        name,
+        "{scope}: {answer:#}"
+    );
     let expected_source = format!("pub fn {name}() {{}}");
-    assert_eq!(hit["source"], expected_source, "{scope}: {answer:#}");
-    let id = hit["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("symbol carries identity")?;
+    assert_eq!(
+        workspace_client::query::literal(hit, "source")?,
+        expected_source,
+        "{scope}: {answer:#}"
+    );
+    let id = workspace_client::query::iri(hit, "symbol")?;
     assert!(id.ends_with(&format!("/{name}")), "{id}");
     let args = json!({"id": id, "include": ["source"]});
     let answer = call_tool(client, "get_symbol", args).await?;
@@ -2597,7 +2521,7 @@ async fn assert_original_identifier(
 #[tokio::test]
 async fn test_native_client_accepts_original_identifier_candidates() -> TestResult {
     use rift_cloud_client::{Config, GlobalClient, QueryTerm};
-    let fixture = GlobalFixture::start(SymbolFixture::CasePairs).await?;
+    let fixture = complete_fixture(SymbolFixture::CasePairs).await?;
     let client = GlobalClient::new(Config {
         endpoint: fixture.endpoint.clone(),
         ..Config::default()
@@ -2674,13 +2598,17 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
         served_workspace(&[("src/lib.rs", source)], None).await?;
     for name in ["createProgram", "createprogram"] {
         let args = json!({"query": format!("Vault::{name}"), "limit": 1, "include": ["source"]});
-        let answer = call_tool(&client, "search", args).await?;
+        let answer = search_symbols(&client, args).await?;
         assert_eq!(
-            answer["results"][0]["hit"]["symbol"]["name"], name,
+            workspace_client::query::literal(&workspace_client::query::rows(&answer)?[0], "name")?,
+            name,
             "{answer:#}"
         );
         assert_eq!(
-            answer["results"][0]["source"],
+            workspace_client::query::literal(
+                &workspace_client::query::rows(&answer)?[0],
+                "source"
+            )?,
             format!("pub fn {name}() {{}}"),
             "{answer:#}"
         );
@@ -2692,11 +2620,12 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
 
 #[tokio::test]
 async fn test_served_package_reads_apply_workspace_request_opt_out() -> TestResult {
-    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
     let configuration = format!(
         "[telemetry]\ndisabled = true\n[global]\nendpoint = \"{}\"\n\n{DEMO_PACKAGE}",
         fixture.endpoint
     );
+    let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (_directory, client, server_task) = workspace.served;
     let answer = search_symbols(
@@ -2704,12 +2633,7 @@ async fn test_served_package_reads_apply_workspace_request_opt_out() -> TestResu
         json!({"query": "beacon", "target": "symbol", "scope": "global"}),
     )
     .await?;
-    assert!(
-        !answer["results"]
-            .as_array()
-            .ok_or("results list")?
-            .is_empty()
-    );
+    assert!(!workspace_client::query::rows(&answer)?.is_empty());
     let requests = fixture.requests().await;
     assert!(!requests.is_empty());
     assert!(requests.iter().all(|request| request.telemetry_disabled));

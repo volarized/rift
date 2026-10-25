@@ -1,5 +1,6 @@
 //! Existing producer and retained-answer services through library evaluation.
 
+use crate::query::FactRequirement;
 use std::collections::BTreeMap;
 use std::error::Error;
 
@@ -47,6 +48,7 @@ fn service(query: &PreparedQuery, hits: Vec<SearchHit>) -> QueryServices {
             result,
         }],
         bindings: Vec::new(),
+        datasets: Vec::new(),
     }
 }
 
@@ -63,7 +65,7 @@ fn test_ranked_service_reuses_existing_hit_scores_and_symbol_identity() -> TestR
         "SELECT ?symbol ?score { SERVICE :search { ?hit :query 'config'; :symbol ?symbol; :score ?score } }",
         limits(),
     )?;
-    assert!(!query.requirements().domain);
+    assert!(!query.requirements().requires(FactRequirement::Domain));
     assert_eq!(query.retrievals().len(), 1);
     assert_eq!(query.retrievals()[0].query.as_deref(), Some("config"));
     let services = service(&query, vec![hit(0)?]);
@@ -191,6 +193,7 @@ fn test_retained_table_preserves_duplicates_blank_nodes_and_inner_filter() -> Te
     let services = QueryServices {
         retrievals: Vec::new(),
         bindings: vec![retained],
+        datasets: Vec::new(),
     };
     let query = PreparedQuery::parse(
         "SELECT ?number ?node { SERVICE <urn:rift:result:12345678> { FILTER(?number > 1) } }",
@@ -222,6 +225,7 @@ fn test_retained_graph_uses_rdf_graph_matching() -> TestResult {
     };
     let services = QueryServices {
         retrievals: Vec::new(),
+        datasets: Vec::new(),
         bindings: vec![RetainedResult {
             service: "urn:rift:result:12345678".to_owned(),
             answer: QueryAnswer::Graph {
@@ -249,6 +253,7 @@ fn test_retained_graph_uses_rdf_graph_matching() -> TestResult {
 fn test_retained_boolean_uses_one_typed_value() -> TestResult {
     let services = QueryServices {
         retrievals: Vec::new(),
+        datasets: Vec::new(),
         bindings: vec![RetainedResult {
             service: "urn:rift:result:12345678".to_owned(),
             answer: QueryAnswer::Boolean { value: false },

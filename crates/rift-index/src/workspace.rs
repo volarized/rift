@@ -582,6 +582,12 @@ const FINGERPRINT_PATH_SEPARATOR: u8 = 0;
 const FINGERPRINT_FILE_SEPARATOR: u8 = 0xff;
 
 impl WorkspaceFingerprint {
+    /// Returns the complete captured source identity, without diagnostic truncation.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     /// Captures visible file paths and bytes without parsing syntax.
     ///
     /// Work is bounded by [`WorkspaceIndexLimits`]. A claimed file whose bytes are not

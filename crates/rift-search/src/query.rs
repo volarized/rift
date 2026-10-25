@@ -1,5 +1,21 @@
 //! Query-language-independent domain facts and acquisition requirements.
 
+mod provider;
+mod source;
+
+pub use source::{
+    require_source_agreement, source_digest, validate_source_selections,
+    validate_source_selections_by_unit,
+};
+
+pub use provider::{
+    QueryProviderContext, QueryProviderDeclaration, QueryProviderEdge, QueryProviderEndpoint,
+    QueryProviderInput, QueryProviderRecord, QueryProviderReference, QueryProviderRelationship,
+    QueryProviderSelection, QueryProviderSnapshot, QueryProviderTarget,
+};
+
+use std::collections::BTreeSet;
+
 use rift_protocol::documentation::{
     DocumentationBlock, DocumentationLink, DocumentationReference, DocumentationReferenceCandidate,
     DocumentationSource,
@@ -7,13 +23,24 @@ use rift_protocol::documentation::{
 use rift_protocol::query::QueryOccurrence;
 pub use rift_protocol::query::{QuerySource, QuerySymbol};
 use rift_protocol::read::{
-    Node, Relationship, RelationshipFacet, SymbolHistory, SymbolId, TraversalDirection,
+    Relationship, RelationshipFacet, SymbolHistory, SymbolId, TraversalDirection,
 };
 use serde::{Deserialize, Serialize};
 
+mod nodes;
+pub use nodes::{QueryNode, QueryNodeSource};
+
+#[cfg(test)]
+pub(crate) use nodes::tests::source as test_node_source;
+
 /// Complete domain records acquired under one immutable serving selection.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryFacts {
+    /// Original normalized provider graphs associated with the existing payload arrays.
+    pub providers: Vec<QueryProviderSnapshot>,
+    /// Engine-established links retaining canonical or supplied physical endpoints.
+    pub provider_edges: Vec<QueryProviderEdge>,
     /// Families not captured by the selected publication.
     pub unavailable_families: Vec<QueryFactFamily>,
     /// Established logical symbols and their physical declarations.
@@ -24,10 +51,12 @@ pub struct QueryFacts {
     pub relationship_records: Vec<rift_protocol::relationship_read::RelationshipRecord>,
     /// Physical usage locations independent of an enclosing declaration.
     pub occurrences: Vec<QueryOccurrence>,
+    /// Original selected-publication usage records and their established relationship links.
+    pub occurrence_records: Vec<rift_protocol::relationship_read::RelationshipOccurrence>,
     /// Source units and requested bytes.
     pub sources: Vec<QuerySource>,
-    /// Source structure from the selected syntax publication.
-    pub nodes: Vec<Node>,
+    /// Complete original named trees from the selected syntax publication.
+    pub nodes: Vec<QueryNodeSource>,
     /// Selected symbol timelines, retaining their completeness decisions.
     pub histories: Vec<SymbolHistory>,
     /// Captured documentation source ownership and revisions.
@@ -108,13 +137,36 @@ pub struct AdjacencyRequirement {
     pub depth: Option<u32>,
 }
 
+/// One domain acquisition required before evaluation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FactRequirement {
+    /// Whether ordinary selected domain facts are required outside a query service.
+    Domain,
+    /// Whether the result describes the complete captured published records.
+    Description,
+    /// Whether the selected semantic domain must be completely acquired.
+    CompleteDomain,
+    /// Whether source bytes must be available to the mapping.
+    Source,
+    /// Whether complete concrete syntax node rows are required.
+    Nodes,
+    /// Whether selected symbol timelines are required.
+    History,
+    /// Whether timeline facts are required beyond exact selected symbols.
+    AllHistories,
+    /// Whether collected documentation records are required.
+    Documentation,
+    /// Whether unanchored physical usages are required.
+    AllOccurrences,
+}
+
 /// Sufficient domain operations required before evaluation can report a complete answer.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct FactRequirements {
-    /// Whether ordinary selected domain facts are required outside a query service.
-    pub domain: bool,
-    /// Whether the result describes the complete captured published records.
-    pub description: bool,
+    /// Domain acquisitions required before evaluation.
+    pub required: BTreeSet<FactRequirement>,
     /// Exact name restriction proved for a single subject's ordinary pattern.
     pub symbol_name: Option<String>,
     /// Exact symbol restriction proved for a physical usage-only pattern.
@@ -123,22 +175,8 @@ pub struct FactRequirements {
     pub occurrences: Vec<SymbolId>,
     /// Required anchored relationship acquisitions.
     pub adjacency: Vec<AdjacencyRequirement>,
-    /// Whether the selected semantic domain must be completely acquired.
-    pub complete_domain: bool,
-    /// Whether source bytes must be available to the mapping.
-    pub source: bool,
-    /// Whether complete concrete syntax node rows are required.
-    pub nodes: bool,
-    /// Whether selected symbol timelines are required.
-    pub history: bool,
     /// Exact symbols selected through their timeline relationship.
     pub history_symbols: Vec<SymbolId>,
-    /// Whether timeline facts are required beyond exact selected symbols.
-    pub all_histories: bool,
-    /// Whether collected documentation records are required.
-    pub documentation: bool,
-    /// Whether unanchored physical usages are required.
-    pub all_occurrences: bool,
     /// Relationship facets used anywhere in the algebra.
     pub facets: Vec<RelationshipFacet>,
     /// Explicit dataset and named-graph IRIs, resolved by the serving owner.
@@ -147,4 +185,111 @@ pub struct FactRequirements {
     pub services: Vec<String>,
     /// Existing retrieval requests executed before language evaluation.
     pub retrievals: Vec<rift_protocol::read::SearchParams>,
+}
+
+impl FactRequirements {
+    /// Validates domain selection before request metadata enters acquisition.
+    ///
+    /// Empty requirements select no domain facts. A requested domain family requires
+    /// the domain selection that causes the serving owner to acquire those facts.
+    ///
+    /// # Errors
+    /// Returns an invalid request when a required family has no domain selection.
+    pub fn validate_selection(&self) -> Result<(), rift_error::RiftError> {
+        if !self.requires(FactRequirement::Domain) && !self.required.is_empty() {
+            return Err(rift_error::errors::server::read_invalid()
+                .field("requirements")
+                .violation("required fact families must include the domain selection")
+                .error());
+        }
+        Ok(())
+    }
+
+    /// Returns whether this acquisition is required before evaluation.
+    #[must_use]
+    pub fn requires(&self, requirement: FactRequirement) -> bool {
+        self.required.contains(&requirement)
+    }
+
+    /// Requires this domain acquisition before evaluation.
+    pub fn require(&mut self, requirement: FactRequirement) {
+        self.required.insert(requirement);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FactRequirement, FactRequirements, QueryFacts};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn fact_selection_refuses_families_without_domain() {
+        assert!(FactRequirements::default().validate_selection().is_ok());
+        for requirement in [
+            FactRequirement::Description,
+            FactRequirement::CompleteDomain,
+            FactRequirement::Source,
+            FactRequirement::Nodes,
+            FactRequirement::History,
+            FactRequirement::AllHistories,
+            FactRequirement::Documentation,
+            FactRequirement::AllOccurrences,
+        ] {
+            let mut requirements = FactRequirements::default();
+            requirements.require(requirement);
+            let error = requirements
+                .validate_selection()
+                .expect_err("a required family cannot select an empty domain");
+            assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
+            requirements.require(FactRequirement::Domain);
+            assert!(requirements.validate_selection().is_ok());
+        }
+    }
+
+    #[test]
+    fn requirement_exchange_preserves_every_acquisition() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let requirements = FactRequirements {
+            required: [
+                FactRequirement::Domain,
+                FactRequirement::Description,
+                FactRequirement::CompleteDomain,
+                FactRequirement::Source,
+                FactRequirement::Nodes,
+                FactRequirement::History,
+                FactRequirement::AllHistories,
+                FactRequirement::Documentation,
+                FactRequirement::AllOccurrences,
+            ]
+            .into(),
+            ..FactRequirements::default()
+        };
+        let decoded =
+            serde_json::from_value::<FactRequirements>(serde_json::to_value(&requirements)?)?;
+        assert_eq!(decoded, requirements);
+        Ok(())
+    }
+
+    #[test]
+    fn requirement_exchange_refuses_old_or_unknown_layout() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut value = serde_json::to_value(FactRequirements::default())?;
+        let object = value.as_object_mut().ok_or("requirement object")?;
+        object.remove("required");
+        object.insert("domain".to_owned(), Value::Bool(true));
+        assert!(serde_json::from_value::<FactRequirements>(value).is_err());
+
+        let mut value = serde_json::to_value(FactRequirements::default())?;
+        value["required"] = json!(["unknown"]);
+        assert!(serde_json::from_value::<FactRequirements>(value).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fact_exchange_refuses_unknown_records() -> Result<(), Box<dyn std::error::Error>> {
+        let mut value = serde_json::to_value(QueryFacts::default())?;
+        value["unknown"] = json!([]);
+        assert!(serde_json::from_value::<QueryFacts>(value).is_err());
+        Ok(())
+    }
 }

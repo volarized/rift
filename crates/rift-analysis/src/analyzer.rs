@@ -406,7 +406,11 @@ impl PackageAnalyzer {
     }
 }
 
-fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read::RelationshipFacet {
+/// Returns the existing portable facet of one normalized provider relationship.
+#[must_use]
+pub const fn relationship_facet(
+    kind: rift_core::RelationshipKind,
+) -> rift_protocol::read::RelationshipFacet {
     match kind {
         rift_core::RelationshipKind::Reference => {
             rift_protocol::read::RelationshipFacet::References

@@ -1,13 +1,23 @@
-use super::{CapturedCandidates, RiftProxy, invalid};
+use super::{CapturedCandidates, RiftProxy};
 use rift_error::{RiftError, errors};
 use rift_protocol::query::QueryParams;
-use rift_search::sparql::{QueryLimits, QueryServiceData};
+use rift_search::query::FactRequirement;
+use rift_search::sparql::QueryLimits;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
+
+mod acquire;
+mod evaluate;
+mod identity;
+mod retained;
+mod source;
+#[cfg(test)]
+mod tests;
 
 pub(super) struct QueryForward {
     pub(super) backend: String,
     pub(super) response: Result<CallToolResponse, rmcp::ErrorData>,
     pub(super) captured: Vec<CapturedCandidates>,
+    pub(super) owned: bool,
 }
 
 impl RiftProxy {
@@ -18,19 +28,18 @@ impl RiftProxy {
         let params: QueryParams =
             serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
                 .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let worker = self.query_worker.as_ref().ok_or_else(|| unsupported())?;
-        let program = self.query_program.clone().ok_or_else(|| unsupported())?;
+        let worker = self.query_worker.as_ref().ok_or_else(unsupported)?;
+        let program = self.query_program.clone().ok_or_else(unsupported)?;
         let limits = QueryLimits::try_from(&self.query_configuration)?;
         let deadline = tokio::time::Instant::now() + self.forward_budget;
         let cancellation = tokio_util::sync::CancellationToken::new();
         let guard = cancellation.clone().drop_guard();
-        let statement = params.query.clone();
         let plan = tokio::time::timeout_at(
             deadline,
             worker.run_with_cancellation("query parse", cancellation, move |cancelled| {
                 rift_server::prepare_query(
                     program.as_path(),
-                    statement,
+                    params.query,
                     limits,
                     deadline.into_std(),
                     &|| cancelled.is_cancelled(),
@@ -45,27 +54,24 @@ impl RiftProxy {
                 .error()
         })??;
         drop(guard);
-
-        if let Some(page) = plan.page_selection()
-            && let view = rift_protocol::symbol_read::CapturedViewId::parse(&page.view)?
-            && let Ok(Some(selected)) = self
+        if let Some(page) = plan.page_selection() {
+            if let Some(response) = self.query_material_page(page.clone(), deadline).await? {
+                return Ok(owned(Ok(response)));
+            }
+            let view = rift_protocol::symbol_read::CapturedViewId::parse(&page.view)?;
+            if let Ok(Some(selected)) = self
                 .candidate_views
                 .backend(&view, std::time::SystemTime::now())?
-        {
-            let backend = if selected.backend == "local" {
-                self
-            } else {
-                self.backends
-                    .get(&selected.backend)
-                    .ok_or_else(|| self.extra.refusal(&selected.backend, "search", "view"))?
-            };
-            return Ok(QueryForward {
-                backend: selected.backend,
-                response: backend.forward_read(request.clone()).await?,
-                captured: Vec::new(),
-            });
+            {
+                let backend = self.query_backend(&selected.backend)?;
+                return Ok(QueryForward {
+                    backend: selected.backend,
+                    response: backend.forward_read(request.clone()).await?,
+                    captured: Vec::new(),
+                    owned: false,
+                });
+            }
         }
-
         let mut federated = false;
         for producer in plan.retrievals() {
             let backends = self.candidate_backends(producer)?;
@@ -76,77 +82,37 @@ impl RiftProxy {
                 backend: "local".to_owned(),
                 response: self.forward_read(request.clone()).await?,
                 captured: Vec::new(),
+                owned: false,
             });
         }
-        if plan.requirements().domain {
+        if plan.requirements().requires(FactRequirement::Domain) {
             return Err(errors::server::read_unavailable()
                 .operation("query acquisition")
                 .detail("required graph facts are unavailable for the selected projects")
                 .error());
         }
-        let mut retrievals = Vec::new();
-        let mut captured = Vec::new();
-        let mut selected = None;
-        for producer in plan.retrievals() {
-            let (result, context) = match self.query_retrieval(producer).await? {
-                Ok(result) => result,
-                Err(response) => {
-                    return Ok(QueryForward {
-                        backend: "local".to_owned(),
-                        response: Ok(response.into()),
-                        captured,
-                    });
-                }
-            };
-            let first = context
-                .pools
-                .iter()
-                .find(|pool| pool.backend != "global")
-                .ok_or_else(|| invalid("scope", "captured project context is unavailable"))?;
-            if selected
-                .as_ref()
-                .is_some_and(|selected| selected != &first.backend)
-            {
-                return Err(invalid("scope", "captured project contexts do not match"));
-            }
-            selected = Some(first.backend.clone());
-            retrievals.push(QueryServiceData {
-                request: producer.clone(),
-                result,
-            });
-            captured.push(context);
-        }
-        let selected =
-            selected.ok_or_else(|| invalid("scope", "captured project context is unavailable"))?;
-        let backend = if selected == "local" {
-            self
+        Ok(owned(
+            self.evaluate_owned_query(plan, limits, deadline).await?,
+        ))
+    }
+
+    fn query_backend(&self, name: &str) -> Result<&Self, RiftError> {
+        if name == "local" {
+            Ok(self)
         } else {
             self.backends
-                .get(&selected)
-                .ok_or_else(|| self.extra.refusal(&selected, "search", "scope"))?
-        };
-        let supplied = crate::server::QueryCandidateRequest { params, retrievals };
-        super::super::encode_bounded(&supplied, super::CANDIDATE_BYTES_MAX)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let arguments = serde_json::to_value(supplied)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?
-            .as_object()
-            .cloned()
-            .ok_or_else(|| invalid("arguments", "query request is not an object"))?;
-        let forwarded = CallToolRequestParams::new("query_candidates").with_arguments(arguments);
-        let response = tokio::time::timeout_at(deadline, backend.forward_read(forwarded))
-            .await
-            .map_err(|_| {
-                errors::server::read_unavailable()
-                    .operation("query acquisition")
-                    .detail("query acquisition exceeded the request deadline")
-                    .error()
-            })??;
-        Ok(QueryForward {
-            backend: selected,
-            response,
-            captured,
-        })
+                .get(name)
+                .ok_or_else(|| self.extra.refusal(name, "search", "view"))
+        }
+    }
+}
+
+fn owned(response: Result<CallToolResponse, rmcp::ErrorData>) -> QueryForward {
+    QueryForward {
+        backend: "local".to_owned(),
+        response,
+        captured: Vec::new(),
+        owned: true,
     }
 }
 

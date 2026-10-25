@@ -6,7 +6,10 @@ import asyncio
 from pathlib import Path
 from typing import cast
 
+from dulwich.repo import Repo
+
 from rift_dev.check_artifact import (
+    CONFIGURATION,
     check_external_change,
     check_reads,
     incoming_references,
@@ -20,6 +23,7 @@ from rift_dev.query import bindings, declaration_request, iri, literal
 from rift_dev.rift_test_client import (
     Client,
     Server,
+    ToolFailure,
     array_value,
     collector_line,
     gate_deadline,
@@ -30,7 +34,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import TEST_CASE_KEY, resource_attribute
+from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
 
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
@@ -77,6 +81,52 @@ async def check_embedded_references(client: Client, root: Path) -> None:
         (root / "service.py").read_bytes() == PYTHON_SOURCE.encode(),
         "reference read changed source bytes",
     )
+
+
+async def check_mixed_references_unavailable(client: Client) -> None:
+    """Require complete relationship acquisition to refuse an unserved language."""
+    seed = symbol_id(await symbol_hit(client, "serve", "python"))
+    try:
+        answer = await incoming_references(client, seed)
+    except ToolFailure as failure:
+        require(
+            failure.code == "capability_unavailable"
+            and failure.retry == "operator_action",
+            f"mixed relationship acquisition returned a different refusal: {failure}",
+        )
+    else:
+        raise AssertionError(
+            f"unserved Rust relationships returned a complete answer: {answer}"
+        )
+
+
+async def check_python_references(
+    binary: Path, base: Path, telemetry: Collector
+) -> None:
+    """Read relationship metadata from a complete served Python workspace."""
+    root = base / "python"
+    root.mkdir()
+    with Repo.init(root):
+        pass
+    (root / "rift.toml").write_text(
+        CONFIGURATION + PYTHON_CONFIGURATION, encoding="utf-8", newline=""
+    )
+    (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
+    (root / "pyproject.toml").write_text(PYTHON_METADATA, encoding="utf-8", newline="")
+    with Server(
+        binary,
+        root,
+        base / "python-server.log",
+        env={"OTEL_RESOURCE_ATTRIBUTES": resource_attribute(TEST_CASE_KEY, "agent")},
+        collector=telemetry,
+    ) as server:
+        try:
+            async with server.connect() as client:
+                await check_embedded_references(client, root)
+        except BaseException as error:
+            for note in server.evidence():
+                error.add_note(note)
+            raise
 
 
 async def check_resources(client: Client) -> None:
@@ -219,7 +269,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     await check_reads(client)
                     await check_resources(client)
                     await check_external_change(client, root)
-                    await check_embedded_references(client, root)
+                    await check_mixed_references_unavailable(client)
                     await declaration_node(client, "beacon_one")
                     client.require_complete(READ_TOOLS)
                 server.stop()
@@ -228,6 +278,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     any(parse_line(line) is not None for line in logs.splitlines()),
                     "startup recorded no logs",
                 )
+                await check_python_references(binary, base, telemetry)
             except BaseException as error:
                 for note in server.evidence():
                     error.add_note(note)

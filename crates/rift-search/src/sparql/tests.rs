@@ -1,5 +1,6 @@
 //! SPARQL semantics and acquisition controls over independently enumerated facts.
 
+use crate::query::FactRequirement;
 use std::error::Error;
 
 use rift_protocol::query::{QueryAnswer, QueryOccurrence, RdfTerm};
@@ -81,7 +82,11 @@ fn rows(
 fn test_name_query_uses_default_prefix_without_semantic_acquisition() -> TestResult {
     let query = "SELECT ?symbol { ?symbol :name \"load_config\" }";
     let prepared = PreparedQuery::parse(query, limits())?;
-    assert!(!prepared.requirements().complete_domain);
+    assert!(
+        !prepared
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
     assert!(prepared.requirements().adjacency.is_empty());
     let answer = rows(evaluate(query)?)?;
     assert_eq!(answer.len(), 1);
@@ -105,7 +110,7 @@ fn test_missing_node_family_refuses_negative_answers_but_allows_names() -> TestR
         "ASK { FILTER NOT EXISTS { ?node a :Node } }",
     ] {
         let prepared = PreparedQuery::parse(query, limits())?;
-        assert!(prepared.requirements().nodes);
+        assert!(prepared.requirements().requires(FactRequirement::Nodes));
         assert!(
             prepared
                 .evaluate(facts.clone(), limits(), QueryCancellation::default())
@@ -113,7 +118,7 @@ fn test_missing_node_family_refuses_negative_answers_but_allows_names() -> TestR
         );
     }
     let prepared = PreparedQuery::parse("ASK { ?symbol :name \"load_config\" }", limits())?;
-    assert!(!prepared.requirements().nodes);
+    assert!(!prepared.requirements().requires(FactRequirement::Nodes));
     assert_eq!(
         prepared.evaluate(facts, limits(), QueryCancellation::default())?,
         QueryAnswer::Boolean { value: true }
@@ -130,12 +135,21 @@ fn test_supplied_node_facts_preserve_identity_and_empty_available_family() -> Te
     );
     let identity = "rift://node/rust/src/lib.rs@0-3#ba7816bf";
     facts.nodes.push(serde_json::from_value(serde_json::json!({
-        "id": identity, "unit": "rift://file/src/lib.rs", "language": "rust",
-        "kind": "identifier", "range": {"start": 0, "end": 3}
+        "unit": "rift://source/project/src/lib.rs", "bytes": 3,
+        "nodes": [{"ordinal": 0, "parent": null, "node": {
+            "id": identity, "unit": "rift://file/src/lib.rs", "language": "rust",
+            "kind": "identifier", "range": {"start": 0, "end": 3}
+        }}]
     }))?);
+    facts
+        .sources
+        .push(serde_json::from_value(serde_json::json!({
+            "unit": "rift://source/project/src/lib.rs", "text": "abc",
+            "digest": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        }))?);
     let answer = rows(prepared.evaluate(facts, limits(), QueryCancellation::default())?)?;
     assert_eq!(answer.len(), 1);
-    assert_eq!(
+    assert_ne!(
         answer[0]["node"],
         RdfTerm::Iri {
             value: identity.to_owned()
@@ -235,7 +249,11 @@ fn test_occurrence_query_retains_two_locations_and_one_caller() -> TestResult {
     );
     let prepared = PreparedQuery::parse(&query, limits())?;
     assert_eq!(prepared.requirements().occurrences.len(), 1);
-    assert!(!prepared.requirements().complete_domain);
+    assert!(
+        !prepared
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
     let answer = rows(evaluate(&query)?)?;
     assert_eq!(answer.len(), 2);
     assert_ne!(answer[0]["usage"], answer[1]["usage"]);
@@ -303,9 +321,17 @@ fn test_cycle_closure_reaches_seed_and_each_endpoint_once() -> TestResult {
 #[test]
 fn test_all_query_forms_use_library_results() -> TestResult {
     let described = PreparedQuery::parse(&format!("DESCRIBE <{}>", identity("seed")), limits())?;
-    assert!(described.requirements().domain);
-    assert!(described.requirements().description);
-    assert!(!described.requirements().complete_domain);
+    assert!(described.requirements().requires(FactRequirement::Domain));
+    assert!(
+        described
+            .requirements()
+            .requires(FactRequirement::Description)
+    );
+    assert!(
+        !described
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
     assert_eq!(
         evaluate("ASK { ?s :name \"load_config\" }")?,
         QueryAnswer::Boolean { value: true }
@@ -396,11 +422,23 @@ fn test_negation_and_variable_predicates_require_semantic_domain() -> TestResult
         "ASK { ?s :name 'load_config' FILTER NOT EXISTS { ?s :calls ?target } }",
         limits(),
     )?;
-    assert!(query.requirements().complete_domain);
+    assert!(
+        query
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
     assert!(!query.requirements().facets.is_empty());
     let query = PreparedQuery::parse("SELECT * { ?s ?p ?o }", limits())?;
-    assert!(query.requirements().complete_domain);
-    assert!(query.requirements().all_occurrences);
+    assert!(
+        query
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
+    assert!(
+        query
+            .requirements()
+            .requires(FactRequirement::AllOccurrences)
+    );
     Ok(())
 }
 
@@ -513,7 +551,11 @@ fn test_inverse_and_mixed_paths_match_complete_graph_oracle() -> TestResult {
         identity("seed")
     );
     let prepared = PreparedQuery::parse(&query, limits())?;
-    assert!(prepared.requirements().complete_domain);
+    assert!(
+        prepared
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
     let answer = rows(evaluate(&query)?)?;
     assert_eq!(answer.len(), 3);
     assert_eq!(
@@ -642,7 +684,9 @@ fn test_parsed_finite_call_and_inverse_reference_chains_acquire_only_the_anchore
         );
         let prepared = PreparedQuery::parse(&query, limits())?;
         assert!(
-            !prepared.requirements().complete_domain,
+            !prepared
+                .requirements()
+                .requires(FactRequirement::CompleteDomain),
             "{}",
             prepared.expanded()
         );
@@ -650,7 +694,7 @@ fn test_parsed_finite_call_and_inverse_reference_chains_acquire_only_the_anchore
         let requirement = &prepared.requirements().adjacency[0];
         assert_eq!(requirement.seed.as_str(), identity("seed"));
         assert_eq!(
-            serde_json::to_value(&requirement.direction)?,
+            serde_json::to_value(requirement.direction)?,
             serde_json::json!(direction)
         );
         assert_eq!(requirement.facets.len(), 1);
@@ -670,7 +714,11 @@ fn test_finite_chain_planning_preserves_branch_cycle_and_duplicate_constraints()
             .join("/");
         let statement = format!("SELECT ?callee {{ <{}> {path} ?callee }}", identity("seed"));
         let prepared = PreparedQuery::parse(&statement, limits())?;
-        assert!(!prepared.requirements().complete_domain);
+        assert!(
+            !prepared
+                .requirements()
+                .requires(FactRequirement::CompleteDomain)
+        );
         assert_eq!(
             prepared.requirements().adjacency[0].depth,
             Some(u32::try_from(steps)?)
@@ -700,7 +748,7 @@ fn test_finite_chain_planning_preserves_branch_cycle_and_duplicate_constraints()
         assert!(
             PreparedQuery::parse(&statement, limits())?
                 .requirements()
-                .complete_domain,
+                .requires(FactRequirement::CompleteDomain),
             "{statement}"
         );
     }
@@ -708,7 +756,11 @@ fn test_finite_chain_planning_preserves_branch_cycle_and_duplicate_constraints()
         &format!("SELECT ?middle {{ <{seed}> :calls ?middle . ?middle :calls <{seed}> }}"),
         limits(),
     )?;
-    assert!(!cycle.requirements().complete_domain);
+    assert!(
+        !cycle
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
+    );
     assert_eq!(cycle.requirements().adjacency[0].depth, Some(2));
     assert_eq!(
         rows(cycle.evaluate(fixture()?, limits(), QueryCancellation::default())?)?.len(),
@@ -729,11 +781,15 @@ fn test_uniform_inverse_path_alternatives_preserve_direction_and_maximum_depth()
         let statement = format!("SELECT ?symbol {{ <{}> {path} ?symbol }}", identity("seed"));
         let prepared = PreparedQuery::parse(&statement, limits())?;
         let requirements = prepared.requirements();
-        assert!(!requirements.complete_domain, "{}", prepared.expanded());
+        assert!(
+            !requirements.requires(FactRequirement::CompleteDomain),
+            "{}",
+            prepared.expanded()
+        );
         assert_eq!(requirements.adjacency.len(), 1);
         assert_eq!(requirements.adjacency[0].depth, depth);
         assert_eq!(
-            serde_json::to_value(&requirements.adjacency[0].direction)?,
+            serde_json::to_value(requirements.adjacency[0].direction)?,
             "incoming"
         );
         assert_eq!(
@@ -746,7 +802,7 @@ fn test_uniform_inverse_path_alternatives_preserve_direction_and_maximum_depth()
         assert!(
             PreparedQuery::parse(&statement, limits())?
                 .requirements()
-                .complete_domain
+                .requires(FactRequirement::CompleteDomain)
         );
     }
     Ok(())
@@ -756,8 +812,15 @@ fn test_description_uses_captured_published_records_without_implicit_semantic_ac
 -> TestResult {
     let prepared = PreparedQuery::parse(&format!("DESCRIBE <{}>", identity("seed")), limits())?;
     let required = prepared.requirements();
-    assert!(required.description && required.domain && required.source);
-    assert!(!required.complete_domain && !required.all_occurrences);
+    assert!(
+        required.requires(FactRequirement::Description)
+            && required.requires(FactRequirement::Domain)
+            && required.requires(FactRequirement::Source)
+    );
+    assert!(
+        !required.requires(FactRequirement::CompleteDomain)
+            && !required.requires(FactRequirement::AllOccurrences)
+    );
     assert!(required.adjacency.is_empty() && required.occurrences.is_empty());
     let answer = prepared.evaluate(fixture()?, limits(), QueryCancellation::default())?;
     let QueryAnswer::Graph { triples } = answer else {
@@ -782,15 +845,91 @@ fn test_description_uses_captured_published_records_without_implicit_semantic_ac
         ),
         limits(),
     )?;
-    assert!(semantic.requirements().description);
+    assert!(
+        semantic
+            .requirements()
+            .requires(FactRequirement::Description)
+    );
     assert_eq!(semantic.requirements().adjacency.len(), 1);
     let generic =
         PreparedQuery::parse("DESCRIBE ?symbol { ?symbol ?predicate ?object }", limits())?;
-    assert!(generic.requirements().complete_domain);
     assert!(
-        generic.requirements().nodes
-            && generic.requirements().history
-            && generic.requirements().documentation
+        generic
+            .requirements()
+            .requires(FactRequirement::CompleteDomain)
     );
+    assert!(
+        generic.requirements().requires(FactRequirement::Nodes)
+            && generic.requirements().requires(FactRequirement::History)
+            && generic
+                .requirements()
+                .requires(FactRequirement::Documentation)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_graph_selection_preserves_default_named_and_invalid_terms() -> TestResult {
+    use oxigraph::model::{Literal, NamedNode, Term};
+    use spareval::QueryableDataset;
+
+    let dataset =
+        super::dataset::VirtualDataset::new(fixture()?, limits(), QueryCancellation::default().0)?;
+    let default = dataset
+        .internal_quads_for_pattern(None, None, None, Some(None))
+        .collect::<Result<Vec<_>, _>>()?;
+    let named = dataset
+        .internal_quads_for_pattern(None, None, None, None)
+        .collect::<Result<Vec<_>, _>>()?;
+    let graph = Term::NamedNode(NamedNode::new(super::LOCAL_GRAPH)?);
+    assert!(!default.is_empty());
+    assert!(default.iter().all(|quad| quad.graph_name.is_none()));
+    assert_eq!(default.len(), named.len());
+    assert!(
+        named
+            .iter()
+            .all(|quad| quad.graph_name.as_ref() == Some(&graph))
+    );
+
+    let selected = dataset
+        .internal_quads_for_pattern(None, None, None, Some(Some(&graph)))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(selected.len(), named.len());
+    let invalid = Term::Literal(Literal::from("invalid graph"));
+    assert_eq!(
+        dataset
+            .internal_quads_for_pattern(None, None, None, Some(Some(&invalid)))
+            .count(),
+        0,
+    );
+    Ok(())
+}
+
+#[test]
+fn test_dataset_clause_and_variable_graph_keep_library_selection() -> TestResult {
+    let graph = super::LOCAL_GRAPH;
+    let statement = format!("SELECT ?symbol FROM <{graph}> {{ ?symbol :name \"load_config\" }}");
+    let selected = rows(evaluate(&statement)?)?;
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0]["symbol"],
+        RdfTerm::Iri {
+            value: identity("seed")
+        }
+    );
+
+    let selected = rows(evaluate(
+        "SELECT ?symbol ?graph { GRAPH ?graph { ?symbol :name \"load_config\" } }",
+    )?)?;
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0]["graph"],
+        RdfTerm::Iri {
+            value: graph.to_owned()
+        }
+    );
+    assert!(rows(evaluate(
+        "SELECT ?symbol { VALUES ?graph { \"invalid graph\" } GRAPH ?graph { ?symbol :name \"load_config\" } }",
+    )?)?.is_empty());
     Ok(())
 }

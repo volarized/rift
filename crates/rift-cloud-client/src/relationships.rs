@@ -218,64 +218,31 @@ impl GlobalClient {
                 .iter()
                 .map(|group| group.relationships.len() + group.occurrences.len())
                 .sum::<usize>();
-            let completion_progress = match &result {
-                Some(selected) => selected
-                    .groups
-                    .iter()
-                    .zip(&page.groups)
-                    .any(|(previous, group)| !previous.complete && group.complete),
-                None => page.groups.iter().any(|group| group.complete),
-            };
-            for record in page.groups.iter().flat_map(|group| &group.relationships) {
-                if !record_ids.insert(record.id.as_str().to_owned()) {
+            let completion_progress = completion_progress(result.as_ref(), &page);
+            let identities = page_record_ids(&page)?;
+            records =
+                records
+                    .checked_add(u64::try_from(identities.len()).map_err(|_| {
+                        invalid("relationship record count exceeds the platform bound")
+                    })?)
+                    .filter(|count| *count <= limits.records_max)
+                    .ok_or_else(|| {
+                        invalid("relationship acquisition exceeds the accepted record bound")
+                    })?;
+            for identity in identities {
+                if !record_ids.insert(identity.to_owned()) {
                     return Err(invalid(
                         "relationship record identity repeats across cursor pages",
                     ));
                 }
             }
-            let serialized = page
-                .groups
-                .iter()
-                .flat_map(|group| {
-                    group
-                        .relationships
-                        .iter()
-                        .map(serde_json::to_vec)
-                        .chain(group.occurrences.iter().map(serde_json::to_vec))
-                })
-                .chain(page.symbols.iter().map(serde_json::to_vec))
-                .chain(page.sources.iter().map(serde_json::to_vec));
-            for encoded in serialized {
-                let encoded = encoded.map_err(|source| {
-                    failure::response_source(
-                        "relationship_pages",
-                        "relationships",
-                        "JSON serialization failed",
-                        None,
-                        source,
-                    )
-                })?;
-                bytes = bytes
-                    .checked_add(u64::try_from(encoded.len()).map_err(|_| {
-                        invalid("relationship byte count exceeds the platform bound")
-                    })?)
-                    .ok_or_else(|| invalid("relationship byte count exceeds the platform bound"))?;
-                records = records.checked_add(1).ok_or_else(|| {
-                    invalid("relationship record count exceeds the platform bound")
-                })?;
-                if bytes > limits.bytes_max || records > limits.records_max {
-                    return Err(invalid(
-                        "relationship acquisition exceeds the accepted record or byte bound",
-                    ));
-                }
-            }
+            admit_page_bytes(&page, &mut bytes, limits.bytes_max)?;
             let next = page.next_cursor.clone();
-            match &mut result {
-                Some(selected) => merge_page(selected, page)?,
-                None => {
-                    request.view = Some(page.view.id.clone());
-                    result = Some(page);
-                }
+            if let Some(selected) = &mut result {
+                merge_page(selected, page)?;
+            } else {
+                request.view = Some(page.view.id.clone());
+                result = Some(page);
             }
             let Some(next) = next else {
                 let selected = result.ok_or_else(|| invalid("relationship page is absent"))?;
@@ -295,6 +262,62 @@ impl GlobalClient {
         Err(invalid(
             "relationship acquisition exceeds the accepted request bound",
         ))
+    }
+}
+
+fn admit_page_bytes(
+    page: &RelationshipSearchPage,
+    bytes: &mut u64,
+    maximum: u64,
+) -> Result<(), RiftError> {
+    let serialized = page
+        .groups
+        .iter()
+        .flat_map(|group| {
+            group
+                .relationships
+                .iter()
+                .map(serde_json::to_vec)
+                .chain(group.occurrences.iter().map(serde_json::to_vec))
+        })
+        .chain(page.symbols.iter().map(serde_json::to_vec))
+        .chain(page.sources.iter().map(serde_json::to_vec));
+    for encoded in serialized {
+        let encoded = encoded.map_err(|source| {
+            failure::response_source(
+                "relationship_pages",
+                "relationships",
+                "JSON serialization failed",
+                None,
+                source,
+            )
+        })?;
+        *bytes = bytes
+            .checked_add(
+                u64::try_from(encoded.len())
+                    .map_err(|_| invalid("relationship byte count exceeds the platform bound"))?,
+            )
+            .ok_or_else(|| invalid("relationship byte count exceeds the platform bound"))?;
+        if *bytes > maximum {
+            return Err(invalid(
+                "relationship acquisition exceeds the accepted record or byte bound",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn completion_progress(
+    selected: Option<&RelationshipSearchPage>,
+    page: &RelationshipSearchPage,
+) -> bool {
+    match selected {
+        Some(selected) => selected
+            .groups
+            .iter()
+            .zip(&page.groups)
+            .any(|(previous, group)| !previous.complete && group.complete),
+        None => page.groups.iter().any(|group| group.complete),
     }
 }
 
@@ -414,20 +437,18 @@ fn validate_page(
             "relationship page metadata or requested groups differ",
         ));
     }
-    let mut count = 0usize;
+    let count = page_record_ids(page)?.len();
     for (seed, group) in request.relationships.seeds.iter().zip(&page.groups) {
         if seed != &group.seed {
             return Err(invalid(
                 "relationship page omitted or reordered a requested subject",
             ));
         }
-        count = count
-            .checked_add(group.relationships.len())
-            .ok_or_else(|| invalid("relationship page count exceeds the platform bound"))?;
-        count = count
-            .checked_add(group.occurrences.len())
-            .ok_or_else(|| invalid("relationship page count exceeds the platform bound"))?;
-        for occurrence in &group.occurrences {
+        if group.relationships.len() > 1_000 || group.occurrences.len() > 1_000 {
+            return Err(invalid("relationship projections exceed their page bound"));
+        }
+        for record in &group.occurrences {
+            let occurrence = &record.occurrence;
             SymbolIdentity::parse(occurrence.target.as_str())?;
             if let Some(enclosing) = &occurrence.enclosing {
                 SymbolIdentity::parse(enclosing.as_str())?;
@@ -498,6 +519,29 @@ fn validate_page(
         ));
     }
     Ok(())
+}
+
+fn page_record_ids(page: &RelationshipSearchPage) -> Result<HashSet<&str>, RiftError> {
+    let mut ids = HashSet::new();
+    for record in page.groups.iter().flat_map(|group| &group.relationships) {
+        if !ids.insert(record.id.as_str()) {
+            return Err(invalid(
+                "relationship record identity repeats within a page",
+            ));
+        }
+    }
+    let mut usages = std::collections::BTreeMap::new();
+    for record in page.groups.iter().flat_map(|group| &group.occurrences) {
+        if let Some(previous) = usages.insert(record.id.as_str(), record.relationship.as_ref())
+            && previous != record.relationship.as_ref()
+        {
+            return Err(invalid(
+                "original usage record changed its relationship link",
+            ));
+        }
+    }
+    ids.extend(usages.into_keys());
+    Ok(ids)
 }
 
 fn merge_page(

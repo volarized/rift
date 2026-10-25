@@ -39,11 +39,43 @@ pub struct RetainedResult {
 
 /// Adapter-owned local service inputs; callbacks perform no acquisition or I/O.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryServices {
     /// Complete results from existing ranked, regex, revision and change producers.
     pub retrievals: Vec<QueryServiceData>,
     /// Previously retained binding tables.
     pub bindings: Vec<RetainedResult>,
+    /// Complete facts for additional accepted named graphs.
+    pub datasets: Vec<QueryDataset>,
+}
+
+/// One accepted named graph and its complete original selected facts.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryDataset {
+    /// Expanded graph IRI resolved by the serving owner.
+    pub graph: String,
+    /// Facts acquired from the graph's selected publication.
+    pub facts: QueryFacts,
+    /// Original identities and the exact public identities advertised for this owner.
+    pub identities: QueryIdentities,
+    /// Whether this owner contributes facts to the default graph.
+    pub default: bool,
+}
+
+/// Checked identity translation applied before RDF matching and joins.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueryIdentities {
+    /// Original and advertised canonical symbol identities.
+    pub symbols: Vec<(rift_protocol::read::SymbolId, rift_protocol::read::SymbolId)>,
+    /// Original and advertised physical source-unit identities.
+    pub sources: Vec<(
+        rift_protocol::read::SourceUnitId,
+        rift_protocol::read::SourceUnitId,
+    )>,
+    /// Full selection digest used to scope generated blank-node labels.
+    pub blank_prefix: rift_protocol::identity::SourceDigest,
 }
 
 impl QueryServices {
@@ -51,7 +83,7 @@ impl QueryServices {
         self,
         mut evaluator: SparqlEvaluator,
         limits: QueryLimits,
-        cancellation: QueryCancellation,
+        cancellation: &QueryCancellation,
     ) -> Result<SparqlEvaluator, QueryError> {
         if !self.retrievals.is_empty() {
             evaluator = evaluator.with_service_handler(
@@ -357,7 +389,7 @@ pub(super) fn request(
             | GraphPattern::Minus { left, right }
             | GraphPattern::LeftJoin { left, right, .. }
             | GraphPattern::Lateral { left, right } => {
-                pending.extend([left.as_ref(), right.as_ref()])
+                pending.extend([left.as_ref(), right.as_ref()]);
             }
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }
@@ -430,12 +462,12 @@ fn input(
             ));
         }
     };
-    if let Some(previous) = fields.insert(key.to_owned(), value.clone()) {
-        if previous != value {
-            return Err(failure::parse(format!(
-                "retrieval input {key} carries conflicting values"
-            )));
-        }
+    if let Some(previous) = fields.insert(key.to_owned(), value.clone())
+        && previous != value
+    {
+        return Err(failure::parse(format!(
+            "retrieval input {key} carries conflicting values"
+        )));
     }
     Ok(())
 }
@@ -505,7 +537,7 @@ fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPa
             | GraphPattern::Minus { left, right }
             | GraphPattern::LeftJoin { left, right, .. }
             | GraphPattern::Lateral { left, right } => {
-                pending.extend([left.as_mut(), right.as_mut()])
+                pending.extend([left.as_mut(), right.as_mut()]);
             }
             GraphPattern::Filter { inner, .. }
             | GraphPattern::Extend { inner, .. }

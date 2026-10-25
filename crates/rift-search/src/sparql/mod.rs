@@ -1,5 +1,6 @@
 //! Library-owned SPARQL evaluation over immutable domain facts.
 
+use crate::query::FactRequirement;
 mod dataset;
 mod failure;
 mod page;
@@ -22,7 +23,9 @@ pub use crate::query::{
 pub use page::{PageForm, PageSelection, continuation_query};
 pub use plan::QueryPlan;
 pub use recipes::retrieval_query;
-pub use services::{QueryServiceData, QueryServices, RetainedResult};
+pub use services::{
+    QueryDataset, QueryIdentities, QueryServiceData, QueryServices, RetainedResult,
+};
 
 macro_rules! vocabulary_iri {
     ($term:literal) => {
@@ -149,23 +152,16 @@ impl PreparedQuery {
         facts: QueryFacts,
         limits: QueryLimits,
         cancellation: QueryCancellation,
-        services: QueryServices,
+        mut services: QueryServices,
     ) -> Result<QueryAnswer, QueryError> {
         services.validate(&self.requirements)?;
-        for family in &facts.unavailable_families {
-            let required = match family {
-                QueryFactFamily::Nodes => self.requirements.nodes,
-                QueryFactFamily::History => self.requirements.history,
-                QueryFactFamily::Documentation => self.requirements.documentation,
-            };
-            if required {
-                return Err(failure::invalid(format!(
-                    "selected publication does not contain required {family:?} facts"
-                )));
-            }
+        self.requirements.validate_facts(&facts)?;
+        for selected in &services.datasets {
+            self.requirements.validate_facts(&selected.facts)?;
         }
-        let dataset = dataset::VirtualDataset::new(facts, limits, cancellation.0.clone())?;
-        let evaluator = services.install(SparqlEvaluator::new(), limits, cancellation.clone())?;
+        let dataset = dataset::VirtualDataset::new(facts, limits, cancellation.0.clone())?
+            .with_datasets(std::mem::take(&mut services.datasets))?;
+        let evaluator = services.install(SparqlEvaluator::new(), limits, &cancellation)?;
         let result = evaluator
             .with_cancellation_token(cancellation.0)
             .for_query(self.query.clone())
@@ -173,6 +169,28 @@ impl PreparedQuery {
             .execute()
             .map_err(result::evaluation_error)?;
         result::collect(result, limits)
+    }
+}
+
+impl FactRequirements {
+    /// Checks that the selected publication contains every requested fact family.
+    ///
+    /// # Errors
+    /// Returns the mapping refusal for a required family absent from the publication.
+    pub fn validate_facts(&self, facts: &QueryFacts) -> Result<(), QueryError> {
+        for family in &facts.unavailable_families {
+            let required = match family {
+                QueryFactFamily::Nodes => self.requires(FactRequirement::Nodes),
+                QueryFactFamily::History => self.requires(FactRequirement::History),
+                QueryFactFamily::Documentation => self.requires(FactRequirement::Documentation),
+            };
+            if required {
+                return Err(failure::invalid(format!(
+                    "selected publication does not contain required {family:?} facts"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
