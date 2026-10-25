@@ -4,35 +4,45 @@ use rift_search::query::{FactRequirement, FactRequirements};
 #[tokio::test]
 async fn pattern_pages_and_exact_source_keep_the_original_publication()
 -> Result<(), Box<dyn std::error::Error>> {
-    original_pages("pattern").await
+    original_pages("pattern", false).await
 }
 
 #[tokio::test]
 async fn query_pages_and_exact_source_keep_the_original_publication()
 -> Result<(), Box<dyn std::error::Error>> {
-    original_pages("query").await
+    original_pages("query", false).await
 }
 
-async fn original_pages(selector: &str) -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::test]
+async fn revision_pages_and_exact_source_keep_the_resolved_commit()
+-> Result<(), Box<dyn std::error::Error>> {
+    original_pages("query", true).await
+}
+
+async fn original_pages(selector: &str, revision: bool) -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let original = "pub fn shared_alpha() {}\npub fn shared_beta() {}\n";
     std::fs::write(root.path().join("lib.rs"), original)?;
     crate::server::hermetic_workspace(root.path(), "")?;
+    let original_revision = revision_fixture(root.path(), revision)?;
     let server =
         RiftMcp::build_settled(root.path(), rift_index::WorkspaceIndexLimits::default()).await?;
     let mut selected = serde_json::json!({"target":"symbol", "scope":"local", "limit":1});
     selected[selector] = serde_json::json!("shared");
+    if revision {
+        selected["rev"] = serde_json::json!("main");
+    }
     let mut request: SearchParams = serde_json::from_value(selected)?;
-    let mut snapshot = server
-        .retrieval_snapshot(&request)
-        .await
-        .map_err(|failure| format!("original pattern selection: {failure:?}"))?
-        .ok_or("original pattern publication")?;
     let limits = rift_search::query::QueryLimits::try_from(
         &rift_protocol::query::QueryConfiguration::default(),
     )?;
     let deadline = server.request_deadline().await;
     let mut budget = QueryBudget::for_request(limits, deadline.at().into_std(), &|| false)?;
+    let mut snapshot = server
+        .retrieval_snapshot(&request, &budget, deadline)
+        .await
+        .map_err(|failure| format!("original pattern selection: {failure:?}"))?
+        .ok_or("original pattern publication")?;
     let (first, first_contributions) = server
         .retrieval_snapshot_page(&mut snapshot, request.clone(), &budget, deadline)
         .await
@@ -41,6 +51,9 @@ async fn original_pages(selector: &str) -> Result<(), Box<dyn std::error::Error>
     assert_eq!(first.pagination.total_pages, 2);
     let view = first.view.clone().ok_or("issued original view")?;
     std::fs::write(root.path().join("lib.rs"), "pub fn changed() {}\n")?;
+    if revision {
+        rift_history::fixture::commit_all(root.path(), "replace shared functions");
+    }
     request.page_index = 1;
     request.view = Some(view.id.clone());
     let (second, second_contributions) = server
@@ -56,11 +69,8 @@ async fn original_pages(selector: &str) -> Result<(), Box<dyn std::error::Error>
     assert!(!second_contributions[0].is_empty());
     assert_ne!(first_contributions, second_contributions);
     assert_ne!(first.results[0].range, second.results[0].range);
-    let original_input = snapshot
-        .resolved
-        .published
-        .reads
-        .local_search_view_input(true)?;
+    let original_input = snapshot.reads.local_search_view_input(true)?;
+    assert_eq!(original_input.captured_revision()?, original_revision);
     let selected = server
         .local_views
         .get()
@@ -88,4 +98,21 @@ async fn original_pages(selector: &str) -> Result<(), Box<dyn std::error::Error>
         "pub fn changed() {}\n"
     );
     Ok(())
+}
+
+fn revision_fixture(
+    root: &std::path::Path,
+    revision: bool,
+) -> Result<Option<rift_protocol::read::RevisionId>, Box<dyn std::error::Error>> {
+    Ok(if revision {
+        rift_history::fixture::init(root);
+        rift_history::fixture::commit_all(root, "introduce shared functions");
+        let resolved = rift_history::Repository::open(root)?
+            .resolve("main")?
+            .commit_id();
+        std::fs::write(root.join("lib.rs"), "pub fn working_only() {}\n")?;
+        Some(rift_protocol::read::RevisionId(resolved))
+    } else {
+        None
+    })
 }

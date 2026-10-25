@@ -787,6 +787,12 @@ impl ReadService {
         })
     }
 
+    /// Returns the fixed local owner of this captured workspace.
+    #[must_use]
+    pub const fn owner(&self) -> &rift_protocol::identity::SymbolOwner {
+        self.index.owner()
+    }
+
     /// Returns the immutable workspace index this snapshot serves.
     pub(crate) const fn index(&self) -> &WorkspaceIndex {
         &self.index

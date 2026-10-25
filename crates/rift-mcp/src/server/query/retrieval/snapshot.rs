@@ -7,13 +7,14 @@ use rift_protocol::read::{ReadWarning, SearchParams, SearchResult, SearchScope};
 use rift_protocol::symbol_read::CapturedView;
 
 use super::super::{QueryBudget, acquisition_failure};
-use crate::server::{ResolvedWorkspace, RiftMcp, ToolFailure};
+use crate::server::{RiftMcp, ToolFailure};
 
 #[cfg(test)]
 mod tests;
 
 pub(super) struct Snapshot {
-    resolved: ResolvedWorkspace,
+    reads: Arc<rift_server::ReadService>,
+    prepared: bool,
     answer: Arc<rift_server::StoreAnswer>,
     references: Arc<rift_server::EngineReferences>,
     warnings: Vec<ReadWarning>,
@@ -33,14 +34,21 @@ impl RiftMcp {
     pub(super) async fn retrieval_snapshot(
         &self,
         request: &SearchParams,
+        budget: &QueryBudget,
+        deadline: crate::server::RequestDeadline,
     ) -> Result<Option<Snapshot>, ToolFailure> {
         if request.view.is_some()
-            || request.rev.is_some()
             || request.change.is_some()
             || request.target == rift_protocol::read::SearchParamsTarget::Commit
             || request.scope != SearchScope::Local
         {
             return Ok(None);
+        }
+        if let Some(rev) = &request.rev {
+            return self
+                .revision_retrieval_snapshot(rev.clone(), budget, deadline)
+                .await
+                .map(Some);
         }
         let (resolved, answer, warnings, references, _) =
             self.current_search_inputs(request).await?;
@@ -48,15 +56,49 @@ impl RiftMcp {
             .published
             .configuration
             .accepted_for_tool(rift_protocol::error::ErrorPhase::Read)?;
+        let prepared = resolved.published.preparation.is_none();
+        let reads = Arc::clone(&resolved.published.reads);
+        let mut captured_warnings = Self::current_tree_warnings(&resolved, true);
+        captured_warnings.extend(warnings);
         Ok(Some(Snapshot {
-            resolved,
+            reads,
+            prepared,
             answer: Arc::new(answer),
             references: Arc::new(references),
-            warnings,
+            warnings: captured_warnings,
             configuration,
             view: None,
             sources: None,
         }))
+    }
+
+    async fn revision_retrieval_snapshot(
+        &self,
+        revision: rift_protocol::read::RevisionId,
+        budget: &QueryBudget,
+        deadline: crate::server::RequestDeadline,
+    ) -> Result<Snapshot, ToolFailure> {
+        let resolved = self
+            .published_workspace(rift_protocol::error::ErrorPhase::Read, deadline)
+            .await?;
+        let configuration = resolved
+            .published
+            .configuration
+            .accepted_for_tool(rift_protocol::error::ErrorPhase::Read)?;
+        let capture = self.revision_read_factory(&resolved.published, revision)?;
+        let reads = self
+            .query_work(budget, deadline, move |_| capture())
+            .await?;
+        Ok(Snapshot {
+            reads,
+            prepared: true,
+            answer: Arc::new(rift_server::StoreAnswer::identifier_only()),
+            references: Arc::default(),
+            warnings: Vec::new(),
+            configuration,
+            view: None,
+            sources: None,
+        })
     }
 
     pub(super) async fn retrieval_snapshot_page(
@@ -67,11 +109,11 @@ impl RiftMcp {
         deadline: crate::server::RequestDeadline,
     ) -> Result<(Box<SearchResult>, Vec<Vec<rift_core::ContributionKey>>), ToolFailure> {
         let first = snapshot.view.is_none();
-        let prepared = snapshot.resolved.published.preparation.is_none();
+        let prepared = snapshot.prepared;
         let answer = Arc::clone(&snapshot.answer);
         let references = Arc::clone(&snapshot.references);
         let configuration = snapshot.configuration.clone();
-        let reads = Arc::clone(&snapshot.resolved.published.reads);
+        let reads = Arc::clone(&snapshot.reads);
         let sources = snapshot.sources.as_ref().map(Arc::clone);
         let mut page = self
             .query_work(budget, deadline, move |budget| {
@@ -101,9 +143,6 @@ impl RiftMcp {
             })
             .await?;
         snapshot.sources = Some(Arc::clone(&page.sources));
-        page.result
-            .warnings
-            .extend(Self::current_tree_warnings(&snapshot.resolved, true));
         page.result
             .warnings
             .extend(snapshot.warnings.iter().cloned());

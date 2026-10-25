@@ -890,6 +890,23 @@ mod tests {
                 .iter()
                 .any(|symbol| symbol.symbol.name == "helper")
         );
+        for provider in &target.facts.providers {
+            for record in &provider.records {
+                let symbol = &target.facts.symbols[record.symbol_index];
+                assert_eq!(symbol.declarations.len(), record.declarations.len());
+                for declaration in &record.declarations {
+                    let published = &symbol.declarations[declaration.declaration_index];
+                    assert!(published.source_complete);
+                    assert!(
+                        published
+                            .source
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty())
+                    );
+                    assert_eq!(published.node, declaration.binding.node().cloned());
+                }
+            }
+        }
         assert_eq!(target.source(&target.facts)?, source);
         target.validate(&roots, &trees, &configuration)?;
         assert_eq!(
@@ -1116,6 +1133,191 @@ mod tests {
             error.slug(),
             rift_error::errors::server::read_cancelled::SLUG
         );
+        Ok(())
+    }
+    fn package_facts_with_equal_declarations()
+    -> Result<(rift_search::query::QueryFacts, usize), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        std::fs::write(
+            dependency.path().join("index.ts"),
+            "export function entry() { return 7; }\n",
+        )?;
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0","types":"./index.ts"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let target = QueryPackageTarget::prepare(
+            call_request(workspace.path(), dependency.path(), &roots)?,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )?;
+        let mut facts = target.facts;
+        let symbol = facts
+            .symbols
+            .iter()
+            .position(|entry| entry.symbol.name == "entry")
+            .expect("original package entry");
+        let record = facts
+            .providers
+            .iter_mut()
+            .flat_map(|provider| &mut provider.records)
+            .find(|record| record.symbol_index == symbol)
+            .expect("original provider record");
+        let original = record.declarations[0].clone();
+        let key = rift_core::ContributionKey::new(
+            original.contribution.reference().provider().clone(),
+            original.contribution.publication(),
+            rift_core::ProviderSymbolId::for_symbol("rift://symbol/local/typescript/secondary")?,
+        );
+        assert_ne!(key, original.contribution);
+        record.contributions.push(key.clone());
+        record.contributions.sort();
+        let declarations = &mut facts.symbols[symbol].declarations;
+        let index = declarations.len();
+        declarations.push(declarations[original.declaration_index].clone());
+        assert_eq!(
+            declarations[original.declaration_index],
+            declarations[index]
+        );
+        record
+            .declarations
+            .push(rift_search::query::QueryProviderDeclaration {
+                declaration_index: index,
+                contribution: key,
+                binding: original.binding,
+            });
+        facts.validate_providers()?;
+        Ok((facts, symbol))
+    }
+
+    #[test]
+    fn original_package_declaration_selectors_survive_repeated_merge() -> TestResult {
+        let (facts, symbol) = package_facts_with_equal_declarations()?;
+        let selectors = |facts: &rift_search::query::QueryFacts| {
+            facts
+                .providers
+                .iter()
+                .flat_map(|provider| &provider.records)
+                .flat_map(|record| &record.declarations)
+                .map(|declaration| {
+                    (
+                        declaration.contribution.clone(),
+                        declaration.declaration_index,
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let expected = selectors(&facts);
+        let encoded = serde_json::to_vec(&facts)?;
+        let mut held = rift_search::query::QueryFacts::default();
+        crate::engine_read::merge_package_facts(&mut held, serde_json::from_slice(&encoded)?)?;
+        assert_eq!(selectors(&held), expected);
+        for reversed in [false, true] {
+            let mut incoming: rift_search::query::QueryFacts = serde_json::from_slice(&encoded)?;
+            if reversed {
+                incoming.symbols[symbol].declarations.reverse();
+                for record in incoming
+                    .providers
+                    .iter_mut()
+                    .flat_map(|provider| &mut provider.records)
+                    .filter(|record| record.symbol_index == symbol)
+                {
+                    for declaration in &mut record.declarations {
+                        declaration.declaration_index = 1 - declaration.declaration_index;
+                    }
+                }
+            }
+            incoming.validate_providers()?;
+            crate::engine_read::merge_package_facts(&mut held, incoming)?;
+            assert_eq!(
+                selectors(&held),
+                expected,
+                "original key selectors changed; reversed {reversed}"
+            );
+        }
+        let records = &held.providers[0].records;
+        let record = records
+            .iter()
+            .find(|record| record.symbol_index == symbol)
+            .expect("held original provider record");
+        assert_eq!(held.symbols[record.symbol_index].declarations.len(), 2);
+        assert_eq!(
+            record
+                .declarations
+                .iter()
+                .map(|declaration| declaration.declaration_index)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1])
+        );
+        held.validate_providers()?;
+        Ok(())
+    }
+    #[test]
+    fn original_package_declaration_selectors_keep_distinct_captured_roots() -> TestResult {
+        let (first, symbol) = package_facts_with_equal_declarations()?;
+        let (second, second_symbol) = package_facts_with_equal_declarations()?;
+        assert_ne!(
+            first.providers[0].context.root,
+            second.providers[0].context.root
+        );
+        assert_eq!(first.symbols[symbol], second.symbols[second_symbol]);
+        let encoded = serde_json::to_vec(&second)?;
+        let mut held = first;
+        let original = held.providers[0]
+            .records
+            .iter()
+            .find(|record| record.symbol_index == symbol)
+            .expect("first original record")
+            .declarations
+            .clone();
+        for _ in 0..2 {
+            crate::engine_read::merge_package_facts(&mut held, serde_json::from_slice(&encoded)?)?;
+            assert_eq!(held.providers.len(), 2);
+            let first_record = held.providers[0]
+                .records
+                .iter()
+                .find(|record| record.symbol_index == symbol)
+                .expect("first original record");
+            assert_eq!(first_record.declarations, original);
+            let second_record = held.providers[1]
+                .records
+                .iter()
+                .find(|record| record.symbol_index == symbol)
+                .expect("second original record");
+            assert_eq!(second_record.declarations.len(), original.len());
+            for (first, second) in original.iter().zip(&second_record.declarations) {
+                assert_eq!(first.contribution, second.contribution);
+                assert_eq!(second.declaration_index, first.declaration_index + 2);
+            }
+            assert_eq!(held.symbols[symbol].declarations.len(), 4);
+            held.validate_providers()?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn unassociated_package_declarations_keep_canonical_merge_behavior() -> TestResult {
+        let (mut facts, _) = package_facts_with_equal_declarations()?;
+        facts.providers.clear();
+        for symbol in &mut facts.symbols {
+            for declaration in &mut symbol.declarations {
+                declaration.node = None;
+            }
+        }
+        facts.validate_providers()?;
+        let symbols = serde_json::to_value(&facts.symbols)?;
+        let sources = serde_json::to_value(&facts.sources)?;
+        let encoded = serde_json::to_vec(&facts)?;
+        let mut held = rift_search::query::QueryFacts::default();
+        for _ in 0..2 {
+            crate::engine_read::merge_package_facts(&mut held, serde_json::from_slice(&encoded)?)?;
+            assert_eq!(serde_json::to_value(&held.symbols)?, symbols);
+            assert_eq!(serde_json::to_value(&held.sources)?, sources);
+            assert!(held.providers.is_empty());
+            held.validate_providers()?;
+        }
         Ok(())
     }
 }

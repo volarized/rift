@@ -262,10 +262,16 @@ fn merge_record_evidence(
     Ok(())
 }
 
+#[derive(Default)]
+struct ProviderAssociation {
+    symbol: Option<usize>,
+    declarations: Vec<(usize, Option<usize>)>,
+}
+
 fn merge_provider_contexts(
     held: &mut rift_search::query::QueryFacts,
     providers: &[rift_search::query::QueryProviderSnapshot],
-) -> Result<(Vec<usize>, BTreeMap<usize, usize>), RiftError> {
+) -> Result<(Vec<usize>, BTreeMap<usize, ProviderAssociation>), RiftError> {
     // The array selector scopes original contribution keys to one checked captured graph.
     let mut provider_remap = Vec::with_capacity(providers.len());
     for snapshot in providers {
@@ -293,28 +299,62 @@ fn merge_provider_contexts(
     for (provider, snapshot) in held.providers.iter().enumerate() {
         for record in &snapshot.records {
             for key in &record.contributions {
-                associations.insert((provider, key.clone()), record.symbol_index);
+                associations.insert((provider, key), (record.symbol_index, None));
             }
-        }
-    }
-    let mut supplied_associations = BTreeMap::new();
-    for (provider, snapshot) in providers.iter().enumerate() {
-        let provider = provider_remap[provider];
-        for record in &snapshot.records {
-            for key in &record.contributions {
-                if let Some(index) = associations.get(&(provider, key.clone())) {
-                    match supplied_associations.insert(record.symbol_index, *index) {
-                        Some(previous) if previous != *index => {
-                            return unavailable(
-                                "captured provider contributions select conflicting records",
-                            )
-                            .fail();
-                        }
-                        _ => {}
-                    }
+            for declaration in &record.declarations {
+                if let Some(original) = associations.get_mut(&(provider, &declaration.contribution))
+                    && original
+                        .1
+                        .replace(declaration.declaration_index)
+                        .is_some_and(|index| index != declaration.declaration_index)
+                {
+                    return unavailable("captured provider declaration selectors conflict within their original source context").fail();
                 }
             }
         }
+    }
+    let mut supplied_associations = BTreeMap::<usize, ProviderAssociation>::new();
+    for (provider, snapshot) in providers.iter().enumerate() {
+        let provider = provider_remap[provider];
+        for record in &snapshot.records {
+            let selected = supplied_associations
+                .entry(record.symbol_index)
+                .or_default();
+            for key in &record.contributions {
+                if let Some((index, _)) = associations.get(&(provider, key))
+                    && selected
+                        .symbol
+                        .replace(*index)
+                        .is_some_and(|previous| previous != *index)
+                {
+                    return unavailable(
+                        "captured provider contributions select conflicting records",
+                    )
+                    .fail();
+                }
+            }
+            selected
+                .declarations
+                .try_reserve_exact(record.declarations.len())
+                .map_err(|error| unavailable(error.to_string()))?;
+            for declaration in &record.declarations {
+                let original = associations
+                    .get(&(provider, &declaration.contribution))
+                    .and_then(|(_, index)| *index);
+                selected
+                    .declarations
+                    .push((declaration.declaration_index, original));
+            }
+        }
+    }
+    for association in supplied_associations.values_mut() {
+        association.declarations.sort_unstable();
+        for pair in association.declarations.windows(2) {
+            if pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1 {
+                return unavailable("captured provider declaration selectors conflict within their original source context").fail();
+            }
+        }
+        association.declarations.dedup();
     }
     Ok((provider_remap, supplied_associations))
 }
@@ -370,7 +410,7 @@ fn merge_sources(
 fn merge_symbols(
     held: &mut rift_search::query::QueryFacts,
     symbols: Vec<rift_search::query::QuerySymbol>,
-    supplied_associations: &BTreeMap<usize, usize>,
+    supplied_associations: &BTreeMap<usize, ProviderAssociation>,
 ) -> Result<Vec<(usize, Vec<usize>)>, RiftError> {
     let mut identities = held
         .symbols
@@ -385,28 +425,22 @@ fn merge_symbols(
             .id
             .as_ref()
             .and_then(|identity| identities.get(identity).copied())
-            .or_else(|| supplied_associations.get(&supplied_index).copied());
+            .or_else(|| {
+                supplied_associations
+                    .get(&supplied_index)
+                    .and_then(|association| association.symbol)
+            });
         let (position, declarations) = if let Some(position) = previous {
             let previous = &mut held.symbols[position];
             if previous.symbol != symbol.symbol {
                 return unavailable("dependency declarations disagree within the selected source")
                     .fail();
             }
-            let mut declarations = Vec::with_capacity(symbol.declarations.len());
-            for declaration in symbol.declarations {
-                let index = if let Some(index) = previous
-                    .declarations
-                    .iter()
-                    .position(|held| held == &declaration)
-                {
-                    index
-                } else {
-                    let index = previous.declarations.len();
-                    previous.declarations.push(declaration);
-                    index
-                };
-                declarations.push(index);
-            }
+            let declarations = merge_declarations(
+                &mut previous.declarations,
+                symbol.declarations,
+                supplied_associations.get(&supplied_index),
+            )?;
             (position, declarations)
         } else {
             let position = held.symbols.len();
@@ -420,6 +454,51 @@ fn merge_symbols(
         symbol_remap.push((position, declarations));
     }
     Ok(symbol_remap)
+}
+
+fn merge_declarations(
+    held: &mut Vec<rift_protocol::symbol_read::SymbolDeclaration>,
+    supplied: Vec<rift_protocol::symbol_read::SymbolDeclaration>,
+    association: Option<&ProviderAssociation>,
+) -> Result<Vec<usize>, RiftError> {
+    let mut remap = Vec::new();
+    remap
+        .try_reserve_exact(supplied.len())
+        .map_err(|error| unavailable(error.to_string()))?;
+    for (supplied_index, declaration) in supplied.into_iter().enumerate() {
+        let original = association.and_then(|association| {
+            association
+                .declarations
+                .binary_search_by_key(&supplied_index, |entry| entry.0)
+                .ok()
+                .map(|index| association.declarations[index].1)
+        });
+        let selected = match original {
+            Some(Some(index)) => {
+                if held.get(index) != Some(&declaration) {
+                    return unavailable(
+                        "captured provider declaration differs within its original source context",
+                    )
+                    .fail();
+                }
+                Some(index)
+            }
+            Some(None) => None,
+            // These canonical artifact rows have no provider association to remap.
+            None => held.iter().position(|previous| previous == &declaration),
+        };
+        let index = if let Some(index) = selected {
+            index
+        } else {
+            held.try_reserve(1)
+                .map_err(|error| unavailable(error.to_string()))?;
+            let index = held.len();
+            held.push(declaration);
+            index
+        };
+        remap.push(index);
+    }
+    Ok(remap)
 }
 
 fn merge_provider_snapshots(

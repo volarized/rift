@@ -391,6 +391,41 @@ fn every_package_provider_keeps_canonical_facts_and_reports_actual_calls() {
             reused.files()[0].file().syntax_facts(),
             retained[1].facts()
         ));
+        let original_bytes = canonical(&reused);
+        let (publication, _, semantics, _, positions) = reused.into_parts_with_declarations();
+        let (fresh_publication, _, _, _, fresh_positions) = fresh.into_parts_with_declarations();
+        assert_eq!(
+            canonical_json(&publication).expect("same artifact encoding"),
+            original_bytes
+        );
+        assert_eq!(publication, fresh_publication);
+        assert_eq!(
+            positions, fresh_positions,
+            "original associations survive supplied syntax"
+        );
+        assert_eq!(positions.len(), publication.declarations.len());
+        for (record, contribution, declaration) in positions {
+            let record = &semantics.graph().records()[record];
+            let key = &record.contributions()[contribution];
+            let binding = semantics
+                .graph()
+                .contribution(key)
+                .expect("original contribution")
+                .source()
+                .expect("published binding");
+            let declarations = publication
+                .declarations
+                .iter()
+                .filter(|item| item.unit.0 == binding.unit().to_string())
+                .collect::<Vec<_>>();
+            assert!(
+                declarations
+                    .iter()
+                    .any(|item| item.range.start == binding.range().start()
+                        && item.range.end == binding.range().end())
+            );
+            assert!(declaration < publication.declarations.len());
+        }
     }
 }
 

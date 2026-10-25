@@ -306,3 +306,71 @@ fn provider_target_keys_preserve_adjacent_u64_revisions() -> Result<(), Box<dyn 
     assert_ne!(record.key(&first)?, record.key(&second)?);
     Ok(())
 }
+
+#[test]
+fn accepted_configuration_digests_preserve_adjacent_large_counts() {
+    let mut first = rift_protocol::configuration::WorkspaceConfiguration::default();
+    let mut second = rift_protocol::configuration::WorkspaceConfiguration::default();
+    first.global.max_symbols = 1_u64 << 53;
+    second.global.max_symbols = first.global.max_symbols + 1;
+    first.validate().expect("accepted positive global count");
+    second.validate().expect("accepted adjacent global count");
+    assert_ne!(
+        serde_json::to_vec(&first).expect("first accepted configuration"),
+        serde_json::to_vec(&second).expect("second accepted configuration")
+    );
+    assert_ne!(
+        crate::query::QueryProviderSelection::configuration_digest(&first)
+            .expect("first configuration digest"),
+        crate::query::QueryProviderSelection::configuration_digest(&second)
+            .expect("second configuration digest"),
+    );
+}
+
+#[test]
+fn accepted_configuration_digests_ignore_object_order_and_keep_array_order() {
+    use crate::query::QueryProviderSelection;
+    use rift_protocol::configuration::WorkspaceConfiguration;
+
+    let first: WorkspaceConfiguration = serde_json::from_str(
+        r#"{
+        "lsp":{"probe":{"command":["unused-server"],"initialization_options":{
+            "z":{"b":2,"a":1},"a":[{"z":1,"a":2},3]
+        }}}
+    }"#,
+    )
+    .expect("first accepted options");
+    let second: WorkspaceConfiguration = serde_json::from_str(
+        r#"{
+        "lsp":{"probe":{"command":["unused-server"],"initialization_options":{
+            "a":[{"a":2,"z":1},3],"z":{"a":1,"b":2}
+        }}}
+    }"#,
+    )
+    .expect("reordered accepted options");
+    first.validate().expect("accepted first configuration");
+    second.validate().expect("accepted reordered configuration");
+    assert_eq!(first, second);
+    assert_ne!(
+        serde_json::to_vec(&first).expect("first source order"),
+        serde_json::to_vec(&second).expect("second source order")
+    );
+    let digest = QueryProviderSelection::configuration_digest(&first).expect("first digest");
+    assert_eq!(
+        digest,
+        QueryProviderSelection::configuration_digest(&second).expect("reordered digest")
+    );
+    let mut changed = second;
+    changed
+        .lsp
+        .get_mut("probe")
+        .expect("original process")
+        .initialization_options = Some(serde_json::json!({
+        "a":[3,{"a":2,"z":1}],"z":{"a":1,"b":2}
+    }));
+    changed.validate().expect("accepted changed array");
+    assert_ne!(
+        digest,
+        QueryProviderSelection::configuration_digest(&changed).expect("changed digest")
+    );
+}

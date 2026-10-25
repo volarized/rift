@@ -3459,6 +3459,25 @@ impl RiftMcp {
         let Some(rev) = rev else {
             return self.current_tree_read(&resolved, true, operation).await;
         };
+        let capture = self.revision_read_factory(&resolved.published, rev)?;
+        self.blocking
+            .run("revision workspace read", move || {
+                let reads = capture()?;
+                operation(&reads)
+            })
+            .await
+            .map(Json)
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
+    }
+
+    fn revision_read_factory(
+        &self,
+        published: &PublishedWorkspace,
+        rev: rift_protocol::read::RevisionId,
+    ) -> Result<
+        impl FnOnce() -> Result<Arc<ReadService>, RiftError> + Send + 'static + use<>,
+        ToolFailure,
+    > {
         let RevisionRead {
             root,
             limits,
@@ -3466,27 +3485,24 @@ impl RiftMcp {
             text_inclusion,
             languages,
             history,
-        } = self.revision_read(&resolved.published)?;
+        } = self.revision_read(published)?;
+        let owner = published.reads.owner().clone();
         let stored = self.history.as_ref().map(|lane| lane.stored().clone());
-        self.blocking
-            .run("revision workspace read", move || {
-                let reads = ReadService::at_revision_with_languages(
-                    &root,
-                    &rev,
-                    limits,
-                    &visibility,
-                    &text_inclusion,
-                    &languages,
-                    history,
-                )?;
-                if let Some(stored) = &stored {
-                    reads.attach_history_store(stored);
-                }
-                operation(&reads)
-            })
-            .await
-            .map(Json)
-            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
+        Ok(move || {
+            let reads = Arc::new(ReadService::at_revision_with_owner(
+                (&root, owner),
+                &rev,
+                limits,
+                &visibility,
+                &text_inclusion,
+                &languages,
+                history,
+            )?);
+            if let Some(stored) = &stored {
+                reads.attach_history_store(stored);
+            }
+            Ok(reads)
+        })
     }
 
     /// The workspace policy one read of committed source applies, derived once from the
@@ -7799,7 +7815,7 @@ done
         assert_eq!(
             text,
             "1 error\n\tinvalid_request · retry never\n\
-             \t\tthe request does not match the documented form: field limit, \
+             \t\tthe request does not match the documented form: field declaration_limit, \
              violation zero; \
              correct the reported field and resend the request\n\
              \t\trift.server.read_invalid\n"

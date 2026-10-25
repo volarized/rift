@@ -57,7 +57,7 @@ pub(super) fn capture(
         configuration,
         selection,
     } = input;
-    let (_, files, semantics, _) = analysis.into_parts();
+    let (_, files, semantics, _, declaration_positions) = analysis.into_parts_with_declarations();
     let graph = semantics.graph();
     let inputs = captured
         .iter()
@@ -115,6 +115,7 @@ pub(super) fn capture(
     let shared_context = std::sync::Arc::new(context);
     let mut records = RecordCapture {
         graph,
+        declaration_positions: &declaration_positions,
         semantics: &semantics,
         files: &files,
         source,
@@ -136,6 +137,7 @@ pub(super) fn capture(
 
 struct RecordCapture<'capture> {
     graph: &'capture NormalizedGraph,
+    declaration_positions: &'capture [(usize, usize, usize)],
     semantics: &'capture WorkspaceSemantics,
     files: &'capture [AnalyzedFile],
     source: &'capture SelectedSource,
@@ -156,17 +158,18 @@ impl RecordCapture<'_> {
         budget: &mut Option<&mut crate::QueryFactBudget<'_>>,
     ) -> Result<(), RiftError> {
         let graph = self.graph;
-        for record in graph.records() {
+        for (record_index, record) in graph.records().iter().enumerate() {
             if cancelled() {
                 return rift_error::errors::server::read_cancelled().fail();
             }
-            self.capture_record(record, facts, snapshot, budget)?;
+            self.capture_record(record_index, record, facts, snapshot, budget)?;
         }
         Ok(())
     }
 
     fn capture_record(
         &mut self,
+        record_index: usize,
         record: &SymbolRecord,
         facts: &mut QueryFacts,
         snapshot: &mut QueryProviderSnapshot,
@@ -209,7 +212,9 @@ impl RecordCapture<'_> {
         });
         let mut payload = QuerySymbol {
             symbol,
-            declarations: Vec::new(),
+            declarations: existing.map_or_else(Vec::new, |index| {
+                std::mem::take(&mut facts.symbols[index].declarations)
+            }),
         };
         let mut bindings = Vec::new();
         let target = record
@@ -227,13 +232,27 @@ impl RecordCapture<'_> {
             context: Some(Arc::clone(&self.context)),
             target,
         };
-        for key in record.contributions() {
-            self.capture_declaration(key, combined, &selected_target, &mut payload, &mut bindings)?;
+        for (contribution_index, key) in record.contributions().iter().enumerate() {
+            self.capture_declaration(
+                (key, (record_index, contribution_index)),
+                combined,
+                &selected_target,
+                &mut payload,
+                &mut bindings,
+            )?;
         }
         if bindings.is_empty() {
+            if let Some(index) = existing {
+                facts.symbols[index].declarations = payload.declarations;
+            }
             return Ok(());
         }
-        let symbol_index = merge_payload(facts, payload, existing, &mut bindings);
+        let symbol_index = existing.unwrap_or(facts.symbols.len());
+        if let Some(index) = existing {
+            facts.symbols[index].declarations = payload.declarations;
+        } else {
+            facts.symbols.push(payload);
+        }
         snapshot.records.push(QueryProviderRecord {
             symbol_index,
             identity: record.identity().cloned(),
@@ -249,7 +268,7 @@ impl RecordCapture<'_> {
 
     fn capture_declaration(
         &mut self,
-        key: &ContributionKey,
+        (key, position): (&ContributionKey, (usize, usize)),
         combined: &PortableSymbolFacts,
         selected_target: &QueryProviderTarget,
         payload: &mut QuerySymbol,
@@ -297,8 +316,14 @@ impl RecordCapture<'_> {
             file.source(),
             &unit,
         )?;
-        let declaration_index = payload.declarations.len();
-        payload.declarations.push(declaration);
+        let declaration_index = retain_declaration(
+            &mut payload.declarations,
+            declaration,
+            self.declaration_positions
+                .binary_search_by_key(&position, |original| (original.0, original.1))
+                .ok()
+                .map(|index| self.declaration_positions[index].2),
+        )?;
         bindings.push(QueryProviderDeclaration {
             declaration_index,
             contribution: key.clone(),
@@ -377,32 +402,38 @@ fn declaration(
     })
 }
 
-fn merge_payload(
-    facts: &mut QueryFacts,
-    payload: QuerySymbol,
-    existing: Option<usize>,
-    bindings: &mut [QueryProviderDeclaration],
-) -> usize {
-    let symbol_index = existing.unwrap_or(facts.symbols.len());
-    if let Some(index) = existing {
-        let original = &mut facts.symbols[index];
-        for binding in bindings {
-            let declaration = &payload.declarations[binding.declaration_index];
-            let index = original
-                .declarations
-                .iter()
-                .position(|held| held == declaration)
-                .unwrap_or_else(|| {
-                    let index = original.declarations.len();
-                    original.declarations.push(declaration.clone());
-                    index
-                });
-            binding.declaration_index = index;
+fn retain_declaration(
+    declarations: &mut Vec<rift_protocol::symbol_read::SymbolDeclaration>,
+    supplied: rift_protocol::symbol_read::SymbolDeclaration,
+    original: Option<usize>,
+) -> Result<usize, RiftError> {
+    if let Some(index) = original {
+        let published = declarations
+            .get_mut(index)
+            .ok_or_else(|| unavailable("the original publication declaration is missing"))?;
+        if published.origin != supplied.origin
+            || published.unit != supplied.unit
+            || published.range != supplied.range
+            || published.line != supplied.line
+            || published.signature_indices != supplied.signature_indices
+            || published.type_indices != supplied.type_indices
+            || published.documentation_indices != supplied.documentation_indices
+        {
+            return unavailable(
+                "the original publication declaration differs from its provider binding",
+            )
+            .fail();
         }
+        published.node = supplied.node;
+        Ok(index)
     } else {
-        facts.symbols.push(payload);
+        declarations
+            .try_reserve(1)
+            .map_err(|error| unavailable(error.to_string()))?;
+        let index = declarations.len();
+        declarations.push(supplied);
+        Ok(index)
     }
-    symbol_index
 }
 
 fn capture_edges(
@@ -445,4 +476,62 @@ fn capture_edges(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn declaration(source: Option<&str>) -> rift_protocol::symbol_read::SymbolDeclaration {
+        rift_protocol::symbol_read::SymbolDeclaration {
+            origin: AssembledSymbol::wire_origin(
+                &rift_core::ContributionOrigin::new(None, rift_core::SourceKind::Synthetic)
+                    .expect("fixture origin"),
+            ),
+            path: None,
+            unit: Some(SourceUnitId("rift://source/local/lib.rs".to_owned())),
+            range: TextRange { start: 0, end: 14 },
+            line: 1,
+            node: None,
+            source: source.map(str::to_owned),
+            source_complete: source.is_some(),
+            signature_indices: vec![0],
+            type_indices: Vec::new(),
+            documentation_indices: vec![0],
+        }
+    }
+
+    #[test]
+    fn original_publication_declaration_keeps_source_and_metadata() {
+        let original = declaration(Some("fn beacon() {}"));
+        let mut declarations = vec![original.clone()];
+        assert_eq!(
+            retain_declaration(&mut declarations, declaration(None), Some(0))
+                .expect("same original association"),
+            0
+        );
+        assert_eq!(declarations, vec![original]);
+        let mut foreign = declaration(None);
+        foreign.signature_indices = vec![1];
+        assert!(retain_declaration(&mut declarations, foreign, Some(0)).is_err());
+        assert!(retain_declaration(&mut declarations, declaration(None), Some(1)).is_err());
+    }
+
+    #[test]
+    fn distinct_original_declaration_positions_preserve_equal_payloads() {
+        let original = declaration(Some("fn beacon() {}"));
+        let mut declarations = vec![original.clone(), original.clone()];
+        assert_eq!(
+            retain_declaration(&mut declarations, declaration(None), Some(1))
+                .expect("second original association"),
+            1
+        );
+        assert_eq!(declarations, vec![original.clone(), original]);
+        assert_eq!(
+            retain_declaration(&mut declarations, declaration(None), None)
+                .expect("unpublished physical association"),
+            2
+        );
+        assert_eq!(declarations.len(), 3);
+    }
 }

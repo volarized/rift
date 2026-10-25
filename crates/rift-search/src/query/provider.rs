@@ -73,14 +73,17 @@ impl QueryProviderSelection {
     pub fn configuration_digest(
         configuration: &rift_protocol::configuration::WorkspaceConfiguration,
     ) -> Result<SourceDigest, rift_error::RiftError> {
-        let bytes = rift_protocol::canonical::canonical_json(configuration).map_err(|error| {
+        let invalid = |error: serde_json::Error| {
             rift_error::errors::server::read_unavailable()
                 .operation("query provider configuration")
                 .detail(error.to_string())
                 .error()
-        })?;
+        };
+        let mut value = serde_json::to_value(configuration).map_err(invalid)?;
+        value.sort_all_objects();
+        let bytes = serde_json::to_vec(&value).map_err(invalid)?;
         SourceDigest::parse(
-            &data_encoding::HEXLOWER.encode(rift_core::FileDigest::of(bytes.as_bytes()).as_bytes()),
+            &data_encoding::HEXLOWER.encode(rift_core::FileDigest::of(&bytes).as_bytes()),
         )
     }
 }

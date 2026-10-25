@@ -28,7 +28,7 @@ impl RiftMcp {
             paging.limit = Some(request.limit.unwrap_or(rift_protocol::read::PAGE_LIMIT_MAX));
             let mut selected: Option<Box<SearchResult>> = None;
             let mut contributions = Vec::new();
-            let mut snapshot = self.retrieval_snapshot(request).await?;
+            let mut snapshot = self.retrieval_snapshot(request, budget, deadline).await?;
             loop {
                 requests.claim().map_err(failure)?;
                 let captured = crate::global::CapturedGlobalViews::default();

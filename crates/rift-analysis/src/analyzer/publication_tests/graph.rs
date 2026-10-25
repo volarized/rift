@@ -206,7 +206,8 @@ impl GraphFixture {
             .collect::<Result<Vec<_>, _>>()?;
         let input =
             ExactPackageInput::new(&self.owner, &self.language, &self.origin, &sources, limits)?;
-        publish(&input, self.analysis.files(), semantics, false).map(|(publication, _)| publication)
+        publish(&input, self.analysis.files(), semantics, false)
+            .map(|(publication, _, _)| publication)
     }
 }
 
@@ -762,5 +763,89 @@ fn four_byte_names_keep_full_artifact_facts_and_neighbor_publication() {
         let restored: PackagePublication =
             serde_json::from_value(wire).expect("full artifact restore");
         assert_eq!(&restored, publication);
+    }
+}
+
+#[test]
+fn original_declaration_positions_keep_distinct_keys_and_obey_count_admission() {
+    let fixture = GraphFixture::new();
+    let graph = fixture.analysis.semantics.graph();
+    let original = graph
+        .records()
+        .iter()
+        .flat_map(rift_core::SymbolRecord::contributions)
+        .find_map(|key| {
+            graph.contribution(key).filter(|contribution| {
+                contribution.source().is_some() && contribution.identity_anchor().is_some()
+            })
+        })
+        .expect("captured declaration");
+    let contributions = ["left", "right"]
+        .into_iter()
+        .map(|name| {
+            Contribution::builder(
+                ContributionKey::new(
+                    GraphFixture::provider(),
+                    ProviderRevision::new(1).expect("revision"),
+                    ProviderSymbolId::for_symbol(
+                        format!("{}/{name}", fixture.identity("start").as_str()).as_str(),
+                    )
+                    .expect("distinct provider key"),
+                ),
+                SourceApplicability::Independent,
+                original.facts().expect("captured facts").clone(),
+                original.origin().clone(),
+            )
+            .source(original.source().expect("captured binding").clone())
+            .identity_anchor(
+                original
+                    .identity_anchor()
+                    .expect("captured identity")
+                    .clone(),
+            )
+            .build()
+            .expect("distinct original contribution")
+        })
+        .collect();
+    let semantics = GraphFixture::graph_with_contributions(contributions);
+    let mut previous = Vec::new();
+    for limit in [1, 2] {
+        let mut records = Records::default();
+        records.publication.symbols = limit;
+        let origin = symbol_origin(&fixture.owner, &fixture.origin).expect("published origin");
+        for held in fixture.analysis.files() {
+            records
+                .file(&fixture.owner, held)
+                .expect("published source");
+        }
+        records
+            .graph(
+                &fixture.owner,
+                &origin,
+                &semantics,
+                fixture.analysis.files(),
+            )
+            .expect("original graph projection");
+        assert_eq!(
+            records.declarations.len(),
+            usize::try_from(limit).expect("count")
+        );
+        assert_eq!(records.symbols_truncated, limit == 1);
+        if limit == 2 {
+            assert_ne!(
+                records.declarations[0].position,
+                records.declarations[1].position
+            );
+            assert_eq!(
+                records.declarations[0].publication,
+                records.declarations[1].publication
+            );
+            assert_eq!(records.declarations[0].publication, previous[0]);
+        }
+        previous = records
+            .declarations
+            .into_iter()
+            .map(|declaration| declaration.publication)
+            .collect();
     }
 }

@@ -29,6 +29,11 @@ impl ReadService {
         self.validated_pattern(&params, &store, &references)?;
         super::accepted_query(&params)?;
         super::search_page_limit(&params)?;
+        if self.revision().is_some() && super::force_include_requested(&params) {
+            return rift_error::errors::server::read_unsupported()
+                .capability("force_include at a revision")
+                .fail();
+        }
         let selected = self.selected_paths(params.paths.as_ref())?;
         Ok(SearchSnapshot {
             reads: self,
