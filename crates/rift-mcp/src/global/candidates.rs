@@ -97,6 +97,7 @@ pub(crate) fn package_candidate_pool(
                 Ok(rift_server::SearchCandidateItem {
                     ranked,
                     hit: candidate.hit,
+                    contributions: Vec::new(),
                 })
             })
             .collect::<Result<Vec<_>, RiftError>>()
@@ -120,13 +121,43 @@ pub(crate) fn package_candidate_pool(
     }))
 }
 
-/// Combines captured input orders once, then applies one result bound and page.
-pub(crate) fn merge_candidate_pools(
+pub(crate) fn merge_candidate_pools_with_contributions(
     params: &SearchParams,
     pools: &[SearchCandidatePool],
     weights: RankingWeights,
     results_max: usize,
-) -> Result<SearchResult, RiftError> {
+    budget: Option<&mut rift_server::QueryFactBudget<'_>>,
+) -> Result<(SearchResult, Vec<Vec<rift_core::ContributionKey>>), RiftError> {
+    let page = merge_candidate_rows(params, pools, weights, results_max, budget)?;
+    let (results, contributions) = page
+        .rows
+        .into_iter()
+        .map(|(hit, keys)| (hit, keys.to_vec()))
+        .unzip();
+    Ok((
+        SearchResult {
+            view: None,
+            results,
+            pagination: page.pagination,
+            warnings: page.warnings,
+        },
+        contributions,
+    ))
+}
+
+struct CandidatePage<'pool> {
+    rows: Vec<(SearchHit, &'pool [rift_core::ContributionKey])>,
+    pagination: rift_protocol::read::Pagination,
+    warnings: Vec<ReadWarning>,
+}
+
+fn merge_candidate_rows<'pool>(
+    params: &SearchParams,
+    pools: &'pool [SearchCandidatePool],
+    weights: RankingWeights,
+    results_max: usize,
+    mut budget: Option<&mut rift_server::QueryFactBudget<'_>>,
+) -> Result<CandidatePage<'pool>, RiftError> {
     crate::proxy::encode_bounded(&pools, CANDIDATE_BYTES_MAX)
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
     let limit = rift_server::search_page_limit(params)?;
@@ -150,11 +181,9 @@ pub(crate) fn merge_candidate_pools(
                 let mut order = Vec::with_capacity(input.order.len());
                 for item in &input.order {
                     let identity = captured_identity(pool, &item.hit)?;
-                    payloads.entry(identity.clone()).or_insert_with(|| {
-                        let mut hit = item.hit.clone();
-                        hit.view = Some(pool.view.clone());
-                        hit
-                    });
+                    payloads
+                        .entry(identity.clone())
+                        .or_insert((item, &pool.view));
                     order.push(item.ranked.clone().with_identity(identity));
                 }
                 destination.push(RankingInput::new(input.kind, order));
@@ -173,27 +202,30 @@ pub(crate) fn merge_candidate_pools(
         .as_deref()
         .unwrap_or_default()
         .contains(&SearchInclude::Score);
-    let mut hits = ranked
-        .candidates()
-        .iter()
-        .filter_map(|candidate| {
-            payloads.get(candidate.identity()).cloned().map(|mut hit| {
-                hit.matched_by = rift_server::matched_fields(candidate);
-                hit.score = include_score.then(|| candidate.score());
-                hit
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut hits = Vec::new();
+    for candidate in ranked.candidates() {
+        if let Some((item, view)) = payloads.get(candidate.identity()) {
+            let item = *item;
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.charge(item)?;
+                budget.charge(view)?;
+            }
+            let mut hit = item.hit.clone();
+            hit.view = Some((*view).clone());
+            hit.matched_by = rift_server::matched_fields(candidate);
+            hit.score = include_score.then(|| candidate.score());
+            hits.push((hit, item.contributions.as_slice()));
+        }
+    }
     if ranked.len() == results_max {
         warnings.push(ReadWarning::ResultsTruncated {
             results_max: u64::try_from(results_max).unwrap_or(u64::MAX),
         });
     }
-    super::order_search_hits(&mut hits, params.order);
-    let (results, pagination) = super::page_window(hits, params.page_index, limit);
-    Ok(SearchResult {
-        view: None,
-        results,
+    hits.sort_by(|left, right| super::compare_search_hits(&left.0, &right.0, params.order));
+    let (rows, pagination) = super::page_window(hits, params.page_index, limit);
+    Ok(CandidatePage {
+        rows,
         pagination,
         warnings,
     })
@@ -234,7 +266,9 @@ fn captured_identity(
 
 #[cfg(test)]
 mod tests {
-    use super::{CANDIDATE_BYTES_MAX, SearchCandidatePool, merge_candidate_pools};
+    use super::{
+        CANDIDATE_BYTES_MAX, SearchCandidatePool, merge_candidate_pools_with_contributions,
+    };
     use rift_protocol::read::{SearchHit, SearchParams};
     use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
     use rift_ranking::{
@@ -307,6 +341,7 @@ mod tests {
                             FieldSet::of(SearchableField::Name),
                         ),
                         hit,
+                        contributions: Vec::new(),
                     }],
                 }],
                 ..SearchCandidateInputs::default()
@@ -326,11 +361,12 @@ mod tests {
         .expect("modeled logical identity")
         .wire_identity();
         let pools = [pool("local", 0, Some(&id)), pool("extra", 0, Some(&id))];
-        let result = merge_candidate_pools(
+        let (result, _) = merge_candidate_pools_with_contributions(
             &params,
             &pools,
             RankingWeights::fixed(0.5, 0.5, 0.0, 60),
             10,
+            None,
         )
         .expect("combined pools");
         assert_eq!(result.results.len(), 2);
@@ -357,15 +393,54 @@ mod tests {
         let first = pool("local", 0, None);
         let second = pool("local", 20, None);
         let pools = [first.clone(), first, second];
-        let result = merge_candidate_pools(
+        let (result, _) = merge_candidate_pools_with_contributions(
             &params,
             &pools,
             RankingWeights::fixed(0.5, 0.5, 0.0, 60),
             10,
+            None,
         )
         .expect("raw facts");
         assert_eq!(result.results.len(), 2);
         assert!(result.results.iter().all(|hit| matches!(&hit.hit, rift_protocol::read::SearchHitTarget::Symbol { symbol } if symbol.id.is_none())));
+    }
+
+    #[test]
+    fn captured_candidate_pages_keep_original_contributions_after_ordering() {
+        let mut first = pool("local", 0, None);
+        let mut second = pool("local", 20, None);
+        let key = |name| {
+            rift_core::ContributionKey::new(
+                rift_core::ProviderId::new("syntax").expect("provider"),
+                rift_core::ProviderRevision::new(1).expect("revision"),
+                rift_core::ProviderSymbolId::new(name).expect("record"),
+            )
+        };
+        first.inputs.precise[0].order[0].contributions = vec![key("first")];
+        second.inputs.precise[0].order[0].contributions = vec![key("second")];
+        first.inputs.precise[0].order[0].hit.path =
+            Some(serde_json::from_value(serde_json::json!("z.json")).expect("project path"));
+        second.inputs.precise[0].order[0].hit.path =
+            Some(serde_json::from_value(serde_json::json!("a.json")).expect("project path"));
+        let pools = [first, second];
+        for (page, expected) in [(0, "second"), (1, "first")] {
+            let params: SearchParams = serde_json::from_value(serde_json::json!({
+                "query":"beacon", "order":"path", "limit":1, "page_index":page
+            }))
+            .expect("ordered page");
+            let (result, contributions) = super::merge_candidate_pools_with_contributions(
+                &params,
+                &pools,
+                RankingWeights::fixed(0.5, 0.5, 0.0, 60),
+                10,
+                None,
+            )
+            .expect("original candidate page");
+            assert_eq!(result.results.len(), 1);
+            assert_eq!(contributions, vec![vec![key(expected)]]);
+            assert_eq!(result.pagination.total_pages, 2);
+            assert_eq!(result.results[0].view.as_ref(), Some(&pools[0].view));
+        }
     }
 
     #[test]
@@ -375,11 +450,12 @@ mod tests {
         let mut pool = pool("local", 0, None);
         pool.inputs.precise[0].order[0].hit.source =
             Some("\u{0001}".repeat(CANDIDATE_BYTES_MAX / 6));
-        let failure = merge_candidate_pools(
+        let failure = merge_candidate_pools_with_contributions(
             &params,
             &[pool],
             RankingWeights::fixed(0.5, 0.5, 0.0, 60),
             10,
+            None,
         )
         .expect_err("escaped aggregate exceeds bound");
         assert_eq!(

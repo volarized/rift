@@ -34,17 +34,13 @@ pub(super) fn capture(
     limits: QueryLimits,
     budget: &mut QueryFactBudget<'_>,
 ) -> Result<(), RiftError> {
-    if facts
-        .symbols
-        .iter()
-        .all(|symbol| symbol.symbol.id.is_some())
-    {
+    let groups = selected_groups(view, facts, budget)?;
+    if groups.is_empty() {
         return Ok(());
     }
-    let groups = selected_groups(view, facts, budget)?;
     let (records, units) = capture_records(view, facts, &groups, budget)?;
     let source_indices = capture_sources(view, selection, requirements, facts, units, budget)?;
-    let context = capture_context(selection, facts, &source_indices, budget)?;
+    let context = capture_context(view, selection, facts, &source_indices, budget)?;
     let mut snapshot = QueryProviderSnapshot {
         context,
         records,
@@ -206,6 +202,7 @@ fn capture_sources(
 }
 
 fn capture_context(
+    view: &WorkspaceSymbolView,
     selection: &QueryProviderSelection,
     facts: &QueryFacts,
     source_indices: &[usize],
@@ -216,6 +213,9 @@ fn capture_context(
         .find_map(|index| facts.sources[*index].digest.as_ref())
         .cloned()
         .ok_or_else(missing)?;
+    let fingerprint =
+        SourceDigest::parse(&data_encoding::HEXLOWER.encode(view.fingerprint().as_bytes()))?;
+    budget.charge_material(fingerprint.get_size())?;
     budget.charge_material(selection.get_size())?;
     budget.charge_material(selection.root.get_size())?;
     budget.charge_material(selection.owner.get_size())?;
@@ -224,9 +224,10 @@ fn capture_context(
         selection: selection.clone(),
         root: selection.root.clone(),
         owner: selection.owner.clone(),
-        index_revision: selection.index_revision,
-        source_revision: selection.source_revision,
-        tree_revision: selection.tree_revision,
+        index_revision: view.normalized_graph().index_revision(),
+        source_revision: view.normalized_graph().source_revision(),
+        tree_revision: view.normalized_graph().tree_revision(),
+        fingerprint,
         source_digest,
         inputs: Vec::new(),
     };

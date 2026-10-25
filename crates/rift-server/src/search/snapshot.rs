@@ -70,7 +70,7 @@ impl SearchSnapshot {
         let input = self.reads.local_search_view_input(ready)?;
         match &self.selected.force_include {
             Some(sources) if self.params.scope != SearchScope::Global => {
-                input.with_sources(sources)
+                input.with_selected_sources(sources)
             }
             _ => Ok(input),
         }

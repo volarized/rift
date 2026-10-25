@@ -87,7 +87,13 @@ impl QueryAcquisition {
                         ))
                     }
                     SearchHitTarget::Symbol { symbol } => {
-                        validate_canonical_symbol(symbol)?;
+                        validate_canonical_symbol(
+                            symbol,
+                            hit.path.as_ref().map(|path| path.0.as_str()),
+                            hit.unit
+                                .as_ref()
+                                .map(rift_protocol::read::SourceUnitId::as_str),
+                        )?;
                         None
                     }
                     _ if keys.is_empty() => None,
@@ -105,13 +111,17 @@ impl QueryAcquisition {
     }
 }
 
-fn validate_canonical_symbol(symbol: &Symbol) -> Result<(), RiftError> {
+fn validate_canonical_symbol(
+    symbol: &Symbol,
+    path: Option<&str>,
+    unit: Option<&str>,
+) -> Result<(), RiftError> {
     let identity = symbol.id.as_ref().ok_or_else(|| {
         rift_error::errors::server::read_unavailable()
             .operation("query acquisition")
             .detail(format!(
-                "retrieval symbol {:?} has no canonical identity or original selected record",
-                symbol.name,
+                "retrieval symbol {:?} has no canonical identity or original selected record: language {:?}, kind {:?}, origin {:?}, path {path:?}, unit {unit:?}",
+                symbol.name, symbol.language, symbol.kind, symbol.origin,
             ))
             .error()
     })?;

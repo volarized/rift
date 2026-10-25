@@ -514,7 +514,7 @@ fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &Symb
     (current && symbols && served).then_some((traversal, seed))
 }
 
-type ReferenceSource<'source> = (
+pub(super) type ReferenceSource<'source> = (
     &'source EngineSlot,
     &'source IndexedFile,
     &'source SyntaxSymbol,

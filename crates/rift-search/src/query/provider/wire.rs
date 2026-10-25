@@ -100,15 +100,24 @@ pub(super) mod key {
         decode_key(<(String, u64, String)>::deserialize(deserializer)?)
     }
 }
-pub(super) mod keys {
+/// Checked serialization of original provider contribution keys.
+pub mod keys {
     use super::{ContributionKey, Deserialize, Deserializer, Key, Serializer, decode_key};
-    pub(crate) fn serialize<S: Serializer>(
+    /// Serializes original provider contribution keys.
+    ///
+    /// # Errors
+    /// Returns the existing serializer failure.
+    pub fn serialize<S: Serializer>(
         values: &[ContributionKey],
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         serializer.collect_seq(values.iter().map(Key))
     }
-    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    /// Decodes original provider contribution keys through their checked constructors.
+    ///
+    /// # Errors
+    /// Returns the existing decoding or contribution validation failure.
+    pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Vec<ContributionKey>, D::Error> {
         Vec::<(String, u64, String)>::deserialize(deserializer)?

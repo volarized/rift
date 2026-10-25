@@ -314,7 +314,7 @@ fn force_included_search_retains_original_source_after_mutation_and_removal() {
                 .is_some_and(|path| path.0 == "hidden.rs")
         })
         .expect("forced declaration row");
-    assert_eq!(material.material.index.source(&path), Some(original));
+    assert_eq!(material.material.source(&path), Some(original));
     let refused = local_view_input(
         Arc::clone(&material.material.index),
         material.material.metadata.to_vec(),

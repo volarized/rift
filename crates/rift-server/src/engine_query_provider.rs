@@ -147,6 +147,13 @@ impl EngineQuery<'_> {
             return unavailable("the physical subject source publication is no longer selected")
                 .fail();
         }
+        let selected = match self.view_input {
+            Some(input) => input.provider_view(&snapshot.context)?.ok_or_else(|| {
+                unavailable("the physical subject has no original provider association")
+            })?,
+            None => current.as_ref(),
+        };
+        validate_original_record(selected, record)?;
         for declaration in &record.declarations {
             let (owner, path) = rift_protocol::identity::parse_source_unit_identity(
                 &declaration.binding.unit().to_string(),
@@ -158,7 +165,7 @@ impl EngineQuery<'_> {
                 continue;
             }
             let path = rift_core::ProjectPath::new(path)?;
-            let Some(file) = self.reads.index().file(&path) else {
+            let Some(file) = selected.file(&path) else {
                 continue;
             };
             let Some(symbol) = file.syntax().symbols().iter().find(|symbol| {
@@ -256,11 +263,11 @@ impl EngineQuery<'_> {
         let Some(selection) = &self.provider_selection else {
             return Ok(None);
         };
-        let file = self
-            .reads
-            .index()
-            .file(path)
-            .ok_or_else(|| unavailable("the engine target has no selected source bytes"))?;
+        let file = match self.view_input {
+            Some(input) => input.indices().find_map(|view| view.file(path)),
+            None => self.reads.index().file(path),
+        }
+        .ok_or_else(|| unavailable("the engine target has no selected source bytes"))?;
         let unit = crate::read::source_unit_id(path);
         Ok(facts
             .providers
@@ -326,7 +333,9 @@ impl EngineQuery<'_> {
                 .capability("relationship acquisition for the selected direction and facets")
                 .fail();
         }
-        for subject in subjects {
+        for requested in subjects {
+            let scoped = self.scoped_canonical_target(requested)?;
+            let subject = scoped.as_ref().unwrap_or(requested);
             if let Some(identity) = subject.canonical_symbol() {
                 self.resolve_facets(&[identity], direction, facets).await?;
                 continue;
@@ -344,6 +353,41 @@ impl EngineQuery<'_> {
             }
         }
         Ok(())
+    }
+
+    fn scoped_canonical_target(
+        &self,
+        subject: &QueryProviderTarget,
+    ) -> Result<Option<QueryProviderTarget>, RiftError> {
+        let Some(input) = self.view_input else {
+            return Ok(None);
+        };
+        if input.indices().nth(1).is_none() {
+            return Ok(None);
+        }
+        let Some(identity) = subject.canonical_symbol() else {
+            return Ok(None);
+        };
+        let Some(facts) = self.query_facts else {
+            return Ok(None);
+        };
+        for (provider, snapshot) in facts.providers.iter().enumerate() {
+            if snapshot.records.iter().any(|record| {
+                record
+                    .identity
+                    .as_ref()
+                    .is_some_and(|held| held.as_str() == identity.as_str())
+            }) {
+                let endpoint = rift_search::query::QueryProviderEndpoint {
+                    provider: Some(provider),
+                    target: subject.target.clone(),
+                };
+                return self.provider_target(&endpoint).map(Some).ok_or_else(|| {
+                    unavailable("the physical subject has no original provider context")
+                });
+            }
+        }
+        Ok(None)
     }
 
     async fn resolve_physical(
@@ -607,31 +651,24 @@ impl EngineQuery<'_> {
             }
             None => return unavailable("the engine target has no admitted source owner").fail(),
         };
-        let file = self
-            .reads
-            .index()
-            .file(&path)
-            .ok_or_else(|| unavailable("the engine target has no selected source bytes"))?;
+        let file = match self.view_input {
+            Some(input) => input.indices().find_map(|view| view.file(&path)),
+            None => self.reads.index().file(&path),
+        }
+        .ok_or_else(|| unavailable("the engine target has no selected source bytes"))?;
         let unit = crate::read::source_unit_id(file.path());
         let positions = rift_lsp::position::LineIndex::new(file.source());
         let selection = indexed_range(&positions, *range, *encoding)?;
-        let canonical = if *file_level {
-            None
-        } else if name.is_some() {
-            project_declaration(self.reads, &path, (*range, *encoding), "query calls")?
-        } else {
-            file.enclosing_symbol(selection.start, selection.end)
-                .map(|symbol| symbol_id(self.reads.index(), crate::search::declared(file, symbol)))
-                .transpose()?
-                .flatten()
-        }
-        .as_ref()
-        .map(QueryProviderTarget::canonical)
-        .transpose()?;
         let selected = if *file_level {
             None
         } else {
-            canonical.or(self.local_provider_at(&path, &selection, name.is_some())?)
+            self.provider_location_target(
+                file,
+                &path,
+                &selection,
+                (*range, *encoding),
+                name.is_some(),
+            )?
         };
         match direction {
             TraversalDirection::Outgoing => {
@@ -666,6 +703,42 @@ impl EngineQuery<'_> {
             }
         }
         Ok(())
+    }
+
+    fn provider_location_target(
+        &self,
+        file: &rift_index::IndexedFile,
+        path: &rift_core::ProjectPath,
+        selection: &TextRange,
+        request: (Range, PositionEncoding),
+        named: bool,
+    ) -> Result<Option<QueryProviderTarget>, RiftError> {
+        let canonical = if let Some(input) = self.view_input {
+            file.enclosing_symbol(selection.start, selection.end)
+                .and_then(|symbol| {
+                    input
+                        .indices()
+                        .find_map(|view| view.symbol_identity(path, symbol.range))
+                })
+                .map(|identity| SymbolId(identity.as_str().to_owned()))
+        } else if named {
+            project_declaration(self.reads, path, request, "query calls")?
+        } else {
+            file.enclosing_symbol(selection.start, selection.end)
+                .map(|symbol| symbol_id(self.reads.index(), crate::search::declared(file, symbol)))
+                .transpose()?
+                .flatten()
+        }
+        .as_ref()
+        .map(QueryProviderTarget::canonical)
+        .transpose()?;
+        if self.view_input.is_some() {
+            Ok(self
+                .local_provider_at(path, selection, named)?
+                .or(canonical))
+        } else {
+            Ok(canonical.or(self.local_provider_at(path, selection, named)?))
+        }
     }
 
     /// Returns reached subjects using original scoped endpoint selectors.
@@ -1230,4 +1303,31 @@ fn provider_at(
             context: Some(Arc::clone(context)),
             target,
         }))
+}
+
+fn validate_original_record(
+    selected: &rift_index::WorkspaceSymbolView,
+    record: &rift_search::query::QueryProviderRecord,
+) -> Result<(), RiftError> {
+    let graph = selected.normalized_graph();
+    let original = record
+        .contributions
+        .first()
+        .and_then(|key| graph.record_for(key.reference()))
+        .ok_or_else(|| unavailable("the physical subject has no original provider association"))?;
+    if original.identity() != record.identity.as_ref()
+        || original.contributions() != record.contributions.as_slice()
+    {
+        return unavailable("the physical subject has no original provider association").fail();
+    }
+    for declaration in &record.declarations {
+        if graph
+            .contribution(&declaration.contribution)
+            .and_then(|contribution| contribution.source())
+            != Some(&declaration.binding)
+        {
+            return unavailable("the physical subject has no original provider association").fail();
+        }
+    }
+    Ok(())
 }

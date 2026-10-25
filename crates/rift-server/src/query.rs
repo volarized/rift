@@ -125,15 +125,8 @@ impl LocalSymbolViewInput {
             projection.symbol_ids = None;
             projection.symbol_name = None;
         }
-        let mut facts = self.query_facts_with_budget(&projection, limits, budget)?;
-        local_provider::capture(
-            self.index(),
-            selection,
-            &projection,
-            &mut facts,
-            limits,
-            budget,
-        )?;
+        let mut facts =
+            self.project_selected_facts(&projection, limits, budget, Some(selection))?;
         if let Some(package) = self.package_facts() {
             budget.charge(package.as_ref())?;
             merge_query_facts(&mut facts, package.as_ref().clone())?;
@@ -182,14 +175,38 @@ impl LocalSymbolViewInput {
         limits: QueryLimits,
         budget: &mut QueryFactBudget<'_>,
     ) -> Result<QueryFacts, RiftError> {
+        self.project_selected_facts(requirements, limits, budget, None)
+    }
+
+    fn project_selected_facts(
+        &self,
+        requirements: &FactRequirements,
+        limits: QueryLimits,
+        budget: &mut QueryFactBudget<'_>,
+        selection: Option<&rift_search::query::QueryProviderSelection>,
+    ) -> Result<QueryFacts, RiftError> {
         if requirements.requires(FactRequirement::Domain) && !self.ready {
             return errors::server::read_unavailable()
                 .operation("query acquisition")
                 .detail("selected workspace publication is not ready")
                 .fail();
         }
-        let mut facts =
-            project_query_facts_with_budget(self.index(), requirements, limits, budget)?;
+        let mut facts = QueryFacts::default();
+        for view in self.indices() {
+            budget.check()?;
+            let mut selected = project_query_facts_with_budget(view, requirements, limits, budget)?;
+            if let Some(selection) = selection {
+                local_provider::capture(
+                    view,
+                    selection,
+                    requirements,
+                    &mut selected,
+                    limits,
+                    budget,
+                )?;
+            }
+            merge_query_facts(&mut facts, selected)?;
+        }
         budget.check()?;
         if requirements.requires(FactRequirement::History)
             || requirements.requires(FactRequirement::Description)

@@ -3,6 +3,8 @@
 mod retained_size;
 mod wire;
 
+pub use wire::keys as contribution_keys;
+
 use rift_core::{
     ContributionKey, DeclarationBinding, IndexRevision, ReferenceRole, SourceRevision, SymbolId,
     TreeRevision, WorkspaceId,
@@ -31,9 +33,11 @@ pub struct QueryProviderContext {
     /// Original normalized tree revision.
     #[serde(with = "wire::tree_revision")]
     pub tree_revision: TreeRevision,
-    /// Full digest of the source material admitted by this owner.
+    /// Full source fingerprint retained from the original normalized owner.
+    pub fingerprint: SourceDigest,
+    /// Complete digest of one selected source unit.
     pub source_digest: SourceDigest,
-    /// Exact metadata inputs captured by the same source owner before analysis.
+    /// Captured source inputs retained for validation.
     pub inputs: Vec<QueryProviderInput>,
 }
 
@@ -262,7 +266,34 @@ impl QueryProviderEndpoint {
     }
 }
 
+#[derive(Serialize)]
+struct ContextKey<'context> {
+    selection: &'context QueryProviderSelection,
+    #[serde(serialize_with = "wire::workspace::serialize")]
+    root: &'context WorkspaceId,
+    owner: &'context SymbolOwner,
+    #[serde(serialize_with = "wire::index_revision::serialize")]
+    index_revision: &'context IndexRevision,
+    #[serde(serialize_with = "wire::source_revision::serialize")]
+    source_revision: &'context SourceRevision,
+    #[serde(serialize_with = "wire::tree_revision::serialize")]
+    tree_revision: &'context TreeRevision,
+    fingerprint: &'context SourceDigest,
+}
+
 impl QueryProviderContext {
+    fn key_context(&self) -> ContextKey<'_> {
+        ContextKey {
+            selection: &self.selection,
+            root: &self.root,
+            owner: &self.owner,
+            index_revision: &self.index_revision,
+            source_revision: &self.source_revision,
+            tree_revision: &self.tree_revision,
+            fingerprint: &self.fingerprint,
+        }
+    }
+
     /// Returns the original target key without cloning captured context metadata.
     ///
     /// # Errors
@@ -279,23 +310,26 @@ fn provider_target_key(
     use sha2::{Digest, Sha256};
     #[derive(Serialize)]
     struct Identity<'target> {
-        context: Option<&'target QueryProviderContext>,
+        context: Option<ContextKey<'target>>,
         #[serde(serialize_with = "wire::target::serialize")]
         target: &'target NormalizedTarget,
     }
-    let bytes = rift_protocol::canonical::canonical_json(&Identity { context, target }).map_err(
-        |error| {
-            rift_error::errors::server::read_invalid()
-                .field("query")
-                .violation(error.to_string())
-                .error()
-        },
-    )?;
+    // Typed fields and target tuples have fixed order; preserve every u64 revision bit.
+    let bytes = serde_json::to_vec(&Identity {
+        context: context.map(QueryProviderContext::key_context),
+        target,
+    })
+    .map_err(|error| {
+        rift_error::errors::server::read_invalid()
+            .field("query")
+            .violation(error.to_string())
+            .error()
+    })?;
     Ok(Sha256::digest(bytes).into())
 }
 
 impl QueryProviderTarget {
-    /// Returns a fixed-size key covering the complete original target and source context.
+    /// Returns a fixed-size key covering the original target and immutable source owner.
     ///
     /// # Errors
     /// Returns the existing encoding error if this captured target cannot be serialized.
@@ -338,7 +372,7 @@ impl QueryProviderRecord {
     pub fn key(&self, context: &QueryProviderContext) -> Result<Vec<u8>, serde_json::Error> {
         #[derive(Serialize)]
         struct Identity<'record> {
-            context: &'record QueryProviderContext,
+            context: ContextKey<'record>,
             #[serde(serialize_with = "wire::keys::serialize")]
             contributions: &'record [ContributionKey],
             declarations: Declarations<'record>,
@@ -360,7 +394,7 @@ impl QueryProviderRecord {
             }
         }
         serde_json::to_vec(&Identity {
-            context,
+            context: context.key_context(),
             contributions: &self.contributions,
             declarations: Declarations(&self.declarations),
         })

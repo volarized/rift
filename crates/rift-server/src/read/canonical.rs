@@ -45,7 +45,8 @@ impl LocalSymbolViewInput {
         .with_query_result_arc(self.material.query_result.clone())
         .with_package_facts_arc(self.material.package_facts.clone())
         .with_query_references_arc(self.material.query_references.clone())
-        .with_provider_selection_arc(self.material.provider_selection.clone()))
+        .with_provider_selection_arc(self.material.provider_selection.clone())
+        .with_selected_indices(Arc::clone(&self.material.selected)))
     }
 
     /// Returns the warnings retained by this immutable input.
@@ -95,7 +96,8 @@ impl LocalSymbolViewInput {
         .with_query_result_arc(self.material.query_result.clone())
         .with_package_facts_arc(self.material.package_facts.clone())
         .with_query_references_arc(self.material.query_references.clone())
-        .with_provider_selection_arc(self.material.provider_selection.clone()))
+        .with_provider_selection_arc(self.material.provider_selection.clone())
+        .with_selected_indices(Arc::clone(&self.material.selected)))
     }
 
     /// Root of the immutable publication admitted by this input.
@@ -132,6 +134,7 @@ impl LocalSymbolViewInput {
             .saturating_add(bytes.as_ref().map_or(0, |bytes| bytes.len()));
         self.material = Arc::new(LocalSymbolMaterial {
             index: Arc::clone(&self.material.index),
+            selected: Arc::clone(&self.material.selected),
             metadata: Arc::clone(&self.material.metadata),
             history: Arc::clone(&self.material.history),
             traversal: self.material.traversal.clone(),
@@ -192,6 +195,7 @@ impl LocalSymbolViewInput {
             .saturating_add(selection.as_deref().map_or(0, bytes));
         self.material = Arc::new(LocalSymbolMaterial {
             index: Arc::clone(&self.material.index),
+            selected: Arc::clone(&self.material.selected),
             metadata: Arc::clone(&self.material.metadata),
             history: Arc::clone(&self.material.history),
             traversal: self.material.traversal.clone(),
@@ -233,6 +237,11 @@ impl LocalSymbolViewInput {
             (left, right) => left.or(right),
         };
         self.ready &= other.ready;
+        for selected in other.material.selected.iter() {
+            self = self
+                .with_selected_view(Arc::clone(selected))
+                .map_err(|_| SymbolUnavailableReason::ViewContext)?;
+        }
         self = self
             .combine_histories(other)
             .map_err(|_| SymbolUnavailableReason::ViewContext)?;
@@ -272,6 +281,7 @@ impl LocalSymbolViewInput {
 #[derive(Debug)]
 struct LocalSymbolMaterial {
     index: Arc<rift_index::WorkspaceSymbolView>,
+    selected: Arc<[Arc<rift_index::WorkspaceSymbolView>]>,
     metadata: Arc<[u8]>,
     history: Arc<history::CapturedHistories>,
     traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
@@ -441,19 +451,22 @@ impl State {
                 .saturating_add(std::mem::size_of::<HeldView>())
                 .saturating_add(held.view.id.get_heap_size())
                 .saturating_add(held.view.expires_at.capacity());
-            if let HeldMaterial::Local(material) = &held.material
-                && charged.track(Arc::as_ptr(&material.index))
-            {
-                let bytes = if shared {
-                    let (bytes, next) = material.index.as_ref().get_size_with_tracker(charged);
-                    charged = next;
-                    bytes
-                } else {
-                    material.index.retained_material_bytes()
-                };
-                total = total
-                    .saturating_add(bytes)
-                    .saturating_add(2 * std::mem::size_of::<usize>());
+            if let HeldMaterial::Local(material) = &held.material {
+                for index in std::iter::once(&material.index).chain(material.selected.iter()) {
+                    if !charged.track(Arc::as_ptr(index)) {
+                        continue;
+                    }
+                    let bytes = if shared {
+                        let (bytes, next) = index.as_ref().get_size_with_tracker(charged);
+                        charged = next;
+                        bytes
+                    } else {
+                        index.retained_material_bytes()
+                    };
+                    total = total
+                        .saturating_add(bytes)
+                        .saturating_add(2 * std::mem::size_of::<usize>());
+                }
             }
             let first = match &held.material {
                 HeldMaterial::Local(material) => charged.track(Arc::as_ptr(material)),
@@ -1063,8 +1076,11 @@ impl LocalSymbolMaterial {
                 None,
             ));
         }
-        let Some(readable) = self.index.object_by_identity(&key)? else {
-            if !self.index.identity_coverage_complete(identity.language()) {
+        let Some(readable) = self.selected_object(&key)? else {
+            if !self
+                .indices()
+                .all(|index| index.identity_coverage_complete(identity.language()))
+            {
                 return Ok((
                     unavailable(
                         request,
@@ -1211,15 +1227,39 @@ impl LocalSymbolMaterial {
     ) -> Result<(Vec<rift_protocol::symbol_read::SymbolDeclaration>, usize), RiftError> {
         let limit = super::accepted_declaration_limit(request.declaration_limit)?
             .min(self.index.results_max());
-        let (mut declarations, total) = self
-            .index
-            .declarations_by_identity_page(key, offset, limit)?;
-        if request.include.contains(&GetSymbolInclude::Source) {
-            let (bindings, _) = self.index.symbols_by_identity_page(key, offset, limit)?;
-            for (declaration, matched) in declarations.iter_mut().zip(bindings) {
-                declaration.node = Some(super::node_id(matched.file, matched.symbol.range));
-                declaration.source = Some(super::excerpt(matched.file, matched.symbol.range));
-                declaration.source_complete = true;
+        let mut declarations = Vec::new();
+        let mut total = 0usize;
+        for (owner, index) in self.indices().enumerate() {
+            for binding in index.canonical_declarations(key) {
+                let (path, position, matched, declaration) = binding?;
+                let mut duplicate = false;
+                for previous in self.indices().take(owner) {
+                    if let Some(held) = previous.canonical_declaration(key, path, position) {
+                        if held != declaration {
+                            return Err(invalid("view", "captured declaration bindings disagree"));
+                        }
+                        duplicate = true;
+                    }
+                }
+                if duplicate {
+                    continue;
+                }
+                if total >= offset && declarations.len() < limit {
+                    let mut declaration = declaration.clone();
+                    if request.include.contains(&GetSymbolInclude::Source) {
+                        declaration.node = Some(super::node_id(matched.file, matched.symbol.range));
+                        declaration.source =
+                            Some(super::excerpt(matched.file, matched.symbol.range));
+                        declaration.source_complete = true;
+                    }
+                    declarations.push(declaration);
+                }
+                total = total.checked_add(1).ok_or_else(|| {
+                    invalid(
+                        "view",
+                        "captured declaration count exceeds the platform bound",
+                    )
+                })?;
             }
         }
         Ok((declarations, total))
@@ -1250,6 +1290,7 @@ fn local_view_input(
 ) -> LocalSymbolViewInput {
     let material = Arc::new(LocalSymbolMaterial {
         index,
+        selected: Arc::from([]),
         metadata: Arc::from(metadata),
         history,
         traversal,
@@ -1259,7 +1300,7 @@ fn local_view_input(
         query_references: None,
     });
     let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
-        .saturating_add(4 * std::mem::size_of::<usize>())
+        .saturating_add(6 * std::mem::size_of::<usize>())
         .saturating_add(material.metadata.len())
         .saturating_add(material.history.retained_bytes())
         .saturating_add(
@@ -1287,6 +1328,7 @@ mod package;
 mod query;
 mod query_references;
 pub use query::{CapturedQueryView, QueryMaterial, QueryViewInput};
+mod selected;
 mod source;
 mod traversal;
 

@@ -38,7 +38,7 @@ macro_rules! heap_fields {
     };
 }
 
-heap_fields!(QueryProviderContext; fields [selection, root, owner, source_digest]; vectors [inputs]);
+heap_fields!(QueryProviderContext; fields [selection, root, owner, fingerprint, source_digest]; vectors [inputs]);
 heap_fields!(QueryProviderInput; fields [uri, digest]; vectors []);
 heap_fields!(QueryProviderSnapshot; fields [context]; vectors [records, source_indices, references, relationships]);
 heap_fields!(QueryProviderRecord; fields [identity, container]; vectors [contributions, declarations]);

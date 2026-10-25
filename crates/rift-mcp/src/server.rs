@@ -2424,7 +2424,14 @@ impl RiftMcp {
                 .await
                 .map(Json);
         }
-        if let Some(captured) = self.captured_query(&params).await? {
+        if let Some(captured) = self
+            .captured_query(
+                &params,
+                extensions.get::<candidates::CapturedSearchContributions>(),
+                extensions.get::<crate::global::CapturedGlobalViews>(),
+            )
+            .await?
+        {
             return Ok(Json(captured));
         }
         if params.rev.is_none()

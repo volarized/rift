@@ -178,6 +178,7 @@ impl LocalSymbolViewInput {
             .saturating_add(history.retained_bytes());
         self.material = Arc::new(LocalSymbolMaterial {
             index: Arc::clone(&self.material.index),
+            selected: Arc::clone(&self.material.selected),
             metadata: Arc::clone(&self.material.metadata),
             history,
             traversal: self.material.traversal.clone(),

@@ -71,20 +71,21 @@ pub(super) fn capture(
             })
         })
         .collect::<Result<Vec<_>, RiftError>>()?;
+    let bytes = rift_protocol::canonical::canonical_json(&inputs)
+        .map_err(|error| unavailable(error.to_string()))?;
+    let fingerprint = SourceDigest::parse(
+        &data_encoding::HEXLOWER.encode(FileDigest::of(bytes.as_bytes()).as_bytes()),
+    )?;
     let selection = if let Some(selection) = selection {
         selection.clone()
     } else {
-        let bytes = rift_protocol::canonical::canonical_json(&inputs)
-            .map_err(|error| unavailable(error.to_string()))?;
         rift_search::query::QueryProviderSelection {
             root: WorkspaceId::new(root.as_str())?,
             owner: owner.clone(),
             index_revision: graph.index_revision(),
             source_revision: graph.source_revision(),
             tree_revision: graph.tree_revision(),
-            fingerprint: SourceDigest::parse(
-                &data_encoding::HEXLOWER.encode(FileDigest::of(bytes.as_bytes()).as_bytes()),
-            )?,
+            fingerprint: fingerprint.clone(),
             configuration: rift_search::query::QueryProviderSelection::configuration_digest(
                 configuration,
             )?,
@@ -97,6 +98,7 @@ pub(super) fn capture(
         index_revision: graph.index_revision(),
         source_revision: graph.source_revision(),
         tree_revision: graph.tree_revision(),
+        fingerprint,
         source_digest: SourceDigest::parse(&data_encoding::HEXLOWER.encode(digest.as_bytes()))?,
         inputs,
     };

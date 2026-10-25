@@ -51,7 +51,7 @@ impl LocalSymbolMaterial {
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         let text = if request.unit.is_project() {
-            self.index.source(&path)
+            self.source(&path)
         } else {
             match self
                 .package_source(&request.unit)

@@ -525,7 +525,7 @@ pub(crate) fn package_traversal_hit(
 /// when absent, and attaches the walk's path and distance. Every other payload stays
 /// untouched - a lexical or ranked match's score already means more than a graph distance
 /// would, and a changed declaration keeps the `change` block that named what differs.
-fn absorb_traversal_match(existing: &mut SearchHit, path: Vec<GraphHop>, distance: u64) {
+pub(crate) fn absorb_traversal_match(existing: &mut SearchHit, path: Vec<GraphHop>, distance: u64) {
     if !existing.matched_by.contains(&MatchedField::Relationship) {
         existing.matched_by.push(MatchedField::Relationship);
     }
@@ -1277,6 +1277,19 @@ pub(crate) mod tests {
             &StoreAnswer::identifier_only(),
             &references,
         )?;
+        let identity = graph_identity("branch_a");
+        assert_eq!(
+            result
+                .results
+                .iter()
+                .filter(|hit| {
+                    crate::search::hit_symbol_id(hit)
+                        .is_some_and(|selected| selected.as_str() == identity)
+                })
+                .count(),
+            1,
+            "the lexical and traversal matches share one original symbol: {result:?}"
+        );
         let hit = result
             .results
             .iter()

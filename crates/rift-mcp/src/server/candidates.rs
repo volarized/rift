@@ -81,12 +81,51 @@ fn global_context(
     Ok(())
 }
 
+#[derive(Clone)]
+pub(in crate::server) struct CapturedSearchContributions {
+    budget: rift_server::QueryFactBudget<'static>,
+    rows: Arc<Mutex<Option<Vec<Vec<rift_core::ContributionKey>>>>>,
+}
+
+impl CapturedSearchContributions {
+    pub(in crate::server) fn new(budget: rift_server::QueryFactBudget<'static>) -> Self {
+        Self {
+            budget,
+            rows: Arc::default(),
+        }
+    }
+
+    pub(in crate::server) fn take(
+        &self,
+    ) -> Result<Option<Vec<Vec<rift_core::ContributionKey>>>, ToolFailure> {
+        self.rows
+            .lock()
+            .map(|mut rows| rows.take())
+            .map_err(|_| unavailable("producer record associations are unavailable"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchCandidateRequest {
     pub(crate) params: SearchParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) view: Option<CapturedView>,
+}
+
+impl SearchCandidateRequest {
+    fn decode(request: CallToolRequestParams) -> Result<Self, ToolFailure> {
+        let arguments = request.arguments.unwrap_or_default();
+        crate::proxy::encode_bounded(&arguments, BYTES_MAX).map_err(transport_failure)?;
+        serde_json::from_value(arguments.into()).map_err(|error| {
+            errors::mcp::parameter_invalid()
+                .tool("search_candidates")
+                .field("arguments")
+                .accepted(error.to_string())
+                .mcp()
+                .tool_failure(wire::ErrorPhase::Read)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -159,6 +198,22 @@ fn validate_candidate_query(params: &SearchParams) -> Result<(), ToolFailure> {
     Ok(())
 }
 
+fn candidate_query_budget(
+    resolved: &super::ResolvedWorkspace,
+    budget: Option<rift_server::QueryFactBudget<'static>>,
+    deadline: super::RequestDeadline,
+) -> Result<rift_server::QueryFactBudget<'static>, ToolFailure> {
+    if let Some(budget) = budget {
+        Ok(budget)
+    } else {
+        let configuration = resolved.published.configuration.search_configuration();
+        let limits = rift_search::query::QueryLimits::try_from(&configuration.query)
+            .map_err(read_failure)?;
+        rift_server::QueryFactBudget::for_request(limits, deadline.at().into_std(), &|| false)
+            .map_err(read_failure)
+    }
+}
+
 fn preparing_candidates(
     resolved: &super::ResolvedWorkspace,
     warnings: &[ReadWarning],
@@ -183,6 +238,8 @@ impl RiftMcp {
     pub(in crate::server) async fn captured_query(
         &self,
         params: &SearchParams,
+        contributions: Option<&CapturedSearchContributions>,
+        global_views: Option<&crate::global::CapturedGlobalViews>,
     ) -> Result<Option<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
         use rift_protocol::symbol_read::SymbolUnavailableReason;
         let unavailable = |reason, view| {
@@ -254,8 +311,9 @@ impl RiftMcp {
         .cloned()
         .ok_or_else(|| super::candidates::unavailable("candidate request is not an object"))?;
         let captured = self
-            .search_candidates_request(
+            .search_candidates_with_budget(
                 CallToolRequestParams::new("search_candidates").with_arguments(arguments),
+                contributions.map(|captured| captured.budget.clone()),
             )
             .await?;
         let captured = match captured {
@@ -266,6 +324,24 @@ impl RiftMcp {
                 ));
             }
         };
+        if let Some(global) = &captured.global
+            && let Some(views) = global_views
+        {
+            views
+                .include_view(Some(&global.view))
+                .map_err(read_failure)?;
+        }
+        self.merge_captured_candidates(params, captured, contributions)
+            .await
+            .map(Some)
+    }
+
+    async fn merge_captured_candidates(
+        &self,
+        params: &SearchParams,
+        captured: SearchCandidateResponse,
+        contributions: Option<&CapturedSearchContributions>,
+    ) -> Result<rift_protocol::search_read::SearchReadResult, ToolFailure> {
         let mut pools = vec![crate::global::candidates::SearchCandidatePool {
             backend: "local".to_owned(),
             root: captured.root,
@@ -274,14 +350,41 @@ impl RiftMcp {
             inputs: captured.inputs,
         }];
         pools.extend(captured.global);
-        Self::merge_captured_query(
-            params,
-            &captured.ranking,
-            captured.view,
-            captured.results_max,
-            &pools,
-        )
-        .map(Some)
+        let params = params.clone();
+        let mut budget = contributions.map(|captured| captured.budget.clone());
+        let (result, keys) = self
+            .blocking
+            .run("captured search merge", move || {
+                if let Some(budget) = &budget {
+                    budget.check()?;
+                }
+                let result = Self::merge_captured_query(
+                    &params,
+                    &captured.ranking,
+                    captured.view,
+                    captured.results_max,
+                    &pools,
+                    budget.as_mut(),
+                )?;
+                if let Some(budget) = &budget {
+                    budget.check()?;
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(read_failure)?;
+        if let Some(captured) = contributions {
+            let mut rows = captured.rows.lock().map_err(|_| {
+                super::candidates::unavailable("producer record associations are unavailable")
+            })?;
+            if rows.is_some() {
+                return Err(super::candidates::unavailable(
+                    "producer record associations were already captured",
+                ));
+            }
+            *rows = Some(keys);
+        }
+        Ok(result)
     }
 
     fn merge_captured_query(
@@ -290,20 +393,32 @@ impl RiftMcp {
         view: CapturedView,
         results_max: usize,
         pools: &[crate::global::candidates::SearchCandidatePool],
-    ) -> Result<rift_protocol::search_read::SearchReadResult, ToolFailure> {
+        budget: Option<&mut rift_server::QueryFactBudget<'_>>,
+    ) -> Result<
+        (
+            rift_protocol::search_read::SearchReadResult,
+            Vec<Vec<rift_core::ContributionKey>>,
+        ),
+        RiftError,
+    > {
         let weights = rift_ranking::RankingWeights::new(
             ranking.identifier_weight,
             ranking.lexical_weight,
             ranking.vector_weight,
             ranking.fusion_k,
-        )
-        .map_err(read_failure)?;
-        let mut result =
-            crate::global::candidates::merge_candidate_pools(params, pools, weights, results_max)
-                .map_err(read_failure)?;
+        )?;
+        let (mut result, contributions) =
+            crate::global::candidates::merge_candidate_pools_with_contributions(
+                params,
+                pools,
+                weights,
+                results_max,
+                budget,
+            )?;
         result.view = Some(view);
-        Ok(rift_protocol::search_read::SearchReadResult::Results(
-            Box::new(result),
+        Ok((
+            rift_protocol::search_read::SearchReadResult::Results(Box::new(result)),
+            contributions,
         ))
     }
 
@@ -377,17 +492,15 @@ impl RiftMcp {
         &self,
         request: CallToolRequestParams,
     ) -> Result<SearchCandidateResult, ToolFailure> {
-        let arguments = request.arguments.unwrap_or_default();
-        crate::proxy::encode_bounded(&arguments, BYTES_MAX).map_err(transport_failure)?;
-        let requested: SearchCandidateRequest =
-            serde_json::from_value(arguments.into()).map_err(|error| {
-                errors::mcp::parameter_invalid()
-                    .tool("search_candidates")
-                    .field("arguments")
-                    .accepted(error.to_string())
-                    .mcp()
-                    .tool_failure(wire::ErrorPhase::Read)
-            })?;
+        self.search_candidates_with_budget(request, None).await
+    }
+
+    async fn search_candidates_with_budget(
+        &self,
+        request: CallToolRequestParams,
+        budget: Option<rift_server::QueryFactBudget<'static>>,
+    ) -> Result<SearchCandidateResult, ToolFailure> {
+        let requested = SearchCandidateRequest::decode(request)?;
         let views = self
             .local_views
             .get()
@@ -418,11 +531,20 @@ impl RiftMcp {
             .published
             .configuration
             .accepted_for_tool(wire::ErrorPhase::Read)?;
+        let mut budget = candidate_query_budget(&resolved, budget, deadline)?;
+        let mut projection_budget = budget.clone();
         let params = requested.params.clone();
         let (mut inputs, material) = self
             .current_captured_read(&resolved, true, move |reads, capture_warnings| {
-                let (mut inputs, material) =
-                    reads.search_candidate_view_input(&params, &answer, &references, ready)?;
+                projection_budget.check()?;
+                let (mut inputs, material) = reads.search_candidate_view_input_with_budget(
+                    &params,
+                    &answer,
+                    &references,
+                    ready,
+                    &mut projection_budget,
+                )?;
+                projection_budget.check()?;
                 inputs.warnings.extend(capture_warnings.iter().cloned());
                 let material = material.with_warnings(capture_warnings)?;
                 let selection = material.provider_selection(&accepted)?;
@@ -461,6 +583,7 @@ impl RiftMcp {
                     results_max,
                     global,
                 };
+                budget.charge(&answer)?;
                 self.save_candidates(requested.params, answer.clone())?;
                 response = Some(answer);
                 Ok(true)

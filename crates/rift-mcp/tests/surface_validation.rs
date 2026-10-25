@@ -504,10 +504,6 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
     let answer = result
         .structured_content
         .ok_or("structured answer absent")?;
-    eprintln!(
-        "exact miss context: {}",
-        json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
-    );
     assert_validates(&validator, &answer, "get_symbol miss");
     assert_eq!(answer["outcome"], "missing");
     let warning = &answer["symbol_not_found"];
@@ -595,10 +591,6 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
-        eprintln!(
-            "exact miss context: {}",
-            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
-        );
         assert_validates(output, &answer, "configured work result");
         let warning = &answer["symbol_not_found"];
         assert_eq!(
@@ -666,10 +658,6 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
-        eprintln!(
-            "exact miss context: {}",
-            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
-        );
         assert_validates(&validator, &answer, "get_symbol work bound");
         let warning = &answer["symbol_not_found"];
         assert_eq!(warning["id"], request["id"]);
@@ -715,10 +703,6 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
         let answer = result
             .structured_content
             .ok_or("structured answer absent")?;
-        eprintln!(
-            "exact miss context: {}",
-            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
-        );
         let alternatives = answer["symbol_not_found"]["alternatives"]
             .as_array()
             .ok_or("alternatives absent")?;
@@ -974,7 +958,11 @@ async fn call_tool_retrying_acceptance(
         }
         last_failure = failure.text;
     }
-    Err(format!("the server kept refusing a retryable corpus request: {last_failure}").into())
+    Err(format!(
+        "the server kept refusing a retryable corpus request: {last_failure}; request {} {:?}",
+        params.name, params.arguments,
+    )
+    .into())
 }
 
 #[tokio::test]

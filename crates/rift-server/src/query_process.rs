@@ -23,7 +23,7 @@ const DIAGNOSTIC_BYTES_DEFAULT: usize = 8 * 1024;
 // is u32::MAX; every other byte is fixed by the strict exchange structure.
 const ACKNOWLEDGMENT_BYTES_MAX: usize = b"{\"version\":4294967295,\"payload\":null}".len();
 // Change the version when the query snapshot contract changes. Zero is not a supported version.
-const QUERY_EXCHANGE_VERSION: u32 = 7;
+const QUERY_EXCHANGE_VERSION: u32 = 8;
 
 /// Versioned query data shared by the child and authoritative fact reads.
 #[derive(Debug, Deserialize, Serialize)]

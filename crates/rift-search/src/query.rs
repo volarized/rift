@@ -11,7 +11,7 @@ pub use source::{
 pub use provider::{
     QueryProviderContext, QueryProviderDeclaration, QueryProviderEdge, QueryProviderEndpoint,
     QueryProviderInput, QueryProviderRecord, QueryProviderReference, QueryProviderRelationship,
-    QueryProviderSelection, QueryProviderSnapshot, QueryProviderTarget,
+    QueryProviderSelection, QueryProviderSnapshot, QueryProviderTarget, contribution_keys,
 };
 
 use std::collections::BTreeSet;

@@ -143,6 +143,91 @@ impl WorkspaceSymbolView {
         Ok(view)
     }
 
+    /// Validates overlapping captured source identities without reading source again.
+    ///
+    /// # Errors
+    /// Refuses different roots, owners or captured file identities.
+    pub fn validate_source_selection(&self, other: &Self) -> Result<(), RiftError> {
+        if self.root != other.root || self.owner != other.owner || self.limits != other.limits {
+            return errors::analysis::package_input_identity_invalid().fail();
+        }
+        for file in other.files() {
+            let conflict = self.file(file.path()).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            }) || self.text_files.get(file.path()).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            });
+            if conflict {
+                return errors::analysis::package_input_identity_invalid().fail();
+            }
+        }
+        for (path, file) in &other.text_files {
+            let conflict = self.text_files.get(path).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            }) || self.files.get(path).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            });
+            if conflict {
+                return errors::analysis::package_input_identity_invalid().fail();
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterates original canonical declaration bindings without cloning their payload.
+    pub fn canonical_declarations<'view>(
+        &'view self,
+        identity: &SymbolId,
+    ) -> impl Iterator<
+        Item = Result<
+            (
+                &'view ProjectPath,
+                usize,
+                SymbolMatch<'view>,
+                &'view rift_protocol::symbol_read::SymbolDeclaration,
+            ),
+            RiftError,
+        >,
+    > + use<'view> {
+        self.declarations
+            .canonical
+            .get(identity)
+            .into_iter()
+            .flatten()
+            .map(move |(path, index)| {
+                let missing = || errors::index::workspace_provider().error();
+                let file = self.file(path).ok_or_else(missing)?;
+                let symbol = file.syntax().symbols().get(*index).ok_or_else(missing)?;
+                let rank = symbol_rank(symbol, &IdentifierMatcher::new(&symbol.qualified_name))
+                    .ok_or_else(missing)?;
+                let declaration = self
+                    .declarations
+                    .facts
+                    .get(&(path.clone(), *index))
+                    .ok_or_else(missing)?;
+                Ok((
+                    path,
+                    *index,
+                    SymbolMatch { file, symbol, rank },
+                    declaration,
+                ))
+            })
+    }
+
+    /// Returns one original declaration only under its established identity.
+    #[must_use]
+    pub fn canonical_declaration(
+        &self,
+        identity: &SymbolId,
+        path: &ProjectPath,
+        index: usize,
+    ) -> Option<&rift_protocol::symbol_read::SymbolDeclaration> {
+        let key = (path.clone(), index);
+        (self.identities.get(&key) == Some(identity))
+            .then(|| self.declarations.facts.get(&key))
+            .flatten()
+    }
+
     /// Root of the captured workspace, independent of the caller's current directory.
     #[must_use]
     pub fn root(&self) -> &Path {

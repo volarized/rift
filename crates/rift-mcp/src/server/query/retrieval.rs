@@ -131,15 +131,22 @@ impl RiftMcp {
         } else {
             let mut extensions = rmcp::model::Extensions::default();
             extensions.insert(captured.clone());
+            let associations =
+                super::super::candidates::CapturedSearchContributions::new(budget.clone());
+            extensions.insert(associations.clone());
             let result = self
                 .discovery_search(crate::parameters::Parameters(paging.clone()), extensions)
                 .await?
                 .0;
-            let contributions = match &result {
-                SearchReadResult::Results(result) => {
-                    (0..result.results.len()).map(|_| Vec::new()).collect()
+            let contributions = if let Some(rows) = associations.take()? {
+                rows
+            } else {
+                match &result {
+                    SearchReadResult::Results(result) => {
+                        (0..result.results.len()).map(|_| Vec::new()).collect()
+                    }
+                    SearchReadResult::Unavailable(_) => Vec::new(),
                 }
-                SearchReadResult::Unavailable(_) => Vec::new(),
             };
             (result, contributions)
         })

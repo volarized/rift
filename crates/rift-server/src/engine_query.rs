@@ -543,6 +543,7 @@ struct AcquiredSubject {
 /// Request-owned engine facts and admitted dependency targets.
 pub struct EngineQuery<'request> {
     query_facts: Option<&'request rift_search::query::QueryFacts>,
+    view_input: Option<&'request crate::LocalSymbolViewInput>,
     primary_contexts: Vec<Arc<rift_search::query::QueryProviderContext>>,
     provider_targets: Vec<Arc<QueryPackageTarget>>,
     resolved_providers: BTreeSet<(
@@ -586,6 +587,7 @@ impl<'request> EngineQuery<'request> {
         Self {
             provider_targets: Vec::new(),
             query_facts: None,
+            view_input: None,
             primary_contexts: Vec::new(),
             resolved_providers: BTreeSet::new(),
             provider_selection: None,
@@ -677,6 +679,27 @@ impl<'request> EngineQuery<'request> {
     ) -> Self {
         self.provider_selection = Some(Arc::new(selection));
         self
+    }
+
+    /// Borrows the same original material that supplied the selected provider records.
+    ///
+    /// # Errors
+    /// Refuses a different captured serving selection.
+    pub fn with_view_input(
+        mut self,
+        input: &'request crate::LocalSymbolViewInput,
+    ) -> Result<Self, RiftError> {
+        let selection = self
+            .provider_selection
+            .as_deref()
+            .ok_or_else(|| unavailable("the physical subject has no original serving selection"))?;
+        input.validate_provider_selection(selection)?;
+        if input.captured_provider_selection() != Some(selection) {
+            return unavailable("the physical subject differs from the selected publication")
+                .fail();
+        }
+        self.view_input = Some(input);
+        Ok(self)
     }
 
     /// Original serving selection shared with bounded source preparation.
@@ -1308,6 +1331,7 @@ impl<'request> EngineQuery<'request> {
             })?;
             let acquisition = Acquisition {
                 reads: self.reads,
+                view_input: self.view_input,
                 engines: self.engines,
                 deadline: self.deadline,
                 roots: self.roots,
@@ -1446,6 +1470,7 @@ fn append_batch(
 
 struct Acquisition<'source> {
     reads: &'source ReadService,
+    view_input: Option<&'source crate::LocalSymbolViewInput>,
     engines: &'source EnginePool,
     deadline: Instant,
     roots: &'source CalleeRoots,
@@ -1454,15 +1479,37 @@ struct Acquisition<'source> {
     requests: ProviderRequests,
 }
 
-impl Acquisition<'_> {
+impl<'source> Acquisition<'source> {
+    fn reference_source(
+        &self,
+        identity: &CoreSymbolId,
+    ) -> Result<Option<super::ReferenceSource<'source>>, RiftError> {
+        if let Some(input) = self.view_input {
+            for index in input.indices() {
+                if let Some(binding) = index.canonical_declarations(identity).next() {
+                    let (_, _, matched, _) = binding?;
+                    if matched.symbol.name_range.is_none() {
+                        continue;
+                    }
+                    let Some(slot) = self.engines.engine_for(matched.file.syntax().language())
+                    else {
+                        continue;
+                    };
+                    return Ok(Some((slot, matched.file, matched.symbol)));
+                }
+            }
+            return Ok(None);
+        }
+        reference_source(self.reads, self.engines, identity)
+    }
+
     async fn project(
         self,
         identity: &CoreSymbolId,
         direction: TraversalDirection,
         facet: RelationshipFacet,
     ) -> Result<AcquiredSubject, RiftError> {
-        let Some((slot, file, symbol)) = reference_source(self.reads, self.engines, identity)?
-        else {
+        let Some((slot, file, symbol)) = self.reference_source(identity)? else {
             if let Some((file, _)) = super::resolve_graph_symbol(self.reads.index(), identity)?
                 && self.engines.engine_for(file.syntax().language()).is_none()
             {

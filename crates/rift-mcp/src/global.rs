@@ -1306,19 +1306,24 @@ fn unit_identity(
 }
 
 pub(crate) fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
+    hits.sort_by(|left, right| compare_search_hits(left, right, order));
+}
+
+pub(crate) fn compare_search_hits(
+    left: &SearchHit,
+    right: &SearchHit,
+    order: ResultOrder,
+) -> std::cmp::Ordering {
     match order {
-        ResultOrder::Relevance => {}
-        ResultOrder::Path => hits.sort_by(|left, right| {
-            left.path
-                .is_none()
-                .cmp(&right.path.is_none())
-                .then_with(|| left.path.cmp(&right.path))
-                .then_with(|| left.unit.cmp(&right.unit))
-                .then_with(|| search_hit_key(left).cmp(search_hit_key(right)))
-        }),
-        ResultOrder::Identity => {
-            hits.sort_by(|left, right| search_hit_key(left).cmp(search_hit_key(right)));
-        }
+        ResultOrder::Relevance => std::cmp::Ordering::Equal,
+        ResultOrder::Path => left
+            .path
+            .is_none()
+            .cmp(&right.path.is_none())
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.unit.cmp(&right.unit))
+            .then_with(|| search_hit_key(left).cmp(search_hit_key(right))),
+        ResultOrder::Identity => search_hit_key(left).cmp(search_hit_key(right)),
     }
 }
 

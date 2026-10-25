@@ -200,15 +200,17 @@ async fn assert_query_fact_refusals(
         .await?;
     assert_eq!(invalid.is_error, Some(true), "{invalid:?}");
     assert!(serde_json::to_string(&invalid)?.contains("invalid_request"));
-    let mut incompatible = request.clone();
-    incompatible["version"] = json!(0);
-    let incompatible = client
-        .call_tool(tool_request("query_facts", &incompatible))
-        .await?;
-    assert_eq!(incompatible.is_error, Some(true), "{incompatible:?}");
-    let incompatible = serde_json::to_string(&incompatible)?;
-    assert!(incompatible.contains("capability_unavailable · retry operator_action"));
-    assert!(incompatible.contains("rift.server.read_unsupported"));
+    for version in [0, 7] {
+        let mut incompatible = request.clone();
+        incompatible["version"] = json!(version);
+        let incompatible = client
+            .call_tool(tool_request("query_facts", &incompatible))
+            .await?;
+        assert_eq!(incompatible.is_error, Some(true), "{incompatible:?}");
+        let incompatible = serde_json::to_string(&incompatible)?;
+        assert!(incompatible.contains("capability_unavailable · retry operator_action"));
+        assert!(incompatible.contains("rift.server.read_unsupported"));
+    }
     let mut forged = request;
     forged["payload"]["view"] = json!("0".repeat(64));
     let expired = client

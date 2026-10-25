@@ -254,10 +254,13 @@ impl RiftMcp {
             .configuration
             .accepted_for_tool(wire::ErrorPhase::Read)?;
         let ((facts, material, provider_selection), mut warnings) = self
-            .project_fresh_query(&resolved, requirements, &accepted, execution)
-            .await?;
-        let material = self
-            .combine_query_material(material, retained_material, execution)
+            .project_fresh_query(
+                &resolved,
+                requirements,
+                &accepted,
+                retained_material,
+                execution,
+            )
             .await?;
         let material = limit_material(material, expiry.as_ref())?;
         warnings.extend(retained_warnings);
@@ -270,6 +273,7 @@ impl RiftMcp {
                     resolved: &resolved,
                     engines: &engines,
                     roots: &roots,
+                    material: &material,
                     accepted: &accepted,
                     execution,
                 },
@@ -351,32 +355,6 @@ impl RiftMcp {
             }));
         }
         Ok(Ok(resolved))
-    }
-
-    async fn combine_query_material(
-        &self,
-        material: rift_server::LocalSymbolViewInput,
-        retained_material: Option<rift_server::LocalSymbolViewInput>,
-        execution: QueryExecution<'_>,
-    ) -> Result<rift_server::LocalSymbolViewInput, ToolFailure> {
-        let QueryExecution {
-            budget, deadline, ..
-        } = execution;
-        let material = match retained_material {
-            Some(selected) => self.query_work(budget, deadline, move |budget| {
-                for input in [&material, &selected] {
-                    if let Some(references) = input.query_references() {
-                        budget.charge_material(references.retained_material_bytes())?;
-                    }
-                }
-                for facts in [material.package_facts(), selected.package_facts()].into_iter().flatten() {
-                    budget.charge(facts.as_ref())?;
-                }
-                material.combine(&selected).map_err(|_| acquisition_failure("selected query facts belong to different publications; select one retained context"))
-            }).await?,
-            None => material,
-        };
-        Ok(material)
     }
 
     async fn selected_query_services(
@@ -514,6 +492,7 @@ impl RiftMcp {
         resolved: &super::ResolvedWorkspace,
         requirements: &FactRequirements,
         accepted: &rift_protocol::configuration::WorkspaceConfiguration,
+        retained_material: Option<rift_server::LocalSymbolViewInput>,
         execution: QueryExecution<'_>,
     ) -> Result<QueryProjection, ToolFailure> {
         let QueryExecution {
@@ -544,6 +523,8 @@ impl RiftMcp {
                         let selection = material.provider_selection(&projection_configuration)?;
                         budget.charge(&selection)?;
                         let material = material.with_provider_selection(selection.clone())?;
+                        let material =
+                            combine_query_material(material, retained_material, &mut budget)?;
                         let mut facts = material.query_facts_with_selection(
                             &projection_requirements,
                             limits,
@@ -1117,11 +1098,38 @@ fn limit_material(
     }
 }
 
+fn combine_query_material(
+    material: rift_server::LocalSymbolViewInput,
+    retained_material: Option<rift_server::LocalSymbolViewInput>,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<rift_server::LocalSymbolViewInput, RiftError> {
+    let Some(selected) = retained_material else {
+        return Ok(material);
+    };
+    for input in [&material, &selected] {
+        if let Some(references) = input.query_references() {
+            budget.charge_material(references.retained_material_bytes())?;
+        }
+    }
+    for facts in [material.package_facts(), selected.package_facts()]
+        .into_iter()
+        .flatten()
+    {
+        budget.charge(facts.as_ref())?;
+    }
+    material.combine(&selected).map_err(|_| {
+        acquisition_failure(
+            "selected query facts belong to different publications; select one retained context",
+        )
+    })
+}
+
 #[derive(Clone, Copy)]
 struct ScopedQueryInput<'query> {
     resolved: &'query super::ResolvedWorkspace,
     engines: &'query rift_server::EnginePool,
     roots: &'query rift_server::CalleeRoots,
+    material: &'query rift_server::LocalSymbolViewInput,
     accepted: &'query rift_protocol::configuration::WorkspaceConfiguration,
     execution: QueryExecution<'query>,
 }
@@ -1280,6 +1288,7 @@ impl RiftMcp {
         .with_query_budget(input.execution.budget.clone())
         .with_query_facts(facts)?
         .with_provider_selection(selection)
+        .with_view_input(input.material)?
         .with_provider_requests(input.execution.requests.clone());
         let requests_max = input.accepted.search.query.requests;
         let global_configuration = input

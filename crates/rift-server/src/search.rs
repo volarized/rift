@@ -448,7 +448,7 @@ impl ReadService {
                 payloads,
                 &mut traversed,
             )?;
-            results.extend(traversed.into_iter().map(SelectedHit::from));
+            merge_selected_traversal_hits(&mut results, traversed);
         }
         // Either bound reaching `results_max` costs the caller the same hits, so the two
         // carry one warning: the candidate pool cut before resolution, and the hit set
@@ -853,6 +853,27 @@ impl From<SearchHit> for SelectedHit {
         Self {
             hit,
             contributions: Vec::new(),
+        }
+    }
+}
+
+fn merge_selected_traversal_hits(results: &mut Vec<SelectedHit>, traversed: Vec<SearchHit>) {
+    for hit in traversed {
+        let existing = hit_symbol_id(&hit).and_then(|identity| {
+            results
+                .iter_mut()
+                .find(|selected| hit_symbol_id(&selected.hit) == Some(identity))
+        });
+        match (existing, hit) {
+            (
+                Some(existing),
+                SearchHit {
+                    traversal_path: Some(path),
+                    distance: Some(distance),
+                    ..
+                },
+            ) => crate::traversal::absorb_traversal_match(&mut existing.hit, path, distance),
+            (_, hit) => results.push(SelectedHit::from(hit)),
         }
     }
 }
@@ -1444,16 +1465,6 @@ impl ResolvedCandidate<'_> {
             Self::TextFile(file) => Some(file.path()),
             Self::Declaration(..) => None,
         }
-    }
-
-    /// The wire hit this candidate becomes, scored by its place in the fused order.
-    fn into_hit(
-        self,
-        criteria: SearchCriteria<'_>,
-        candidate: &FusedCandidate,
-    ) -> Result<SearchHit, RiftError> {
-        self.into_selected_hit(criteria, candidate, None)
-            .map(|selected| selected.hit)
     }
 
     fn into_selected_hit(
