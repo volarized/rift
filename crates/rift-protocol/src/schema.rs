@@ -1018,12 +1018,24 @@ pub fn declare_history_ranges(schema: &mut Schema) {
 /// enforces the bound at load and the schema carries it for readers.
 pub fn declare_server_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
+        ByteSize, Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
         SERVER_QUEUE_TIMEOUT_MS_MAX, SERVER_READINESS_TIMEOUT_MS_MAX,
         SERVER_READINESS_TIMEOUT_MS_MIN, SERVER_VALIDATION_INTERVAL_MS_MAX,
         SERVER_VALIDATION_INTERVAL_MS_MIN, SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX,
         ServerConfiguration,
     };
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, retained_size),
+        RIFT_RANGE,
+        range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(u64::MAX)),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, view_lifetime),
+        RIFT_RANGE,
+        range(&Duration::from_millis(1), &Duration::from_millis(u64::MAX)),
+    );
     annotate_property(
         schema,
         property!(ServerConfiguration, worker_queue_timeout),
@@ -1079,6 +1091,31 @@ pub fn declare_server_ranges(schema: &mut Schema) {
             ])),
         ),
     );
+}
+
+/// Declares the positive byte ranges accepted by query configuration.
+pub fn declare_query_ranges(schema: &mut Schema) {
+    use crate::configuration::ByteSize;
+    use crate::query::QueryConfiguration;
+
+    for name in [
+        property!(QueryConfiguration, statement_size),
+        property!(QueryConfiguration, fact_size),
+        property!(QueryConfiguration, result_size),
+        property!(QueryConfiguration, page_limit),
+        property!(QueryConfiguration, input_size),
+        property!(QueryConfiguration, output_size),
+        property!(QueryConfiguration, material_size),
+        property!(QueryConfiguration, heap_size),
+        property!(QueryConfiguration, diagnostic_size),
+    ] {
+        annotate_property(
+            schema,
+            name,
+            RIFT_RANGE,
+            range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(u64::MAX)),
+        );
+    }
 }
 
 /// A [`SearchConfiguration`](crate::configuration::SearchConfiguration) states its

@@ -21,11 +21,14 @@ use super::{
 
 /// One complete result produced by the existing retrieval owner.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryServiceData {
     /// The accepted request whose results were acquired.
     pub request: SearchParams,
     /// Complete selected hits and their original serving context.
     pub result: SearchResult,
+    /// Original selected owner graph and provider endpoint for each result row.
+    pub targets: Vec<Option<(String, crate::query::QueryProviderEndpoint)>>,
 }
 
 /// One retained table, addressed by its execution's service IRI.
@@ -84,7 +87,47 @@ impl QueryServices {
         mut evaluator: SparqlEvaluator,
         limits: QueryLimits,
         cancellation: &QueryCancellation,
+        dataset: VirtualDataset,
     ) -> Result<SparqlEvaluator, QueryError> {
+        for record in &self.retrievals {
+            if record.targets.len() != record.result.results.len() {
+                return Err(failure::evaluation(
+                    "retrieval record associations do not match selected rows",
+                ));
+            }
+            for (hit, target) in record.result.results.iter().zip(&record.targets) {
+                match (&hit.hit, target) {
+                    (
+                        rift_protocol::read::SearchHitTarget::Symbol { symbol },
+                        Some((graph, endpoint)),
+                    ) => {
+                        let selected = dataset.selected_resource(graph, endpoint)?;
+                        if let Some(identity) = &symbol.id
+                            && selected
+                                != Term::NamedNode(
+                                    NamedNode::new(identity.as_str()).map_err(failure::invalid)?,
+                                )
+                        {
+                            return Err(failure::evaluation(
+                                "retrieval symbol differs from its original selected record",
+                            ));
+                        }
+                    }
+                    (rift_protocol::read::SearchHitTarget::Symbol { symbol }, None) => {
+                        let identity = symbol.id.as_ref().ok_or_else(|| {
+                            failure::evaluation("retrieval symbol has no original selected record")
+                        })?;
+                        crate::query::QueryProviderTarget::canonical(identity)?;
+                    }
+                    (_, None) => {}
+                    (_, Some(_)) => {
+                        return Err(failure::evaluation(
+                            "retrieval record association has a different result target",
+                        ));
+                    }
+                }
+            }
+        }
         if !self.retrievals.is_empty() {
             evaluator = evaluator.with_service_handler(
                 NamedNode::new(SEARCH_SERVICE).map_err(failure::invalid)?,
@@ -92,6 +135,7 @@ impl QueryServices {
                     records: self.retrievals.into_iter().map(Arc::new).collect(),
                     limits,
                     cancellation: cancellation.clone(),
+                    dataset: Arc::new(dataset),
                 },
             );
         }
@@ -146,6 +190,7 @@ struct RetrievalHandler {
     records: Vec<Arc<QueryServiceData>>,
     limits: QueryLimits,
     cancellation: QueryCancellation,
+    dataset: Arc<VirtualDataset>,
 }
 
 impl ServiceHandler for RetrievalHandler {
@@ -167,7 +212,7 @@ impl ServiceHandler for RetrievalHandler {
             self.limits,
             self.cancellation.0.clone(),
         )?
-        .with_retrieval(Arc::clone(record));
+        .with_retrieval(Arc::clone(record), Arc::clone(&self.dataset));
         let query = Query::Select {
             dataset: None,
             pattern: execution_pattern(pattern, self.limits.algebra_nodes_max)?,
@@ -438,6 +483,19 @@ fn input(
     key: &str,
     object: &TermPattern,
 ) -> Result<(), QueryError> {
+    if ["query", "pattern"].contains(&key)
+        && match object {
+            TermPattern::Literal(value) => {
+                value.datatype().as_str() != "http://www.w3.org/2001/XMLSchema#string"
+            }
+            TermPattern::Variable(_) | TermPattern::BlankNode(_) => false,
+            TermPattern::NamedNode(_) => true,
+        }
+    {
+        return Err(failure::parse(format!(
+            "retrieval input {key} must be a string literal"
+        )));
+    }
     let value = match object {
         TermPattern::Literal(value)
             if value.datatype().as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON" =>
@@ -455,12 +513,7 @@ fn input(
                 .unwrap_or(value.as_str())
                 .to_owned(),
         ),
-        TermPattern::Variable(_) => return Ok(()),
-        TermPattern::BlankNode(_) => {
-            return Err(failure::parse(
-                "retrieval input values must be literals or vocabulary terms",
-            ));
-        }
+        TermPattern::Variable(_) | TermPattern::BlankNode(_) => return Ok(()),
     };
     if let Some(previous) = fields.insert(key.to_owned(), value.clone())
         && previous != value
@@ -518,7 +571,10 @@ fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPa
                         return true;
                     };
                     if !INPUT_FIELDS.contains(&key)
-                        || matches!(triple.object, TermPattern::Variable(_))
+                        || matches!(
+                            triple.object,
+                            TermPattern::Variable(_) | TermPattern::BlankNode(_)
+                        )
                     {
                         return true;
                     }
@@ -554,4 +610,35 @@ fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPa
         }
     }
     Ok(pattern)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::{Literal, Map, NamedNode, TermPattern, Value, input};
+
+    #[test]
+    fn textual_inputs_preserve_their_rdf_datatype() -> Result<(), Box<dyn std::error::Error>> {
+        for key in ["query", "pattern"] {
+            for value in [
+                TermPattern::Literal(Literal::from(42u64)),
+                TermPattern::Literal(Literal::new_language_tagged_literal("text", "en")?),
+                TermPattern::Literal(Literal::new_typed_literal(
+                    "42",
+                    NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")?,
+                )),
+                TermPattern::NamedNode(NamedNode::new("urn:rift:vocabulary:text")?),
+            ] {
+                assert!(input(&mut Map::new(), key, &value).is_err());
+            }
+            let mut fields = Map::new();
+            let text = "42 \"quoted\" \\ unicode λ\nnext";
+            input(
+                &mut fields,
+                key,
+                &TermPattern::Literal(Literal::new_simple_literal(text)),
+            )?;
+            assert_eq!(fields.get(key), Some(&Value::String(text.to_owned())));
+        }
+        Ok(())
+    }
 }

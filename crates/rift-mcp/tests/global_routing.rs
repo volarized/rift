@@ -100,6 +100,86 @@ async fn search_symbols(
     call_tool(client, "search", serde_json::to_value(query)?).await
 }
 
+async fn ranked_search_symbols(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    args: Value,
+) -> TestResult<Value> {
+    let request = serde_json::from_value::<rift_protocol::read::SearchParams>(args)?;
+    let query = workspace_client::query::retrieval(&request)?;
+    workspace_client::search_after_population(client, &query).await
+}
+
+async fn pattern_with_view(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    args: Value,
+) -> TestResult<Value> {
+    let request = serde_json::from_value::<rift_protocol::read::SearchParams>(args)?;
+    let query = workspace_client::query::projected_retrieval(
+        &request,
+        "?upstream ?upstream_expiry",
+        "?hit :view/:id ?upstream; :view/:expires_at ?upstream_expiry .",
+    )?;
+    call_tool(client, "search", serde_json::to_value(query)?).await
+}
+
+async fn assert_pattern_view_readback(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    fixture: &GlobalFixture,
+    answer: &Value,
+) -> TestResult {
+    for row in workspace_client::query::rows(answer)? {
+        assert_eq!(
+            workspace_client::query::literal(row, "upstream_expiry")?.parse::<jiff::Timestamp>()?,
+            view_expiry(fixture.captured_view())?
+        );
+        assert_eq!(
+            workspace_client::query::literal(row, "upstream")?,
+            "a".repeat(64)
+        );
+    }
+    let view = answer["view"]["id"]
+        .as_str()
+        .ok_or("captured pattern view")?;
+    let source = call_tool(
+        client,
+        "get_source",
+        json!({"unit":COLLECTED_UNIT,"view":view}),
+    )
+    .await?;
+    assert_eq!(source["outcome"], "found", "{source:#}");
+    assert_eq!(source["view"], answer["view"]);
+    assert!(
+        source["source"]["text"]
+            .as_str()
+            .is_some_and(|source| source.contains("pub fn helper_beacon() {}"))
+    );
+    let symbol = global_api::collected_identity(SymbolFixture::Valid, "helper_beacon");
+    let exact = call_tool(
+        client,
+        "get_symbol",
+        json!({"id":symbol,"view":view,"include":["source"]}),
+    )
+    .await?;
+    assert_eq!(exact["outcome"], "found", "{exact:#}");
+    assert_eq!(exact["view"], answer["view"]);
+    assert_eq!(
+        exact["declarations"][0]["source"],
+        "pub fn helper_beacon() {}"
+    );
+    for request in fixture
+        .requests()
+        .await
+        .iter()
+        .filter(|request| request.uri.contains("/symbols") || request.uri.contains("/source"))
+    {
+        assert_eq!(
+            request.body.as_ref().ok_or("exact read body")?["view"],
+            "a".repeat(64)
+        );
+    }
+    Ok(())
+}
+
 async fn read_producer(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     name: &'static str,
@@ -117,6 +197,10 @@ fn literals<'a>(answer: &'a Value, field: &str) -> TestResult<Vec<&'a str>> {
         .iter()
         .map(|row| workspace_client::query::literal(row, field))
         .collect()
+}
+
+fn view_expiry(view: &Value) -> TestResult<jiff::Timestamp> {
+    Ok(view["expires_at"].as_str().ok_or("view expiry")?.parse()?)
 }
 
 fn assert_unavailable(answer: &Value) {
@@ -233,23 +317,33 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
     )
     .await?;
     let started = tokio::time::Instant::now();
-    let answer = search_symbols(
-        &client,
-        json!({"target":"symbol", "query":"local_beacon","scope":"global"}),
-    )
-    .await?;
+    let params = serde_json::from_value(json!({
+        "target":"symbol", "query":"local_beacon", "scope":"global"
+    }))?;
+    let query = workspace_client::query::retrieval(&params)?;
+    let failure = failed_call(
+        client
+            .call_tool(tool_request("search", &serde_json::to_value(query)?))
+            .await,
+    )?;
     let elapsed = started.elapsed();
     assert!(
         elapsed < RESOLUTION_DELAY,
         "the request deadline must end the resolution wait: elapsed={elapsed:?}"
     );
-    let warning = answer["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|warning| warning["code"] == "global_api_unavailable")
-        .ok_or_else(|| format!("missing deadline warning: {answer:#}"))?;
-    assert_eq!(warning["failure_class"], "timeout");
+    assert_eq!(
+        failure.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{}",
+        failure.text
+    );
+    assert!(
+        fixture
+            .requests()
+            .await
+            .iter()
+            .any(|request| request.uri.ends_with("/resolutions"))
+    );
     assert_eq!(fixture.requests().await.len(), 2);
     client.cancel().await?;
     server_task.await?;
@@ -260,8 +354,7 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
 /// deadline, however slow the machine running the test.
 const READ_DELAY: Duration = Duration::from_secs(10);
 
-/// A package read the request deadline cuts short discards the remote lane: symbol and full-text `search` each answer the project hits alone, with the timeout warning, well before
-/// the held page would have arrived.
+/// A package read past the request deadline refuses the complete search before its held page arrives.
 #[tokio::test]
 async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let hold = Some(Hold::Read(READ_DELAY));
@@ -283,20 +376,27 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     ];
     for (tool, args) in reads {
         let started = tokio::time::Instant::now();
-        let answer = read_producer(&client, tool, args).await?;
+        let params = serde_json::from_value(args)?;
+        let query = workspace_client::query::retrieval(&params)?;
+        let failure = failed_call(
+            client
+                .call_tool(tool_request(tool, &serde_json::to_value(query)?))
+                .await,
+        )?;
         let elapsed = started.elapsed();
         assert!(
             elapsed < READ_DELAY,
             "{tool}: the request deadline must end the read wait: elapsed={elapsed:?}"
         );
-        let warning = answer["warnings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|warning| warning["code"] == "global_api_unavailable")
-            .ok_or_else(|| format!("{tool}: missing deadline warning: {answer:#}"))?;
-        assert_eq!(warning["failure_class"], "timeout", "{tool}");
-        assert_unavailable(&answer);
+        assert_eq!(
+            failure.code,
+            ErrorCode::TemporarilyUnavailable,
+            "{tool}: {}",
+            failure.text
+        );
+        assert!(fixture.requests().await.iter().any(|request| {
+            request.uri.contains("/search?") || request.uri.ends_with("/search")
+        }));
     }
     drop(directory);
     client.cancel().await?;
@@ -356,9 +456,96 @@ async fn await_local_caller(
     Ok(())
 }
 
-/// An outgoing walk from `caller` against a fixture holding `hold` past the request
-/// deadline: the walk answers well before the held answer would have arrived, the
-/// standard library callee drops, and the answer carries the timeout warning.
+async fn assert_admitted_outgoing_source(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    fixture: &GlobalFixture,
+    callee: &CalleePosition,
+    runtime: bool,
+) -> TestResult {
+    let (callee_uri, callee_line, callee_start, _, callee_name) = callee;
+    let (callee_line, callee_start, callee_name) = (*callee_line, *callee_start, *callee_name);
+    let original_source = if runtime {
+        let path = reqwest::Url::parse(callee_uri)?
+            .to_file_path()
+            .map_err(|()| "the runtime fixture has an absolute source path")?;
+        fs::read_to_string(path)?
+    } else {
+        "function beacon() {}\n".to_owned()
+    };
+    let name_start = original_source
+        .split_inclusive('\n')
+        .take(callee_line)
+        .map(str::len)
+        .sum::<usize>()
+        + callee_start;
+    let answer = call_tool(
+        client,
+        "search",
+        json!({"query":
+            "SELECT ?name ?unit ?start ?end ?source { \
+             <rift://symbol/local/rust/walk/caller> :calls ?callee . \
+             ?callee :name ?name; :declarations ?declaration . \
+             ?declaration :unit ?unit; :range ?range . \
+             ?range :start ?start; :end ?end . ?unit :source ?source }"
+        }),
+    )
+    .await?;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert_eq!(rows.len(), 1, "{answer:#}");
+    let row = &rows[0];
+    assert_eq!(workspace_client::query::literal(row, "name")?, callee_name);
+    let start = workspace_client::query::literal(row, "start")?.parse::<usize>()?;
+    let end = workspace_client::query::literal(row, "end")?.parse::<usize>()?;
+    assert!(start <= name_start && name_start + callee_name.len() <= end);
+    assert!(original_source.get(start..end).is_some());
+    if !runtime {
+        assert_eq!((start, end), (0, 20));
+    }
+    assert_eq!(
+        workspace_client::query::literal(row, "source")?,
+        original_source
+    );
+    let unit = workspace_client::query::iri(row, "unit")?;
+    let (owner, path) = rift_protocol::identity::parse_source_unit_identity(unit)?;
+    if runtime {
+        assert_eq!(path.as_str(), "core/src/cmp.rs");
+        assert!(matches!(
+            owner,
+            Some(rift_protocol::identity::SymbolOwner::Runtime { runtime, version })
+            if runtime == "rustc" && version.starts_with("1.98.")
+        ));
+    } else {
+        assert_eq!(path.as_str(), "index.js");
+        assert_eq!(
+            owner,
+            Some(rift_protocol::identity::SymbolOwner::Package {
+                manager: "npm".to_owned(),
+                registry: "npmjs.org".to_owned(),
+                name: "demo".to_owned(),
+                version: "1.0.0".to_owned(),
+            })
+        );
+    }
+    let source = call_tool(
+        client,
+        "get_source",
+        json!({"unit":unit,"view":answer["view"]["id"]}),
+    )
+    .await?;
+    assert_eq!(source["outcome"], "found", "{source:#}");
+    assert_eq!(source["source"]["text"], original_source);
+    assert_eq!(source["view"], answer["view"]);
+    let requests = fixture.requests().await;
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.uri.ends_with("/capabilities")),
+        "admitted source facts require no global naming request: {requests:#?}"
+    );
+    Ok(())
+}
+
+/// An outgoing walk keeps admitted source facts while a global answer is held.
 async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     let fixture = GlobalFixture::start_with(FixtureOptions {
         hold: Some(hold),
@@ -372,11 +559,18 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         fixture.endpoint
     );
     let runtime = matches!(hold, Hold::Declarations(_));
-    let (callee_uri, callee_line) = if runtime {
+    let callee = if runtime {
         runtime_callee_position()?
     } else {
-        ("${uri%/lib.rs}/node_modules/demo/index.js".to_owned(), 0)
+        (
+            "${uri%/lib.rs}/node_modules/demo/index.js".to_owned(),
+            0,
+            9,
+            15,
+            "beacon",
+        )
     };
+    let (callee_uri, callee_line, callee_start, callee_end, callee_name) = &callee;
     let source_uri =
         "\\\"uri\\\":\\\"$uri\\\",\\\"range\\\":{\\\"start\\\":{\\\"line\\\":CALLEE_LINE";
     let scripted_uri = format!(
@@ -384,6 +578,14 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
     );
     let script = fake_engine::SCRIPTED_CALLS_ENGINE
         .replace(source_uri, &scripted_uri)
+        .replace(
+            "\\\"name\\\":\\\"beacon\\\"",
+            &format!("\\\"name\\\":\\\"{callee_name}\\\""),
+        )
+        .replace(
+            "\\\"selectionRange\\\":{\\\"start\\\":{\\\"line\\\":CALLEE_LINE,\\\"character\\\":7},\\\"end\\\":{\\\"line\\\":CALLEE_LINE,\\\"character\\\":13}}",
+            &format!("\\\"selectionRange\\\":{{\\\"start\\\":{{\\\"line\\\":CALLEE_LINE,\\\"character\\\":{callee_start}}},\\\"end\\\":{{\\\"line\\\":CALLEE_LINE,\\\"character\\\":{callee_end}}}}}"),
+        )
         .replace("PROGRESS", announced_work::ANNOUNCED_WORK)
         .replace("CALLEE_LINE", &callee_line.to_string())
         .replace("CALLER_LINE", "3");
@@ -417,43 +619,9 @@ async fn outgoing_walk_past_a_held_global_answer(hold: Hold) -> TestResult {
         })
         .await?;
     await_local_caller(&client, &fixture).await?;
-    let walk = serde_json::to_value(workspace_client::query::path(
-        "rift://symbol/local/rust/walk/caller",
-        ":calls",
-    )?)?;
-    let started = tokio::time::Instant::now();
-    let failure = failed_call(client.call_tool(tool_request("search", &walk)).await)?;
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < CALLEE_HOLD,
-        "the request deadline must end the wait: elapsed={elapsed:?}"
-    );
-    assert_eq!(
-        failure.code,
-        ErrorCode::TemporarilyUnavailable,
-        "{}",
-        failure.text
-    );
-    let held_route = if runtime {
-        "/declarations"
-    } else {
-        "/resolutions"
-    };
-    let requests = fixture.requests().await;
-    assert!(
-        requests
-            .iter()
-            .any(|request| request.uri.ends_with(held_route)),
-        "the deadline ends an actual held {held_route} request: failure={}; requests={requests:#?}",
-        failure.text
-    );
-    rift_tracing::info!(stage = "client.cancel", "stop stage started");
+    assert_admitted_outgoing_source(&client, &fixture, &callee, runtime).await?;
     client.cancel().await?;
-    rift_tracing::info!(stage = "client.cancel", "stop stage ended");
-    rift_tracing::info!(stage = "server_task", "stop stage started");
     server_task.await?;
-    rift_tracing::info!(stage = "server_task", "stop stage ended");
-    rift_tracing::info!(stage = "return", "stop stage ended");
     Ok(())
 }
 
@@ -467,7 +635,9 @@ fn enable_runtime_resolution(root: &std::path::Path) {
     .expect("the fixture enables the existing runtime resolver");
 }
 
-fn runtime_callee_position() -> Result<(String, usize), Box<dyn std::error::Error>> {
+type CalleePosition = (String, usize, usize, usize, &'static str);
+
+fn runtime_callee_position() -> TestResult<CalleePosition> {
     let sysroot = std::process::Command::new("rustup")
         .args(["run", "1.98", "rustc", "--print", "sysroot"])
         .output()?;
@@ -478,27 +648,36 @@ fn runtime_callee_position() -> Result<(String, usize), Box<dyn std::error::Erro
     let source = std::path::PathBuf::from(String::from_utf8(sysroot.stdout)?.trim())
         .join("lib/rustlib/src/rust/library/core/src/cmp.rs");
     let text = fs::read_to_string(&source)?;
-    let line = text
+    let (line, declaration) = text
         .lines()
-        .position(|line| line.starts_with("pub ") && line.contains("fn max<"))
+        .enumerate()
+        .find(|(_, line)| line.starts_with("pub ") && line.contains("fn max<"))
         .ok_or("the installed runtime source declares max")?;
+    let start = declaration
+        .find("fn max<")
+        .ok_or("the runtime function name")?
+        + 3;
     Ok((
         reqwest::Url::from_file_path(&source)
             .map_err(|()| "the installed runtime source has an absolute path")?
             .to_string(),
         line,
+        start,
+        start + "max".len(),
+        "max",
     ))
 }
 
-/// A resolution held past the request deadline names no callee.
+/// An admitted call target retains its original source without global naming.
 #[tokio::test]
-async fn request_deadline_bounds_the_resolution_an_outgoing_walk_waits_for() -> TestResult {
+async fn an_admitted_call_target_keeps_physical_facts_without_global_resolution() -> TestResult {
     outgoing_walk_past_a_held_global_answer(Hold::Resolution(CALLEE_HOLD)).await
 }
 
-/// A declarations answer held past the request deadline names no callee.
+/// An admitted runtime call target retains its original source without global naming.
 #[tokio::test]
-async fn request_deadline_bounds_the_declarations_an_outgoing_walk_waits_for() -> TestResult {
+async fn an_admitted_runtime_call_target_keeps_physical_facts_without_global_naming() -> TestResult
+{
     outgoing_walk_past_a_held_global_answer(Hold::Declarations(CALLEE_HOLD)).await
 }
 
@@ -527,9 +706,16 @@ async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
         "{}",
         failure.text
     );
+    let requests = fixture.requests().await;
     assert!(
-        fixture.requests().await.is_empty(),
-        "unversioned positions are unasked"
+        requests.len() <= 1,
+        "one operation metadata read: {requests:#?}"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.uri.ends_with("/capabilities")),
+        "unversioned positions make no resolution, declaration or relationship read: {requests:#?}"
     );
     client.cancel().await?;
     server_task.await?;
@@ -1009,7 +1195,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
     let workspace = served_dependent_workspace(Some(&configuration)).await?;
     let (directory, client, server_task) = workspace.served;
 
-    let global = search_symbols(
+    let global = pattern_with_view(
         &client,
         json!({
             "pattern": r"fn helper_\w+",
@@ -1020,6 +1206,7 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
     )
     .await?;
     assert_helper_beacon_pattern_hits(&global)?;
+    assert_pattern_view_readback(&client, &fixture, &global).await?;
 
     let all = search_symbols(
         &client,
@@ -1080,6 +1267,260 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
         "{requests:#?}"
     );
     drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+async fn assert_mixed_source_readback(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    fixture: &GlobalFixture,
+    mixed: &Value,
+) -> TestResult {
+    let before = fixture.requests().await.len();
+    let local = call_tool(
+        client,
+        "get_source",
+        json!({
+            "unit":"rift://source/project/src/lib.rs", "view":mixed["view"]["id"]
+        }),
+    )
+    .await?;
+    assert_eq!(local["outcome"], "found", "{local:#}");
+    assert_eq!(local["view"], mixed["view"]);
+    assert!(
+        local["source"]["text"]
+            .as_str()
+            .is_some_and(|source| source.contains("pub fn local_beacon() {}"))
+    );
+    assert_eq!(
+        fixture.requests().await.len(),
+        before,
+        "local source stays with its original workspace"
+    );
+    let remote = call_tool(
+        client,
+        "get_source",
+        json!({
+            "unit":COLLECTED_UNIT, "view":mixed["view"]["id"]
+        }),
+    )
+    .await?;
+    assert_eq!(remote["outcome"], "found", "{remote:#}");
+    assert_eq!(remote["view"], mixed["view"]);
+    assert!(
+        remote["source"]["text"]
+            .as_str()
+            .is_some_and(|source| source.contains("pub fn helper_beacon() {}"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_pattern_empty_and_mixed_results_keep_original_views_and_source_owners() -> TestResult
+{
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        view_lifetime: Duration::from_mins(5),
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let original_view = fixture.captured_view().clone();
+    let configuration = format!(
+        "[global]\nenabled=true\nendpoint={:?}\nattempts=1\n{DEMO_PACKAGE}\n[languages.rust]\nstdlib=false\n",
+        fixture.endpoint,
+    );
+    let (directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            (
+                "src/lib.rs",
+                "pub fn local_beacon() {}\npub fn beacon() {}\n",
+            ),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    for selector in ["pattern", "query"] {
+        let mut fields = json!({
+            "scope":"global",
+            "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
+        });
+        fields[selector] = json!("no_producer_match_here");
+        if selector == "pattern" {
+            fields["target"] = json!("file");
+        }
+        let parameters = serde_json::from_value(fields)?;
+        let inner = workspace_client::query::projected_retrieval(&parameters, "", "")?;
+        let request = rift_protocol::query::QueryParams {
+            query: format!("SELECT (COUNT(?hit) AS ?count) {{ {{ {} }} }}", inner.query),
+            language: rift_protocol::query::QueryLanguage::Sparql,
+        };
+        let empty = workspace_client::search_after_population(&client, &request).await?;
+        let requests = fixture.requests().await;
+        let rows = workspace_client::query::rows(&empty)
+            .map_err(|error| format!("{selector}: {error}; requests={requests:#?}"))?;
+        assert_eq!(
+            workspace_client::query::literal(&rows[0], "count")?,
+            "0",
+            "{selector}: {empty:#}"
+        );
+        assert_eq!(
+            view_expiry(&empty["view"])?,
+            view_expiry(&original_view)?,
+            "{selector}"
+        );
+    }
+    let mixed = search_symbols(
+        &client,
+        json!({
+            "pattern":r"fn \w*beacon", "scope":"all", "target":"file",
+            "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
+        }),
+    )
+    .await?;
+    assert_eq!(workspace_client::query::rows(&mixed)?.len(), 4, "{mixed:#}");
+    assert_eq!(view_expiry(&mixed["view"])?, view_expiry(&original_view)?);
+    let ranked = ranked_search_symbols(
+        &client,
+        json!({
+            "query":"beacon", "scope":"all", "include":["source"],
+            "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
+        }),
+    )
+    .await?;
+    let requests = fixture.requests().await;
+    let rows = workspace_client::query::rows(&ranked)
+        .map_err(|error| format!("{error}; requests={requests:#?}"))?;
+    assert!(
+        rows.iter().any(|row| row["path"]["value"] == "src/lib.rs"),
+        "{ranked:#}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["unit"]["value"] == COLLECTED_UNIT),
+        "{ranked:#}"
+    );
+    assert_eq!(view_expiry(&ranked["view"])?, view_expiry(&original_view)?);
+    fs::write(directory.path().join("src/lib.rs"), "pub fn changed() {}\n")?;
+    for mixed in [&mixed, &ranked] {
+        assert_mixed_source_readback(&client, &fixture, mixed).await?;
+    }
+    assert_eq!(pattern_requests(&fixture).await.len(), 2);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn empty_global_package_pages_validate_original_metadata_in_both_phases() -> TestResult {
+    use rift_cloud_client::{
+        Config, GlobalClient, PackageIdentity, PackageSearchRequest, PackageSearchRequestPhase,
+        PackageSearchRequestTarget, QueryTerm,
+    };
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        view_lifetime: Duration::from_mins(5),
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let client = GlobalClient::new(Config {
+        endpoint: fixture.endpoint.clone(),
+        token_env: "RIFT_GLOBAL_TEST_UNUSED_TOKEN".to_owned(),
+        ..Config::default()
+    })?;
+    let parsed = rift_ranking::ParsedQuery::parse("no_producer_match_here")?;
+    for phase in [
+        PackageSearchRequestPhase::Precise,
+        PackageSearchRequestPhase::Broad,
+    ] {
+        let broad = matches!(phase, PackageSearchRequestPhase::Broad);
+        let request = PackageSearchRequest {
+            query: Some(parsed.source().to_owned()),
+            terms: Some(
+                parsed
+                    .members()
+                    .iter()
+                    .map(|member| QueryTerm {
+                        text: member.text().to_owned(),
+                        phrase: member.is_phrase(),
+                        prefix: broad && !member.is_phrase(),
+                    })
+                    .collect(),
+            ),
+            identifiers: Some(
+                parsed
+                    .candidates()
+                    .into_iter()
+                    .map(|candidate| candidate.text().to_owned())
+                    .collect(),
+            ),
+            include: None,
+            packages: Some(vec![PackageIdentity {
+                manager: "cargo".to_owned(),
+                registry: "crates.io".to_owned(),
+                name: "demo".to_owned(),
+                version: "1.0.0".to_owned(),
+            }]),
+            phase: Some(phase),
+            target: Some(PackageSearchRequestTarget::All),
+            traversal: None,
+            view: None,
+        };
+        let page = client
+            .search_packages(&request, 1, None)
+            .await
+            .map_err(|error| format!("empty package page, broad {broad}: {error:?}"))?;
+        assert!(page.items.is_empty());
+        let original = serde_json::to_value(fixture.captured_view())?;
+        let selected = serde_json::to_value(page.view)?;
+        assert_eq!(selected["id"], original["id"]);
+        assert_eq!(view_expiry(&selected)?, view_expiry(&original)?);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn global_pattern_without_original_view_refuses_even_when_no_match_exists() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        pattern_view: global_api::PatternView::Missing,
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled=true\nendpoint={:?}\nattempts=1\n{DEMO_PACKAGE}\n[languages.rust]\nstdlib=false\n",
+        fixture.endpoint,
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (_directory, client, server_task) = workspace.served;
+    let request = workspace_client::query::retrieval(&serde_json::from_value(json!({
+        "pattern":"no_pattern_match_here", "scope":"global", "target":"file",
+        "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
+    }))?)?;
+    let failure = failed_call(
+        client
+            .call_tool(tool_request("search", &serde_json::to_value(request)?))
+            .await,
+    )?;
+    assert_eq!(
+        failure.code,
+        ErrorCode::CapabilityUnavailable,
+        "{}",
+        failure.text
+    );
+    assert!(failure.text.contains("rift.server.read_unsupported"));
+    assert_eq!(pattern_requests(&fixture).await.len(), 1);
+    assert!(
+        fixture
+            .requests()
+            .await
+            .iter()
+            .all(|request| !request.uri.contains("/symbols") && !request.uri.contains("/source"))
+    );
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -1685,7 +2126,7 @@ async fn the_package_argument_adds_a_package_the_context_lacks() -> TestResult {
     let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let answer = search_symbols(
+    let answer = ranked_search_symbols(
         &client,
         json!({
             "query": "helper_beacon",
@@ -1743,7 +2184,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
         (
             "search",
             json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :pattern 'beacon'; :scope 'all' } }"}),
-            "query",
+            "pattern",
         ),
         (
             "search",
@@ -2220,7 +2661,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
     let configuration = format!("{configuration}\n[languages.rust]\nstdlib=false\n");
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
 
-    let answer = search_symbols(
+    let answer = pattern_with_view(
         &client,
         json!({
             "pattern": r"fn helper_\w+",
@@ -2232,6 +2673,7 @@ async fn a_pattern_beside_packages_matches_the_requested_release() -> TestResult
     )
     .await?;
     assert_helper_beacon_pattern_hits(&answer)?;
+    assert_pattern_view_readback(&client, &fixture, &answer).await?;
 
     let bodies: Vec<Value> = pattern_requests(&fixture)
         .await
@@ -2429,9 +2871,8 @@ async fn test_identifier_case_pairs_rank_exact_spelling_through_mcp() -> TestRes
         ] {
             assert_original_identifier(&client, scope, name).await?;
         }
-        let args =
-            json!({"query": "SEARCHHIT", "scope": scope, "limit": 10, "include": ["source"]});
-        let answer = search_symbols(&client, args).await?;
+        let args = json!({"query": "SEARCHHIT", "scope": scope, "target":"symbol", "limit": 10, "include": ["source"]});
+        let answer = ranked_search_symbols(&client, args).await?;
         let names = literals(&answer, "name")?;
         assert!(
             names.contains(&"SearchHit") && names.contains(&"searchHit"),
@@ -2458,7 +2899,7 @@ async fn assert_identifier_request(
     expected: [&str; 2],
 ) -> TestResult {
     let args = json!({"query": query, "scope": "global", "limit": 10});
-    let answer = search_symbols(client, args).await?;
+    let answer = ranked_search_symbols(client, args).await?;
     assert_eq!(
         workspace_client::query::rows(&answer)?.len(),
         2,
@@ -2481,7 +2922,7 @@ async fn assert_original_identifier(
     name: &str,
 ) -> TestResult {
     let args = json!({"query": name, "scope": scope, "limit": 1, "include": ["source"]});
-    let answer = search_symbols(client, args).await?;
+    let answer = ranked_search_symbols(client, args).await?;
     let hits = workspace_client::query::rows(&answer)?;
     assert_eq!(hits.len(), 1, "{scope}: {answer:#}");
     let hit = &hits[0];
@@ -2591,7 +3032,7 @@ async fn test_qualified_identifier_case_ranks_original_spelling() -> TestResult 
         served_workspace(&[("src/lib.rs", source)], None).await?;
     for name in ["createProgram", "createprogram"] {
         let args = json!({"query": format!("Vault::{name}"), "limit": 1, "include": ["source"]});
-        let answer = search_symbols(&client, args).await?;
+        let answer = ranked_search_symbols(&client, args).await?;
         assert_eq!(
             workspace_client::query::literal(&workspace_client::query::rows(&answer)?[0], "name")?,
             name,

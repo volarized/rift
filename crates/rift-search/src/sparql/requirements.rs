@@ -271,7 +271,7 @@ impl FactRequirements {
     fn selection(&mut self, name: &NamedNodePattern, service: bool) {
         match name {
             NamedNodePattern::NamedNode(name) if service => {
-                self.services.push(name.as_str().to_owned())
+                self.services.push(name.as_str().to_owned());
             }
             NamedNodePattern::NamedNode(name) => self.datasets.push(name.as_str().to_owned()),
             NamedNodePattern::Variable(_) => self.require(FactRequirement::CompleteDomain),

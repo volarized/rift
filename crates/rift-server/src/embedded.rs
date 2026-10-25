@@ -839,7 +839,7 @@ fn incoming_calls(
             continue;
         };
         let index = &indices[&call.from.file];
-        let from = indexed_hierarchy_item(&call.from, uri, index)?;
+        let from = indexed_hierarchy_item(&call.from, &uri, index)?;
         let ranges = call
             .from_ranges
             .iter()
@@ -865,7 +865,7 @@ fn hierarchy_item(
         return Ok(None);
     };
     let index = rift_lsp::LineIndex::new(text.as_str());
-    indexed_hierarchy_item(item, uri, &index).map(Some)
+    indexed_hierarchy_item(item, &uri, &index).map(Some)
 }
 
 fn hierarchy_uri(
@@ -881,7 +881,7 @@ fn hierarchy_uri(
 
 fn indexed_hierarchy_item(
     item: &ty_ide::CallHierarchyItem,
-    uri: String,
+    uri: &str,
     index: &rift_lsp::LineIndex<'_>,
 ) -> Result<Value, AnswerRefusal> {
     Ok(json!({

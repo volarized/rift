@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolIdentity;
 use rift_protocol::relationship_read::{
-    RELATIONSHIP_SEEDS_MAX, RELATIONSHIPS_FEATURE, RelationshipCapability, RelationshipSearchPage,
+    RELATIONSHIPS_FEATURE, RelationshipBounds, RelationshipCapability, RelationshipSearchPage,
     RelationshipSearchRequest, RelationshipSearchResult,
 };
 
@@ -43,6 +43,17 @@ impl GlobalClient {
                     "direction": operation.direction,
                     "facets": operation.facets,
                 }))
+                .map(|mut selected| {
+                    selected.bounds = operation.bounds.as_ref().map(|bounds| RelationshipBounds {
+                        max_seeds: bounds.max_seeds,
+                        max_facets: bounds.max_facets,
+                        max_relationships: bounds.max_relationships,
+                        max_occurrences: bounds.max_occurrences,
+                        max_symbols: bounds.max_symbols,
+                        max_sources: bounds.max_sources,
+                    });
+                    selected
+                })
                 .map_err(|_| invalid("relationship capabilities are invalid"))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -56,7 +67,17 @@ impl GlobalClient {
         }
         for (index, operation) in supported.iter().enumerate() {
             if operation.facets.is_empty()
-                || operation.facets.len() > 16
+                || operation.bounds.as_ref().is_some_and(|bounds| {
+                    [
+                        bounds.max_seeds,
+                        bounds.max_facets,
+                        bounds.max_relationships,
+                        bounds.max_occurrences,
+                        bounds.max_symbols,
+                        bounds.max_sources,
+                    ]
+                    .contains(&0)
+                })
                 || supported[..index]
                     .iter()
                     .any(|previous| previous.direction == operation.direction)
@@ -74,6 +95,45 @@ impl GlobalClient {
         Ok(supported)
     }
 
+    /// Intersects the accepted local counts with the advertised raw operation bounds.
+    ///
+    /// # Errors
+    /// Returns unsupported when the exact raw operation or its count policy is absent.
+    pub fn relationship_bounds(
+        &self,
+        capabilities: &crate::Capabilities,
+        direction: rift_protocol::read::TraversalDirection,
+        facets: &[rift_protocol::read::RelationshipFacet],
+    ) -> Result<RelationshipBounds, RiftError> {
+        let selected = Self::relationship_capabilities(capabilities)?
+            .into_iter()
+            .find(|operation| {
+                operation.direction == direction
+                    && !facets.is_empty()
+                    && facets.iter().all(|facet| operation.facets.contains(facet))
+            });
+        let bounds = selected
+            .and_then(|operation| operation.bounds)
+            .ok_or_else(|| {
+                rift_error::errors::server::read_unsupported()
+                    .capability("global relationship operation with advertised count bounds")
+                    .error()
+            })?;
+        // A local usize above u64::MAX cannot restrict an advertised u64 count.
+        let count = |remote: u64, local: usize| {
+            u64::try_from(local).map_or(remote, |local| remote.min(local))
+        };
+        let config = &self.inner.config;
+        Ok(RelationshipBounds {
+            max_seeds: count(bounds.max_seeds, config.max_seeds),
+            max_facets: count(bounds.max_facets, config.max_facets),
+            max_relationships: count(bounds.max_relationships, config.max_relationships),
+            max_occurrences: count(bounds.max_occurrences, config.max_occurrences),
+            max_symbols: count(bounds.max_symbols, config.max_symbols),
+            max_sources: count(bounds.max_sources, config.max_sources),
+        })
+    }
+
     /// Reads one raw adjacency page without ranking, endpoint deduplication or shortest paths.
     ///
     /// # Errors
@@ -84,7 +144,7 @@ impl GlobalClient {
         limit: i64,
         cursor: Option<&str>,
     ) -> Result<RelationshipSearchResult, RiftError> {
-        validate_request(request)?;
+        validate_request(request, &self.inner.config)?;
         crate::validate_page(limit, cursor)?;
         let capabilities = self.get_capabilities().await?;
         if !crate::supports_feature(&capabilities, RELATIONSHIPS_FEATURE) {
@@ -93,21 +153,7 @@ impl GlobalClient {
                 "global API does not advertise feature: relationships",
             ));
         }
-        let supported = Self::relationship_capabilities(&capabilities)?;
-        if !supported.iter().any(|operation| {
-            operation.direction == request.relationships.direction
-                && !request.relationships.facets.is_empty()
-                && request
-                    .relationships
-                    .facets
-                    .iter()
-                    .all(|facet| operation.facets.contains(facet))
-        }) {
-            return Err(failure::configuration_invalid(
-                "relationships",
-                "global API does not support the required relationship direction and facets",
-            ));
-        }
+        let bounds = self.validate_advertised_request(request, &capabilities)?;
         crate::validate_read_bounds(
             request
                 .packages
@@ -117,7 +163,7 @@ impl GlobalClient {
             cursor,
             &capabilities,
         )?;
-        let body = crate::serialize_body(request, self.inner.config.max_request)?;
+        let body = serialize_request(request, self.inner.config.max_request)?;
         crate::validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
         let query = SearchPackagesRequestQuery {
             limit: Some(limit),
@@ -154,7 +200,7 @@ impl GlobalClient {
             Err(error) => return self.observed(Err(error)).await,
         };
         if let RelationshipSearchResult::Page(page) = &parsed.value {
-            if let Err(error) = validate_page(request, page, limit) {
+            if let Err(error) = validate_page(request, page, limit, &bounds) {
                 return self.observed(Err(error)).await;
             }
             if let Err(error) = facts::validate_page(
@@ -164,11 +210,52 @@ impl GlobalClient {
                     capabilities.bounds.source_bytes_max,
                     self.inner.config.max_source,
                 ),
+                usize::try_from(bounds.max_symbols)
+                    .map_err(|_| invalid("relationship symbol count exceeds the platform bound"))?,
+                usize::try_from(bounds.max_sources)
+                    .map_err(|_| invalid("relationship source count exceeds the platform bound"))?,
             ) {
                 return self.observed(Err(error)).await;
             }
         }
         Ok(parsed.value)
+    }
+
+    fn validate_advertised_request(
+        &self,
+        request: &RelationshipSearchRequest,
+        capabilities: &crate::Capabilities,
+    ) -> Result<RelationshipBounds, RiftError> {
+        let supported = Self::relationship_capabilities(capabilities)?;
+        let bounds = self.relationship_bounds(
+            capabilities,
+            request.relationships.direction,
+            &request.relationships.facets,
+        )?;
+        if !count_within(request.relationships.seeds.len(), bounds.max_seeds)
+            || !count_within(request.relationships.facets.len(), bounds.max_facets)
+        {
+            return Err(failure::request_invalid(
+                "relationship_page",
+                "relationships",
+                "relationship selection exceeds its advertised count bound",
+            ));
+        }
+        if !supported.iter().any(|operation| {
+            operation.direction == request.relationships.direction
+                && !request.relationships.facets.is_empty()
+                && request
+                    .relationships
+                    .facets
+                    .iter()
+                    .all(|facet| operation.facets.contains(facet))
+        }) {
+            return Err(failure::configuration_invalid(
+                "relationships",
+                "global API does not support the required relationship direction and facets",
+            ));
+        }
+        Ok(bounds)
     }
 
     /// Acquires every required cursor page under original context and explicit work bounds.
@@ -194,10 +281,10 @@ impl GlobalClient {
         limits: RelationshipReadLimits,
         mut admit: impl FnMut() -> Result<(), RiftError>,
     ) -> Result<RelationshipSearchResult, RiftError> {
-        validate_request(request)?;
+        validate_request(request, &self.inner.config)?;
         let capabilities = self.get_capabilities().await?;
         let limit = crate::advertised_page_limit(crate::PAGE_LIMIT_MAX, &capabilities);
-        let mut request = request.clone();
+        let mut continuation_request = None;
         let mut result: Option<RelationshipSearchPage> = None;
         let mut cursor = None;
         let mut cursors = HashSet::new();
@@ -207,7 +294,11 @@ impl GlobalClient {
         for _ in 0..limits.requests_max {
             admit()?;
             let page = match self
-                .relationship_page(&request, limit, cursor.as_deref())
+                .relationship_page(
+                    continuation_request.as_ref().unwrap_or(request),
+                    limit,
+                    cursor.as_deref(),
+                )
                 .await?
             {
                 RelationshipSearchResult::Page(page) => page,
@@ -241,7 +332,6 @@ impl GlobalClient {
             if let Some(selected) = &mut result {
                 merge_page(selected, page)?;
             } else {
-                request.view = Some(page.view.id.clone());
                 result = Some(page);
             }
             let Some(next) = next else {
@@ -251,11 +341,19 @@ impl GlobalClient {
                         "final relationship page did not complete every requested subject",
                     ));
                 }
-                facts::validate_complete(&request, &selected)?;
+                facts::validate_complete(request, &selected)?;
                 return Ok(RelationshipSearchResult::Page(selected));
             };
             if (count == 0 && !completion_progress) || !cursors.insert(next.clone()) {
                 return Err(invalid("relationship cursor made no progress"));
+            }
+            if continuation_request.is_none() {
+                let selected = result
+                    .as_ref()
+                    .ok_or_else(|| invalid("relationship page is absent"))?;
+                let mut continued = request.clone();
+                continued.view = Some(selected.view.id.clone());
+                continuation_request = Some(continued);
             }
             cursor = Some(next);
         }
@@ -263,6 +361,25 @@ impl GlobalClient {
             "relationship acquisition exceeds the accepted request bound",
         ))
     }
+}
+
+fn serialize_request(
+    request: &RelationshipSearchRequest,
+    limit: usize,
+) -> Result<Vec<u8>, RiftError> {
+    let mut buffer = rift_protocol::message::MessageBuffer::new(limit);
+    if let Err(error) = serde_json::to_writer(&mut buffer, request) {
+        return Err(match buffer.rejected_bytes() {
+            Some(bytes) => failure::body_limit("serialize_body", "request", bytes, limit),
+            None => failure::request_invalid_source(
+                "serialize_body",
+                "body",
+                "JSON serialization failed",
+                error,
+            ),
+        });
+    }
+    Ok(buffer.into_bytes())
 }
 
 fn admit_page_bytes(
@@ -321,11 +438,14 @@ fn completion_progress(
     }
 }
 
-fn validate_request(request: &RelationshipSearchRequest) -> Result<(), RiftError> {
+fn validate_request(
+    request: &RelationshipSearchRequest,
+    config: &crate::Config,
+) -> Result<(), RiftError> {
     let selection = &request.relationships;
     if selection.seeds.is_empty()
-        || selection.seeds.len() > RELATIONSHIP_SEEDS_MAX
-        || selection.facets.len() > 16
+        || selection.seeds.len() > config.max_seeds
+        || selection.facets.len() > config.max_facets
         || (request.packages.is_empty() && request.runtimes.is_empty() && request.view.is_none())
         || request
             .packages
@@ -344,22 +464,20 @@ fn validate_request(request: &RelationshipSearchRequest) -> Result<(), RiftError
             "raw adjacency requires bounded subjects and an exact package domain or retained view",
         ));
     }
-    let mut runtimes = HashSet::new();
-    for runtime in &request.runtimes {
-        rift_protocol::identity::SymbolOwner::Runtime {
-            runtime: runtime.runtime.clone(),
-            version: runtime.version.clone(),
-        }
-        .validate()?;
-        if !runtimes.insert((&runtime.runtime, &runtime.version)) {
-            return Err(failure::request_invalid(
-                "relationship_page",
-                "runtimes",
-                "exact runtimes must be distinct",
-            ));
-        }
-    }
+    validate_runtimes(request)?;
     let mut seeds = HashSet::new();
+    if selection
+        .facets
+        .iter()
+        .enumerate()
+        .any(|(index, facet)| selection.facets[..index].contains(facet))
+    {
+        return Err(failure::request_invalid(
+            "relationship_page",
+            "relationships.facets",
+            "facets must be distinct",
+        ));
+    }
     for seed in &selection.seeds {
         let identity = SymbolIdentity::parse(seed.as_str()).map_err(|source| {
             failure::request_invalid_source(
@@ -388,6 +506,29 @@ fn validate_request(request: &RelationshipSearchRequest) -> Result<(), RiftError
             ));
         }
     }
+    validate_packages(request)
+}
+
+fn validate_runtimes(request: &RelationshipSearchRequest) -> Result<(), RiftError> {
+    let mut runtimes = HashSet::new();
+    for runtime in &request.runtimes {
+        rift_protocol::identity::SymbolOwner::Runtime {
+            runtime: runtime.runtime.clone(),
+            version: runtime.version.clone(),
+        }
+        .validate()?;
+        if !runtimes.insert((&runtime.runtime, &runtime.version)) {
+            return Err(failure::request_invalid(
+                "relationship_page",
+                "runtimes",
+                "exact runtimes must be distinct",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_packages(request: &RelationshipSearchRequest) -> Result<(), RiftError> {
     let mut packages = HashSet::new();
     for package in &request.packages {
         package.owner()?;
@@ -425,6 +566,7 @@ fn validate_page(
     request: &RelationshipSearchRequest,
     page: &RelationshipSearchPage,
     limit: i64,
+    bounds: &RelationshipBounds,
 ) -> Result<(), RiftError> {
     if page.groups.len() != request.relationships.seeds.len()
         || page.analyzer_revision.is_empty()
@@ -444,7 +586,9 @@ fn validate_page(
                 "relationship page omitted or reordered a requested subject",
             ));
         }
-        if group.relationships.len() > 1_000 || group.occurrences.len() > 1_000 {
+        if !count_within(group.relationships.len(), bounds.max_relationships)
+            || !count_within(group.occurrences.len(), bounds.max_occurrences)
+        {
             return Err(invalid("relationship projections exceed their page bound"));
         }
         for record in &group.occurrences {
@@ -519,6 +663,10 @@ fn validate_page(
         ));
     }
     Ok(())
+}
+
+fn count_within(count: usize, maximum: u64) -> bool {
+    u64::try_from(count).is_ok_and(|count| count <= maximum)
 }
 
 fn page_record_ids(page: &RelationshipSearchPage) -> Result<HashSet<&str>, RiftError> {

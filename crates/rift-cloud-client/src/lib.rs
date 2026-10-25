@@ -196,6 +196,18 @@ pub struct Config {
     pub max_response: usize,
     /// Most UTF-8 bytes one source payload carries, also bounded by capabilities.
     pub max_source: usize,
+    /// Most original symbol records in one relationship page.
+    pub max_symbols: usize,
+    /// Most original source units in one relationship page.
+    pub max_sources: usize,
+    /// Most subjects in one relationship request.
+    pub max_seeds: usize,
+    /// Most selected facets in one relationship request.
+    pub max_facets: usize,
+    /// Most relationship projections in one relationship group.
+    pub max_relationships: usize,
+    /// Most occurrence projections in one relationship group.
+    pub max_occurrences: usize,
     /// Local ceiling for capability cache lifetime.
     pub capabilities_ttl: Duration,
     /// Local ceiling for package resolution cache lifetime.
@@ -218,6 +230,14 @@ impl Default for Config {
             max_request: REQUEST_BODY_BYTES_MAX,
             max_response: RESPONSE_BODY_BYTES_MAX,
             max_source: SOURCE_BYTES_MAX,
+            max_symbols: usize::from(rift_protocol::configuration::GLOBAL_SYMBOLS_DEFAULT),
+            max_sources: usize::from(rift_protocol::configuration::GLOBAL_SOURCES_DEFAULT),
+            max_seeds: usize::from(rift_protocol::configuration::GLOBAL_SEEDS_DEFAULT),
+            max_facets: usize::from(rift_protocol::configuration::GLOBAL_FACETS_DEFAULT),
+            max_relationships: usize::from(
+                rift_protocol::configuration::GLOBAL_RELATIONSHIPS_DEFAULT,
+            ),
+            max_occurrences: usize::from(rift_protocol::configuration::GLOBAL_OCCURRENCES_DEFAULT),
             capabilities_ttl: Duration::from_mins(15),
             resolution_ttl: Duration::from_mins(15),
             failure_ttl: Duration::from_secs(30),
@@ -254,6 +274,32 @@ impl TryFrom<&rift_protocol::configuration::GlobalConfiguration> for Config {
             })?,
             max_source: usize::try_from(value.max_source.bytes()).map_err(|source| {
                 failure::configuration_source("max_source", "outside configured bounds", source)
+            })?,
+            max_symbols: usize::try_from(value.max_symbols).map_err(|source| {
+                failure::configuration_source("max_symbols", "outside configured bounds", source)
+            })?,
+            max_sources: usize::try_from(value.max_sources).map_err(|source| {
+                failure::configuration_source("max_sources", "outside configured bounds", source)
+            })?,
+            max_seeds: usize::try_from(value.max_seeds).map_err(|source| {
+                failure::configuration_source("max_seeds", "outside configured bounds", source)
+            })?,
+            max_facets: usize::try_from(value.max_facets).map_err(|source| {
+                failure::configuration_source("max_facets", "outside configured bounds", source)
+            })?,
+            max_relationships: usize::try_from(value.max_relationships).map_err(|source| {
+                failure::configuration_source(
+                    "max_relationships",
+                    "outside configured bounds",
+                    source,
+                )
+            })?,
+            max_occurrences: usize::try_from(value.max_occurrences).map_err(|source| {
+                failure::configuration_source(
+                    "max_occurrences",
+                    "outside configured bounds",
+                    source,
+                )
             })?,
             capabilities_ttl: Duration::from_millis(value.capabilities_ttl.milliseconds()),
             resolution_ttl: Duration::from_millis(value.resolution_ttl.milliseconds()),
@@ -2836,6 +2882,18 @@ fn search_hit_identity(hit: &PackageSearchItem) -> Result<String, RiftError> {
 }
 
 fn validate_config(config: &Config) -> Result<(), RiftError> {
+    for (field, value) in [
+        ("max_symbols", config.max_symbols),
+        ("max_sources", config.max_sources),
+        ("max_seeds", config.max_seeds),
+        ("max_facets", config.max_facets),
+        ("max_relationships", config.max_relationships),
+        ("max_occurrences", config.max_occurrences),
+    ] {
+        if value == 0 {
+            return Err(failure::configuration_invalid(field, "must be positive"));
+        }
+    }
     for (field, value, maximum) in [
         (
             "max_request",

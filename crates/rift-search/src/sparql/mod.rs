@@ -161,7 +161,12 @@ impl PreparedQuery {
         }
         let dataset = dataset::VirtualDataset::new(facts, limits, cancellation.0.clone())?
             .with_datasets(std::mem::take(&mut services.datasets))?;
-        let evaluator = services.install(SparqlEvaluator::new(), limits, &cancellation)?;
+        let evaluator = services.install(
+            SparqlEvaluator::new(),
+            limits,
+            &cancellation,
+            dataset.clone(),
+        )?;
         let result = evaluator
             .with_cancellation_token(cancellation.0)
             .for_query(self.query.clone())

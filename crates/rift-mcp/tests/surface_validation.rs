@@ -205,6 +205,11 @@ fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
         rdf_bytes_max: usize::try_from(configuration.fact_size.bytes()).ok()?,
         result_items_max: usize::try_from(configuration.results).ok()?,
         result_bytes_max: usize::try_from(configuration.result_size.bytes()).ok()?,
+        input_bytes_max: None,
+        output_bytes_max: None,
+        material_bytes_max: None,
+        heap_bytes_max: None,
+        diagnostic_bytes_max: None,
     };
     let query =
         rift_search::sparql::PreparedQuery::parse(request["query"].as_str()?, limits).ok()?;
@@ -263,7 +268,7 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
 /// A search hit in a file is addressed by exactly one of `path` and `unit`, and a file hit
 /// carries `unit` only for a package file, which a package scope alone reaches. A commit
 /// hit carries neither.
-
+///
 /// Every warning on a package-scoped answer is one of the package warnings.
 fn assert_dependency_warnings_only(structured: &Value) {
     for warning in structured["warnings"].as_array().into_iter().flatten() {
@@ -754,11 +759,11 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
         let request = serde_json::to_value(workspace_client::query::retrieval(
             &serde_json::from_value(request.clone())?,
         )?)?;
-        let answer = client
-            .call_tool(tools_call_request("search", &request)?)
-            .await?
-            .structured_content
-            .ok_or("remote discovery")?;
+        let answer =
+            call_tool_retrying_acceptance(&client, tools_call_request("search", &request)?)
+                .await?
+                .structured_content
+                .ok_or("remote discovery")?;
         assert!(
             !answer["warnings"]
                 .as_array()
@@ -957,6 +962,7 @@ async fn call_tool_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<rmcp::model::CallToolResult> {
+    let mut last_failure = String::new();
     for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
         let result = client.call_tool(params.clone()).await?;
         if result.is_error != Some(true) {
@@ -966,8 +972,9 @@ async fn call_tool_retrying_acceptance(
         if failure.retry != RetryDirective::SameRequest {
             return Err(format!("the tool failed: {}", failure.text).into());
         }
+        last_failure = failure.text;
     }
-    Err("the server kept refusing a retryable corpus request".into())
+    Err(format!("the server kept refusing a retryable corpus request: {last_failure}").into())
 }
 
 #[tokio::test]
@@ -1049,6 +1056,17 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
             break;
         }
     }
+    assert_complete_remote_binding(&validators, &mut arms).await?;
+    arms.assert_proven();
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+async fn assert_complete_remote_binding(
+    validators: &BTreeMap<String, (Validator, Validator)>,
+    arms: &mut CorpusArms,
+) -> TestResult {
     // The incomplete default context above proves refusals. This separately accepted
     // context proves a positive remote binding without claiming those missing facts.
     let (_complete, complete_client, complete_task) =
@@ -1084,9 +1102,6 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
     arms.observe(&structured);
     complete_client.cancel().await?;
     complete_task.await?;
-    arms.assert_proven();
-    client.cancel().await?;
-    server_task.await?;
     Ok(())
 }
 

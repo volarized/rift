@@ -18,7 +18,6 @@ use std::path::Path;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
 use workspace_client::{await_workspace_ready, query, search_after_population};
@@ -52,26 +51,6 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
     let client = ().serve(client_transport).await?;
     await_workspace_ready(&client).await?;
     Ok(client)
-}
-
-fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "tool arguments must be an object".into())
-}
-
-async fn call(
-    client: &RunningService<RoleClient, ()>,
-    tool: &'static str,
-    tool_arguments: Value,
-) -> TestResult<Value> {
-    let result = client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(&tool_arguments)?))
-        .await?;
-    result
-        .structured_content
-        .ok_or_else(|| format!("{tool} must return structured content").into())
 }
 
 /// A Rust source file's declaration reaches symbol search with its original source range.

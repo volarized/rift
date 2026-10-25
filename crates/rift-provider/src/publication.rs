@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_publication_and_graph_refuse_unmeasured_signature_material() {
+    fn retained_publication_and_graph_measure_signature_extensions() {
         use get_size2::GetSize;
         use rift_core::{IndexRevision, SourceRevision, TreeRevision};
         use rift_protocol::read::{ExtensionKey, ExtensionValue, Extensions, Signature};
@@ -665,18 +665,23 @@ mod tests {
         )
         .build()
         .expect("admitted facts");
-        assert_eq!(contribution.get_size(), usize::MAX);
+        let contribution_bytes = contribution.get_size();
+        assert_ne!(contribution_bytes, usize::MAX);
+        assert!(contribution_bytes > std::mem::size_of_val(&contribution));
         let limits = PublicationLimits::default();
         let publication =
             ProviderPublication::new(provider("syntax"), revision(1), vec![contribution], limits)
                 .expect("publication");
-        assert_eq!(publication.get_size(), usize::MAX);
+        let publication_bytes = publication.get_size();
+        assert_ne!(publication_bytes, usize::MAX);
+        assert!(publication_bytes >= contribution_bytes);
         let publications = Arc::new(
             super::PublicationSet::empty(limits)
                 .replaced(publication)
                 .expect("set"),
         );
-        assert_eq!(publications.get_heap_size(), usize::MAX);
+        assert_ne!(publications.get_heap_size(), usize::MAX);
+        assert!(publications.get_heap_size() >= publication_bytes);
         let graph = crate::Normalizer::normalize(
             IndexRevision::new(1).expect("revision"),
             SourceRevision::new(1).expect("source"),
@@ -685,11 +690,11 @@ mod tests {
             None,
         )
         .expect("normalized graph");
-        assert_eq!(graph.get_size(), usize::MAX);
+        assert_ne!(graph.get_size(), usize::MAX);
         assert_eq!(
             graph.records().len(),
             1,
-            "unmeasured material does not discard facts"
+            "measured material does not discard facts"
         );
     }
 

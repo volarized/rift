@@ -3,6 +3,7 @@
 #![allow(dead_code, reason = "shared query helpers serve several public suites")]
 
 use std::error::Error;
+use std::fmt::Write as _;
 
 use oxigraph::model::{Literal, NamedNode};
 use rift_protocol::query::{QueryLanguage, QueryParams};
@@ -60,21 +61,21 @@ pub(crate) fn projected_retrieval(
         }
         let predicate = NamedNode::new(format!("{}{key}", rift_search::sparql::VOCABULARY))?;
         let object = input(value)?;
-        group.push_str(&format!("?hit {predicate} {object} . "));
+        write!(group, "?hit {predicate} {object} . ")?;
     }
     group.push_str("?hit :index ?index . OPTIONAL { ?hit :symbol ?symbol . OPTIONAL { ?symbol :name ?name } OPTIONAL { ?symbol :kind ?kind } OPTIONAL { ?symbol :language ?language } } ");
     let mut projected = String::from("?hit ?symbol ?name ?kind ?language ?index");
     for field in HIT_FIELDS {
-        group.push_str(&format!("OPTIONAL {{ ?hit :{field} ?{field} }} "));
-        projected.push_str(&format!(" ?{field}"));
+        write!(group, "OPTIONAL {{ ?hit :{field} ?{field} }} ")?;
+        write!(projected, " ?{field}")?;
     }
     for include in parameters.include.as_ref().into_iter().flatten() {
         let field = match include {
             rift_protocol::read::SearchInclude::Source => "source",
             rift_protocol::read::SearchInclude::Score => "score",
         };
-        group.push_str(&format!("OPTIONAL {{ ?hit :{field} ?{field} }} "));
-        projected.push_str(&format!(" ?{field}"));
+        write!(group, "OPTIONAL {{ ?hit :{field} ?{field} }} ")?;
+        write!(projected, " ?{field}")?;
     }
     group.push_str(pattern);
     projected.push(' ');

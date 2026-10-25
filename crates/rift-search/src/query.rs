@@ -84,6 +84,7 @@ pub enum QueryFactFamily {
 
 /// Accepted bounds supplied by the serving owner.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryLimits {
     /// Most UTF-8 bytes admitted before parsing.
     pub query_bytes_max: usize,
@@ -97,6 +98,27 @@ pub struct QueryLimits {
     pub result_items_max: usize,
     /// Most serialized result bytes retained from one execution.
     pub result_bytes_max: usize,
+    /// Explicit encoded request ceiling, or the accepted size derivation.
+    #[serde(deserialize_with = "required_byte_override")]
+    pub input_bytes_max: Option<usize>,
+    /// Explicit encoded response ceiling, or the accepted size derivation.
+    #[serde(deserialize_with = "required_byte_override")]
+    pub output_bytes_max: Option<usize>,
+    /// Explicit acquired material ceiling, or the accepted size derivation.
+    #[serde(deserialize_with = "required_byte_override")]
+    pub material_bytes_max: Option<usize>,
+    /// Explicit live Rust allocation ceiling, or the accepted size derivation.
+    #[serde(deserialize_with = "required_byte_override")]
+    pub heap_bytes_max: Option<usize>,
+    /// Explicit standard error prefix ceiling, or the diagnostic default.
+    #[serde(deserialize_with = "required_byte_override")]
+    pub diagnostic_bytes_max: Option<usize>,
+}
+
+fn required_byte_override<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<usize>, D::Error> {
+    Option::<usize>::deserialize(deserializer)
 }
 
 impl TryFrom<&rift_protocol::query::QueryConfiguration> for QueryLimits {
@@ -120,6 +142,26 @@ impl TryFrom<&rift_protocol::query::QueryConfiguration> for QueryLimits {
             rdf_bytes_max: quantity(configuration.fact_size.bytes())?,
             result_items_max: quantity(configuration.results)?,
             result_bytes_max: quantity(configuration.result_size.bytes())?,
+            input_bytes_max: configuration
+                .input_size
+                .map(|value| quantity(value.bytes()))
+                .transpose()?,
+            output_bytes_max: configuration
+                .output_size
+                .map(|value| quantity(value.bytes()))
+                .transpose()?,
+            material_bytes_max: configuration
+                .material_size
+                .map(|value| quantity(value.bytes()))
+                .transpose()?,
+            heap_bytes_max: configuration
+                .heap_size
+                .map(|value| quantity(value.bytes()))
+                .transpose()?,
+            diagnostic_bytes_max: configuration
+                .diagnostic_size
+                .map(|value| quantity(value.bytes()))
+                .transpose()?,
         })
     }
 }

@@ -24,10 +24,12 @@ pub use package::{QueryPackageTarget, QuerySourceRequest};
 
 #[path = "engine_query_provider.rs"]
 mod provider;
+pub(super) use provider::PreparedEdge;
+pub(super) use provider::project_provider_edges;
 
 #[derive(Debug)]
 enum RetainedTarget {
-    Global(super::PackageCallee),
+    Global(Box<super::PackageCallee>),
     Admitted(Arc<QueryPackageTarget>),
 }
 
@@ -156,13 +158,79 @@ pub(crate) fn merge_package_facts(
     added: rift_search::query::QueryFacts,
 ) -> Result<(), RiftError> {
     added.validate_providers()?;
+    merge_record_evidence(held, added.relationship_records, added.occurrence_records)?;
+    let (provider_remap, supplied_associations) = merge_provider_contexts(held, &added.providers)?;
+    let source_remap = merge_sources(held, added.sources)?;
+    let symbol_remap = merge_symbols(held, added.symbols, &supplied_associations)?;
+    merge_provider_snapshots(
+        held,
+        added.providers,
+        &provider_remap,
+        &source_remap,
+        &symbol_remap,
+    )?;
+    for mut edge in added.provider_edges {
+        for endpoint in edge.from.iter_mut().chain(std::iter::once(&mut edge.to)) {
+            if let Some(provider) = endpoint.provider {
+                endpoint.provider =
+                    Some(*provider_remap.get(provider).ok_or_else(|| {
+                        unavailable("captured provider endpoint selector is absent")
+                    })?);
+            }
+        }
+        held.provider_edges.push(edge);
+    }
+    deduplicate_provider_edges(&mut held.provider_edges);
+    held.relationships.extend(added.relationships);
+    held.occurrences.extend(added.occurrences);
+    for source in added.nodes {
+        source.validate()?;
+        match held
+            .nodes
+            .iter()
+            .find(|previous| previous.unit == source.unit)
+        {
+            Some(previous) if previous != &source => {
+                return unavailable(
+                    "captured syntax tree differs within its original source context",
+                )
+                .fail();
+            }
+            Some(_) => {}
+            None => held.nodes.push(source),
+        }
+    }
+    held.histories.extend(added.histories);
+    held.documentation_sources
+        .extend(added.documentation_sources);
+    held.documentation_blocks.extend(added.documentation_blocks);
+    held.documentation_links.extend(added.documentation_links);
+    held.documentation_references
+        .extend(added.documentation_references);
+    held.documentation_reference_candidates
+        .extend(added.documentation_reference_candidates);
+    for family in added.unavailable_families {
+        if !held.unavailable_families.contains(&family) {
+            held.unavailable_families.push(family);
+        }
+    }
+    deduplicate_relationships(&mut held.relationships);
+    deduplicate_occurrences(&mut held.occurrences);
+    Ok(())
+}
+
+fn merge_record_evidence(
+    held: &mut rift_search::query::QueryFacts,
+    relationships: Vec<rift_protocol::relationship_read::RelationshipRecord>,
+    occurrences: Vec<rift_protocol::relationship_read::RelationshipOccurrence>,
+) -> Result<(), RiftError> {
     let mut records = held
         .relationship_records
         .iter()
         .enumerate()
         .map(|(index, record)| (record.id.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    for record in added.relationship_records {
+    for record in relationships {
         match records.get(&record.id).copied() {
             Some(index) if held.relationship_records[index].relationship != record.relationship => {
                 return unavailable(
@@ -182,7 +250,7 @@ pub(crate) fn merge_package_facts(
         .iter()
         .map(|record| (record.id.clone(), record.relationship.clone()))
         .collect::<BTreeMap<_, _>>();
-    for record in added.occurrence_records {
+    for record in occurrences {
         if let Some(previous) = links.insert(record.id.clone(), record.relationship.clone())
             && previous != record.relationship
         {
@@ -191,27 +259,33 @@ pub(crate) fn merge_package_facts(
         held.occurrence_records.push(record);
     }
     deduplicate_occurrence_records(&mut held.occurrence_records);
+    Ok(())
+}
+
+fn merge_provider_contexts(
+    held: &mut rift_search::query::QueryFacts,
+    providers: &[rift_search::query::QueryProviderSnapshot],
+) -> Result<(Vec<usize>, BTreeMap<usize, usize>), RiftError> {
     // The array selector scopes original contribution keys to one checked captured graph.
-    let mut provider_remap = Vec::with_capacity(added.providers.len());
-    for snapshot in &added.providers {
-        let index = match held
+    let mut provider_remap = Vec::with_capacity(providers.len());
+    for snapshot in providers {
+        let index = if let Some(index) = held
             .providers
             .iter()
             .position(|previous| previous.context == snapshot.context)
         {
-            Some(index) => index,
-            None => {
-                let index = held.providers.len();
-                held.providers
-                    .push(rift_search::query::QueryProviderSnapshot {
-                        context: snapshot.context.clone(),
-                        records: Vec::new(),
-                        source_indices: Vec::new(),
-                        references: Vec::new(),
-                        relationships: Vec::new(),
-                    });
-                index
-            }
+            index
+        } else {
+            let index = held.providers.len();
+            held.providers
+                .push(rift_search::query::QueryProviderSnapshot {
+                    context: snapshot.context.clone(),
+                    records: Vec::new(),
+                    source_indices: Vec::new(),
+                    references: Vec::new(),
+                    relationships: Vec::new(),
+                });
+            index
         };
         provider_remap.push(index);
     }
@@ -224,7 +298,7 @@ pub(crate) fn merge_package_facts(
         }
     }
     let mut supplied_associations = BTreeMap::new();
-    for (provider, snapshot) in added.providers.iter().enumerate() {
+    for (provider, snapshot) in providers.iter().enumerate() {
         let provider = provider_remap[provider];
         for record in &snapshot.records {
             for key in &record.contributions {
@@ -242,106 +316,120 @@ pub(crate) fn merge_package_facts(
             }
         }
     }
-    let mut source_remap = Vec::with_capacity(added.sources.len());
+    Ok((provider_remap, supplied_associations))
+}
+
+fn merge_sources(
+    held: &mut rift_search::query::QueryFacts,
+    sources: Vec<rift_search::query::QuerySource>,
+) -> Result<Vec<usize>, RiftError> {
+    let mut source_remap = Vec::with_capacity(sources.len());
     let mut source_units = held
         .sources
         .iter()
         .enumerate()
         .map(|(index, source)| (source.unit.clone(), index))
         .collect::<BTreeMap<_, _>>();
-    for mut source in added.sources {
+    for mut source in sources {
         complete_source_digest(&mut source)?;
-        let index = match source_units.get(&source.unit).copied() {
-            Some(index) => {
-                let previous = &mut held.sources[index];
-                complete_source_digest(previous)?;
-                if previous
-                    .digest
-                    .as_ref()
-                    .zip(source.digest.as_ref())
-                    .is_some_and(|(held, added)| held != added)
-                {
-                    return unavailable(
-                        "dependency source digest changed during query acquisition",
-                    )
+        let index = if let Some(index) = source_units.get(&source.unit).copied() {
+            let previous = &mut held.sources[index];
+            complete_source_digest(previous)?;
+            if previous
+                .digest
+                .as_ref()
+                .zip(source.digest.as_ref())
+                .is_some_and(|(held, added)| held != added)
+            {
+                return unavailable("dependency source digest changed during query acquisition")
                     .fail();
-                }
-                if previous.digest.is_none() {
-                    previous.digest = source.digest;
-                }
-                match (&mut previous.text, source.text) {
-                    (Some(original), Some(captured)) if original != &captured => {
-                        return unavailable("dependency source changed during query acquisition")
-                            .fail();
-                    }
-                    (missing @ None, Some(captured)) => *missing = Some(captured),
-                    _ => {}
-                }
-                index
             }
-            None => {
-                let index = held.sources.len();
-                source_units.insert(source.unit.clone(), index);
-                held.sources.push(source);
-                index
+            if previous.digest.is_none() {
+                previous.digest = source.digest;
             }
+            match (&mut previous.text, source.text) {
+                (Some(original), Some(captured)) if original != &captured => {
+                    return unavailable("dependency source changed during query acquisition")
+                        .fail();
+                }
+                (missing @ None, Some(captured)) => *missing = Some(captured),
+                _ => {}
+            }
+            index
+        } else {
+            let index = held.sources.len();
+            source_units.insert(source.unit.clone(), index);
+            held.sources.push(source);
+            index
         };
         source_remap.push(index);
     }
+    Ok(source_remap)
+}
+
+fn merge_symbols(
+    held: &mut rift_search::query::QueryFacts,
+    symbols: Vec<rift_search::query::QuerySymbol>,
+    supplied_associations: &BTreeMap<usize, usize>,
+) -> Result<Vec<(usize, Vec<usize>)>, RiftError> {
     let mut identities = held
         .symbols
         .iter()
         .enumerate()
         .filter_map(|(index, symbol)| symbol.symbol.id.clone().map(|identity| (identity, index)))
         .collect::<BTreeMap<_, _>>();
-    let mut symbol_remap = Vec::with_capacity(added.symbols.len());
-    for (supplied_index, symbol) in added.symbols.into_iter().enumerate() {
+    let mut symbol_remap = Vec::with_capacity(symbols.len());
+    for (supplied_index, symbol) in symbols.into_iter().enumerate() {
         let previous = symbol
             .symbol
             .id
             .as_ref()
             .and_then(|identity| identities.get(identity).copied())
             .or_else(|| supplied_associations.get(&supplied_index).copied());
-        let (position, declarations) = match previous {
-            Some(position) => {
-                let previous = &mut held.symbols[position];
-                if previous.symbol != symbol.symbol {
-                    return unavailable(
-                        "dependency declarations disagree within the selected source",
-                    )
+        let (position, declarations) = if let Some(position) = previous {
+            let previous = &mut held.symbols[position];
+            if previous.symbol != symbol.symbol {
+                return unavailable("dependency declarations disagree within the selected source")
                     .fail();
-                }
-                let mut declarations = Vec::with_capacity(symbol.declarations.len());
-                for declaration in symbol.declarations {
-                    let index = match previous
-                        .declarations
-                        .iter()
-                        .position(|held| held == &declaration)
-                    {
-                        Some(index) => index,
-                        None => {
-                            let index = previous.declarations.len();
-                            previous.declarations.push(declaration);
-                            index
-                        }
-                    };
-                    declarations.push(index);
-                }
-                (position, declarations)
             }
-            None => {
-                let position = held.symbols.len();
-                if let Some(identity) = &symbol.symbol.id {
-                    identities.insert(identity.clone(), position);
-                }
-                let declarations = (0..symbol.declarations.len()).collect();
-                held.symbols.push(symbol);
-                (position, declarations)
+            let mut declarations = Vec::with_capacity(symbol.declarations.len());
+            for declaration in symbol.declarations {
+                let index = if let Some(index) = previous
+                    .declarations
+                    .iter()
+                    .position(|held| held == &declaration)
+                {
+                    index
+                } else {
+                    let index = previous.declarations.len();
+                    previous.declarations.push(declaration);
+                    index
+                };
+                declarations.push(index);
             }
+            (position, declarations)
+        } else {
+            let position = held.symbols.len();
+            if let Some(identity) = &symbol.symbol.id {
+                identities.insert(identity.clone(), position);
+            }
+            let declarations = (0..symbol.declarations.len()).collect();
+            held.symbols.push(symbol);
+            (position, declarations)
         };
         symbol_remap.push((position, declarations));
     }
-    for (supplied_index, mut snapshot) in added.providers.into_iter().enumerate() {
+    Ok(symbol_remap)
+}
+
+fn merge_provider_snapshots(
+    held: &mut rift_search::query::QueryFacts,
+    providers: Vec<rift_search::query::QueryProviderSnapshot>,
+    provider_remap: &[usize],
+    source_remap: &[usize],
+    symbol_remap: &[(usize, Vec<usize>)],
+) -> Result<(), RiftError> {
+    for (supplied_index, mut snapshot) in providers.into_iter().enumerate() {
         let index = provider_remap[supplied_index];
         for source in &mut snapshot.source_indices {
             *source = *source_remap
@@ -399,53 +487,6 @@ pub(crate) fn merge_package_facts(
             .fail();
         }
     }
-    for mut edge in added.provider_edges {
-        for endpoint in edge.from.iter_mut().chain(std::iter::once(&mut edge.to)) {
-            if let Some(provider) = endpoint.provider {
-                endpoint.provider =
-                    Some(*provider_remap.get(provider).ok_or_else(|| {
-                        unavailable("captured provider endpoint selector is absent")
-                    })?);
-            }
-        }
-        held.provider_edges.push(edge);
-    }
-    deduplicate_provider_edges(&mut held.provider_edges);
-    held.relationships.extend(added.relationships);
-    held.occurrences.extend(added.occurrences);
-    for source in added.nodes {
-        source.validate()?;
-        match held
-            .nodes
-            .iter()
-            .find(|previous| previous.unit == source.unit)
-        {
-            Some(previous) if previous != &source => {
-                return unavailable(
-                    "captured syntax tree differs within its original source context",
-                )
-                .fail();
-            }
-            Some(_) => {}
-            None => held.nodes.push(source),
-        }
-    }
-    held.histories.extend(added.histories);
-    held.documentation_sources
-        .extend(added.documentation_sources);
-    held.documentation_blocks.extend(added.documentation_blocks);
-    held.documentation_links.extend(added.documentation_links);
-    held.documentation_references
-        .extend(added.documentation_references);
-    held.documentation_reference_candidates
-        .extend(added.documentation_reference_candidates);
-    for family in added.unavailable_families {
-        if !held.unavailable_families.contains(&family) {
-            held.unavailable_families.push(family);
-        }
-    }
-    deduplicate_relationships(&mut held.relationships);
-    deduplicate_occurrences(&mut held.occurrences);
     Ok(())
 }
 
@@ -501,6 +542,8 @@ struct AcquiredSubject {
 
 /// Request-owned engine facts and admitted dependency targets.
 pub struct EngineQuery<'request> {
+    query_facts: Option<&'request rift_search::query::QueryFacts>,
+    primary_contexts: Vec<Arc<rift_search::query::QueryProviderContext>>,
     provider_targets: Vec<Arc<QueryPackageTarget>>,
     resolved_providers: BTreeSet<(
         rift_search::query::QueryProviderEndpoint,
@@ -542,6 +585,8 @@ impl<'request> EngineQuery<'request> {
     ) -> Self {
         Self {
             provider_targets: Vec::new(),
+            query_facts: None,
+            primary_contexts: Vec::new(),
             resolved_providers: BTreeSet::new(),
             provider_selection: None,
             reads,
@@ -572,6 +617,56 @@ impl<'request> EngineQuery<'request> {
     pub fn with_provider_requests(mut self, requests: ProviderRequests) -> Self {
         self.provider_requests = requests;
         self
+    }
+
+    /// Borrows original primary facts for request-owned provider acquisition.
+    ///
+    /// # Errors
+    /// Refuses metadata copies that exceed the shared request admission.
+    pub fn with_query_facts(
+        mut self,
+        facts: &'request rift_search::query::QueryFacts,
+    ) -> Result<Self, RiftError> {
+        use get_size2::GetSize as _;
+        let mut budget = match &self.query_budget {
+            Some(budget) => budget.clone(),
+            None => crate::QueryFactBudget::for_request(
+                rift_search::query::QueryLimits::try_from(&self.configuration.search.query)?,
+                self.deadline.into_std(),
+                &|| false,
+            )?,
+        };
+        let slots = facts
+            .providers
+            .len()
+            .checked_mul(std::mem::size_of::<
+                Arc<rift_search::query::QueryProviderContext>,
+            >())
+            .ok_or_else(|| unavailable("the provider directory exceeds the platform bound"))?;
+        budget.charge_material(slots)?;
+        self.primary_contexts = Vec::with_capacity(facts.providers.len());
+        let extra = self
+            .primary_contexts
+            .capacity()
+            .saturating_sub(facts.providers.len())
+            .checked_mul(std::mem::size_of::<
+                Arc<rift_search::query::QueryProviderContext>,
+            >())
+            .ok_or_else(|| unavailable("the provider directory exceeds the platform bound"))?;
+        budget.charge_material(extra)?;
+        for snapshot in &facts.providers {
+            budget.charge_material(
+                snapshot
+                    .context
+                    .get_size()
+                    .saturating_add(2 * std::mem::size_of::<usize>()),
+            )?;
+            self.primary_contexts
+                .push(Arc::new(snapshot.context.clone()));
+        }
+        self.query_budget = Some(budget);
+        self.query_facts = Some(facts);
+        Ok(self)
     }
 
     /// Binds provider acquisition to the original immutable serving publication.
@@ -929,7 +1024,7 @@ impl<'request> EngineQuery<'request> {
     ) -> Result<(), RiftError> {
         let named_global = match &target.request {
             QuerySourceRequest::Call(callee) => self.targets.iter().find_map(|(identity, held)| {
-                matches!(held, RetainedTarget::Global(previous) if previous == callee)
+                matches!(held, RetainedTarget::Global(previous) if previous.as_ref() == callee)
                     .then_some(identity)
             }),
             QuerySourceRequest::Reference { .. }
@@ -963,6 +1058,35 @@ impl<'request> EngineQuery<'request> {
             .len()
             .saturating_add(self.references.query_source_requests.len());
         let physical_edges = self.name_physical_package_sources(&target, &facts)?;
+        self.name_incoming_package_requests(&facts)?;
+        self.name_prepared_package_requests(&target, &facts)?;
+        let pending_after = self
+            .references
+            .package_callees
+            .len()
+            .saturating_add(self.references.query_source_requests.len());
+        if pending_after >= pending_before && !replaces_global {
+            return unavailable("the prepared source did not resolve a pending dependency fact")
+                .fail();
+        }
+        deduplicate_occurrences(&mut self.references.query_occurrences);
+        deduplicate_relationships(&mut self.references.query_relationships);
+        merge_package_facts(&mut self.references.query_package_facts, facts)?;
+        self.admit_prepared_edges(physical_edges)?;
+        let held = Arc::new(target);
+        self.provider_targets.push(Arc::clone(&held));
+        for identity in held.name_ranges.keys() {
+            let identity = CoreSymbolId::new(identity.0.clone())?;
+            self.targets
+                .insert(identity, RetainedTarget::Admitted(Arc::clone(&held)));
+        }
+        Ok(())
+    }
+
+    fn name_incoming_package_requests(
+        &mut self,
+        facts: &rift_search::query::QueryFacts,
+    ) -> Result<(), RiftError> {
         let mut waiting_calls = Vec::new();
         let mut caller_positions = BTreeMap::new();
         for request in std::mem::take(&mut self.references.query_source_requests) {
@@ -971,7 +1095,7 @@ impl<'request> EngineQuery<'request> {
                 caller,
                 ranges,
             } = &request
-                && let Some(identity) = known_package_symbol(caller, &facts)?
+                && let Some(identity) = known_package_symbol(caller, facts)?
             {
                 let origin = caller
                     .query_origin()
@@ -979,7 +1103,7 @@ impl<'request> EngineQuery<'request> {
                 let unit = caller
                     .unit(&origin)
                     .ok_or_else(|| unavailable("the caller has no exact source unit"))?;
-                let text = target.source_for(&facts, &unit)?;
+                let text = QueryPackageTarget::source_for(facts, &unit)?;
                 let positions = caller_positions
                     .entry(unit.clone())
                     .or_insert_with(|| rift_lsp::position::LineIndex::new(text));
@@ -1007,15 +1131,22 @@ impl<'request> EngineQuery<'request> {
         }
         drop(caller_positions);
         self.references.query_source_requests = waiting_calls;
+        Ok(())
+    }
+
+    fn name_prepared_package_requests(
+        &mut self,
+        target: &QueryPackageTarget,
+        facts: &rift_search::query::QueryFacts,
+    ) -> Result<(), RiftError> {
         match &target.request {
-            QuerySourceRequest::Provider { .. } => {}
-            QuerySourceRequest::IncomingCall { .. } => {}
+            QuerySourceRequest::Provider { .. } | QuerySourceRequest::IncomingCall { .. } => {}
             QuerySourceRequest::Call(callee) => {
                 let mut waiting = Vec::new();
                 for pending in std::mem::take(&mut self.references.package_callees) {
                     if pending.query_uri() == callee.query_uri()
                         && pending.package() == callee.package()
-                        && let Some(identity) = known_package_symbol(&pending, &facts)?
+                        && let Some(identity) = known_package_symbol(&pending, facts)?
                     {
                         name_package_occurrences(
                             &mut self.references.query_occurrences,
@@ -1070,7 +1201,7 @@ impl<'request> EngineQuery<'request> {
                     let occurrence = QueryOccurrence {
                         target: symbol.clone(),
                         enclosing: (!*file_level)
-                            .then(|| enclosing_package_symbol(&facts, &target.unit, &range))
+                            .then(|| enclosing_package_symbol(facts, &target.unit, &range))
                             .flatten(),
                         source: SourceUnitSpan {
                             unit: target.unit.clone(),
@@ -1085,26 +1216,6 @@ impl<'request> EngineQuery<'request> {
                 }
                 self.references.query_source_requests = waiting;
             }
-        }
-        let pending_after = self
-            .references
-            .package_callees
-            .len()
-            .saturating_add(self.references.query_source_requests.len());
-        if pending_after >= pending_before && !replaces_global {
-            return unavailable("the prepared source did not resolve a pending dependency fact")
-                .fail();
-        }
-        deduplicate_occurrences(&mut self.references.query_occurrences);
-        deduplicate_relationships(&mut self.references.query_relationships);
-        merge_package_facts(&mut self.references.query_package_facts, facts)?;
-        self.admit_prepared_edges(physical_edges)?;
-        let held = Arc::new(target);
-        self.provider_targets.push(Arc::clone(&held));
-        for identity in held.name_ranges.keys() {
-            let identity = CoreSymbolId::new(identity.0.clone())?;
-            self.targets
-                .insert(identity, RetainedTarget::Admitted(Arc::clone(&held)));
         }
         Ok(())
     }
@@ -1123,7 +1234,7 @@ impl<'request> EngineQuery<'request> {
             return None;
         };
         self.targets.iter().find_map(|(identity, held)| {
-            matches!(held, RetainedTarget::Global(previous) if previous == callee)
+            matches!(held, RetainedTarget::Global(previous) if previous.as_ref() == callee)
                 .then(|| SymbolId(identity.as_str().to_owned()))
         })
     }
@@ -1147,7 +1258,7 @@ impl<'request> EngineQuery<'request> {
         self.references.name_package_callees(|callee| {
             let declaration = named(callee)?;
             if let Ok(identity) = CoreSymbolId::new(declaration.id.0.clone()) {
-                targets.insert(identity, RetainedTarget::Global(callee.clone()));
+                targets.insert(identity, RetainedTarget::Global(Box::new(callee.clone())));
             }
             Some(declaration)
         });
@@ -1350,18 +1461,10 @@ impl Acquisition<'_> {
         direction: TraversalDirection,
         facet: RelationshipFacet,
     ) -> Result<AcquiredSubject, RiftError> {
-        let Self {
-            reads,
-            engines,
-            deadline,
-            roots,
-            facts,
-            maximum,
-            requests,
-        } = self;
-        let Some((slot, file, symbol)) = reference_source(reads, engines, identity)? else {
-            if let Some((file, _)) = super::resolve_graph_symbol(reads.index(), identity)?
-                && engines.engine_for(file.syntax().language()).is_none()
+        let Some((slot, file, symbol)) = reference_source(self.reads, self.engines, identity)?
+        else {
+            if let Some((file, _)) = super::resolve_graph_symbol(self.reads.index(), identity)?
+                && self.engines.engine_for(file.syntax().language()).is_none()
             {
                 return errors::server::read_unsupported()
                     .capability(
@@ -1374,35 +1477,25 @@ impl Acquisition<'_> {
             ))
             .fail();
         };
-        let target =
-            ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
+        let target = ReferenceTarget::new(
+            slot.workspace_root(),
+            self.reads.index().root(),
+            file,
+            symbol,
+        )?;
         if direction == TraversalDirection::Incoming && facet == RelationshipFacet::Calls {
-            let (report, unconfirmed) = outgoing_report(
-                Box::pin(incoming_on_engine(
-                    slot, &target, deadline, maximum, requests,
-                ))
-                .await?,
-            )?;
-            let mut batch = map_incoming_calls(
-                reads,
-                identity,
-                report,
-                roots,
-                slot.workspace_root(),
-                facts,
-                file.syntax().language(),
-            )?;
-            batch.unconfirmed = unconfirmed.then(|| target.language.clone());
-            return Ok(batch);
+            return self
+                .incoming_calls(identity, slot, &target, file.syntax().language())
+                .await;
         }
         match direction {
             TraversalDirection::Incoming => {
                 let (report, unconfirmed) = Box::pin(references_on_engine_with_bound(
                     slot,
                     &target,
-                    deadline,
-                    maximum,
-                    Some(requests.clone()),
+                    self.deadline,
+                    self.maximum,
+                    Some(self.requests.clone()),
                 ))
                 .await?;
                 let excluded = symbol.name_range.map(|range| {
@@ -1415,12 +1508,12 @@ impl Acquisition<'_> {
                     )
                 });
                 let mut batch = map_complete_references(
-                    reads,
+                    self.reads,
                     identity,
                     report,
                     slot.workspace_root(),
-                    roots,
-                    facts,
+                    self.roots,
+                    self.facts,
                     (file.syntax().language(), excluded),
                 )?;
                 batch.unconfirmed = unconfirmed.then(|| target.language.clone());
@@ -1431,9 +1524,9 @@ impl Acquisition<'_> {
                     Box::pin(outgoing_on_engine(
                         slot,
                         &target,
-                        deadline,
-                        maximum,
-                        requests.clone(),
+                        self.deadline,
+                        self.maximum,
+                        self.requests.clone(),
                     ))
                     .await?,
                 )?;
@@ -1443,13 +1536,13 @@ impl Acquisition<'_> {
                     provider: file.syntax().language(),
                 };
                 let mut batch = map_source_calls(
-                    reads,
+                    self.reads,
                     identity,
-                    source,
+                    &source,
                     report,
-                    roots,
+                    self.roots,
                     slot.workspace_root(),
-                    facts,
+                    self.facts,
                 )?;
                 batch.unconfirmed = unconfirmed.then(|| target.language.clone());
                 Ok(batch)
@@ -1464,16 +1557,8 @@ impl Acquisition<'_> {
         direction: TraversalDirection,
         facet: RelationshipFacet,
     ) -> Result<AcquiredSubject, RiftError> {
-        let Self {
-            reads,
-            engines,
-            deadline,
-            roots,
-            facts,
-            maximum,
-            requests,
-        } = self;
-        let slot = engines
+        let slot = self
+            .engines
             .engine_for(&held.provider)
             .ok_or_else(|| unavailable("the admitted dependency provider is unavailable"))?;
         let id = SymbolId(identity.as_str().to_owned());
@@ -1481,7 +1566,7 @@ impl Acquisition<'_> {
             unavailable("the admitted dependency has no declaration name position")
         })?;
         let offset = declaration.source.range.start;
-        let source = held.source_for(facts, &declaration.source.unit)?;
+        let source = QueryPackageTarget::source_for(self.facts, &declaration.source.unit)?;
         let index = rift_lsp::position::LineIndex::new(source);
         let offset = usize::try_from(offset).map_err(|_| {
             unavailable("the dependency declaration position cannot be represented")
@@ -1495,32 +1580,18 @@ impl Acquisition<'_> {
             canonical_uri: declaration.uri.clone(),
         };
         if direction == TraversalDirection::Incoming && facet == RelationshipFacet::Calls {
-            let (report, unconfirmed) = outgoing_report(
-                Box::pin(incoming_on_engine(
-                    slot, &target, deadline, maximum, requests,
-                ))
-                .await?,
-            )?;
-            let mut batch = map_incoming_calls(
-                reads,
-                identity,
-                report,
-                roots,
-                slot.workspace_root(),
-                facts,
-                &held.provider,
-            )?;
-            batch.unconfirmed = unconfirmed.then(|| target.language.clone());
-            return Ok(batch);
+            return self
+                .incoming_calls(identity, slot, &target, &held.provider)
+                .await;
         }
         match direction {
             TraversalDirection::Incoming => {
                 let (report, unconfirmed) = Box::pin(references_on_engine_with_bound(
                     slot,
                     &target,
-                    deadline,
-                    maximum,
-                    Some(requests.clone()),
+                    self.deadline,
+                    self.maximum,
+                    Some(self.requests.clone()),
                 ))
                 .await?;
                 let exclusion = held
@@ -1528,12 +1599,12 @@ impl Acquisition<'_> {
                     .get(&id)
                     .map(|location| (location.source.unit.clone(), location.source.range.clone()));
                 let mut batch = map_complete_references(
-                    reads,
+                    self.reads,
                     identity,
                     report,
                     slot.workspace_root(),
-                    roots,
-                    facts,
+                    self.roots,
+                    self.facts,
                     (&held.provider, exclusion),
                 )?;
                 batch.unconfirmed = unconfirmed.then(|| target.language.clone());
@@ -1544,9 +1615,9 @@ impl Acquisition<'_> {
                     Box::pin(outgoing_on_engine(
                         slot,
                         &target,
-                        deadline,
-                        maximum,
-                        requests.clone(),
+                        self.deadline,
+                        self.maximum,
+                        self.requests.clone(),
                     ))
                     .await?,
                 )?;
@@ -1556,18 +1627,47 @@ impl Acquisition<'_> {
                     provider: &held.provider,
                 };
                 let mut batch = map_source_calls(
-                    reads,
+                    self.reads,
                     identity,
-                    source,
+                    &source,
                     report,
-                    roots,
+                    self.roots,
                     slot.workspace_root(),
-                    facts,
+                    self.facts,
                 )?;
                 batch.unconfirmed = unconfirmed.then(|| target.language.clone());
                 Ok(batch)
             }
         }
+    }
+    async fn incoming_calls(
+        self,
+        identity: &CoreSymbolId,
+        slot: &super::EngineSlot,
+        target: &ReferenceTarget,
+        provider: &rift_protocol::read::Language,
+    ) -> Result<AcquiredSubject, RiftError> {
+        let (report, unconfirmed) = outgoing_report(
+            Box::pin(incoming_on_engine(
+                slot,
+                target,
+                self.deadline,
+                self.maximum,
+                self.requests,
+            ))
+            .await?,
+        )?;
+        let mut batch = map_incoming_calls(
+            self.reads,
+            identity,
+            report,
+            self.roots,
+            slot.workspace_root(),
+            self.facts,
+            provider,
+        )?;
+        batch.unconfirmed = unconfirmed.then(|| target.language.clone());
+        Ok(batch)
     }
 }
 
@@ -1708,6 +1808,19 @@ struct IncomingReport {
     encoding: PositionEncoding,
 }
 
+impl IncomingReport {
+    fn validate_count(&self) -> Result<(), RiftError> {
+        let count = self.calls.iter().try_fold(0_usize, |count, call| {
+            count.checked_add(call.from_ranges.len().max(1))
+        });
+        if count.is_none_or(|count| count > self.maximum) {
+            return unavailable("the incoming call occurrences exceed the engine response bound")
+                .fail();
+        }
+        Ok(())
+    }
+}
+
 async fn incoming_on_engine(
     slot: &super::EngineSlot,
     target: &ReferenceTarget,
@@ -1767,16 +1880,10 @@ fn map_incoming_calls(
     facts: &rift_search::query::QueryFacts,
     provider: &rift_protocol::read::Language,
 ) -> Result<AcquiredSubject, RiftError> {
-    let count = report.calls.iter().try_fold(0_usize, |count, call| {
-        count.checked_add(call.from_ranges.len().max(1))
-    });
-    if count.is_none_or(|count| count > report.maximum) {
-        return unavailable("the incoming call occurrences exceed the engine response bound")
-            .fail();
-    }
+    report.validate_count()?;
     let trees = [workspace_root, reads.index().root()];
     let mut acquired = AcquiredSubject::default();
-    let called = SymbolId(target.as_str().to_owned());
+    let subject = SymbolId(target.as_str().to_owned());
     let mut caller_positions = BTreeMap::new();
     for call in report.calls {
         let file_level = call.from.kind == lsp_types::SymbolKind::MODULE
@@ -1814,23 +1921,23 @@ fn map_incoming_calls(
                     file.source(),
                 )
             }
-            CalleeFile::Package(callee) => {
+            CalleeFile::Package(dependency) => {
                 let caller = if file_level {
                     None
-                } else if let Some(caller) = known_package_symbol(&callee, facts)? {
+                } else if let Some(caller) = known_package_symbol(&dependency, facts)? {
                     Some(caller)
                 } else {
                     acquired.sources.push(QuerySourceRequest::IncomingCall {
-                        target: called.clone(),
-                        caller: callee.with_query_sources(Vec::new(), provider.clone()),
+                        target: subject.clone(),
+                        caller: dependency.with_query_sources(Vec::new(), provider.clone()),
                         ranges: call.from_ranges,
                     });
                     continue;
                 };
-                let origin = callee
+                let origin = dependency
                     .query_origin()
                     .ok_or_else(|| unavailable("the incoming caller has no exact owner"))?;
-                let unit = callee
+                let unit = dependency
                     .unit(&origin)
                     .ok_or_else(|| unavailable("the incoming caller has no source unit"))?;
                 let text = facts
@@ -1840,17 +1947,13 @@ fn map_incoming_calls(
                     .and_then(|source| source.text.as_deref());
                 let Some(text) = text else {
                     if file_level {
-                        for range in call.from_ranges {
-                            acquired.sources.push(QuerySourceRequest::Reference {
-                                target: called.clone(),
-                                uri: call.from.uri.clone(),
-                                range,
-                                encoding: report.encoding,
-                                provider: provider.clone(),
-                                facet: RelationshipFacet::Calls,
-                                file_level: true,
-                            });
-                        }
+                        retain_incoming_file_references(
+                            &mut acquired,
+                            &subject,
+                            call,
+                            report.encoding,
+                            provider,
+                        );
                         continue;
                     }
                     return Err(unavailable(
@@ -1863,40 +1966,86 @@ fn map_incoming_calls(
                 return unavailable("the incoming caller has no admitted source owner").fail();
             }
         };
-        let positions = caller_positions
-            .entry(unit.clone())
-            .or_insert_with(|| rift_lsp::position::LineIndex::new(text));
-        let sources = call
-            .from_ranges
-            .into_iter()
-            .map(|range| {
-                indexed_range(positions, range, report.encoding).map(|range| SourceUnitSpan {
-                    unit: unit.clone(),
-                    range,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(caller) = caller {
-            name_package_occurrences(
-                &mut acquired.occurrences,
-                &mut acquired.relationships,
-                &caller,
-                &called,
-                &sources,
-            );
-        } else {
-            acquired
-                .occurrences
-                .extend(sources.into_iter().map(|source| QueryOccurrence {
-                    target: called.clone(),
-                    enclosing: None,
-                    source,
-                    facet: RelationshipFacet::Calls,
-                }));
-        }
+        append_incoming_calls(
+            &mut acquired,
+            &subject,
+            (caller, unit, text),
+            call.from_ranges,
+            report.encoding,
+            &mut caller_positions,
+        )?;
     }
     deduplicate_occurrences(&mut acquired.occurrences);
     Ok(acquired)
+}
+
+fn retain_incoming_file_references(
+    acquired: &mut AcquiredSubject,
+    subject: &SymbolId,
+    call: CallHierarchyIncomingCall,
+    encoding: PositionEncoding,
+    provider: &rift_protocol::read::Language,
+) {
+    for range in call.from_ranges {
+        acquired.sources.push(QuerySourceRequest::Reference {
+            target: subject.clone(),
+            uri: call.from.uri.clone(),
+            range,
+            encoding,
+            provider: provider.clone(),
+            facet: RelationshipFacet::Calls,
+            file_level: true,
+        });
+    }
+}
+
+fn append_incoming_calls<'text>(
+    acquired: &mut AcquiredSubject,
+    subject: &SymbolId,
+    binding: (
+        Option<SymbolId>,
+        rift_protocol::read::SourceUnitId,
+        &'text str,
+    ),
+    ranges: Vec<Range>,
+    encoding: PositionEncoding,
+    caller_positions: &mut BTreeMap<
+        rift_protocol::read::SourceUnitId,
+        rift_lsp::position::LineIndex<'text>,
+    >,
+) -> Result<(), RiftError> {
+    let (caller, unit, text) = binding;
+    let positions = caller_positions
+        .entry(unit.clone())
+        .or_insert_with(|| rift_lsp::position::LineIndex::new(text));
+    let sources = ranges
+        .into_iter()
+        .map(|range| {
+            indexed_range(positions, range, encoding).map(|range| SourceUnitSpan {
+                unit: unit.clone(),
+                range,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(caller) = caller {
+        name_package_occurrences(
+            &mut acquired.occurrences,
+            &mut acquired.relationships,
+            &caller,
+            subject,
+            &sources,
+        );
+    } else {
+        acquired
+            .occurrences
+            .extend(sources.into_iter().map(|source| QueryOccurrence {
+                target: subject.clone(),
+                enclosing: None,
+                source,
+                facet: RelationshipFacet::Calls,
+            }));
+    }
+    Ok(())
 }
 
 struct OutgoingReport {
@@ -1943,9 +2092,9 @@ async fn outgoing_on_engine(
                     }
                 }
                 Ok(Some(OutgoingReport {
+                    maximum,
                     calls,
                     encoding,
-                    maximum,
                 }))
             })
         },
@@ -2019,7 +2168,7 @@ fn map_calls(
     map_source_calls(
         reads,
         caller,
-        source,
+        &source,
         report,
         roots,
         workspace_root,
@@ -2036,7 +2185,7 @@ struct CallSource<'source> {
 fn map_source_calls(
     reads: &ReadService,
     caller: &CoreSymbolId,
-    source: CallSource<'_>,
+    source: &CallSource<'_>,
     report: OutgoingReport,
     roots: &CalleeRoots,
     workspace_root: &std::path::Path,
@@ -2087,7 +2236,12 @@ fn map_source_calls(
                 continue;
             }
             CalleeFile::Unaddressed => {
-                return unavailable("the outgoing target has no admitted source owner").fail();
+                return unavailable(format!(
+                    "the outgoing target has no admitted source owner: uri {}, served root {}",
+                    call.to.uri.as_str(),
+                    reads.index().root().display()
+                ))
+                .fail();
             }
         };
         let target = project_declaration(
@@ -2235,10 +2389,6 @@ fn relationship(occurrence: &QueryOccurrence) -> Option<Relationship> {
     })
 }
 
-#[expect(
-    clippy::ptr_arg,
-    reason = "Retained accounting includes allocated vector capacity."
-)]
 pub(super) fn retained_occurrence_bytes(occurrences: &Vec<QueryOccurrence>) -> usize {
     occurrences.iter().fold(
         occurrences
@@ -2597,8 +2747,8 @@ mod tests {
                 rift_protocol::read::RelationshipFacet::Calls
             );
             assert_eq!(
-                &source
-                    [occurrence.source.range.start as usize..occurrence.source.range.end as usize],
+                &source[usize::try_from(occurrence.source.range.start)?
+                    ..usize::try_from(occurrence.source.range.end)?],
                 "beacon"
             );
         }
@@ -2622,15 +2772,7 @@ mod tests {
             &facts,
             &provider,
         )?;
-        assert_eq!(module_calls.occurrences.len(), 2);
-        assert!(
-            module_calls
-                .occurrences
-                .iter()
-                .all(|occurrence| occurrence.enclosing.is_none()
-                    && occurrence.facet == rift_protocol::read::RelationshipFacet::Calls)
-        );
-        assert!(module_calls.relationships.is_empty());
+        assert_file_level_calls(&module_calls);
         let report = super::IncomingReport {
             maximum: 1,
             calls: vec![lsp_types::CallHierarchyIncomingCall {
@@ -2656,6 +2798,18 @@ mod tests {
         );
         Ok(())
     }
+    fn assert_file_level_calls(mapped: &super::AcquiredSubject) {
+        assert_eq!(mapped.occurrences.len(), 2);
+        assert!(
+            mapped
+                .occurrences
+                .iter()
+                .all(|occurrence| occurrence.enclosing.is_none()
+                    && occurrence.facet == rift_protocol::read::RelationshipFacet::Calls)
+        );
+        assert!(mapped.relationships.is_empty());
+    }
+
     #[test]
     fn raw_records_keep_distinct_identities_and_refuse_payload_conflicts() -> TestResult {
         use rift_protocol::relationship_read::{RelationshipRecord, RelationshipRecordId};

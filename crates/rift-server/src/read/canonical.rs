@@ -37,13 +37,14 @@ impl LocalSymbolViewInput {
         Ok(local_view_input(
             Arc::new(self.material.index.with_sources(sources)?),
             self.material.metadata.to_vec(),
-            self.material.history.clone(),
+            Arc::clone(&self.material.history),
             self.material.traversal.clone(),
             self.ready,
         )
         .with_expiry_limit(self.expiry_limit)
         .with_query_result_arc(self.material.query_result.clone())
         .with_package_facts_arc(self.material.package_facts.clone())
+        .with_query_references_arc(self.material.query_references.clone())
         .with_provider_selection_arc(self.material.provider_selection.clone()))
     }
 
@@ -55,6 +56,16 @@ impl LocalSymbolViewInput {
         let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         Ok(metadata.warnings)
+    }
+
+    /// Returns the version-control revision retained by this immutable input.
+    ///
+    /// # Errors
+    /// Returns the original captured metadata read failure.
+    pub fn captured_revision(&self) -> Result<Option<rift_protocol::read::RevisionId>, RiftError> {
+        let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
+            .map_err(|error| material_error("decode captured metadata", &error))?;
+        Ok(metadata.revision)
     }
 
     /// Adds caller-owned warnings before the immutable material is admitted.
@@ -76,13 +87,14 @@ impl LocalSymbolViewInput {
         Ok(local_view_input(
             Arc::clone(&self.material.index),
             metadata,
-            self.material.history.clone(),
+            Arc::clone(&self.material.history),
             self.material.traversal.clone(),
             self.ready,
         )
         .with_expiry_limit(self.expiry_limit)
         .with_query_result_arc(self.material.query_result.clone())
         .with_package_facts_arc(self.material.package_facts.clone())
+        .with_query_references_arc(self.material.query_references.clone())
         .with_provider_selection_arc(self.material.provider_selection.clone()))
     }
 
@@ -100,26 +112,6 @@ impl LocalSymbolViewInput {
 
     pub(crate) fn index(&self) -> &rift_index::WorkspaceSymbolView {
         &self.material.index
-    }
-
-    pub(crate) fn captured_history(
-        &self,
-    ) -> Result<Option<rift_protocol::read::SymbolHistory>, RiftError> {
-        self.material
-            .history
-            .as_ref()
-            .map(|(_, bytes)| {
-                serde_json::from_slice(bytes)
-                    .map_err(|error| material_error("decode captured history", &error))
-            })
-            .transpose()
-    }
-
-    pub(crate) fn captured_history_bytes(&self) -> Option<&[u8]> {
-        self.material
-            .history
-            .as_ref()
-            .map(|(_, bytes)| bytes.as_ref())
     }
 
     /// Retains one encoded execution result under the existing material admission bound.
@@ -141,11 +133,12 @@ impl LocalSymbolViewInput {
         self.material = Arc::new(LocalSymbolMaterial {
             index: Arc::clone(&self.material.index),
             metadata: Arc::clone(&self.material.metadata),
-            history: self.material.history.clone(),
+            history: Arc::clone(&self.material.history),
             traversal: self.material.traversal.clone(),
             query_result: bytes,
             package_facts: self.material.package_facts.clone(),
             provider_selection: self.material.provider_selection.clone(),
+            query_references: self.material.query_references.clone(),
         });
         self
     }
@@ -200,11 +193,12 @@ impl LocalSymbolViewInput {
         self.material = Arc::new(LocalSymbolMaterial {
             index: Arc::clone(&self.material.index),
             metadata: Arc::clone(&self.material.metadata),
-            history: self.material.history.clone(),
+            history: Arc::clone(&self.material.history),
             traversal: self.material.traversal.clone(),
             query_result: self.material.query_result.clone(),
             package_facts: self.material.package_facts.clone(),
             provider_selection: selection,
+            query_references: self.material.query_references.clone(),
         });
         self
     }
@@ -218,7 +212,7 @@ impl LocalSymbolViewInput {
     ///
     /// # Errors
     /// Refuses selections backed by different publications.
-    pub fn combine(mut self, other: Self) -> Result<Self, SymbolUnavailableReason> {
+    pub fn combine(mut self, other: &Self) -> Result<Self, SymbolUnavailableReason> {
         if !Arc::ptr_eq(&self.material.index, &other.material.index) {
             return Err(SymbolUnavailableReason::ViewContext);
         }
@@ -239,10 +233,25 @@ impl LocalSymbolViewInput {
             (left, right) => left.or(right),
         };
         self.ready &= other.ready;
+        self = self
+            .combine_histories(other)
+            .map_err(|_| SymbolUnavailableReason::ViewContext)?;
         if let Some(facts) = other.material.package_facts.as_deref() {
             self = self
                 .with_package_facts(facts.clone())
                 .map_err(|_| SymbolUnavailableReason::ViewContext)?;
+        }
+        if let Some(references) = &other.material.query_references {
+            let combined = match &self.material.query_references {
+                Some(existing) if Arc::ptr_eq(existing, references) => Arc::clone(existing),
+                Some(existing) => Arc::new(
+                    existing
+                        .combine_provider_references(references)
+                        .map_err(|_| SymbolUnavailableReason::ViewContext)?,
+                ),
+                None => Arc::clone(references),
+            };
+            self = self.with_query_references_arc(Some(combined));
         }
         Ok(self)
     }
@@ -264,11 +273,12 @@ impl LocalSymbolViewInput {
 struct LocalSymbolMaterial {
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Arc<[u8]>,
-    history: Option<(String, Arc<[u8]>)>,
+    history: Arc<history::CapturedHistories>,
     traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
     query_result: Option<Arc<[u8]>>,
     package_facts: Option<Arc<rift_search::query::QueryFacts>>,
     provider_selection: Option<Arc<rift_search::query::QueryProviderSelection>>,
+    query_references: Option<Arc<crate::EngineReferences>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -375,7 +385,7 @@ struct State {
 }
 
 impl State {
-    fn expire(&mut self, now: SystemTime) {
+    fn expire(&mut self, now: SystemTime, views_max: usize) {
         let expired: Vec<_> = self
             .views
             .iter()
@@ -386,7 +396,7 @@ impl State {
             self.views.remove(&key);
             self.expired.insert(key);
         }
-        while self.expired.len() > VIEW_SLOTS {
+        while self.expired.len() > views_max {
             self.expired.pop_first();
         }
         self.cursors.retain(|key, cursor| {
@@ -397,7 +407,7 @@ impl State {
                 false
             }
         });
-        while self.expired.len() > VIEW_SLOTS {
+        while self.expired.len() > views_max {
             self.expired.pop_first();
         }
     }
@@ -468,6 +478,8 @@ impl State {
 #[derive(Debug)]
 pub struct LocalSymbolViews {
     material_bytes_max: usize,
+    views_max: usize,
+    view_lifetime: Duration,
     service_key: [u8; 32],
     state: Mutex<State>,
 }
@@ -498,9 +510,30 @@ impl LocalSymbolViews {
     pub fn new(material_bytes_max: usize, service_key: [u8; 32]) -> Self {
         Self {
             material_bytes_max,
+            views_max: VIEW_SLOTS,
+            view_lifetime: VIEW_LIFETIME,
             service_key,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Creates a service-local store with accepted byte, count and lifetime bounds.
+    ///
+    /// # Errors
+    /// Returns a registered read refusal for a zero count, byte bound or lifetime.
+    pub fn bounded(
+        material_bytes_max: usize,
+        service_key: [u8; 32],
+        views_max: usize,
+        view_lifetime: Duration,
+    ) -> Result<Self, RiftError> {
+        if material_bytes_max == 0 || views_max == 0 || view_lifetime.is_zero() {
+            return Err(invalid("view", "captured view bounds must be positive"));
+        }
+        let mut views = Self::new(material_bytes_max, service_key);
+        views.views_max = views_max;
+        views.view_lifetime = view_lifetime;
+        Ok(views)
     }
 
     /// Captures one exact publication, or refuses admission without discarding active views.
@@ -573,12 +606,12 @@ impl LocalSymbolViews {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire(now);
-        if input.retained_bytes == 0 || state.views.len() == VIEW_SLOTS {
+        state.expire(now, self.views_max);
+        if input.retained_bytes == 0 || state.views.len() >= self.views_max {
             rift_tracing::warn!(
                 component = "server",
                 rows = state.views.len(),
-                views_max = VIEW_SLOTS,
+                views_max = self.views_max,
                 incoming_bytes = input.retained_bytes,
                 index_bytes = input.index_bytes,
                 ready = input.ready,
@@ -592,7 +625,7 @@ impl LocalSymbolViews {
         let ready = input.ready;
         let id = self.next_key(&mut state)?;
         let mut expires = now
-            .checked_add(VIEW_LIFETIME)
+            .checked_add(self.view_lifetime)
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
         if let Some(limit) = input.expiry_limit {
             expires = expires.min(limit);
@@ -600,9 +633,22 @@ impl LocalSymbolViews {
         if expires <= now {
             return Ok(None);
         }
+        let elapsed = expires
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| invalid("view", "view expiry exceeds the clock bound"))?;
+        let seconds = i64::try_from(elapsed.as_secs())
+            .map_err(|_| invalid("view", "view expiry exceeds the clock bound"))?;
+        let timestamp = chrono::DateTime::from_timestamp(seconds, elapsed.subsec_nanos())
+            .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
+        let expires_at = timestamp.to_rfc3339();
+        let decoded = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|_| invalid("view", "view expiry exceeds the clock bound"))?;
+        if SystemTime::from(decoded) != expires {
+            return Err(invalid("view", "view expiry exceeds the clock bound"));
+        }
         let view = CapturedView {
             id: CapturedViewId::parse(&id)?,
-            expires_at: chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339(),
+            expires_at,
         };
         state.views.insert(
             id.clone(),
@@ -620,7 +666,7 @@ impl LocalSymbolViews {
                 component = "server",
                 rows = state.views.len(),
                 cursors = state.cursors.len(),
-                views_max = VIEW_SLOTS,
+                views_max = self.views_max,
                 material_bytes,
                 incoming_bytes = retained_bytes,
                 index_bytes,
@@ -712,7 +758,7 @@ impl LocalSymbolViews {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire(now);
+        state.expire(now, self.views_max);
         let Some(held) = state.views.get(id.as_str()) else {
             return Err(if state.expired.contains(id.as_str()) {
                 SymbolUnavailableReason::ViewExpired
@@ -746,21 +792,13 @@ impl LocalSymbolViews {
         owner: &SymbolOwner,
         now: SystemTime,
     ) -> Result<GetSymbolResult, RiftError> {
-        let identity = SymbolIdentity::parse(request.id.as_str())?;
-        super::accepted_limit(request.declaration_limit)?;
-        if request.rev.is_some() && (request.view.is_some() || request.declaration_cursor.is_some())
-        {
-            return Err(invalid(
-                "rev",
-                "rev cannot accompany a captured view or continuation",
-            ));
-        }
+        let identity = symbol_request_identity(request)?;
         let (held, offset) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expire(now);
+            state.expire(now, self.views_max);
             let continuation = match &request.declaration_cursor {
                 Some(key) => match state.cursors.get(key) {
                     Some(cursor) if cursor.matches(request) => Some(cursor),
@@ -830,7 +868,7 @@ impl LocalSymbolViews {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expire(now);
+            state.expire(now, self.views_max);
             let key = self.next_key(&mut state)?;
             state.cursors.insert(key.clone(), continuation);
             if state.admitted_material_bytes(self.material_bytes_max) > self.material_bytes_max {
@@ -850,6 +888,18 @@ impl LocalSymbolViews {
         }
         Ok(result)
     }
+}
+
+fn symbol_request_identity(request: &GetSymbolParams) -> Result<SymbolIdentity, RiftError> {
+    let identity = SymbolIdentity::parse(request.id.as_str())?;
+    super::accepted_declaration_limit(request.declaration_limit)?;
+    if request.rev.is_some() && (request.view.is_some() || request.declaration_cursor.is_some()) {
+        return Err(invalid(
+            "rev",
+            "rev cannot accompany a captured view or continuation",
+        ));
+    }
+    Ok(identity)
 }
 
 fn invalid(field: &'static str, violation: &'static str) -> RiftError {
@@ -879,7 +929,13 @@ impl ReadService {
     /// Returns the original captured index or read failure.
     pub fn local_search_view_input(&self, ready: bool) -> Result<LocalSymbolViewInput, RiftError> {
         let (index, metadata) = self.local_view_material()?;
-        Ok(local_view_input(index, metadata, None, None, ready))
+        Ok(local_view_input(
+            index,
+            metadata,
+            Arc::default(),
+            None,
+            ready,
+        ))
     }
 
     /// Captures one traversal's engine rows from the same source and index revision.
@@ -905,7 +961,13 @@ impl ReadService {
         } else {
             None
         };
-        Ok(local_view_input(index, metadata, None, traversal, ready))
+        Ok(local_view_input(
+            index,
+            metadata,
+            Arc::default(),
+            traversal,
+            ready,
+        ))
     }
 
     fn local_view_material(
@@ -956,7 +1018,13 @@ impl ReadService {
         } else {
             None
         };
-        Ok(local_view_input(index, metadata, history, None, ready))
+        Ok(local_view_input(
+            index,
+            metadata,
+            Arc::new(history::CapturedHistories::single(history)),
+            None,
+            ready,
+        ))
     }
 }
 
@@ -1141,7 +1209,8 @@ impl LocalSymbolMaterial {
         key: &rift_core::SymbolId,
         offset: usize,
     ) -> Result<(Vec<rift_protocol::symbol_read::SymbolDeclaration>, usize), RiftError> {
-        let limit = super::accepted_limit(request.declaration_limit)?.min(self.index.results_max());
+        let limit = super::accepted_declaration_limit(request.declaration_limit)?
+            .min(self.index.results_max());
         let (mut declarations, total) = self
             .index
             .declarations_by_identity_page(key, offset, limit)?;
@@ -1163,8 +1232,8 @@ impl LocalSymbolMaterial {
         if !request.include.contains(&GetSymbolInclude::History) {
             return Ok(None);
         }
-        match &self.history {
-            Some((id, bytes)) if id == request.id.as_str() => serde_json::from_slice(bytes)
+        match self.history.get(request.id.as_str()) {
+            Some(bytes) => serde_json::from_slice(bytes)
                 .map(Some)
                 .map_err(|error| material_error("decode captured history", &error)),
             _ => Ok(None),
@@ -1175,7 +1244,7 @@ impl LocalSymbolMaterial {
 fn local_view_input(
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Vec<u8>,
-    history: Option<(String, Arc<[u8]>)>,
+    history: Arc<history::CapturedHistories>,
     traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
     ready: bool,
 ) -> LocalSymbolViewInput {
@@ -1187,15 +1256,12 @@ fn local_view_input(
         query_result: None,
         package_facts: None,
         provider_selection: None,
+        query_references: None,
     });
     let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
         .saturating_add(4 * std::mem::size_of::<usize>())
         .saturating_add(material.metadata.len())
-        .saturating_add(material.history.as_ref().map_or(0, |(id, bytes)| {
-            id.capacity()
-                .saturating_add(bytes.len())
-                .saturating_add(2 * std::mem::size_of::<usize>())
-        }))
+        .saturating_add(material.history.retained_bytes())
         .saturating_add(
             material
                 .traversal
@@ -1215,9 +1281,11 @@ fn local_view_input(
     }
 }
 
+mod history;
 mod nodes;
 mod package;
 mod query;
+mod query_references;
 pub use query::{CapturedQueryView, QueryMaterial, QueryViewInput};
 mod source;
 mod traversal;

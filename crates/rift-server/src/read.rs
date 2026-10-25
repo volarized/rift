@@ -1425,15 +1425,23 @@ fn accepted_symbol_name(name: &str) -> Result<(), RiftError> {
 ///
 /// Returns `invalid_request` naming `limit` when the size is outside its bounds.
 pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
+    accepted_limit_for(requested, "limit")
+}
+
+pub(crate) fn accepted_declaration_limit(requested: u64) -> Result<usize, RiftError> {
+    accepted_limit_for(requested, "declaration_limit")
+}
+
+fn accepted_limit_for(requested: u64, field: &'static str) -> Result<usize, RiftError> {
     if requested == 0 {
         return errors::server::read_invalid()
-            .field("limit")
+            .field(field)
             .violation("zero")
             .fail();
     }
     if requested > PAGE_LIMIT_MAX {
         return errors::server::read_invalid()
-            .field("limit")
+            .field(field)
             .violation(format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"))
             .fail();
     }
@@ -1592,20 +1600,31 @@ pub(crate) fn wire_symbol(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
 ) -> Result<(Symbol, Option<ReadWarning>), RiftError> {
+    wire_symbol_with(index, matched, |_| Ok(())).map(|(symbol, warning, ())| (symbol, warning))
+}
+
+pub(crate) fn wire_symbol_with<T>(
+    index: &WorkspaceIndex,
+    matched: SymbolMatch<'_>,
+    selected: impl FnOnce(Option<&ReadableSymbol>) -> Result<T, RiftError>,
+) -> Result<(Symbol, Option<ReadWarning>, T), RiftError> {
     if !rift_core::is_portable_name(&matched.symbol.name)
         || !rift_core::is_portable_name(&matched.symbol.qualified_name)
     {
         let placement = rift_syntax::DocumentPlacement::project_path(matched.file.path())?;
         let facts = matched.symbol.facts(matched.file.syntax().language());
+        let selected = selected(None)?;
         return Ok((
             rift_provider::AssembledSymbol::wire_facts(&facts, placement.origin()),
             None,
+            selected,
         ));
     }
     let readable = index.assembled_symbol(matched)?;
+    let selected = selected(Some(&readable))?;
     let symbol = assembled_wire_symbol(&readable);
     let disagreement = symbol_disagreement_warning(readable.assembled());
-    Ok((symbol, disagreement))
+    Ok((symbol, disagreement, selected))
 }
 
 fn assembled_wire_symbol(readable: &ReadableSymbol) -> Symbol {

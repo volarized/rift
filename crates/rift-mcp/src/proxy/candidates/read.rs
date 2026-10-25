@@ -11,6 +11,8 @@ use rmcp::model::{
 use std::time::SystemTime;
 
 mod dependency;
+#[cfg(test)]
+mod unavailable_tests;
 
 impl RiftProxy {
     pub(super) async fn capture_query_read(
@@ -45,9 +47,21 @@ impl RiftProxy {
             let decoded: rift_protocol::query::QueryReadResult =
                 serde_json::from_value(value.clone())
                     .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            if let rift_protocol::query::QueryReadResult::Results(answer) = decoded
-                && let Some(view) = answer.view
-            {
+            let view = match decoded {
+                rift_protocol::query::QueryReadResult::Results(answer) => answer.view,
+                rift_protocol::query::QueryReadResult::Unavailable(
+                    rift_protocol::search_read::SearchUnavailable::Unavailable {
+                        reason:
+                            rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired
+                            | rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
+                        ..
+                    },
+                ) => None,
+                rift_protocol::query::QueryReadResult::Unavailable(
+                    rift_protocol::search_read::SearchUnavailable::Unavailable { view, .. },
+                ) => view,
+            };
+            if let Some(view) = view {
                 let selected = SavedCandidateBackend {
                     backend: name.to_owned(),
                     root: root.to_owned(),
@@ -69,41 +83,6 @@ impl RiftProxy {
                         return Err(invalid("view", "captured backend context does not match"));
                     }
                     Some(_) => {}
-                    None if !forwarded.captured.is_empty() => {
-                        let mut backends = Vec::new();
-                        for captured in forwarded.captured {
-                            for pool in captured.pools {
-                                let context = SavedCandidateBackend {
-                                    backend: pool.backend,
-                                    root: pool.root,
-                                    owner: pool.owner,
-                                    view: selected.view.clone(),
-                                    project: None,
-                                    upstream_view: Some(pool.view),
-                                };
-                                if let Some(previous) =
-                                    backends.iter().find(|previous: &&SavedCandidateBackend| {
-                                        previous.backend == context.backend
-                                            && previous.owner == context.owner
-                                    })
-                                {
-                                    if previous != &context {
-                                        return Err(invalid(
-                                            "view",
-                                            "captured backend contexts do not match",
-                                        ));
-                                    }
-                                } else {
-                                    backends.push(context);
-                                }
-                            }
-                        }
-                        self.candidate_views.save_query(
-                            &selected.view,
-                            backends,
-                            SystemTime::now(),
-                        )?;
-                    }
                     None => {
                         let mut pending = self.candidate_views.reserve_backend(
                             &selected.backend,

@@ -11,16 +11,19 @@ use rift_search::sparql::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::process::{BoundedRun, Command, RunEnding, run_bounded};
+use crate::process::{BoundedRun, Command, RunEnding, run_bounded_streams};
 
 /// Hidden command shared by the runner and the installed Rift executable.
 pub const QUERY_CHILD_COMMAND: &str = "__query";
 /// Space for metadata, JSON framing and the child executable's initial allocations.
 const PROCESS_OVERHEAD_BYTES: usize = 32 * 1024 * 1024;
-/// Diagnostic prefix retained from either child stream; query data uses owned files.
-const DIAGNOSTIC_BYTES_MAX: usize = 8 * 1024;
+/// Default diagnostic prefix; the accepted configuration can override it.
+const DIAGNOSTIC_BYTES_DEFAULT: usize = 8 * 1024;
+// The only stdout frame is {"version":<u32>,"payload":null}. Its longest version
+// is u32::MAX; every other byte is fixed by the strict exchange structure.
+const ACKNOWLEDGMENT_BYTES_MAX: usize = b"{\"version\":4294967295,\"payload\":null}".len();
 // Change the version when the query snapshot contract changes. Zero is not a supported version.
-const QUERY_EXCHANGE_VERSION: u32 = 5;
+const QUERY_EXCHANGE_VERSION: u32 = 7;
 
 /// Versioned query data shared by the child and authoritative fact reads.
 #[derive(Debug, Deserialize, Serialize)]
@@ -55,10 +58,16 @@ impl<T> QueryExchange<T> {
 /// Finite byte ceilings derived from the accepted statement, fact and result bounds.
 #[derive(Clone, Copy, Debug)]
 pub struct QueryProcessLimits {
-    /// Most serialized bytes exchanged with a query child.
-    pub bytes_max: usize,
+    /// Most serialized request bytes sent to a query child.
+    pub input_bytes_max: usize,
+    /// Most serialized response bytes read from a query child.
+    pub output_bytes_max: usize,
+    /// Most acquired material bytes retained by one request.
+    pub material_bytes_max: usize,
     /// Most live Rust allocation bytes in a query child.
     pub heap_bytes_max: usize,
+    /// Most standard error bytes retained from a query child.
+    pub diagnostic_bytes_max: usize,
 }
 
 impl QueryProcessLimits {
@@ -72,21 +81,35 @@ impl QueryProcessLimits {
     /// # Errors
     /// Returns unavailable when the accepted sizes exceed platform arithmetic.
     pub fn from_query(limits: QueryLimits) -> Result<Self, RiftError> {
-        let sum = limits
-            .query_bytes_max
-            .checked_add(limits.rdf_bytes_max)
-            .and_then(|bytes| bytes.checked_add(limits.result_bytes_max));
-        let heap_bytes_max = sum
-            .and_then(|bytes| bytes.checked_mul(2))
-            .and_then(|bytes| bytes.checked_add(PROCESS_OVERHEAD_BYTES))
-            .ok_or_else(|| unavailable("query process heap limit exceeds the platform bound"))?;
-        let bytes_max = sum
-            .and_then(|bytes| bytes.checked_mul(4))
-            .and_then(|bytes| bytes.checked_add(PROCESS_OVERHEAD_BYTES))
-            .ok_or_else(|| unavailable("query process byte limits exceed the platform bound"))?;
+        let derived = |copies| {
+            limits
+                .query_bytes_max
+                .checked_add(limits.rdf_bytes_max)
+                .and_then(|bytes| bytes.checked_add(limits.result_bytes_max))
+                .and_then(|bytes| bytes.checked_mul(copies))
+                .and_then(|bytes| bytes.checked_add(PROCESS_OVERHEAD_BYTES))
+                .ok_or_else(|| unavailable("query process byte limits exceed the platform bound"))
+        };
+        let resolve = |explicit: Option<usize>, copies| {
+            let bytes = explicit.map_or_else(|| derived(copies), Ok)?;
+            if bytes == 0 {
+                return Err(unavailable("query process byte limit must be positive"));
+            }
+            Ok(bytes)
+        };
         Ok(Self {
-            bytes_max,
-            heap_bytes_max,
+            input_bytes_max: resolve(limits.input_bytes_max, 4)?,
+            output_bytes_max: resolve(limits.output_bytes_max, 4)?,
+            material_bytes_max: resolve(limits.material_bytes_max, 4)?,
+            heap_bytes_max: resolve(limits.heap_bytes_max, 2)?,
+            diagnostic_bytes_max: resolve(
+                Some(
+                    limits
+                        .diagnostic_bytes_max
+                        .unwrap_or(DIAGNOSTIC_BYTES_DEFAULT),
+                ),
+                1,
+            )?,
         })
     }
 }
@@ -121,7 +144,7 @@ impl<'a> QueryFactBudget<'a> {
             state: std::sync::Arc::new(std::sync::Mutex::new(QueryFactAdmission {
                 writer: BoundedWriter {
                     writer: std::io::sink(),
-                    remaining: QueryProcessLimits::from_query(limits)?.bytes_max,
+                    remaining: QueryProcessLimits::from_query(limits)?.material_bytes_max,
                 },
                 failure: None,
             })),
@@ -311,11 +334,11 @@ enum QueryFailure {
 }
 
 impl QueryFailure {
-    fn capture(error: RiftError) -> Self {
+    fn capture(error: &RiftError) -> Self {
         let field = |name| {
             error
                 .context()
-                .find_map(|(key, value)| (key == name).then_some(value.to_owned()))
+                .find_map(|(key, value)| (key == name).then_some(value.clone()))
         };
         match error.slug().as_str() {
             "rift.server.read_invalid" => Self::Invalid {
@@ -420,7 +443,7 @@ fn execute(
             active: &active,
         },
         &task,
-        process_limits.bytes_max,
+        process_limits.input_bytes_max,
     );
     check_request(deadline, cancelled)?;
     written?;
@@ -430,18 +453,25 @@ fn execute(
         .arg(QUERY_CHILD_COMMAND)
         .arg(request.path())
         .arg(response.path())
-        .arg(process_limits.bytes_max.to_string())
+        .arg(process_limits.input_bytes_max.to_string())
+        .arg(process_limits.output_bytes_max.to_string())
         .arg(process_limits.heap_bytes_max.to_string());
     let timeout = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
         .ok_or_else(|| unavailable("query exceeded the request deadline"))?;
-    let run = run_bounded(&mut command, timeout, DIAGNOSTIC_BYTES_MAX, cancelled)
-        .map_err(process_error)?;
+    let run = run_bounded_streams(
+        &mut command,
+        timeout,
+        ACKNOWLEDGMENT_BYTES_MAX,
+        process_limits.diagnostic_bytes_max,
+        cancelled,
+    )
+    .map_err(process_error)?;
     collect_response(
         run,
         &response,
-        process_limits.bytes_max,
+        process_limits.output_bytes_max,
         deadline,
         cancelled,
     )
@@ -460,6 +490,11 @@ fn collect_response(
         RunEnding::Exited => {}
     }
     let exit = run.exit.map_err(process_error)?;
+    if run.stdout.total_bytes > u64::try_from(ACKNOWLEDGMENT_BYTES_MAX).unwrap_or(u64::MAX) {
+        return Err(incompatible(
+            "query protocol acknowledgment exceeds its frame bound",
+        ));
+    }
     decode_acknowledgment(run.stdout.text.as_bytes())?;
     if !exit.success() {
         return Err(unavailable(format!(
@@ -518,26 +553,49 @@ fn exchange_directory() -> std::io::Result<tempfile::TempDir> {
 pub fn run_query_child(
     request_path: &Path,
     response_path: &Path,
-    bytes_max: usize,
+    input_bytes_max: usize,
+    output_bytes_max: usize,
+    heap_bytes_max: usize,
 ) -> Result<(), RiftError> {
     write_json(
         std::io::stdout(),
         &QueryExchange::new(()),
-        DIAGNOSTIC_BYTES_MAX,
+        ACKNOWLEDGMENT_BYTES_MAX,
     )?;
     let request = std::fs::File::open(request_path).map_err(process_error)?;
-    let bytes = read_request(request, bytes_max)?;
+    let bytes = read_request(request, input_bytes_max)?;
     let request = serde_json::from_slice::<QueryExchange<QueryTask>>(&bytes)
         .map_err(|_| incompatible("query request schema is incompatible"))
-        .and_then(QueryExchange::into_payload);
+        .and_then(QueryExchange::into_payload)
+        .and_then(|task| {
+            let limits = match &task {
+                QueryTask::Prepare { limits, .. } | QueryTask::Evaluate { limits, .. } => *limits,
+            };
+            let accepted = QueryProcessLimits::from_query(limits)?;
+            if (
+                accepted.input_bytes_max,
+                accepted.output_bytes_max,
+                accepted.heap_bytes_max,
+            ) != (input_bytes_max, output_bytes_max, heap_bytes_max)
+            {
+                return Err(incompatible(
+                    "query child limits differ from the accepted request",
+                ));
+            }
+            Ok(task)
+        });
     drop(bytes);
-    let response = QueryExchange::new(request.and_then(run_task).map_err(QueryFailure::capture));
+    let response = QueryExchange::new(
+        request
+            .and_then(run_task)
+            .map_err(|error| QueryFailure::capture(&error)),
+    );
     let output = std::fs::OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(response_path)
         .map_err(process_error)?;
-    write_json(output, &response, bytes_max)
+    write_json(output, &response, output_bytes_max)
 }
 
 fn run_task(task: QueryTask) -> Result<QueryOutput, RiftError> {

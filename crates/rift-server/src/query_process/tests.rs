@@ -10,6 +10,11 @@ fn limits() -> QueryLimits {
         rdf_bytes_max: 16_777_216,
         result_items_max: 20_000,
         result_bytes_max: 16_777_216,
+        input_bytes_max: None,
+        output_bytes_max: None,
+        material_bytes_max: None,
+        heap_bytes_max: None,
+        diagnostic_bytes_max: None,
     }
 }
 
@@ -18,7 +23,7 @@ fn process_byte_limits_are_finite_and_refuse_arithmetic_overflow() {
     let limits = limits();
     let bound = QueryProcessLimits::from_query(limits).expect("accepted bounds");
     assert_eq!(
-        bound.bytes_max,
+        bound.input_bytes_max,
         4 * (limits.query_bytes_max + limits.rdf_bytes_max + limits.result_bytes_max)
             + PROCESS_OVERHEAD_BYTES
     );
@@ -27,6 +32,9 @@ fn process_byte_limits_are_finite_and_refuse_arithmetic_overflow() {
         2 * (limits.query_bytes_max + limits.rdf_bytes_max + limits.result_bytes_max)
             + PROCESS_OVERHEAD_BYTES
     );
+    assert_eq!(bound.output_bytes_max, bound.input_bytes_max);
+    assert_eq!(bound.material_bytes_max, bound.input_bytes_max);
+    assert_eq!(bound.diagnostic_bytes_max, 8192);
     assert!(
         QueryProcessLimits::from_query(QueryLimits {
             query_bytes_max: usize::MAX,
@@ -43,6 +51,77 @@ fn process_byte_limits_are_finite_and_refuse_arithmetic_overflow() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn explicit_process_bounds_are_independent_and_replace_only_their_derivation() {
+    let automatic = QueryProcessLimits::from_query(limits()).expect("automatic bounds");
+    let accepted = QueryLimits {
+        input_bytes_max: Some(101),
+        output_bytes_max: Some(102),
+        material_bytes_max: Some(103),
+        heap_bytes_max: Some(104),
+        diagnostic_bytes_max: Some(1),
+        ..limits()
+    };
+    let resolved = QueryProcessLimits::from_query(accepted).expect("explicit bounds");
+    assert_eq!(resolved.input_bytes_max, 101);
+    assert_eq!(resolved.output_bytes_max, 102);
+    assert_eq!(resolved.material_bytes_max, 103);
+    assert_eq!(resolved.heap_bytes_max, 104);
+    assert_eq!(resolved.diagnostic_bytes_max, 1);
+    let independent = QueryProcessLimits::from_query(QueryLimits {
+        input_bytes_max: Some(1),
+        ..limits()
+    })
+    .expect("one override");
+    assert_eq!(independent.output_bytes_max, automatic.output_bytes_max);
+    assert_eq!(independent.material_bytes_max, automatic.material_bytes_max);
+    assert_eq!(independent.heap_bytes_max, automatic.heap_bytes_max);
+    assert!(
+        QueryProcessLimits::from_query(QueryLimits {
+            query_bytes_max: usize::MAX,
+            ..accepted
+        })
+        .is_ok()
+    );
+    assert!(
+        QueryProcessLimits::from_query(QueryLimits {
+            input_bytes_max: Some(0),
+            ..accepted
+        })
+        .is_err()
+    );
+}
+
+#[test]
+fn material_override_bounds_shared_record_admission() {
+    let mut budget = QueryFactBudget::new(
+        QueryLimits {
+            material_bytes_max: Some(3),
+            ..limits()
+        },
+        &|| false,
+    )
+    .expect("configured material admission");
+    budget.charge_bytes(b"abc").expect("exact material bound");
+    assert!(budget.charge_bytes(b"d").is_err());
+}
+
+#[test]
+fn acknowledgment_frame_bound_covers_every_version_and_rejects_extra_bytes() {
+    let acknowledgment = QueryExchange {
+        version: u32::MAX,
+        payload: (),
+    };
+    let bytes = serde_json::to_vec(&acknowledgment).expect("fixed acknowledgment");
+    assert_eq!(bytes.len(), ACKNOWLEDGMENT_BYTES_MAX);
+    let mut value = serde_json::to_value(limits()).expect("current limits");
+    value
+        .as_object_mut()
+        .expect("limits object")
+        .remove("input_bytes_max");
+    assert!(serde_json::from_value::<QueryLimits>(value).is_err());
 }
 
 #[cfg(unix)]
@@ -271,7 +350,7 @@ fn typed_evaluation_collects_lazy_bindings_and_preserves_invalid_refusals() {
     .err()
     .expect("invalid statement");
     let original = invalid.to_string();
-    let failure = QueryFailure::capture(invalid);
+    let failure = QueryFailure::capture(&invalid);
     let bytes = serde_json::to_vec(&failure).expect("encoded refusal");
     let failure: QueryFailure = serde_json::from_slice(&bytes).expect("typed refusal");
     assert_eq!(failure.into_error().to_string(), original);
@@ -286,7 +365,7 @@ fn registered_refusals_preserve_identity() {
     ] {
         let slug = original.slug();
         let message = original.to_string();
-        let captured = QueryFailure::capture(original).into_error();
+        let captured = QueryFailure::capture(&original).into_error();
         assert_eq!(captured.slug(), slug);
         assert_eq!(captured.to_string(), message);
     }
@@ -325,7 +404,7 @@ fn child_refuses_old_tasks_and_incompatible_versions_before_execution() {
     };
     std::fs::write(&response, b"").expect("response file");
     std::fs::write(&request, serde_json::to_vec(&task).expect("old task")).expect("request file");
-    run_query_child(&request, &response, 8192).expect("typed schema refusal");
+    run_query_child(&request, &response, 8192, 8192, 8192).expect("typed schema refusal");
     let error = decode_response(&std::fs::read(&response).expect("complete refusal"))
         .err()
         .expect("old task cannot produce an answer");
@@ -334,7 +413,7 @@ fn child_refuses_old_tasks_and_incompatible_versions_before_execution() {
     envelope.version = 0;
     std::fs::write(&request, serde_json::to_vec(&envelope).expect("new task"))
         .expect("request file");
-    run_query_child(&request, &response, 8192).expect("typed version refusal");
+    run_query_child(&request, &response, 8192, 8192, 8192).expect("typed version refusal");
     let error = decode_response(&std::fs::read(&response).expect("complete refusal"))
         .err()
         .expect("incompatible version cannot produce an answer");
@@ -349,10 +428,10 @@ fn acknowledgment_distinguishes_protocol_refusal_from_an_observed_child_failure(
         (false, "rift.server.read_unsupported"),
         (true, "rift.server.read_unavailable"),
     ] {
-        let mut run = run_bounded(
+        let mut run = crate::process::run_bounded(
             &mut fixture_command(FixtureMode::Print),
             std::time::Duration::from_secs(10),
-            DIAGNOSTIC_BYTES_MAX,
+            DIAGNOSTIC_BYTES_DEFAULT,
             &|| false,
         )
         .expect("owned exit-status fixture");

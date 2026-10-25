@@ -6,12 +6,16 @@ use rift_error::{RiftError, errors};
 use rift_protocol::read::{SearchParams, SearchScope};
 use rift_search::sparql::{FactRequirements, QueryPlan};
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, ServerResult,
+    CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult, ClientRequest,
+    ServerResult,
 };
+
+#[cfg(test)]
+mod tests;
 
 pub(super) enum Acquired {
     Facts(Vec<(String, QueryFactSelection)>),
-    Response(Result<CallToolResponse, rmcp::ErrorData>),
+    Response(Box<Result<CallToolResponse, rmcp::ErrorData>>),
 }
 
 impl RiftProxy {
@@ -43,6 +47,27 @@ impl RiftProxy {
                 }
             }
         }
+        if plan
+            .requirements()
+            .requires(rift_search::query::FactRequirement::Domain)
+        {
+            selections
+                .entry("local".to_owned())
+                .or_insert_with(|| domain_requirements(plan.requirements()));
+        }
+        for graph in &plan.requirements().datasets {
+            let name = if graph == rift_search::sparql::LOCAL_GRAPH {
+                "local"
+            } else if let Some(name) = graph.strip_prefix(rift_search::sparql::EXTRA_PROJECTS) {
+                self.query_backend(name)?;
+                name
+            } else {
+                return Err(super::retained::unavailable());
+            };
+            selections
+                .entry(name.to_owned())
+                .or_insert_with(|| domain_requirements(plan.requirements()));
+        }
         let mut acquired = Vec::new();
         for (name, requirements) in selections {
             match self
@@ -50,7 +75,7 @@ impl RiftProxy {
                 .await?
             {
                 Acquired::Facts(mut facts) => acquired.append(&mut facts),
-                response => return Ok(response),
+                response @ Acquired::Response(_) => return Ok(response),
             }
         }
         Ok(Acquired::Facts(acquired))
@@ -77,6 +102,7 @@ impl RiftProxy {
             .and_then(std::path::Path::to_str)
             .ok_or_else(super::retained::unavailable)?
             .to_owned();
+        let expected_owner = backend.owner.clone();
         let allowance = requests.reserve(requests.remaining().saturating_sub(1))?;
         let maximum = allowance.maximum();
         let request = rift_server::QueryExchange::new(QueryFactRequest {
@@ -112,41 +138,26 @@ impl RiftProxy {
             Ok(ServerResult::CallToolResult(result)) => result,
             Ok(_) => return Err(super::retained::unavailable()),
             Err(error) => {
-                return Ok(Acquired::Response(Err(crate::proxy::forwarded_error(
-                    error,
-                )?)));
+                return Ok(Acquired::Response(Box::new(Err(
+                    crate::proxy::forwarded_error(error)?,
+                ))));
             }
         };
         if result.is_error == Some(true) {
-            return Ok(Acquired::Response(Ok(result.into())));
+            return Ok(Acquired::Response(Box::new(Ok(result.into()))));
         }
         let selected = self
             .query_work(budget, deadline, move |budget| {
                 budget.charge(&result)?;
-                let value = result
-                    .structured_content
-                    .ok_or_else(super::retained::unavailable)?;
-                let response: rift_server::QueryExchange<serde_json::Value> =
-                    serde_json::from_value(value).map_err(encoding_failure)?;
-                let response: QueryFactResult = serde_json::from_value(response.into_payload()?)
-                    .map_err(|_| {
-                        errors::server::read_unsupported()
-                            .capability("query fact response schema is incompatible")
-                            .error()
-                    })?;
-                match response {
+                match decode_response(result)? {
                     QueryFactResult::Facts(selected) => {
-                        if selected.root != expected_root
-                            || selected.selection.owner != selected.owner
-                            || crate::proxy::captured_expiry(&selected.view)?
-                                <= std::time::SystemTime::now()
-                        {
-                            return Err(super::retained::unavailable());
-                        }
-                        selected.facts.validate_providers()?;
-                        if selected.requests > maximum {
-                            return Err(super::retained::unavailable());
-                        }
+                        validate_selection(
+                            &selected,
+                            &expected_root,
+                            &expected_owner,
+                            maximum,
+                            std::time::SystemTime::now(),
+                        )?;
                         allowance.complete(selected.requests)?;
                         budget.charge(&selected)?;
                         Ok(Ok(*selected))
@@ -157,7 +168,7 @@ impl RiftProxy {
             .await?;
         match selected {
             Ok(selected) => Ok(Acquired::Facts(vec![(name.to_owned(), selected)])),
-            Err(reason) => Ok(Acquired::Response(Ok(
+            Err(reason) => Ok(Acquired::Response(Box::new(Ok(
                 rmcp::model::CallToolResult::structured(
                     serde_json::to_value(rift_protocol::query::QueryReadResult::Unavailable(
                         reason,
@@ -165,7 +176,7 @@ impl RiftProxy {
                     .map_err(encoding_failure)?,
                 )
                 .into(),
-            ))),
+            )))),
         }
     }
 
@@ -197,6 +208,90 @@ impl RiftProxy {
         drop(guard);
         result
     }
+}
+
+fn domain_requirements(requirements: &FactRequirements) -> FactRequirements {
+    let mut selected = requirements.clone();
+    selected.retrievals.clear();
+    selected.datasets.clear();
+    selected.services.clear();
+    selected
+}
+
+fn decode_response(result: CallToolResult) -> Result<QueryFactResult, RiftError> {
+    let incompatible = || {
+        errors::server::read_unsupported()
+            .capability("query fact response schema is incompatible")
+            .error()
+    };
+    let response: rift_server::QueryExchange<serde_json::Value> =
+        serde_json::from_value(result.structured_content.ok_or_else(incompatible)?)
+            .map_err(|_| incompatible())?;
+    serde_json::from_value(response.into_payload()?).map_err(|_| incompatible())
+}
+
+fn validate_selection(
+    selected: &QueryFactSelection,
+    root: &str,
+    owner: &rift_protocol::identity::SymbolOwner,
+    maximum: u64,
+    now: std::time::SystemTime,
+) -> Result<(), RiftError> {
+    let root_uri = rift_server::query_provider_root(std::path::Path::new(root))?;
+    if selected.root != root
+        || &selected.owner != owner
+        || selected.selection.owner != selected.owner
+        || selected.selection.root.as_str() != root_uri.as_str()
+        || crate::proxy::captured_expiry(&selected.view)? <= now
+        || selected.requests > maximum
+    {
+        return Err(super::retained::unavailable());
+    }
+    selected.facts.validate_providers()?;
+    for service in &selected.services.retrievals {
+        if service.targets.len() != service.result.results.len() {
+            return Err(super::retained::unavailable());
+        }
+        for (hit, target) in service.result.results.iter().zip(&service.targets) {
+            match (&hit.hit, target) {
+                (
+                    rift_protocol::read::SearchHitTarget::Symbol { symbol },
+                    Some((graph, endpoint)),
+                ) => {
+                    if graph != rift_search::sparql::LOCAL_GRAPH {
+                        return Err(super::retained::unavailable());
+                    }
+                    let provider = endpoint
+                        .provider
+                        .and_then(|provider| selected.facts.providers.get(provider))
+                        .ok_or_else(super::retained::unavailable)?;
+                    let record = provider
+                        .record(&endpoint.target)
+                        .ok_or_else(super::retained::unavailable)?;
+                    if provider.context.selection != selected.selection
+                        || selected
+                            .facts
+                            .symbols
+                            .get(record.symbol_index)
+                            .is_none_or(|selected| selected.symbol != **symbol)
+                    {
+                        return Err(super::retained::unavailable());
+                    }
+                }
+                (rift_protocol::read::SearchHitTarget::Symbol { symbol }, None) => {
+                    rift_search::query::QueryProviderTarget::canonical(
+                        symbol
+                            .id
+                            .as_ref()
+                            .ok_or_else(super::retained::unavailable)?,
+                    )?;
+                }
+                (_, None) => {}
+                (_, Some(_)) => return Err(super::retained::unavailable()),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn original_request(

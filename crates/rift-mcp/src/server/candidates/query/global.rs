@@ -96,13 +96,16 @@ impl RiftMcp {
         .map_err(read_failure)?;
         match &mut result {
             GetSymbolResult::Found { view, .. } | GetSymbolResult::Missing { view, .. } => {
-                if view != &selected.view {
+                if !same_view(view, &selected.view) {
                     return Err(context_failure(&root.view, "get_symbol"));
                 }
                 *view = root.view.clone();
             }
             GetSymbolResult::Unavailable { view, .. } => {
-                if view.as_ref().is_some_and(|view| view != &selected.view) {
+                if view
+                    .as_ref()
+                    .is_some_and(|view| !same_view(view, &selected.view))
+                {
                     return Err(context_failure(&root.view, "get_symbol"));
                 }
                 *view = Some(root.view.clone());
@@ -189,13 +192,16 @@ impl RiftMcp {
         }
         match &mut result {
             GetSourceResult::Found { view, .. } | GetSourceResult::Missing { view, .. } => {
-                if view != &selected.view {
+                if !same_view(view, &selected.view) {
                     return Err(context_failure(&root.view, "get_source"));
                 }
                 *view = root.view.clone();
             }
             GetSourceResult::Unavailable { view, .. } => {
-                if view.as_ref().is_some_and(|view| view != &selected.view) {
+                if view
+                    .as_ref()
+                    .is_some_and(|view| !same_view(view, &selected.view))
+                {
                     return Err(context_failure(&root.view, "get_source"));
                 }
                 *view = Some(root.view.clone());
@@ -215,6 +221,14 @@ impl RiftMcp {
             .accepted_for_tool(super::super::super::wire::ErrorPhase::Read)?;
         Ok(published.configuration.global_configuration() == selected.configuration)
     }
+}
+
+fn same_view(actual: &CapturedView, selected: &CapturedView) -> bool {
+    actual.id == selected.id
+        && crate::proxy::captured_expiry(actual)
+            .ok()
+            .zip(crate::proxy::captured_expiry(selected).ok())
+            .is_some_and(|(actual, selected)| actual == selected)
 }
 
 fn captured_symbol(held: &SelectedGlobal, params: &GetSymbolParams) -> bool {
@@ -269,4 +283,33 @@ fn publish_context(
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(selected);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CapturedView, CapturedViewId, same_view};
+
+    #[test]
+    fn retained_global_views_preserve_original_expiry_instants() {
+        let view = |key: char, expires_at: &str| CapturedView {
+            id: CapturedViewId::parse(&key.to_string().repeat(64)).expect("fixture view"),
+            expires_at: expires_at.to_owned(),
+        };
+        let selected = view('a', "2099-10-10T10:05:00.123456789+00:00");
+        for expiry in [
+            "2099-10-10T10:05:00.123456789Z",
+            "2099-10-10T11:05:00.123456789+01:00",
+        ] {
+            assert!(same_view(&view('a', expiry), &selected));
+        }
+        for actual in [
+            view('b', &selected.expires_at),
+            view('a', "2099-10-10T10:05:00.123456788Z"),
+            view('a', "2099-10-10T10:05:00.123456790Z"),
+            view('a', "invalid"),
+        ] {
+            assert!(!same_view(&actual, &selected));
+        }
+        assert!(!same_view(&view('a', "invalid"), &view('a', "invalid")));
+    }
 }

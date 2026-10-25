@@ -454,8 +454,14 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
             value["relationship_capabilities"] = serde_json::json!([
-                {"direction":"outgoing","facets":["calls"]},
-                {"direction":"incoming","facets":["references"]}
+                {"direction":"outgoing","facets":["calls"],"bounds":{
+                    "max_seeds":64,"max_facets":16,"max_relationships":1000,
+                    "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
+                }},
+                {"direction":"incoming","facets":["references"],"bounds":{
+                    "max_seeds":64,"max_facets":16,"max_relationships":1000,
+                    "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
+                }}
             ]);
         }
         OperationFixture::Documentation { .. } | OperationFixture::DocumentationBounds { .. } => {

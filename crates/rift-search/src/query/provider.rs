@@ -403,16 +403,15 @@ impl super::QueryFacts {
     /// Selects a worker endpoint using the existing captured provider array.
     #[must_use]
     pub fn provider_endpoint(&self, target: &QueryProviderTarget) -> Option<QueryProviderEndpoint> {
-        let provider = match &target.context {
-            Some(context) => Some(
+        let provider = if let Some(context) = &target.context {
+            Some(
                 self.providers
                     .iter()
                     .position(|snapshot| &snapshot.context == context.as_ref())?,
-            ),
-            None => {
-                target.canonical_symbol()?;
-                None
-            }
+            )
+        } else {
+            target.canonical_symbol()?;
+            None
         };
         Some(QueryProviderEndpoint {
             provider,
@@ -423,14 +422,13 @@ impl super::QueryFacts {
     /// Restores the original captured target for a request-owned frontier.
     #[must_use]
     pub fn provider_target(&self, endpoint: &QueryProviderEndpoint) -> Option<QueryProviderTarget> {
-        let context = match endpoint.provider {
-            Some(index) => Some(std::sync::Arc::new(
+        let context = if let Some(index) = endpoint.provider {
+            Some(std::sync::Arc::new(
                 self.providers.get(index)?.context.clone(),
-            )),
-            None => {
-                endpoint.canonical_symbol()?;
-                None
-            }
+            ))
+        } else {
+            endpoint.canonical_symbol()?;
+            None
         };
         Some(QueryProviderTarget {
             context,
@@ -508,7 +506,13 @@ impl super::QueryFacts {
                         .get(association.declaration_index)
                         .ok_or_else(invalid)?;
                     let unit = association.binding.unit().to_string();
-                    if declaration.unit.as_ref().map(|unit| unit.as_str()) != Some(unit.as_str())
+                    let (_, path) = rift_protocol::identity::parse_source_unit_identity(&unit)?;
+                    let matches_unit = match (&declaration.unit, &declaration.path) {
+                        (Some(selected), None) => selected.as_str() == unit,
+                        (None, Some(selected)) => selected.0 == path,
+                        _ => false,
+                    };
+                    if !matches_unit
                         || declaration.range.start != association.binding.range().start()
                         || declaration.range.end != association.binding.range().end()
                         || declaration.node.as_ref() != association.binding.node()

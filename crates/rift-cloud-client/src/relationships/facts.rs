@@ -15,8 +15,10 @@ pub(super) fn validate_page(
     request: &RelationshipSearchRequest,
     page: &RelationshipSearchPage,
     source_bytes_max: usize,
+    symbols_max: usize,
+    sources_max: usize,
 ) -> Result<(), RiftError> {
-    if page.symbols.len() > 10_000 || page.sources.len() > 10_000 {
+    if page.symbols.len() > symbols_max || page.sources.len() > sources_max {
         return Err(invalid(
             "relationship fact projections exceed their page bound",
         ));

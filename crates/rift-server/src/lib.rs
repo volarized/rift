@@ -35,7 +35,7 @@ pub use history_fill::{
     AnalyzedCommit, FillPlan, HistoryAnalysis, PendingCommit, RELEASE_TAGS_MAX, UnversionedTag,
     release_version,
 };
-pub use query::merge_query_facts;
+pub use query::{merge_query_facts, query_provider_root};
 pub use query_process::{
     QUERY_CHILD_COMMAND, QueryExchange, QueryFactBudget, QueryProcessLimits, evaluate_query,
     prepare_query, run_query_child,
@@ -51,8 +51,8 @@ pub use rift_core::CapturedStream;
 pub use rift_error::RiftError;
 pub use rift_lsp::capabilities::PositionEncoding;
 pub use search::{
-    PatternBounds, SearchCandidateInput, SearchCandidateInputs, SearchCandidateItem, StoreAnswer,
-    accepted_pattern, matched_fields, search_page_limit,
+    PatternBounds, SearchCandidateInput, SearchCandidateInputs, SearchCandidateItem,
+    SearchSnapshot, StoreAnswer, accepted_pattern, matched_fields, search_page_limit,
 };
 
 /// Compile-time marker for server-layer ownership.

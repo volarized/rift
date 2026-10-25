@@ -7,10 +7,34 @@ use crate::symbol_read::{CapturedView, CapturedViewId};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Most canonical subjects in one raw adjacency batch.
+/// Default canonical subjects in one raw adjacency batch, before accepted policy applies.
 pub const RELATIONSHIP_SEEDS_MAX: usize = 64;
 /// Capability advertised for the raw relationship branch of `/v1/search`.
 pub const RELATIONSHIPS_FEATURE: &str = "relationships";
+
+/// Positive count bounds for one raw relationship operation.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipBounds {
+    /// Most subjects in one request.
+    #[schemars(range(min = 1))]
+    pub max_seeds: u64,
+    /// Most selected facets in one request.
+    #[schemars(range(min = 1))]
+    pub max_facets: u64,
+    /// Most relationship projections in one group.
+    #[schemars(range(min = 1))]
+    pub max_relationships: u64,
+    /// Most occurrence projections in one group.
+    #[schemars(range(min = 1))]
+    pub max_occurrences: u64,
+    /// Most original symbol records in one page.
+    #[schemars(range(min = 1))]
+    pub max_symbols: u64,
+    /// Most original source units in one page.
+    #[schemars(range(min = 1))]
+    pub max_sources: u64,
+}
 
 /// One relationship operation the reader establishes from its existing collected facts.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -19,9 +43,12 @@ pub struct RelationshipCapability {
     /// Supported direction relative to each selected subject.
     pub direction: TraversalDirection,
     /// Facets whose complete selected-domain reads the reader supports.
-    #[schemars(length(min = 1, max = 16))]
+    #[schemars(length(min = 1))]
     #[schemars(extend("uniqueItems" = true))]
     pub facets: Vec<RelationshipFacet>,
+    /// Accepted count bounds for this operation. Absence does not establish raw read support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<RelationshipBounds>,
 }
 
 /// Opaque identity of one original record within its selected publication.
@@ -86,12 +113,12 @@ pub struct RelationshipOccurrence {
 #[serde(deny_unknown_fields)]
 pub struct RelationshipSelection {
     /// Established subjects whose complete adjacency is required.
-    #[schemars(length(min = 1, max = 64))]
+    #[schemars(length(min = 1))]
     pub seeds: Vec<SymbolId>,
     /// Direction relative to each selected subject.
     pub direction: TraversalDirection,
     /// Portable relationship facets. Empty selects every available facet.
-    #[schemars(length(max = 16))]
+    #[schemars(extend("uniqueItems" = true))]
     pub facets: Vec<RelationshipFacet>,
 }
 
@@ -126,14 +153,12 @@ pub struct RelationshipGroup {
     /// Requested canonical subject, including when its adjacency is empty.
     pub seed: SymbolId,
     /// Original records, preserving parallel edges, evidence and occurrences.
-    #[schemars(length(max = 1000))]
     pub relationships: Vec<RelationshipRecord>,
     /// Physical usages, including recursive and file-level locations without a caller symbol.
     /// Page limits count distinct original record identities across relationships and usages.
     /// Multiple projections of one original record consume one slot; independent records
     /// consume separate slots even when their payloads or locations are equal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 1000))]
     pub occurrences: Vec<RelationshipOccurrence>,
     /// Provider exhausted this subject's adjacency under the selected exact domain.
     pub complete: bool,
@@ -144,17 +169,15 @@ pub struct RelationshipGroup {
 #[serde(deny_unknown_fields)]
 pub struct RelationshipSearchPage {
     /// One authoritative group for every requested subject, in request order.
-    #[schemars(length(min = 1, max = 64))]
+    #[schemars(length(min = 1))]
     pub groups: Vec<RelationshipGroup>,
     /// Exact symbols reached by this page. Identical captured records may repeat across pages;
     /// conflicting records are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 10000))]
     pub symbols: Vec<crate::query::QuerySymbol>,
     /// Physical source catalog and requested bytes for reached declarations and occurrences.
     /// Identical captured records may repeat across pages; conflicting records are refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(length(max = 10000))]
     #[schemars(with = "Vec<RelationshipSourceSchema>")]
     pub sources: Vec<crate::query::QuerySource>,
     /// Opaque continuation bound to subjects, direction, facets and selected domain.

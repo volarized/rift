@@ -22,6 +22,11 @@ fn limits() -> QueryLimits {
         rdf_bytes_max: 16_777_216,
         result_items_max: 20_000,
         result_bytes_max: 16_777_216,
+        input_bytes_max: None,
+        output_bytes_max: None,
+        material_bytes_max: None,
+        heap_bytes_max: None,
+        diagnostic_bytes_max: None,
     }
 }
 
@@ -45,11 +50,53 @@ fn service(query: &PreparedQuery, hits: Vec<SearchHit>) -> QueryServices {
     QueryServices {
         retrievals: vec![QueryServiceData {
             request: query.retrievals()[0].clone(),
+            targets: vec![None; result.results.len()],
             result,
         }],
         bindings: Vec::new(),
         datasets: Vec::new(),
     }
+}
+
+#[test]
+fn retrieval_associations_are_required_and_match_every_result_row() -> TestResult {
+    let query = PreparedQuery::parse(
+        "SELECT ?symbol { SERVICE :search { ?hit :query 'config'; :symbol ?symbol } }",
+        limits(),
+    )?;
+    let mut services = service(&query, vec![hit(0)?, hit(4)?]);
+    let mut encoded = serde_json::to_value(&services)?;
+    encoded["retrievals"][0]
+        .as_object_mut()
+        .ok_or("retrieval object")?
+        .remove("targets");
+    assert!(serde_json::from_value::<QueryServices>(encoded).is_err());
+    services.retrievals[0].targets.pop();
+    let error = query
+        .evaluate_with_services(
+            QueryFacts::default(),
+            limits(),
+            QueryCancellation::default(),
+            services,
+        )
+        .expect_err("every selected row requires its original association slot");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
+    let mut services = service(&query, vec![hit(0)?]);
+    let SearchHitTarget::Symbol { symbol } = &mut services.retrievals[0].result.results[0].hit
+    else {
+        return Err("symbol fixture".into());
+    };
+    symbol.id = None;
+    let error = query
+        .evaluate_with_services(
+            QueryFacts::default(),
+            limits(),
+            QueryCancellation::default(),
+            services,
+        )
+        .expect_err("a physical symbol cannot receive a replacement child resource");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
+    Ok(())
 }
 
 fn rows(answer: QueryAnswer) -> Result<Vec<BTreeMap<String, RdfTerm>>, Box<dyn Error>> {
@@ -84,6 +131,35 @@ fn test_ranked_service_reuses_existing_hit_scores_and_symbol_identity() -> TestR
         }
     );
     assert!(matches!(&answer[0]["score"], RdfTerm::Literal { value, .. } if value == "0.5"));
+    Ok(())
+}
+
+#[test]
+fn service_output_paths_keep_existential_nodes_and_original_views() -> TestResult {
+    let view = rift_protocol::symbol_read::CapturedView {
+        id: rift_protocol::symbol_read::CapturedViewId::parse(&"a".repeat(64))?,
+        expires_at: "2030-01-01T00:00:00Z".to_owned(),
+    };
+    for statement in [
+        "SELECT ?upstream { SERVICE :search { ?hit :query 'config'; :view/:id ?upstream } }",
+        "SELECT ?upstream { SERVICE :search { ?hit :query 'config'; :view _:original . _:original :id ?upstream } }",
+    ] {
+        let query = PreparedQuery::parse(statement, limits())?;
+        assert_eq!(query.retrievals().len(), 1);
+        assert!(query.retrievals()[0].view.is_none());
+        let mut services = service(&query, vec![hit(0)?]);
+        services.retrievals[0].result.view = Some(view.clone());
+        let answer = rows(query.evaluate_with_services(
+            QueryFacts::default(),
+            limits(),
+            QueryCancellation::default(),
+            services,
+        )?)?;
+        assert_eq!(answer.len(), 1);
+        assert!(
+            matches!(&answer[0]["upstream"], RdfTerm::Literal { value, .. } if value == view.id.as_str())
+        );
+    }
     Ok(())
 }
 

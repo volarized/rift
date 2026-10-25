@@ -17,6 +17,11 @@ fn limits() -> QueryLimits {
         rdf_bytes_max: 1 << 20,
         result_items_max: 1000,
         result_bytes_max: 1 << 20,
+        input_bytes_max: None,
+        output_bytes_max: None,
+        material_bytes_max: None,
+        heap_bytes_max: None,
+        diagnostic_bytes_max: None,
     }
 }
 

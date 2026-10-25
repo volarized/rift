@@ -89,12 +89,17 @@ impl QuerySourceRequest {
             Self::Call(callee) | Self::IncomingCall { caller: callee, .. } => callee
                 .query_origin()
                 .ok_or_else(|| unavailable("dependency runtime version is unavailable")),
-            Self::Reference { uri, .. } | Self::Provider { uri, .. } => match roots
-                .address(trees, uri)?
-            {
-                Some(rift_lsp::uri::EngineAddress::Package(file)) => Ok(file.origin().clone()),
-                _ => unavailable("the reference source has no admitted dependency owner").fail(),
-            },
+            Self::Reference { uri, .. } | Self::Provider { uri, .. } => {
+                if let Some((origin, _, _)) = CalleeRoots::runtime_query_source(uri, trees)? {
+                    return Ok(origin);
+                }
+                match roots.address(trees, uri)? {
+                    Some(rift_lsp::uri::EngineAddress::Package(file)) => Ok(file.origin().clone()),
+                    _ => {
+                        unavailable("the reference source has no admitted dependency owner").fail()
+                    }
+                }
+            }
         }
     }
 }
@@ -330,7 +335,7 @@ impl QueryPackageTarget {
             trees,
             configuration,
             cancelled,
-            mut budget,
+            budget,
             selection,
         } = input;
         if cancelled() {
@@ -357,74 +362,20 @@ impl QueryPackageTarget {
         let unit = SourceUnitId(
             rift_core::SourceUnitId::for_origin(&source.origin, &source.path)?.to_string(),
         );
-        let files = analysis
-            .files()
-            .iter()
-            .map(|file| (file.file().path().as_str(), file.file()))
-            .collect::<BTreeMap<_, _>>();
         let uris = captured
             .iter()
             .map(|(uri, path, _)| (path.as_str().to_owned(), uri.clone()))
             .collect::<BTreeMap<_, _>>();
-        let mut name_ranges = BTreeMap::new();
-        for declaration in &analysis.publication().declarations {
-            let (_, path) =
-                rift_protocol::identity::parse_source_unit_identity(declaration.unit.as_str())?;
-            let Some(file) = files.get(path.as_str()) else {
-                continue;
-            };
-            let Some(uri) = uris.get(path.as_str()) else {
-                continue;
-            };
-            let syntax = file.enclosing_symbol(declaration.range.start, declaration.range.end);
-            if let Some(range) = syntax.and_then(|symbol| symbol.name_range) {
-                let location = DeclarationLocation {
-                    source: SourceUnitSpan {
-                        unit: declaration.unit.clone(),
-                        range: TextRange {
-                            start: range.start,
-                            end: range.end,
-                        },
-                    },
-                    uri: uri.clone(),
-                };
-                if declaration.unit == unit
-                    && declaration.range.start <= source.offset as u64
-                    && (source.offset as u64) < declaration.range.end
-                {
-                    name_ranges.insert(declaration.symbol.clone(), location);
-                } else {
-                    name_ranges
-                        .entry(declaration.symbol.clone())
-                        .or_insert(location);
-                }
-            }
-        }
-        let selected = analysis
-            .publication()
-            .declarations
-            .iter()
-            .filter(|declaration| {
-                declaration.unit == unit
-                    && declaration.range.start <= source.offset as u64
-                    && (source.offset as u64) < declaration.range.end
-            })
-            .min_by_key(|declaration| declaration.range.end - declaration.range.start)
-            .map(|declaration| declaration.symbol.clone());
-        drop(files);
+        let (name_ranges, selected) = captured_names(&analysis, &source, &unit, &uris)?;
         let mut facts = publication_facts(analysis.publication());
-        let Some(rift_lsp::uri::EngineAddress::Package(admitted)) =
-            roots.address(trees, &source.uri)?
-        else {
-            return unavailable("the captured provider source has no admitted root").fail();
-        };
+        let root = roots.query_source_root(&source.uri, trees)?;
         let providers = provider::capture(
             analysis,
             &mut facts,
             provider::ProviderCapture {
                 source: &source,
                 owner,
-                root: admitted.root().root_uri()?,
+                root,
                 digest,
                 inputs: &context,
                 captured: &captured,
@@ -438,16 +389,9 @@ impl QueryPackageTarget {
                 selection,
             },
             cancelled,
-            budget.as_deref_mut(),
+            budget,
         )?;
-        if matches!(
-            &request,
-            QuerySourceRequest::Call(_) | QuerySourceRequest::IncomingCall { .. }
-        ) && providers.selected.is_none()
-        {
-            return unavailable("the admitted call target has no original declaration binding")
-                .fail();
-        }
+        validate_call_target(&request, &providers, &facts, &source)?;
         let mut context = context
             .into_iter()
             .map(|(uri, _, text)| (uri, FileDigest::of(text.as_bytes())))
@@ -496,11 +440,10 @@ impl QueryPackageTarget {
         &self,
         facts: &'facts QueryFacts,
     ) -> Result<&'facts str, RiftError> {
-        self.source_for(facts, &self.unit)
+        Self::source_for(facts, &self.unit)
     }
 
     pub(super) fn source_for<'facts>(
-        &self,
         facts: &'facts QueryFacts,
         unit: &SourceUnitId,
     ) -> Result<&'facts str, RiftError> {
@@ -511,6 +454,106 @@ impl QueryPackageTarget {
             .and_then(|source| source.text.as_deref())
             .ok_or_else(|| unavailable("the admitted dependency source is no longer retained"))
     }
+}
+
+fn captured_names(
+    analysis: &rift_analysis::PackageAnalysis,
+    source: &SelectedSource,
+    unit: &SourceUnitId,
+    uris: &BTreeMap<String, Uri>,
+) -> Result<(BTreeMap<SymbolId, DeclarationLocation>, Option<SymbolId>), RiftError> {
+    let files = analysis
+        .files()
+        .iter()
+        .map(|file| (file.file().path().as_str(), file.file()))
+        .collect::<BTreeMap<_, _>>();
+    let mut name_ranges = BTreeMap::new();
+    for declaration in &analysis.publication().declarations {
+        let (_, path) =
+            rift_protocol::identity::parse_source_unit_identity(declaration.unit.as_str())?;
+        let Some(file) = files.get(path.as_str()) else {
+            continue;
+        };
+        let Some(uri) = uris.get(path.as_str()) else {
+            continue;
+        };
+        let syntax = file.enclosing_symbol(declaration.range.start, declaration.range.end);
+        if let Some(range) = syntax.and_then(|symbol| symbol.name_range) {
+            let location = DeclarationLocation {
+                source: SourceUnitSpan {
+                    unit: declaration.unit.clone(),
+                    range: TextRange {
+                        start: range.start,
+                        end: range.end,
+                    },
+                },
+                uri: uri.clone(),
+            };
+            if declaration.unit == *unit
+                && declaration.range.start <= source.offset as u64
+                && (source.offset as u64) < declaration.range.end
+            {
+                name_ranges.insert(declaration.symbol.clone(), location);
+            } else {
+                name_ranges
+                    .entry(declaration.symbol.clone())
+                    .or_insert(location);
+            }
+        }
+    }
+    let selected = analysis
+        .publication()
+        .declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.unit == *unit
+                && declaration.range.start <= source.offset as u64
+                && (source.offset as u64) < declaration.range.end
+        })
+        .min_by_key(|declaration| declaration.range.end - declaration.range.start)
+        .map(|declaration| declaration.symbol.clone());
+    Ok((name_ranges, selected))
+}
+
+fn validate_call_target(
+    request: &QuerySourceRequest,
+    providers: &provider::CapturedProviders,
+    facts: &QueryFacts,
+    source: &SelectedSource,
+) -> Result<(), RiftError> {
+    if matches!(
+        request,
+        QuerySourceRequest::Call(_) | QuerySourceRequest::IncomingCall { .. }
+    ) && providers.selected.is_none()
+    {
+        let candidate = providers
+            .names
+            .iter()
+            .min_by_key(|(_, location)| {
+                location
+                    .source
+                    .range
+                    .start
+                    .abs_diff(u64::try_from(source.offset).unwrap_or(u64::MAX))
+            })
+            .map(|(target, location)| {
+                let name = facts
+                    .provider_record(target)
+                    .and_then(|(_, record)| facts.symbols.get(record.symbol_index))
+                    .map(|symbol| symbol.symbol.name.as_str());
+                (
+                    name,
+                    location.source.unit.as_str(),
+                    location.source.range.start,
+                    location.source.range.end,
+                )
+            });
+        return unavailable(format!(
+                "the admitted call target has no original declaration binding: source {}, position {}, captured name position candidate {candidate:?}",
+                source.path.as_str(), source.offset,
+            )).fail();
+    }
+    Ok(())
 }
 
 fn captured_revision(digest: FileDigest) -> u64 {
@@ -627,6 +670,20 @@ fn selected_source(
             provider,
             ..
         } => {
+            if let Some((origin, path, source)) = CalleeRoots::runtime_query_source(uri, trees)? {
+                if source.len() as u64 > bytes_max {
+                    return unavailable("dependency source exceeds the accepted byte bound").fail();
+                }
+                let offset = LineIndex::new(&source).byte_offset(*encoding, range.start)?;
+                return Ok(SelectedSource {
+                    origin,
+                    path,
+                    uri: uri.clone(),
+                    provider: provider.clone(),
+                    text: source.to_string(),
+                    offset,
+                });
+            }
             let (file, text) = roots.capture_query_file(uri, trees, bytes_max)?;
             let offset = LineIndex::new(&text).byte_offset(*encoding, range.start)?;
             Ok(SelectedSource {
@@ -729,18 +786,24 @@ mod tests {
         dependency: &Path,
         roots: &CalleeRoots,
     ) -> Result<QuerySourceRequest, rift_error::RiftError> {
+        call_request_at(workspace, dependency, roots, Position::new(0, 16))
+    }
+
+    fn call_request_at(
+        workspace: &Path,
+        dependency: &Path,
+        roots: &CalleeRoots,
+        position: Position,
+    ) -> Result<QuerySourceRequest, rift_error::RiftError> {
         let uri = TreeRoot::new(dependency)?.document_uri(&ProjectPath::new("index.ts")?)?;
-        let caller = rift_core::SymbolId::new("rift://symbol/local/typescript/app/caller")?;
+        let seed = rift_core::SymbolId::new("rift://symbol/local/typescript/app/caller")?;
         let named = NamedCallee {
             uri: &uri,
             name: "entry",
-            position: Position {
-                line: 0,
-                character: 16,
-            },
+            position,
             encoding: PositionEncoding::Utf16,
         };
-        let CalleeFile::Package(callee) = callee_file(roots, &[workspace], &caller, named)? else {
+        let CalleeFile::Package(callee) = callee_file(roots, &[workspace], &seed, named)? else {
             panic!("fixture URI must name its admitted package source");
         };
         let provider = Language::from_identity_segment("typescript")
@@ -748,6 +811,46 @@ mod tests {
         Ok(QuerySourceRequest::Call(
             callee.with_query_sources(Vec::new(), provider),
         ))
+    }
+
+    #[test]
+    fn test_package_call_refuses_the_exclusive_end_of_the_original_name() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        std::fs::write(
+            dependency.path().join("index.ts"),
+            "export function entry() { return 7; }\n",
+        )?;
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0","types":"./index.ts"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let admitted = QueryPackageTarget::prepare(
+            call_request(workspace.path(), dependency.path(), &roots)?,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )?;
+        assert!(admitted.symbol().is_some());
+        let request = call_request_at(
+            workspace.path(),
+            dependency.path(),
+            &roots,
+            Position::new(0, 21),
+        )?;
+        let error = QueryPackageTarget::prepare(
+            request,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )
+        .expect_err("an enclosing canonical declaration cannot replace the supplied name position");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unavailable::SLUG
+        );
+        Ok(())
     }
 
     #[test]
@@ -941,14 +1044,14 @@ mod tests {
         let roots = roots(dependency.path(), package.clone())?;
         let uri =
             TreeRoot::new(dependency.path())?.document_uri(&ProjectPath::new("src/inner.rs")?)?;
-        let caller = rift_core::SymbolId::new("rift://symbol/local/rust/app/entry")?;
+        let seed = rift_core::SymbolId::new("rift://symbol/local/rust/app/entry")?;
         let named = NamedCallee {
             uri: &uri,
             name: "middle",
             position: Position::new(0, 7),
             encoding: PositionEncoding::Utf16,
         };
-        let CalleeFile::Package(callee) = callee_file(&roots, &[workspace.path()], &caller, named)?
+        let CalleeFile::Package(callee) = callee_file(&roots, &[workspace.path()], &seed, named)?
         else {
             panic!("admitted Cargo source");
         };

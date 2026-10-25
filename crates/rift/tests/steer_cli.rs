@@ -365,6 +365,11 @@ fn suggested_producer(output: &Output) -> TestResult<rift_protocol::read::Search
         rdf_bytes_max: 1,
         result_items_max: 1,
         result_bytes_max: 1,
+        input_bytes_max: None,
+        output_bytes_max: None,
+        material_bytes_max: None,
+        heap_bytes_max: None,
+        diagnostic_bytes_max: None,
     };
     let prepared = rift_search::sparql::PreparedQuery::parse(&request.query, limits)?;
     assert_eq!(prepared.retrievals().len(), 1);

@@ -738,6 +738,21 @@ pub(crate) struct CapturedGlobalSearchCandidates {
     pub(crate) candidates: GlobalSearchCandidates,
 }
 
+impl CapturedGlobalSearchCandidates {
+    pub(crate) fn attach_view(&mut self) {
+        if let Some(view) = &self.view {
+            for candidate in self
+                .candidates
+                .precise
+                .iter_mut()
+                .chain(&mut self.candidates.broad)
+            {
+                candidate.hit.view = Some(view.clone());
+            }
+        }
+    }
+}
+
 /// Reads both package candidate phases under one captured selection.
 pub(crate) async fn captured_package_search(
     client: &GlobalClient,
@@ -767,6 +782,12 @@ pub(crate) async fn captured_package_search(
         let mut request = search_request(params, query, packages, QueryPhase::Broad);
         request.view = Some(view.id.as_str().to_owned());
         let broad_page = client.search_packages_pages(&request, page_limit).await?;
+        if broad_page.view != view {
+            return errors::server::read_unavailable()
+                .operation("global search")
+                .detail("global search changed its original captured selection")
+                .fail();
+        }
         extend_page_warnings(&mut warnings, broad_page.warnings);
         broad_page
             .items
@@ -815,20 +836,65 @@ pub(crate) async fn package_patterns(
     let page = client
         .search_package_patterns(&request, rift_cloud_client::PAGE_LIMIT_MAX, None)
         .await?;
+    let view = page.captured_view(None)?;
     let warnings = page_warnings(page.warnings);
     let matches = page
         .items
         .iter()
-        .map(PackagePatternMatch::try_from)
+        .map(|item| -> Result<_, RiftError> {
+            let mut matched = PackagePatternMatch::try_from(item)?;
+            matched.file.view.clone_from(&view);
+            if let Some(declaration) = &mut matched.declaration {
+                declaration.view.clone_from(&view);
+            }
+            Ok(matched)
+        })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(GlobalPatternMatches { matches, warnings })
+    Ok(GlobalPatternMatches {
+        view,
+        matches,
+        warnings,
+    })
 }
 
 /// Package pattern matches and page warnings returned by one remote read.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct GlobalPatternMatches {
+    pub(crate) view: Option<rift_protocol::symbol_read::CapturedView>,
     pub(crate) matches: Vec<PackagePatternMatch>,
     pub(crate) warnings: Vec<ReadWarning>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CapturedGlobalViews(
+    pub(crate) Arc<std::sync::Mutex<Option<rift_protocol::symbol_read::CapturedView>>>,
+);
+
+impl CapturedGlobalViews {
+    pub(crate) fn include_view(
+        &self,
+        view: Option<&rift_protocol::symbol_read::CapturedView>,
+    ) -> Result<(), RiftError> {
+        let view = view.ok_or_else(|| {
+            errors::server::read_unsupported()
+                .capability("global search original captured selection")
+                .error()
+        })?;
+        let mut held = self.0.lock().map_err(|_| {
+            errors::server::read_unavailable()
+                .operation("query acquisition")
+                .detail("producer publication is unavailable")
+                .error()
+        })?;
+        if held.as_ref().is_some_and(|held| held != view) {
+            return errors::server::read_unavailable()
+                .operation("query acquisition")
+                .detail("global search changed its original captured selection")
+                .fail();
+        }
+        *held = Some(view.clone());
+        Ok(())
+    }
 }
 
 fn includes_source(params: &SearchParams) -> bool {
@@ -2972,6 +3038,7 @@ mod tests {
                 warnings: vec![ReadWarning::GlobalAccessDisabled],
             };
             let remote = super::GlobalPatternMatches {
+                view: None,
                 matches: vec![matched(4), matched(14)],
                 warnings: vec![ReadWarning::GlobalPageWarning {
                     warning_code: rift_protocol::read::GlobalPageWarningCode::ResultTruncated,

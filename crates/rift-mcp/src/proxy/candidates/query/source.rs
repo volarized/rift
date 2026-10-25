@@ -96,7 +96,7 @@ impl RiftProxy {
                 budget.charge_bytes(captured.material().metadata())?;
                 let saved = retained::metadata(&captured)?;
                 validate_backends(&saved, &backends)?;
-                select_read(request, captured, saved, budget)
+                select_read(request, &captured, &saved, budget)
             })
             .await?;
         match selected {
@@ -113,7 +113,7 @@ impl RiftProxy {
             } => {
                 let response = self
                     .query_backend(&backend)?
-                    .forward_read(request.clone())
+                    .forward_read((*request).clone())
                     .await?;
                 self.query_work(&budget, deadline, move |budget| {
                     if let Ok(CallToolResponse::Complete(response)) = &response {
@@ -175,7 +175,7 @@ enum SelectedRead {
     Captured(serde_json::Value),
     Forward {
         backend: String,
-        request: CallToolRequestParams,
+        request: Box<CallToolRequestParams>,
         view: CapturedView,
         public_unit: Option<rift_protocol::read::SourceUnitId>,
         source_units: Vec<(
@@ -187,11 +187,11 @@ enum SelectedRead {
 
 fn select_read(
     request: CallToolRequestParams,
-    captured: rift_server::CapturedQueryView,
-    saved: Metadata,
+    captured: &rift_server::CapturedQueryView,
+    saved: &Metadata,
     budget: &mut rift_server::QueryFactBudget<'_>,
 ) -> Result<SelectedRead, RiftError> {
-    let mut arguments = request.arguments.clone().unwrap_or_default();
+    let mut arguments = request.arguments.unwrap_or_default();
     let (provider, public_unit) = if request.name == "get_symbol" {
         let id = arguments
             .get("id")
@@ -232,43 +232,16 @@ fn select_read(
             return Err(retained::unavailable());
         }
         if let Some(bytes) = &source.bytes {
-            let text = std::str::from_utf8(
+            return captured_source(
+                params,
                 captured
                     .material()
                     .sources()
                     .get(bytes.clone())
                     .ok_or_else(retained::unavailable)?,
-            )
-            .map_err(|_| retained::unavailable())?;
-            let range = params.range.unwrap_or(rift_protocol::read::TextRange {
-                start: 0,
-                end: u64::try_from(text.len()).map_err(|_| retained::unavailable())?,
-            });
-            let start = usize::try_from(range.start).map_err(|_| retained::unavailable())?;
-            let end = usize::try_from(range.end).map_err(|_| retained::unavailable())?;
-            let excerpt = text.get(start..end).ok_or_else(|| {
-                errors::server::read_invalid()
-                    .field("range")
-                    .violation("source range must contain complete UTF-8 bytes")
-                    .error()
-            })?;
-            budget.charge_bytes(excerpt.as_bytes())?;
-            let response = GetSourceResult::Found {
-                source: rift_protocol::read::SourceExcerpt {
-                    span: rift_protocol::read::SourceUnitSpan {
-                        unit: params.unit,
-                        range,
-                    },
-                    text: excerpt.to_owned(),
-                },
-                source_complete: true,
-                view: captured.view().clone(),
-                warnings: Vec::new(),
-            };
-            budget.charge(&response)?;
-            return Ok(SelectedRead::Captured(
-                serde_json::to_value(response).map_err(encoding_failure)?,
-            ));
+                captured.view(),
+                budget,
+            );
         }
         arguments.insert(
             "unit".to_owned(),
@@ -293,11 +266,49 @@ fn select_read(
     );
     Ok(SelectedRead::Forward {
         backend: provider.backend.clone(),
-        request: CallToolRequestParams::new(request.name).with_arguments(arguments),
+        request: Box::new(CallToolRequestParams::new(request.name).with_arguments(arguments)),
         view: captured.view().clone(),
         public_unit,
         source_units,
     })
+}
+
+fn captured_source(
+    params: GetSourceParams,
+    bytes: &[u8],
+    view: &CapturedView,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<SelectedRead, RiftError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| retained::unavailable())?;
+    let range = params.range.unwrap_or(rift_protocol::read::TextRange {
+        start: 0,
+        end: u64::try_from(text.len()).map_err(|_| retained::unavailable())?,
+    });
+    let start = usize::try_from(range.start).map_err(|_| retained::unavailable())?;
+    let end = usize::try_from(range.end).map_err(|_| retained::unavailable())?;
+    let excerpt = text.get(start..end).ok_or_else(|| {
+        errors::server::read_invalid()
+            .field("range")
+            .violation("source range must contain complete UTF-8 bytes")
+            .error()
+    })?;
+    budget.charge_bytes(excerpt.as_bytes())?;
+    let response = GetSourceResult::Found {
+        source: rift_protocol::read::SourceExcerpt {
+            span: rift_protocol::read::SourceUnitSpan {
+                unit: params.unit,
+                range,
+            },
+            text: excerpt.to_owned(),
+        },
+        source_complete: true,
+        view: view.clone(),
+        warnings: Vec::new(),
+    };
+    budget.charge(&response)?;
+    Ok(SelectedRead::Captured(
+        serde_json::to_value(response).map_err(encoding_failure)?,
+    ))
 }
 
 fn qualify_response(
@@ -392,10 +403,10 @@ fn qualify_response(
         match &mut symbol {
             rift_protocol::symbol_read::GetSymbolResult::Found { view: selected, .. }
             | rift_protocol::symbol_read::GetSymbolResult::Missing { view: selected, .. } => {
-                *selected = view
+                *selected = view;
             }
             rift_protocol::symbol_read::GetSymbolResult::Unavailable { view: selected, .. } => {
-                *selected = Some(view)
+                *selected = Some(view);
             }
         }
         serde_json::to_value(symbol).map_err(encoding_failure)?

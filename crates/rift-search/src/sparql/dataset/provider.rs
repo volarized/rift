@@ -1,6 +1,12 @@
 //! RDF resources for captured normalized provider records.
 
-use super::*;
+#[cfg(test)]
+mod selected_tests;
+
+use super::{
+    CancellationToken, HashMap, HashSet, Projection, QueryError, QueryFacts, QueryLimits, Term,
+    blank, child, failure, invalid, iri, term_bytes, vocabulary,
+};
 use crate::query::{QueryProviderEdge, QueryProviderEndpoint};
 use rift_provider::NormalizedTarget;
 
@@ -9,6 +15,8 @@ pub(super) struct ProviderIndex {
     targets: HashMap<Vec<u8>, Term>,
     edges: Vec<IndexedEdge>,
     by_subject: HashMap<Term, Vec<usize>>,
+    declarations: Vec<(Term, Term)>,
+    by_declaration: HashMap<Term, Vec<usize>>,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +42,35 @@ struct IndexedEdge {
 }
 
 impl ProviderIndex {
+    pub(super) fn selected_resource(
+        &self,
+        facts: &QueryFacts,
+        endpoint: &QueryProviderEndpoint,
+    ) -> Result<Term, QueryError> {
+        let Some(provider) = endpoint.provider else {
+            return endpoint
+                .canonical_symbol()
+                .ok_or_else(|| {
+                    failure::invalid("unscoped provider target has no canonical identity")
+                })
+                .and_then(|identity| iri(identity.as_str()));
+        };
+        let snapshot = facts
+            .providers
+            .get(provider)
+            .ok_or_else(|| failure::invalid("captured provider target is absent"))?;
+        if snapshot.record(&endpoint.target).is_none() {
+            return Err(failure::invalid(
+                "captured provider target has no original record",
+            ));
+        }
+        let key = serde_json::to_vec(endpoint).map_err(invalid)?;
+        self.targets
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| failure::invalid("captured provider resource is absent"))
+    }
+
     pub(super) fn new(
         facts: &QueryFacts,
         limits: QueryLimits,
@@ -45,24 +82,10 @@ impl ProviderIndex {
             targets: HashMap::new(),
             edges: Vec::new(),
             by_subject: HashMap::new(),
+            declarations: Vec::new(),
+            by_declaration: HashMap::new(),
         };
-        let mut bytes = 0usize;
-        for symbol in &facts.symbols {
-            if cancellation.is_cancelled() {
-                return Err(failure::cancelled());
-            }
-            let resource = match &symbol.symbol.id {
-                Some(identity) => iri(identity.as_str())?,
-                None => blank(&serde_json::to_vec(symbol).map_err(invalid)?)?,
-            };
-            bytes = bytes
-                .checked_add(term_bytes(&resource))
-                .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
-            if bytes > limits.rdf_bytes_max {
-                return Err(failure::bound("rdf_bytes_max"));
-            }
-            result.symbols.push(resource);
-        }
+        let mut bytes = result.index_symbols(facts, limits, cancellation)?;
         for (provider, snapshot) in facts.providers.iter().enumerate() {
             for record in &snapshot.records {
                 if cancellation.is_cancelled() {
@@ -77,6 +100,37 @@ impl ProviderIndex {
                     None => blank(&record.key(&snapshot.context).map_err(invalid)?)?,
                 };
                 result.symbols[record.symbol_index] = resource.clone();
+                for association in &record.declarations {
+                    if cancellation.is_cancelled() {
+                        return Err(failure::cancelled());
+                    }
+                    let declaration = symbol
+                        .declarations
+                        .get(association.declaration_index)
+                        .ok_or_else(|| {
+                            failure::invalid("captured provider declaration is absent")
+                        })?;
+                    if declaration.unit.is_none() {
+                        let subject =
+                            child(&resource, "declarations", association.declaration_index)?;
+                        let unit = iri(&association.binding.unit().to_string())?;
+                        bytes = bytes
+                            .checked_add(term_bytes(&subject))
+                            .and_then(|bytes| bytes.checked_add(term_bytes(&unit)))
+                            .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
+                        if bytes > limits.rdf_bytes_max
+                            || result.declarations.len() >= limits.quads_max
+                        {
+                            return Err(failure::bound("rdf_bytes_max"));
+                        }
+                        result
+                            .by_declaration
+                            .entry(subject.clone())
+                            .or_default()
+                            .push(result.declarations.len());
+                        result.declarations.push((subject, unit));
+                    }
+                }
                 let targets = record
                     .identity
                     .as_ref()
@@ -113,6 +167,32 @@ impl ProviderIndex {
         Ok(result)
     }
 
+    fn index_symbols(
+        &mut self,
+        facts: &QueryFacts,
+        limits: QueryLimits,
+        cancellation: &CancellationToken,
+    ) -> Result<usize, QueryError> {
+        let mut bytes = 0usize;
+        for symbol in &facts.symbols {
+            if cancellation.is_cancelled() {
+                return Err(failure::cancelled());
+            }
+            let resource = match &symbol.symbol.id {
+                Some(identity) => iri(identity.as_str())?,
+                None => blank(&serde_json::to_vec(symbol).map_err(invalid)?)?,
+            };
+            bytes = bytes
+                .checked_add(term_bytes(&resource))
+                .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
+            if bytes > limits.rdf_bytes_max {
+                return Err(failure::bound("rdf_bytes_max"));
+            }
+            self.symbols.push(resource);
+        }
+        Ok(bytes)
+    }
+
     fn resource(
         &mut self,
         facts: &QueryFacts,
@@ -124,27 +204,26 @@ impl ProviderIndex {
             return iri(identity.as_str());
         }
         let key = serde_json::to_vec(target).map_err(invalid)?;
-        match self.targets.get(&key) {
-            Some(resource) => Ok(resource.clone()),
-            None => {
-                let provider = target.provider.ok_or_else(|| {
-                    failure::invalid("unscoped provider target has no canonical identity")
-                })?;
-                let snapshot = facts
-                    .providers
-                    .get(provider)
-                    .ok_or_else(|| failure::invalid("captured provider target is absent"))?;
-                let resource = blank(&snapshot.context.target_key(&target.target)?)?;
-                *bytes = bytes
-                    .checked_add(key.len())
-                    .and_then(|bytes| bytes.checked_add(term_bytes(&resource)))
-                    .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
-                if *bytes > limits.rdf_bytes_max {
-                    return Err(failure::bound("rdf_bytes_max"));
-                }
-                self.targets.insert(key, resource.clone());
-                Ok(resource)
+        if let Some(resource) = self.targets.get(&key) {
+            Ok(resource.clone())
+        } else {
+            let provider = target.provider.ok_or_else(|| {
+                failure::invalid("unscoped provider target has no canonical identity")
+            })?;
+            let snapshot = facts
+                .providers
+                .get(provider)
+                .ok_or_else(|| failure::invalid("captured provider target is absent"))?;
+            let resource = blank(&snapshot.context.target_key(&target.target)?)?;
+            *bytes = bytes
+                .checked_add(key.len())
+                .and_then(|bytes| bytes.checked_add(term_bytes(&resource)))
+                .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
+            if *bytes > limits.rdf_bytes_max {
+                return Err(failure::bound("rdf_bytes_max"));
             }
+            self.targets.insert(key, resource.clone());
+            Ok(resource)
         }
     }
 
@@ -281,6 +360,28 @@ impl ProviderIndex {
         facts: &QueryFacts,
         output: &mut Projection,
     ) -> Result<(), QueryError> {
+        let unit_predicate = vocabulary("unit")?;
+        if output
+            .pattern
+            .predicate
+            .as_ref()
+            .is_none_or(|predicate| predicate == &unit_predicate)
+        {
+            let selected = output.pattern.subject.as_ref().map(|subject| {
+                self.by_declaration
+                    .get(subject)
+                    .map_or(&[][..], Vec::as_slice)
+            });
+            let all = if selected.is_none() {
+                0..self.declarations.len()
+            } else {
+                0..0
+            };
+            for index in selected.unwrap_or(&[]).iter().copied().chain(all) {
+                let (subject, unit) = &self.declarations[index];
+                output.push(subject.clone(), vocabulary("unit")?, unit.clone())?;
+            }
+        }
         let usages = vocabulary("usages")?;
         let selected = output
             .pattern
@@ -416,26 +517,17 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    #[test]
-    fn provider_and_canonical_usages_share_location_but_keep_relationship_evidence() -> TestResult {
-        let limits = QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())?;
-        let caller = SymbolId("rift://symbol/local/rust/fixture/caller".to_owned());
-        let target = SymbolId("rift://symbol/local/rust/fixture/target".to_owned());
-        let text = "fn caller() { target(); }\r\n";
-        let start = u64::try_from(text.find("target").ok_or("fixture occurrence")?)?;
-        let source = SourceUnitSpan {
-            unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
-            range: TextRange {
-                start,
-                end: start + 6,
-            },
-        };
+    fn usage_facts(
+        caller: &SymbolId,
+        target: &SymbolId,
+        source: &SourceUnitSpan,
+    ) -> Result<QueryFacts, Box<dyn std::error::Error>> {
         let mut facts = QueryFacts::default();
         let from = facts
-            .provider_endpoint(&QueryProviderTarget::canonical(&caller)?)
+            .provider_endpoint(&QueryProviderTarget::canonical(caller)?)
             .ok_or("canonical caller")?;
         let to = facts
-            .provider_endpoint(&QueryProviderTarget::canonical(&target)?)
+            .provider_endpoint(&QueryProviderTarget::canonical(target)?)
             .ok_or("canonical target")?;
         facts.provider_edges = vec![
             QueryProviderEdge {
@@ -459,6 +551,24 @@ mod tests {
             source: source.clone(),
             facet: RelationshipFacet::Reads,
         });
+        Ok(facts)
+    }
+
+    #[test]
+    fn provider_and_canonical_usages_share_location_but_keep_relationship_evidence() -> TestResult {
+        let limits = QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())?;
+        let caller = SymbolId("rift://symbol/local/rust/fixture/caller".to_owned());
+        let target = SymbolId("rift://symbol/local/rust/fixture/target".to_owned());
+        let text = "fn caller() { target(); }\r\n";
+        let start = u64::try_from(text.find("target").ok_or("fixture occurrence")?)?;
+        let source = SourceUnitSpan {
+            unit: SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
+            range: TextRange {
+                start,
+                end: start + 6,
+            },
+        };
+        let facts = usage_facts(&caller, &target, &source)?;
         let statement = format!(
             "SELECT ?usage ?unit ?start ?end ?path ?enclosing ?facet {{ <{}> :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end; :path ?path; :enclosing ?enclosing; :facets ?facet }} ORDER BY ?facet",
             target.as_str()
@@ -497,7 +607,7 @@ mod tests {
                 matches!(row.get("end"), Some(RdfTerm::Literal { value, .. }) if value == &(start + 6).to_string())
             );
         }
-        let facets = bindings
+        let selected_facets = bindings
             .iter()
             .filter_map(|row| match row.get("facet") {
                 Some(RdfTerm::Iri { value }) => Some(value.as_str()),
@@ -505,7 +615,7 @@ mod tests {
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            facets,
+            selected_facets,
             std::collections::BTreeSet::from([
                 format!("{VOCABULARY}calls"),
                 format!("{VOCABULARY}references"),
@@ -555,6 +665,11 @@ mod tests {
             rdf_bytes_max: 16_777_216,
             result_items_max: 20_000,
             result_bytes_max: 16_777_216,
+            input_bytes_max: None,
+            output_bytes_max: None,
+            material_bytes_max: None,
+            heap_bytes_max: None,
+            diagnostic_bytes_max: None,
         };
         let caller = SymbolId("rift://symbol/local/rust/fixture/caller".to_owned());
         let target = SymbolId("rift://symbol/local/rust/fixture/target".to_owned());

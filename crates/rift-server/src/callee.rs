@@ -65,6 +65,45 @@ pub struct CalleeRoots {
 }
 
 impl CalleeRoots {
+    pub(crate) fn runtime_query_source(
+        uri: &Uri,
+        trees: &[&Path],
+    ) -> Result<Option<(rift_core::SourceLocation, ProjectPath, Arc<str>)>, RiftError> {
+        let Some(stub) = uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) else {
+            return Ok(None);
+        };
+        let path = ProjectPath::new(stub)?;
+        let mut captures = trees
+            .iter()
+            .filter_map(|root| crate::embedded::python_standard_library(root, &path));
+        let Some((runtime, source)) = captures.next() else {
+            return query_source_failure("the selected runtime source has no admitted owner");
+        };
+        if captures.any(|other| other != (runtime.clone(), Arc::clone(&source))) {
+            return query_source_failure(
+                "the selected runtime source has conflicting captured owners",
+            );
+        }
+        Ok(Some((
+            rift_core::SourceLocation::Stdlib {
+                runtime: Some(runtime),
+            },
+            path,
+            source,
+        )))
+    }
+
+    pub(crate) fn query_source_root(&self, uri: &Uri, trees: &[&Path]) -> Result<Uri, RiftError> {
+        if let Some(stub) = uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
+            ProjectPath::new(stub)?;
+            return rift_lsp::uri::parse_uri(VENDORED_STDLIB_PREFIX);
+        }
+        let Some(EngineAddress::Package(file)) = self.address(trees, uri)? else {
+            return query_source_failure("the captured provider source has no admitted root");
+        };
+        file.root().root_uri()
+    }
+
     pub(crate) fn capture_query_source(
         &self,
         callee: &PackageCallee,
@@ -74,27 +113,12 @@ impl CalleeRoots {
         let uri = callee
             .query_uri()
             .ok_or_else(|| query_source_error("dependency target has no document URI"))?;
-        let source = if let Some(stub) = uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
-            let path = ProjectPath::new(stub)?;
+        let source = if let Some((origin, path, source)) = Self::runtime_query_source(uri, trees)? {
             if &path != callee.path() {
                 return query_source_failure(
                     "runtime source path differs from the selected target",
                 );
             }
-            let mut captures = trees
-                .iter()
-                .filter_map(|root| crate::embedded::python_standard_library(root, &path));
-            let Some((runtime, source)) = captures.next() else {
-                return query_source_failure("the selected runtime source has no admitted owner");
-            };
-            if captures.any(|other| other != (runtime.clone(), Arc::clone(&source))) {
-                return query_source_failure(
-                    "the selected runtime source has conflicting captured owners",
-                );
-            }
-            let origin = rift_core::SourceLocation::Stdlib {
-                runtime: Some(runtime),
-            };
             if callee.query_origin().as_ref() != Some(&origin) {
                 return query_source_failure(
                     "runtime source owner differs from the selected target",
@@ -605,7 +629,7 @@ pub(crate) enum CalleeFile {
     /// A file below the served tree.
     Project(rift_core::ProjectPath),
     /// A package's file, held until the global API names the declaration.
-    Package(PackageCallee),
+    Package(Box<PackageCallee>),
     /// A file under no root, or a scheme no root reads.
     Unaddressed,
 }
@@ -624,7 +648,7 @@ pub(crate) fn callee_file(
     call: NamedCallee<'_>,
 ) -> Result<CalleeFile, RiftError> {
     let held = |package: CalleePackage, path: ProjectPath| {
-        CalleeFile::Package(PackageCallee {
+        CalleeFile::Package(Box::new(PackageCallee {
             caller: caller.clone(),
             package,
             path,
@@ -635,7 +659,7 @@ pub(crate) fn callee_file(
             query_sources: None,
             query_uri: Some(call.uri.clone()),
             query_provider: None,
-        })
+        }))
     };
     if let Some(stub) = call.uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
         if let Ok(path) = ProjectPath::new(stub) {
@@ -1271,20 +1295,23 @@ mod tests {
         let classify = |path: &str| -> Result<String, Box<dyn std::error::Error>> {
             let uri: Uri = format!("file://{library}/{path}").parse()?;
             Ok(match callee_file(&roots, &trees, &caller, call(&uri))? {
-                CalleeFile::Package(PackageCallee {
-                    package: CalleePackage::Installed(package),
-                    path,
-                    ..
-                }) => format!(
-                    "{}/{}@{} {path}",
-                    package.manager, package.name, package.version
-                ),
-                CalleeFile::Package(PackageCallee {
-                    package: CalleePackage::Runtime(runtime),
-                    path,
-                    ..
-                }) => format!("stdlib/{}@{} {path}", runtime.runtime, runtime.version),
-                CalleeFile::Package(_) | CalleeFile::Project(_) | CalleeFile::Unaddressed => {
+                CalleeFile::Package(held) => match *held {
+                    PackageCallee {
+                        package: CalleePackage::Installed(package),
+                        path,
+                        ..
+                    } => format!(
+                        "{}/{}@{} {path}",
+                        package.manager, package.name, package.version
+                    ),
+                    PackageCallee {
+                        package: CalleePackage::Runtime(runtime),
+                        path,
+                        ..
+                    } => format!("stdlib/{}@{} {path}", runtime.runtime, runtime.version),
+                    _ => "not an installed package".to_owned(),
+                },
+                CalleeFile::Project(_) | CalleeFile::Unaddressed => {
                     "not an installed package".to_owned()
                 }
             })

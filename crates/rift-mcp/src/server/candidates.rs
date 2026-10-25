@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::{ReadAnswer, RiftMcp, ToolFailure, wire};
 
 const BYTES_MAX: usize = crate::global::candidates::CANDIDATE_BYTES_MAX;
+#[cfg(test)]
 const SLOTS_MAX: usize = 256;
 
 pub(in crate::server) fn write_captured_context(
@@ -111,6 +112,7 @@ pub(crate) enum SearchCandidateResult {
 #[derive(Debug)]
 pub(super) struct CandidateResponses {
     bytes: Mutex<Vec<SavedCandidateBytes>>,
+    slots_max: u64,
 }
 
 #[derive(Debug)]
@@ -123,7 +125,8 @@ struct SavedCandidateBytes {
 impl Default for CandidateResponses {
     fn default() -> Self {
         Self {
-            bytes: Mutex::new(Vec::with_capacity(SLOTS_MAX)),
+            bytes: Mutex::new(Vec::new()),
+            slots_max: rift_protocol::configuration::ServerConfiguration::default().retained_views,
         }
     }
 }
@@ -919,6 +922,15 @@ mod captured_search_startup_tests {
 }
 
 impl CandidateResponses {
+    pub(super) fn for_configuration(
+        server: &rift_protocol::configuration::ServerConfiguration,
+    ) -> Self {
+        Self {
+            bytes: Mutex::new(Vec::new()),
+            slots_max: server.retained_views,
+        }
+    }
+
     fn save_bytes(
         &self,
         id: String,
@@ -930,6 +942,22 @@ impl CandidateResponses {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         saved.retain(|row| row.expires > SystemTime::now());
+        if u64::try_from(saved.len()).unwrap_or(u64::MAX) >= self.slots_max {
+            return Err(errors::server::read_unavailable()
+                .operation("search_candidates")
+                .detail("captured candidates exceed the byte or view bound")
+                .error());
+        }
+        saved.try_reserve_exact(1).map_err(|source| {
+            errors::server::read_unavailable()
+                .operation("search_candidates")
+                .detail("captured candidates exceed the byte or view bound")
+                .error()
+                .with(rift_error::ErrorContext::new(
+                    "source",
+                    rift_error::ErrorValue::source(source),
+                ))
+        })?;
         let retained = saved.iter().fold(
             saved
                 .capacity()
@@ -941,10 +969,7 @@ impl CandidateResponses {
                     .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
             },
         );
-        if saved.len() >= SLOTS_MAX
-            || retained.is_none_or(|bytes| bytes > BYTES_MAX)
-            || saved.iter().any(|row| row.id == id)
-        {
+        if retained.is_none_or(|bytes| bytes > BYTES_MAX) || saved.iter().any(|row| row.id == id) {
             let stored_bytes = saved
                 .iter()
                 .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.len()));
@@ -955,7 +980,7 @@ impl CandidateResponses {
                 component = "mcp",
                 operation = "search_candidates",
                 rows = saved.len(),
-                views_max = SLOTS_MAX,
+                views_max = self.slots_max,
                 ?retained,
                 bytes_max = BYTES_MAX,
                 ?stored_bytes,

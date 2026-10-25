@@ -87,6 +87,106 @@ fn captured_input(reads: &ReadService) -> LocalSymbolViewInput {
 }
 
 #[test]
+fn configured_retention_count_and_lifetime_keep_original_expiry() {
+    let (_directory, reads, _) = fixture(true);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let store = LocalSymbolViews::bounded(1 << 20, [91; 32], 1, Duration::from_secs(2))
+        .expect("accepted retention policy");
+    let view = capture(&store, &reads, now);
+    let expires = SystemTime::from(
+        chrono::DateTime::parse_from_rfc3339(&view.expires_at).expect("original expiry"),
+    );
+    assert_eq!(expires, now + Duration::from_secs(2));
+    assert!(
+        store
+            .capture_at(captured_input(&reads), now)
+            .expect("count admission")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .captured_view_at(&view.id, reads.index.root(), reads.index.owner(), now)
+            .expect("held view"),
+        view
+    );
+    assert_eq!(
+        store.captured_view_at(&view.id, reads.index.root(), reads.index.owner(), expires),
+        Err(SymbolUnavailableReason::ViewExpired)
+    );
+    assert!(
+        store
+            .capture_at(captured_input(&reads), expires)
+            .expect("expired slot released")
+            .is_some()
+    );
+    let store = LocalSymbolViews::bounded(1 << 20, [92; 32], 2, Duration::from_secs(10))
+        .expect("longer policy");
+    let mut input = captured_input(&reads);
+    input.expiry_limit = Some(now + Duration::from_secs(1));
+    let view = store
+        .capture_at(input, now)
+        .expect("upstream expiry")
+        .expect("captured view");
+    let expires = SystemTime::from(
+        chrono::DateTime::parse_from_rfc3339(&view.expires_at).expect("upstream expiry"),
+    );
+    assert_eq!(expires, now + Duration::from_secs(1));
+}
+
+#[test]
+fn huge_retention_lifetime_refuses_unsupported_time_without_panicking() {
+    let (_directory, reads, _) = fixture(true);
+    let store = LocalSymbolViews::bounded(
+        1 << 20,
+        [93; 32],
+        usize::MAX,
+        Duration::from_millis(u64::MAX),
+    )
+    .expect("positive policy does not allocate configured capacity");
+    assert!(
+        store
+            .capture_at(captured_input(&reads), SystemTime::now())
+            .is_err()
+    );
+    assert!(LocalSymbolViews::bounded(1 << 20, [94; 32], 0, Duration::from_secs(1)).is_err());
+    assert!(LocalSymbolViews::bounded(1 << 20, [95; 32], 1, Duration::ZERO).is_err());
+}
+
+#[test]
+fn non_rfc3339_retention_expiry_refuses_without_discarding_held_views() {
+    let (_directory, reads, _) = fixture(true);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let lifetime = Duration::from_hours(11_000 * 366 * 24);
+    let expires = now
+        .checked_add(lifetime)
+        .expect("system clock representation");
+    let elapsed = expires
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("positive clock");
+    assert!(
+        chrono::DateTime::from_timestamp(
+            i64::try_from(elapsed.as_secs()).expect("timestamp seconds"),
+            0
+        )
+        .is_some()
+    );
+    let store = LocalSymbolViews::bounded(1 << 20, [96; 32], 2, lifetime).expect("positive policy");
+    let mut input = captured_input(&reads);
+    input.expiry_limit = Some(now + Duration::from_secs(60));
+    let original = store
+        .capture_at(input, now)
+        .expect("original upstream expiry")
+        .expect("held view");
+    assert!(store.capture_at(captured_input(&reads), now).is_err());
+    assert_eq!(
+        store
+            .captured_view_at(&original.id, reads.index.root(), reads.index.owner(), now)
+            .expect("valid held view survives refusal"),
+        original
+    );
+}
+
+#[test]
 fn provider_selection_storage_preserves_original_configuration_and_expiry() {
     let (_directory, reads, _) = fixture(true);
     let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
@@ -148,7 +248,7 @@ fn search_view_input_retains_nonempty_material_and_truthful_history_coverage() {
         .local_search_view_input(true)
         .expect("captured search material");
     assert!(input.ready);
-    assert!(input.material.history.is_none());
+    assert!(input.captured_histories().next().is_none());
     assert!(!input.material.index.index_documents().is_empty());
     let view = store
         .capture_at(input, now)
@@ -218,7 +318,7 @@ fn force_included_search_retains_original_source_after_mutation_and_removal() {
     let refused = local_view_input(
         Arc::clone(&material.material.index),
         material.material.metadata.to_vec(),
-        None,
+        Arc::default(),
         None,
         true,
     );
@@ -603,6 +703,57 @@ fn local_view_response_admission_runs_only_after_material_admission() {
             .views
             .contains_key(captured.id.as_str())
     );
+}
+
+#[test]
+fn rust_material_uses_measured_admission_and_refuses_the_actual_byte_bound() {
+    let directory = tempfile::tempdir().expect("workspace");
+    std::fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+    )
+    .expect("captured metadata");
+    std::fs::write(
+        directory.path().join("lib.rs"),
+        "/// Original.\n#[inline]\npub fn kept(value: &str) -> usize { value.len() }\n",
+    )
+    .expect("captured Rust source");
+    let reads = ReadService::build(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        &SourceVisibility::default(),
+        &TextFileInclusion::default(),
+        HistoryConfiguration::default(),
+    )
+    .expect("original publication");
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+    let store = LocalSymbolViews::new(1 << 26, [61; 32]);
+    let view = store
+        .capture_at(
+            reads
+                .local_search_view_input(true)
+                .expect("measured material"),
+            now,
+        )
+        .expect("admission")
+        .expect("retained Rust material");
+    let charge = store.state.lock().expect("store").material_bytes();
+    assert!(charge > 0 && charge < usize::MAX);
+    assert!(
+        store
+            .selected_view_at(&view.id, reads.index.root(), reads.index.owner(), now)
+            .is_ok()
+    );
+    let tiny = LocalSymbolViews::new(charge - 1, [62; 32]);
+    assert!(
+        tiny.capture_at(
+            reads.local_search_view_input(true).expect("same material"),
+            now
+        )
+        .expect("byte bound refusal")
+        .is_none()
+    );
+    assert!(tiny.state.lock().expect("store").views.is_empty());
 }
 
 #[test]
@@ -1428,7 +1579,7 @@ fn text_generation_input(index: &rift_index::WorkspaceIndex) -> LocalSymbolViewI
     local_view_input(
         index.symbol_view().expect("captured generation"),
         metadata,
-        None,
+        Arc::default(),
         None,
         true,
     )

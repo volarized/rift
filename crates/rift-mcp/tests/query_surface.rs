@@ -7,7 +7,7 @@
 )]
 mod fake_engine;
 mod hermetic_search;
-mod query;
+use workspace_client::query;
 #[expect(
     dead_code,
     reason = "shared workspace helpers serve several integration suites"
@@ -82,7 +82,8 @@ async fn query_worker_without_protocol_acknowledgment_requires_operator_action()
 
 #[tokio::test]
 async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -> TestResult {
-    use rift_search::query::{FactRequirement, FactRequirements};
+    use rift_search::query::FactRequirement;
+    use sha2::Digest as _;
 
     let (_directory, client, server_task) = served_workspace(FILES, None).await?;
     let identity = "rift://symbol/local/rust/query_fixture/beacon";
@@ -125,7 +126,6 @@ async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -
             .iter()
             .any(|item| item.symbol.name == "beacon")
     );
-    use sha2::Digest as _;
     let digest = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(FILES[1].1.as_bytes()));
     assert!(facts.sources.iter().any(|source| {
         source.unit.as_str() == "rift://source/project/src/lib.rs"
@@ -147,6 +147,31 @@ async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -
     .await?;
     assert_eq!(held["symbol"], original["symbol"]);
     assert_eq!(held["view"], selected["view"]);
+    assert_query_fact_refusals(&client, request, &selected["view"]["id"]).await?;
+    let held_again = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({
+                "id":identity,"view":selected["view"]["id"],"include":[]
+            }),
+        ),
+    )
+    .await?;
+    assert_eq!(held_again["symbol"], held["symbol"]);
+    assert_eq!(held_again["view"], held["view"]);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+async fn assert_query_fact_refusals(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    request: Value,
+    view: &Value,
+) -> TestResult {
+    use rift_search::query::{FactRequirement, FactRequirements};
+
     for requirement in [
         FactRequirement::Source,
         FactRequirement::Nodes,
@@ -169,7 +194,7 @@ async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -
     }
     let mut supplied = request.clone();
     supplied["payload"]["facts"] = json!({"symbols":[{"name":"changed"}]});
-    supplied["payload"]["view"] = selected["view"]["id"].clone();
+    supplied["payload"]["view"] = view.clone();
     let invalid = client
         .call_tool(tool_request("query_facts", &supplied))
         .await?;
@@ -191,20 +216,6 @@ async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -
         .await?;
     assert_eq!(expired.is_error, Some(true), "{expired:?}");
     assert!(serde_json::to_string(&expired)?.contains("view_expired"));
-    let held_again = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "get_symbol",
-            &json!({
-                "id":identity,"view":selected["view"]["id"],"include":[]
-            }),
-        ),
-    )
-    .await?;
-    assert_eq!(held_again["symbol"], held["symbol"]);
-    assert_eq!(held_again["view"], held["view"]);
-    client.cancel().await?;
-    server_task.await?;
     Ok(())
 }
 
@@ -230,6 +241,7 @@ async fn captured_view_does_not_authorize_supplied_query_records() -> TestResult
     }))?;
     let supplied = rift_search::sparql::QueryServiceData {
         request: producer.clone(),
+        targets: vec![None; result.results.len()],
         result,
     };
     let rejected = client

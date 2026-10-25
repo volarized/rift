@@ -61,11 +61,12 @@ impl LocalSymbolViewInput {
         self.material = Arc::new(LocalSymbolMaterial {
             index: Arc::clone(&self.material.index),
             metadata: Arc::clone(&self.material.metadata),
-            history: self.material.history.clone(),
+            history: Arc::clone(&self.material.history),
             traversal: self.material.traversal.clone(),
             query_result: self.material.query_result.clone(),
             package_facts: facts,
             provider_selection: self.material.provider_selection.clone(),
+            query_references: self.material.query_references.clone(),
         });
         self
     }
@@ -240,13 +241,15 @@ impl LocalSymbolMaterial {
         })
     }
 
-    pub(super) fn package_source_text(&self, unit: &SourceUnitId) -> Option<Option<&str>> {
+    pub(super) fn package_source(
+        &self,
+        unit: &SourceUnitId,
+    ) -> Option<&rift_protocol::query::QuerySource> {
         self.package_facts
             .as_ref()?
             .sources
             .iter()
             .find(|source| source.unit == *unit)
-            .map(|source| source.text.as_deref())
     }
 
     pub(super) fn package_symbol(
@@ -294,7 +297,7 @@ impl LocalSymbolMaterial {
                 None,
             ));
         }
-        let limit = super::super::accepted_limit(request.declaration_limit)?;
+        let limit = super::super::accepted_declaration_limit(request.declaration_limit)?;
         let mut declarations = selected
             .declarations
             .iter()
@@ -307,8 +310,8 @@ impl LocalSymbolMaterial {
                 let text = declaration
                     .unit
                     .as_ref()
-                    .and_then(|unit| self.package_source_text(unit))
-                    .flatten();
+                    .and_then(|unit| self.package_source(unit))
+                    .and_then(|source| source.text.as_deref());
                 let Some(text) = text else {
                     return Ok((
                         unavailable(

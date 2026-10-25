@@ -10,12 +10,24 @@ use rift_search::query::{
     FactRequirements, QueryFactFamily, QueryFacts, QueryLimits, QuerySource, QuerySymbol,
 };
 
+mod history;
+mod local_provider;
+
 /// Combines admitted facts while preserving their original source and provider associations.
 ///
 /// # Errors
 /// Refuses conflicting source bytes, record identities or captured selectors.
 pub fn merge_query_facts(held: &mut QueryFacts, added: QueryFacts) -> Result<(), RiftError> {
     crate::engine_read::merge_package_facts(held, added)
+}
+
+/// Returns the serving root URI through the existing workspace path codec.
+///
+/// # Errors
+/// Refuses a relative or non-Unicode root or an invalid workspace identity.
+pub fn query_provider_root(root: &std::path::Path) -> Result<rift_core::WorkspaceId, RiftError> {
+    let uri = rift_lsp::uri::TreeRoot::new(root)?.root_uri()?;
+    rift_core::WorkspaceId::new(uri.as_str())
 }
 
 impl ReadService {
@@ -53,9 +65,9 @@ impl LocalSymbolViewInput {
         configuration: &rift_protocol::configuration::WorkspaceConfiguration,
     ) -> Result<rift_search::query::QueryProviderSelection, RiftError> {
         let graph = self.index().normalized_graph();
-        let root = rift_lsp::uri::TreeRoot::new(self.root())?.root_uri()?;
+        let root = query_provider_root(self.root())?;
         Ok(rift_search::query::QueryProviderSelection {
-            root: rift_core::WorkspaceId::new(root.as_str())?,
+            root,
             owner: self.owner().clone(),
             index_revision: graph.index_revision(),
             source_revision: graph.source_revision(),
@@ -78,7 +90,7 @@ impl LocalSymbolViewInput {
         selection: &rift_search::query::QueryProviderSelection,
     ) -> Result<(), RiftError> {
         let graph = self.index().normalized_graph();
-        let root = rift_lsp::uri::TreeRoot::new(self.root())?.root_uri()?;
+        let root = query_provider_root(self.root())?;
         if selection.root.as_str() != root.as_str()
             || &selection.owner != self.owner()
             || selection.index_revision != graph.index_revision()
@@ -107,7 +119,31 @@ impl LocalSymbolViewInput {
         selection: &rift_search::query::QueryProviderSelection,
     ) -> Result<QueryFacts, RiftError> {
         self.validate_provider_selection(selection)?;
-        self.query_facts_with_budget(requirements, limits, budget)
+        let include_acquired = provider_relationships(requirements);
+        let mut projection = requirements.clone();
+        if include_acquired && self.query_references().is_some() {
+            projection.symbol_ids = None;
+            projection.symbol_name = None;
+        }
+        let mut facts = self.query_facts_with_budget(&projection, limits, budget)?;
+        local_provider::capture(
+            self.index(),
+            selection,
+            &projection,
+            &mut facts,
+            limits,
+            budget,
+        )?;
+        if let Some(package) = self.package_facts() {
+            budget.charge(package.as_ref())?;
+            merge_query_facts(&mut facts, package.as_ref().clone())?;
+        }
+        if let Some(references) = self.query_references().filter(|_| include_acquired) {
+            budget.charge_material(references.retained_material_bytes())?;
+            references.project_provider_edges(&mut facts)?;
+        }
+        history::require_foreign_histories(self.owner(), requirements, &mut facts);
+        Ok(facts)
     }
 
     /// Projects facts from this input's original publication and source selection.
@@ -155,23 +191,39 @@ impl LocalSymbolViewInput {
         let mut facts =
             project_query_facts_with_budget(self.index(), requirements, limits, budget)?;
         budget.check()?;
-        if let Some(bytes) = self.captured_history_bytes() {
-            budget.charge_bytes(bytes)?;
-        }
-        if let Some(history) = self.captured_history()? {
-            if history.complete
-                && !requirements.requires(FactRequirement::AllHistories)
-                && !requirements.history_symbols.is_empty()
-                && requirements
-                    .history_symbols
-                    .iter()
-                    .all(|identity| *identity == history.symbol)
-            {
-                facts
-                    .unavailable_families
-                    .retain(|family| *family != QueryFactFamily::History);
+        if requirements.requires(FactRequirement::History)
+            || requirements.requires(FactRequirement::Description)
+        {
+            for (_, bytes) in self.captured_histories() {
+                budget.check()?;
+                if facts.histories.len() >= limits.quads_max {
+                    return query_bound("search.query.statements");
+                }
+                budget.charge_bytes(bytes)?;
+                let history = serde_json::from_slice(bytes).map_err(|error| {
+                    errors::server::read_unavailable()
+                        .operation("decode captured history")
+                        .detail(error.to_string())
+                        .error()
+                })?;
+                facts.histories.push(history);
             }
-            facts.histories.push(history);
+        }
+        let captured = if requirements.requires(FactRequirement::AllHistories) {
+            self.captured_histories_complete()
+        } else {
+            !requirements.history_symbols.is_empty()
+                && requirements.history_symbols.iter().all(|identity| {
+                    facts
+                        .histories
+                        .iter()
+                        .any(|history| history.symbol == *identity && history.complete)
+                })
+        };
+        if captured {
+            facts
+                .unavailable_families
+                .retain(|family| *family != QueryFactFamily::History);
         }
         Ok(facts)
     }
@@ -266,14 +318,29 @@ fn project_query_facts_with_budget(
             }
         }
     }
-    if requirements.symbol_ids.is_none() {
+    project_physical_symbols(view, requirements, &mut facts, limits, budget)?;
+    project_sources(view, requirements, &mut facts, limits, budget)?;
+    project_documentation(view, requirements, &mut facts, limits, budget)?;
+    Ok(facts)
+}
+
+fn project_physical_symbols(
+    view: &WorkspaceSymbolView,
+    requirements: &FactRequirements,
+    facts: &mut QueryFacts,
+    limits: QueryLimits,
+    budget: &mut QueryFactBudget<'_>,
+) -> Result<(), RiftError> {
+    let physical_targets = provider_relationships(requirements);
+    if requirements.symbol_ids.is_none() || physical_targets {
         for declaration in view.unestablished_declarations() {
             budget.check()?;
             let (object, matched, declaration) = declaration?;
-            if requirements
-                .symbol_name
-                .as_deref()
-                .is_some_and(|name| object.facts().name() != name)
+            if !physical_targets
+                && requirements
+                    .symbol_name
+                    .as_deref()
+                    .is_some_and(|name| object.facts().name() != name)
             {
                 continue;
             }
@@ -298,6 +365,16 @@ fn project_query_facts_with_budget(
             });
         }
     }
+    Ok(())
+}
+
+fn project_sources(
+    view: &WorkspaceSymbolView,
+    requirements: &FactRequirements,
+    facts: &mut QueryFacts,
+    limits: QueryLimits,
+    budget: &mut QueryFactBudget<'_>,
+) -> Result<(), RiftError> {
     let mut source_bytes = 0usize;
     for (path, source) in view.sources() {
         budget.check()?;
@@ -332,6 +409,16 @@ fn project_query_facts_with_budget(
             .then(|| source.to_owned());
         facts.sources.push(record);
     }
+    Ok(())
+}
+
+fn project_documentation(
+    view: &WorkspaceSymbolView,
+    requirements: &FactRequirements,
+    facts: &mut QueryFacts,
+    limits: QueryLimits,
+    budget: &mut QueryFactBudget<'_>,
+) -> Result<(), RiftError> {
     let documentation = view.documentation().index();
     if requirements.symbol_name.is_none() && requirements.symbol_ids.is_none() {
         if documentation.coverage.omitted != 0
@@ -376,7 +463,16 @@ fn project_query_facts_with_budget(
                 .push(record.clone());
         }
     }
-    Ok(facts)
+    Ok(())
+}
+
+fn provider_relationships(requirements: &FactRequirements) -> bool {
+    requirements.requires(FactRequirement::CompleteDomain)
+        || requirements.requires(FactRequirement::Description)
+        || requirements.requires(FactRequirement::AllOccurrences)
+        || !requirements.facets.is_empty()
+        || !requirements.adjacency.is_empty()
+        || !requirements.occurrences.is_empty()
 }
 
 fn query_bound<T>(bound: &'static str) -> Result<T, RiftError> {
@@ -408,6 +504,11 @@ mod tests {
             rdf_bytes_max: 16_777_216,
             result_items_max: 20_000,
             result_bytes_max: 16_777_216,
+            input_bytes_max: None,
+            output_bytes_max: None,
+            material_bytes_max: None,
+            heap_bytes_max: None,
+            diagnostic_bytes_max: None,
         }
     }
 

@@ -16,10 +16,11 @@ pub(crate) const CANDIDATE_BYTES_MAX: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SavedCandidateBackend {
-    pub(crate) owner: Option<rift_protocol::identity::SymbolOwner>,
-    pub(crate) backend: String,
-    pub(crate) root: String,
+pub(crate) struct SavedCandidateBackend<Text = String, Owner = rift_protocol::identity::SymbolOwner>
+{
+    pub(crate) owner: Option<Owner>,
+    pub(crate) backend: Text,
+    pub(crate) root: Text,
     pub(crate) view: CapturedView,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) project: Option<String>,

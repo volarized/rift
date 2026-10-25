@@ -21,7 +21,6 @@
 //! fixture that helper lays out carries the table this suite must not have.
 
 #[path = "query/mod.rs"]
-#[allow(dead_code, reason = "shared query helpers serve several public suites")]
 mod query;
 mod search_live_gate;
 

@@ -39,7 +39,56 @@ Read `rift://map` first for served languages, workspace layout, and language ser
 - Regex: `SELECT ?path ?start {SERVICE :search {?hit :pattern "TODO|FIXME"; :target "file"; :path ?path; :start ?start}}`
 - Count: `SELECT (COUNT(?usage) AS ?count) {<symbol-id> :usages ?usage}`
 
-Ranking uses `SERVICE :search {?hit :query "project settings"; :symbol ?symbol}`. Use outer projection, `ORDER BY`, `LIMIT`, and `OFFSET`. Follow returned `pagination.next_query` unchanged for transport pages. Carry the returned `view` with exact symbol and source reads. Missing required facts return unavailability, never a false boolean or empty complete answer.
+### Text search
+
+Find declarations by text, keeping the retrieval order. Optional fields remain unbound when the selected hit does not carry them.
+
+```sparql
+SELECT ?symbol ?name ?path
+WHERE {
+SERVICE :search {
+?hit :query "request deadline"; :target "symbol"; :index ?index .
+OPTIONAL { ?hit :symbol ?symbol . OPTIONAL { ?symbol :name ?name } }
+OPTIONAL { ?hit :path ?path }
+}
+}
+ORDER BY ?index LIMIT 20 OFFSET 0
+```
+
+### Match search
+
+Match a regex in selected files. Structured retrieval inputs use `rdf:JSON`.
+
+```sparql
+SELECT ?path ?line ?source
+WHERE {
+SERVICE :search {
+?hit :pattern "TODO|FIXME"; :target "file"; :index ?index; :path ?path;
+:paths '{"include":["crates/**"]}'^^rdf:JSON;
+:include '["source"]'^^rdf:JSON .
+OPTIONAL { ?hit :line ?line }
+OPTIONAL { ?hit :source ?source }
+}
+}
+ORDER BY ?index LIMIT 20 OFFSET 0
+```
+
+### Traversal
+
+Select a declaration by its name and path, then follow two call edges. This example starts at Rift's CLI entry point; use a name and path from the served workspace. Required relationships must be available from the selected provider.
+
+```sparql
+SELECT ?callee ?name ?path
+WHERE {
+?seed a :Symbol; :name "main"; :path "crates/rift/src/main.rs" .
+?seed :calls/:calls ?callee .
+OPTIONAL { ?callee :name ?name }
+OPTIONAL { ?callee :path ?path }
+}
+ORDER BY ?name ?path LIMIT 20
+```
+
+Set `OFFSET 20` to select the next query window. Follow returned `pagination.next_query` unchanged for transport pages. Carry the returned `view` with exact symbol and source reads. Missing required facts return unavailability, never a false boolean or empty complete answer.
 
 The `:` vocabulary is `urn:rift:vocabulary:`. The local named graph is `urn:rift:graph:local`.
 

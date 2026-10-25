@@ -50,11 +50,14 @@ pub(super) struct Input {
     source_bytes: Vec<u8>,
     expires: SystemTime,
     original_view: CapturedView,
+    configuration: QueryConfiguration,
+    maximum: usize,
 }
 
 impl Input {
     pub(super) fn prepare(
         mut selections: Vec<(String, QueryFactSelection, QueryIdentities)>,
+        configuration: QueryConfiguration,
         maximum: usize,
         budget: &mut rift_server::QueryFactBudget<'_>,
     ) -> Result<Self, RiftError> {
@@ -132,6 +135,8 @@ impl Input {
             source_bytes,
             expires,
             original_view,
+            configuration,
+            maximum,
         })
     }
 
@@ -140,10 +145,8 @@ impl Input {
         views: &rift_server::LocalSymbolViews,
         root: &Path,
         owner: &SymbolOwner,
-        answer: QueryAnswer,
-        configuration: &QueryConfiguration,
+        answer: &QueryAnswer,
         warnings: Vec<ReadWarning>,
-        maximum: usize,
         budget: &mut rift_server::QueryFactBudget<'_>,
     ) -> Result<QueryReadResult, RiftError> {
         budget.check()?;
@@ -153,7 +156,7 @@ impl Input {
             view: self.original_view,
         };
         let (saved, records, _) =
-            SavedQuery::encoded(context, &answer, configuration, warnings, Vec::new())?;
+            SavedQuery::encoded(context, answer, &self.configuration, warnings, Vec::new())?;
         let metadata = Metadata {
             answer: saved,
             providers: self.providers,
@@ -175,9 +178,11 @@ impl Input {
         let mut response = None;
         let admitted = views.capture_query_with(material, |view| {
             saved.context.view = view.clone();
-            let page_maximum =
-                usize::try_from(configuration.page_limit.bytes()).map_err(|_| unavailable())?;
-            saved.validate_pages(&page_records, page_maximum.min(maximum), || budget.check())?;
+            let page_maximum = usize::try_from(self.configuration.page_limit.bytes())
+                .map_err(|_| unavailable())?;
+            saved.validate_pages(&page_records, page_maximum.min(self.maximum), || {
+                budget.check()
+            })?;
             let first = saved.response(saved.decode_bytes(&page_records, Some(0))?, 0)?;
             budget.charge(&first)?;
             response = Some(first);

@@ -77,7 +77,8 @@ enum CliCommand {
     __Query {
         request: PathBuf,
         response: PathBuf,
-        bytes_max: usize,
+        input_bytes_max: usize,
+        output_bytes_max: usize,
         heap_bytes_max: usize,
     },
     /// Delete the backup binary left behind by a Windows self-update.
@@ -154,11 +155,18 @@ fn main() -> ExitCode {
     if let Some(CliCommand::__Query {
         request,
         response,
-        bytes_max,
+        input_bytes_max,
+        output_bytes_max,
         heap_bytes_max,
     }) = &cli.command
     {
-        return query_child::run(request, response, *bytes_max, *heap_bytes_max);
+        return query_child::run(
+            request,
+            response,
+            *input_bytes_max,
+            *output_bytes_max,
+            *heap_bytes_max,
+        );
     }
     run_async(cli)
 }

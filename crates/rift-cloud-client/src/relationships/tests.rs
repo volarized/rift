@@ -27,6 +27,204 @@ fn request() -> RelationshipSearchRequest {
 }
 
 #[tokio::test]
+async fn relationship_request_counts_use_configured_exact_bounds() {
+    let (server, _) = operation_client(OperationFixture::Relationships {
+        pages: vec![page(0, true, None)],
+        advertised: true,
+    })
+    .await;
+    let mut configuration = server.config();
+    configuration.max_seeds = 1;
+    configuration.max_facets = 1;
+    let client = crate::GlobalClient::new(configuration).expect("configured counts");
+    client
+        .relationship_page(&request(), 10, None)
+        .await
+        .expect("exact subject and facet counts");
+    let mut too_many = request();
+    too_many
+        .relationships
+        .seeds
+        .push(rift_protocol::read::SymbolId(TARGET.to_owned()));
+    assert_eq!(
+        client
+            .relationship_page(&too_many, 10, None)
+            .await
+            .expect_err("one extra subject")
+            .slug()
+            .as_str(),
+        "rift.client.request_invalid"
+    );
+    let mut too_many = request();
+    too_many
+        .relationships
+        .facets
+        .push(rift_protocol::read::RelationshipFacet::References);
+    assert_eq!(
+        client
+            .relationship_page(&too_many, 10, None)
+            .await
+            .expect_err("one extra facet")
+            .slug()
+            .as_str(),
+        "rift.client.request_invalid"
+    );
+    let requests = server.state.request_log.lock().await;
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path.ends_with("/search"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn relationship_request_byte_refusal_precedes_continuation_copy_and_send() {
+    let (server, _) = operation_client(OperationFixture::Relationships {
+        pages: vec![],
+        advertised: true,
+    })
+    .await;
+    let mut configuration = server.config();
+    configuration.max_seeds = usize::MAX;
+    configuration.max_request = 128;
+    let client = crate::GlobalClient::new(configuration).expect("configured counts and bytes");
+    let mut selected = request();
+    selected.relationships.seeds = (0..64)
+        .map(|index| {
+            rift_protocol::read::SymbolId(format!(
+                "rift://symbol/cargo/crates.io/demo@1.0.0/rust/entry{index}"
+            ))
+        })
+        .collect();
+    let original = serde_json::to_value(&selected).expect("original request");
+    let mut admissions = 0;
+    let error = client
+        .relationship_pages_with_admission(&selected, limits(), || {
+            admissions += 1;
+            Ok(())
+        })
+        .await
+        .expect_err("request byte bound");
+    assert_eq!(error.slug().as_str(), "rift.client.body_limit");
+    assert_eq!(admissions, 1);
+    assert_eq!(
+        serde_json::to_value(&selected).expect("unchanged request"),
+        original
+    );
+    assert!(
+        !server
+            .state
+            .request_log
+            .lock()
+            .await
+            .iter()
+            .any(|request| request.path.ends_with("/search"))
+    );
+}
+
+#[tokio::test]
+async fn relationship_group_counts_use_configured_exact_bounds() {
+    for occurrences in [false, true] {
+        let mut selected = page(0, true, None);
+        if occurrences {
+            selected["groups"][0]["occurrences"] = json!([
+                located_projection(0, Some(0), 0),
+                located_projection(0, Some(0), 1),
+            ]);
+        } else {
+            let mut second = selected["groups"][0]["relationships"][0].clone();
+            second["id"] = json!(format!("{:064x}", 1));
+            selected["groups"][0]["relationships"]
+                .as_array_mut()
+                .expect("records")
+                .push(second);
+        }
+        let (server, _) = operation_client(OperationFixture::Relationships {
+            pages: vec![selected],
+            advertised: true,
+        })
+        .await;
+        for maximum in [2, 1] {
+            let mut configuration = server.config();
+            if occurrences {
+                configuration.max_occurrences = maximum;
+            } else {
+                configuration.max_relationships = maximum;
+            }
+            let client = crate::GlobalClient::new(configuration).expect("group count policy");
+            let result = client.relationship_page(&request(), 10, None).await;
+            if maximum == 2 {
+                result.expect("exact configured group count");
+            } else {
+                assert_eq!(
+                    result
+                        .expect_err("one over configured group count")
+                        .slug()
+                        .as_str(),
+                    "rift.client.response_invalid"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn relationship_bounds_require_remote_policy_and_intersect_local_counts() {
+    let (server, _) = operation_client(OperationFixture::Relationships {
+        pages: vec![page(0, true, None)],
+        advertised: true,
+    })
+    .await;
+    let mut configuration = server.config();
+    configuration.max_seeds = 2;
+    configuration.max_facets = 2;
+    configuration.max_relationships = 2;
+    configuration.max_occurrences = 2;
+    configuration.max_symbols = 2;
+    configuration.max_sources = 2;
+    let client = crate::GlobalClient::new(configuration).expect("local counts");
+    let mut value: Value =
+        serde_json::from_str(&super::capabilities_json()).expect("fixture metadata");
+    value["supported_features"] = json!(["relationships"]);
+    value["relationship_capabilities"] = json!([{
+        "direction":"outgoing", "facets":["calls"], "bounds":{
+            "max_seeds":1, "max_facets":1, "max_relationships":1,
+            "max_occurrences":1, "max_symbols":1, "max_sources":1,
+        }
+    }]);
+    let capabilities: crate::Capabilities =
+        serde_json::from_value(value.clone()).expect("advertised counts");
+    let bounds = client
+        .relationship_bounds(
+            &capabilities,
+            rift_protocol::read::TraversalDirection::Outgoing,
+            &[rift_protocol::read::RelationshipFacet::Calls],
+        )
+        .expect("intersection");
+    assert_eq!(
+        serde_json::to_value(bounds).expect("active counts"),
+        json!({"max_seeds":1,"max_facets":1,"max_relationships":1,"max_occurrences":1,"max_symbols":1,"max_sources":1})
+    );
+    value["relationship_capabilities"][0]
+        .as_object_mut()
+        .expect("operation")
+        .remove("bounds");
+    let capabilities: crate::Capabilities =
+        serde_json::from_value(value).expect("old ordinary metadata remains valid");
+    assert!(crate::GlobalClient::relationship_capabilities(&capabilities).is_ok());
+    let error = client
+        .relationship_bounds(
+            &capabilities,
+            rift_protocol::read::TraversalDirection::Outgoing,
+            &[rift_protocol::read::RelationshipFacet::Calls],
+        )
+        .expect_err("old metadata cannot establish raw count policy");
+    assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
+}
+
+#[tokio::test]
 async fn cached_relationship_capability_does_not_retry_an_unsupported_operation() {
     let problem = json!({
         "type":"about:blank", "title":"Service unavailable", "status":503,
@@ -550,6 +748,88 @@ async fn raw_relationship_bound_and_capability_refusals_are_explicit() {
     .await;
     assert!(client.relationship_pages(&invalid, limits()).await.is_err());
     assert!(server.state.request_log.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn configured_catalog_counts_admit_exact_pages_and_refuse_one_above() {
+    for (symbols, sources, supplied_sources, accepted) in [
+        (2, 1, 1, true),
+        (1, 1, 1, false),
+        (2, 1, 2, false),
+        (2, 2, 2, true),
+    ] {
+        let mut answer = page(0, true, None);
+        if supplied_sources == 2 {
+            let mut source = answer["sources"][0].clone();
+            source["unit"] = json!("rift://source/cargo/crates.io/demo@1.0.0/src/other.rs");
+            answer["sources"]
+                .as_array_mut()
+                .expect("source catalog")
+                .push(source);
+        }
+        let (_server, base) = operation_client(OperationFixture::Relationships {
+            pages: vec![answer],
+            advertised: true,
+        })
+        .await;
+        let mut configuration = base.inner.config.clone();
+        configuration.max_symbols = symbols;
+        configuration.max_sources = sources;
+        let client = crate::GlobalClient::new_with_token(configuration, None)
+            .expect("accepted catalog counts");
+        let result = client.relationship_page(&request(), 200, None).await;
+        assert_eq!(
+            matches!(result, Ok(RelationshipSearchResult::Page(_))),
+            accepted,
+            "configured symbols {symbols}, sources {sources}, supplied sources {supplied_sources}: {result:?}",
+        );
+    }
+}
+
+#[test]
+fn protocol_catalog_counts_reach_client_configuration_and_refuse_zero() {
+    let mut source = rift_protocol::configuration::GlobalConfiguration {
+        max_symbols: 2,
+        max_sources: 3,
+        ..Default::default()
+    };
+    let configured = crate::Config::try_from(&source).expect("accepted protocol catalog counts");
+    assert_eq!(configured.max_symbols, 2);
+    assert_eq!(configured.max_sources, 3);
+    source.max_symbols = 0;
+    assert!(crate::Config::try_from(&source).is_err());
+    source.max_symbols = 2;
+    source.max_sources = 0;
+    assert!(crate::Config::try_from(&source).is_err());
+}
+
+#[tokio::test]
+async fn catalog_counts_apply_per_page_while_existing_aggregate_budgets_remain() {
+    let first = page(0, false, Some("1"));
+    let mut second = page(1, true, None);
+    let other = format!("{TARGET}_second");
+    second["groups"][0]["relationships"][0]["relationship"]["to"] = json!(other);
+    second["symbols"][1] = symbol(&other, "other");
+    second["sources"][0]["unit"] = json!("rift://source/cargo/crates.io/demo@1.0.0/src/other.rs");
+    let (_server, base) = operation_client(OperationFixture::Relationships {
+        pages: vec![first, second],
+        advertised: true,
+    })
+    .await;
+    let mut configuration = base.inner.config.clone();
+    configuration.max_symbols = 2;
+    configuration.max_sources = 1;
+    let client =
+        crate::GlobalClient::new_with_token(configuration, None).expect("accepted per-page counts");
+    let RelationshipSearchResult::Page(answer) = client
+        .relationship_pages(&request(), limits())
+        .await
+        .expect("each page is within the accepted count and aggregate byte bounds")
+    else {
+        panic!("complete captured relationship pages");
+    };
+    assert_eq!(answer.symbols.len(), 3);
+    assert_eq!(answer.sources.len(), 2);
 }
 
 #[tokio::test]

@@ -202,7 +202,7 @@ fn captured_framework_charge_counts_template_capacity_and_checked_source() {
 }
 
 #[test]
-fn captured_symbol_material_refuses_unmeasured_portable_facts_without_overflow() {
+fn captured_symbol_material_measures_signature_extensions_without_overflow() {
     let root = tempfile::tempdir().expect("workspace");
     fs::write(
         root.path().join("Cargo.toml"),
@@ -229,16 +229,20 @@ fn captured_symbol_material_refuses_unmeasured_portable_facts_without_overflow()
         },
     )]));
     object.facts = object.facts.clone().signatures(signatures);
+    let object_bytes = object.get_size();
+    assert_ne!(object_bytes, usize::MAX);
     let mut view = index.build_symbol_view().expect("immutable view");
     view.declarations = Arc::new(SymbolDeclarations {
         assembled: BTreeMap::from([(identity, Ok(object))]),
         ..SymbolDeclarations::default()
     });
-    assert_eq!(super::retained_size::measure(&view), usize::MAX);
+    let measured = super::retained_size::measure(&view);
+    assert_ne!(measured, usize::MAX);
+    assert!(measured >= object_bytes);
     assert_eq!(
         view.declarations.assembled.len(),
         1,
-        "refusal retains object facts"
+        "measurement retains object facts"
     );
     assert!(!view.normalized_graph().records().is_empty());
 }

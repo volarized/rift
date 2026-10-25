@@ -8043,8 +8043,7 @@
               "$ref": "#/components/schemas/SymbolId"
             },
             "description": "Established subjects whose complete adjacency is required.",
-            "minItems": 1,
-            "maxItems": 64
+            "minItems": 1
           },
           "direction": {
             "$ref": "#/components/schemas/TraversalDirection",
@@ -8056,7 +8055,7 @@
               "$ref": "#/components/schemas/RelationshipFacet"
             },
             "description": "Portable relationship facets. Empty selects every available facet.",
-            "maxItems": 16
+            "uniqueItems": true
           }
         },
         "required": [
@@ -8089,24 +8088,21 @@
               "$ref": "#/components/schemas/RelationshipGroup"
             },
             "description": "One authoritative group for every requested subject, in request order.",
-            "minItems": 1,
-            "maxItems": 64
+            "minItems": 1
           },
           "symbols": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/QuerySymbol"
             },
-            "description": "Exact symbols reached by this page. Identical captured records may repeat across pages;\nconflicting records are refused.",
-            "maxItems": 10000
+            "description": "Exact symbols reached by this page. Identical captured records may repeat across pages;\nconflicting records are refused."
           },
           "sources": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RelationshipSource"
             },
-            "description": "Physical source catalog and requested bytes for reached declarations and occurrences.\nIdentical captured records may repeat across pages; conflicting records are refused.",
-            "maxItems": 10000
+            "description": "Physical source catalog and requested bytes for reached declarations and occurrences.\nIdentical captured records may repeat across pages; conflicting records are refused."
           },
           "next_cursor": {
             "type": "string",
@@ -8159,16 +8155,14 @@
             "items": {
               "$ref": "#/components/schemas/RelationshipRecord"
             },
-            "description": "Original records, preserving parallel edges, evidence and occurrences.",
-            "maxItems": 1000
+            "description": "Original records, preserving parallel edges, evidence and occurrences."
           },
           "occurrences": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/RelationshipOccurrence"
             },
-            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct original record identities across relationships and usages.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal.",
-            "maxItems": 1000
+            "description": "Physical usages, including recursive and file-level locations without a caller symbol.\nPage limits count distinct original record identities across relationships and usages.\nMultiple projections of one original record consume one slot; independent records\nconsume separate slots even when their payloads or locations are equal."
           },
           "complete": {
             "type": "boolean",
@@ -8249,8 +8243,7 @@
             "items": {
               "$ref": "#/components/schemas/SymbolDeclaration"
             },
-            "description": "Physical declarations, preserving their association indices.",
-            "maxItems": 10000
+            "description": "Physical declarations, preserving their association indices."
           }
         },
         "required": [
@@ -8285,8 +8278,7 @@
           },
           "text": {
             "type": "string",
-            "description": "Selected text, absent when source is unavailable or unrequested.",
-            "maxLength": 67108864
+            "description": "Selected text, absent when source is unavailable or unrequested."
           }
         },
         "required": [
@@ -8316,8 +8308,11 @@
             },
             "description": "Facets whose complete selected-domain reads the reader supports.",
             "minItems": 1,
-            "maxItems": 16,
             "uniqueItems": true
+          },
+          "bounds": {
+            "description": "Accepted count bounds for this operation. Absence does not establish raw read support.",
+            "$ref": "#/components/schemas/RelationshipBounds"
           }
         },
         "required": [
@@ -8348,6 +8343,57 @@
           "occurrence"
         ],
         "description": "One physical usage projected from an original selected-publication record."
+      },
+      "RelationshipBounds": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "max_seeds": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Most subjects in one request."
+          },
+          "max_facets": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Most selected facets in one request."
+          },
+          "max_relationships": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Most relationship projections in one group."
+          },
+          "max_occurrences": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Most occurrence projections in one group."
+          },
+          "max_symbols": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Most original symbol records in one page."
+          },
+          "max_sources": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 1,
+            "description": "Most original source units in one page."
+          }
+        },
+        "required": [
+          "max_seeds",
+          "max_facets",
+          "max_relationships",
+          "max_occurrences",
+          "max_symbols",
+          "max_sources"
+        ],
+        "description": "Positive count bounds for one raw relationship operation."
       }
     },
     "headers": {

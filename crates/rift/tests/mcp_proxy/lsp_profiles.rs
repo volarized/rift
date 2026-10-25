@@ -73,12 +73,21 @@ async fn configure_engine(root: &Path, profile: Option<&str>, script: &str) -> T
 }
 
 fn search() -> TestResult<Value> {
-    Ok(serde_json::to_value(query::retrieval(
-        &serde_json::from_value(json!({
-            "query":"beacon", "target":"symbol", "scope":"all",
-            "paths":{"include":["lib.rs"]}, "order":"path", "include":["source"],
-        }))?,
-    )?)?)
+    let selected = |scope: &str| {
+        format!(
+            r#"{{ SERVICE <{}> {{ ?hit :query "beacon"; :target "symbol"; :scope "{scope}"; :paths '{{"include":["lib.rs"]}}'^^rdf:JSON; :order "path"; :include '["source"]'^^rdf:JSON; :symbol ?symbol; :source ?source; :path ?path . ?symbol :name ?name . }} }}"#,
+            rift_search::sparql::SEARCH_SERVICE,
+        )
+    };
+    Ok(serde_json::to_value(QueryParams {
+        query: format!(
+            "PREFIX : <{}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> SELECT ?symbol ?source ?path ?name {{ {} UNION {} }} ORDER BY ?path ?symbol",
+            rift_search::sparql::VOCABULARY,
+            selected("local"),
+            selected("local#docs"),
+        ),
+        language: QueryLanguage::Sparql,
+    })?)
 }
 
 #[derive(Debug)]
@@ -330,7 +339,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             ("docs/lib.rs", &docs_source),
             ("docs/caller.rs", CALLER_SOURCE),
         ],
-        "[search.query]\npage_size = 1\n",
+        "[search.query]\npage_size = 1\n[global]\nenabled = false\n",
     )?;
     let root = directory.path();
     let docs = root.join("docs");

@@ -53,7 +53,10 @@ impl LocalSymbolMaterial {
         let text = if request.unit.is_project() {
             self.index.source(&path)
         } else {
-            match self.package_source_text(&request.unit) {
+            match self
+                .package_source(&request.unit)
+                .map(|source| source.text.as_deref())
+            {
                 Some(Some(text)) => Some(text),
                 Some(None) => {
                     return Ok(source_unavailable(

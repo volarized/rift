@@ -6,15 +6,15 @@ use rift_provider::NormalizedTarget;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub(super) mod optional_context {
-    use super::*;
+    use super::{Deserialize, Deserializer, Serialize, Serializer};
     use crate::query::QueryProviderContext;
     use std::sync::Arc;
 
-    pub(crate) fn serialize<S: Serializer>(
-        value: &Option<Arc<QueryProviderContext>>,
+    pub(crate) fn serialize<'value, S: Serializer>(
+        value: impl Into<Option<&'value Arc<QueryProviderContext>>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        value.as_deref().serialize(serializer)
+        value.into().map(Arc::as_ref).serialize(serializer)
     }
 
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
@@ -27,7 +27,7 @@ pub(super) mod optional_context {
 macro_rules! checked_text {
     ($module:ident, $kind:ty) => {
         pub(super) mod $module {
-            use super::*;
+            use super::{Deserialize, Deserializer, Serializer};
             pub(crate) fn serialize<S: Serializer>(
                 value: &$kind,
                 serializer: S,
@@ -47,7 +47,7 @@ checked_text!(workspace, rift_core::WorkspaceId);
 macro_rules! revision {
     ($module:ident, $kind:ty) => {
         pub(super) mod $module {
-            use super::*;
+            use super::{Deserialize, Deserializer, Serializer};
             pub(crate) fn serialize<S: Serializer>(
                 value: &$kind,
                 serializer: S,
@@ -85,7 +85,9 @@ fn decode_key<E: serde::de::Error>(value: (String, u64, String)) -> Result<Contr
     ))
 }
 pub(super) mod key {
-    use super::*;
+    use super::{
+        ContributionKey, Deserialize, Deserializer, Key, Serialize, Serializer, decode_key,
+    };
     pub(crate) fn serialize<S: Serializer>(
         value: &ContributionKey,
         serializer: S,
@@ -99,7 +101,7 @@ pub(super) mod key {
     }
 }
 pub(super) mod keys {
-    use super::*;
+    use super::{ContributionKey, Deserialize, Deserializer, Key, Serializer, decode_key};
     pub(crate) fn serialize<S: Serializer>(
         values: &[ContributionKey],
         serializer: S,
@@ -143,7 +145,10 @@ fn decode_binding<E: serde::de::Error>(
     ))
 }
 pub(super) mod binding {
-    use super::*;
+    use super::{
+        Binding, DeclarationBinding, Deserialize, Deserializer, NodeId, Serialize, Serializer,
+        decode_binding,
+    };
     pub(crate) fn serialize<S: Serializer>(
         value: &DeclarationBinding,
         serializer: S,
@@ -159,12 +164,15 @@ pub(super) mod binding {
     }
 }
 pub(super) mod optional_binding {
-    use super::*;
-    pub(crate) fn serialize<S: Serializer>(
-        value: &Option<DeclarationBinding>,
+    use super::{
+        Binding, DeclarationBinding, Deserialize, Deserializer, NodeId, Serialize, Serializer,
+        decode_binding,
+    };
+    pub(crate) fn serialize<'value, S: Serializer>(
+        value: impl Into<Option<&'value DeclarationBinding>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        value.as_ref().map(Binding).serialize(serializer)
+        value.into().map(Binding).serialize(serializer)
     }
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
@@ -175,13 +183,13 @@ pub(super) mod optional_binding {
     }
 }
 pub(super) mod optional_symbol {
-    use super::*;
-    pub(crate) fn serialize<S: Serializer>(
-        value: &Option<rift_core::SymbolId>,
+    use super::{Deserialize, Deserializer, Serialize, Serializer};
+    pub(crate) fn serialize<'value, S: Serializer>(
+        value: impl Into<Option<&'value rift_core::SymbolId>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         value
-            .as_ref()
+            .into()
             .map(rift_core::SymbolId::as_str)
             .serialize(serializer)
     }
@@ -232,7 +240,9 @@ impl Serialize for TargetRef<'_> {
     }
 }
 pub(super) mod target {
-    use super::*;
+    use super::{
+        Deserialize, Deserializer, NormalizedTarget, Serialize, Serializer, Target, TargetRef,
+    };
     pub(crate) fn serialize<S: Serializer>(
         value: &NormalizedTarget,
         serializer: S,
@@ -246,7 +256,7 @@ pub(super) mod target {
     }
 }
 pub(super) mod targets {
-    use super::*;
+    use super::{Deserialize, Deserializer, NormalizedTarget, Serializer, Target, TargetRef};
     pub(crate) fn serialize<S: Serializer>(
         value: &[NormalizedTarget],
         serializer: S,
@@ -263,12 +273,14 @@ pub(super) mod targets {
     }
 }
 pub(super) mod optional_target {
-    use super::*;
-    pub(crate) fn serialize<S: Serializer>(
-        value: &Option<NormalizedTarget>,
+    use super::{
+        Deserialize, Deserializer, NormalizedTarget, Serialize, Serializer, Target, TargetRef,
+    };
+    pub(crate) fn serialize<'value, S: Serializer>(
+        value: impl Into<Option<&'value NormalizedTarget>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        value.as_ref().map(TargetRef).serialize(serializer)
+        value.into().map(TargetRef).serialize(serializer)
     }
     pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
@@ -281,7 +293,7 @@ pub(super) mod optional_target {
 macro_rules! portable_enum {
     ($module:ident,$kind:ty,{$($variant:ident => $text:literal),+ $(,)?}) => {
         pub(super) mod $module {
-            use super::*;
+            use super::{Deserialize, Deserializer, Serializer};
             pub(crate) fn serialize<S: Serializer>(value: &$kind, serializer: S) -> Result<S::Ok,S::Error> {
                 serializer.serialize_str(match value { $(<$kind>::$variant => $text),+ })
             }

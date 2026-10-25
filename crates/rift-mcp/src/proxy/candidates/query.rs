@@ -1,7 +1,6 @@
-use super::{CapturedCandidates, RiftProxy};
+use super::RiftProxy;
 use rift_error::{RiftError, errors};
 use rift_protocol::query::QueryParams;
-use rift_search::query::FactRequirement;
 use rift_search::sparql::QueryLimits;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
@@ -16,7 +15,6 @@ mod tests;
 pub(super) struct QueryForward {
     pub(super) backend: String,
     pub(super) response: Result<CallToolResponse, rmcp::ErrorData>,
-    pub(super) captured: Vec<CapturedCandidates>,
     pub(super) owned: bool,
 }
 
@@ -67,12 +65,16 @@ impl RiftProxy {
                 return Ok(QueryForward {
                     backend: selected.backend,
                     response: backend.forward_read(request.clone()).await?,
-                    captured: Vec::new(),
                     owned: false,
                 });
             }
         }
         let mut federated = false;
+        federated |= plan
+            .requirements()
+            .datasets
+            .iter()
+            .any(|graph| graph != rift_search::sparql::LOCAL_GRAPH);
         for producer in plan.retrievals() {
             let backends = self.candidate_backends(producer)?;
             federated |= backends.len() != 1 || backends[0].0 != "local";
@@ -81,15 +83,8 @@ impl RiftProxy {
             return Ok(QueryForward {
                 backend: "local".to_owned(),
                 response: self.forward_read(request.clone()).await?,
-                captured: Vec::new(),
                 owned: false,
             });
-        }
-        if plan.requirements().requires(FactRequirement::Domain) {
-            return Err(errors::server::read_unavailable()
-                .operation("query acquisition")
-                .detail("required graph facts are unavailable for the selected projects")
-                .error());
         }
         Ok(owned(
             self.evaluate_owned_query(plan, limits, deadline).await?,
@@ -111,7 +106,6 @@ fn owned(response: Result<CallToolResponse, rmcp::ErrorData>) -> QueryForward {
     QueryForward {
         backend: "local".to_owned(),
         response,
-        captured: Vec::new(),
         owned: true,
     }
 }

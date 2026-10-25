@@ -12,21 +12,8 @@ use crate::symbol_read::{CapturedView, SymbolDeclaration};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Most encoded answer bytes per page, reserving room for both MCP representations.
-pub const QUERY_PAGE_BYTES_MAX: u64 = 4_194_304;
-
-const STATEMENT_BYTES_MIN: u64 = 1_024;
-const STATEMENT_BYTES_MAX: u64 = 1_048_576;
-const ALGEBRA_NODES_MAX: u64 = 65_536;
-const REQUESTS_MAX: u64 = 100_000;
-const STATEMENTS_MAX: u64 = 10_000_000;
-const FACT_BYTES_MIN: u64 = 1_048_576;
-const FACT_BYTES_MAX: u64 = 4_294_967_296;
-const RESULT_ITEMS_MAX: u64 = 1_000_000;
-const RESULT_BYTES_MIN: u64 = 1_024;
-const RESULT_BYTES_MAX: u64 = 1_073_741_824;
-const PAGE_ITEMS_MAX: u64 = 10_000;
-const PAGE_BYTES_MIN: u64 = 1_024;
+/// Default encoded answer bytes per page, reserving room for both MCP representations.
+pub const QUERY_PAGE_BYTES_DEFAULT: u64 = 4_194_304;
 
 /// The query language the server evaluates.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -46,9 +33,9 @@ pub enum QueryLanguage {
     { "query": "ASK { ?symbol a :Symbol; :name 'ReadService' }", "language": "sparql" }
 ]))]
 pub struct QueryParams {
-    /// SPARQL Query text. The server supplies vocabulary and standard prefixes.
+    /// Query text.
     pub query: String,
-    /// The implemented query language. Omitted selects SPARQL.
+    /// Currently only SPARQL is supported.
     #[serde(default)]
     pub language: QueryLanguage,
 }
@@ -75,7 +62,6 @@ pub struct QuerySymbol {
     /// The logical symbol's current selected facts.
     pub symbol: Symbol,
     /// Physical declarations, preserving their association indices.
-    #[schemars(length(max = 10000))]
     pub declarations: Vec<SymbolDeclaration>,
 }
 
@@ -90,7 +76,6 @@ pub struct QuerySource {
     pub digest: Option<crate::identity::SourceDigest>,
     /// Selected text, absent when source is unavailable or unrequested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 67_108_864))]
     pub text: Option<String>,
 }
 
@@ -156,30 +141,46 @@ impl From<Pagination> for QueryPagination {
 /// The `[search.query]` bounds for acquisition, evaluation and retained answers.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[schemars(transform = crate::schema::declare_query_ranges)]
 pub struct QueryConfiguration {
-    /// Most query text admitted before parsing, 1kb to 1mb.
+    /// Most query text bytes admitted before parsing. Must be positive.
     pub statement_size: crate::configuration::ByteSize,
-    /// Most parsed algebra nodes, 1 to 65536.
-    #[schemars(range(min = 1, max = 65_536))]
+    /// Most parsed algebra nodes. Must be positive.
+    #[schemars(range(min = 1))]
     pub algebra_nodes: u64,
-    /// Most provider requests during one acquisition, 1 to 100000.
-    #[schemars(range(min = 1, max = 100_000))]
+    /// Most provider requests during one acquisition. Must be positive.
+    #[schemars(range(min = 1))]
     pub requests: u64,
-    /// Most projected RDF statements, 1 to 10000000.
-    #[schemars(range(min = 1, max = 10_000_000))]
+    /// Most projected RDF statements. Must be positive.
+    #[schemars(range(min = 1))]
     pub statements: u64,
-    /// Most projected RDF term bytes, 1mb to 4gb.
+    /// Most projected RDF term bytes. Must be positive.
     pub fact_size: crate::configuration::ByteSize,
-    /// Most evaluated rows or triples retained, 1 to 1000000.
-    #[schemars(range(min = 1, max = 1_000_000))]
+    /// Most evaluated rows or triples retained. Must be positive.
+    #[schemars(range(min = 1))]
     pub results: u64,
-    /// Most serialized bytes retained for one answer, 1kb to 1gb.
+    /// Most serialized bytes retained for one answer. Must be positive.
     pub result_size: crate::configuration::ByteSize,
-    /// Most rows or triples served in one transport page, 1 to 10000.
-    #[schemars(range(min = 1, max = 10_000))]
+    /// Most rows or triples served in one transport page. Must be positive.
+    #[schemars(range(min = 1))]
     pub page_size: u64,
-    /// Most encoded answer bytes in one transport page, 1kb to 4mb.
+    /// Most encoded answer bytes in one transport page. Must be positive.
     pub page_limit: crate::configuration::ByteSize,
+    /// Most encoded request bytes sent to one query child. Omitted derives four times
+    /// `statement_size + fact_size + result_size`, plus 33554432 bytes for framing and metadata.
+    pub input_size: Option<crate::configuration::ByteSize>,
+    /// Most encoded response bytes read from one query child. Omitted uses the same
+    /// derivation as `input_size`, independently of an explicit `input_size`.
+    pub output_size: Option<crate::configuration::ByteSize>,
+    /// Most acquired record material retained by one query. Omitted uses the same
+    /// derivation as `input_size`, independently of either exchange override.
+    pub material_size: Option<crate::configuration::ByteSize>,
+    /// Most live Rust allocation bytes in one query child. Omitted derives twice
+    /// `statement_size + fact_size + result_size`, plus 33554432 bytes for initial allocations.
+    pub heap_size: Option<crate::configuration::ByteSize>,
+    /// Most diagnostic bytes retained from one query child's standard error.
+    /// Omitted retains 8192 bytes; protocol acknowledgment bytes are counted separately.
+    pub diagnostic_size: Option<crate::configuration::ByteSize>,
 }
 
 impl Default for QueryConfiguration {
@@ -193,7 +194,12 @@ impl Default for QueryConfiguration {
             results: 1_000_000,
             result_size: crate::configuration::ByteSize::from_bytes(134_217_728),
             page_size: 1_000,
-            page_limit: crate::configuration::ByteSize::from_bytes(QUERY_PAGE_BYTES_MAX),
+            page_limit: crate::configuration::ByteSize::from_bytes(QUERY_PAGE_BYTES_DEFAULT),
+            input_size: None,
+            output_size: None,
+            material_size: None,
+            heap_size: None,
+            diagnostic_size: None,
         }
     }
 }
@@ -202,43 +208,73 @@ impl QueryConfiguration {
     pub(crate) fn violation(&self) -> Option<crate::configuration::ConfigurationViolation> {
         crate::configuration::first_out_of_range([
             (
+                "search.query.input_size",
+                self.input_size
+                    .map_or(1, crate::configuration::ByteSize::bytes),
+                1,
+                u64::MAX,
+            ),
+            (
+                "search.query.output_size",
+                self.output_size
+                    .map_or(1, crate::configuration::ByteSize::bytes),
+                1,
+                u64::MAX,
+            ),
+            (
+                "search.query.material_size",
+                self.material_size
+                    .map_or(1, crate::configuration::ByteSize::bytes),
+                1,
+                u64::MAX,
+            ),
+            (
+                "search.query.heap_size",
+                self.heap_size
+                    .map_or(1, crate::configuration::ByteSize::bytes),
+                1,
+                u64::MAX,
+            ),
+            (
+                "search.query.diagnostic_size",
+                self.diagnostic_size
+                    .map_or(1, crate::configuration::ByteSize::bytes),
+                1,
+                u64::MAX,
+            ),
+            (
                 "search.query.statement_size",
                 self.statement_size.bytes(),
-                STATEMENT_BYTES_MIN,
-                STATEMENT_BYTES_MAX,
+                1,
+                u64::MAX,
             ),
             (
                 "search.query.algebra_nodes",
                 self.algebra_nodes,
                 1,
-                ALGEBRA_NODES_MAX,
+                u64::MAX,
             ),
-            ("search.query.requests", self.requests, 1, REQUESTS_MAX),
-            (
-                "search.query.statements",
-                self.statements,
-                1,
-                STATEMENTS_MAX,
-            ),
+            ("search.query.requests", self.requests, 1, u64::MAX),
+            ("search.query.statements", self.statements, 1, u64::MAX),
             (
                 "search.query.fact_size",
                 self.fact_size.bytes(),
-                FACT_BYTES_MIN,
-                FACT_BYTES_MAX,
+                1,
+                u64::MAX,
             ),
-            ("search.query.results", self.results, 1, RESULT_ITEMS_MAX),
+            ("search.query.results", self.results, 1, u64::MAX),
             (
                 "search.query.result_size",
                 self.result_size.bytes(),
-                RESULT_BYTES_MIN,
-                RESULT_BYTES_MAX,
+                1,
+                u64::MAX,
             ),
-            ("search.query.page_size", self.page_size, 1, PAGE_ITEMS_MAX),
+            ("search.query.page_size", self.page_size, 1, u64::MAX),
             (
                 "search.query.page_limit",
                 self.page_limit.bytes(),
-                PAGE_BYTES_MIN,
-                QUERY_PAGE_BYTES_MAX,
+                1,
+                u64::MAX,
             ),
         ])
     }

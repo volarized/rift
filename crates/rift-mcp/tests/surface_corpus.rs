@@ -179,10 +179,9 @@ async fn discovered_id(
     if request["scope"]
         .as_str()
         .is_none_or(|scope| scope == "local")
+        && let Some(path) = path.or((name == "beacon_one").then_some("lib.rs"))
     {
-        if let Some(path) = path.or((name == "beacon_one").then_some("lib.rs")) {
-            return crate::workspace_client::captured_seed(client, name, path).await;
-        }
+        return crate::workspace_client::captured_seed(client, name, path).await;
     }
     let producer = serde_json::from_value(request.clone())?;
     let request = crate::workspace_client::query::retrieval(&producer)?;

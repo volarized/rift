@@ -115,13 +115,19 @@ const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 /// The lock a blocking operation's worker permit is recorded under, waits and holds alike.
 pub(crate) const WORKER_PERMIT_LOCK: &str = "worker.permit";
 
-pub(crate) fn captured_views() -> Result<rift_server::LocalSymbolViews, RiftError> {
-    let material_bytes_max = usize::try_from(8_u64 * 1024 * 1024 * 1024)
+pub(crate) fn captured_views(
+    server: &ServerConfiguration,
+) -> Result<rift_server::LocalSymbolViews, RiftError> {
+    let material_bytes_max = usize::try_from(server.retained_size.bytes())
         .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    Ok(rift_server::LocalSymbolViews::new(
+    let views_max = usize::try_from(server.retained_views)
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    rift_server::LocalSymbolViews::bounded(
         material_bytes_max,
         crate::http::token_entropy("captured view key")?,
-    ))
+        views_max,
+        Duration::from_millis(server.view_lifetime.milliseconds()),
+    )
 }
 
 /// One admitted blocking operation's worker permit, recorded as [`WORKER_PERMIT_LOCK`].
@@ -2124,7 +2130,9 @@ impl RiftMcp {
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
         validation.feed_engines(Arc::clone(&engines));
-        let local_views = std::sync::OnceLock::from(captured_views()?);
+        let local_views = std::sync::OnceLock::from(captured_views(
+            &startup_configuration.server_configuration(),
+        )?);
         let server = Self {
             root: root.clone(),
             identity,
@@ -2146,7 +2154,9 @@ impl RiftMcp {
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
             local_views: Arc::new(local_views),
-            candidate_responses: Arc::default(),
+            candidate_responses: Arc::new(candidates::CandidateResponses::for_configuration(
+                &startup_configuration.server_configuration(),
+            )),
             #[cfg(test)]
             query_program: std::env::var_os("CARGO_BIN_EXE_rift")
                 .map(|program| Arc::new(PathBuf::from(program))),
@@ -2417,6 +2427,29 @@ impl RiftMcp {
         if let Some(captured) = self.captured_query(&params).await? {
             return Ok(Json(captured));
         }
+        if params.rev.is_none()
+            && params.change.is_none()
+            && params.target != rift_protocol::read::SearchParamsTarget::Commit
+            && let Some(capture) = extensions.get::<crate::global::CapturedGlobalViews>()
+        {
+            let (resolved, answer, warnings, references, deadline) =
+                self.current_search_inputs(&params).await?;
+            return self
+                .route_current_tree_search(
+                    resolved,
+                    params,
+                    answer,
+                    warnings,
+                    references,
+                    (deadline, Some(capture.clone())),
+                )
+                .await
+                .map(|Json(answer)| {
+                    Json(rift_protocol::search_read::SearchReadResult::Results(
+                        Box::new(answer),
+                    ))
+                });
+        }
         self.search_result(params).await.map(|Json(answer)| {
             Json(rift_protocol::search_read::SearchReadResult::Results(
                 Box::new(answer),
@@ -2549,8 +2582,15 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let (resolved, answer, warnings, references, deadline) =
             self.current_search_inputs(&params).await?;
-        self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
-            .await
+        self.route_current_tree_search(
+            resolved,
+            params,
+            answer,
+            warnings,
+            references,
+            (deadline, None),
+        )
+        .await
     }
 
     async fn current_search_inputs(
@@ -2637,19 +2677,23 @@ impl RiftMcp {
         answer: StoreAnswer,
         warnings: Vec<ReadWarning>,
         references: EngineReferences,
-        deadline: RequestDeadline,
+        (deadline, capture): (RequestDeadline, Option<crate::global::CapturedGlobalViews>),
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let references = Arc::new(references);
-        if params.pattern.is_some()
-            && !matches!(
-                params.scope,
-                SearchScope::Local
-                    | SearchScope::NamedLocal { .. }
-                    | SearchScope::ProfileLocal { .. }
-            )
-        {
+        let local_scope = matches!(
+            params.scope,
+            SearchScope::Local | SearchScope::NamedLocal { .. } | SearchScope::ProfileLocal { .. }
+        );
+        if params.pattern.is_some() && !local_scope {
             return self
-                .route_pattern_search(resolved, params, answer, warnings, references, deadline)
+                .route_pattern_search(
+                    resolved,
+                    params,
+                    answer,
+                    warnings,
+                    references,
+                    (deadline, capture),
+                )
                 .await;
         }
         let parsed = params
@@ -2659,15 +2703,7 @@ impl RiftMcp {
         let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
             .then_some(parsed)
             .flatten();
-        let (Some(parsed), false) = (
-            remote_query,
-            matches!(
-                params.scope,
-                SearchScope::Local
-                    | SearchScope::NamedLocal { .. }
-                    | SearchScope::ProfileLocal { .. }
-            ),
-        ) else {
+        let (Some(parsed), false) = (remote_query, local_scope) else {
             let mut answer = self
                 .current_tree_search_selected(&resolved, params, answer, references)
                 .await?;
@@ -2696,18 +2732,40 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
+        let captured = capture.is_some();
         let (route, mut remote) = self
             .global_read(
                 deadline,
                 &configuration,
                 &read_context,
                 |client, packages| async move {
-                    package_search(&client, requested, parsed, &packages).await
+                    if captured {
+                        crate::global::captured_package_search(
+                            &client, requested, parsed, &packages,
+                        )
+                        .await
+                    } else {
+                        package_search(&client, requested, parsed, &packages)
+                            .await
+                            .map(|candidates| crate::global::CapturedGlobalSearchCandidates {
+                                view: None,
+                                candidates,
+                            })
+                    }
                 },
             )
             .await;
-        let remote_warnings = std::mem::take(&mut remote.warnings);
-        let mut answer = merge_search(&params, limit, local, remote)
+        if let Some(capture) = capture
+            && route.client.is_some()
+            && !route.remote_packages.is_empty()
+        {
+            capture
+                .include_view(remote.view.as_ref())
+                .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
+        }
+        remote.attach_view();
+        let remote_warnings = std::mem::take(&mut remote.candidates.warnings);
+        let mut answer = merge_search(&params, limit, local, remote.candidates)
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
@@ -2726,7 +2784,7 @@ impl RiftMcp {
         answer: StoreAnswer,
         warnings: Vec<ReadWarning>,
         references: Arc<EngineReferences>,
-        deadline: RequestDeadline,
+        (deadline, capture): (RequestDeadline, Option<crate::global::CapturedGlobalViews>),
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let limit = rift_server::search_page_limit(&params)
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
@@ -2752,6 +2810,14 @@ impl RiftMcp {
                 package_patterns(&client, requested, &packages).await
             })
             .await;
+        if let Some(capture) = capture
+            && route.client.is_some()
+            && !route.remote_packages.is_empty()
+        {
+            capture
+                .include_view(remote.view.as_ref())
+                .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
+        }
         let mut answer = merge_patterns(&params, limit, local, remote);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
@@ -3475,9 +3541,18 @@ impl RiftMcp {
             .run("current workspace read", move || operation(&reads))
             .await
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
-        if let Some(stale) = resolved.stale.clone() {
-            answer.warnings_mut().push(stale);
-        }
+        answer.warnings_mut().extend(Self::current_tree_warnings(
+            resolved,
+            include_local_preparation,
+        ));
+        Ok(Json(answer))
+    }
+
+    fn current_tree_warnings(
+        resolved: &ResolvedWorkspace,
+        include_local_preparation: bool,
+    ) -> Vec<ReadWarning> {
+        let mut warnings = resolved.stale.clone().into_iter().collect::<Vec<_>>();
         if include_local_preparation
             && let Some(warning) = resolved
                 .published
@@ -3485,9 +3560,9 @@ impl RiftMcp {
                 .as_ref()
                 .and_then(super::validation::LocalIndexPreparation::warning)
         {
-            answer.warnings_mut().push(warning);
+            warnings.push(warning);
         }
-        Ok(Json(answer))
+        warnings
     }
 
     /// Reads one selected source path while the rest of its workspace is still preparing.
@@ -4292,57 +4367,54 @@ impl ServerHandler for RiftMcp {
         let _ = context.extensions.insert(operation.clone());
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("tools/call", {
-            answered = span
-                .instrument(async {
-                    rift_tracing::debug!("tool request started");
-                    if request.name == "get_symbol" {
-                        let (published, _) = read_published(&self.published).await.snapshot();
-                        let limit = 2.min(self.limits.results_max());
-                        let examples = match published.reads.canonical_examples(limit) {
-                            Ok(examples) => examples,
-                            Err(error) => {
-                                operation.record("error.type", error.slug().as_str());
-                                return error
-                                    .mcp()
-                                    .tool_failure(wire::ErrorPhase::Read)
-                                    .into_call_tool_result();
-                            }
-                        };
-                        let _ = context.extensions.insert(SymbolExamples(examples));
-                    }
-                    let mut result = if request.name == "search_candidates" {
-                        self.search_candidates_call(request, &operation).await
-                    } else if request.name == "query_candidates" {
-                        Self::query_candidates_call(request)
-                    } else if request.name == "query_facts" {
-                        self.query_facts_call(request).await
-                    } else {
-                        let routed = ToolCallContext::new(self, request, context);
-                        match self.tool_router.call(routed).await {
-                            Err(error) => {
-                                let failure = parameter_failure.take().map_or_else(
-                                    || ToolFailure::from(error),
-                                    |failure| {
-                                        ToolFailure::Registered(failure, wire::ErrorPhase::Read)
-                                    },
-                                );
-                                if let ToolFailure::Registered(failure, _) = &failure {
-                                    operation
-                                        .record("error.type", failure.registered().slug().as_str());
-                                }
-                                failure.into_call_tool_result()
-                            }
-                            Ok(response) => Ok(response),
+            answered = Box::pin(span.instrument(async {
+                rift_tracing::debug!("tool request started");
+                if request.name == "get_symbol" {
+                    let (published, _) = read_published(&self.published).await.snapshot();
+                    let limit = 2.min(self.limits.results_max());
+                    let examples = match published.reads.canonical_examples(limit) {
+                        Ok(examples) => examples,
+                        Err(error) => {
+                            operation.record("error.type", error.slug().as_str());
+                            return error
+                                .mcp()
+                                .tool_failure(wire::ErrorPhase::Read)
+                                .into_call_tool_result();
                         }
                     };
-                    candidates::write_captured_context(&mut result, captured.as_deref());
-                    rift_tracing::debug!(
-                        is_error = Ending::of_tool_call(&result) != Ending::Answered,
-                        "tool request completed"
-                    );
-                    result
-                })
-                .await;
+                    let _ = context.extensions.insert(SymbolExamples(examples));
+                }
+                let mut result = if request.name == "search_candidates" {
+                    self.search_candidates_call(request, &operation).await
+                } else if request.name == "query_candidates" {
+                    Self::query_candidates_call(request)
+                } else if request.name == "query_facts" {
+                    self.query_facts_call(request).await
+                } else {
+                    let routed = ToolCallContext::new(self, request, context);
+                    match self.tool_router.call(routed).await {
+                        Err(error) => {
+                            let failure = parameter_failure.take().map_or_else(
+                                || ToolFailure::from(error),
+                                |failure| ToolFailure::Registered(failure, wire::ErrorPhase::Read),
+                            );
+                            if let ToolFailure::Registered(failure, _) = &failure {
+                                operation
+                                    .record("error.type", failure.registered().slug().as_str());
+                            }
+                            failure.into_call_tool_result()
+                        }
+                        Ok(response) => Ok(response),
+                    }
+                };
+                candidates::write_captured_context(&mut result, captured.as_deref());
+                rift_tracing::debug!(
+                    is_error = Ending::of_tool_call(&result) != Ending::Answered,
+                    "tool request completed"
+                );
+                result
+            }))
+            .await;
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
@@ -5415,6 +5487,35 @@ done
         Ok(())
     }
 
+    fn assert_partial_name_preparation(partial: &SearchResult) {
+        assert_eq!(partial.results.len(), 1);
+        assert_eq!(
+            partial.results[0].path.as_ref().map(|path| path.0.as_str()),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            partial.results[0].source.as_deref(),
+            Some("pub fn beacon() {}")
+        );
+        assert_eq!(
+            partial
+                .warnings
+                .iter()
+                .filter(|warning| matches!(
+                    warning,
+                    ReadWarning::LocalIndexPreparing {
+                        prepared: 2,
+                        total: Some(3),
+                        ready_in: None,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "an existing name hit does not finish the selected local scope"
+        );
+    }
+
     #[tokio::test]
     async fn partial_name_hit_warns_until_another_matching_file_is_prepared() -> TestResult {
         let (directory, assembled) = starting_fixture().await?;
@@ -5447,32 +5548,7 @@ done
             .answered_search(Parameters(parameters.clone()))
             .await?
             .0;
-        assert_eq!(partial.results.len(), 1);
-        assert_eq!(
-            partial.results[0].path.as_ref().map(|path| path.0.as_str()),
-            Some("src/lib.rs")
-        );
-        assert_eq!(
-            partial.results[0].source.as_deref(),
-            Some("pub fn beacon() {}")
-        );
-        assert_eq!(
-            partial
-                .warnings
-                .iter()
-                .filter(|warning| matches!(
-                    warning,
-                    ReadWarning::LocalIndexPreparing {
-                        prepared: 2,
-                        total: Some(3),
-                        ready_in: None,
-                        ..
-                    }
-                ))
-                .count(),
-            1,
-            "an existing name hit does not finish the selected local scope"
-        );
+        assert_partial_name_preparation(&partial);
         assembled.context.validation.observe_whole_workspace()?;
         let pending = assembled.context.validation.take_pending();
         assert_eq!(
@@ -6128,9 +6204,8 @@ done
             &self,
             params: Parameters<SearchParams>,
         ) -> Result<super::Json<SearchResult>, super::ToolFailure> {
-            let super::Json(answer) = self
-                .discovery_search(params, rmcp::model::Extensions::default())
-                .await?;
+            let super::Json(answer) =
+                Box::pin(self.discovery_search(params, rmcp::model::Extensions::default())).await?;
             match answer {
                 rift_protocol::search_read::SearchReadResult::Results(answer) => {
                     Ok(super::Json(*answer))

@@ -11,6 +11,7 @@ from rift_dev.rift_test_client import (
     array_value,
     object_value,
     string_value,
+    tail_text,
 )
 
 _INPUT_FIELDS = frozenset(
@@ -142,13 +143,23 @@ def incoming_references_request(symbol: str) -> JsonObject:
 
 def bindings(answer: JsonObject) -> list[JsonObject]:
     """Require the actual SELECT result branch before inspecting its rows."""
+    if not isinstance(answer.get("answer"), dict):
+        raise _bindings_error(answer)
     result = object_value(answer.get("answer"), "query answer")
     if result.get("result") != "bindings":
-        raise AssertionError(f"expected SELECT bindings: {answer!r}")
+        raise _bindings_error(answer)
     return [
         object_value(row, "query binding")
         for row in array_value(result.get("bindings"), "query bindings")
     ]
+
+
+def _bindings_error(answer: JsonObject) -> AssertionError:
+    response = tail_text(json.dumps(answer, ensure_ascii=False, allow_nan=False))
+    return AssertionError(
+        f"expected SELECT bindings: outcome={answer.get('outcome')!r}, "
+        f"reason={answer.get('reason')!r}; response={response}"
+    )
 
 
 def iri(row: JsonObject, field: str) -> str:

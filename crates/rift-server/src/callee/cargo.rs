@@ -242,7 +242,7 @@ mod tests {
         assert!(start.elapsed() < Duration::from_secs(2));
     }
     struct CargoFixture {
-        _workspace: tempfile::TempDir,
+        workspace: tempfile::TempDir,
         reads: ReadService,
         engines: EnginePool,
         roots: CalleeRoots,
@@ -250,8 +250,6 @@ mod tests {
     }
 
     fn installed_tokio_fixture() -> Result<CargoFixture, Box<dyn std::error::Error>> {
-        let phase = std::time::Instant::now();
-        eprintln!("Tokio fixture: begin");
         let workspace = tempfile::tempdir()?;
         std::fs::write(
             workspace.path().join("Cargo.toml"),
@@ -295,6 +293,32 @@ mod tests {
             &|| false,
         )?;
         assert_eq!(std::fs::read(workspace.path().join("Cargo.lock"))?, lock);
+        let fixture = CargoFixture {
+            workspace,
+            reads,
+            engines,
+            roots,
+            configuration,
+        };
+        let target = installed_tokio_target(&fixture)?;
+        assert!(
+            target.symbol().is_none(),
+            "Tokio channel has no established canonical identity"
+        );
+        target.validate(
+            &fixture.roots,
+            &[fixture.workspace.path()],
+            &fixture.configuration,
+        )?;
+        Ok(fixture)
+    }
+
+    fn installed_tokio_target(
+        fixture: &CargoFixture,
+    ) -> Result<crate::QueryPackageTarget, Box<dyn std::error::Error>> {
+        let workspace = &fixture.workspace;
+        let roots = &fixture.roots;
+        let configuration = &fixture.configuration;
         let root = roots.packages.iter().find(|root| matches!(root.origin(), rift_core::SourceLocation::Dependency { package } if package.manager == "cargo" && package.registry == "crates.io" && package.name == "tokio")).ok_or("Cargo-reported Tokio source root")?;
         let uri = root
             .root()
@@ -317,11 +341,34 @@ mod tests {
             position,
             encoding: rift_lsp::capabilities::PositionEncoding::Utf16,
         };
-        let crate::callee::CalleeFile::Package(callee) =
-            crate::callee::callee_file(&roots, &[workspace.path()], &caller, named)?
+        let crate::callee::CalleeFile::Package(target) =
+            crate::callee::callee_file(roots, &[workspace.path()], &caller, named)?
         else {
             panic!("exact Cargo source owner");
         };
+        verify_tokio_analyses(fixture, root, &file, &text, offset)?;
+        let target = crate::QueryPackageTarget::prepare(
+            crate::QuerySourceRequest::Call(target.with_query_sources(
+                Vec::new(),
+                rift_protocol::read::Language::from_identity_segment("rust")?,
+            )),
+            roots,
+            &[workspace.path()],
+            configuration,
+        )?;
+        Ok(target)
+    }
+
+    fn verify_tokio_analyses(
+        fixture: &CargoFixture,
+        root: &rift_lsp::uri::PackageRoot,
+        file: &rift_lsp::uri::PackageFile,
+        text: &str,
+        offset: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let workspace = &fixture.workspace;
+        let roots = &fixture.roots;
+        let configuration = &fixture.configuration;
         let inventory_root = crate::callee::query_file_path(&root.root().root_uri()?)?;
         let inventory = rift_index::WorkspaceIndex::build(
             &inventory_root,
@@ -354,16 +401,50 @@ mod tests {
             rift_core::SourceKind::Authored,
         )?;
         let language = rift_protocol::read::Language::from_identity_segment("rust")?;
-        let selected_sources = [rift_analysis::PackageSource::new(file.path(), &text)];
+        let selected_sources = [rift_analysis::PackageSource::new(file.path(), text)];
         let selected_input = rift_analysis::ExactPackageInput::new(
             &owner,
             &language,
             &origin,
             &selected_sources,
-            rift_analysis::ExactPackageLimits::from_configuration(&configuration)?,
+            rift_analysis::ExactPackageLimits::from_configuration(configuration)?,
         )?
         .with_framework_context(&metadata, &[])?;
         let selected = rift_analysis::PackageAnalyzer::analyze(selected_input, 1)?;
+        let selected = selected_tokio_declaration(selected, file, text, offset)?;
+        let input = rift_analysis::ExactPackageInput::new(
+            &owner,
+            &language,
+            &origin,
+            &sources,
+            rift_analysis::ExactPackageLimits::from_configuration(configuration)?,
+        )?
+        .with_framework_context(&metadata, &[])?;
+        let (library_path, _) = input
+            .namespace_input()
+            .library_target()
+            .ok_or("original Cargo library target")?;
+        let library = sources
+            .iter()
+            .find(|source| source.path() == &library_path)
+            .copied()
+            .ok_or("captured library root")?;
+        let input = input.with_library(&owner, metadata[0], library)?;
+        let oracle = rift_analysis::PackageAnalyzer::analyze(input, 1)?;
+        verify_tokio_oracle(oracle, file, text, offset, &selected)
+    }
+
+    struct TokioDeclaration {
+        identity: Option<rift_core::SymbolId>,
+        range: (u64, u64),
+    }
+
+    fn selected_tokio_declaration(
+        selected: rift_analysis::PackageAnalysis,
+        file: &rift_lsp::uri::PackageFile,
+        text: &str,
+        offset: usize,
+    ) -> Result<TokioDeclaration, Box<dyn std::error::Error>> {
         assert_eq!(selected.files().len(), 1);
         let parsed = selected.files()[0].file();
         assert_eq!(parsed.path(), file.path());
@@ -407,77 +488,33 @@ mod tests {
                 Some((key, record))
             })
             .collect::<Vec<_>>();
-        let graph = selected_semantics.graph();
-        let candidates = graph
-            .records()
-            .iter()
-            .flat_map(|record| record.contributions().iter().map(move |key| (record, key)))
-            .filter_map(|(record, key)| {
-                let contribution = graph.contribution(key)?;
-                Some((
-                    key,
-                    contribution.facts().map(|facts| facts.name()),
-                    contribution.source(),
-                    record.identity(),
-                ))
-            })
-            .take(16)
-            .collect::<Vec<_>>();
-        eprintln!(
-            "selected-file Tokio unit {:?} syntax range {:?} scope {:?} first records {:?}",
-            file.unit(),
-            declaration_range,
-            scope.contributions().iter().take(16).collect::<Vec<_>>(),
-            candidates,
-        );
         assert_eq!(physical.len(), 1);
         assert!(selected_semantics.assembled_record(physical[0].1).is_some());
-        let selected_identity = physical[0].1.identity().cloned();
-        eprintln!(
-            "selected-file Tokio exact physical declaration {:?} range {:?} identity {:?}",
-            physical[0].0,
-            declaration_range,
-            physical[0].1.identity(),
-        );
-        let input = rift_analysis::ExactPackageInput::new(
-            &owner,
-            &language,
-            &origin,
-            &sources,
-            rift_analysis::ExactPackageLimits::from_configuration(&configuration)?,
-        )?
-        .with_framework_context(&metadata, &[])?;
-        let (library_path, _) = input
-            .namespace_input()
-            .library_target()
-            .ok_or("original Cargo library target")?;
-        let library = sources
-            .iter()
-            .find(|source| source.path() == &library_path)
-            .copied()
-            .ok_or("captured library root")?;
-        let input = input.with_library(&owner, metadata[0], library)?;
-        let oracle = rift_analysis::PackageAnalyzer::analyze(input, 1)?;
+        Ok(TokioDeclaration {
+            identity: physical[0].1.identity().cloned(),
+            range: declaration_range,
+        })
+    }
+
+    fn verify_tokio_oracle(
+        oracle: rift_analysis::PackageAnalysis,
+        file: &rift_lsp::uri::PackageFile,
+        text: &str,
+        offset: usize,
+        captured: &TokioDeclaration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let original = oracle
             .files()
             .iter()
             .find(|original| original.file().path() == file.path())
             .ok_or("original selected Tokio source")?;
         assert_eq!(original.file().source(), text);
-        let selected_unit = file.unit().to_string();
-        eprintln!(
-            "full Tokio oracle Rust files {} declarations {} selected {:?}",
-            sources.len(),
-            oracle.publication().declarations.len(),
-            oracle
-                .publication()
-                .declarations
-                .iter()
-                .filter(|declaration| declaration.unit.as_str() == selected_unit.as_str())
-                .take(16)
-                .map(|declaration| (&declaration.symbol, &declaration.range))
-                .collect::<Vec<_>>()
-        );
+        let declaration = original
+            .file()
+            .enclosing_symbol(u64::try_from(offset)?, u64::try_from(offset)? + 1)
+            .ok_or("original Tokio syntax declaration")?;
+        let declaration_range = (declaration.item_range.start, declaration.item_range.end);
+        assert_eq!(declaration_range, captured.range);
         let (_, _, semantics, _) = oracle.into_parts();
         let scope = semantics
             .graph()
@@ -492,48 +529,24 @@ mod tests {
                 let record = semantics.graph().record_for(key.reference())?;
                 Some((
                     key,
-                    contribution.facts().map(|facts| facts.name()),
+                    contribution
+                        .facts()
+                        .map(rift_core::PortableSymbolFacts::name),
                     binding.range(),
                     record.identity(),
                     semantics.assembled_record(record).is_some(),
                 ))
             })
             .collect::<Vec<_>>();
-        eprintln!("full Tokio oracle selected provider records {selected:?}");
         let original = selected
             .iter()
             .find(|(_, name, range, _, _)| {
                 *name == Some("channel") && (range.start(), range.end()) == declaration_range
             })
             .ok_or("authoritative Tokio physical declaration")?;
-        assert_eq!(selected_identity.as_ref(), original.3);
+        assert_eq!(captured.identity.as_ref(), original.3);
         assert!(original.4);
-        eprintln!(
-            "Tokio fixture: exact namespace preparation starts at {:?}",
-            phase.elapsed()
-        );
-        let target = crate::QueryPackageTarget::prepare(
-            crate::QuerySourceRequest::Call(callee.with_query_sources(
-                Vec::new(),
-                rift_protocol::read::Language::from_identity_segment("rust")?,
-            )),
-            &roots,
-            &[workspace.path()],
-            &configuration,
-        )?;
-        assert!(
-            target.symbol().is_none(),
-            "Tokio channel has no established canonical identity"
-        );
-        target.validate(&roots, &[workspace.path()], &configuration)?;
-        eprintln!("Tokio fixture: complete at {:?}", phase.elapsed());
-        Ok(CargoFixture {
-            _workspace: workspace,
-            reads,
-            engines,
-            roots,
-            configuration,
-        })
+        Ok(())
     }
 
     #[test]
@@ -556,7 +569,6 @@ mod tests {
 
     async fn physical_tokio_call(fixture: &CargoFixture) -> Result<(), Box<dyn std::error::Error>> {
         use rift_protocol::query::{QueryAnswer, RdfTerm};
-        use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
         use rift_search::query::QueryLimits;
         use rift_search::sparql::{PreparedQuery, QueryCancellation};
 
@@ -576,7 +588,7 @@ mod tests {
             rift_protocol::read::SymbolId("rift://symbol/local/rust/beacon/beacon".to_owned());
         query
             .resolve(
-                &[caller.clone()],
+                std::slice::from_ref(&caller),
                 rift_protocol::read::TraversalDirection::Outgoing,
             )
             .await?;
@@ -609,6 +621,39 @@ mod tests {
             phase.elapsed()
         );
         let packages = query.references().query_package_facts().clone();
+        let (unit, expected) = tokio_channel_source(&packages)?;
+        let limits = QueryLimits::try_from(&fixture.configuration.search.query)?;
+        let mut facts = fixture.reads.query_facts(true, false, limits)?;
+        crate::merge_query_facts(&mut facts, packages.clone())?;
+        let statement = format!(
+            "SELECT ?target ?name WHERE {{ <{}> :calls ?target . ?target :name ?name FILTER(?name = \"channel\") }}",
+            caller.as_str()
+        );
+        let answer = PreparedQuery::parse(&statement, limits)?.evaluate(
+            facts,
+            limits,
+            QueryCancellation::default(),
+        )?;
+        let QueryAnswer::Bindings { bindings, .. } = answer else {
+            panic!("SELECT bindings");
+        };
+        assert_eq!(bindings.len(), 1, "one physical channel resource");
+        assert!(matches!(
+            bindings[0].get("target"),
+            Some(RdfTerm::BlankNode { .. })
+        ));
+        assert_tokio_source_view(
+            material
+                .with_provider_selection(selection)?
+                .with_package_facts(packages)?,
+            &unit,
+            &expected,
+        )
+    }
+
+    fn tokio_channel_source(
+        packages: &rift_search::query::QueryFacts,
+    ) -> Result<(rift_protocol::read::SourceUnitId, String), Box<dyn std::error::Error>> {
         assert!(
             !packages.provider_edges.is_empty(),
             "physical dependency edge retained"
@@ -637,31 +682,17 @@ mod tests {
                 .get(usize::try_from(range.start)?..usize::try_from(range.end)?)
                 .is_some_and(|text| text.contains("pub fn channel"))
         );
-        let limits = QueryLimits::try_from(&fixture.configuration.search.query)?;
-        let mut facts = fixture.reads.query_facts(true, false, limits)?;
-        crate::merge_query_facts(&mut facts, packages.clone())?;
-        let statement = format!(
-            "SELECT ?target ?name WHERE {{ <{}> :calls ?target . ?target :name ?name FILTER(?name = \"channel\") }}",
-            caller.as_str()
-        );
-        let answer = PreparedQuery::parse(&statement, limits)?.evaluate(
-            facts,
-            limits,
-            QueryCancellation::default(),
-        )?;
-        let QueryAnswer::Bindings { bindings, .. } = answer else {
-            panic!("SELECT bindings");
-        };
-        assert_eq!(bindings.len(), 1, "one physical channel resource");
-        assert!(matches!(
-            bindings[0].get("target"),
-            Some(RdfTerm::BlankNode { .. })
-        ));
+        Ok((unit, expected))
+    }
+
+    fn assert_tokio_source_view(
+        material: crate::LocalSymbolViewInput,
+        unit: &rift_protocol::read::SourceUnitId,
+        expected: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
         let owner = material.owner().clone();
         let root = material.root().to_owned();
-        let material = material
-            .with_provider_selection(selection)?
-            .with_package_facts(packages)?;
         let views = crate::LocalSymbolViews::new(64 << 20, [41; 32]);
         let view = views
             .capture(material)?
@@ -687,7 +718,7 @@ mod tests {
         };
         assert!(source_complete);
         assert_eq!(source.text, expected);
-        assert_eq!(source.span.unit, unit);
+        assert_eq!(&source.span.unit, unit);
         Ok(())
     }
 
@@ -800,6 +831,15 @@ mod tests {
             }), "original Tokio ownership at frontier {depth}: {next:?}");
             frontier = next;
         }
+        assert_tokio_three_step_facts(reads, &query, roots, configuration)
+    }
+
+    fn assert_tokio_three_step_facts(
+        reads: &ReadService,
+        query: &crate::EngineQuery<'_>,
+        roots: &CalleeRoots,
+        configuration: &WorkspaceConfiguration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         for target in query.validation_targets() {
             target.validate(roots, &[reads.index().root()], configuration)?;
         }

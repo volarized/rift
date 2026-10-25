@@ -3,6 +3,7 @@
 mod identity;
 mod nodes;
 mod provider;
+mod symbols;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,9 +25,11 @@ pub(super) struct VirtualDataset {
     facts: Arc<QueryFacts>,
     occurrences: Arc<OccurrenceIndex>,
     providers: Arc<provider::ProviderIndex>,
+    symbols: Arc<Option<symbols::SymbolIndex>>,
     limits: QueryLimits,
     cancellation: CancellationToken,
     retrieval: Option<Arc<super::services::QueryServiceData>>,
+    retrieval_owner: Option<Arc<Self>>,
     retained_graph: Option<Arc<Vec<rift_protocol::query::RdfTriple>>>,
     datasets: Arc<Vec<(Term, Self)>>,
     identities: Arc<identity::IdentityMap>,
@@ -93,6 +96,28 @@ impl OccurrenceIndex {
 }
 
 impl VirtualDataset {
+    pub(super) fn selected_resource(
+        &self,
+        graph: &str,
+        endpoint: &crate::query::QueryProviderEndpoint,
+    ) -> Result<Term, QueryError> {
+        let selected = if graph == super::LOCAL_GRAPH {
+            self
+        } else {
+            let graph = iri(graph)?;
+            self.datasets
+                .iter()
+                .find(|(name, _)| name == &graph)
+                .map(|(_, selected)| selected)
+                .ok_or_else(|| failure::invalid("selected provider graph is absent"))?
+        };
+        selected.identities.public(
+            selected
+                .providers
+                .selected_resource(&selected.facts, endpoint)?,
+        )
+    }
+
     pub(super) fn new(
         facts: QueryFacts,
         limits: QueryLimits,
@@ -113,13 +138,21 @@ impl VirtualDataset {
         }
         let occurrences = Arc::new(OccurrenceIndex::new(&facts, limits, &cancellation)?);
         let providers = Arc::new(provider::ProviderIndex::new(&facts, limits, &cancellation)?);
+        let symbols = Arc::new(symbols::SymbolIndex::new(
+            &facts,
+            &providers,
+            limits,
+            cancellation.clone(),
+        )?);
         Ok(Self {
             facts: Arc::new(facts),
             occurrences,
             providers,
+            symbols,
             limits,
             cancellation,
             retrieval: None,
+            retrieval_owner: None,
             retained_graph: None,
             datasets: Arc::new(Vec::new()),
             identities: Arc::new(identity::IdentityMap::default()),
@@ -127,12 +160,12 @@ impl VirtualDataset {
         })
     }
 
-    fn project(&self, pattern: Pattern) -> Result<Vec<InternalQuad<Term>>, QueryError> {
+    fn project(&self, pattern: &Pattern) -> Result<Vec<InternalQuad<Term>>, QueryError> {
         let mut output = Projection::new(pattern.clone(), self.limits, self.cancellation.clone())?;
-        self.project_owner(&mut output, &pattern, iri(super::LOCAL_GRAPH)?)?;
+        self.project_owner(&mut output, pattern, iri(super::LOCAL_GRAPH)?)?;
         for (graph, selected) in self.datasets.iter() {
             if pattern.graph_name != Some(GraphName::DefaultGraph) || selected.default_graph {
-                selected.project_owner(&mut output, &pattern, graph.clone())?;
+                selected.project_owner(&mut output, pattern, graph.clone())?;
             }
         }
         Ok(output.quads)
@@ -218,8 +251,10 @@ impl VirtualDataset {
     pub(super) fn with_retrieval(
         mut self,
         retrieval: Arc<super::services::QueryServiceData>,
+        owner: Arc<Self>,
     ) -> Self {
         self.retrieval = Some(retrieval);
+        self.retrieval_owner = Some(owner);
         self
     }
 
@@ -242,6 +277,9 @@ impl VirtualDataset {
                 blank(&serde_json::to_vec(&(request_digest.as_slice(), index)).map_err(invalid)?)?;
             output.class(resource.clone(), "SearchHit")?;
             output.fields(resource.clone(), hit)?;
+            if let Some(view) = &retrieval.result.view {
+                output.fields_at(resource.clone(), "view", view)?;
+            }
             output.push(
                 resource.clone(),
                 vocabulary("index")?,
@@ -260,9 +298,25 @@ impl VirtualDataset {
                 )?;
             }
             if let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit {
-                let subject = match &symbol.id {
-                    Some(identity) => iri(identity.as_str())?,
-                    None => child(&resource, "symbol", 0)?,
+                let subject = match retrieval.targets.get(index) {
+                    Some(Some((graph, endpoint))) => self
+                        .retrieval_owner
+                        .as_ref()
+                        .ok_or_else(|| failure::evaluation("retrieval owner is unavailable"))?
+                        .selected_resource(graph, endpoint)?,
+                    Some(None) => match &symbol.id {
+                        Some(identity) => iri(identity.as_str())?,
+                        None => {
+                            return Err(failure::evaluation(
+                                "retrieval symbol has no original selected record",
+                            ));
+                        }
+                    },
+                    None => {
+                        return Err(failure::evaluation(
+                            "retrieval record associations do not match selected rows",
+                        ));
+                    }
                 };
                 output.push(resource, vocabulary("symbol")?, subject.clone())?;
                 output.symbol(
@@ -287,16 +341,6 @@ impl VirtualDataset {
                 super::services::rdf_term(&triple.predicate)?,
                 super::services::rdf_term(&triple.object)?,
             )?;
-        }
-        Ok(())
-    }
-
-    fn symbols(&self, output: &mut Projection) -> Result<(), QueryError> {
-        if output.relationship_predicate() {
-            return Ok(());
-        }
-        for (symbol, subject) in self.facts.symbols.iter().zip(&self.providers.symbols) {
-            output.symbol(&subject, symbol)?;
         }
         Ok(())
     }
@@ -500,6 +544,7 @@ struct Projection {
     quads: Vec<InternalQuad<Term>>,
     cancellation: CancellationToken,
     identities: Arc<identity::IdentityMap>,
+    symbol_subjects: Option<symbols::SymbolIndex>,
 }
 
 impl Projection {
@@ -517,6 +562,7 @@ impl Projection {
             quads: Vec::new(),
             cancellation,
             identities: Arc::new(identity::IdentityMap::default()),
+            symbol_subjects: None,
         })
     }
 
@@ -538,6 +584,10 @@ impl Projection {
     fn push(&mut self, subject: Term, predicate: Term, object: Term) -> Result<(), QueryError> {
         if self.cancellation.is_cancelled() {
             return Err(failure::cancelled());
+        }
+        if let Some(subjects) = &mut self.symbol_subjects {
+            subjects.record(subject, self.limits);
+            return Ok(());
         }
         if !self.matches(&subject, &predicate, &object) {
             return Ok(());
@@ -744,6 +794,13 @@ impl Projection {
     }
 
     fn fields<T: Serialize>(&mut self, subject: Term, value: &T) -> Result<(), QueryError> {
+        if self
+            .symbol_subjects
+            .as_ref()
+            .is_some_and(symbols::SymbolIndex::is_full)
+        {
+            return Ok(());
+        }
         let value = serde_json::to_value(value).map_err(invalid)?;
         self.project_value(subject, value)
     }
@@ -754,6 +811,13 @@ impl Projection {
         key: &str,
         value: &T,
     ) -> Result<(), QueryError> {
+        if self
+            .symbol_subjects
+            .as_ref()
+            .is_some_and(symbols::SymbolIndex::is_full)
+        {
+            return Ok(());
+        }
         let value = serde_json::to_value(value).map_err(invalid)?;
         self.project_value(subject, serde_json::json!({key: value}))
     }
@@ -762,12 +826,24 @@ impl Projection {
         let mut pending = vec![(subject, value)];
         let mut visited = 0usize;
         while let Some((subject, value)) = pending.pop() {
-            visited = visited
-                .checked_add(1)
-                .ok_or_else(|| failure::bound("quads_max"))?;
-            if visited > self.limits.quads_max || pending.len() > self.limits.quads_max {
-                return Err(failure::bound("quads_max"));
+            if self
+                .symbol_subjects
+                .as_ref()
+                .is_some_and(symbols::SymbolIndex::is_full)
+            {
+                return Ok(());
             }
+            let next = visited.checked_add(1).filter(|next| {
+                *next <= self.limits.quads_max && pending.len() <= self.limits.quads_max
+            });
+            let Some(next) = next else {
+                if let Some(subjects) = &mut self.symbol_subjects {
+                    subjects.disable();
+                    return Ok(());
+                }
+                return Err(failure::bound("quads_max"));
+            };
+            visited = next;
             let Value::Object(fields) = value else {
                 continue;
             };
@@ -941,7 +1017,7 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
             object: object.cloned(),
             graph_name,
         };
-        match self.project(pattern) {
+        match self.project(&pattern) {
             Ok(quads) => quads.into_iter().map(Ok).collect::<Vec<_>>().into_iter(),
             Err(error) => vec![Err(error)].into_iter(),
         }

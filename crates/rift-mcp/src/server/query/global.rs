@@ -89,6 +89,7 @@ impl GlobalQuery {
         !facets.is_empty()
             && self.capabilities.iter().any(|operation| {
                 operation.direction == direction
+                    && operation.bounds.is_some()
                     && facets.iter().all(|facet| operation.facets.contains(facet))
             })
     }
@@ -213,13 +214,14 @@ impl GlobalQuery {
     pub(super) async fn acquire(
         &mut self,
         mcp: &RiftMcp,
-        resolved: &super::super::ResolvedWorkspace,
+        input: &super::ScopedQueryInput<'_>,
         query: &mut EngineQuery<'_>,
         seeds: &[SymbolId],
         direction: TraversalDirection,
         facets: &[RelationshipFacet],
-        deadline: super::super::RequestDeadline,
     ) -> Result<bool, RiftError> {
+        let resolved = input.resolved;
+        let deadline = input.execution.deadline;
         self.prepare(mcp, resolved, query, deadline).await?;
         if !self.supports(direction, facets) {
             return Ok(false);
@@ -230,12 +232,62 @@ impl GlobalQuery {
                 "the selected incoming package domain is incomplete",
             ));
         }
+        let configuration = resolved.published.configuration.global_configuration();
+        let bounds = self
+            .capabilities
+            .iter()
+            .find(|operation| {
+                operation.direction == direction
+                    && facets.iter().all(|facet| operation.facets.contains(facet))
+            })
+            .and_then(|operation| operation.bounds.as_ref())
+            .ok_or_else(|| {
+                acquisition_failure("global relationship count bounds are unavailable")
+            })?;
+        let seeds_max = usize::try_from(bounds.max_seeds.min(configuration.max_seeds))
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                acquisition_failure("relationship subject bound exceeds the platform bound")
+            })?;
+        let facets_max = usize::try_from(bounds.max_facets.min(configuration.max_facets))
+            .ok()
+            .filter(|count| *count > 0)
+            .ok_or_else(|| {
+                acquisition_failure("relationship facet bound exceeds the platform bound")
+            })?;
+        for seeds in seeds.chunks(seeds_max) {
+            for facets in facets.chunks(facets_max) {
+                if let Some(mut budget) = query.query_budget() {
+                    budget.charge(&(seeds, facets, &self.packages, &self.runtimes, &self.view))?;
+                }
+                self.acquire_selected(
+                    resolved,
+                    query,
+                    RelationshipSelection {
+                        seeds: seeds.to_vec(),
+                        direction,
+                        facets: facets.to_vec(),
+                    },
+                    deadline,
+                )
+                .await?;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn acquire_selected(
+        &mut self,
+        resolved: &super::super::ResolvedWorkspace,
+        query: &mut EngineQuery<'_>,
+        relationships: RelationshipSelection,
+        deadline: super::super::RequestDeadline,
+    ) -> Result<(), RiftError> {
+        let direction = relationships.direction;
+        let facets = relationships.facets.clone();
         let request = RelationshipSearchRequest {
-            relationships: RelationshipSelection {
-                seeds: seeds.to_vec(),
-                direction,
-                facets: facets.to_vec(),
-            },
+            relationships,
             packages: if self.view.is_none() {
                 self.packages.clone()
             } else {
@@ -261,7 +313,13 @@ impl GlobalQuery {
         let limits = rift_cloud_client::relationships::RelationshipReadLimits {
             requests_max: query.remaining_provider_requests(),
             records_max: configuration.statements,
-            bytes_max: configuration.fact_size.bytes(),
+            bytes_max: u64::try_from(
+                rift_server::QueryProcessLimits::from_query(
+                    rift_search::query::QueryLimits::try_from(&configuration)?,
+                )?
+                .material_bytes_max,
+            )
+            .map_err(|_| acquisition_failure("query material bound exceeds the platform bound"))?,
         };
         let client = self
             .client
@@ -294,12 +352,12 @@ impl GlobalQuery {
             query.admit_relationship_records(
                 &group.seed,
                 direction,
-                facets,
+                &facets,
                 group.relationships,
                 group.occurrences,
             )?;
         }
-        Ok(true)
+        Ok(())
     }
 
     fn include_view(&mut self, view: &CapturedView) -> Result<(), RiftError> {
@@ -329,10 +387,19 @@ mod tests {
 
     #[test]
     fn facet_selection_preserves_required_local_operations() {
+        let configuration = rift_protocol::configuration::GlobalConfiguration::default();
         let query = GlobalQuery {
             capabilities: vec![RelationshipCapability {
                 direction: TraversalDirection::Outgoing,
                 facets: vec![RelationshipFacet::Calls],
+                bounds: Some(rift_protocol::relationship_read::RelationshipBounds {
+                    max_seeds: configuration.max_seeds,
+                    max_facets: configuration.max_facets,
+                    max_relationships: configuration.max_relationships,
+                    max_occurrences: configuration.max_occurrences,
+                    max_symbols: configuration.max_symbols,
+                    max_sources: configuration.max_sources,
+                }),
             }],
             ..GlobalQuery::default()
         };

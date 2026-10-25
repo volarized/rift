@@ -627,6 +627,18 @@ pub const GLOBAL_SOURCE_BYTES_DEFAULT: u64 = 1 << 20;
 pub const GLOBAL_SOURCE_BYTES_MIN: u64 = 1;
 /// Global source payload bytes, at most.
 pub const GLOBAL_SOURCE_BYTES_MAX: u64 = 64 << 20;
+/// Default original symbols in one global relationship page.
+pub const GLOBAL_SYMBOLS_DEFAULT: u16 = 10_000;
+/// Default original source units in one global relationship page.
+pub const GLOBAL_SOURCES_DEFAULT: u16 = 10_000;
+/// Default subjects in one global relationship request.
+pub const GLOBAL_SEEDS_DEFAULT: u16 = 64;
+/// Default selected facets in one global relationship request.
+pub const GLOBAL_FACETS_DEFAULT: u16 = 16;
+/// Default relationship projections in one global relationship group.
+pub const GLOBAL_RELATIONSHIPS_DEFAULT: u16 = 1_000;
+/// Default occurrence projections in one global relationship group.
+pub const GLOBAL_OCCURRENCES_DEFAULT: u16 = 1_000;
 
 /// The `[global]` table: global REST API access, request bounds, and cache lifetimes.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
@@ -656,6 +668,24 @@ pub struct GlobalConfiguration {
     /// Most UTF-8 bytes in one source payload from the global API. The client also applies the
     /// advertised source bound, using the smaller value.
     pub max_source: ByteSize,
+    /// Most original symbol records in one global relationship page.
+    #[schemars(range(min = 1))]
+    pub max_symbols: u64,
+    /// Most original source units in one global relationship page.
+    #[schemars(range(min = 1))]
+    pub max_sources: u64,
+    /// Most subjects in one global relationship request.
+    #[schemars(range(min = 1))]
+    pub max_seeds: u64,
+    /// Most selected facets in one global relationship request.
+    #[schemars(range(min = 1))]
+    pub max_facets: u64,
+    /// Most relationship projections in one global relationship group.
+    #[schemars(range(min = 1))]
+    pub max_relationships: u64,
+    /// Most occurrence projections in one global relationship group.
+    #[schemars(range(min = 1))]
+    pub max_occurrences: u64,
     /// Capabilities cache lifetime, 1m to 24h.
     pub capabilities_ttl: Duration,
     /// Package-resolution cache lifetime, 1m to 24h.
@@ -677,6 +707,12 @@ impl Default for GlobalConfiguration {
             max_request: ByteSize::from_bytes(GLOBAL_REQUEST_BYTES_DEFAULT),
             max_response: ByteSize::from_bytes(GLOBAL_RESPONSE_BYTES_DEFAULT),
             max_source: ByteSize::from_bytes(GLOBAL_SOURCE_BYTES_DEFAULT),
+            max_symbols: u64::from(GLOBAL_SYMBOLS_DEFAULT),
+            max_sources: u64::from(GLOBAL_SOURCES_DEFAULT),
+            max_seeds: u64::from(GLOBAL_SEEDS_DEFAULT),
+            max_facets: u64::from(GLOBAL_FACETS_DEFAULT),
+            max_relationships: u64::from(GLOBAL_RELATIONSHIPS_DEFAULT),
+            max_occurrences: u64::from(GLOBAL_OCCURRENCES_DEFAULT),
             capabilities_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
             resolution_ttl: Duration::from_millis(GLOBAL_CACHE_TTL_MS_DEFAULT),
             failure_ttl: Duration::from_millis(GLOBAL_FAILURE_TTL_MS_DEFAULT),
@@ -730,6 +766,17 @@ impl GlobalConfiguration {
                 GLOBAL_SOURCE_BYTES_MIN,
                 GLOBAL_SOURCE_BYTES_MAX,
             ),
+            ("global.max_symbols", self.max_symbols, 1, u64::MAX),
+            ("global.max_sources", self.max_sources, 1, u64::MAX),
+            ("global.max_seeds", self.max_seeds, 1, u64::MAX),
+            ("global.max_facets", self.max_facets, 1, u64::MAX),
+            (
+                "global.max_relationships",
+                self.max_relationships,
+                1,
+                u64::MAX,
+            ),
+            ("global.max_occurrences", self.max_occurrences, 1, u64::MAX),
             (
                 "global.capabilities_ttl",
                 self.capabilities_ttl.milliseconds(),
@@ -852,6 +899,13 @@ pub struct ResolvedLspConfiguration<'configuration> {
 #[serde(default, deny_unknown_fields)]
 #[schemars(transform = crate::schema::declare_server_ranges)]
 pub struct ServerConfiguration {
+    /// Most measured material bytes retained for exact reads and query continuations.
+    pub retained_size: ByteSize,
+    /// Most immutable views retained by one serving owner.
+    #[schemars(range(min = 1))]
+    pub retained_views: u64,
+    /// Longest lifetime of a newly captured view. An upstream expiry can shorten it.
+    pub view_lifetime: Duration,
     /// Workers running blocking filesystem and parser operations at once, 1 to 64.
     #[schemars(range(min = 1, max = 64))]
     pub num_workers: u64,
@@ -888,6 +942,9 @@ pub struct ServerConfiguration {
 impl Default for ServerConfiguration {
     fn default() -> Self {
         Self {
+            retained_size: ByteSize::from_bytes(8 * 1024 * 1024 * 1024),
+            retained_views: 256,
+            view_lifetime: Duration::from_millis(15 * 60 * 1000),
             num_workers: 4,
             workspaces: SERVER_WORKSPACES_DEFAULT,
             worker_queue_timeout: Duration::from_millis(30_000),
@@ -918,6 +975,19 @@ impl ServerConfiguration {
     /// The table's bounds in key order.
     fn violation(&self) -> Option<ConfigurationViolation> {
         first_out_of_range([
+            (
+                "server.retained_size",
+                self.retained_size.bytes(),
+                1,
+                u64::MAX,
+            ),
+            ("server.retained_views", self.retained_views, 1, u64::MAX),
+            (
+                "server.view_lifetime",
+                self.view_lifetime.milliseconds(),
+                1,
+                u64::MAX,
+            ),
             (
                 "server.num_workers",
                 self.num_workers,

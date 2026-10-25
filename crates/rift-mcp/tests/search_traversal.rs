@@ -24,7 +24,7 @@ mod hermetic_search;
 mod live_engine_gate;
 #[path = "python_runtime/environment.rs"]
 mod python_runtime_environment;
-mod query;
+use workspace_client::query;
 #[cfg(unix)]
 #[path = "../../rift-lsp/tests/typescript_install.rs"]
 mod typescript_install;
@@ -72,6 +72,152 @@ const ENGINELESS_FILES: &[(&str, &str)] = &[
     ("Cargo.toml", RUST_LIBRARY),
     ("lib.rs", "pub fn beacon() {}\n"),
 ];
+
+const PHYSICAL_CALLS_QUERY: &str = "SELECT ?symbol ?name ?unit ?start ?end ?derivation { \
+    ?caller a :Symbol; :name 'root'; :calls ?symbol . \
+    ?symbol :name ?name; :declarations ?declaration . \
+    ?declaration :unit ?unit; :range ?range . ?range :start ?start; :end ?end . \
+    ?relationship a :Relationship; :from ?caller; :to ?symbol; :facets :calls; :derivation ?derivation \
+    } ORDER BY ?name";
+
+#[tokio::test]
+async fn physical_calls_keep_the_admitted_runtime_source() -> TestResult {
+    let configuration =
+        format!("[source]\nexclude = [\"rift.toml\", \"pyproject.toml\"]\n\n{ENGINE}");
+    let (directory, client, _server_task) = workspace_client::served_prepared_workspace(
+        &[
+            ("pyproject.toml", GRAPH_METADATA),
+            ("graph.py", "def root():\n    return len([])\n"),
+        ],
+        Some(configuration),
+        python_runtime_environment::prepare,
+    )
+    .await?;
+    let answer = call_retrying_acceptance(&client, tool_request("search", &json!({
+        "query":"SELECT ?caller ?symbol ?name ?unit { ?caller a :Symbol; :name 'root'; :calls ?symbol . ?symbol :name ?name; :declarations ?declaration . ?declaration :unit ?unit }"
+    }))).await?;
+    let rows = query::rows(&answer)?;
+    assert_eq!(rows.len(), 1, "{answer}");
+    assert_eq!(rows[0]["caller"]["type"], "blank_node");
+    assert_eq!(query::literal(&rows[0], "name")?, "len");
+    let unit = query::iri(&rows[0], "unit")?;
+    let (owner, _) = rift_protocol::identity::parse_source_unit_identity(unit)?;
+    assert!(matches!(
+        owner,
+        Some(rift_protocol::identity::SymbolOwner::Runtime { .. })
+    ));
+    let params = json!({"unit":unit,"view":answer["view"]["id"]});
+    let original = call_retrying_acceptance(&client, tool_request("get_source", &params)).await?;
+    assert_eq!(original["outcome"], "found", "{original}");
+    assert_eq!(original["view"], answer["view"]);
+    assert!(
+        original["source"]["text"]
+            .as_str()
+            .ok_or("runtime source")?
+            .contains("def len(")
+    );
+    std::fs::write(
+        directory.path().join("graph.py"),
+        "# changed after capture\n",
+    )?;
+    let held = call_retrying_acceptance(&client, tool_request("get_source", &params)).await?;
+    assert_eq!(held["source"], original["source"]);
+    assert_eq!(held["view"], original["view"]);
+    client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_query_refuses_unserved_records_in_the_complete_domain() -> TestResult {
+    let source = "def leaf():\n    return 1\n\ndef root():\n    return leaf()\n";
+    let (_directory, client, _server_task) =
+        served_workspace(&[("graph.py", source)], Some(ENGINE.to_owned())).await?;
+    let selected = call_retrying_acceptance(&client, tool_request("search", &json!({
+        "query":"SELECT ?unit { ?symbol a :Symbol; :name 'dependencies'; :declarations ?declaration . ?declaration :unit ?unit }"
+    }))).await?;
+    let rows = query::rows(&selected)?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        query::iri(&rows[0], "unit")?,
+        "rift://source/project/rift.toml"
+    );
+    let failure = failed_call(
+        client
+            .call_tool(tool_request(
+                "search",
+                &json!({"query":PHYSICAL_CALLS_QUERY}),
+            ))
+            .await,
+    )?;
+    assert_eq!(failure.code, ErrorCode::TemporarilyUnavailable);
+    assert!(
+        failure
+            .message
+            .contains("no captured declaration name position"),
+        "{failure:?}"
+    );
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A Python file without namespace metadata keeps physical declaration bindings through
+/// actual engine calls. Held source and result identity survive a later file edit.
+#[tokio::test]
+async fn search_query_local_physical_calls_keep_held_source() -> TestResult {
+    let source = "def leaf():\n    return 1\n\ndef root():\n    return leaf()\n";
+    let (directory, client, _server_task) = served_workspace(
+        &[("graph.py", source)],
+        Some(format!("[source]\nexclude=['rift.toml']\n{ENGINE}")),
+    )
+    .await?;
+    let statement = PHYSICAL_CALLS_QUERY;
+    let answer =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let rows = query::rows(&answer)?;
+    assert_eq!(rows.len(), 1, "one original physical callee: {answer}");
+    let row = &rows[0];
+    assert_eq!(query::literal(row, "name")?, "leaf");
+    let symbol: rift_protocol::query::RdfTerm = serde_json::from_value(row["symbol"].clone())?;
+    assert!(matches!(
+        symbol,
+        rift_protocol::query::RdfTerm::BlankNode { .. }
+    ));
+    assert_eq!(
+        query::iri(row, "derivation")?,
+        format!("{}resolution", rift_search::sparql::VOCABULARY)
+    );
+    let unit = query::iri(row, "unit")?;
+    assert_eq!(unit, "rift://source/project/graph.py");
+    let start = query::literal(row, "start")?.parse::<usize>()?;
+    let end = query::literal(row, "end")?.parse::<usize>()?;
+    let expected = source.get(start..end).ok_or("original declaration range")?;
+    assert!(expected.starts_with("def leaf()"));
+    let view = answer["view"]["id"].as_str().ok_or("held physical query")?;
+    std::fs::write(
+        directory.path().join("graph.py"),
+        "def changed():\n    return 2\n",
+    )?;
+    let held = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_source",
+            &json!({"unit":unit,"range":{"start":start,"end":end},"view":view}),
+        ),
+    )
+    .await?;
+    assert_eq!(held["source"]["text"], expected);
+    let replay = format!(
+        "SELECT ?symbol ?name ?unit ?start ?end ?derivation {{ SERVICE <{}{view}> {{}} }}",
+        rift_search::sparql::RESULT_SERVICE_PREFIX,
+    );
+    let retained =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":replay}))).await?;
+    assert_eq!(retained["answer"], answer["answer"]);
+    assert_eq!(retained["view"]["expires_at"], answer["view"]["expires_at"]);
+    client.cancel().await?;
+    Ok(())
+}
 
 #[tokio::test]
 async fn search_traversal_neighbors_depth_one_reaches_the_direct_callers() -> TestResult {
@@ -356,10 +502,14 @@ async fn search_query_and_traversal_merge_carry_both_matched_by_entries_and_the_
 /// Every requested relationship must have complete provider coverage before evaluation.
 #[tokio::test]
 async fn search_traversal_over_an_unproduced_facet_serves_the_coverage_warning() -> TestResult {
+    let configuration =
+        format!("[source]\nexclude = [\"rift.toml\", \"pyproject.toml\"]\n\n{ENGINE}");
     let (_directory, client, _server_task) =
-        served_workspace(CALL_GRAPH_FILES, Some(ENGINE.to_owned())).await?;
-    let seed = captured_seed(&client, "leaf", "graph.py").await?;
-    let request = serde_json::to_value(query::path(&seed, "(^:implements|^:references)")?)?;
+        served_workspace(CALL_GRAPH_FILES, Some(configuration)).await?;
+    let request = json!({"query":
+        "SELECT ?symbol ?name { ?seed a :Symbol; :name 'leaf'; :path 'graph.py' . \
+         ?seed (^:implements|^:references) ?symbol . ?symbol :name ?name } ORDER BY ?name"
+    });
     required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
     client.cancel().await?;
     Ok(())
@@ -761,7 +911,7 @@ async fn live_walk(
         let started = std::time::Instant::now();
         let structured = call_retrying_acceptance(
             client,
-            tool_request("search", &path_arguments(&seed, direction)?),
+            tool_request("search", &path_arguments(seed, direction)?),
         )
         .await?;
         let reached = symbol_names(&structured);
@@ -1677,9 +1827,8 @@ async fn held_dependency_graph(
     Ok(())
 }
 
-/// A standard library callee's position goes to the global API as `stdlib/python` at the
-/// release the resolution served, at typeshed's own path, and the answered declaration ends
-/// the edge: the callee is a hit addressed by its unit, and nothing drops.
+/// A standard library callee retains its resolved runtime owner, typeshed source unit
+/// and exact declaration. Admitted source supplies its name without remote declaration lookup.
 #[tokio::test]
 async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global_id() -> TestResult
 {
@@ -1731,16 +1880,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     );
     assert!(counted["warnings"].is_null(), "{counted}");
 
-    let requests = declaration_requests(&fixture).await;
-    assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
-    let positions = requests[0]["positions"]
-        .as_array()
-        .ok_or("the request carries positions")?;
-    assert_eq!(positions.len(), 1, "{requests:?}");
-    assert_eq!(
-        positions[0]["unit"],
-        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
-    );
+    assert!(declaration_requests(&fixture).await.is_empty());
 
     let source_requests: Vec<Value> = fixture
         .requests()
@@ -1865,11 +2005,11 @@ async fn search_query_continues_three_calls_through_an_installed_dependency() ->
     Ok(())
 }
 
-/// One unnamed required dependency callee refuses the complete query. A complete
-/// sibling query retains the named declaration, exact package owner and original bytes.
+/// Admitted installed source supplies both callees, including the declaration the remote
+/// fixture does not name. Exact reads retain the original package owner and bytes.
 #[cfg(unix)]
 #[tokio::test]
-async fn search_query_refuses_an_unnamed_required_dependency_callee() -> TestResult {
+async fn search_query_keeps_installed_callees_without_remote_declaration_names() -> TestResult {
     let fixture = python_global_api().await?;
     let configuration = format!(
         "[source]\nexclude = [\".venv/**\"]\n\n{}\n{OUTGOING_ENGINE}",
@@ -1881,27 +2021,14 @@ async fn search_query_refuses_an_unnamed_required_dependency_callee() -> TestRes
         &captured_seed(&client, "hello", "app.py").await?,
         "outgoing",
     )?;
-    required_facts_unavailable(&client, &request, ErrorCode::TemporarilyUnavailable).await?;
-    let requests = declaration_requests(&fixture).await;
-    let mut asked = requests
-        .iter()
-        .flat_map(|request| request["positions"].as_array().cloned().unwrap_or_default())
-        .map(|position| {
-            (
-                position["unit"].as_str().unwrap_or_default().to_owned(),
-                position["line"].as_u64().unwrap_or(u64::MAX),
-            )
-        })
-        .collect::<Vec<_>>();
-    asked.sort();
-    assert_eq!(
-        asked,
-        [
-            (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 0),
-            (global_api::named_unit(&global_api::NAMED_POSITIONS[1]), 4)
-        ]
-    );
-    assert_eq!(requests.len(), 1);
+    let answer = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
+    assert_eq!(projected_names(&answer)?, ["greet", "quiet"]);
+    for name in ["greet", "quiet"] {
+        let exact = read_dependency_hit(&client, &answer, name).await?;
+        assert_eq!(exact["symbol"]["name"], name);
+        assert_eq!(exact["symbol"]["origin"]["package"]["version"], "1.0.0");
+    }
+    assert!(declaration_requests(&fixture).await.is_empty());
     client.cancel().await?;
 
     let files = INSTALLED_FILES.iter().map(|(path, source)| (*path, if *path == "app.py" {
@@ -1921,6 +2048,55 @@ async fn search_query_refuses_an_unnamed_required_dependency_callee() -> TestRes
     assert_eq!(exact["symbol"]["origin"]["location"], "dependency");
     assert_eq!(exact["symbol"]["origin"]["package"]["version"], "1.0.0");
     held_dependency_graph(&client, &answer).await?;
+    client.cancel().await?;
+    Ok(())
+}
+
+/// A stale engine URI cannot supply a declaration when its installed source is absent
+/// before the first acquisition. A remote name does not substitute for missing source.
+#[cfg(unix)]
+#[tokio::test]
+async fn search_query_refuses_an_installed_callee_without_admitted_source() -> TestResult {
+    let fixture = python_global_api().await?;
+    let (engine, configuration) = utf16_calls_engine(&fixture.endpoint)?;
+    let files = INSTALLED_FILES
+        .iter()
+        .copied()
+        .filter(|(path, _)| *path != ".venv/lib/python3.12/site-packages/greeting/core.py")
+        .collect::<Vec<_>>();
+    let (directory, client, _server_task) = served_workspace(&files, Some(configuration)).await?;
+    let missing = ".venv/lib/python3.12/site-packages/greeting/core.py";
+    assert!(!directory.path().join(missing).exists());
+    let request = path_arguments(
+        &captured_seed(&client, "hello", "app.py").await?,
+        "outgoing",
+    )?;
+    required_facts_unavailable(&client, &request, ErrorCode::TemporarilyUnavailable).await?;
+    let log = std::fs::read_to_string(engine.path().join("engine.sh.log"))?;
+    let requests = log
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "callHierarchy/outgoingCalls"),
+        "the supplied target must reach source admission"
+    );
+    let supplied = std::fs::read_to_string(engine.path().join("engine.sh.targets"))?;
+    let caller = requests
+        .iter()
+        .find(|request| request["method"] == "callHierarchy/outgoingCalls")
+        .and_then(|request| request["params"]["item"]["uri"].as_str())
+        .and_then(|uri| uri.strip_suffix("app.py"))
+        .ok_or("original caller source URI")?;
+    assert!(!supplied.is_empty());
+    assert!(
+        supplied
+            .lines()
+            .all(|uri| uri.strip_prefix(caller) == Some(missing))
+    );
+    assert!(declaration_requests(&fixture).await.is_empty());
     client.cancel().await?;
     Ok(())
 }
@@ -2062,6 +2238,7 @@ while IFS= read -r header; do
   IFS= read -r blank
   length=$(printf '%s' "$header" | tr -dc 0-9)
   body=$(dd bs=1 count="$length" 2>/dev/null)
+  printf '%s\n' "$body" >> "$0.log"
   id=$(printf '%s' "$body" | grep -o '"id":[0-9]*' | head -1 | tr -dc 0-9)
   uri=$(printf '%s' "$body" | grep -o '"uri":"[^"]*"' | head -1 | cut -d'"' -f4)
   case "$body" in
@@ -2073,6 +2250,7 @@ while IFS= read -r header; do
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"name\":\"hello\",\"kind\":12,\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":3,\"character\":0},\"end\":{\"line\":5,\"character\":24}},\"selectionRange\":{\"start\":{\"line\":3,\"character\":4},\"end\":{\"line\":3,\"character\":9}}}]}" ;;
     *'"method":"callHierarchy/outgoingCalls"'*)
       core="${uri%/app.py}/.venv/lib/python3.12/site-packages/greeting/core.py"
+      printf '%s\n' "$core" >> "$0.targets"
       frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"to\":{\"name\":\"greet\",\"kind\":12,\"uri\":\"$core\",\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":1,\"character\":15}},\"selectionRange\":{\"start\":{\"line\":0,\"character\":4},\"end\":{\"line\":0,\"character\":9}}},\"fromRanges\":[]}]}" ;;
     *'"method":"exit"'*)
       exit 0 ;;
@@ -2082,21 +2260,28 @@ while IFS= read -r header; do
 done
 "#;
 
-/// A dependency callee an engine counting in UTF-16 names goes to the global API in a
-/// request spelling that encoding, and the declaration it answers ends the edge.
+#[cfg(unix)]
+fn utf16_calls_engine(endpoint: &str) -> TestResult<(tempfile::TempDir, String)> {
+    let engine = tempfile::tempdir()?;
+    let script = engine.path().join("engine.sh");
+    std::fs::write(&script, UTF16_CALLS_ENGINE)?;
+    let command = serde_json::to_string(&script)?;
+    let configuration = format!(
+        "[source]\nexclude = [\".venv/**\"]\n\n{}\n\
+         [languages.python.lsp]\ncommand = [\"sh\", {command}]\nsettle_delay = \"10ms\"\n",
+        global_table(endpoint),
+    );
+    Ok((engine, configuration))
+}
+
+/// An engine omitting positionEncoding uses UTF-16. Its original prepared position,
+/// dependency declaration, source range and held bytes survive local acquisition.
 #[cfg(unix)]
 #[tokio::test]
 async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf16() -> TestResult {
     let fixture = python_global_api().await?;
-    let engine = tempfile::tempdir()?;
+    let (engine, configuration) = utf16_calls_engine(&fixture.endpoint)?;
     let script = engine.path().join("engine.sh");
-    std::fs::write(&script, UTF16_CALLS_ENGINE)?;
-    let configuration = format!(
-        "[source]\nexclude = [\".venv/**\"]\n\n{}\n\
-         [languages.python.lsp]\ncommand = [\"sh\", \"{}\"]\nsettle_delay = \"10ms\"\n",
-        global_table(&fixture.endpoint),
-        script.display()
-    );
     let (_directory, client, _server_task) =
         served_workspace(INSTALLED_FILES, Some(configuration)).await?;
 
@@ -2118,17 +2303,58 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
         global_api::named_identity(&global_api::NAMED_POSITIONS[1]),
         "{greet}"
     );
-    let requests = declaration_requests(&fixture).await;
-    assert_eq!(requests.len(), 1, "one request per walk: {requests:?}");
-    assert_eq!(requests[0]["position_encoding"], json!("utf-16"));
+    assert!(declaration_requests(&fixture).await.is_empty());
+    let exact = read_dependency_hit(&client, &hello, "greet").await?;
+    let declaration = &exact["declarations"][0];
+    let start = usize::try_from(
+        declaration["range"]["start"]
+            .as_u64()
+            .ok_or("declaration start")?,
+    )?;
+    let end = usize::try_from(
+        declaration["range"]["end"]
+            .as_u64()
+            .ok_or("declaration end")?,
+    )?;
     assert_eq!(
-        requests[0]["positions"],
-        json!([{
-            "unit": global_api::named_unit(&global_api::NAMED_POSITIONS[1]),
-            "line": 0,
-            "character": 4
-        }])
+        declaration["source"]
+            .as_str()
+            .ok_or("dependency declaration source")?,
+        &global_api::GREETING_SOURCE[start..end]
     );
+    let log = std::fs::read_to_string(format!("{}.log", script.display()))?;
+    let requests = log
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared = requests
+        .iter()
+        .filter(|request| request["method"] == "textDocument/prepareCallHierarchy")
+        .collect::<Vec<_>>();
+    assert!(
+        !prepared.is_empty(),
+        "engine receives the original name position"
+    );
+    for request in prepared {
+        assert_eq!(
+            request["params"]["position"],
+            json!({"line":3,"character":4})
+        );
+    }
+    let outgoing = requests
+        .iter()
+        .filter(|request| request["method"] == "callHierarchy/outgoingCalls")
+        .collect::<Vec<_>>();
+    assert!(
+        !outgoing.is_empty(),
+        "engine receives its original prepared item"
+    );
+    for request in outgoing {
+        assert_eq!(
+            request["params"]["item"]["selectionRange"],
+            json!({"start":{"line":3,"character":4},"end":{"line":3,"character":9}})
+        );
+    }
 
     client.cancel().await?;
     Ok(())
@@ -2181,6 +2407,8 @@ fn symbol_names(structured: &Value) -> Vec<String> {
 #[cfg(unix)]
 #[tokio::test]
 async fn search_query_keeps_local_rust_facts_when_cargo_metadata_is_unavailable() -> TestResult {
+    use std::fmt::Write as _;
+
     let progress = r#"frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"ready","value":{"kind":"begin","title":"analysis"}}}'
 frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"ready","value":{"kind":"end"}}}'"#;
     let script = fake_engine::SCRIPTED_CALLS_ENGINE
@@ -2211,10 +2439,11 @@ frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"ready","value":
         ),
     );
     std::fs::write(engine.path().join("engine.sh"), script)?;
-    configuration.push_str(&format!(
+    write!(
+        configuration,
         "[languages.rust.lsp.environment]\nPATH={}\n",
         serde_json::to_string(&tools)?
-    ));
+    )?;
     let lock = "version=4\n[[package]]\nname='helper'\nversion='1.0.0'\nsource='registry+https://github.com/rust-lang/crates.io-index'\n";
     let source = "pub fn beacon() {}\n\npub fn caller() {\n    beacon();\n}\n";
     let (_directory, client, _server_task) = served_workspace(

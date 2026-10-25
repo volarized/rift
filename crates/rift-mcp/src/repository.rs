@@ -180,6 +180,9 @@ fn differing_server_keys(
     workspace: &ServerConfiguration,
 ) -> Vec<&'static str> {
     let ServerConfiguration {
+        retained_size: authority_retained_size,
+        retained_views: authority_retained_views,
+        view_lifetime: authority_view_lifetime,
         num_workers: authority_num_workers,
         workspaces: authority_workspaces,
         worker_queue_timeout: authority_worker_queue_timeout,
@@ -191,6 +194,9 @@ fn differing_server_keys(
         port_range: authority_port_range,
     } = authority;
     let ServerConfiguration {
+        retained_size: workspace_retained_size,
+        retained_views: workspace_retained_views,
+        view_lifetime: workspace_view_lifetime,
         num_workers: workspace_num_workers,
         workspaces: workspace_workspaces,
         worker_queue_timeout: workspace_worker_queue_timeout,
@@ -202,6 +208,15 @@ fn differing_server_keys(
         port_range: workspace_port_range,
     } = workspace;
     let mut keys = Vec::new();
+    if authority_retained_size != workspace_retained_size {
+        keys.push("server.retained_size");
+    }
+    if authority_retained_views != workspace_retained_views {
+        keys.push("server.retained_views");
+    }
+    if authority_view_lifetime != workspace_view_lifetime {
+        keys.push("server.view_lifetime");
+    }
     if authority_num_workers != workspace_num_workers {
         keys.push("server.num_workers");
     }

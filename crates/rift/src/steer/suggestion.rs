@@ -371,6 +371,11 @@ pub(super) mod tests {
             rdf_bytes_max: 1,
             result_items_max: 1,
             result_bytes_max: 1,
+            input_bytes_max: None,
+            output_bytes_max: None,
+            material_bytes_max: None,
+            heap_bytes_max: None,
+            diagnostic_bytes_max: None,
         };
         let prepared = rift_search::sparql::PreparedQuery::parse(&request.query, limits)
             .expect("suggestion parses");
@@ -396,7 +401,7 @@ pub(super) mod tests {
                 .retain(|_, value| value.as_array().is_none_or(|items| !items.is_empty()));
         }
         if producer.target != rift_protocol::read::SearchParamsTarget::All {
-            options["target"] = serde_json::to_value(&producer.target).expect("target serializes");
+            options["target"] = serde_json::to_value(producer.target).expect("target serializes");
         }
         if let Some(limit) = length {
             if limit != usize::try_from(super::GREP_HEAD_LIMIT_DEFAULT).expect("default fits")

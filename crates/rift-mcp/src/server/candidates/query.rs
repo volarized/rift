@@ -86,7 +86,7 @@ impl RiftMcp {
                     views,
                     &responses,
                     material,
-                    answer,
+                    &answer,
                     &configuration,
                     warnings,
                     upstream,
@@ -232,13 +232,13 @@ fn retain(
     views: &rift_server::LocalSymbolViews,
     responses: &CandidateResponses,
     material: rift_server::LocalSymbolViewInput,
-    answer: QueryAnswer,
+    answer: &QueryAnswer,
     configuration: &QueryConfiguration,
     warnings: Vec<ReadWarning>,
     upstream: Vec<QueryGlobalSelection>,
 ) -> Result<QueryReadResult, RiftError> {
     let maximum = usize::try_from(configuration.result_size.bytes()).map_err(|_| page_failure())?;
-    let (encoded, template_end, offsets) = encode_records(&answer, maximum)?;
+    let (encoded, template_end, offsets) = encode_records(answer, maximum)?;
     let material = material.with_query_result(encoded);
     let root = material
         .root()
@@ -259,8 +259,8 @@ fn retain(
             warnings,
             upstream,
         };
-        saved.pages = plan_pages(&answer, &offsets, &saved, configuration)?;
-        let response = saved.response(first_page(&answer, saved.pages.first(), &offsets), 0)?;
+        saved.pages = plan_pages(answer, &offsets, &saved, configuration)?;
+        let response = saved.response(first_page(answer, saved.pages.first(), &offsets), 0)?;
         let encoded = crate::proxy::encode_bounded(&SavedRead::Query(Box::new(saved)), BYTES_MAX)
             .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
         responses.save_bytes(
@@ -321,7 +321,10 @@ fn append_record(
     row: &impl Serialize,
     maximum: usize,
 ) -> Result<(), RiftError> {
-    let encoded = serde_json::to_vec(row).map_err(encoding_failure)?;
+    let remaining = maximum
+        .checked_sub(bytes.len())
+        .ok_or_else(retention_failure)?;
+    let encoded = crate::proxy::encode_bounded(row, remaining).map_err(encoding_failure)?;
     if bytes
         .len()
         .checked_add(encoded.len())
@@ -329,6 +332,12 @@ fn append_record(
     {
         return Err(retention_failure());
     }
+    bytes.try_reserve_exact(encoded.len()).map_err(|source| {
+        retention_failure().with(rift_error::ErrorContext::new(
+            "source",
+            rift_error::ErrorValue::source(source),
+        ))
+    })?;
     bytes.extend_from_slice(&encoded);
     Ok(())
 }

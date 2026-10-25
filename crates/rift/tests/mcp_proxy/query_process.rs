@@ -24,6 +24,11 @@ fn limits() -> QueryLimits {
         rdf_bytes_max: 1_048_576,
         result_items_max: 20_000,
         result_bytes_max: 1_048_576,
+        input_bytes_max: None,
+        output_bytes_max: None,
+        material_bytes_max: None,
+        heap_bytes_max: None,
+        diagnostic_bytes_max: None,
     }
 }
 
@@ -64,6 +69,62 @@ fn packaged_child_parses_and_evaluates_complete_results() -> TestResult {
         "query child prepare and evaluate elapsed_ms={}",
         started.elapsed().as_millis()
     );
+    Ok(())
+}
+
+#[test]
+fn packaged_child_keeps_acknowledgment_independent_of_diagnostics() -> TestResult {
+    let limits = QueryLimits {
+        diagnostic_bytes_max: Some(1),
+        ..limits()
+    };
+    let plan = rift_server::prepare_query(
+        &program(),
+        "ASK {}".into(),
+        limits,
+        Instant::now() + Duration::from_secs(10),
+        &|| false,
+    )?;
+    assert_eq!(plan.statement(), "ASK {}");
+    for (input_bytes_max, output_bytes_max) in [(Some(1), None), (None, Some(1))] {
+        let error = rift_server::prepare_query(
+            &program(),
+            "ASK {}".into(),
+            QueryLimits {
+                input_bytes_max,
+                output_bytes_max,
+                ..limits
+            },
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+        )
+        .expect_err("configured exchange admission refuses oversized data");
+        assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
+    }
+    Ok(())
+}
+
+#[test]
+fn packaged_child_large_count_bounds_do_not_preallocate_their_capacity() -> TestResult {
+    let limits = QueryLimits {
+        algebra_nodes_max: usize::MAX,
+        quads_max: usize::MAX,
+        result_items_max: usize::MAX,
+        ..limits()
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let plan =
+        rift_server::prepare_query(&program(), "ASK {}".into(), limits, deadline, &|| false)?;
+    let answer = rift_server::evaluate_query(
+        &program(),
+        plan,
+        QueryFacts::default(),
+        limits,
+        QueryServices::default(),
+        deadline,
+        &|| false,
+    )?;
+    assert_eq!(answer, QueryAnswer::Boolean { value: true });
     Ok(())
 }
 
@@ -170,6 +231,8 @@ async fn packaged_child_refuses_unversioned_and_incompatible_requests() -> TestR
     for request in [
         task.clone(),
         serde_json::json!({"version":3,"payload":task.clone()}),
+        serde_json::json!({"version":5,"payload":task.clone()}),
+        serde_json::json!({"version":6,"payload":task.clone()}),
         serde_json::json!({"version":0,"payload":task}),
     ] {
         let (status, diagnostic, response, acknowledgment) =
@@ -226,6 +289,7 @@ async fn run_child_request(
         .arg(rift_server::QUERY_CHILD_COMMAND)
         .arg(&request)
         .arg(&response)
+        .arg("8192")
         .arg("8192")
         .arg(heap_bytes_max.to_string())
         .stdout(std::process::Stdio::piped())

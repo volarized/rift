@@ -57,6 +57,7 @@ pub struct EngineReferences {
     query_relationships: Vec<Relationship>,
     query_package_facts: rift_search::query::QueryFacts,
     query_source_requests: Vec<QuerySourceRequest>,
+    query_provider_edges: Vec<query::PreparedEdge>,
 }
 
 impl EngineReferences {
@@ -64,6 +65,52 @@ impl EngineReferences {
     #[must_use]
     pub const fn query_package_facts(&self) -> &rift_search::query::QueryFacts {
         &self.query_package_facts
+    }
+
+    /// Projects acquired endpoints after the original provider records have been combined.
+    ///
+    /// # Errors
+    /// Refuses an endpoint whose original captured provider is absent.
+    pub fn project_provider_edges(
+        &self,
+        facts: &mut rift_search::query::QueryFacts,
+    ) -> Result<(), RiftError> {
+        query::project_provider_edges(&self.query_provider_edges, facts)
+    }
+
+    /// Keeps acquired scoped endpoints without copying their existing symbol or source payloads.
+    #[must_use]
+    pub fn into_provider_references(self) -> Self {
+        Self {
+            revision: self.revision,
+            query_provider_edges: self.query_provider_edges,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn has_provider_references(&self) -> bool {
+        !self.query_provider_edges.is_empty()
+    }
+
+    pub(crate) fn combine_provider_references(&self, other: &Self) -> Result<Self, RiftError> {
+        if self.revision != other.revision {
+            return errors::server::read_unavailable()
+                .operation("query relationships")
+                .detail("source revision changed between engine batches")
+                .fail();
+        }
+        let mut edges = Vec::with_capacity(
+            self.query_provider_edges
+                .len()
+                .saturating_add(other.query_provider_edges.len()),
+        );
+        edges.extend(self.query_provider_edges.iter().cloned());
+        edges.extend(other.query_provider_edges.iter().cloned());
+        Ok(Self {
+            revision: self.revision.clone(),
+            query_provider_edges: edges,
+            ..Self::default()
+        })
     }
 
     /// Combines complete query batches captured from the same source revision.
@@ -82,6 +129,7 @@ impl EngineReferences {
         self.query_relationships.extend(other.query_relationships);
         self.query_source_requests
             .extend(other.query_source_requests);
+        self.query_provider_edges.extend(other.query_provider_edges);
         merge_package_facts(&mut self.query_package_facts, other.query_package_facts)?;
         self.package_callees.extend(other.package_callees);
         self.package_declarations.extend(other.package_declarations);
@@ -116,7 +164,6 @@ impl EngineReferences {
     }
 
     /// Locally acquired relationships, excluding original remote record payloads.
-    #[must_use]
     pub fn query_local_relationships(&self) -> impl Iterator<Item = &Relationship> {
         self.query_relationships.iter()
     }
@@ -290,7 +337,9 @@ impl EngineReferences {
         reads.engine_index_current() && self.revision.as_deref() == Some(reads.engine_revision())
     }
 
-    pub(crate) fn retained_material_bytes(&self) -> usize {
+    /// Material retained by these acquired references, including vector capacity and shared context.
+    #[must_use]
+    pub fn retained_material_bytes(&self) -> usize {
         use get_size2::{GetSize, StandardTracker};
         use rift_protocol::{
             btree_material_bytes, retained_map_material, retained_sequence_material,
@@ -307,6 +356,8 @@ impl EngineReferences {
             retained_map_material(&self.outgoing, tracker, retained_vector_material);
         let (query_relationships, tracker) =
             retained_vector_material(&self.query_relationships, tracker);
+        let (provider_edges, tracker) =
+            retained_vector_material(&self.query_provider_edges, tracker);
         let query_occurrences = query::retained_occurrence_bytes(&self.query_occurrences);
         let query_package_facts = query::retained_package_bytes(&self.query_package_facts);
         let (declarations, tracker) = retained_map_material(
@@ -347,6 +398,7 @@ impl EngineReferences {
             incoming,
             outgoing,
             query_relationships,
+            provider_edges,
             query_occurrences,
             query_package_facts,
             declarations,
@@ -1052,7 +1104,7 @@ fn map_callees(
                 "engine calls",
             )?,
             CalleeFile::Package(held) => {
-                mapped.held.push(held);
+                mapped.held.push(*held);
                 continue;
             }
             CalleeFile::Unaddressed => None,
@@ -1705,7 +1757,7 @@ mod tests {
             encoding: PositionEncoding::Utf8,
         };
         match crate::callee::callee_file(&CalleeRoots::default(), &[], &caller, call)? {
-            crate::callee::CalleeFile::Package(held) => Ok(held),
+            crate::callee::CalleeFile::Package(held) => Ok(*held),
             _ => Err("a typeshed stub is held for the global API".into()),
         }
     }

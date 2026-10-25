@@ -353,26 +353,29 @@ pub(crate) async fn call_retrying_acceptance(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     params: CallToolRequestParams,
 ) -> TestResult<Value> {
-    let mut refused = None;
-    for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
-        let result = client.call_tool(params.clone()).await?;
-        if result.is_error != Some(true) {
-            return result
-                .structured_content
-                .ok_or_else(|| "the tool must return structured content".into());
+    Box::pin(async move {
+        let mut refused = None;
+        for _attempt in 0..ACCEPTANCE_ATTEMPTS_MAX {
+            let result = client.call_tool(params.clone()).await?;
+            if result.is_error != Some(true) {
+                return result
+                    .structured_content
+                    .ok_or_else(|| "the tool must return structured content".into());
+            }
+            let failure = tool_failure(&result)?;
+            if failure.retry != RetryDirective::SameRequest {
+                return Err(format!("the tool failed: {}", failure.text).into());
+            }
+            refused = Some(failure.text);
         }
-        let failure = tool_failure(&result)?;
-        if failure.retry != RetryDirective::SameRequest {
-            return Err(format!("the tool failed: {}", failure.text).into());
-        }
-        refused = Some(failure.text);
-    }
-    Err(format!(
-        "the server kept refusing a retryable request through {ACCEPTANCE_ATTEMPTS_MAX} \
+        Err(format!(
+            "the server kept refusing a retryable request through {ACCEPTANCE_ATTEMPTS_MAX} \
          attempts; the last refusal: {}",
-        refused.unwrap_or_default()
-    )
-    .into())
+            refused.unwrap_or_default()
+        )
+        .into())
+    })
+    .await
 }
 
 /// The facts of one failed tool call, read from its error text.
@@ -469,7 +472,6 @@ fn failure_head(line: &str) -> TestResult<(ErrorCode, RetryDirective)> {
 }
 
 #[path = "query/mod.rs"]
-#[allow(dead_code, reason = "shared query helpers serve several public suites")]
 pub(crate) mod query;
 
 /// Selects one original declaration before a canonical read or engine walk.

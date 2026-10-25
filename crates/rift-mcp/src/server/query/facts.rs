@@ -9,7 +9,9 @@ use rift_search::sparql::{FactRequirements, LOCAL_GRAPH, QueryFacts, QueryServic
 use rift_server::QueryExchange;
 use serde::{Deserialize, Serialize};
 
-use super::{QueryBudget, RiftMcp, ToolFailure, acquisition_failure, failure, query_limits};
+use super::{
+    QueryBudget, QueryExecution, RiftMcp, ToolFailure, acquisition_failure, failure, query_limits,
+};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -45,6 +47,8 @@ pub(crate) enum QueryFactResult {
     Unavailable(SearchUnavailable),
 }
 
+type SelectedFactView = Option<(rift_server::LocalSymbolViewInput, CapturedView)>;
+
 impl RiftMcp {
     pub(in crate::server) async fn query_facts_call(
         &self,
@@ -62,129 +66,155 @@ impl RiftMcp {
         &self,
         request: rmcp::model::CallToolRequestParams,
     ) -> Result<serde_json::Value, ToolFailure> {
-        let deadline = self.request_deadline().await;
-        let configuration = self
-            .published
-            .read()
-            .await
-            .current
-            .configuration
-            .search_configuration()
-            .query;
-        let limits = query_limits(&configuration)?;
-        let budget = QueryBudget::for_request(limits, deadline.at().into_std(), &|| false)
-            .map_err(failure)?;
-        let request = self
-            .query_work(&budget, deadline, move |budget| {
-                let arguments = request.arguments.unwrap_or_default();
-                budget.charge(&arguments)?;
-                let request: QueryExchange<serde_json::Value> =
-                    serde_json::from_value(arguments.into()).map_err(|_| {
-                        errors::server::read_invalid()
-                            .field("arguments")
-                            .violation("query fact arguments do not match the documented form")
-                            .error()
-                    })?;
-                let request = serde_json::from_value::<QueryFactRequest>(request.into_payload()?)
-                    .map_err(|_| {
-                    errors::server::read_invalid()
-                        .field("arguments")
-                        .violation("query fact arguments do not match the documented form")
-                        .error()
-                })?;
-                request.requirements.validate_selection()?;
-                Ok(request)
-            })
-            .await?;
-        if request
-            .requirements
-            .datasets
-            .iter()
-            .any(|dataset| dataset != LOCAL_GRAPH)
-        {
-            return self
-                .encode_query_fact_response(
-                    QueryFactResult::Unavailable(unavailable(SymbolUnavailableReason::ViewContext)),
-                    &budget,
-                    deadline,
-                )
-                .await;
-        }
-        let selected_view = if let Some(view) = request.view {
-            let selected = self.captured_context(&view, "query facts")?;
-            match self.query_selection(&selected.view)? {
-                Ok(Some(material)) => Some((material, selected.view)),
-                Ok(None) => {
-                    return self
-                        .encode_query_fact_response(
-                            QueryFactResult::Unavailable(unavailable(
-                                SymbolUnavailableReason::ViewExpired,
-                            )),
-                            &budget,
-                            deadline,
-                        )
-                        .await;
-                }
-                Err(reason) => {
-                    return self
-                        .encode_query_fact_response(
-                            QueryFactResult::Unavailable(unavailable(reason)),
-                            &budget,
-                            deadline,
-                        )
-                        .await;
-                }
-            }
-        } else {
-            None
-        };
-        let requests =
-            rift_server::ProviderRequests::new(configuration.requests.min(request.requests));
-        let request_maximum = requests.remaining();
-        let selected = match self
-            .acquire_query_data(
-                &request.requirements,
-                &request.requirements.retrievals,
-                selected_view,
-                &configuration,
-                limits,
-                &budget,
-                deadline,
-                requests.clone(),
-            )
-            .await?
-        {
-            Ok(selected) => selected,
-            Err(reason) => {
+        Box::pin(async move {
+            let deadline = self.request_deadline().await;
+            let configuration = self.query_configuration().await;
+            let limits = query_limits(&configuration)?;
+            let budget = QueryBudget::for_request(limits, deadline.at().into_std(), &|| false)
+                .map_err(failure)?;
+            let request = self
+                .decode_query_fact_request(request, &budget, deadline)
+                .await?;
+            if request
+                .requirements
+                .datasets
+                .iter()
+                .any(|dataset| dataset != LOCAL_GRAPH)
+            {
                 return self
                     .encode_query_fact_response(
-                        QueryFactResult::Unavailable(reason),
+                        QueryFactResult::Unavailable(unavailable(
+                            SymbolUnavailableReason::ViewContext,
+                        )),
                         &budget,
                         deadline,
                     )
                     .await;
             }
-        };
-        if request
-            .requirements
-            .validate_facts(&selected.facts)
-            .is_err()
-        {
-            return self
-                .encode_query_fact_response(
-                    QueryFactResult::Unavailable(SearchUnavailable::Unavailable {
-                        reason: SymbolUnavailableReason::InsufficientCoverage,
-                        view: None,
-                        warnings: selected.warnings,
-                    }),
-                    &budget,
-                    deadline,
+            let selected_view = match self.query_fact_view(request.view)? {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    return self
+                        .encode_query_fact_response(
+                            QueryFactResult::Unavailable(reason),
+                            &budget,
+                            deadline,
+                        )
+                        .await;
+                }
+            };
+            let requests =
+                rift_server::ProviderRequests::new(configuration.requests.min(request.requests));
+            let request_maximum = requests.remaining();
+            let selected = match self
+                .acquire_query_data(
+                    &request.requirements,
+                    &request.requirements.retrievals,
+                    selected_view,
+                    QueryExecution {
+                        configuration: &configuration,
+                        limits,
+                        budget: &budget,
+                        deadline,
+                        requests: &requests,
+                    },
                 )
-                .await;
-        }
+                .await?
+            {
+                Ok(selected) => selected,
+                Err(reason) => {
+                    return self
+                        .encode_query_fact_response(
+                            QueryFactResult::Unavailable(reason),
+                            &budget,
+                            deadline,
+                        )
+                        .await;
+                }
+            };
+            let selected = self
+                .query_work(&budget, deadline, move |budget| {
+                    selected.bind_targets(budget)
+                })
+                .await?;
+            if request
+                .requirements
+                .validate_facts(&selected.facts)
+                .is_err()
+            {
+                return self
+                    .encode_query_fact_response(
+                        QueryFactResult::Unavailable(SearchUnavailable::Unavailable {
+                            reason: SymbolUnavailableReason::InsufficientCoverage,
+                            view: None,
+                            warnings: selected.warnings,
+                        }),
+                        &budget,
+                        deadline,
+                    )
+                    .await;
+            }
+            self.capture_query_fact_response(selected, request_maximum, requests, &budget, deadline)
+                .await
+        })
+        .await
+    }
+
+    fn query_fact_view(
+        &self,
+        view: Option<CapturedViewId>,
+    ) -> Result<Result<SelectedFactView, SearchUnavailable>, ToolFailure> {
+        let Some(view) = view else {
+            return Ok(Ok(None));
+        };
+        let selected = self.captured_context(&view, "query facts")?;
+        Ok(match self.query_selection(&selected.view)? {
+            Ok(Some(material)) => Ok(Some((material, selected.view))),
+            Ok(None) => Err(unavailable(SymbolUnavailableReason::ViewExpired)),
+            Err(reason) => Err(unavailable(reason)),
+        })
+    }
+
+    async fn decode_query_fact_request(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        budget: &QueryBudget,
+        deadline: super::super::RequestDeadline,
+    ) -> Result<QueryFactRequest, ToolFailure> {
+        self.query_work(budget, deadline, move |budget| {
+            let arguments = request.arguments.unwrap_or_default();
+            budget.charge(&arguments)?;
+            let request: QueryExchange<serde_json::Value> =
+                serde_json::from_value(arguments.into()).map_err(|_| {
+                    errors::server::read_invalid()
+                        .field("arguments")
+                        .violation("query fact arguments do not match the documented form")
+                        .error()
+                })?;
+            let request = serde_json::from_value::<QueryFactRequest>(request.into_payload()?)
+                .map_err(|_| {
+                    errors::server::read_invalid()
+                        .field("arguments")
+                        .violation("query fact arguments do not match the documented form")
+                        .error()
+                })?;
+            request.requirements.validate_selection()?;
+            Ok(request)
+        })
+        .await
+    }
+
+    async fn capture_query_fact_response(
+        &self,
+        selected: super::QueryAcquisition,
+        request_maximum: u64,
+        requests: rift_server::ProviderRequests,
+        budget: &QueryBudget,
+        deadline: super::super::RequestDeadline,
+    ) -> Result<serde_json::Value, ToolFailure> {
         let views = std::sync::Arc::clone(&self.local_views);
         let responses = std::sync::Arc::clone(&self.candidate_responses);
-        self.query_work(&budget, deadline, move |budget| {
+        self.query_work(budget, deadline, move |budget| {
             let views = views.get().ok_or_else(retention_failure)?;
             let root = selected.material.root().to_path_buf();
             let root_text = root.to_str().ok_or_else(retention_failure)?.to_owned();

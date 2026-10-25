@@ -172,81 +172,26 @@ fn source_lines(text: &str, value: &serde_json::Value, indent: &str) -> Result<(
     Ok(())
 }
 
-fn view_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
-    if let Some(view) = structured.get("view") {
-        token(text, &view["id"], "$.view.id")?;
-        token(text, &view["expires_at"], "$.view.expires_at")?;
-    }
-    for warning in structured["warnings"].as_array().into_iter().flatten() {
-        token(text, &warning["code"], "$.warnings.code")?;
+fn query_continuation_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+    let continuations = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("next_query "))
+        .collect::<Vec<_>>();
+    match (
+        structured["pagination"]["next_query"].as_str(),
+        continuations.as_slice(),
+    ) {
+        (Some(expected), [encoded]) => {
+            let actual =
+                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())?;
+            if actual != expected {
+                return Err("$.pagination.next_query differs".into());
+            }
+        }
+        (None, []) => {}
+        _ => return Err("$.pagination.next_query missing or repeated".into()),
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use rmcp::model::ContentBlock;
-    use serde_json::{Value, json};
-
-    use super::*;
-
-    /// A successful result holding `text` and `structured`.
-    fn result_of(text: &str, structured: Value) -> CallToolResult {
-        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
-        result.structured_content = Some(structured);
-        result
-    }
-
-    #[test]
-    fn canonical_declaration_source_keeps_two_layout_tabs_and_original_bytes() {
-        let source = json!("pub fn beacon() {\n\tlet original = 1;\n\n}\n");
-        let text = "\t\tpub fn beacon() {\n\t\t\tlet original = 1;\n\n\t\t}\n";
-        assert_eq!(source_lines(text, &source, "\t\t"), Ok(()));
-        assert!(source_lines(&text.replace("original", "changed"), &source, "\t\t").is_err());
-        assert!(source_lines(&text.replacen("\t\tpub", "\tpub", 1), &source, "\t\t").is_err());
-    }
-
-    #[test]
-    fn exact_source_keeps_one_layout_tab_and_original_bytes() {
-        let source = json!("    pub fn beacon() {}\n");
-        let text = "\t    pub fn beacon() {}\n";
-        assert_eq!(source_lines(text, &source, "\t"), Ok(()));
-        assert!(source_lines(&text.replace("beacon", "changed"), &source, "\t").is_err());
-        assert!(source_lines(&text.replacen('\t', "\t\t", 1), &source, "\t").is_err());
-    }
-
-    #[test]
-    fn a_result_without_structured_content_or_text_is_refused() {
-        let no_structured = CallToolResult::success(vec![ContentBlock::text("0 nodes\n")]);
-        let no_content = CallToolResult::success(Vec::new());
-        assert!(text_states(NODES_TOOL, &no_structured).is_err());
-        assert!(text_states(NODES_TOOL, &no_content).is_err());
-    }
-
-    #[test]
-    fn a_non_text_block_is_refused() {
-        let mut result = CallToolResult::success(vec![ContentBlock::image("AAAA", "image/png")]);
-        result.structured_content = Some(json!({ "nodes": [], "source": [] }));
-        assert!(text_states(NODES_TOOL, &result).is_err());
-    }
-
-    #[test]
-    fn each_tool_takes_its_layout_check_and_an_unknown_tool_is_refused() {
-        let search = result_of(
-            "0 results\n",
-            json!({
-                "results": [],
-                "pagination": { "page_index": 0, "total_pages": 0 }
-            }),
-        );
-        assert_eq!(text_states(SEARCH_TOOL, &search), Ok(()));
-        assert!(text_states("other", &search).is_err());
-        assert!(text_states(GET_SYMBOL_TOOL, &search).is_err());
-        assert!(text_states(NODES_TOOL, &search).is_err());
-        let nodes = result_of("0 nodes\n", json!({ "nodes": [], "source": [] }));
-        assert_eq!(text_states(NODES_TOOL, &nodes), Ok(()));
-        assert!(text_states(SEARCH_TOOL, &nodes).is_err());
-    }
 }
 
 /// Checks independently parsed JSON rows and the published query result metadata.
@@ -331,26 +276,86 @@ fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), S
             _ => return Err("$.answer.result".into()),
         }
     }
-    let continuations = text
-        .lines()
-        .filter_map(|line| line.strip_prefix("next_query "))
-        .collect::<Vec<_>>();
-    match (
-        structured["pagination"]["next_query"].as_str(),
-        continuations.as_slice(),
-    ) {
-        (Some(expected), [encoded]) => {
-            let actual =
-                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())?;
-            if actual != expected {
-                return Err("$.pagination.next_query differs".into());
-            }
-        }
-        (None, []) => {}
-        _ => return Err("$.pagination.next_query missing or repeated".into()),
-    }
+    query_continuation_text(text, structured)?;
     for warning in structured["warnings"].as_array().into_iter().flatten() {
         token(text, &warning["code"], "$.warnings.code")?;
     }
     view_text(text, structured)
+}
+
+fn view_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+    if let Some(view) = structured.get("view") {
+        token(text, &view["id"], "$.view.id")?;
+        token(text, &view["expires_at"], "$.view.expires_at")?;
+    }
+    for warning in structured["warnings"].as_array().into_iter().flatten() {
+        token(text, &warning["code"], "$.warnings.code")?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rmcp::model::ContentBlock;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    /// A successful result holding `text` and `structured`.
+    fn result_of(text: &str, structured: Value) -> CallToolResult {
+        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        result.structured_content = Some(structured);
+        result
+    }
+
+    #[test]
+    fn canonical_declaration_source_keeps_two_layout_tabs_and_original_bytes() {
+        let source = json!("pub fn beacon() {\n\tlet original = 1;\n\n}\n");
+        let text = "\t\tpub fn beacon() {\n\t\t\tlet original = 1;\n\n\t\t}\n";
+        assert_eq!(source_lines(text, &source, "\t\t"), Ok(()));
+        assert!(source_lines(&text.replace("original", "changed"), &source, "\t\t").is_err());
+        assert!(source_lines(&text.replacen("\t\tpub", "\tpub", 1), &source, "\t\t").is_err());
+    }
+
+    #[test]
+    fn exact_source_keeps_one_layout_tab_and_original_bytes() {
+        let source = json!("    pub fn beacon() {}\n");
+        let text = "\t    pub fn beacon() {}\n";
+        assert_eq!(source_lines(text, &source, "\t"), Ok(()));
+        assert!(source_lines(&text.replace("beacon", "changed"), &source, "\t").is_err());
+        assert!(source_lines(&text.replacen('\t', "\t\t", 1), &source, "\t").is_err());
+    }
+
+    #[test]
+    fn a_result_without_structured_content_or_text_is_refused() {
+        let no_structured = CallToolResult::success(vec![ContentBlock::text("0 nodes\n")]);
+        let no_content = CallToolResult::success(Vec::new());
+        assert!(text_states(NODES_TOOL, &no_structured).is_err());
+        assert!(text_states(NODES_TOOL, &no_content).is_err());
+    }
+
+    #[test]
+    fn a_non_text_block_is_refused() {
+        let mut result = CallToolResult::success(vec![ContentBlock::image("AAAA", "image/png")]);
+        result.structured_content = Some(json!({ "nodes": [], "source": [] }));
+        assert!(text_states(NODES_TOOL, &result).is_err());
+    }
+
+    #[test]
+    fn each_tool_takes_its_layout_check_and_an_unknown_tool_is_refused() {
+        let search = result_of(
+            "0 results\n",
+            json!({
+                "results": [],
+                "pagination": { "page_index": 0, "total_pages": 0 }
+            }),
+        );
+        assert_eq!(text_states(SEARCH_TOOL, &search), Ok(()));
+        assert!(text_states("other", &search).is_err());
+        assert!(text_states(GET_SYMBOL_TOOL, &search).is_err());
+        assert!(text_states(NODES_TOOL, &search).is_err());
+        let nodes = result_of("0 nodes\n", json!({ "nodes": [], "source": [] }));
+        assert_eq!(text_states(NODES_TOOL, &nodes), Ok(()));
+        assert!(text_states(SEARCH_TOOL, &nodes).is_err());
+    }
 }

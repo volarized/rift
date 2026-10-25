@@ -1,4 +1,7 @@
-use super::*;
+use super::{
+    Digest, HashSet, Literal, Projection, QueryError, QueryFacts, Sha256, Value, blank, child,
+    failure, invalid, iri, vocabulary,
+};
 
 pub(super) fn count(facts: &QueryFacts) -> Result<usize, QueryError> {
     facts.nodes.iter().try_fold(0usize, |count, source| {

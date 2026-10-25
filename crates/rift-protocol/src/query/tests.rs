@@ -3,19 +3,46 @@ use crate::configuration::{ByteSize, ConfigurationViolation};
 use serde_json::json;
 
 #[test]
+fn optional_process_sizes_are_positive_and_keep_automatic_defaults() {
+    let automatic = QueryConfiguration::default();
+    let value = serde_json::to_value(&automatic).expect("query configuration");
+    for field in [
+        "input_size",
+        "output_size",
+        "material_size",
+        "heap_size",
+        "diagnostic_size",
+    ] {
+        assert!(value[field].is_null());
+        let mut wire = value.clone();
+        wire[field] = json!("0b");
+        let configuration: QueryConfiguration = serde_json::from_value(wire).expect("byte shape");
+        assert!(configuration.violation().is_some(), "{field}");
+        let mut wire = value.clone();
+        wire[field] = json!("1b");
+        let configuration: QueryConfiguration = serde_json::from_value(wire).expect("byte shape");
+        assert!(configuration.violation().is_none(), "{field}");
+    }
+}
+
+#[test]
 fn query_numeric_schema_bounds_match_configuration_admission() {
     let schema =
         serde_json::to_value(schemars::schema_for!(QueryConfiguration)).expect("query schema");
-    for (field, maximum) in [
-        ("algebra_nodes", ALGEBRA_NODES_MAX),
-        ("requests", REQUESTS_MAX),
-        ("statements", STATEMENTS_MAX),
-        ("results", RESULT_ITEMS_MAX),
-        ("page_size", PAGE_ITEMS_MAX),
+    for field in [
+        "algebra_nodes",
+        "requests",
+        "statements",
+        "results",
+        "page_size",
     ] {
         assert_eq!(schema["properties"][field]["minimum"], 1);
-        assert_eq!(schema["properties"][field]["maximum"], maximum);
-        for value in [0, 1, maximum, maximum + 1] {
+        assert!(
+            schema["properties"][field]["maximum"]
+                .as_u64()
+                .is_none_or(|maximum| maximum == u64::MAX)
+        );
+        for value in [0, 1, 1 << 40, u64::MAX] {
             let mut wire =
                 serde_json::to_value(QueryConfiguration::default()).expect("query default");
             wire[field] = json!(value);
@@ -23,7 +50,7 @@ fn query_numeric_schema_bounds_match_configuration_admission() {
                 serde_json::from_value(wire).expect("configuration shape");
             assert_eq!(
                 configuration.violation().is_some(),
-                value == 0 || value > maximum,
+                value == 0,
                 "{field}={value}"
             );
         }
@@ -31,38 +58,20 @@ fn query_numeric_schema_bounds_match_configuration_admission() {
 }
 
 #[test]
-fn query_byte_configuration_accepts_exact_bounds_and_refuses_one_over() {
+fn query_byte_configuration_accepts_positive_policy_and_refuses_zero() {
     type Field = fn(&mut QueryConfiguration) -> &mut ByteSize;
-    let cases: [(&str, u64, u64, Field); 4] = [
-        (
-            "statement_size",
-            STATEMENT_BYTES_MIN,
-            STATEMENT_BYTES_MAX,
-            |value| &mut value.statement_size,
-        ),
-        ("fact_size", FACT_BYTES_MIN, FACT_BYTES_MAX, |value| {
-            &mut value.fact_size
-        }),
-        ("result_size", RESULT_BYTES_MIN, RESULT_BYTES_MAX, |value| {
-            &mut value.result_size
-        }),
-        (
-            "page_limit",
-            PAGE_BYTES_MIN,
-            QUERY_PAGE_BYTES_MAX,
-            |value| &mut value.page_limit,
-        ),
+    let cases: [(&str, Field); 4] = [
+        ("statement_size", |value| &mut value.statement_size),
+        ("fact_size", |value| &mut value.fact_size),
+        ("result_size", |value| &mut value.result_size),
+        ("page_limit", |value| &mut value.page_limit),
     ];
-    for (field, minimum, maximum, select) in cases {
-        for bytes in [minimum - 1, minimum, maximum, maximum + 1] {
+    for (field, select) in cases {
+        for bytes in [0, 1, 1 << 40, u64::MAX] {
             let mut configuration = QueryConfiguration::default();
             *select(&mut configuration) = ByteSize::from_bytes(bytes);
             let violation = configuration.violation();
-            assert_eq!(
-                violation.is_some(),
-                bytes < minimum || bytes > maximum,
-                "{field}={bytes}"
-            );
+            assert_eq!(violation.is_some(), bytes == 0, "{field}={bytes}");
             if let Some(ConfigurationViolation::LimitOutOfRange {
                 field: reported, ..
             }) = violation

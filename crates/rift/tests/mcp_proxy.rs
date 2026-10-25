@@ -1221,12 +1221,68 @@ async fn validated_proxy_text(
         );
     }
     if let Some(view) = view {
-        let mut held_request = request.clone();
-        held_request["view"] = serde_json::to_value(&view.id)?;
-        held_request
-            .as_object_mut()
-            .ok_or("tool arguments must be an object")?
-            .remove("rev");
+        if name == "search" && reference["answer"].is_null() {
+            let unavailable: rift_protocol::query::QueryReadResult =
+                serde_json::from_value(reference.clone())?;
+            assert!(matches!(
+                unavailable,
+                rift_protocol::query::QueryReadResult::Unavailable(_)
+            ));
+            let held = proxied_result(
+                client,
+                "get_source",
+                &json!({"unit":"rift://source/project/lib.rs", "view":view.id}),
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "unavailable query view read failed: {error}; query {request}; answer {reference}"
+                )
+            })?;
+            assert_ne!(held.is_error, Some(true), "{held:?}");
+            let (source, selected) = proxy_text_view(text_of(&held)?)?;
+            assert_eq!(selected.as_ref(), Some(&view));
+            if let Some(structured) = &held.structured_content {
+                let held_source: rift_protocol::source_read::GetSourceResult =
+                    serde_json::from_value(structured.clone())?;
+                let rift_protocol::source_read::GetSourceResult::Found {
+                    source,
+                    source_complete,
+                    view: source_view,
+                    ..
+                } = held_source
+                else {
+                    return Err("held source must be found".into());
+                };
+                assert_eq!(
+                    source.text,
+                    "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n"
+                );
+                assert!(source_complete);
+                assert_eq!(source_view, view);
+                text_complete::assert_text_states("get_source", &held);
+            }
+            let (body, mut sources) =
+                validated_proxy_rows(client, &body, result, reference).await?;
+            sources.push(source);
+            return Ok((body, sources));
+        }
+        let held_request = if name == "search" {
+            let answer: rift_protocol::query::QueryAnswer =
+                serde_json::from_value(reference["answer"].clone())?;
+            let page = reference["pagination"]["page_index"]
+                .as_u64()
+                .ok_or("query pagination.page_index must be an integer")?;
+            json!({"query":rift_search::sparql::continuation_query(&answer, &view.id, page)?})
+        } else {
+            let mut held_request = request.clone();
+            held_request["view"] = serde_json::to_value(&view.id)?;
+            held_request
+                .as_object_mut()
+                .ok_or("tool arguments must be an object")?
+                .remove("rev");
+            held_request
+        };
         let held = proxied_result(client, name, &held_request).await?;
         assert_ne!(held.is_error, Some(true), "{name}: {held:?}");
         assert_eq!(
@@ -1243,6 +1299,41 @@ async fn validated_proxy_text(
         }
     }
     validated_proxy_rows(client, &body, result, reference).await
+}
+
+fn assert_proxy_result_forms(
+    name: &str,
+    all_result: &rmcp::model::CallToolResult,
+    text_result: &rmcp::model::CallToolResult,
+) {
+    assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
+    assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
+    assert_eq!(
+        text_result.structured_content, None,
+        "{name}: {text_result:?}"
+    );
+}
+
+fn assert_stated_identities<'answer>(
+    name: &str,
+    result: &'answer rmcp::model::CallToolResult,
+    text: &str,
+) -> TestResult<&'answer serde_json::Value> {
+    let structured = result
+        .structured_content
+        .as_ref()
+        .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
+    for identity in stated_identities(name, structured) {
+        assert!(
+            (if name == "search" {
+                text.contains(&serde_json::to_string(identity)?)
+            } else {
+                text.split_whitespace().any(|token| token == identity)
+            }),
+            "{name}: identity {identity} is no bare token of the text:\n{text}"
+        );
+    }
+    Ok(structured)
 }
 
 /// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
@@ -1322,12 +1413,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
                 proxied_result(&text, name, &request),
             );
             let (all_result, text_result) = (all_result?, text_result?);
-            assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
-            assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
-            assert_eq!(
-                text_result.structured_content, None,
-                "{name}: {text_result:?}"
-            );
+            assert_proxy_result_forms(name, &all_result, &text_result);
             text_complete::assert_text_states(name, &all_result);
             let all_text = text_of(&all_result)?;
             let reference = all_result
@@ -1340,20 +1426,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
             );
             assert_eq!(all_body?, text_body?, "{name}: texts differ");
 
-            let structured = all_result
-                .structured_content
-                .as_ref()
-                .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
-            for identity in stated_identities(name, structured) {
-                assert!(
-                    (if name == "search" {
-                        all_text.contains(&serde_json::to_string(identity)?)
-                    } else {
-                        all_text.split_whitespace().any(|token| token == identity)
-                    }),
-                    "{name}: identity {identity} is no bare token of the text:\n{all_text}"
-                );
-            }
+            let structured = assert_stated_identities(name, &all_result, all_text)?;
 
             let Some(pagination) = structured.get("pagination") else {
                 break;

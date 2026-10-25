@@ -233,8 +233,50 @@ fn skill_markdown(form: SkillForm) -> String {
          - Substring: `SELECT ?symbol {?symbol a :Symbol; :name ?name FILTER(CONTAINS(?name, \"config\"))}`\n\
          - Regex: `SELECT ?path ?start {SERVICE :search {?hit :pattern \"TODO|FIXME\"; :target \"file\"; :path ?path; :start ?start}}`\n\
          - Count: `SELECT (COUNT(?usage) AS ?count) {<symbol-id> :usages ?usage}`\n\n\
-         Ranking uses `SERVICE :search {?hit :query \"project settings\"; :symbol ?symbol}`. \
-         Use outer projection, `ORDER BY`, `LIMIT`, and `OFFSET`. Follow returned \
+         ### Text search\n\n\
+         Find declarations by text, keeping the retrieval order. Optional fields remain \
+         unbound when the selected hit does not carry them.\n\n\
+         ```sparql\n\
+         SELECT ?symbol ?name ?path\n\
+         WHERE {\n\
+           SERVICE :search {\n\
+             ?hit :query \"request deadline\"; :target \"symbol\"; :index ?index .\n\
+             OPTIONAL { ?hit :symbol ?symbol . OPTIONAL { ?symbol :name ?name } }\n\
+             OPTIONAL { ?hit :path ?path }\n\
+           }\n\
+         }\n\
+         ORDER BY ?index LIMIT 20 OFFSET 0\n\
+         ```\n\n\
+         ### Match search\n\n\
+         Match a regex in selected files. Structured retrieval inputs use `rdf:JSON`.\n\n\
+         ```sparql\n\
+         SELECT ?path ?line ?source\n\
+         WHERE {\n\
+           SERVICE :search {\n\
+             ?hit :pattern \"TODO|FIXME\"; :target \"file\"; :index ?index; :path ?path;\n\
+                  :paths '{\"include\":[\"crates/**\"]}'^^rdf:JSON;\n\
+                  :include '[\"source\"]'^^rdf:JSON .\n\
+             OPTIONAL { ?hit :line ?line }\n\
+             OPTIONAL { ?hit :source ?source }\n\
+           }\n\
+         }\n\
+         ORDER BY ?index LIMIT 20 OFFSET 0\n\
+         ```\n\n\
+         ### Traversal\n\n\
+         Select a declaration by its name and path, then follow two call edges. This \
+         example starts at Rift's CLI entry point; use a name and path from the served \
+         workspace. Required relationships must be available from the selected provider.\n\n\
+         ```sparql\n\
+         SELECT ?callee ?name ?path\n\
+         WHERE {\n\
+           ?seed a :Symbol; :name \"main\"; :path \"crates/rift/src/main.rs\" .\n\
+           ?seed :calls/:calls ?callee .\n\
+           OPTIONAL { ?callee :name ?name }\n\
+           OPTIONAL { ?callee :path ?path }\n\
+         }\n\
+         ORDER BY ?name ?path LIMIT 20\n\
+         ```\n\n\
+         Set `OFFSET 20` to select the next query window. Follow returned \
          `pagination.next_query` unchanged for transport pages. Carry the returned `view` \
          with exact symbol and source reads. Missing required facts return unavailability, \
          never a false boolean or empty complete answer.\n\n",
@@ -643,6 +685,254 @@ mod tests {
         assert_eq!(document["version"], env!("CARGO_PKG_VERSION"));
         assert!(manifest.ends_with('\n'));
         assert_eq!(manifest, plugin_manifest());
+    }
+
+    fn prepared_examples(
+        form: SkillForm,
+        limits: rift_search::query::QueryLimits,
+    ) -> Result<Vec<rift_search::sparql::PreparedQuery>, rift_error::RiftError> {
+        let rendered = skill_markdown(form);
+        rendered
+            .split("```sparql\n")
+            .skip(1)
+            .map(|block| {
+                let (statement, _) = block
+                    .split_once("\n```")
+                    .expect("each rendered SPARQL example closes its fence");
+                rift_search::sparql::PreparedQuery::parse(statement, limits)
+            })
+            .collect()
+    }
+
+    fn example_service(
+        query: &rift_search::sparql::PreparedQuery,
+        hits: Vec<rift_protocol::read::SearchHit>,
+    ) -> rift_search::sparql::QueryServices {
+        rift_search::sparql::QueryServices {
+            retrievals: vec![rift_search::sparql::QueryServiceData {
+                request: query.retrievals()[0].clone(),
+                targets: vec![None; hits.len()],
+                result: rift_protocol::read::SearchResult {
+                    view: None,
+                    results: hits,
+                    pagination: rift_protocol::read::Pagination {
+                        page_index: 0,
+                        total_pages: 1,
+                    },
+                    warnings: Vec::new(),
+                },
+            }],
+            bindings: Vec::new(),
+            datasets: Vec::new(),
+        }
+    }
+
+    fn example_bindings(
+        answer: rift_protocol::query::QueryAnswer,
+    ) -> Vec<std::collections::BTreeMap<String, rift_protocol::query::RdfTerm>> {
+        match answer {
+            rift_protocol::query::QueryAnswer::Bindings { bindings, .. } => bindings,
+            other => panic!("rendered SELECT example returned {other:?}"),
+        }
+    }
+
+    fn example_symbol(
+        name: &str,
+        start: u64,
+    ) -> Result<rift_protocol::query::QuerySymbol, serde_json::Error> {
+        let symbol: rift_protocol::read::Symbol = serde_json::from_value(serde_json::json!({
+            "id": format!("rift://symbol/local/rust/fixture/{name}"),
+            "name": name, "kind": "function", "language": "rust"
+        }))?;
+        let declaration = rift_protocol::symbol_read::SymbolDeclaration {
+            origin: symbol.origin.clone(),
+            path: Some(serde_json::from_value(serde_json::json!(
+                "crates/rift/src/main.rs"
+            ))?),
+            unit: None,
+            range: rift_protocol::read::TextRange {
+                start,
+                end: start + 1,
+            },
+            line: 1,
+            node: None,
+            source: None,
+            source_complete: false,
+            signature_indices: Vec::new(),
+            type_indices: Vec::new(),
+            documentation_indices: Vec::new(),
+        };
+        Ok(rift_protocol::query::QuerySymbol {
+            symbol,
+            declarations: vec![declaration],
+        })
+    }
+
+    fn example_relationship(
+        from: &str,
+        to: &str,
+        start: u64,
+    ) -> Result<rift_protocol::read::Relationship, serde_json::Error> {
+        serde_json::from_value(serde_json::json!({
+            "from": format!("rift://symbol/local/rust/fixture/{from}"),
+            "to": format!("rift://symbol/local/rust/fixture/{to}"),
+            "kind": "call", "facets": ["calls"], "derivation": "resolution",
+            "occurrence": {
+                "unit": "rift://source/project/crates/rift/src/main.rs",
+                "range": { "start": start, "end": start + 1 }
+            }
+        }))
+    }
+
+    fn evaluate_text_example(
+        query: &rift_search::sparql::PreparedQuery,
+        limits: rift_search::query::QueryLimits,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let hits = vec![
+            serde_json::from_value(serde_json::json!({
+                "hit": { "target": "symbol", "symbol": {
+                    "id": "rift://symbol/local/rust/fixture/deadline",
+                    "name": "request_deadline", "kind": "function", "language": "rust"
+                } },
+                "path": "crates/fixture.rs", "score": 0.8
+            }))?,
+            serde_json::from_value(serde_json::json!({
+                "hit": { "target": "symbol", "symbol": {
+                    "id": "rift://symbol/local/rust/fixture/timeout",
+                    "name": "request_timeout", "kind": "function", "language": "rust"
+                } },
+                "score": 0.5
+            }))?,
+        ];
+        let rows = example_bindings(query.evaluate_with_services(
+            rift_search::query::QueryFacts::default(),
+            limits,
+            rift_search::sparql::QueryCancellation::default(),
+            example_service(query, hits),
+        )?);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0]["name"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "request_deadline")
+        );
+        assert!(rows[0].contains_key("path"));
+        assert!(!rows[1].contains_key("path"));
+        Ok(())
+    }
+
+    fn evaluate_pattern_example(
+        query: &rift_search::sparql::PreparedQuery,
+        limits: rift_search::query::QueryLimits,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let hits = vec![
+            serde_json::from_value(serde_json::json!({
+                "hit": { "target": "file", "size": 40, "languages": [] },
+                "path": "crates/fixture.rs", "line": 1, "source": "// TODO: check deadline"
+            }))?,
+            serde_json::from_value(serde_json::json!({
+                "hit": { "target": "file", "size": 40, "languages": [] },
+                "path": "crates/other.rs"
+            }))?,
+        ];
+        let rows = example_bindings(query.evaluate_with_services(
+            rift_search::query::QueryFacts::default(),
+            limits,
+            rift_search::sparql::QueryCancellation::default(),
+            example_service(query, hits),
+        )?);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            matches!(&rows[0]["source"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "// TODO: check deadline")
+        );
+        assert!(rows[0].contains_key("line"));
+        assert!(!rows[1].contains_key("source"));
+        assert!(!rows[1].contains_key("line"));
+        Ok(())
+    }
+
+    fn evaluate_traversal_example(
+        query: &rift_search::sparql::PreparedQuery,
+        limits: rift_search::query::QueryLimits,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let facts = rift_search::query::QueryFacts {
+            symbols: vec![
+                example_symbol("main", 0)?,
+                example_symbol("middle", 2)?,
+                example_symbol("leaf", 4)?,
+            ],
+            relationships: vec![
+                example_relationship("main", "middle", 0)?,
+                example_relationship("middle", "leaf", 2)?,
+            ],
+            ..rift_search::query::QueryFacts::default()
+        };
+        let rows = example_bindings(query.evaluate(
+            facts,
+            limits,
+            rift_search::sparql::QueryCancellation::default(),
+        )?);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["callee"],
+            rift_protocol::query::RdfTerm::Iri {
+                value: "rift://symbol/local/rust/fixture/leaf".to_owned(),
+            }
+        );
+        assert!(
+            matches!(&rows[0]["name"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "leaf")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_sparql_examples_evaluate_original_rows_and_two_call_edges()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = rift_search::query::QueryLimits::try_from(
+            &rift_protocol::query::QueryConfiguration::default(),
+        )?;
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let queries = prepared_examples(form, limits)?;
+            assert_eq!(queries.len(), 3);
+            evaluate_text_example(&queries[0], limits)?;
+            evaluate_pattern_example(&queries[1], limits)?;
+            evaluate_traversal_example(&queries[2], limits)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rendered_sparql_examples_use_served_prefixes_and_retrieval_metadata()
+    -> Result<(), rift_error::RiftError> {
+        let limits = rift_search::query::QueryLimits::try_from(
+            &rift_protocol::query::QueryConfiguration::default(),
+        )?;
+        for form in [SkillForm::Installed, SkillForm::Plugin] {
+            let rendered = skill_markdown(form);
+            let queries = rendered
+                .split("```sparql\n")
+                .skip(1)
+                .map(|block| {
+                    let (statement, _) = block
+                        .split_once("\n```")
+                        .expect("each rendered SPARQL example closes its fence");
+                    rift_search::sparql::PreparedQuery::parse(statement, limits)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(queries.len(), 3);
+            assert_eq!(queries[0].retrievals().len(), 1);
+            assert!(queries[0].retrievals()[0].query.is_some());
+            assert!(queries[0].retrievals()[0].pattern.is_none());
+            assert_eq!(queries[1].retrievals().len(), 1);
+            assert!(queries[1].retrievals()[0].pattern.is_some());
+            assert!(queries[1].retrievals()[0].paths.is_some());
+            assert!(queries[2].retrievals().is_empty());
+            assert!(
+                queries[2]
+                    .requirements()
+                    .facets
+                    .contains(&rift_protocol::read::RelationshipFacet::Calls)
+            );
+        }
+        Ok(())
     }
 
     #[test]

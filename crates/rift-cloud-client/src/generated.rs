@@ -3893,14 +3893,13 @@ pub struct RelationshipSearchRequest {
 #[serde(deny_unknown_fields)]
 pub struct RelationshipSelection {
     /// Established subjects whose complete adjacency is required.
-    #[validate(length(min = 1u64, max = 64u64))]
+    #[validate(length(min = 1u64))]
     pub seeds: Vec<String>,
     /// Which edge direction a search traversal walks from each visited symbol. A language
     /// engine supplies the edges of both: its references for `incoming`, its call hierarchy for
     /// `outgoing`.
     pub direction: TraversalDirection,
     /// Portable relationship facets. Empty selects every available facet.
-    #[validate(length(max = 16u64))]
     pub facets: Vec<RelationshipFacet>,
 }
 /// One raw relationship page from an immutable selected publication.
@@ -4014,7 +4013,6 @@ pub struct QuerySource {
     )]
     pub digest: Option<String>,
     /// Selected text, absent when source is unavailable or unrequested.
-    #[validate(length(max = 67_108_864u64))]
     pub text: Option<String>,
 }
 /// Complete lowercase SHA-256 digest of immutable source bytes.
@@ -4029,6 +4027,8 @@ pub struct RelationshipCapability {
     pub direction: TraversalDirection,
     /// Facets whose complete selected-domain reads the reader supports.
     pub facets: Vec<RelationshipFacet>,
+    /// Positive count bounds for one raw relationship operation.
+    pub bounds: Option<RelationshipBounds>,
 }
 /// One physical usage projected from an original selected-publication record.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -4040,6 +4040,23 @@ pub struct RelationshipOccurrence {
     pub relationship: Option<String>,
     /// One physical reference or call supplied by a selected provider.
     pub occurrence: QueryOccurrence,
+}
+/// Positive count bounds for one raw relationship operation.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct RelationshipBounds {
+    /// Most subjects in one request.
+    pub max_seeds: u64,
+    /// Most selected facets in one request.
+    pub max_facets: u64,
+    /// Most relationship projections in one group.
+    pub max_relationships: u64,
+    /// Most occurrence projections in one group.
+    pub max_occurrences: u64,
+    /// Most original symbol records in one page.
+    pub max_symbols: u64,
+    /// Most original source units in one page.
+    pub max_sources: u64,
 }
 /// Returns supported package managers, features, publication revisions, and active bounds.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]

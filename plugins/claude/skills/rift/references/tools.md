@@ -63,6 +63,6 @@ selects every reference occurrence. Required unavailable facts prevent evaluatio
 
 Parameters:
 
-- `query` (required) - SPARQL Query text.
-- `language` - The implemented query language.
+- `query` (required) - Query text.
+- `language` - Currently only SPARQL is supported.
 

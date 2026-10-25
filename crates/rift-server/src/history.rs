@@ -257,7 +257,7 @@ impl SymbolTimelines {
         syntax: SyntaxLimits,
         store: Option<&StoredHistory>,
     ) -> Result<Self, RiftError> {
-        Self::open_with_capture(root, revision, history, syntax, store, false)
+        Self::open_with_capture(root, revision, history, syntax, store, false, true)
     }
 
     /// Captures one bounded timeline before its read connection closes.
@@ -268,7 +268,18 @@ impl SymbolTimelines {
         syntax: SyntaxLimits,
         store: Option<&StoredHistory>,
     ) -> Result<Self, RiftError> {
-        Self::open_with_capture(root, revision, history, syntax, store, true)
+        Self::open_with_capture(root, revision, history, syntax, store, true, true)
+    }
+
+    /// Reads recorded timelines from one store snapshot without requesting a fill.
+    pub(crate) fn open_recorded(
+        root: &Path,
+        revision: Option<&RevisionId>,
+        history: &HistoryConfiguration,
+        syntax: SyntaxLimits,
+        store: &StoredHistory,
+    ) -> Result<Self, RiftError> {
+        Self::open_with_capture(root, revision, history, syntax, Some(store), true, false)
     }
 
     fn open_with_capture(
@@ -278,6 +289,7 @@ impl SymbolTimelines {
         syntax: SyntaxLimits,
         store: Option<&StoredHistory>,
         retained: bool,
+        notify_lagging: bool,
     ) -> Result<Self, RiftError> {
         if !history.enabled {
             return errors::server::read_unsupported()
@@ -310,6 +322,7 @@ impl SymbolTimelines {
                 revision.is_some(),
                 revisions_max,
                 retained,
+                notify_lagging,
             )?),
             None => TimelineSource::Walk(Box::new(WalkedTimelines {
                 repository,
@@ -344,6 +357,23 @@ impl SymbolTimelines {
             TimelineSource::Walk(walked) => walked.timeline(provider, matched, identity),
         }
     }
+
+    /// Composes only recorded versions under the request's remaining admission.
+    pub(crate) fn recorded_timeline(
+        &self,
+        matched: SymbolMatch<'_>,
+        identity: SymbolId,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<SymbolHistory, RiftError> {
+        match &self.source {
+            TimelineSource::Store(stored) => {
+                stored.timeline_with_budget(matched, identity, Some(budget))
+            }
+            TimelineSource::Walk(_) => errors::server::read_unsupported()
+                .capability("recorded symbol history")
+                .fail(),
+        }
+    }
 }
 
 /// Timelines read from the history store: one read connection, and the
@@ -369,6 +399,7 @@ impl StoredTimelines {
         revision_read: bool,
         revisions_max: usize,
         retained: bool,
+        notify_lagging: bool,
     ) -> Result<Self, RiftError> {
         let reads = stored.connect()?;
         if retained {
@@ -382,7 +413,7 @@ impl StoredTimelines {
             Some(start) => reads.commit(start)?.is_some(),
             None => false,
         };
-        if !held && !revision_read {
+        if !held && !revision_read && notify_lagging {
             (stored.lagging)();
         }
         Ok(Self {
@@ -408,6 +439,20 @@ impl StoredTimelines {
         matched: SymbolMatch<'_>,
         symbol: SymbolId,
     ) -> Result<SymbolHistory, RiftError> {
+        self.timeline_with_budget(matched, symbol, None)
+    }
+
+    fn timeline_with_budget(
+        &self,
+        matched: SymbolMatch<'_>,
+        symbol: SymbolId,
+        mut budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<SymbolHistory, RiftError> {
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+            budget.charge(&self.start)?;
+            budget.charge(&matched.file.path().as_str())?;
+        }
         let Some(start) = self.start.clone() else {
             return Ok(timeline_answer(symbol, Vec::new(), false));
         };
@@ -417,6 +462,9 @@ impl StoredTimelines {
         let mut next = Some(start);
         let mut complete = false;
         for _ in 0..self.revisions_max {
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+            }
             let Some(id) = next else {
                 complete = true;
                 break;
@@ -428,6 +476,7 @@ impl StoredTimelines {
                 .reads
                 .declaration_change(&commit, &path, qualified_name)?
             {
+                charge_stored_version(budget.as_deref_mut(), &commit, &path, kind)?;
                 versions.push(stored_version(&commit, &path, kind));
                 if kind == SymbolVersionKind::Moved
                     && let Some(old_path) = self.reads.moved_from(&commit, &path, qualified_name)?
@@ -436,6 +485,12 @@ impl StoredTimelines {
                 }
             }
             if let Some(old_path) = self.reads.renamed_from(&commit, &path)? {
+                charge_stored_version(
+                    budget.as_deref_mut(),
+                    &commit,
+                    &path,
+                    SymbolVersionKind::Moved,
+                )?;
                 versions.push(stored_version(&commit, &path, SymbolVersionKind::Moved));
                 path = old_path;
             }
@@ -446,6 +501,26 @@ impl StoredTimelines {
         }
         Ok(timeline_answer(symbol, versions, complete))
     }
+}
+
+fn charge_stored_version(
+    budget: Option<&mut crate::QueryFactBudget<'_>>,
+    commit: &StoredCommit,
+    path: &str,
+    kind: SymbolVersionKind,
+) -> Result<(), RiftError> {
+    if let Some(budget) = budget {
+        budget.charge(&(
+            &commit.id,
+            path,
+            kind,
+            &commit.committed_at,
+            commit.summary(),
+            &commit.author,
+        ))?;
+        budget.charge_material(std::mem::size_of::<SymbolVersion>())?;
+    }
+    Ok(())
 }
 
 /// One version a held commit contributes.
@@ -1349,6 +1424,337 @@ mod tests {
         let (stored_filled, lagged) = stored(&store, HistoryStrategy::Everything);
         let caught_up = stored_timeline(root, &service, &history, &stored_filled, "beacon_one")?;
         assert!(caught_up.complete, "the store holds the whole history now");
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn query_history_limits() -> rift_search::query::QueryLimits {
+        rift_search::query::QueryLimits {
+            query_bytes_max: 16_384,
+            algebra_nodes_max: 4096,
+            quads_max: 100_000,
+            rdf_bytes_max: 16_777_216,
+            result_items_max: 20_000,
+            result_bytes_max: 16_777_216,
+            input_bytes_max: None,
+            output_bytes_max: None,
+            material_bytes_max: None,
+            heap_bytes_max: None,
+            diagnostic_bytes_max: None,
+        }
+    }
+
+    #[test]
+    fn recorded_query_histories_match_the_selected_catalog_and_survive_store_trim() -> TestResult {
+        use rift_protocol::query::QueryAnswer;
+        use rift_search::query::QueryFactFamily;
+        use rift_search::sparql::{PreparedQuery, QueryCancellation};
+
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let configuration = HistoryConfiguration::default();
+        let store = filled_store(directory.path(), folder.path(), &configuration)?;
+        let (stored, lagged) = stored(&store, HistoryStrategy::Everything);
+        service.attach_history_store(&stored);
+        let first = service.index().symbols("beacon_one", 1)?[0];
+        let request = rift_protocol::symbol_read::GetSymbolParams {
+            id: timeline_identity(&service, first)?,
+            include: Vec::new(),
+            rev: None,
+            view: None,
+            declaration_limit: 1,
+            declaration_cursor: None,
+        };
+        let material = service.local_symbol_view_input(&request, true)?;
+        let limits = query_history_limits();
+        let prepared = PreparedQuery::parse("ASK { ?symbol :history ?history }", limits)?;
+        let requirements = prepared.requirements();
+        let mut facts = material.query_facts(requirements, limits)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        service.query_histories(&material, requirements, &mut facts, limits, &mut budget)?;
+        assert!(
+            !facts
+                .unavailable_families
+                .contains(&QueryFactFamily::History)
+        );
+        let expected =
+            recorded_history_oracle(&material, directory.path(), &configuration, &stored)?;
+        assert_eq!(facts.histories, expected);
+        assert!(facts.histories.len() >= 2);
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        let material = material.with_histories(&facts.histories, true, limits, &mut budget)?;
+        assert_mixed_query_histories_missing(
+            &service,
+            &request,
+            &facts.histories,
+            &prepared,
+            limits,
+            &mut budget,
+        )?;
+        let views = crate::read::LocalSymbolViews::new(8 << 20, [7; 32]);
+        let view = views
+            .capture(material)?
+            .ok_or("captured timeline catalog")?;
+        store
+            .filler()?
+            .ok_or("filler lock")?
+            .trim(&std::collections::BTreeSet::new())?;
+        fs::write(directory.path().join("lib.rs"), "pub fn changed() {}\n")?;
+        let selected = || {
+            views
+                .selected_input(&view.id, service.index().root(), service.index().owner())
+                .map_err(|reason| format!("held timeline catalog: {reason:?}"))
+        };
+        let held = selected()?;
+        let held_facts = held.query_facts(requirements, limits)?;
+        assert_eq!(held_facts.histories, expected);
+        assert_captured_history_bounds(&views, &view, &service, &expected, limits, &mut budget)?;
+        assert!(
+            !held_facts
+                .unavailable_families
+                .contains(&QueryFactFamily::History)
+        );
+        assert_exact_query_histories(&views, &view, &service, &expected, &request)?;
+        let names =
+            PreparedQuery::parse("ASK { ?symbol a :Symbol; :name \"beacon_one\" }", limits)?;
+        let names_facts = held.query_facts(names.requirements(), limits)?;
+        assert!(
+            names_facts.histories.is_empty(),
+            "name reads do not copy the timeline catalog"
+        );
+        assert_eq!(
+            names.evaluate(names_facts, limits, QueryCancellation::default())?,
+            QueryAnswer::Boolean { value: true }
+        );
+        let renewed = views
+            .capture(held)?
+            .ok_or("same captured timeline catalog")?;
+        assert_eq!(renewed.expires_at, view.expires_at);
+        assert_eq!(
+            prepared.evaluate(held_facts, limits, QueryCancellation::default())?,
+            QueryAnswer::Boolean { value: true },
+        );
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    fn recorded_history_oracle(
+        material: &crate::LocalSymbolViewInput,
+        root: &Path,
+        configuration: &HistoryConfiguration,
+        stored: &StoredHistory,
+    ) -> Result<Vec<SymbolHistory>, Box<dyn std::error::Error>> {
+        let provider = CountingProvider::new();
+        let mut oracle = SymbolTimelines::open_captured(
+            root,
+            None,
+            configuration,
+            SyntaxLimits::default(),
+            Some(stored),
+        )?;
+        let mut expected = Vec::new();
+        for (identity, object) in material.index().objects() {
+            object?;
+            let (bindings, _) = material.index().symbols_by_identity_page(identity, 0, 1)?;
+            if let Some(matched) = bindings.first().copied() {
+                expected.push(oracle.timeline(
+                    &provider,
+                    matched,
+                    SymbolId(identity.as_str().to_owned()),
+                )?);
+            }
+        }
+        assert_eq!(provider.analyzed(), 0);
+        Ok(expected)
+    }
+
+    fn assert_mixed_query_histories_missing(
+        service: &ReadService,
+        request: &rift_protocol::symbol_read::GetSymbolParams,
+        histories: &[SymbolHistory],
+        prepared: &rift_search::sparql::PreparedQuery,
+        limits: rift_search::query::QueryLimits,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> TestResult {
+        use rift_search::query::QueryFactFamily;
+        use rift_search::sparql::QueryCancellation;
+        let foreign = rift_search::query::QueryFacts {
+            symbols: vec![rift_search::query::QuerySymbol {
+                symbol: serde_json::from_value(serde_json::json!({
+                    "id":"rift://symbol/cargo/crates.io/dependency@1.0.0/rust/dependency/other",
+                    "language":"rust", "name":"other", "kind":"function",
+                    "origin":{"source_kind":"synthetic"}
+                }))?,
+                declarations: Vec::new(),
+            }],
+            ..rift_search::query::QueryFacts::default()
+        };
+        let mixed = service
+            .local_symbol_view_input(request, true)?
+            .with_histories(histories, true, limits, budget)?
+            .with_package_facts(foreign)?;
+        let selection = mixed
+            .provider_selection(&rift_protocol::configuration::WorkspaceConfiguration::default())?;
+        let mixed_facts = mixed.query_facts_with_selection(
+            prepared.requirements(),
+            limits,
+            budget,
+            &selection,
+        )?;
+        assert!(
+            mixed_facts
+                .unavailable_families
+                .contains(&QueryFactFamily::History)
+        );
+        assert!(
+            prepared
+                .evaluate(mixed_facts, limits, QueryCancellation::default())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    fn assert_captured_history_bounds(
+        views: &crate::read::LocalSymbolViews,
+        view: &rift_protocol::symbol_read::CapturedView,
+        service: &ReadService,
+        expected: &[SymbolHistory],
+        limits: rift_search::query::QueryLimits,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> TestResult {
+        let mut changed = expected[0].clone();
+        changed.complete = !changed.complete;
+        let conflict = views
+            .selected_input(&view.id, service.index().root(), service.index().owner())
+            .map_err(|reason| format!("held timeline catalog: {reason:?}"))?
+            .with_histories(&[changed], false, limits, budget)
+            .expect_err("one captured identity cannot select different timelines");
+        assert_eq!(conflict.slug().as_str(), "rift.server.read_unavailable");
+        let cancelled = || true;
+        let mut cancelled_budget = crate::QueryFactBudget::new(limits, &cancelled)?;
+        assert_eq!(
+            views
+                .selected_input(&view.id, service.index().root(), service.index().owner())
+                .map_err(|reason| format!("held timeline catalog: {reason:?}"))?
+                .with_histories(expected, true, limits, &mut cancelled_budget)
+                .expect_err("retention observes cancellation before cloning records")
+                .slug()
+                .as_str(),
+            "rift.server.read_cancelled"
+        );
+        let bounded = rift_search::query::QueryLimits {
+            quads_max: 1,
+            ..limits
+        };
+        assert_eq!(
+            views
+                .selected_input(&view.id, service.index().root(), service.index().owner())
+                .map_err(|reason| format!("held timeline catalog: {reason:?}"))?
+                .with_histories(expected, true, bounded, budget)
+                .expect_err("retention cannot exceed the accepted timeline count")
+                .slug()
+                .as_str(),
+            "rift.server.read_unavailable"
+        );
+        Ok(())
+    }
+
+    fn assert_exact_query_histories(
+        views: &crate::read::LocalSymbolViews,
+        view: &rift_protocol::symbol_read::CapturedView,
+        service: &ReadService,
+        expected: &[SymbolHistory],
+        request: &rift_protocol::symbol_read::GetSymbolParams,
+    ) -> TestResult {
+        for name in ["beacon_one", "beacon_two"] {
+            let timeline = expected
+                .iter()
+                .find(|history| history.symbol.as_str().ends_with(name))
+                .ok_or("captured public timeline")?;
+            let exact = rift_protocol::symbol_read::GetSymbolParams {
+                id: timeline.symbol.clone(),
+                include: vec![
+                    rift_protocol::read::GetSymbolInclude::History,
+                    rift_protocol::read::GetSymbolInclude::Source,
+                ],
+                view: Some(view.id.clone()),
+                ..request.clone()
+            };
+            let rift_protocol::symbol_read::GetSymbolResult::Found {
+                history,
+                declarations,
+                view: returned,
+                ..
+            } = views.resolve(&exact, service.index().root(), service.index().owner())?
+            else {
+                return Err("retained exact timeline missing".into());
+            };
+            assert_eq!(history.as_ref(), Some(timeline));
+            assert_eq!(&returned, view);
+            assert!(
+                declarations[0]
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.contains(name))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recorded_query_histories_keep_missing_facts_and_honor_cancellation_and_bounds() -> TestResult
+    {
+        use rift_search::query::QueryFactFamily;
+        use rift_search::sparql::{PreparedQuery, QueryCancellation};
+
+        let (_directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let location = rift_history_store::StoreLocation::new(folder.path(), "aa");
+        let store = rift_history_store::HistoryStore::open(&location)?;
+        let (stored, lagged) = stored(&store, HistoryStrategy::Everything);
+        service.attach_history_store(&stored);
+        let first = service.index().symbols("beacon_one", 1)?[0];
+        let request = rift_protocol::symbol_read::GetSymbolParams {
+            id: timeline_identity(&service, first)?,
+            include: Vec::new(),
+            rev: None,
+            view: None,
+            declaration_limit: 1,
+            declaration_cursor: None,
+        };
+        let material = service.local_symbol_view_input(&request, true)?;
+        let limits = query_history_limits();
+        let prepared = PreparedQuery::parse("ASK { ?symbol :history ?history }", limits)?;
+        let requirements = prepared.requirements();
+        let mut facts = material.query_facts(requirements, limits)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        service.query_histories(&material, requirements, &mut facts, limits, &mut budget)?;
+        assert!(
+            facts
+                .unavailable_families
+                .contains(&QueryFactFamily::History)
+        );
+        assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        assert!(
+            prepared
+                .evaluate(facts.clone(), limits, QueryCancellation::default())
+                .is_err()
+        );
+        let mut cancelled = crate::QueryFactBudget::new(limits, &|| true)?;
+        let error = service
+            .query_histories(&material, requirements, &mut facts, limits, &mut cancelled)
+            .expect_err("cancelled before any recorded read");
+        assert_eq!(error.slug().as_str(), "rift.server.read_cancelled");
+        let bounded = rift_search::query::QueryLimits {
+            quads_max: 1,
+            ..limits
+        };
+        let mut facts = material.query_facts(requirements, limits)?;
+        let mut budget = crate::QueryFactBudget::new(bounded, &|| false)?;
+        let error = service
+            .query_histories(&material, requirements, &mut facts, bounded, &mut budget)
+            .expect_err("the complete catalog exceeds one timeline");
+        assert_eq!(error.slug().as_str(), "rift.server.read_unavailable");
         assert_eq!(lagged.load(Ordering::SeqCst), 0);
         Ok(())
     }

@@ -22,6 +22,7 @@ pub mod identity;
 pub mod index;
 pub mod lock;
 pub mod map;
+pub mod message;
 pub mod query;
 pub mod read;
 pub mod relationship_read;

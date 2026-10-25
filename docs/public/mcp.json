@@ -8021,10 +8021,10 @@
           "language": {
             "$ref": "#/$defs/QueryLanguage",
             "default": "sparql",
-            "description": "The implemented query language. Omitted selects SPARQL."
+            "description": "Currently only SPARQL is supported."
           },
           "query": {
-            "description": "SPARQL Query text. The server supplies vocabulary and standard prefixes.",
+            "description": "Query text.",
             "type": "string"
           }
         },
