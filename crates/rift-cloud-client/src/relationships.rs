@@ -154,15 +154,17 @@ impl GlobalClient {
             ));
         }
         let bounds = self.validate_advertised_request(request, &capabilities)?;
-        crate::validate_read_bounds(
-            request
-                .packages
-                .len()
-                .saturating_add(request.runtimes.len()),
-            limit,
-            cursor,
-            &capabilities,
-        )?;
+        let packages = request
+            .packages
+            .len()
+            .saturating_add(request.runtimes.len());
+        crate::validate_read_bounds(packages, limit, cursor, &capabilities)?;
+        // Larger counts cannot lower the accepted i64 transport page limit.
+        let limit = limit
+            .min(i64::try_from(bounds.max_relationships).unwrap_or(i64::MAX))
+            .min(i64::try_from(bounds.max_occurrences).unwrap_or(i64::MAX))
+            .max(capabilities.bounds.page_limit_min);
+        crate::validate_read_bounds(packages, limit, cursor, &capabilities)?;
         let body = serialize_request(request, self.inner.config.max_request)?;
         crate::validate_body_for_capabilities(&body, &capabilities, self.inner.config.max_request)?;
         let query = SearchPackagesRequestQuery {

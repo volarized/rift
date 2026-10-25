@@ -26,6 +26,233 @@ fn request() -> RelationshipSearchRequest {
     serde_json::from_value(json!({"relationships":{"seeds":[SEED],"direction":"outgoing","facets":["calls"]},"packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]})).expect("strict request")
 }
 
+fn relationship_bounds() -> rift_protocol::relationship_read::RelationshipBounds {
+    let configuration = rift_protocol::configuration::GlobalConfiguration::default();
+    rift_protocol::relationship_read::RelationshipBounds {
+        max_seeds: configuration.max_seeds,
+        max_facets: configuration.max_facets,
+        max_relationships: configuration.max_relationships,
+        max_occurrences: configuration.max_occurrences,
+        max_symbols: configuration.max_symbols,
+        max_sources: configuration.max_sources,
+    }
+}
+
+#[tokio::test]
+async fn relationship_page_windows_intersect_local_and_advertised_group_counts() {
+    for occurrences in [false, true] {
+        for (local, remote, expected) in [(100, 1000, 100), (1000, 50, 50)] {
+            assert_relationship_page_window(local, remote, expected, occurrences).await;
+        }
+    }
+}
+
+async fn assert_relationship_page_window(
+    local: usize,
+    remote: u64,
+    expected: i64,
+    occurrences: bool,
+) {
+    let mut bounds = relationship_bounds();
+    let mut pages = vec![page(0, false, Some("1")), page(1, true, None)];
+    if occurrences {
+        bounds.max_occurrences = remote;
+        for (index, page) in pages.iter_mut().enumerate() {
+            let index = u64::try_from(index).expect("fixture page index");
+            page["groups"][0]["occurrences"] =
+                json!([located_projection(index, Some(index), index)]);
+        }
+    } else {
+        bounds.max_relationships = remote;
+    }
+    let (server, _) = operation_client(OperationFixture::RelationshipBounds {
+        pages,
+        bounds,
+        page_limit_min: crate::PAGE_LIMIT_MIN,
+        page_limit_max: crate::PAGE_LIMIT_MAX,
+    })
+    .await;
+    let mut configuration = server.config();
+    if occurrences {
+        configuration.max_occurrences = local;
+    } else {
+        configuration.max_relationships = local;
+    }
+    let client = crate::GlobalClient::new(configuration).expect("accepted count policy");
+    let mut admissions = 0;
+    let result = client
+        .relationship_pages_with_admission(&request(), limits(), || {
+            admissions += 1;
+            Ok(())
+        })
+        .await
+        .expect("complete selected pages");
+    let RelationshipSearchResult::Page(result) = result else {
+        panic!("raw pages");
+    };
+    assert_eq!(admissions, 2);
+    assert_eq!(result.groups[0].relationships.len(), 2);
+    assert_eq!(
+        result.groups[0].occurrences.len(),
+        usize::from(occurrences) * 2
+    );
+    assert_eq!(result.view.id.as_str(), "a".repeat(64));
+    assert_eq!(result.view.expires_at, "2099-01-01T00:00:00Z");
+    let requests = server.state.request_log.lock().await;
+    let pages = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/search"))
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2);
+    for page in &pages {
+        assert!(
+            page.query
+                .as_deref()
+                .expect("page query")
+                .split('&')
+                .any(|field| field == format!("limit={expected}"))
+        );
+    }
+    let first: Value = serde_json::from_slice(&pages[0].body).expect("first selected request");
+    let second: Value = serde_json::from_slice(&pages[1].body).expect("continued selected request");
+    assert_eq!(first["relationships"], second["relationships"]);
+    assert_eq!(second["view"], "a".repeat(64));
+    assert!(first["view"].is_null());
+    assert_eq!(second["packages"], first["packages"]);
+}
+
+#[tokio::test]
+async fn relationship_page_windows_preserve_independent_generic_limit_refusal() {
+    let mut bounds = relationship_bounds();
+    bounds.max_relationships = 1;
+    bounds.max_occurrences = 1;
+    let (server, client) = operation_client(OperationFixture::RelationshipBounds {
+        pages: vec![],
+        bounds,
+        page_limit_min: crate::PAGE_LIMIT_MIN,
+        page_limit_max: 2,
+    })
+    .await;
+    assert_eq!(
+        client
+            .relationship_page(&request(), 3, None)
+            .await
+            .expect_err("generic advertised limit remains independent")
+            .slug()
+            .as_str(),
+        "rift.client.request_invalid"
+    );
+    assert!(
+        !server
+            .state
+            .request_log
+            .lock()
+            .await
+            .iter()
+            .any(|request| request.path.ends_with("/search"))
+    );
+}
+
+#[tokio::test]
+async fn relationship_page_windows_keep_generic_minimum_above_remote_group_counts() {
+    let mut bounds = relationship_bounds();
+    bounds.max_relationships = 1;
+    bounds.max_occurrences = 1;
+    let (server, _) = operation_client(OperationFixture::RelationshipBounds {
+        pages: vec![page(0, false, Some("1")), page(1, true, None)],
+        bounds,
+        page_limit_min: 10,
+        page_limit_max: crate::PAGE_LIMIT_MAX,
+    })
+    .await;
+    let mut configuration = server.config();
+    configuration.max_relationships = 100;
+    configuration.max_occurrences = 100;
+    let client = crate::GlobalClient::new(configuration).expect("accepted count policy");
+    let result = client
+        .relationship_pages(&request(), limits())
+        .await
+        .expect("remote groups below the generic minimum remain valid");
+    let RelationshipSearchResult::Page(result) = result else {
+        panic!("raw pages");
+    };
+    assert_eq!(result.groups[0].relationships.len(), 2);
+    assert_eq!(result.view.id.as_str(), "a".repeat(64));
+    assert_eq!(result.view.expires_at, "2099-01-01T00:00:00Z");
+    let requests = server.state.request_log.lock().await;
+    let pages = requests
+        .iter()
+        .filter(|request| request.path.ends_with("/search"))
+        .collect::<Vec<_>>();
+    assert_eq!(pages.len(), 2);
+    for page in pages {
+        assert!(
+            page.query
+                .as_deref()
+                .expect("page query")
+                .split('&')
+                .any(|field| field == "limit=10")
+        );
+    }
+}
+
+#[tokio::test]
+async fn relationship_page_windows_preserve_local_group_refusal_above_generic_minimum() {
+    for occurrences in [false, true] {
+        let mut selected = page(0, true, None);
+        if occurrences {
+            selected["groups"][0]["occurrences"] = json!([
+                located_projection(0, Some(0), 0),
+                located_projection(0, Some(0), 1),
+            ]);
+        } else {
+            let mut second = selected["groups"][0]["relationships"][0].clone();
+            second["id"] = json!(format!("{:064x}", 1));
+            selected["groups"][0]["relationships"]
+                .as_array_mut()
+                .expect("records")
+                .push(second);
+        }
+        let (server, _) = operation_client(OperationFixture::RelationshipBounds {
+            pages: vec![selected],
+            bounds: relationship_bounds(),
+            page_limit_min: 10,
+            page_limit_max: crate::PAGE_LIMIT_MAX,
+        })
+        .await;
+        let mut configuration = server.config();
+        if occurrences {
+            configuration.max_occurrences = 1;
+        } else {
+            configuration.max_relationships = 1;
+        }
+        let client = crate::GlobalClient::new(configuration).expect("accepted count policy");
+        assert_eq!(
+            client
+                .relationship_pages(&request(), limits())
+                .await
+                .expect_err("local group count remains strict")
+                .slug()
+                .as_str(),
+            "rift.client.response_invalid"
+        );
+        let requests = server.state.request_log.lock().await;
+        let pages = requests
+            .iter()
+            .filter(|request| request.path.ends_with("/search"))
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1);
+        assert!(
+            pages[0]
+                .query
+                .as_deref()
+                .expect("page query")
+                .split('&')
+                .any(|field| field == "limit=10")
+        );
+    }
+}
+
 #[tokio::test]
 async fn relationship_request_counts_use_configured_exact_bounds() {
     let (server, _) = operation_client(OperationFixture::Relationships {

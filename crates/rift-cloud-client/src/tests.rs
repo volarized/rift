@@ -91,6 +91,12 @@ enum OperationFixture {
         pages: Vec<serde_json::Value>,
         advertised: bool,
     },
+    RelationshipBounds {
+        pages: Vec<serde_json::Value>,
+        bounds: rift_protocol::relationship_read::RelationshipBounds,
+        page_limit_min: i64,
+        page_limit_max: i64,
+    },
     Valid,
     ExactSymbol(serde_json::Value),
     ExactSource(serde_json::Value, StatusCode),
@@ -450,19 +456,21 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::Relationships {
             advertised: true, ..
         }
+        | OperationFixture::RelationshipBounds { .. }
         | OperationFixture::RelationshipRefusal { .. } => {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "relationships"]);
-            value["relationship_capabilities"] = serde_json::json!([
-                {"direction":"outgoing","facets":["calls"],"bounds":{
-                    "max_seeds":64,"max_facets":16,"max_relationships":1000,
-                    "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
-                }},
-                {"direction":"incoming","facets":["references"],"bounds":{
-                    "max_seeds":64,"max_facets":16,"max_relationships":1000,
-                    "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
-                }}
-            ]);
+            value["relationship_capabilities"] = operation_relationship_capabilities(mode);
+            if let OperationFixture::RelationshipBounds {
+                page_limit_min,
+                page_limit_max,
+                ..
+            } = mode
+            {
+                value["bounds"]["page_limit_min"] = serde_json::json!(page_limit_min);
+                value["bounds"]["page_limit_max"] = serde_json::json!(page_limit_max);
+                value["bounds"]["page_limit_default"] = serde_json::json!(page_limit_max);
+            }
         }
         OperationFixture::Documentation { .. } | OperationFixture::DocumentationBounds { .. } => {
             value["supported_features"] = serde_json::json!([
@@ -540,6 +548,25 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
     })
 }
 
+fn operation_relationship_capabilities(mode: &OperationFixture) -> serde_json::Value {
+    let mut operations = serde_json::json!([
+        {"direction":"outgoing","facets":["calls"],"bounds":{
+            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+            "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
+        }},
+        {"direction":"incoming","facets":["references"],"bounds":{
+            "max_seeds":64,"max_facets":16,"max_relationships":1000,
+            "max_occurrences":1000,"max_symbols":10000,"max_sources":10000
+        }}
+    ]);
+    if let OperationFixture::RelationshipBounds { bounds, .. } = mode {
+        for operation in operations.as_array_mut().expect("fixture operations") {
+            operation["bounds"] = serde_json::to_value(bounds).expect("fixture count bounds");
+        }
+    }
+    operations
+}
+
 fn operation_resolution_response(mode: &OperationFixture, request_body: &[u8]) -> Response {
     if matches!(mode, OperationFixture::EchoResolution) {
         let request: serde_json::Value =
@@ -614,7 +641,9 @@ fn operation_search_response(
         )
             .into_response();
     }
-    if let OperationFixture::Relationships { pages, .. } = mode {
+    if let OperationFixture::Relationships { pages, .. }
+    | OperationFixture::RelationshipBounds { pages, .. } = mode
+    {
         let index = query_cursor(query)
             .and_then(|cursor| cursor.parse::<usize>().ok())
             .unwrap_or(0);
