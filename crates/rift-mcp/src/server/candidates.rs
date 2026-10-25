@@ -1054,45 +1054,56 @@ impl CandidateResponses {
         }
     }
 
+    fn retained_bytes(
+        saved: &[SavedCandidateBytes],
+        table_capacity: usize,
+        now: SystemTime,
+        incoming: Option<usize>,
+    ) -> Option<usize> {
+        saved.iter().filter(|row| row.expires > now).fold(
+            table_capacity
+                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
+                .and_then(|bytes| incoming.and_then(|incoming| bytes.checked_add(incoming))),
+            |sum, row| {
+                sum.and_then(|bytes| bytes.checked_add(row.id.capacity()))
+                    .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
+            },
+        )
+    }
+
     fn save_bytes(
         &self,
         id: String,
         expires: SystemTime,
         encoded: Vec<u8>,
     ) -> Result<(), RiftError> {
-        let mut saved = self
-            .bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        saved.retain(|row| row.expires > SystemTime::now());
-        if u64::try_from(saved.len()).unwrap_or(u64::MAX) >= self.slots_max {
-            return Err(errors::server::read_unavailable()
-                .operation("search_candidates")
-                .detail("captured candidates exceed the byte or view bound")
-                .error());
-        }
-        saved.try_reserve_exact(1).map_err(|source| {
+        let unavailable = || {
             errors::server::read_unavailable()
                 .operation("search_candidates")
                 .detail("captured candidates exceed the byte or view bound")
                 .error()
-                .with(rift_error::ErrorContext::new(
-                    "source",
-                    rift_error::ErrorValue::source(source),
-                ))
-        })?;
-        let retained = saved.iter().fold(
-            saved
-                .capacity()
-                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
-                .and_then(|bytes| bytes.checked_add(id.capacity()))
-                .and_then(|bytes| bytes.checked_add(encoded.capacity())),
-            |sum, row| {
-                sum.and_then(|bytes| bytes.checked_add(row.id.capacity()))
-                    .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
-            },
-        );
-        if retained.is_none_or(|bytes| bytes > BYTES_MAX) || saved.iter().any(|row| row.id == id) {
+        };
+        let mut saved = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = SystemTime::now();
+        let live = saved.iter().filter(|row| row.expires > now).count();
+        if u64::try_from(live).unwrap_or(u64::MAX) >= self.slots_max {
+            return Err(unavailable());
+        }
+        let next_len = live.checked_add(1).ok_or_else(unavailable)?;
+        let growth = next_len > saved.capacity();
+        let planned_capacity = if growth {
+            saved.capacity().checked_add(next_len)
+        } else {
+            Some(saved.capacity())
+        };
+        let incoming = id.capacity().checked_add(encoded.capacity());
+        let retained = planned_capacity
+            .and_then(|capacity| Self::retained_bytes(&saved, capacity, now, incoming));
+        let duplicate = saved.iter().any(|row| row.expires > now && row.id == id);
+        if retained.is_none_or(|bytes| bytes > BYTES_MAX) || duplicate {
             let stored_bytes = saved
                 .iter()
                 .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.len()));
@@ -1110,13 +1121,31 @@ impl CandidateResponses {
                 ?stored_capacity,
                 incoming_bytes = encoded.len(),
                 incoming_capacity = encoded.capacity(),
-                duplicate = saved.iter().any(|row| row.id == id),
+                duplicate,
                 "captured candidates exceed the byte or view bound"
             );
-            return Err(errors::server::read_unavailable()
-                .operation("search_candidates")
-                .detail("captured candidates exceed the byte or view bound")
-                .error());
+            return Err(unavailable());
+        }
+        let mut replacement = Vec::new();
+        if growth {
+            replacement.try_reserve_exact(next_len).map_err(|source| {
+                unavailable().with(rift_error::ErrorContext::new(
+                    "source",
+                    rift_error::ErrorValue::source(source),
+                ))
+            })?;
+            let retained = saved
+                .capacity()
+                .checked_add(replacement.capacity())
+                .and_then(|capacity| Self::retained_bytes(&saved, capacity, now, incoming));
+            if retained.is_none_or(|bytes| bytes > BYTES_MAX) {
+                return Err(unavailable());
+            }
+        }
+        saved.retain(|row| row.expires > now);
+        if growth {
+            replacement.append(&mut saved);
+            *saved = replacement;
         }
         saved.push(SavedCandidateBytes {
             id,
@@ -1327,12 +1356,15 @@ mod tests {
     fn aggregate_capacity_refusal_preserves_original_candidate() -> TestResult {
         let responses = CandidateResponses::default();
         let id = String::from("first");
-        let table_bytes = responses
-            .bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .capacity()
-            * std::mem::size_of::<super::SavedCandidateBytes>();
+        let table_capacity = {
+            let mut saved = responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            saved.try_reserve_exact(1)?;
+            saved.capacity()
+        };
+        let table_bytes = table_capacity * std::mem::size_of::<super::SavedCandidateBytes>();
         let mut bytes = Vec::with_capacity(BYTES_MAX - table_bytes - id.capacity());
         bytes.push(7);
         let capacity = bytes.capacity();
@@ -1347,11 +1379,53 @@ mod tests {
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.capacity(), table_capacity);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].id, "first");
         assert_eq!(saved[0].bytes, [7]);
         assert_eq!(saved[0].bytes.capacity(), capacity);
         assert_eq!(saved[0].expires, expires);
+        Ok(())
+    }
+
+    #[test]
+    fn refused_candidate_growth_preserves_empty_and_expired_rows() -> TestResult {
+        let responses = CandidateResponses::default();
+        let expired = SystemTime::UNIX_EPOCH;
+        let incoming = || Vec::with_capacity(BYTES_MAX);
+        assert!(
+            responses
+                .save_bytes(String::from("first"), expired, incoming())
+                .is_err()
+        );
+        {
+            let saved = responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(saved.len(), 0);
+            assert_eq!(saved.capacity(), 0);
+        }
+        responses.save_bytes(String::from("expired"), expired, vec![7])?;
+        let capacity = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity();
+        assert!(
+            responses
+                .save_bytes(String::from("next"), expired, incoming())
+                .is_err()
+        );
+        let saved = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.capacity(), capacity);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, "expired");
+        assert_eq!(saved[0].bytes, [7]);
+        assert_eq!(saved[0].expires, expired);
         Ok(())
     }
 
