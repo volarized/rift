@@ -1028,6 +1028,71 @@ async fn test_global_prose_search_preserves_broad_full_text_order() -> TestResul
     Ok(())
 }
 
+#[tokio::test]
+async fn global_broad_search_keeps_short_terms_exact_and_phrases_unprefixed() -> TestResult {
+    let fixture = GlobalFixture::start_with(FixtureOptions {
+        query_narrowed: false,
+        view_lifetime: Duration::from_mins(5),
+        ..FixtureOptions::default()
+    })
+    .await?;
+    let configuration = format!(
+        "[global]\nenabled=true\nendpoint={:?}\nattempts=1\n{DEMO_PACKAGE}\n[languages.rust]\nstdlib=false\n",
+        fixture.endpoint,
+    );
+    let (_directory, client, server_task) = served_workspace(
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"probe\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            ("src/lib.rs", "pub fn local_probe() {}\n"),
+        ],
+        Some(configuration),
+    )
+    .await?;
+    let answer = ranked_search_symbols(
+        &client,
+        json!({"query":"fn helper_beacon \"pub fn\"", "scope":"global"}),
+    )
+    .await?;
+    let requests = search_requests(&fixture).await;
+    let rows = workspace_client::query::rows(&answer)?;
+    assert!(
+        rows.iter().any(|row| {
+            workspace_client::query::literal(row, "name").is_ok_and(|name| name == "helper_beacon")
+        }),
+        "{answer:#}; requests={requests:#?}"
+    );
+    assert_eq!(
+        view_expiry(&answer["view"])?,
+        view_expiry(fixture.captured_view())?
+    );
+    assert_eq!(requests.len(), 2, "{requests:#?}");
+    for (request, broad) in requests.iter().zip([false, true]) {
+        let body = request.body.as_ref().ok_or("search body is recorded")?;
+        assert_eq!(body["phase"], if broad { "broad" } else { "precise" });
+        assert_eq!(body["identifiers"], json!(["helper_beacon"]));
+        if broad {
+            assert_eq!(body["view"], fixture.captured_view()["id"]);
+        } else {
+            assert!(body.get("view").is_none());
+        }
+        assert_eq!(
+            body["terms"],
+            json!([
+                {"text":"fn", "phrase":false, "prefix":false},
+                {"text":"helper", "phrase":false, "prefix":broad},
+                {"text":"beacon", "phrase":false, "prefix":broad},
+                {"text":"pub fn", "phrase":true, "prefix":false}
+            ])
+        );
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
 /// The search requests `fixture` received, in order.
 async fn search_requests(fixture: &GlobalFixture) -> Vec<global_api::ObservedRequest> {
     fixture
@@ -1349,7 +1414,7 @@ async fn global_pattern_empty_and_mixed_results_keep_original_views_and_source_o
             "scope":"global",
             "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
         });
-        fields[selector] = json!("no_producer_match_here");
+        fields[selector] = json!("absent_producer_match_here");
         if selector == "pattern" {
             fields["target"] = json!("file");
         }
@@ -1432,7 +1497,7 @@ async fn empty_global_package_pages_validate_original_metadata_in_both_phases() 
         token_env: "RIFT_GLOBAL_TEST_UNUSED_TOKEN".to_owned(),
         ..Config::default()
     })?;
-    let parsed = rift_ranking::ParsedQuery::parse("no_producer_match_here")?;
+    let parsed = rift_ranking::ParsedQuery::parse("absent_producer_match_here")?;
     for phase in [
         PackageSearchRequestPhase::Precise,
         PackageSearchRequestPhase::Broad,

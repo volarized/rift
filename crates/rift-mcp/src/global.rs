@@ -950,7 +950,10 @@ fn search_request(
                 .map(|member| QueryTerm {
                     text: member.text().to_owned(),
                     phrase: member.is_phrase(),
-                    prefix: phase == QueryPhase::Broad && !member.is_phrase(),
+                    prefix: phase == QueryPhase::Broad
+                        && !member.is_phrase()
+                        && member.text().chars().count()
+                            >= rift_ranking::QUERY_PREFIX_ALPHANUMERIC_MIN,
                 })
                 .collect(),
         ),
