@@ -57,6 +57,58 @@ pub(super) fn pattern_page_json(cursor: Option<&str>) -> Value {
     })
 }
 
+#[test]
+fn pattern_pages_preserve_optional_original_views_including_complete_empty() {
+    let mut value = pattern_page_json(None);
+    value["items"] = serde_json::json!([]);
+    value["next_cursor"] = serde_json::Value::Null;
+    let older: crate::PackagePatternPage =
+        serde_json::from_value(value.clone()).expect("older page");
+    assert!(older.captured_view(None).expect("optional view").is_none());
+    value["view"] = serde_json::json!({"id":"b".repeat(64),"expires_at":"2099-10-10T12:00:00Z"});
+    let page: crate::PackagePatternPage =
+        serde_json::from_value(value.clone()).expect("captured page");
+    let original = page
+        .captured_view(None)
+        .expect("checked view")
+        .expect("captured view");
+    assert!(page.items.is_empty());
+    assert_eq!(original.id.as_str(), "b".repeat(64));
+    assert_eq!(
+        page.captured_view(Some(&original)).expect("same view"),
+        Some(original.clone())
+    );
+    assert_eq!(
+        page.captured_view(None).expect("stable expiry"),
+        Some(original.clone())
+    );
+    assert!(older.captured_view(Some(&original)).is_err());
+    for change in ["identity", "expiry", "expired", "malformed"] {
+        let mut changed = value.clone();
+        match change {
+            "identity" => changed["view"]["id"] = serde_json::json!("c".repeat(64)),
+            "expiry" => changed["view"]["expires_at"] = serde_json::json!("2100-10-10T12:00:00Z"),
+            "expired" => changed["view"]["expires_at"] = serde_json::json!("2020-10-10T12:00:00Z"),
+            "malformed" => changed["view"]["id"] = serde_json::json!("opaque"),
+            _ => unreachable!(),
+        }
+        let changed: crate::PackagePatternPage =
+            serde_json::from_value(changed).expect("typed view fields");
+        assert!(changed.captured_view(Some(&original)).is_err(), "{change}");
+    }
+    value["view"]["id"] = serde_json::json!("claims.signature");
+    let opaque: crate::PackagePatternPage =
+        serde_json::from_value(value.clone()).expect("opaque view");
+    assert!(
+        opaque
+            .captured_view(None)
+            .expect("existing view codec")
+            .is_some()
+    );
+    value["view"]["expires_at"] = serde_json::json!("not a date");
+    assert!(serde_json::from_value::<crate::PackagePatternPage>(value).is_err());
+}
+
 pub(super) fn pattern_request() -> PackagePatternRequest {
     PackagePatternRequest {
         pattern: r"fn\s+demo".to_owned(),

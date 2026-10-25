@@ -1402,6 +1402,8 @@ pub struct PackagePatternHit {
 /// One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 pub struct PackagePatternPage {
+    /// The immutable serving view and the expiry promised by its owner.
+    pub view: Option<CapturedView>,
     /// Matches in package, file path, and offset order.
     pub items: Vec<PackagePatternHit>,
     /// Opaque cursor for the next page.

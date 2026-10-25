@@ -3517,6 +3517,10 @@
         "additionalProperties": true,
         "description": "One page of pattern matches. A page that stops before the last match carries `next_cursor` at the first match left out and a `result_truncated` warning naming the bound it stopped at. A page **MUST NOT** take the response past `response_body_bytes_max`: the server stops it before the first match that would.",
         "properties": {
+          "view": {
+            "$ref": "#/components/schemas/CapturedView",
+            "description": "The original immutable serving view and expiry. Older responses can omit it; reads requiring captured source context return unavailable."
+          },
           "items": {
             "description": "Matches in package, file path, and offset order.",
             "items": {

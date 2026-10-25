@@ -21,6 +21,52 @@ pub const PATTERN_PAGE_FILES_MAX: usize = 500;
 /// The capability feature a server advertises when it serves pattern search.
 const PATTERN_FEATURE: &str = "patterns";
 
+impl PackagePatternPage {
+    /// Returns the original captured view, checking its identity and expiry.
+    ///
+    /// Older responses can omit the view. A continuation with `previous` must
+    /// preserve that view and its original expiry, including on an empty page.
+    ///
+    /// # Errors
+    /// Returns an invalid-response error for a malformed, expired or changed view.
+    pub fn captured_view(
+        &self,
+        previous: Option<&rift_protocol::symbol_read::CapturedView>,
+    ) -> Result<Option<rift_protocol::symbol_read::CapturedView>, RiftError> {
+        let invalid = || {
+            failure::response_invalid(
+                "validate_pattern_view",
+                "view",
+                "field failed validation",
+                None,
+            )
+        };
+        let Some(view) = &self.view else {
+            return if previous.is_some() {
+                Err(invalid())
+            } else {
+                Ok(None)
+            };
+        };
+        let id =
+            rift_protocol::symbol_read::CapturedViewId::parse(&view.id).map_err(|_| invalid())?;
+        if view.expires_at <= chrono::Utc::now() {
+            return Err(invalid());
+        }
+        if let Some(previous) = previous {
+            let expiry = chrono::DateTime::parse_from_rfc3339(&previous.expires_at)
+                .map_err(|_| invalid())?;
+            if previous.id != id || expiry != view.expires_at {
+                return Err(invalid());
+            }
+        }
+        Ok(Some(rift_protocol::symbol_read::CapturedView {
+            id,
+            expires_at: view.expires_at.to_rfc3339(),
+        }))
+    }
+}
+
 impl GlobalClient {
     /// Reads one page of pattern matches over the selected exact package versions, asking for
     /// the smaller of `limit` and the advertised `page_limit_max`.
@@ -156,6 +202,7 @@ impl PatternPageCheck<'_> {
             warnings: &page.warnings,
         }
         .validate(self.capabilities, false)?;
+        page.captured_view(None)?;
         let within_limit = i64::try_from(page.items.len()).is_ok_and(|count| count <= self.limit);
         if !within_limit {
             return Err(failure::response_invalid(
