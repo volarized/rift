@@ -315,4 +315,342 @@ mod tests {
         );
         Ok(())
     }
+    mod model_oracle {
+        use super::*;
+        use crate::sparql::{PreparedQuery, QueryCancellation};
+        use rift_protocol::query::{QueryAnswer, RdfTerm, RdfTriple};
+        use rift_protocol::read::Symbol;
+        use serde_json::{Value, json};
+
+        type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+        struct Model<'a>(&'a [RdfTriple]);
+
+        impl Model<'_> {
+            fn objects<'a>(&'a self, subject: &RdfTerm, key: &str) -> Vec<&'a RdfTerm> {
+                let predicate = format!("{}{key}", crate::sparql::VOCABULARY);
+                self.0
+                    .iter()
+                    .filter_map(|triple| {
+                        (triple.subject == *subject
+                            && triple.predicate
+                                == RdfTerm::Iri {
+                                    value: predicate.clone(),
+                                })
+                        .then_some(&triple.object)
+                    })
+                    .collect()
+            }
+
+            fn optional<'a>(&'a self, subject: &RdfTerm, key: &str) -> Result<Option<&'a RdfTerm>> {
+                let values = self.objects(subject, key);
+                match values.as_slice() {
+                    [] => Ok(None),
+                    [value] => Ok(Some(*value)),
+                    _ => Err(format!("multiple {key} values").into()),
+                }
+            }
+
+            fn one<'a>(&'a self, subject: &RdfTerm, key: &str) -> Result<&'a RdfTerm> {
+                self.optional(subject, key)?
+                    .ok_or_else(|| format!("missing {key}").into())
+            }
+
+            fn string(&self, subject: &RdfTerm, key: &str) -> Result<String> {
+                match self.one(subject, key)? {
+                    RdfTerm::Literal { value, datatype }
+                        if datatype == "http://www.w3.org/2001/XMLSchema#string" =>
+                    {
+                        Ok(value.clone())
+                    }
+                    _ => Err(format!("{key} must be a string literal").into()),
+                }
+            }
+
+            fn iri(&self, subject: &RdfTerm, key: &str) -> Result<String> {
+                match self.one(subject, key)? {
+                    RdfTerm::Iri { value } => Ok(value.clone()),
+                    _ => Err(format!("{key} must be an IRI").into()),
+                }
+            }
+
+            fn integer(&self, subject: &RdfTerm, key: &str) -> Result<u64> {
+                match self.one(subject, key)? {
+                    RdfTerm::Literal { value, datatype }
+                        if datatype == "http://www.w3.org/2001/XMLSchema#integer" =>
+                    {
+                        Ok(value.parse()?)
+                    }
+                    _ => Err(format!("{key} must be an integer literal").into()),
+                }
+            }
+
+            fn boolean(&self, subject: &RdfTerm, key: &str) -> Result<bool> {
+                match self.one(subject, key)? {
+                    RdfTerm::Literal { value, datatype }
+                        if datatype == "http://www.w3.org/2001/XMLSchema#boolean" =>
+                    {
+                        Ok(value.parse()?)
+                    }
+                    _ => Err(format!("{key} must be a boolean literal").into()),
+                }
+            }
+
+            fn array<'a>(&'a self, subject: &RdfTerm, key: &str) -> Result<Vec<&'a RdfTerm>> {
+                let mut indexed = self
+                    .objects(subject, key)
+                    .into_iter()
+                    .map(|entry| Ok((self.integer(entry, "index")?, entry)))
+                    .collect::<Result<Vec<_>>>()?;
+                indexed.sort_by_key(|(index, _)| *index);
+                for (position, (index, _)) in indexed.iter().enumerate() {
+                    assert_eq!(*index, u64::try_from(position)?);
+                }
+                Ok(indexed.into_iter().map(|(_, entry)| entry).collect())
+            }
+
+            fn integers(&self, subject: &RdfTerm, key: &str) -> Result<Vec<u64>> {
+                self.array(subject, key)?
+                    .into_iter()
+                    .map(|entry| self.integer(entry, "value"))
+                    .collect()
+            }
+
+            fn origin(&self, subject: &RdfTerm) -> Result<Value> {
+                let origin = self.one(subject, "origin")?;
+                assert!(self.optional(origin, "package")?.is_none());
+                assert!(self.optional(origin, "runtime")?.is_none());
+                Ok(json!({
+                    "location": self.string(origin, "location")?,
+                    "source_kind": self.string(origin, "source_kind")?
+                }))
+            }
+
+            fn signature(&self, subject: &RdfTerm) -> Result<Value> {
+                let parameters = self.array(subject, "parameters")?.into_iter().map(|parameter| {
+                    Ok(json!({"name":self.string(parameter,"name")?,"optional":self.boolean(parameter,"optional")?,"variadic":self.boolean(parameter,"variadic")?}))
+                }).collect::<Result<Vec<_>>>()?;
+                let effects = self
+                    .array(subject, "effects")?
+                    .into_iter()
+                    .map(|effect| self.string(effect, "value"))
+                    .collect::<Result<Vec<_>>>()?;
+                let type_parameters = self
+                    .array(subject, "type_parameters")?
+                    .into_iter()
+                    .map(|entry| self.iri(entry, "value"))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut signature = json!({"display":self.string(subject,"display")?,"language":self.string(subject,"language")?,"parameters":parameters,"effects":effects,"type_parameters":type_parameters});
+                if let Some(extensions) = self.optional(subject, "extensions")? {
+                    let RdfTerm::Literal { value, datatype } = extensions else {
+                        return Err("extension JSON literal".into());
+                    };
+                    assert_eq!(datatype, "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON");
+                    signature["extensions"] = serde_json::from_str(value)?;
+                }
+                Ok(signature)
+            }
+
+            fn type_use(&self, subject: &RdfTerm) -> Result<Value> {
+                let term = self.one(subject, "type")?;
+                let mut expression = json!({"language":self.string(term,"language")?,"source":self.string(term,"source")?});
+                if self.optional(term, "resolved")?.is_some() {
+                    expression["resolved"] = json!(self.iri(term, "resolved")?);
+                }
+                Ok(
+                    json!({"role":self.string(subject,"role")?,"origin":self.string(subject,"origin")?,"type":expression}),
+                )
+            }
+
+            fn documentation(&self, subject: &RdfTerm) -> Result<Value> {
+                Ok(
+                    json!({"format":self.string(subject,"format")?,"text":self.string(subject,"text")?}),
+                )
+            }
+
+            fn symbol(&self, subject: &RdfTerm) -> Result<Symbol> {
+                let signatures = self
+                    .array(subject, "signatures")?
+                    .into_iter()
+                    .map(|entry| self.signature(entry))
+                    .collect::<Result<Vec<_>>>()?;
+                let types = self
+                    .array(subject, "types")?
+                    .into_iter()
+                    .map(|entry| self.type_use(entry))
+                    .collect::<Result<Vec<_>>>()?;
+                let documentation = self
+                    .array(subject, "documentation")?
+                    .into_iter()
+                    .map(|entry| self.documentation(entry))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut symbol = json!({"name":self.string(subject,"name")?,"kind":self.string(subject,"kind")?,"language":self.string(subject,"language")?,"origin":self.origin(subject)?,"document_local":self.boolean(subject,"document_local")?,"signatures":signatures,"types":types,"documentation":documentation});
+                if let Some(id) = self.optional(subject, "id")? {
+                    let RdfTerm::Iri { value } = id else {
+                        return Err("canonical symbol IRI".into());
+                    };
+                    symbol["id"] = json!(value);
+                    assert_eq!(subject, id);
+                } else {
+                    assert!(matches!(subject, RdfTerm::BlankNode { .. }));
+                }
+                Ok(serde_json::from_value(symbol)?)
+            }
+
+            fn associations(
+                &self,
+                symbol: &RdfTerm,
+                declaration: &RdfTerm,
+                key: &str,
+                indices: &[u64],
+            ) -> Result<()> {
+                let entries = self.array(symbol, key)?;
+                let linked = self.objects(declaration, key);
+                let mut actual = std::collections::BTreeSet::new();
+                for resource in linked {
+                    assert!(entries.contains(&resource));
+                    actual.insert(self.integer(resource, "index")?);
+                }
+                assert_eq!(actual, indices.iter().copied().collect());
+                Ok(())
+            }
+
+            fn declaration(
+                &self,
+                symbol: &RdfTerm,
+                subject: &RdfTerm,
+            ) -> Result<rift_protocol::symbol_read::SymbolDeclaration> {
+                let range = self.one(subject, "range")?;
+                let signatures = self.integers(subject, "signature_indices")?;
+                let types = self.integers(subject, "type_indices")?;
+                let documentation = self.integers(subject, "documentation_indices")?;
+                self.associations(symbol, subject, "signatures", &signatures)?;
+                self.associations(symbol, subject, "types", &types)?;
+                self.associations(symbol, subject, "documentation", &documentation)?;
+                let mut declaration = json!({"origin":self.origin(subject)?,"range":{"start":self.integer(range,"start")?,"end":self.integer(range,"end")?},"line":self.integer(subject,"line")?,"source_complete":self.boolean(subject,"source_complete")?,"signature_indices":signatures,"type_indices":types,"documentation_indices":documentation});
+                if self.optional(subject, "path")?.is_some() {
+                    declaration["path"] = json!(self.string(subject, "path")?);
+                }
+                if let Some(unit) = self.optional(subject, "unit")? {
+                    let RdfTerm::Iri { value } = unit else {
+                        return Err("physical source unit IRI".into());
+                    };
+                    declaration["unit"] = json!(value);
+                }
+                assert_ne!(
+                    declaration.get("path").is_some(),
+                    declaration.get("unit").is_some()
+                );
+                if self.optional(subject, "source")?.is_some() {
+                    declaration["source"] = json!(self.string(subject, "source")?);
+                }
+                Ok(serde_json::from_value(declaration)?)
+            }
+        }
+
+        fn representative_models() -> Result<QueryFacts> {
+            let mut facts = fixture()?;
+            let mut original = facts.symbols.pop().ok_or("original symbol")?;
+            let target = facts.symbols.remove(0);
+            let target_id = target.symbol.id.as_ref().ok_or("target symbol identity")?;
+            let original_id = original
+                .symbol
+                .id
+                .as_ref()
+                .ok_or("original symbol identity")?;
+            let mut value = serde_json::to_value(&original.symbol)?;
+            value["types"][0]["type"]["resolved"] = json!(target_id);
+            value["signatures"][0]["type_parameters"] =
+                json!([original_id, target_id, original_id]);
+            for field in ["signatures", "types", "documentation"] {
+                let mut entries = value[field].as_array().ok_or("model array")?.clone();
+                entries.push(entries[0].clone());
+                value[field] = json!(entries);
+            }
+            for signature in value["signatures"].as_array_mut().ok_or("signatures")? {
+                let parameter = signature["parameters"][0].clone();
+                signature["parameters"]
+                    .as_array_mut()
+                    .ok_or("parameters")?
+                    .push(parameter);
+            }
+            original.symbol = serde_json::from_value(value)?;
+            let mut declaration = serde_json::to_value(&original.declarations[0])?;
+            declaration["signature_indices"] = json!([1, 0]);
+            declaration["type_indices"] = json!([0, 1]);
+            declaration["documentation_indices"] = json!([1, 0]);
+            let bytes = declaration["source"]
+                .as_str()
+                .ok_or("declaration source")?
+                .len();
+            declaration["range"]["end"] = json!(bytes);
+            original.declarations = vec![serde_json::from_value(declaration)?];
+            let mut anonymous = original.clone();
+            anonymous.symbol.id = None;
+            anonymous.symbol.name = "anonymous".into();
+            facts.symbols = vec![original, anonymous, target];
+            Ok(facts)
+        }
+
+        #[test]
+        fn rdf_reconstructs_original_symbol_models_and_declaration_associations() -> Result<()> {
+            let facts = representative_models()?;
+            let mut expected = facts.symbols.clone();
+            expected.sort_by(|left, right| left.symbol.name.cmp(&right.symbol.name));
+            let answer = PreparedQuery::parse(
+                "CONSTRUCT { ?subject ?predicate ?object } WHERE { ?subject ?predicate ?object }",
+                limits(),
+            )?
+            .evaluate(facts, limits(), QueryCancellation::default())?;
+            let QueryAnswer::Graph { triples } = answer else {
+                return Err("complete RDF graph".into());
+            };
+            let model = Model(&triples);
+            let class = RdfTerm::Iri {
+                value: format!("{}Symbol", crate::sparql::VOCABULARY),
+            };
+            let predicate = RdfTerm::Iri {
+                value: "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".into(),
+            };
+            let mut reconstructed = Vec::new();
+            for triple in &triples {
+                if triple.predicate != predicate || triple.object != class {
+                    continue;
+                }
+                let symbol = model.symbol(&triple.subject)?;
+                for binding in model.array(&triple.subject, "types")? {
+                    let expression = model.one(binding, "type")?;
+                    if let Some(resolved) = model.optional(expression, "resolved")? {
+                        assert!(matches!(resolved, RdfTerm::Iri { .. }));
+                        assert_eq!(model.string(resolved, "name")?, "first");
+                    }
+                }
+                for signature in model.array(&triple.subject, "signatures")? {
+                    let parameters = model.array(signature, "type_parameters")?;
+                    if !parameters.is_empty() {
+                        let names = parameters
+                            .into_iter()
+                            .map(|entry| model.string(model.one(entry, "value")?, "name"))
+                            .collect::<Result<Vec<_>>>()?;
+                        assert_eq!(names, ["third", "first", "third"]);
+                    }
+                }
+                let declarations = model
+                    .objects(&triple.subject, "declarations")
+                    .into_iter()
+                    .map(|declaration| model.declaration(&triple.subject, declaration))
+                    .collect::<Result<Vec<_>>>()?;
+                reconstructed.push(QuerySymbol {
+                    symbol,
+                    declarations,
+                });
+            }
+            reconstructed.sort_by(|left, right| left.symbol.name.cmp(&right.symbol.name));
+            assert_eq!(
+                serde_json::to_value(reconstructed)?,
+                serde_json::to_value(expected)?
+            );
+            Ok(())
+        }
+    }
 }

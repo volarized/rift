@@ -1063,6 +1063,8 @@ impl Projection {
                         "to",
                         "target",
                         "symbol",
+                        "resolved",
+                        "type_parameters",
                         "container",
                         "node",
                         "parent",
