@@ -1,7 +1,8 @@
 use get_size2::{GetSize, GetSizeTracker};
 
 use super::{
-    ByteRange, PythonOverload, RustModulePath, SyntaxExportBinding, SyntaxFacts, SyntaxSymbol,
+    ByteRange, PythonOverload, RustModulePath, SyntaxExportBinding, SyntaxFacts, SyntaxNode,
+    SyntaxSymbol,
 };
 
 impl GetSize for ByteRange {
@@ -14,6 +15,9 @@ impl GetSize for ByteRange {
         (std::mem::size_of::<Self>().saturating_add(heap), tracker)
     }
 }
+// Grammar kind names are static; every other node field is stored in the row.
+impl GetSize for SyntaxNode {}
+
 impl GetSize for PythonOverload {
     fn get_size(&self) -> usize {
         std::mem::size_of::<Self>().saturating_add(get_size2::GetSize::get_heap_size(self))
@@ -114,6 +118,10 @@ impl GetSize for SyntaxFacts {
 
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
         let (language, tracker) = self.language.get_heap_size_with_tracker(tracker);
+        let (nodes, tracker) = match &self.nodes {
+            Some(nodes) => rift_protocol::retained_arc_slice_material(nodes, tracker),
+            None => (0, tracker),
+        };
         let (symbols, tracker) = rift_protocol::retained_vector_material(&self.symbols, tracker);
         let (retained, tracker) =
             rift_protocol::retained_vector_material(&self.left_out_symbols, tracker);
@@ -153,6 +161,7 @@ impl GetSize for SyntaxFacts {
         let (markdown, tracker) = self.markdown_facts.get_heap_size_with_tracker(tracker);
         (
             language
+                .saturating_add(nodes)
                 .saturating_add(symbols)
                 .saturating_add(retained)
                 .saturating_add(exports)

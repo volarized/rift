@@ -246,7 +246,7 @@ fn checked_restored(syntax: &PackageSyntax, text: &str) -> PackageSyntax {
         },
     )
     .expect("checked restored facts");
-    assert_eq!(&restored, facts.as_ref());
+    assert_restored_semantic_facts(&restored, facts.as_ref());
     PackageSyntax::new(syntax.identity().clone(), Arc::new(restored))
 }
 
@@ -926,4 +926,28 @@ fn explicit_package_dialect_refuses_facts_from_default_extension_provider() {
             &selected.language()
         );
     }
+}
+
+fn assert_restored_semantic_facts(
+    restored: &rift_syntax::SyntaxFacts,
+    original: &rift_syntax::SyntaxFacts,
+) {
+    assert_eq!(restored.origin(), original.origin());
+    assert_eq!(restored.language(), original.language());
+    assert_eq!(restored.symbols(), original.symbols());
+    assert_eq!(restored.left_out_symbols(), original.left_out_symbols());
+    assert_eq!(restored.export_bindings(), original.export_bindings());
+    assert_eq!(restored.macro_invocations(), original.macro_invocations());
+    assert_eq!(restored.scope(), original.scope());
+    assert_eq!(restored.has_errors(), original.has_errors());
+    assert_eq!(
+        restored.left_out_declaration_count(),
+        original.left_out_declaration_count()
+    );
+    assert_eq!(restored.markdown_facts(), original.markdown_facts());
+    assert_eq!(restored.source_digest(), original.source_digest());
+    assert_eq!(restored.syntax_limits(), original.syntax_limits());
+    assert!(original.nodes().is_some());
+    assert!(restored.nodes().is_none());
+    assert_ne!(restored, original);
 }

@@ -152,7 +152,7 @@ fn native_declarations_keep_names_ranges_and_language_identity() {
             },
         )
         .expect("new grammar facts restore");
-        assert_eq!(&restored, facts);
+        assert_restored_semantic_facts(&restored, facts);
         let names = SyntaxNames::new(document.language()).expect("new grammar has retained names");
         for symbol in restored.symbols() {
             assert_eq!(names.symbol_kind(symbol.kind), Some(symbol.kind));
@@ -323,4 +323,28 @@ fn native_sources_preserve_includes_and_cython_declarations() {
             );
         }
     }
+}
+
+fn assert_restored_semantic_facts(
+    restored: &rift_syntax::SyntaxFacts,
+    original: &rift_syntax::SyntaxFacts,
+) {
+    assert_eq!(restored.origin(), original.origin());
+    assert_eq!(restored.language(), original.language());
+    assert_eq!(restored.symbols(), original.symbols());
+    assert_eq!(restored.left_out_symbols(), original.left_out_symbols());
+    assert_eq!(restored.export_bindings(), original.export_bindings());
+    assert_eq!(restored.macro_invocations(), original.macro_invocations());
+    assert_eq!(restored.scope(), original.scope());
+    assert_eq!(restored.has_errors(), original.has_errors());
+    assert_eq!(
+        restored.left_out_declaration_count(),
+        original.left_out_declaration_count()
+    );
+    assert_eq!(restored.markdown_facts(), original.markdown_facts());
+    assert_eq!(restored.source_digest(), original.source_digest());
+    assert_eq!(restored.syntax_limits(), original.syntax_limits());
+    assert!(original.nodes().is_some());
+    assert!(restored.nodes().is_none());
+    assert_ne!(restored, original);
 }
