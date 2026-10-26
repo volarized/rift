@@ -411,6 +411,15 @@ pub(super) fn request(
     pattern: &QueryExpression,
     nodes_max: usize,
 ) -> Result<SearchParams, QueryError> {
+    request_for(pattern, nodes_max, INPUT_FIELDS, &["score", "source"])
+}
+
+fn request_for<T: serde::de::DeserializeOwned>(
+    pattern: &QueryExpression,
+    nodes_max: usize,
+    input_fields: &[&str],
+    include_fields: &[&str],
+) -> Result<T, QueryError> {
     let mut fields = Map::new();
     let mut pending = vec![pattern];
     let mut visited = 0usize;
@@ -432,10 +441,10 @@ pub(super) fn request(
                     let Some(key) = predicate.as_str().strip_prefix(VOCABULARY) else {
                         continue;
                     };
-                    if ["score", "source"].contains(&key) {
+                    if include_fields.contains(&key) {
                         include.insert(key.to_owned());
                     }
-                    if INPUT_FIELDS.contains(&key) {
+                    if input_fields.contains(&key) {
                         input(&mut fields, key, &triple.object)?;
                     }
                 }
@@ -566,6 +575,22 @@ fn execution_pattern(
             .map_err(failure::parse)?;
     let hit_class = oxigraph::model::NamedNode::new(format!("{VOCABULARY}SearchHit"))
         .map_err(failure::parse)?;
+    execution_pattern_for(
+        pattern,
+        nodes_max,
+        INPUT_FIELDS,
+        &NamedNodePattern::NamedNode(rdf_type),
+        &TermPattern::NamedNode(hit_class),
+    )
+}
+
+fn execution_pattern_for(
+    pattern: &QueryExpression,
+    nodes_max: usize,
+    input_fields: &[&str],
+    anchor_predicate: &NamedNodePattern,
+    anchor_object: &TermPattern,
+) -> Result<QueryExpression, QueryError> {
     let mut pattern = pattern.clone();
     let mut pending = vec![&mut pattern];
     let mut visited = 0usize;
@@ -584,14 +609,14 @@ fn execution_pattern(
                     let Some(key) = predicate.as_str().strip_prefix(VOCABULARY) else {
                         return true;
                     };
-                    if !INPUT_FIELDS.contains(&key)
+                    if !input_fields.contains(&key)
                         || matches!(triple.object, TermPattern::Variable(_))
                     {
                         return true;
                     }
                     let mut anchor = triple.clone();
-                    anchor.predicate = NamedNodePattern::NamedNode(rdf_type.clone());
-                    anchor.object = TermPattern::NamedNode(hit_class.clone());
+                    anchor.predicate = anchor_predicate.clone();
+                    anchor.object = anchor_object.clone();
                     if !anchors.contains(&anchor) {
                         anchors.push(anchor);
                     }
