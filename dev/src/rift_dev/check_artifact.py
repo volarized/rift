@@ -58,6 +58,7 @@ async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonO
         declaration_request(name),
         seconds=ARTIFACT_SECONDS,
         poll_seconds=POLL_SECONDS,
+        selection="current",
     )
     matches = [
         row
@@ -111,6 +112,7 @@ async def check_reads(client: Client) -> None:
         declaration_request("beacon_one"),
         seconds=ARTIFACT_SECONDS,
         poll_seconds=POLL_SECONDS,
+        selection="current",
     )
     require(
         bool(bindings(search)),

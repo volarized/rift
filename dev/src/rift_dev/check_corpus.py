@@ -1055,6 +1055,7 @@ class Corpus:
                         requests[name],
                         seconds=budget,
                         poll_seconds=POLL_SECONDS,
+                        selection="current",
                     )
                 codes = [
                     string_value(warning.get("code"), "warning code")
@@ -1450,9 +1451,10 @@ async def observed_state(
 
 
 async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
-    """Resend partial local reads until local index preparation completes.
+    """Resend partial current reads until local index preparation completes.
 
-    The wait is bounded by `LOCAL_PREPARATION_SECONDS`.
+    The wait is bounded by `LOCAL_PREPARATION_SECONDS`. Captured selections use
+    `read_settled_local` with its captured selection instead.
     """
     return await read_settled_local(
         client,
@@ -1460,6 +1462,7 @@ async def settled_local(client: Client, name: str, request: JsonObject) -> JsonO
         request,
         seconds=LOCAL_PREPARATION_SECONDS,
         poll_seconds=POLL_SECONDS,
+        selection="current",
     )
 
 
