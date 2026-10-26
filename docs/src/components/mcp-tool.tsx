@@ -295,7 +295,7 @@ function SchemaProperties({
           const branch = dereference(variant, root);
           return (
             <details
-              key={`${keyword}-${index}`}
+              key={`${keyword}-${JSON.stringify(variant)}`}
               open={depth < 1}
               className="border-l border-border pl-3"
             >
