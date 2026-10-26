@@ -774,17 +774,30 @@ impl ReadService {
             &|_| true,
             &mut |file, bytes_max| repository.blob_bytes(file, bytes_max).map(Some),
         )?;
+        Ok(Self::from_revision_index(
+            index,
+            RevisionId(resolved.commit_id()),
+            history,
+        ))
+    }
+
+    /// Serves an already built revision index without another source read or analysis.
+    pub(crate) fn from_revision_index(
+        index: WorkspaceIndex,
+        revision: RevisionId,
+        history: HistoryConfiguration,
+    ) -> Self {
         let revisions = captured_revisions(&index);
-        Ok(Self {
+        Self {
             index,
             revisions,
-            revision: Some(RevisionId(resolved.commit_id())),
+            revision: Some(revision),
             history,
             source_policy: None,
             context: Arc::new(DependencyContext::default()),
             dependency_configuration: DependenciesConfiguration::default(),
             stored_history: OnceLock::new(),
-        })
+        }
     }
 
     /// Returns the fixed local owner of this captured workspace.
@@ -1534,11 +1547,23 @@ fn requested_packages_violation(
 /// `page_index` past the last page yields an empty page carrying the requested index
 /// and the true page count.
 pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+    let (window, pagination) = page_range(results.len(), page_index, limit);
+    let count = window.end - window.start;
+    (
+        results.into_iter().skip(window.start).take(count).collect(),
+        pagination,
+    )
+}
+
+pub(crate) fn page_range(
+    total: usize,
+    page_index: u64,
+    limit: usize,
+) -> (std::ops::Range<usize>, Pagination) {
     assert!(
         limit > 0,
         "page limit must be positive after acceptance: limit={limit}"
     );
-    let total = results.len();
     let total_pages = u64::try_from(total.div_ceil(limit)).unwrap_or(u64::MAX);
     let pagination = Pagination {
         page_index,
@@ -1548,8 +1573,8 @@ pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>
         .ok()
         .and_then(|index| index.checked_mul(limit));
     let window = match start {
-        Some(start) if start < total => results.into_iter().skip(start).take(limit).collect(),
-        _ => Vec::new(),
+        Some(start) if start < total => start..start.saturating_add(limit).min(total),
+        _ => 0..0,
     };
     (window, pagination)
 }

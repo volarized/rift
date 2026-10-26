@@ -4,6 +4,7 @@ use rift_error::{RiftError, errors};
 use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 use rift_search::sparql::{PageForm, PageSelection, QueryLimits};
+use rmcp::handler::server::tool::IntoCallToolResult as _;
 use rmcp::model::{CallToolRequestParams, CallToolResponse};
 
 use super::super::RiftProxy;
@@ -14,7 +15,7 @@ impl RiftProxy {
         &self,
         selection: PageSelection,
         deadline: tokio::time::Instant,
-    ) -> Result<Option<CallToolResponse>, RiftError> {
+    ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
         let Some(views) = self.query_views.get() else {
             return Ok(None);
         };
@@ -51,12 +52,7 @@ impl RiftProxy {
             }
             let response = saved.answer.response(answer, selection.page)?;
             budget.charge(&response)?;
-            Ok(Some(
-                rmcp::model::CallToolResult::structured(
-                    serde_json::to_value(response).map_err(encoding_failure)?,
-                )
-                .into(),
-            ))
+            Ok(Some(crate::output::Json(response).into_call_tool_result()))
         })
         .await
     }
@@ -100,10 +96,9 @@ impl RiftProxy {
             })
             .await?;
         match selected {
-            SelectedRead::Captured(value) => Ok(Some(Ok(rmcp::model::CallToolResult::structured(
-                value,
-            )
-            .into()))),
+            SelectedRead::Captured(value) => {
+                Ok(Some(crate::output::Json(value).into_call_tool_result()))
+            }
             SelectedRead::Forward {
                 backend,
                 request,
@@ -137,7 +132,7 @@ impl RiftProxy {
         }
     }
 
-    fn query_roots(&self) -> std::collections::BTreeMap<String, String> {
+    pub(in crate::proxy) fn query_roots(&self) -> std::collections::BTreeMap<String, String> {
         std::iter::once(("local".to_owned(), self))
             .chain(
                 self.backends
@@ -155,7 +150,7 @@ impl RiftProxy {
     }
 }
 
-fn validate_backends(
+pub(super) fn validate_backends(
     saved: &Metadata,
     backends: &std::collections::BTreeMap<String, String>,
 ) -> Result<(), RiftError> {
@@ -172,7 +167,7 @@ fn encoding_failure(source: serde_json::Error) -> RiftError {
 }
 
 enum SelectedRead {
-    Captured(serde_json::Value),
+    Captured(GetSourceResult),
     Forward {
         backend: String,
         request: Box<CallToolRequestParams>,
@@ -197,21 +192,7 @@ fn select_read(
             .get("id")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(retained::unavailable)?;
-        let mut matches = saved
-            .providers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, provider)| {
-                provider
-                    .symbols
-                    .iter()
-                    .find(|(_, public)| public.as_str() == id)
-                    .map(|(original, _)| (index, original))
-            });
-        let (provider, original) = matches.next().ok_or_else(retained::unavailable)?;
-        if matches.next().is_some() {
-            return Err(retained::unavailable());
-        }
+        let (provider, original) = selected_symbol(saved, id)?;
         arguments.insert(
             "id".to_owned(),
             serde_json::to_value(original).map_err(encoding_failure)?,
@@ -223,16 +204,9 @@ fn select_read(
         if !params.is_valid() {
             return Err(retained::unavailable());
         }
-        let mut matches = saved
-            .sources
-            .iter()
-            .filter(|source| source.public == params.unit);
-        let source = matches.next().ok_or_else(retained::unavailable)?;
-        if matches.next().is_some() {
-            return Err(retained::unavailable());
-        }
+        let source = selected_source(saved, &params.unit)?;
         if let Some(bytes) = &source.bytes {
-            return captured_source(
+            let response = captured_source(
                 params,
                 captured
                     .material()
@@ -241,13 +215,14 @@ fn select_read(
                     .ok_or_else(retained::unavailable)?,
                 captured.view(),
                 budget,
-            );
+            )?;
+            return Ok(SelectedRead::Captured(response));
         }
         arguments.insert(
             "unit".to_owned(),
             serde_json::to_value(&source.original).map_err(encoding_failure)?,
         );
-        (source.provider, Some(source.public.clone()))
+        (source.provider, Some(params.unit))
     };
     let provider_index = provider;
     let provider = saved
@@ -273,12 +248,49 @@ fn select_read(
     })
 }
 
-fn captured_source(
+pub(crate) fn selected_source<'a>(
+    saved: &'a Metadata,
+    unit: &rift_protocol::read::SourceUnitId,
+) -> Result<&'a super::retained::Source, RiftError> {
+    let mut matches = saved
+        .sources
+        .iter()
+        .filter(|source| source.public == *unit || source.original == *unit);
+    let source = matches.next().ok_or_else(retained::unavailable)?;
+    if matches.next().is_some() {
+        return Err(retained::unavailable());
+    }
+    Ok(source)
+}
+
+pub(crate) fn selected_symbol<'a>(
+    saved: &'a Metadata,
+    id: &str,
+) -> Result<(usize, &'a rift_protocol::read::SymbolId), RiftError> {
+    let mut matches = saved
+        .providers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, provider)| {
+            provider
+                .symbols
+                .iter()
+                .find(|(_, public)| public.as_str() == id)
+                .map(|(original, _)| (index, original))
+        });
+    let selected = matches.next().ok_or_else(retained::unavailable)?;
+    if matches.next().is_some() {
+        return Err(retained::unavailable());
+    }
+    Ok(selected)
+}
+
+pub(crate) fn captured_source(
     params: GetSourceParams,
     bytes: &[u8],
     view: &CapturedView,
     budget: &mut rift_server::QueryFactBudget<'_>,
-) -> Result<SelectedRead, RiftError> {
+) -> Result<GetSourceResult, RiftError> {
     let text = std::str::from_utf8(bytes).map_err(|_| retained::unavailable())?;
     let range = params.range.unwrap_or(rift_protocol::read::TextRange {
         start: 0,
@@ -306,9 +318,7 @@ fn captured_source(
         warnings: Vec::new(),
     };
     budget.charge(&response)?;
-    Ok(SelectedRead::Captured(
-        serde_json::to_value(response).map_err(encoding_failure)?,
-    ))
+    Ok(response)
 }
 
 fn qualify_response(
@@ -332,84 +342,138 @@ fn qualify_response(
         .structured_content
         .take()
         .ok_or_else(retained::unavailable)?;
-    let response = if request.name == "get_source" {
+    if request.name == "get_source" {
         let params: GetSourceParams =
             serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
                 .map_err(encoding_failure)?;
         let mut source: GetSourceResult =
             serde_json::from_value(value).map_err(encoding_failure)?;
-        if !source.is_valid_for(&params) {
-            return Err(retained::unavailable());
-        }
-        let unit = public_unit.ok_or_else(retained::unavailable)?;
-        match &mut source {
-            GetSourceResult::Found {
-                source,
-                view: selected,
-                ..
-            } => {
-                source.span.unit = unit;
-                *selected = view;
-            }
-            GetSourceResult::Missing {
-                unit: selected,
-                view: selected_view,
-                ..
-            } => {
-                *selected = unit;
-                *selected_view = view;
-            }
-            GetSourceResult::Unavailable {
-                unit: selected,
-                view: selected_view,
-                ..
-            } => {
-                *selected = unit;
-                *selected_view = Some(view);
-            }
-        }
-        crate::proxy::identity::qualify_source(&mut source, backend)?;
-        serde_json::to_value(source).map_err(encoding_failure)?
+        source = qualify_source(source, &params, backend, view, public_unit)?;
+        Ok(crate::output::Json(source).into_call_tool_result())
     } else {
         let mut symbol: rift_protocol::symbol_read::GetSymbolResult =
             serde_json::from_value(value).map_err(encoding_failure)?;
         let original: rift_protocol::symbol_read::GetSymbolParams =
             serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
                 .map_err(encoding_failure)?;
-        if !symbol.is_valid_for(&original.id) {
+        symbol = qualify_symbol(symbol, &original, backend, view, source_units)?;
+        Ok(crate::output::Json(symbol).into_call_tool_result())
+    }
+}
+
+pub(crate) fn qualify_source(
+    mut source: GetSourceResult,
+    params: &GetSourceParams,
+    backend: &str,
+    view: CapturedView,
+    public_unit: Option<rift_protocol::read::SourceUnitId>,
+) -> Result<GetSourceResult, RiftError> {
+    if !source.is_valid_for(params) {
+        return Err(retained::unavailable());
+    }
+    let unit = public_unit.ok_or_else(retained::unavailable)?;
+    match &mut source {
+        GetSourceResult::Found {
+            source,
+            view: selected,
+            ..
+        } => {
+            source.span.unit = unit;
+            *selected = view;
+        }
+        GetSourceResult::Missing {
+            unit: selected,
+            view: selected_view,
+            ..
+        } => {
+            *selected = unit;
+            *selected_view = view;
+        }
+        GetSourceResult::Unavailable {
+            unit: selected,
+            view: selected_view,
+            ..
+        } => {
+            *selected = unit;
+            *selected_view = Some(view);
+        }
+    }
+    crate::proxy::identity::qualify_source(&mut source, backend)?;
+    Ok(source)
+}
+
+pub(crate) fn qualify_symbol(
+    mut symbol: rift_protocol::symbol_read::GetSymbolResult,
+    original: &rift_protocol::symbol_read::GetSymbolParams,
+    backend: &str,
+    view: CapturedView,
+    source_units: &[(
+        rift_protocol::read::SourceUnitId,
+        rift_protocol::read::SourceUnitId,
+    )],
+) -> Result<rift_protocol::symbol_read::GetSymbolResult, RiftError> {
+    if !symbol.is_valid_for(&original.id) {
+        return Err(retained::unavailable());
+    }
+    crate::proxy::identity::qualify_symbol_result(&mut symbol, backend)?;
+    if let rift_protocol::symbol_read::GetSymbolResult::Found { declarations, .. } = &mut symbol {
+        for declaration in declarations {
+            qualify_declaration_unit(declaration, backend, source_units)?;
+        }
+    }
+    match &mut symbol {
+        rift_protocol::symbol_read::GetSymbolResult::Found { view: selected, .. }
+        | rift_protocol::symbol_read::GetSymbolResult::Missing { view: selected, .. } => {
+            *selected = view;
+        }
+        rift_protocol::symbol_read::GetSymbolResult::Unavailable { view: selected, .. } => {
+            *selected = Some(view);
+        }
+    }
+    Ok(symbol)
+}
+
+fn qualify_declaration_unit(
+    declaration: &mut rift_protocol::symbol_read::SymbolDeclaration,
+    backend: &str,
+    source_units: &[(
+        rift_protocol::read::SourceUnitId,
+        rift_protocol::read::SourceUnitId,
+    )],
+) -> Result<(), RiftError> {
+    let project_unit = match (&declaration.unit, &declaration.path) {
+        (None, Some(path)) => {
+            let unit = rift_core::SourceUnitId::new(
+                rift_core::SourceResolverId::new("project")?,
+                rift_core::SourcePath::new(path.0.as_str())?,
+            )?;
+            Some(rift_protocol::read::SourceUnitId::parse(&unit.to_string())?)
+        }
+        _ => None,
+    };
+    let original = declaration
+        .unit
+        .as_ref()
+        .or(project_unit.as_ref())
+        .ok_or_else(retained::unavailable)?;
+    let mut matches = source_units.iter().filter(|(unit, _)| unit == original);
+    if let Some((_, public)) = matches.next() {
+        if matches.next().is_some() {
             return Err(retained::unavailable());
         }
-        crate::proxy::identity::qualify_symbol_result(&mut symbol, backend)?;
-        if backend != "local"
-            && let rift_protocol::symbol_read::GetSymbolResult::Found { declarations, .. } =
-                &mut symbol
-        {
-            for declaration in declarations {
-                let Some(original) = declaration.unit.as_ref() else {
-                    continue;
-                };
-                if let Some((_, public)) = source_units.iter().find(|(unit, _)| unit == original) {
-                    if public != original {
-                        declaration.unit = Some(public.clone());
-                    }
-                } else if rift_protocol::identity::parse_source_unit_identity(original.as_str())?
-                    .0
-                    .is_none()
-                {
-                    return Err(retained::unavailable());
-                }
-            }
+        if public != original {
+            declaration.unit = Some(public.clone());
+            declaration.path = None;
         }
-        match &mut symbol {
-            rift_protocol::symbol_read::GetSymbolResult::Found { view: selected, .. }
-            | rift_protocol::symbol_read::GetSymbolResult::Missing { view: selected, .. } => {
-                *selected = view;
-            }
-            rift_protocol::symbol_read::GetSymbolResult::Unavailable { view: selected, .. } => {
-                *selected = Some(view);
-            }
-        }
-        serde_json::to_value(symbol).map_err(encoding_failure)?
-    };
-    Ok(Ok(rmcp::model::CallToolResult::structured(response).into()))
+    } else if (backend != "local"
+        || source_units
+            .iter()
+            .any(|(original, public)| original != public))
+        && rift_protocol::identity::parse_source_unit_identity(original.as_str())?
+            .0
+            .is_none()
+    {
+        return Err(retained::unavailable());
+    }
+    Ok(())
 }

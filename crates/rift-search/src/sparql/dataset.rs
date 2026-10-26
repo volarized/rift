@@ -22,6 +22,98 @@ use super::{QueryError, QueryFacts, QueryLimits, QuerySymbol, VOCABULARY};
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
+/// One exact symbol resource projected from an original captured body.
+#[derive(Debug)]
+pub struct QuerySubjectResource {
+    /// Exact protocol term produced by the existing provider and identity owners.
+    pub resource: rift_protocol::query::RdfTerm,
+    /// Index in the unchanged original body's symbol vector.
+    pub symbol: usize,
+    /// Whether the validated pre-enrichment subject directory selects this symbol.
+    pub original: bool,
+}
+
+/// Projects one body's symbol resources once without acquiring facts or changing identities.
+///
+/// The caller admits any saved identity-map copy before passing ownership. The existing
+/// RDF count, byte and cancellation bounds govern provider projection. The supplied material
+/// admission runs before temporary vectors and variable-sized resource copies are allocated.
+/// Equal resources remain separate entries so the caller can refuse ambiguous ownership.
+///
+/// # Errors
+/// Refuses invalid original indices, provider records, identity translations or accepted bounds.
+pub fn retained_subject_resources(
+    facts: &QueryFacts,
+    identities: super::QueryIdentities,
+    original_subjects: &[usize],
+    limits: QueryLimits,
+    cancellation: &super::QueryCancellation,
+    admit_material: &mut impl FnMut(usize) -> Result<(), QueryError>,
+) -> Result<Vec<QuerySubjectResource>, QueryError> {
+    admit_material(0)?;
+    if cancellation.is_cancelled() {
+        return Err(failure::cancelled());
+    }
+    if fact_count(facts)? > limits.quads_max || original_subjects.len() > limits.quads_max {
+        return Err(failure::bound("quads_max"));
+    }
+    let count = facts.symbols.len();
+    let mut selected = subject_buffer::<bool>(count, admit_material)?;
+    selected.resize(count, false);
+    for &index in original_subjects {
+        admit_material(0)?;
+        if cancellation.is_cancelled() {
+            return Err(failure::cancelled());
+        }
+        *selected
+            .get_mut(index)
+            .ok_or_else(|| failure::invalid("original query subject is absent"))? = true;
+    }
+    let resources = provider::ProviderIndex::symbol_resources_admitted(
+        facts,
+        limits,
+        &cancellation.0,
+        admit_material,
+    )?;
+    let identities = identity::IdentityMap::new_admitted(identities, admit_material)?;
+    let mut result = subject_buffer(count, admit_material)?;
+    for index in 0..facts.symbols.len() {
+        admit_material(0)?;
+        if cancellation.is_cancelled() {
+            return Err(failure::cancelled());
+        }
+        let original = &resources[index];
+        admit_material(term_bytes(original))?;
+        let resource = identities.public_admitted(original.clone(), admit_material)?;
+        admit_material(term_bytes(&resource))?;
+        result.push(QuerySubjectResource {
+            resource: super::result::term(resource),
+            symbol: index,
+            original: selected[index],
+        });
+    }
+    Ok(result)
+}
+
+fn subject_buffer<T>(
+    count: usize,
+    admit_material: &mut impl FnMut(usize) -> Result<(), QueryError>,
+) -> Result<Vec<T>, QueryError> {
+    let bytes = count
+        .checked_mul(size_of::<T>())
+        .ok_or_else(|| failure::bound("material_bytes_max"))?;
+    admit_material(bytes)?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(failure::invalid)?;
+    let extra = values
+        .capacity()
+        .checked_sub(count)
+        .and_then(|count| count.checked_mul(size_of::<T>()))
+        .ok_or_else(|| failure::bound("material_bytes_max"))?;
+    admit_material(extra)?;
+    Ok(values)
+}
+
 #[derive(Clone)]
 pub(super) struct VirtualDataset {
     facts: Arc<QueryFacts>,
@@ -33,7 +125,7 @@ pub(super) struct VirtualDataset {
     retrieval: Option<Arc<super::services::QueryServiceData>>,
     retrieval_owner: Option<Arc<Self>>,
     retained_graph: Option<Arc<Vec<rift_protocol::query::RdfTriple>>>,
-    datasets: Arc<Vec<(Term, Self)>>,
+    datasets: Arc<Vec<(Option<Term>, Self)>>,
     identities: Arc<identity::IdentityMap>,
     default_graph: bool,
 }
@@ -100,18 +192,16 @@ impl OccurrenceIndex {
 impl VirtualDataset {
     pub(super) fn selected_resource(
         &self,
-        graph: &str,
+        owner: usize,
         endpoint: &crate::query::QueryProviderEndpoint,
     ) -> Result<Term, QueryError> {
-        let selected = if graph == super::LOCAL_GRAPH {
-            self
-        } else {
-            let graph = iri(graph)?;
+        let selected = if let Some(index) = owner.checked_sub(1) {
             self.datasets
-                .iter()
-                .find(|(name, _)| name == &graph)
+                .get(index)
                 .map(|(_, selected)| selected)
-                .ok_or_else(|| failure::invalid("selected provider graph is absent"))?
+                .ok_or_else(|| failure::invalid("selected provider owner is absent"))?
+        } else {
+            self
         };
         selected.identities.public(
             selected
@@ -166,8 +256,19 @@ impl VirtualDataset {
         let mut output = Projection::new(pattern.clone(), self.limits, self.cancellation.clone())?;
         self.project_owner(&mut output, pattern, iri(super::LOCAL_GRAPH)?)?;
         for (graph, selected) in self.datasets.iter() {
-            if pattern.graph_name != Some(GraphName::DefaultGraph) || selected.default_graph {
-                selected.project_owner(&mut output, pattern, graph.clone())?;
+            match graph {
+                Some(graph)
+                    if pattern.graph_name != Some(GraphName::DefaultGraph)
+                        || selected.default_graph =>
+                {
+                    selected.project_owner(&mut output, pattern, graph.clone())?;
+                }
+                None if pattern.graph_name == Some(GraphName::DefaultGraph)
+                    && selected.default_graph =>
+                {
+                    selected.project_owner(&mut output, pattern, iri(super::LOCAL_GRAPH)?)?;
+                }
+                _ => {}
             }
         }
         Ok(output.quads)
@@ -210,15 +311,22 @@ impl VirtualDataset {
         if datasets.len() > self.limits.quads_max {
             return Err(failure::bound("quads_max"));
         }
-        let mut names = HashSet::from([iri(super::LOCAL_GRAPH)?]);
-        let mut selected = Vec::with_capacity(datasets.len());
         let mut count = fact_count(&self.facts)?;
+        let mut names = if empty_root(&self.facts)? {
+            HashSet::new()
+        } else {
+            HashSet::from([iri(super::LOCAL_GRAPH)?])
+        };
+        let mut selected = Vec::with_capacity(datasets.len());
         for dataset in datasets {
             if self.cancellation.is_cancelled() {
                 return Err(failure::cancelled());
             }
-            let graph = iri(&dataset.graph)?;
-            if !names.insert(graph.clone()) {
+            let graph = dataset.graph.as_deref().map(iri).transpose()?;
+            if graph
+                .as_ref()
+                .is_some_and(|graph| !names.insert(graph.clone()))
+            {
                 return Err(failure::invalid(
                     "selected graph identities must be distinct",
                 ));
@@ -301,11 +409,11 @@ impl VirtualDataset {
             }
             if let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &hit.hit {
                 let subject = match retrieval.targets.get(index) {
-                    Some(Some((graph, endpoint))) => self
+                    Some(Some((owner, endpoint))) => self
                         .retrieval_owner
                         .as_ref()
                         .ok_or_else(|| failure::evaluation("retrieval owner is unavailable"))?
-                        .selected_resource(graph, endpoint)?,
+                        .selected_resource(*owner, endpoint)?,
                     Some(None) => match &symbol.id {
                         Some(identity) => iri(identity.as_str())?,
                         None => {
@@ -980,8 +1088,18 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
         if self.cancellation.is_cancelled() {
             return vec![Err(failure::cancelled())].into_iter();
         }
-        std::iter::once(iri(super::LOCAL_GRAPH))
-            .chain(self.datasets.iter().map(|(graph, _)| Ok(graph.clone())))
+        let primary = match empty_root(&self.facts) {
+            Ok(empty) if !empty || self.datasets.is_empty() => Some(iri(super::LOCAL_GRAPH)),
+            Ok(_) => None,
+            Err(error) => return vec![Err(error)].into_iter(),
+        };
+        primary
+            .into_iter()
+            .chain(
+                self.datasets
+                    .iter()
+                    .filter_map(|(graph, _)| graph.clone().map(Ok)),
+            )
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -991,8 +1109,12 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
             return Err(failure::cancelled());
         }
         Ok(
-            matches!(graph, Term::NamedNode(value) if value.as_str() == super::LOCAL_GRAPH)
-                || self.datasets.iter().any(|(name, _)| name == graph),
+            (matches!(graph, Term::NamedNode(value) if value.as_str() == super::LOCAL_GRAPH)
+                && (self.datasets.is_empty() || !empty_root(&self.facts)?))
+                || self
+                    .datasets
+                    .iter()
+                    .any(|(name, _)| name.as_ref() == Some(graph)),
         )
     }
 
@@ -1033,6 +1155,12 @@ impl<'a> QueryableDataset<'a> for VirtualDataset {
     }
 }
 
+fn empty_root(facts: &QueryFacts) -> Result<bool, QueryError> {
+    Ok(fact_count(facts)? == 0
+        && facts.providers.is_empty()
+        && facts.unavailable_families.is_empty())
+}
+
 fn fact_count(facts: &QueryFacts) -> Result<usize, QueryError> {
     let nodes = nodes::count(facts)?;
     facts
@@ -1064,7 +1192,11 @@ fn vocabulary(value: &str) -> Result<Term, QueryError> {
 }
 
 fn blank(value: &[u8]) -> Result<Term, QueryError> {
-    BlankNode::new(data_encoding::HEXLOWER.encode(&Sha256::digest(value)))
+    blank_digest(&Sha256::digest(value))
+}
+
+fn blank_digest(digest: &[u8]) -> Result<Term, QueryError> {
+    BlankNode::new(data_encoding::HEXLOWER.encode(digest))
         .map(Term::from)
         .map_err(invalid)
 }

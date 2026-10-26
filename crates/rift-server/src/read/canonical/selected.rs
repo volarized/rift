@@ -175,12 +175,15 @@ mod tests {
             "query":"phantom_signal", "target":"symbol", "scope":"local",
             "paths":{"force_include":["hidden.py"]}
         }))?;
+        let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        let limits = QueryLimits::try_from(&configuration.search.query)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
         let snapshot = Arc::clone(&reads).capture_search(
             params,
             Arc::new(crate::StoreAnswer::identifier_only()),
             Arc::new(crate::EngineReferences::default()),
+            &mut budget,
         )?;
-        let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
         let input = snapshot.view_input(true)?;
         let selection = input.provider_selection(&configuration)?;
         let input = input.with_provider_selection(selection.clone())?;
@@ -191,8 +194,6 @@ mod tests {
         let mut requirements = FactRequirements::default();
         requirements.require(FactRequirement::Domain);
         requirements.require(FactRequirement::Source);
-        let limits = QueryLimits::try_from(&configuration.search.query)?;
-        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
         let facts =
             input.query_facts_with_selection(&requirements, limits, &mut budget, &selection)?;
         let (provider, record) = facts
@@ -244,6 +245,14 @@ mod tests {
             reads.index.root(),
             reads.index.owner(),
         )?;
+        assert_captured_source(answer, original, &view)
+    }
+
+    fn assert_captured_source(
+        answer: GetSourceResult,
+        original: &str,
+        view: &CapturedView,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let GetSourceResult::Found {
             source,
             view: answered,
@@ -254,7 +263,7 @@ mod tests {
             return Err("forced source must remain captured".into());
         };
         assert_eq!(source.text, original);
-        assert_eq!(answered, view);
+        assert_eq!(&answered, view);
         assert!(source_complete);
         Ok(())
     }

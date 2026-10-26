@@ -26,7 +26,8 @@ const FILES: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
-async fn query_worker_without_protocol_acknowledgment_requires_operator_action() -> TestResult {
+async fn query_worker_stdout_exceeding_acknowledgment_frame_requires_operator_action() -> TestResult
+{
     use rmcp::ServiceExt as _;
 
     let directory = tempfile::tempdir()?;
@@ -66,7 +67,7 @@ async fn query_worker_without_protocol_acknowledgment_requires_operator_action()
     );
     assert!(
         text.text
-            .contains("query protocol acknowledgment is missing or invalid"),
+            .contains("query protocol acknowledgment exceeds its frame bound"),
         "{}",
         text.text
     );
@@ -118,7 +119,13 @@ async fn authoritative_query_facts_refuse_supplied_records_and_unknown_views() -
     })))?;
     let selected = call_retrying_acceptance(&client, tool_request("query_facts", &request)).await?;
     assert_eq!(selected["payload"]["outcome"], "facts", "{selected}");
-    let selected = &selected["payload"]["response"];
+    let bodies = selected["payload"]["response"]
+        .as_array()
+        .ok_or("owned fact bodies")?;
+    assert_eq!(bodies.len(), 1, "{selected}");
+    let selected = &bodies[0];
+    assert_eq!(selected["graph"], rift_search::sparql::LOCAL_GRAPH);
+    assert_eq!(selected["requirements"], request["payload"]["requirements"]);
     let facts: rift_search::query::QueryFacts = serde_json::from_value(selected["facts"].clone())?;
     assert!(
         facts
@@ -200,7 +207,7 @@ async fn assert_query_fact_refusals(
         .await?;
     assert_eq!(invalid.is_error, Some(true), "{invalid:?}");
     assert!(serde_json::to_string(&invalid)?.contains("invalid_request"));
-    for version in [0, 7] {
+    for version in [0, 8] {
         let mut incompatible = request.clone();
         incompatible["version"] = json!(version);
         let incompatible = client
@@ -830,6 +837,399 @@ async fn retrieval_count_acquires_every_transport_page_before_evaluation() -> Te
         call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
             .await?;
     assert_eq!(query::rows(&answer)?.len(), 1);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_query_source_reads_keep_original_utf8_bytes_and_ranges_after_edit() -> TestResult {
+    use rift_protocol::read::TextRange;
+    use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
+
+    let original = "pub fn beacon() -> &'static str { \"café ☕\" }\n";
+    let files = [("Cargo.toml", FILES[0].1), ("src/lib.rs", original)];
+    let (directory, client, server_task) = served_workspace(&files, None).await?;
+    let request = json!({"query": "SELECT ?symbol ?unit ?full_source { ?symbol :name 'beacon'; :declarations ?declaration . ?declaration :unit ?unit . ?unit :source ?full_source }"});
+    let first = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
+    let rows = query::rows(&first)?;
+    assert_eq!(rows.len(), 1, "{first}");
+    assert_eq!(query::literal(&rows[0], "full_source")?, original);
+    let params = GetSourceParams {
+        unit: serde_json::from_value(json!(query::iri(&rows[0], "unit")?))?,
+        range: None,
+        view: Some(serde_json::from_value(first["view"]["id"].clone())?),
+        rev: None,
+    };
+    std::fs::write(directory.path().join("src/lib.rs"), "pub fn changed() {}\n")?;
+    let latest = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query": "ASK { ?symbol :name 'changed' }"}),
+        ),
+    )
+    .await?;
+    assert_eq!(latest["answer"]["value"], true);
+    let start = original.find("café ☕").ok_or("original UTF-8 range")?;
+    let range = TextRange {
+        start: u64::try_from(start)?,
+        end: u64::try_from(start + "café ☕".len())?,
+    };
+    for selected in [None, Some(range)] {
+        let params = GetSourceParams {
+            range: selected,
+            ..params.clone()
+        };
+        let answer = call_retrying_acceptance(
+            &client,
+            tool_request("get_source", &serde_json::to_value(&params)?),
+        )
+        .await?;
+        let result: GetSourceResult = serde_json::from_value(answer.clone())?;
+        let GetSourceResult::Found {
+            source,
+            source_complete,
+            view,
+            ..
+        } = result
+        else {
+            return Err(format!("original source must remain readable: {answer}").into());
+        };
+        assert_eq!(source.span.unit, params.unit);
+        assert_eq!(serde_json::to_value(view)?, first["view"]);
+        let expected = params.range.unwrap_or(TextRange {
+            start: 0,
+            end: u64::try_from(original.len())?,
+        });
+        assert_eq!(source.span.range, expected);
+        let start = usize::try_from(expected.start)?;
+        let end = usize::try_from(expected.end)?;
+        assert_eq!(source.text, &original[start..end]);
+        assert!(source_complete);
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn original_overload_files() -> [(&'static str, &'static str); 3] {
+    let implementation = "/** Implementation. */\nexport function open(path) {}\n";
+    let overloads = "/** First overload. */\nexport declare function open(path: string): void;\n/** Second overload. */\nexport declare function open(path: number): void;\n";
+    [
+        (
+            "package.json",
+            r#"{"name":"beacon","version":"1.0.0","main":"index.js","types":"index.d.ts"}"#,
+        ),
+        ("index.js", implementation),
+        ("index.d.ts", overloads),
+    ]
+}
+
+fn original_overload_excerpt(
+    declaration: &rift_protocol::symbol_read::SymbolDeclaration,
+    files: &[(&str, &str)],
+) -> TestResult<&'static str> {
+    let path = declaration
+        .path
+        .as_ref()
+        .ok_or("original declaration path")?;
+    let original = files
+        .iter()
+        .find(|(file, _)| *file == path.0.as_str())
+        .map(|(_, source)| *source)
+        .ok_or("original implementation or overload path")?;
+    let start = usize::try_from(declaration.range.start)?;
+    let end = usize::try_from(declaration.range.end)?;
+    let range = original
+        .get(start..end)
+        .ok_or("original declaration range")?;
+    assert!(!range.is_empty());
+    let mut excerpts = [
+        (
+            "index.js",
+            "/** Implementation. */\nexport function open(path) {}",
+        ),
+        (
+            "index.d.ts",
+            "/** First overload. */\nexport declare function open(path: string): void;",
+        ),
+        (
+            "index.d.ts",
+            "/** Second overload. */\nexport declare function open(path: number): void;",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(file, excerpt)| {
+        let offset = original.find(excerpt)?;
+        (file == path.0.as_str() && offset <= start && end <= offset + excerpt.len())
+            .then_some(excerpt)
+    });
+    let excerpt = excerpts.next().ok_or("original declaration excerpt")?;
+    assert!(
+        excerpts.next().is_none(),
+        "one original declaration excerpt"
+    );
+    Ok(excerpt)
+}
+
+async fn original_overload_pages(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    mut request: rift_protocol::symbol_read::GetSymbolParams,
+    expected_view: &rift_protocol::symbol_read::CapturedView,
+) -> TestResult<Vec<rift_protocol::symbol_read::GetSymbolResult>> {
+    use rift_protocol::symbol_read::GetSymbolResult;
+
+    assert_eq!(request.declaration_limit, 1);
+    assert!(request.declaration_cursor.is_none());
+    let mut original = Vec::new();
+    for page in 0..3 {
+        let answer = call_retrying_acceptance(
+            client,
+            tool_request("get_symbol", &serde_json::to_value(&request)?),
+        )
+        .await?;
+        let result: GetSymbolResult = serde_json::from_value(answer.clone())?;
+        let GetSymbolResult::Found {
+            declarations,
+            declaration_cursor,
+            view,
+            ..
+        } = &result
+        else {
+            return Err(format!("original overloads must remain readable: {answer}").into());
+        };
+        assert_eq!(view, expected_view);
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declaration_cursor.is_some(), page < 2);
+        request.declaration_cursor.clone_from(declaration_cursor);
+        original.push(result);
+    }
+    Ok(original)
+}
+
+#[tokio::test]
+async fn direct_query_symbol_declaration_cursors_keep_original_overloads_after_edit() -> TestResult
+{
+    use rift_protocol::read::GetSymbolInclude;
+    use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+
+    let files = original_overload_files();
+    let (directory, client, server_task) = served_workspace(&files, None).await?;
+    let first = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query": "SELECT ?symbol (COUNT(?declaration) AS ?count) { ?symbol :name 'open'; :declarations ?declaration . ?declaration :source ?source } GROUP BY ?symbol"})),
+    )
+    .await?;
+    let rows = query::rows(&first)?;
+    assert_eq!(rows.len(), 1, "{first}");
+    assert_eq!(query::literal(&rows[0], "count")?, "3", "{first}");
+    let mut request = GetSymbolParams {
+        id: serde_json::from_value(json!(query::iri(&rows[0], "symbol")?))?,
+        include: vec![GetSymbolInclude::Source],
+        rev: None,
+        view: Some(serde_json::from_value(first["view"]["id"].clone())?),
+        declaration_limit: 1,
+        declaration_cursor: None,
+    };
+    let expected_view =
+        serde_json::from_value::<rift_protocol::symbol_read::CapturedView>(first["view"].clone())?;
+    let original = original_overload_pages(&client, request.clone(), &expected_view).await?;
+    std::fs::write(
+        directory.path().join("index.js"),
+        "export function replacement(path) {}\n",
+    )?;
+    std::fs::write(
+        directory.path().join("index.d.ts"),
+        "export declare function replacement(path: boolean): void;\n",
+    )?;
+    let latest = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query": "ASK { ?symbol :name 'replacement' }"}),
+        ),
+    )
+    .await?;
+    assert_eq!(latest["answer"]["value"], true);
+    let mut declarations_seen = std::collections::BTreeSet::new();
+    for (page, expected) in original.iter().enumerate() {
+        let answer = call_retrying_acceptance(
+            &client,
+            tool_request("get_symbol", &serde_json::to_value(&request)?),
+        )
+        .await?;
+        let result: GetSymbolResult = serde_json::from_value(answer.clone())?;
+        let GetSymbolResult::Found {
+            symbol,
+            declarations,
+            declaration_cursor,
+            view,
+            ..
+        } = result
+        else {
+            return Err(format!("original overloads must remain readable: {answer}").into());
+        };
+        assert_eq!(view, expected_view);
+        assert_eq!(symbol.id.as_ref(), Some(&request.id));
+        let GetSymbolResult::Found {
+            symbol: original_symbol,
+            declarations: original_declarations,
+            ..
+        } = expected
+        else {
+            return Err("original overload symbol must remain readable".into());
+        };
+        assert_eq!(&symbol, original_symbol);
+        assert_eq!(&declarations, original_declarations);
+        assert_eq!(symbol.signatures.len(), 3);
+        assert_eq!(symbol.documentation.len(), 3);
+        assert_eq!(declarations.len(), 1);
+        let declaration = &declarations[0];
+        assert_eq!(
+            declaration.source.as_deref(),
+            Some(original_overload_excerpt(declaration, &files[1..])?)
+        );
+        assert!(declaration.source_complete);
+        assert!(declarations_seen.insert((
+            declaration.path.clone(),
+            declaration.range.start,
+            declaration.range.end
+        )));
+        assert_eq!(declaration_cursor.is_some(), page < 2);
+        request.declaration_cursor = declaration_cursor;
+    }
+    assert_eq!(declarations_seen.len(), 3);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_empty_query_counts_only_original_rows_after_edit() -> TestResult {
+    let (directory, client, server_task) = served_workspace(FILES, None).await?;
+    let statement = "SELECT ?symbol { ?symbol :name 'changed' }";
+    let first =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    assert!(query::rows(&first)?.is_empty(), "{first}");
+    let view: rift_protocol::symbol_read::CapturedView =
+        serde_json::from_value(first["view"].clone())?;
+    let original_answer: rift_protocol::query::QueryAnswer =
+        serde_json::from_value(first["answer"].clone())?;
+    std::fs::write(
+        directory.path().join("src/lib.rs"),
+        "pub fn changed() -> bool { false }\n",
+    )?;
+    let latest =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    assert_eq!(query::rows(&latest)?.len(), 1, "{latest}");
+    let service = format!(
+        "{}{}",
+        rift_search::sparql::RESULT_SERVICE_PREFIX,
+        view.id.as_str()
+    );
+    let count = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":format!("SELECT (COUNT(*) AS ?count) {{ SERVICE <{service}> {{}} }}")}),
+        ),
+    )
+    .await?;
+    let rows = query::rows(&count)?;
+    assert_eq!(rows.len(), 1, "{count}");
+    assert_eq!(query::literal(&rows[0], "count")?, "0", "{count}");
+    assert_eq!(count["view"]["expires_at"], first["view"]["expires_at"]);
+    let continuation = rift_search::sparql::continuation_query(&original_answer, &view.id, 0)?;
+    let held = call_retrying_acceptance(
+        &client,
+        tool_request("search", &json!({"query":continuation})),
+    )
+    .await?;
+    assert_eq!(held, first, "original empty page and view remain unchanged");
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_anonymous_subject_joins_keep_old_rows_after_edit() -> TestResult {
+    let (directory, client, server_task) =
+        served_workspace(&[("member.json", "{\"beacon\":\"old\"}\n")], None).await?;
+    let mut original = Vec::new();
+    for variable in ["symbol", "renamed"] {
+        let statement = format!("SELECT ?{variable} {{ ?{variable} a :Symbol; :name 'beacon' }}");
+        let first =
+            call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+                .await?;
+        let rows = query::rows(&first)?;
+        assert_eq!(rows.len(), 1, "{first}");
+        assert_eq!(rows[0][variable]["type"], "blank_node", "{first}");
+        original.push((variable, rows[0][variable].clone(), first));
+    }
+    std::fs::write(
+        directory.path().join("member.json"),
+        "{\"replacement\":true}\n",
+    )?;
+    let current = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":"ASK { ?symbol :name 'replacement' }"}),
+        ),
+    )
+    .await?;
+    assert_eq!(current["answer"]["value"], true);
+    for (variable, resource, first) in original {
+        let view = first["view"]["id"]
+            .as_str()
+            .ok_or("original retained view")?;
+        let service = format!(
+            "SERVICE <{}{view}> {{}}",
+            rift_search::sparql::RESULT_SERVICE_PREFIX
+        );
+        for pattern in [
+            format!("{service} ?{variable} :name ?name"),
+            format!("?{variable} :name ?name {service}"),
+            format!("{service} OPTIONAL {{ ?{variable} :name ?name }}"),
+            format!(
+                "{service} ?{variable} :name ?name OPTIONAL {{ ?{variable} :missing ?optional }}"
+            ),
+        ] {
+            let statement = format!("SELECT ?{variable} ?name ?optional {{ {pattern} }}");
+            let retained = call_retrying_acceptance(
+                &client,
+                tool_request("search", &json!({"query":statement})),
+            )
+            .await?;
+            let rows = query::rows(&retained)?;
+            assert_eq!(rows.len(), 1, "{retained}");
+            assert_eq!(rows[0][variable], resource);
+            assert_eq!(query::literal(&rows[0], "name")?, "beacon");
+            assert!(rows[0].get("optional").is_none());
+            assert_eq!(retained["view"]["expires_at"], first["view"]["expires_at"]);
+        }
+        for pattern in [
+            format!("OPTIONAL {{ {service} }} ?{variable} :name ?name"),
+            format!("{service} ?other :name ?name"),
+            format!("{service} ?{variable} :references ?caller"),
+        ] {
+            let statement = format!("SELECT ?{variable} ?other ?name ?caller {{ {pattern} }}");
+            let unavailable = call_retrying_acceptance(
+                &client,
+                tool_request("search", &json!({"query":statement})),
+            )
+            .await?;
+            assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
+            assert_eq!(
+                unavailable["reason"], "insufficient_coverage",
+                "{unavailable}"
+            );
+            assert!(unavailable.get("answer").is_none());
+        }
+    }
     client.cancel().await?;
     server_task.await?;
     Ok(())

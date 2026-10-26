@@ -11,8 +11,103 @@ use super::{QueryError, VOCABULARY};
 use crate::query::{AdjacencyRequirement, FactRequirements};
 
 enum Pending<'a> {
-    Pattern(&'a QueryExpression),
+    Pattern(&'a QueryExpression, bool),
+    Project(&'a QueryExpression),
     Expression(&'a Expression),
+}
+
+struct SubjectProof<'a> {
+    allowed: bool,
+    service: Option<&'a str>,
+    variable: Option<&'a str>,
+}
+
+impl<'a> SubjectProof<'a> {
+    const fn new(allowed: bool) -> Self {
+        Self {
+            allowed,
+            service: None,
+            variable: None,
+        }
+    }
+
+    fn pattern(&mut self, pattern: &'a QueryExpression, mandatory: bool) {
+        match pattern {
+            QueryExpression::Service {
+                name,
+                inner,
+                silent,
+            } => {
+                let NamedNodePattern::NamedNode(name) = name else {
+                    self.allowed = false;
+                    return;
+                };
+                if *silent
+                    || !mandatory
+                    || self.service.is_some_and(|known| known != name.as_str())
+                    || name
+                        .as_str()
+                        .strip_prefix(super::RESULT_SERVICE_PREFIX)
+                        .is_none_or(str::is_empty)
+                    || !matches!(inner.as_ref(), QueryExpression::Bgp { patterns } if patterns.is_empty())
+                {
+                    self.allowed = false;
+                    return;
+                }
+                self.service = Some(name.as_str());
+            }
+            QueryExpression::Path { .. }
+            | QueryExpression::Union { .. }
+            | QueryExpression::Minus { .. }
+            | QueryExpression::Lateral { .. }
+            | QueryExpression::Graph { .. }
+            | QueryExpression::Extend { .. }
+            | QueryExpression::Group { .. }
+            | QueryExpression::Values { .. } => self.allowed = false,
+            _ => {}
+        }
+    }
+
+    fn subject(&mut self, subject: &'a TermPattern) {
+        let TermPattern::Variable(variable) = subject else {
+            self.allowed = false;
+            return;
+        };
+        if self
+            .variable
+            .is_some_and(|known| known != variable.as_str())
+        {
+            self.allowed = false;
+        }
+        self.variable = Some(variable.as_str());
+    }
+
+    fn project(&mut self, pattern: &QueryExpression) {
+        let QueryExpression::Project { variables, .. } = pattern else {
+            self.allowed = false;
+            return;
+        };
+        if !self.variable.is_some_and(|subject| {
+            variables
+                .iter()
+                .any(|variable| variable.as_str() == subject)
+        }) {
+            self.allowed = false;
+        }
+    }
+
+    fn finish(
+        self,
+        text_bytes_max: usize,
+    ) -> Result<Option<super::RetainedSubjectSelection>, QueryError> {
+        let (Some(service), Some(variable)) = (self.service, self.variable) else {
+            return Ok(None);
+        };
+        if !self.allowed {
+            return Ok(None);
+        }
+        super::RetainedSubjectSelection::new(service, variable, text_bytes_max).map(Some)
+    }
 }
 
 struct UniformPath {
@@ -113,7 +208,11 @@ fn uniform_path(
 }
 
 impl FactRequirements {
-    pub(super) fn from_query(query: &Query, nodes_max: usize) -> Result<Self, QueryError> {
+    pub(super) fn from_query(
+        query: &Query,
+        limits: super::QueryLimits,
+    ) -> Result<(Self, Option<super::RetainedSubjectSelection>), QueryError> {
+        let nodes_max = limits.algebra_nodes_max;
         let pattern = match query {
             Query::Select(query) => &query.expression,
             Query::Ask(query) => &query.expression,
@@ -140,72 +239,50 @@ impl FactRequirements {
                     .extend(named.iter().map(|name| name.as_str().to_owned()));
             }
         }
-        let mut pending = vec![Pending::Pattern(pattern)];
+        let mut subject =
+            SubjectProof::new(!matches!(query, Query::Describe(_)) && query.dataset().is_none());
+        let mut pending = vec![Pending::Pattern(pattern, true)];
         let mut visited = 0usize;
         while let Some(node) = pending.pop() {
-            visited = visited
-                .checked_add(1)
-                .ok_or_else(|| failure::bound("algebra_nodes_max"))?;
+            if !matches!(&node, Pending::Project(_)) {
+                visited = visited
+                    .checked_add(1)
+                    .ok_or_else(|| failure::bound("algebra_nodes_max"))?;
+            }
             if visited > nodes_max || pending.len() > nodes_max {
                 return Err(failure::bound("algebra_nodes_max"));
             }
             match node {
-                Pending::Pattern(pattern) => result.pattern(pattern, &mut pending, nodes_max)?,
-                Pending::Expression(expression) => Self::expression(expression, &mut pending),
+                Pending::Pattern(pattern, mandatory) => {
+                    subject.pattern(pattern, mandatory);
+                    result.pattern(pattern, mandatory, &mut pending, nodes_max, &mut subject)?;
+                }
+                Pending::Project(pattern) => subject.project(pattern),
+                Pending::Expression(expression) => {
+                    if matches!(expression, Expression::Exists(_)) {
+                        subject.allowed = false;
+                    }
+                    Self::expression(expression, &mut pending);
+                }
             }
         }
         result.occurrences.sort();
         result.occurrences.dedup();
         result.datasets.sort();
         result.datasets.dedup();
-        Ok(result)
+        Ok((result, subject.finish(limits.query_bytes_max)?))
     }
 
     fn pattern<'a>(
         &mut self,
         pattern: &'a QueryExpression,
+        mandatory: bool,
         pending: &mut Vec<Pending<'a>>,
         nodes_max: usize,
+        subject: &mut SubjectProof<'a>,
     ) -> Result<(), QueryError> {
         match pattern {
-            QueryExpression::Bgp { patterns } => {
-                if !patterns.is_empty() {
-                    self.require(FactRequirement::Domain);
-                }
-                if patterns.len() > nodes_max {
-                    return Err(failure::bound("algebra_nodes_max"));
-                }
-                let chain = linear_adjacency(patterns);
-                if let Some(requirement) = &chain {
-                    for facet in &requirement.facets {
-                        if !self.facets.contains(facet) {
-                            self.facets.push(*facet);
-                        }
-                    }
-                    self.adjacency.push(requirement.clone());
-                }
-                for triple in patterns {
-                    match &triple.predicate {
-                        NamedNodePattern::NamedNode(predicate) => {
-                            if chain.is_some()
-                                && predicate
-                                    .as_str()
-                                    .strip_prefix(VOCABULARY)
-                                    .and_then(facet)
-                                    .is_some()
-                            {
-                                continue;
-                            }
-                            self.triple(&triple.subject, predicate.as_str(), &triple.object);
-                        }
-                        NamedNodePattern::Variable(_) => {
-                            self.require(FactRequirement::CompleteDomain);
-                            self.require(FactRequirement::AllOccurrences);
-                            self.all_families();
-                        }
-                    }
-                }
-            }
+            QueryExpression::Bgp { patterns } => self.bgp(patterns, nodes_max, subject)?,
             QueryExpression::Path {
                 subject,
                 path,
@@ -218,43 +295,62 @@ impl FactRequirements {
             | QueryExpression::Union { left, right }
             | QueryExpression::Minus { left, right }
             | QueryExpression::Lateral { left, right } => {
-                pending.extend([Pending::Pattern(left), Pending::Pattern(right)]);
+                pending.extend([
+                    Pending::Pattern(left, mandatory),
+                    Pending::Pattern(right, mandatory),
+                ]);
             }
             QueryExpression::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                pending.extend([Pending::Pattern(left), Pending::Pattern(right)]);
+                pending.extend([
+                    Pending::Pattern(left, mandatory),
+                    Pending::Pattern(right, false),
+                ]);
                 pending.extend(expression.iter().map(Pending::Expression));
             }
             QueryExpression::Filter { expr, inner } => {
-                pending.extend([Pending::Pattern(inner), Pending::Expression(expr)]);
+                pending.extend([
+                    Pending::Pattern(inner, mandatory),
+                    Pending::Expression(expr),
+                ]);
             }
             QueryExpression::Extend {
                 expression, inner, ..
-            } => pending.extend([Pending::Pattern(inner), Pending::Expression(expression)]),
+            } => pending.extend([
+                Pending::Pattern(inner, mandatory),
+                Pending::Expression(expression),
+            ]),
             QueryExpression::Graph { name, inner } => {
                 self.selection(name, false);
-                pending.push(Pending::Pattern(inner));
+                pending.push(Pending::Pattern(inner, mandatory));
             }
             QueryExpression::Service { name, inner, .. } => self.service(name, inner, nodes_max)?,
             QueryExpression::OrderBy { inner, expression } => {
-                pending.push(Pending::Pattern(inner));
+                pending.push(Pending::Pattern(inner, mandatory));
                 for order in expression {
                     let (spargebra::algebra::OrderExpression::Asc(value)
                     | spargebra::algebra::OrderExpression::Desc(value)) = order;
                     pending.push(Pending::Expression(value));
                 }
             }
-            QueryExpression::Project { inner, .. }
-            | QueryExpression::Distinct { inner }
+            QueryExpression::Project { inner, .. } => {
+                pending.extend([
+                    Pending::Project(pattern),
+                    Pending::Pattern(inner, mandatory),
+                ]);
+            }
+            QueryExpression::Distinct { inner }
             | QueryExpression::Reduced { inner }
-            | QueryExpression::Slice { inner, .. } => pending.push(Pending::Pattern(inner)),
+            | QueryExpression::Slice { inner, .. } => {
+                pending.push(Pending::Pattern(inner, mandatory));
+            }
             QueryExpression::Group {
                 inner, aggregates, ..
             } => {
-                pending.push(Pending::Pattern(inner));
+                pending.push(Pending::Pattern(inner, mandatory));
                 for (_, aggregate) in aggregates {
                     if let spargebra::algebra::AggregateExpression::FunctionCall { expr, .. } =
                         aggregate
@@ -264,6 +360,52 @@ impl FactRequirements {
                 }
             }
             QueryExpression::Values { .. } => {}
+        }
+        Ok(())
+    }
+
+    fn bgp<'a>(
+        &mut self,
+        patterns: &'a [spargebra::term::TriplePattern],
+        nodes_max: usize,
+        subject: &mut SubjectProof<'a>,
+    ) -> Result<(), QueryError> {
+        if !patterns.is_empty() {
+            self.require(FactRequirement::Domain);
+        }
+        if patterns.len() > nodes_max {
+            return Err(failure::bound("algebra_nodes_max"));
+        }
+        let chain = linear_adjacency(patterns);
+        if let Some(requirement) = &chain {
+            for facet in &requirement.facets {
+                if !self.facets.contains(facet) {
+                    self.facets.push(*facet);
+                }
+            }
+            self.adjacency.push(requirement.clone());
+        }
+        for triple in patterns {
+            subject.subject(&triple.subject);
+            match &triple.predicate {
+                NamedNodePattern::NamedNode(predicate) => {
+                    if chain.is_some()
+                        && predicate
+                            .as_str()
+                            .strip_prefix(VOCABULARY)
+                            .and_then(facet)
+                            .is_some()
+                    {
+                        continue;
+                    }
+                    self.triple(&triple.subject, predicate.as_str(), &triple.object);
+                }
+                NamedNodePattern::Variable(_) => {
+                    self.require(FactRequirement::CompleteDomain);
+                    self.require(FactRequirement::AllOccurrences);
+                    self.all_families();
+                }
+            }
         }
         Ok(())
     }
@@ -521,7 +663,7 @@ impl FactRequirements {
 
     fn expression<'a>(expression: &'a Expression, pending: &mut Vec<Pending<'a>>) {
         match expression {
-            Expression::Exists(pattern) => pending.push(Pending::Pattern(pattern)),
+            Expression::Exists(pattern) => pending.push(Pending::Pattern(pattern, false)),
             Expression::Or(left, right) | Expression::And(left, right) => {
                 pending.extend([Pending::Expression(left), Pending::Expression(right)]);
             }

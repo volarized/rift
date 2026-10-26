@@ -37,12 +37,12 @@ impl RiftMcp {
         budget: &QueryBudget,
         deadline: crate::server::RequestDeadline,
     ) -> Result<Option<Snapshot>, ToolFailure> {
-        if request.view.is_some()
-            || request.change.is_some()
-            || request.target == rift_protocol::read::SearchParamsTarget::Commit
-            || request.scope != SearchScope::Local
+        if request.view.is_some() || request.change.is_some() || request.scope != SearchScope::Local
         {
             return Ok(None);
+        }
+        if request.target == rift_protocol::read::SearchParamsTarget::Commit {
+            return self.commit_retrieval_snapshot(deadline).await.map(Some);
         }
         if let Some(rev) = &request.rev {
             return self
@@ -70,6 +70,33 @@ impl RiftMcp {
             view: None,
             sources: None,
         }))
+    }
+
+    async fn commit_retrieval_snapshot(
+        &self,
+        deadline: crate::server::RequestDeadline,
+    ) -> Result<Snapshot, ToolFailure> {
+        let resolved = self
+            .published_workspace(rift_protocol::error::ErrorPhase::Read, deadline)
+            .await?;
+        let configuration = resolved
+            .published
+            .configuration
+            .accepted_for_tool(rift_protocol::error::ErrorPhase::Read)?;
+        let reads = Arc::clone(&resolved.published.reads);
+        if let Some(history) = &self.history {
+            reads.attach_history_store(history.stored());
+        }
+        Ok(Snapshot {
+            reads,
+            prepared: resolved.published.preparation.is_none(),
+            answer: Arc::new(rift_server::StoreAnswer::identifier_only()),
+            references: Arc::default(),
+            warnings: resolved.stale.into_iter().collect(),
+            configuration,
+            view: None,
+            sources: None,
+        })
     }
 
     async fn revision_retrieval_snapshot(
@@ -124,7 +151,7 @@ impl RiftMcp {
                     sources
                 } else {
                     budget.charge(&selected)?;
-                    Arc::new(reads.capture_search(selected, answer, references)?)
+                    Arc::new(reads.capture_search(selected, answer, references, budget)?)
                 };
                 let (result, contributions) = sources.page(page_index, budget)?;
                 let material = if first {

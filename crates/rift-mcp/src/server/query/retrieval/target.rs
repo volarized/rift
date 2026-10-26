@@ -1,5 +1,5 @@
 use rift_error::RiftError;
-use rift_protocol::read::{SearchHitTarget, Symbol};
+use rift_protocol::read::{SearchHit, SearchHitTarget, Symbol};
 use rift_search::query::QueryProviderEndpoint;
 
 use super::super::{QueryAcquisition, acquisition_failure};
@@ -14,9 +14,8 @@ impl QueryAcquisition {
                 "retrieval record associations do not match selected rows",
             ));
         }
-        let selection = self.material.captured_provider_selection();
-        for (service, contributions) in self
-            .services
+        let mut services = std::mem::take(&mut self.services);
+        for (service, contributions) in services
             .retrievals
             .iter_mut()
             .zip(std::mem::take(&mut self.contributions))
@@ -28,86 +27,90 @@ impl QueryAcquisition {
             }
             for (hit, keys) in service.result.results.iter().zip(contributions) {
                 budget.check()?;
-                let target = match &hit.hit {
-                    SearchHitTarget::Symbol { symbol } if !keys.is_empty() => {
-                        let selection = selection.ok_or_else(|| {
-                            acquisition_failure("original provider selection is unavailable")
-                        })?;
-                        let mut found = None;
-                        for (provider, snapshot) in self.facts.providers.iter().enumerate() {
-                            budget.check()?;
-                            if &snapshot.context.selection != selection
-                                || snapshot.context.root != selection.root
-                                || snapshot.context.owner != selection.owner
-                            {
-                                continue;
-                            }
-                            for record in &snapshot.records {
-                                budget.check()?;
-                                if !keys.iter().all(|key| record.contributions.contains(key)) {
-                                    continue;
-                                }
-                                if found.is_some()
-                                    || self
-                                        .facts
-                                        .symbols
-                                        .get(record.symbol_index)
-                                        .is_none_or(|selected| selected.symbol != **symbol)
-                                {
-                                    return Err(acquisition_failure(
-                                        "retrieval symbol differs from its original selected record",
-                                    ));
-                                }
-                                budget.charge(record)?;
-                                found = Some(QueryProviderEndpoint {
-                                    provider: Some(provider),
-                                    target: record.target().ok_or_else(|| {
-                                                rift_error::errors::server::read_unavailable()
-                                                    .operation("query acquisition")
-                                                    .detail(format!(
-                                                        "retrieval symbol {:?} has no original selected record target",
-                                                        symbol.name,
-                                                    ))
-                                                    .error()
-                                    })?,
-                                });
-                            }
-                        }
-                        Some((
-                            rift_search::sparql::LOCAL_GRAPH.to_owned(),
-                            found.ok_or_else(|| {
-                                rift_error::errors::server::read_unavailable()
-                                    .operation("query acquisition")
-                                    .detail(format!(
-                                        "retrieval symbol {:?} has no original selected record among {} providers for {} contribution keys",
-                                        symbol.name, self.facts.providers.len(), keys.len(),
-                                    ))
-                                    .error()
-                            })?,
-                        ))
-                    }
-                    SearchHitTarget::Symbol { symbol } => {
-                        validate_canonical_symbol(
-                            symbol,
-                            hit.path.as_ref().map(|path| path.0.as_str()),
-                            hit.unit
-                                .as_ref()
-                                .map(rift_protocol::read::SourceUnitId::as_str),
-                        )?;
-                        None
-                    }
-                    _ if keys.is_empty() => None,
-                    _ => {
-                        return Err(acquisition_failure(
-                            "retrieval record association has a different result target",
-                        ));
-                    }
-                };
+                let target = self
+                    .bind_original_target(hit, &keys, budget)?
+                    .map(|endpoint| (0, endpoint));
                 budget.charge(&target)?;
                 service.targets.push(target);
             }
         }
+        self.services = services;
         Ok(self)
+    }
+
+    pub(in crate::server::query) fn bind_original_target(
+        &self,
+        hit: &SearchHit,
+        keys: &[rift_core::ContributionKey],
+        budget: &mut rift_server::QueryFactBudget<'_>,
+    ) -> Result<Option<QueryProviderEndpoint>, RiftError> {
+        let SearchHitTarget::Symbol { symbol } = &hit.hit else {
+            if keys.is_empty() {
+                return Ok(None);
+            }
+            return Err(acquisition_failure(
+                "retrieval record association has a different result target",
+            ));
+        };
+        if keys.is_empty() {
+            validate_canonical_symbol(
+                symbol,
+                hit.path.as_ref().map(|path| path.0.as_str()),
+                hit.unit
+                    .as_ref()
+                    .map(rift_protocol::read::SourceUnitId::as_str),
+            )?;
+            return Ok(None);
+        }
+        let selection = self
+            .material
+            .captured_provider_selection()
+            .ok_or_else(|| acquisition_failure("original provider selection is unavailable"))?;
+        let mut found = None;
+        for (provider, snapshot) in self.facts.providers.iter().enumerate() {
+            budget.check()?;
+            if &snapshot.context.selection != selection
+                || snapshot.context.root != selection.root
+                || snapshot.context.owner != selection.owner
+            {
+                continue;
+            }
+            for record in &snapshot.records {
+                budget.check()?;
+                if !keys.iter().all(|key| record.contributions.contains(key)) {
+                    continue;
+                }
+                if found.is_some()
+                    || self
+                        .facts
+                        .symbols
+                        .get(record.symbol_index)
+                        .is_none_or(|selected| selected.symbol != **symbol)
+                {
+                    return Err(acquisition_failure(
+                        "retrieval symbol differs from its original selected record",
+                    ));
+                }
+                budget.charge(record)?;
+                found = Some(QueryProviderEndpoint {
+                    provider: Some(provider),
+                    target: record.target().ok_or_else(|| {
+                        rift_error::errors::server::read_unavailable()
+                            .operation("query acquisition")
+                            .detail(format!(
+                                "retrieval symbol {:?} has no original selected record target",
+                                symbol.name,
+                            ))
+                            .error()
+                    })?,
+                });
+            }
+        }
+        found.map(Some).ok_or_else(|| {
+            rift_error::errors::server::read_unavailable().operation("query acquisition")
+                .detail(format!("retrieval symbol {:?} has no original selected record among {} providers for {} contribution keys",
+                    symbol.name, self.facts.providers.len(), keys.len())).error()
+        })
     }
 }
 

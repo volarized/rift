@@ -21,7 +21,7 @@ mod search;
 mod traversal;
 
 pub use callee::{CalleeDeclaration, CalleePackage, CalleeRoots, PackageCallee};
-pub use change::search_change;
+pub use change::{ChangePage, ChangeSnapshot, search_change};
 pub use configuration::{
     CONFIGURATION_FILE_BYTES_MAX, configuration_file, load_configuration, profile_roots,
 };

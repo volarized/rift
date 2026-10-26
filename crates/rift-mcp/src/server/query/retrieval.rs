@@ -153,7 +153,7 @@ impl RiftMcp {
     }
 }
 
-fn validate_retrieval_start(request: &SearchParams) -> Result<(), ToolFailure> {
+pub(super) fn validate_retrieval_start(request: &SearchParams) -> Result<(), ToolFailure> {
     if request.page_index != 0 {
         return Err(failure(
             rift_error::errors::server::read_invalid()

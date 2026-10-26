@@ -7,6 +7,30 @@ use rift_protocol::identity::SourceDigest;
 
 use super::QuerySource;
 
+/// Qualifies a project source unit under its original captured selection.
+///
+/// A missing selection keeps the original project unit. Canonical package and runtime
+/// units keep their existing identity in every selection.
+///
+/// # Errors
+/// Returns the existing source identity, resolver, path or digest encoding refusal.
+pub fn qualify_source_unit(
+    original: &rift_protocol::read::SourceUnitId,
+    selection: Option<&SourceDigest>,
+) -> Result<rift_protocol::read::SourceUnitId, RiftError> {
+    let (owner, _) = rift_protocol::identity::parse_source_unit_identity(original.as_str())?;
+    let Some(selection) = selection.filter(|_| owner.is_none()) else {
+        return Ok(original.clone());
+    };
+    let original = data_encoding::HEXLOWER
+        .encode(rift_core::FileDigest::of(original.as_str().as_bytes()).as_bytes());
+    let unit = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("rift.sources.project".to_owned())?,
+        rift_core::SourcePath::new(format!("{}/{original}", selection.as_str()))?,
+    )?;
+    rift_protocol::read::SourceUnitId::parse(&unit.to_string())
+}
+
 /// Checks each source's full bytes and compares repeated canonical units.
 ///
 /// Each source is hashed once. The map retains borrowed text and one digest per unit;

@@ -69,6 +69,9 @@ pub(crate) use candidates::normalized_params;
 mod extra;
 mod http_client;
 pub(crate) use candidates::captured_expiry;
+pub(crate) use candidates::{
+    prepare_query_services, query_material, query_material_read, query_replay,
+};
 pub(crate) use http_client::encode_bounded;
 
 /// Bound on one upstream connect-and-initialize attempt.

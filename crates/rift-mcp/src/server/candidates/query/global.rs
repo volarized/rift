@@ -12,10 +12,10 @@ use super::{QueryGlobalSelection, RiftMcp, SavedSymbol, read_failure, retained};
 use crate::global::candidates::SavedCandidateBackend;
 use crate::output::ToolFailure;
 
-struct SelectedGlobal {
-    source: QueryGlobalSelection,
-    root: SavedSymbol,
-    facts: Option<std::sync::Arc<rift_search::query::QueryFacts>>,
+pub(super) struct SelectedGlobal {
+    pub(super) source: QueryGlobalSelection,
+    pub(super) root: SavedSymbol,
+    pub(super) facts: Option<std::sync::Arc<rift_search::query::QueryFacts>>,
 }
 
 impl RiftMcp {
@@ -64,6 +64,18 @@ impl RiftMcp {
         let Some(held) = self.query_global_selection(view, &owner, "get_symbol")? else {
             return Ok(None);
         };
+        let deadline = self.request_deadline().await;
+        self.query_global_symbol_selected(params, held, context, deadline)
+            .await
+    }
+
+    pub(super) async fn query_global_symbol_selected(
+        &self,
+        params: &GetSymbolParams,
+        held: SelectedGlobal,
+        context: Option<&Mutex<Option<SavedCandidateBackend>>>,
+        deadline: crate::server::RequestDeadline,
+    ) -> Result<Option<GetSymbolResult>, ToolFailure> {
         if captured_symbol(&held, params) {
             return Ok(None);
         }
@@ -82,7 +94,6 @@ impl RiftMcp {
         }
         let mut request = params.clone();
         request.view = Some(selected.view.id.clone());
-        let deadline = self.request_deadline().await;
         let mut result = tokio::time::timeout_at(
             deadline.at(),
             self.global.exact_symbol(&selected.configuration, &request),
@@ -130,6 +141,19 @@ impl RiftMcp {
         let Some(held) = self.query_global_selection(view, &owner, "get_source")? else {
             return Ok(None);
         };
+        let deadline = self.request_deadline().await;
+        self.query_global_source_selected(params, held, None, context, deadline)
+            .await
+    }
+
+    pub(super) async fn query_global_source_selected(
+        &self,
+        params: &GetSourceParams,
+        held: SelectedGlobal,
+        expected_digest: Option<rift_protocol::identity::SourceDigest>,
+        context: Option<&Mutex<Option<SavedCandidateBackend>>>,
+        deadline: crate::server::RequestDeadline,
+    ) -> Result<Option<GetSourceResult>, ToolFailure> {
         if held.facts.as_ref().is_some_and(|facts| {
             facts
                 .sources
@@ -138,12 +162,14 @@ impl RiftMcp {
         }) {
             return Ok(None);
         }
-        let digest = held.facts.as_ref().and_then(|facts| {
-            facts
-                .sources
-                .iter()
-                .find(|source| source.unit == params.unit)
-                .and_then(|source| source.digest.clone())
+        let digest = expected_digest.or_else(|| {
+            held.facts.as_ref().and_then(|facts| {
+                facts
+                    .sources
+                    .iter()
+                    .find(|source| source.unit == params.unit)
+                    .and_then(|source| source.digest.clone())
+            })
         });
         let SelectedGlobal {
             source: selected,
@@ -160,7 +186,6 @@ impl RiftMcp {
         }
         let mut request = params.clone();
         request.view = Some(selected.view.id.clone());
-        let deadline = self.request_deadline().await;
         let mut result = tokio::time::timeout_at(
             deadline.at(),
             self.global.exact_source(&selected.configuration, &request),

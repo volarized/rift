@@ -1856,6 +1856,7 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
     let len = callee_hit(&counted, "len")?;
     let id = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
     assert_eq!(query::iri(&len, "symbol")?, id);
+    let requests_before_exact = fixture.requests().await.len();
     let exact = call_retrying_acceptance(
         &client,
         tool_request(
@@ -1866,6 +1867,11 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         ),
     )
     .await?;
+    assert_eq!(
+        fixture.requests().await.len(),
+        requests_before_exact,
+        "the original captured runtime read sends no new HTTP request"
+    );
     assert_eq!(exact["symbol"]["kind"], "function");
     assert_eq!(
         exact["symbol"]["origin"],
@@ -1878,6 +1884,28 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         exact["declarations"][0]["unit"],
         global_api::named_unit(&global_api::NAMED_POSITIONS[0])
     );
+    assert_eq!(exact["view"], counted["view"], "{exact}");
+    let original = global_api::python_runtime::builtins();
+    let declaration = &exact["declarations"][0];
+    let start = usize::try_from(
+        declaration["range"]["start"]
+            .as_u64()
+            .ok_or("original runtime declaration start")?,
+    )?;
+    let end = usize::try_from(
+        declaration["range"]["end"]
+            .as_u64()
+            .ok_or("original runtime declaration end")?,
+    )?;
+    assert_eq!(
+        declaration["source"].as_str(),
+        Some(
+            original
+                .get(start..end)
+                .ok_or("original runtime declaration range")?
+        ),
+        "{exact}"
+    );
     assert!(counted["warnings"].is_null(), "{counted}");
 
     assert!(declaration_requests(&fixture).await.is_empty());
@@ -1889,16 +1917,10 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         .filter(|request| request.uri.ends_with("/source"))
         .filter_map(|request| request.body)
         .collect();
-    assert_eq!(
-        source_requests.len(),
-        1,
-        "one original stub read: {source_requests:?}"
+    assert!(
+        source_requests.is_empty(),
+        "the original captured stub serves source without a network read: {source_requests:?}"
     );
-    assert_eq!(
-        source_requests[0]["unit"],
-        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
-    );
-    assert!(source_requests[0]["view"].is_string());
 
     client.cancel().await?;
     Ok(())

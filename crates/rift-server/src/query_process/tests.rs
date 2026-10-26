@@ -377,7 +377,7 @@ fn parent_refuses_unversioned_incompatible_and_unknown_response_fields() {
     let unversioned = serde_json::to_vec(&answer).expect("old response format");
     assert!(decode_response(&unversioned).is_err());
     let mut envelope = QueryExchange::new(answer);
-    for version in [0, 7] {
+    for version in [0, 8] {
         envelope.version = version;
         let error = decode_response(&serde_json::to_vec(&envelope).expect("incompatible response"))
             .err()
@@ -412,7 +412,7 @@ fn child_refuses_old_tasks_and_incompatible_versions_before_execution() {
         .expect("old task cannot produce an answer");
     assert_eq!(error.slug().as_str(), "rift.server.read_unsupported");
     let mut envelope = QueryExchange::new(task);
-    for version in [0, 7] {
+    for version in [0, 8] {
         envelope.version = version;
         std::fs::write(&request, serde_json::to_vec(&envelope).expect("new task"))
             .expect("request file");
@@ -457,7 +457,7 @@ fn acknowledgment_distinguishes_protocol_refusal_from_an_observed_child_failure(
         assert_eq!(error.slug().as_str(), slug);
     }
     let mut incompatible = QueryExchange::new(());
-    for version in [0, 7] {
+    for version in [0, 8] {
         incompatible.version = version;
         let error =
             decode_acknowledgment(&serde_json::to_vec(&incompatible).expect("version marker"))
@@ -470,7 +470,7 @@ fn acknowledgment_distinguishes_protocol_refusal_from_an_observed_child_failure(
 fn current_exchange_requires_version_and_payload_and_emits_the_current_acknowledgment() {
     let acknowledgment =
         serde_json::to_value(QueryExchange::new(())).expect("current acknowledgment");
-    assert_eq!(acknowledgment["version"], 8);
+    assert_eq!(acknowledgment["version"], 9);
     assert!(decode_acknowledgment(&serde_json::to_vec(&acknowledgment).expect("marker")).is_ok());
     for field in ["version", "payload"] {
         let mut missing = acknowledgment.clone();
@@ -480,4 +480,39 @@ fn current_exchange_requires_version_and_payload_and_emits_the_current_acknowled
             .remove(field);
         assert!(serde_json::from_value::<QueryExchange<()>>(missing).is_err());
     }
+}
+
+#[test]
+fn current_plan_exchange_requires_present_nullable_retained_subject_selection() {
+    let output = run_task(QueryTask::Prepare {
+        statement: "ASK {}".to_owned(),
+        limits: limits(),
+    })
+    .expect("current child plan");
+    let mut envelope = serde_json::to_value(QueryExchange::new(Ok::<_, QueryFailure>(output)))
+        .expect("current plan exchange");
+    assert_eq!(envelope["version"], 9);
+    assert!(
+        envelope["payload"]["Ok"]["Plan"]
+            .get("retained_subject_selection")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    let decoded = decode_response(&serde_json::to_vec(&envelope).expect("current plan frame"))
+        .expect("explicit null proof is a valid current plan");
+    let QueryOutput::Plan(plan) = decoded else {
+        panic!("current preparation returns a plan");
+    };
+    assert_eq!(plan.statement(), "ASK {}");
+    assert!(plan.retained_subject_selection().is_none());
+    let mut absent = envelope.clone();
+    absent["payload"]["Ok"]["Plan"]
+        .as_object_mut()
+        .expect("encoded plan object")
+        .remove("retained_subject_selection");
+    assert!(decode_response(&serde_json::to_vec(&absent).expect("old plan shape")).is_err());
+    envelope["version"] = serde_json::json!(8);
+    let refused = decode_response(&serde_json::to_vec(&envelope).expect("old plan exchange"))
+        .err()
+        .expect("previous query exchange refuses current plan payload");
+    assert_eq!(refused.slug().as_str(), "rift.server.read_unsupported");
 }

@@ -28,8 +28,9 @@ pub struct QueryServiceData {
     pub request: SearchParams,
     /// Complete selected hits and their original serving context.
     pub result: SearchResult,
-    /// Original selected owner graph and provider endpoint for each result row.
-    pub targets: Vec<Option<(String, crate::query::QueryProviderEndpoint)>>,
+    /// Original selected owner and provider endpoint for each result row.
+    /// Owner zero selects primary facts; later owners select the additional bodies in order.
+    pub targets: Vec<Option<(usize, crate::query::QueryProviderEndpoint)>>,
 }
 
 /// One retained table, addressed by its execution's service IRI.
@@ -57,14 +58,21 @@ pub struct QueryServices {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueryDataset {
-    /// Expanded graph IRI resolved by the serving owner.
-    pub graph: String,
+    /// Expanded named graph IRI, or null when this owner has no named graph.
+    #[serde(deserialize_with = "required_graph")]
+    pub graph: Option<String>,
     /// Facts acquired from the graph's selected publication.
     pub facts: QueryFacts,
     /// Original identities and the exact public identities advertised for this owner.
     pub identities: QueryIdentities,
     /// Whether this owner contributes facts to the default graph.
     pub default: bool,
+}
+
+fn required_graph<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(deserializer)
 }
 
 /// Checked identity translation applied before RDF matching and joins.
@@ -100,9 +108,9 @@ impl QueryServices {
                 match (&hit.hit, target) {
                     (
                         rift_protocol::read::SearchHitTarget::Symbol { symbol },
-                        Some((graph, endpoint)),
+                        Some((owner, endpoint)),
                     ) => {
-                        let selected = dataset.selected_resource(graph, endpoint)?;
+                        let selected = dataset.selected_resource(*owner, endpoint)?;
                         if let Some(identity) = &symbol.id
                             && selected
                                 != Term::NamedNode(
@@ -642,6 +650,39 @@ mod input_tests {
             )?;
             assert_eq!(fields.get(key), Some(&Value::String(text.to_owned())));
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dataset_owner_tests {
+    use super::*;
+
+    #[test]
+    fn selected_owner_graph_requires_presence_and_accepts_explicit_null()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let selected = QueryDataset {
+            graph: None,
+            facts: QueryFacts::default(),
+            identities: QueryIdentities {
+                symbols: Vec::new(),
+                sources: Vec::new(),
+                blank_prefix: rift_protocol::identity::SourceDigest::parse(&"a".repeat(64))?,
+            },
+            default: true,
+        };
+        let mut encoded = serde_json::to_value(selected)?;
+        assert!(encoded["graph"].is_null());
+        assert!(
+            serde_json::from_value::<QueryDataset>(encoded.clone())?
+                .graph
+                .is_none()
+        );
+        encoded
+            .as_object_mut()
+            .ok_or("selected owner")?
+            .remove("graph");
+        assert!(serde_json::from_value::<QueryDataset>(encoded).is_err());
         Ok(())
     }
 }

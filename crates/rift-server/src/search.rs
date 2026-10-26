@@ -838,14 +838,14 @@ fn force_include_requested(params: &SearchParams) -> bool {
 /// Project symbol lines wait for pagination when this is a search request.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HitPayloads {
-    source: bool,
+    pub(crate) source: bool,
     score: bool,
     defer_line: bool,
 }
 
-struct SelectedHit {
-    hit: SearchHit,
-    contributions: Vec<rift_core::ContributionKey>,
+pub(crate) struct SelectedHit {
+    pub(crate) hit: SearchHit,
+    pub(crate) contributions: Vec<rift_core::ContributionKey>,
 }
 
 impl From<SearchHit> for SelectedHit {
@@ -1624,7 +1624,7 @@ pub(crate) fn build_symbol_hit(
         .map(|selected| selected.hit)
 }
 
-fn build_selected_symbol_hit(
+pub(crate) fn build_selected_symbol_hit(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
     score: Option<f64>,
@@ -1961,7 +1961,7 @@ pub(crate) fn retain_public_symbol_hits(
     Ok(())
 }
 
-fn public_symbol_warning(
+pub(crate) fn public_symbol_warning(
     hit: &SearchHit,
     indices: &[Option<&WorkspaceIndex>],
 ) -> Result<Option<ReadWarning>, RiftError> {
@@ -2048,7 +2048,7 @@ pub(crate) fn order_hits(results: &mut [SearchHit], order: ResultOrder) {
     results.sort_by(|left, right| hit_ordering(left, right, order));
 }
 
-fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Ordering {
+pub(crate) fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Ordering {
     match order {
         ResultOrder::Relevance => right
             .score

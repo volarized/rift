@@ -124,6 +124,14 @@ impl RiftMcp {
             &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
         >,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
+        if let Some(view) = &params.view
+            && let Some(captured) = self.captured_query_material(view, "get_symbol")?
+        {
+            return self
+                .query_material_symbol(params, captured, context)
+                .await
+                .map(Json);
+        }
         if let Some(result) = self.query_global_symbol(&params, context).await? {
             return Ok(Json(result));
         }

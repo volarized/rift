@@ -1,9 +1,9 @@
-//! Acquired scoped endpoints retained with their original local publication.
+//! Acquired relationships and occurrences retained with their original local publication.
 
 use super::*;
 
 impl LocalSymbolViewInput {
-    /// Retains acquired endpoints without duplicating their symbol or source payloads.
+    /// Retains acquired relationships and occurrences without duplicating symbol or source payloads.
     ///
     /// # Errors
     /// Refuses acquisition from a different source revision.
@@ -22,7 +22,7 @@ impl LocalSymbolViewInput {
         Ok(self.with_query_references_arc(Some(Arc::new(references))))
     }
 
-    /// Acquired endpoints from this exact original publication.
+    /// Acquired relationships and occurrences from this exact original publication.
     #[must_use]
     pub fn query_references(&self) -> Option<&crate::EngineReferences> {
         self.material.query_references.as_deref()

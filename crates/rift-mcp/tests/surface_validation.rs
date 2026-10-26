@@ -304,7 +304,15 @@ fn assert_source_unit_ids_use_served_resolvers(
     match value {
         Value::String(text) => {
             if let Some(rest) = text.strip_prefix("rift://source/") {
+                let qualified_project = rest
+                    .strip_prefix("rift.sources.project/")
+                    .and_then(|path| path.split_once('/'))
+                    .is_some_and(|(selection, source)| {
+                        rift_protocol::identity::SourceDigest::parse(selection).is_ok()
+                            && rift_protocol::identity::SourceDigest::parse(source).is_ok()
+                    });
                 let served = rest.starts_with("project/")
+                    || qualified_project
                     || (reaches_dependencies && rest.starts_with("cargo/"));
                 assert!(
                     served,

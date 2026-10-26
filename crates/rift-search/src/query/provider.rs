@@ -373,6 +373,16 @@ impl QueryProviderRecord {
     /// # Errors
     /// Returns the serialization error when a supplied association cannot be encoded.
     pub fn key(&self, context: &QueryProviderContext) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = Vec::new();
+        self.write_key(context, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn write_key(
+        &self,
+        context: &QueryProviderContext,
+        writer: impl std::io::Write,
+    ) -> Result<(), serde_json::Error> {
         #[derive(Serialize)]
         struct Identity<'record> {
             context: ContextKey<'record>,
@@ -396,11 +406,14 @@ impl QueryProviderRecord {
                 }))
             }
         }
-        serde_json::to_vec(&Identity {
-            context: context.key_context(),
-            contributions: &self.contributions,
-            declarations: Declarations(&self.declarations),
-        })
+        serde_json::to_writer(
+            writer,
+            &Identity {
+                context: context.key_context(),
+                contributions: &self.contributions,
+                declarations: Declarations(&self.declarations),
+            },
+        )
     }
     /// Returns the existing normalized target of this captured record.
     #[must_use]
@@ -504,6 +517,13 @@ impl super::QueryFacts {
     /// # Errors
     /// Returns the registered invalid-query error for absent or conflicting captured associations.
     pub fn validate_providers(&self) -> Result<(), rift_error::RiftError> {
+        self.validate_providers_admitted(&mut |_| Ok(()))
+    }
+
+    pub(crate) fn validate_providers_admitted(
+        &self,
+        admit: &mut impl FnMut(usize) -> Result<(), rift_error::RiftError>,
+    ) -> Result<(), rift_error::RiftError> {
         let invalid = || {
             rift_error::errors::server::read_invalid()
                 .field("query")
@@ -513,6 +533,7 @@ impl super::QueryFacts {
                 .error()
         };
         for snapshot in &self.providers {
+            admit(0)?;
             if snapshot.source_indices.is_empty()
                 || !snapshot.source_indices.iter().any(|index| {
                     self.sources
@@ -523,18 +544,15 @@ impl super::QueryFacts {
             {
                 return Err(invalid());
             }
-            let mut keys = std::collections::BTreeSet::new();
+            validate_provider_keys(&snapshot.records, admit, &invalid)?;
             for record in &snapshot.records {
+                admit(0)?;
                 let symbol = self.symbols.get(record.symbol_index).ok_or_else(invalid)?;
                 if record.contributions.is_empty() || record.declarations.is_empty() {
                     return Err(invalid());
                 }
-                for key in &record.contributions {
-                    if !keys.insert(key) {
-                        return Err(invalid());
-                    }
-                }
                 for association in &record.declarations {
+                    admit(0)?;
                     if !record.contributions.contains(&association.contribution) {
                         return Err(invalid());
                     }
@@ -582,6 +600,7 @@ impl super::QueryFacts {
             }
         }
         for edge in &self.provider_edges {
+            admit(0)?;
             for target in edge.from.iter().chain(std::iter::once(&edge.to)) {
                 if target.provider.is_none() && target.canonical_symbol().is_none() {
                     return Err(invalid());
@@ -601,4 +620,45 @@ impl super::QueryFacts {
         }
         Ok(())
     }
+}
+
+fn validate_provider_keys(
+    records: &[QueryProviderRecord],
+    admit: &mut impl FnMut(usize) -> Result<(), rift_error::RiftError>,
+    invalid: &impl Fn() -> rift_error::RiftError,
+) -> Result<(), rift_error::RiftError> {
+    let mut count = 0usize;
+    for record in records {
+        admit(0)?;
+        count = count
+            .checked_add(record.contributions.len())
+            .ok_or_else(invalid)?;
+    }
+    admit(
+        count
+            .checked_mul(size_of::<&ContributionKey>())
+            .ok_or_else(invalid)?,
+    )?;
+    let mut keys = Vec::new();
+    keys.try_reserve_exact(count).map_err(|_| invalid())?;
+    admit(
+        keys.capacity()
+            .checked_sub(count)
+            .and_then(|extra| extra.checked_mul(size_of::<&ContributionKey>()))
+            .ok_or_else(invalid)?,
+    )?;
+    for record in records {
+        admit(0)?;
+        for key in &record.contributions {
+            admit(0)?;
+            keys.push(key);
+        }
+    }
+    admit(0)?;
+    keys.sort_unstable();
+    admit(0)?;
+    if keys.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid());
+    }
+    Ok(())
 }

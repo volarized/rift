@@ -17,9 +17,11 @@ use rift_search::sparql::{
 use super::{Json, RiftMcp, ToolFailure, wire};
 use crate::failure::McpErrorExt as _;
 
+mod change;
 mod facts;
 pub(crate) use facts::{QueryFactRequest, QueryFactResult, QueryFactSelection};
 mod global;
+mod replay;
 mod retrieval;
 mod selection;
 
@@ -39,12 +41,13 @@ type QueryProjection = (
         QueryFacts,
         rift_server::LocalSymbolViewInput,
         rift_search::query::QueryProviderSelection,
+        Vec<usize>,
     ),
     Vec<ReadWarning>,
 );
 
 impl RiftMcp {
-    async fn query_configuration(&self) -> QueryConfiguration {
+    pub(super) async fn query_configuration(&self) -> QueryConfiguration {
         self.published
             .read()
             .await
@@ -86,34 +89,9 @@ impl RiftMcp {
             let limits = query_limits(&configuration)?;
             let budget = QueryBudget::for_request(limits, deadline.at().into_std(), &|| false)
                 .map_err(failure)?;
-            let program = self.query_program()?;
-            let cancellation = tokio_util::sync::CancellationToken::new();
-            let guard = cancellation.clone().drop_guard();
-            let prepared = tokio::time::timeout_at(
-                deadline.at(),
-                self.blocking.run_with_cancellation(
-                    "query parse",
-                    cancellation,
-                    move |cancelled| {
-                        rift_server::prepare_query(
-                            program.as_path(),
-                            params.query,
-                            limits,
-                            deadline.at().into_std(),
-                            &|| cancelled.is_cancelled(),
-                        )
-                    },
-                ),
-            )
-            .await
-            .map_err(|_| {
-                failure(acquisition_failure(
-                    "query parsing exceeded the request deadline",
-                ))
-            })?
-            .map_err(failure)?;
-            drop(guard);
-            let prepared = self.admit_query_data(&budget, prepared, deadline).await?;
+            let prepared = self
+                .prepare_graph_query(params, limits, &budget, deadline)
+                .await?;
             if prepared
                 .requirements()
                 .datasets
@@ -133,7 +111,34 @@ impl RiftMcp {
             {
                 return Ok(Json(result));
             }
+            let (prepared, requirements, originals) = self
+                .query_work(&budget, deadline, move |budget| {
+                    budget.charge(prepared.requirements())?;
+                    budget.charge(&prepared.retrievals())?;
+                    let mut requirements = prepared.requirements().clone();
+                    if requirements.requires(FactRequirement::Domain)
+                        && !requirements
+                            .services
+                            .iter()
+                            .any(|service| service.starts_with(RESULT_SERVICE_PREFIX))
+                        && !requirements
+                            .datasets
+                            .iter()
+                            .any(|graph| graph == LOCAL_GRAPH)
+                    {
+                        budget.charge(&LOCAL_GRAPH)?;
+                        requirements
+                            .datasets
+                            .try_reserve_exact(1)
+                            .map_err(|_| acquisition_failure("query dataset admission failed"))?;
+                        requirements.datasets.push(LOCAL_GRAPH.to_owned());
+                    }
+                    let originals = prepared.retrievals().to_vec();
+                    Ok((prepared, requirements, originals))
+                })
+                .await?;
             let requests = rift_server::ProviderRequests::new(configuration.requests);
+            let request_maximum = requests.remaining();
             let execution = QueryExecution {
                 configuration: &configuration,
                 limits,
@@ -142,42 +147,66 @@ impl RiftMcp {
                 requests: &requests,
             };
             let selected = match self
-                .acquire_query_data(
-                    prepared.requirements(),
-                    prepared.retrievals(),
-                    None,
-                    execution,
-                )
+                .acquire_fact_queries(&requirements, None, execution, Some(&prepared))
                 .await?
             {
                 Ok(selected) => selected,
                 Err(reason) => return Ok(Json(QueryReadResult::Unavailable(reason))),
             };
-            let selected = self
-                .query_work(&budget, deadline, move |budget| {
-                    selected.bind_targets(budget)
-                })
-                .await?;
-            let answer = self
-                .evaluate_query(
-                    prepared,
-                    selected.facts,
-                    limits,
-                    selected.services,
+            let bodies = self
+                .capture_query_fact_bodies(
+                    selected,
+                    (requirements, request_maximum),
+                    requests,
+                    &budget,
                     deadline,
                 )
                 .await?;
-            self.retain_query(
-                selected.material,
-                answer,
-                &configuration,
-                selected.warnings,
-                selected.upstream,
-            )
-            .await
-            .map(Json)
+            let (input, facts, services, warnings) = self
+                .prepare_query_material(bodies, originals, &configuration, &budget, deadline)
+                .await?;
+            let answer = self
+                .evaluate_query(prepared, facts, limits, services, deadline)
+                .await?;
+            self.retain_query_material(input, answer, warnings, &budget, deadline)
+                .await
+                .map(Json)
         })
         .await
+    }
+
+    async fn prepare_graph_query(
+        &self,
+        params: QueryParams,
+        limits: QueryLimits,
+        budget: &QueryBudget,
+        deadline: super::RequestDeadline,
+    ) -> Result<QueryPlan, ToolFailure> {
+        let program = self.query_program()?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let guard = cancellation.clone().drop_guard();
+        let prepared = tokio::time::timeout_at(
+            deadline.at(),
+            self.blocking
+                .run_with_cancellation("query parse", cancellation, move |cancelled| {
+                    rift_server::prepare_query(
+                        program.as_path(),
+                        params.query,
+                        limits,
+                        deadline.at().into_std(),
+                        &|| cancelled.is_cancelled(),
+                    )
+                }),
+        )
+        .await
+        .map_err(|_| {
+            failure(acquisition_failure(
+                "query parsing exceeded the request deadline",
+            ))
+        })?
+        .map_err(failure)?;
+        drop(guard);
+        self.admit_query_data(budget, prepared, deadline).await
     }
 
     async fn acquire_query_data(
@@ -214,16 +243,18 @@ impl RiftMcp {
             let material = self
                 .query_selection_material(selected.material.take(), selected.expiry.take())
                 .await?;
-            return Ok(Ok(
-                selected.into_acquisition(QueryFacts::default(), material)
-            ));
+            return Ok(Ok(selected.into_acquisition(
+                QueryFacts::default(),
+                material,
+                Vec::new(),
+            )));
         }
         if !requires_semantic && let Some(material) = selected.material.take() {
             let material = limit_material(material, selected.expiry.as_ref())?;
-            let (facts, material) = self
+            let (facts, material, subjects) = self
                 .project_retained_query(material, requirements, execution)
                 .await?;
-            return Ok(Ok(selected.into_acquisition(facts, material)));
+            return Ok(Ok(selected.into_acquisition(facts, material, subjects)));
         }
         self.acquire_current_query(requirements, selected, requires_semantic, execution)
             .await
@@ -253,7 +284,7 @@ impl RiftMcp {
             .published
             .configuration
             .accepted_for_tool(wire::ErrorPhase::Read)?;
-        let ((facts, material, provider_selection), mut warnings) = self
+        let ((facts, material, provider_selection, subjects), mut warnings) = self
             .project_fresh_query(
                 &resolved,
                 requirements,
@@ -315,7 +346,9 @@ impl RiftMcp {
             .attach_query_references(facts, material, references, execution)
             .await?;
         Ok(Ok(QueryAcquisition {
+            graph: Some(LOCAL_GRAPH.to_owned()),
             facts,
+            subjects,
             material,
             services,
             contributions,
@@ -426,7 +459,7 @@ impl RiftMcp {
         material: rift_server::LocalSymbolViewInput,
         requirements: &FactRequirements,
         execution: QueryExecution<'_>,
-    ) -> Result<(QueryFacts, rift_server::LocalSymbolViewInput), ToolFailure> {
+    ) -> Result<(QueryFacts, rift_server::LocalSymbolViewInput, Vec<usize>), ToolFailure> {
         let QueryExecution {
             limits,
             budget,
@@ -444,7 +477,7 @@ impl RiftMcp {
             .current
             .configuration
             .accepted_for_tool(wire::ErrorPhase::Read)?;
-        let (facts, material) = tokio::time::timeout_at(
+        let (facts, material, subjects) = tokio::time::timeout_at(
             deadline.at(),
             self.blocking.run_with_cancellation(
                 "retained query facts",
@@ -464,15 +497,13 @@ impl RiftMcp {
                             "captured provider configuration does not match",
                         ));
                     }
-                    Ok((
-                        material.query_facts_with_selection(
-                            &requirements,
-                            limits,
-                            &mut budget,
-                            selection,
-                        )?,
-                        material,
-                    ))
+                    let (facts, subjects) = material.query_facts_with_subjects(
+                        &requirements,
+                        limits,
+                        &mut budget,
+                        selection,
+                    )?;
+                    Ok((facts, material, subjects))
                 },
             ),
         )
@@ -484,7 +515,7 @@ impl RiftMcp {
         })?
         .map_err(failure)?;
         drop(guard);
-        Ok((facts, material))
+        Ok((facts, material, subjects))
     }
 
     async fn project_fresh_query(
@@ -525,7 +556,7 @@ impl RiftMcp {
                         let material = material.with_provider_selection(selection.clone())?;
                         let material =
                             combine_query_material(material, retained_material, &mut budget)?;
-                        let mut facts = material.query_facts_with_selection(
+                        let (mut facts, subjects) = material.query_facts_with_subjects(
                             &projection_requirements,
                             limits,
                             &mut budget,
@@ -549,7 +580,7 @@ impl RiftMcp {
                             limits,
                             &mut budget,
                         )?;
-                        Ok((facts, material, selection))
+                        Ok((facts, material, selection, subjects))
                     },
                 ),
             )
@@ -692,7 +723,7 @@ impl RiftMcp {
         Ok(answer)
     }
 
-    async fn query_work<T: Send + 'static>(
+    pub(super) async fn query_work<T: Send + 'static>(
         &self,
         budget: &QueryBudget,
         deadline: super::RequestDeadline,
@@ -998,7 +1029,9 @@ fn requires_engine(requirements: &FactRequirements) -> bool {
 }
 
 struct QueryAcquisition {
+    graph: Option<String>,
     facts: QueryFacts,
+    subjects: Vec<usize>,
     material: rift_server::LocalSymbolViewInput,
     services: QueryServices,
     contributions: Vec<Vec<Vec<rift_core::ContributionKey>>>,
@@ -1021,9 +1054,12 @@ impl SelectedQueryServices {
         self,
         facts: QueryFacts,
         material: rift_server::LocalSymbolViewInput,
+        subjects: Vec<usize>,
     ) -> QueryAcquisition {
         QueryAcquisition {
+            graph: Some(LOCAL_GRAPH.to_owned()),
             facts,
+            subjects,
             material,
             services: self.services,
             contributions: self.contributions,
@@ -1227,6 +1263,28 @@ fn query_adjacency(
     facts: &QueryFacts,
 ) -> Vec<rift_search::sparql::AdjacencyRequirement> {
     let mut adjacency = requirements.adjacency.clone();
+    let domain = complete_domain_adjacency(requirements);
+    for seed in canonical_query_symbols(facts) {
+        for (direction, facets, depth) in &domain {
+            adjacency.push(rift_search::sparql::AdjacencyRequirement {
+                seed: seed.clone(),
+                direction: *direction,
+                facets: facets.clone(),
+                depth: *depth,
+            });
+        }
+    }
+    adjacency
+}
+
+fn complete_domain_adjacency(
+    requirements: &FactRequirements,
+) -> Vec<(
+    TraversalDirection,
+    Vec<rift_protocol::read::RelationshipFacet>,
+    Option<u32>,
+)> {
+    let mut domain = Vec::new();
     if requirements.requires(FactRequirement::CompleteDomain) {
         let incoming = requirements
             .facets
@@ -1240,26 +1298,14 @@ fn query_adjacency(
             .copied()
             .filter(|facet| *facet != rift_protocol::read::RelationshipFacet::References)
             .collect::<Vec<_>>();
-        for seed in canonical_query_symbols(facts) {
-            if !incoming.is_empty() {
-                adjacency.push(rift_search::sparql::AdjacencyRequirement {
-                    seed: seed.clone(),
-                    direction: TraversalDirection::Incoming,
-                    facets: incoming.clone(),
-                    depth: Some(1),
-                });
-            }
-            if !outgoing.is_empty() || requirements.facets.is_empty() {
-                adjacency.push(rift_search::sparql::AdjacencyRequirement {
-                    seed,
-                    direction: TraversalDirection::Outgoing,
-                    facets: outgoing.clone(),
-                    depth: None,
-                });
-            }
+        if !incoming.is_empty() {
+            domain.push((TraversalDirection::Incoming, incoming, Some(1)));
+        }
+        if !outgoing.is_empty() || requirements.facets.is_empty() {
+            domain.push((TraversalDirection::Outgoing, outgoing, None));
         }
     }
-    adjacency
+    domain
 }
 
 impl RiftMcp {
@@ -1360,8 +1406,6 @@ impl RiftMcp {
             .await?;
             self.query_dependency_sources(
                 query,
-                remote,
-                input.resolved,
                 input.roots,
                 input.accepted,
                 input.execution.deadline,
@@ -1388,8 +1432,6 @@ impl RiftMcp {
                     .await?;
                 self.query_dependency_sources(
                     query,
-                    remote,
-                    input.resolved,
                     input.roots,
                     input.accepted,
                     input.execution.deadline,
@@ -1454,8 +1496,6 @@ impl RiftMcp {
             .await?;
             self.query_dependency_sources(
                 query,
-                remote,
-                input.resolved,
                 input.roots,
                 input.accepted,
                 input.execution.deadline,
@@ -1636,8 +1676,6 @@ impl RiftMcp {
     async fn query_dependency_sources(
         &self,
         query: &mut rift_server::EngineQuery<'_>,
-        remote: &mut global::GlobalQuery,
-        resolved: &super::ResolvedWorkspace,
         roots: &rift_server::CalleeRoots,
         configuration: &rift_protocol::configuration::WorkspaceConfiguration,
         deadline: super::RequestDeadline,
@@ -1646,7 +1684,6 @@ impl RiftMcp {
         if requests.is_empty() {
             return Ok(());
         }
-        remote.prepare(self, resolved, query, deadline).await?;
         for request in requests {
             let canonical = query.package_identity(&request).is_some();
             let roots = roots.clone();

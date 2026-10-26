@@ -4,7 +4,7 @@ mod provider;
 mod source;
 
 pub use source::{
-    require_source_agreement, source_digest, validate_source_selections,
+    qualify_source_unit, require_source_agreement, source_digest, validate_source_selections,
     validate_source_selections_by_unit,
 };
 

@@ -1,5 +1,5 @@
 use super::symbol::{SavedRead, SavedSymbol};
-use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure, unavailable};
+use super::{CandidateResponses, RiftMcp, read_failure, unavailable};
 use rift_error::{RiftError, errors};
 use rift_protocol::query::{QueryAnswer, QueryConfiguration, QueryReadResult, QueryResult};
 use rift_protocol::read::{Pagination, ReadWarning};
@@ -68,34 +68,6 @@ impl RiftMcp {
             .map(Some))
     }
 
-    pub(in crate::server) async fn retain_query(
-        &self,
-        material: rift_server::LocalSymbolViewInput,
-        answer: QueryAnswer,
-        configuration: &QueryConfiguration,
-        warnings: Vec<ReadWarning>,
-        upstream: Vec<QueryGlobalSelection>,
-    ) -> Result<QueryReadResult, super::ToolFailure> {
-        let views = Arc::clone(&self.local_views);
-        let responses = Arc::clone(&self.candidate_responses);
-        let configuration = configuration.clone();
-        self.blocking
-            .run("query retention", move || {
-                let views = views.get().ok_or_else(retention_failure)?;
-                retain(
-                    views,
-                    &responses,
-                    material,
-                    &answer,
-                    &configuration,
-                    warnings,
-                    upstream,
-                )
-            })
-            .await
-            .map_err(read_failure)
-    }
-
     pub(in crate::server) async fn retained_query(
         &self,
         view: &CapturedViewId,
@@ -150,6 +122,10 @@ impl RiftMcp {
         &self,
         selection: PageSelection,
     ) -> Result<Option<QueryReadResult>, super::ToolFailure> {
+        let view = CapturedViewId::parse(&selection.view).map_err(read_failure)?;
+        if let Some(captured) = self.captured_query_material(&view, "search")? {
+            return self.query_material_page(captured, selection).await;
+        }
         let responses = Arc::clone(&self.candidate_responses);
         let views = Arc::clone(&self.local_views);
         self.blocking
@@ -226,55 +202,6 @@ impl CandidateResponses {
             _ => Err(SymbolUnavailableReason::ViewContext),
         })
     }
-}
-
-fn retain(
-    views: &rift_server::LocalSymbolViews,
-    responses: &CandidateResponses,
-    material: rift_server::LocalSymbolViewInput,
-    answer: &QueryAnswer,
-    configuration: &QueryConfiguration,
-    warnings: Vec<ReadWarning>,
-    upstream: Vec<QueryGlobalSelection>,
-) -> Result<QueryReadResult, RiftError> {
-    let maximum = usize::try_from(configuration.result_size.bytes()).map_err(|_| page_failure())?;
-    let (encoded, template_end, offsets) = encode_records(answer, maximum)?;
-    let material = material.with_query_result(encoded);
-    let root = material
-        .root()
-        .to_str()
-        .ok_or_else(retention_failure)?
-        .to_owned();
-    let owner = material.owner().clone();
-    let mut selected = None;
-    views.capture_with(material, |view| {
-        let mut saved = SavedQuery {
-            context: SavedSymbol {
-                root,
-                owner,
-                view: view.clone(),
-            },
-            template_end,
-            pages: Vec::new(),
-            warnings,
-            upstream,
-        };
-        saved.pages = plan_pages(answer, &offsets, &saved, configuration)?;
-        let response = saved.response(first_page(answer, saved.pages.first(), &offsets), 0)?;
-        let encoded = crate::proxy::encode_bounded(&SavedRead::Query(Box::new(saved)), BYTES_MAX)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        responses.save_bytes(
-            view.id.as_str().to_owned(),
-            crate::proxy::captured_expiry(view)?,
-            encoded,
-        )?;
-        selected = Some(response);
-        Ok(true)
-    })?;
-    Ok(
-        selected
-            .unwrap_or_else(|| query_unavailable(SymbolUnavailableReason::InsufficientCoverage)),
-    )
 }
 
 fn empty_answer(answer: &QueryAnswer) -> QueryAnswer {
@@ -561,4 +488,620 @@ fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
         view: None,
         warnings: Vec::new(),
     })
+}
+
+impl RiftMcp {
+    pub(in crate::server) fn captured_query_material(
+        &self,
+        view: &CapturedViewId,
+        operation: &str,
+    ) -> Result<Option<rift_server::CapturedQueryView>, super::ToolFailure> {
+        if !self.has_captured_context(view) {
+            return Ok(None);
+        }
+        let context = self.captured_context(view, operation)?;
+        let views = self
+            .local_views
+            .get()
+            .ok_or_else(retention_failure)
+            .map_err(read_failure)?;
+        match views.query_view(view, std::path::Path::new(&context.root), &context.owner) {
+            Ok(captured) => Ok(Some(captured)),
+            Err(SymbolUnavailableReason::ViewContext) => Ok(None),
+            Err(reason) => Err(super::captured_read_refusal(operation, view, reason)),
+        }
+    }
+
+    pub(in crate::server) async fn prepare_query_material(
+        &self,
+        bodies: Vec<(
+            crate::server::QueryFactSelection,
+            rift_search::sparql::QueryServices,
+            Option<rift_search::sparql::QueryIdentities>,
+        )>,
+        originals: Vec<rift_protocol::read::SearchParams>,
+        configuration: &QueryConfiguration,
+        budget: &rift_server::QueryFactBudget<'static>,
+        deadline: crate::server::RequestDeadline,
+    ) -> Result<
+        (
+            crate::proxy::query_material::Input,
+            rift_search::sparql::QueryFacts,
+            rift_search::sparql::QueryServices,
+            Vec<ReadWarning>,
+        ),
+        super::ToolFailure,
+    > {
+        let configuration = configuration.clone();
+        let limits =
+            rift_search::sparql::QueryLimits::try_from(&configuration).map_err(read_failure)?;
+        let maximum = rift_server::QueryProcessLimits::from_query(limits)
+            .map_err(read_failure)?
+            .material_bytes_max;
+        self.query_work(budget, deadline, move |budget| {
+            let bytes = bodies
+                .len()
+                .checked_mul(
+                    size_of::<(
+                        String,
+                        crate::server::QueryFactSelection,
+                        rift_search::sparql::QueryServices,
+                        Option<rift_search::sparql::QueryIdentities>,
+                    )>() + "local".len(),
+                )
+                .ok_or_else(retention_failure)?;
+            budget.charge_material(bytes)?;
+            let mut selections = Vec::new();
+            selections
+                .try_reserve_exact(bodies.len())
+                .map_err(|_| retention_failure())?;
+            let extra = selections
+                .capacity()
+                .checked_sub(bodies.len())
+                .and_then(|extra| {
+                    extra.checked_mul(size_of::<(
+                        String,
+                        crate::server::QueryFactSelection,
+                        rift_search::sparql::QueryServices,
+                        Option<rift_search::sparql::QueryIdentities>,
+                    )>())
+                })
+                .ok_or_else(retention_failure)?;
+            budget.charge_material(extra)?;
+            for (body, services, identities) in bodies {
+                budget.check()?;
+                selections.push(("local".to_owned(), body, services, identities));
+            }
+            crate::proxy::prepare_query_services(
+                selections,
+                &originals,
+                limits,
+                configuration,
+                maximum,
+                budget,
+            )
+        })
+        .await
+    }
+
+    pub(in crate::server) async fn retain_query_material(
+        &self,
+        input: crate::proxy::query_material::Input,
+        answer: QueryAnswer,
+        warnings: Vec<ReadWarning>,
+        budget: &rift_server::QueryFactBudget<'static>,
+        deadline: crate::server::RequestDeadline,
+    ) -> Result<QueryReadResult, super::ToolFailure> {
+        let views = Arc::clone(&self.local_views);
+        let responses = Arc::clone(&self.candidate_responses);
+        self.query_work(budget, deadline, move |budget| {
+            let views = views.get().ok_or_else(retention_failure)?;
+            let (root, owner) = input.original_context()?;
+            budget.charge(&(root, owner))?;
+            let root = std::path::PathBuf::from(root);
+            let owner = owner.clone();
+            budget.charge(&answer)?;
+            input.capture_with(views, (&root, &owner), &answer, warnings, budget, |view| {
+                responses.save_symbol(&root, &owner, view)
+            })
+        })
+        .await
+    }
+
+    async fn query_material_budget(
+        &self,
+    ) -> Result<
+        (
+            crate::server::RequestDeadline,
+            rift_server::QueryFactBudget<'static>,
+        ),
+        super::ToolFailure,
+    > {
+        let deadline = self.request_deadline().await;
+        let configuration = self.query_configuration().await;
+        let limits =
+            rift_search::sparql::QueryLimits::try_from(&configuration).map_err(read_failure)?;
+        let budget =
+            rift_server::QueryFactBudget::for_request(limits, deadline.at().into_std(), &|| false)
+                .map_err(read_failure)?;
+        Ok((deadline, budget))
+    }
+
+    async fn query_material_page(
+        &self,
+        captured: rift_server::CapturedQueryView,
+        selection: PageSelection,
+    ) -> Result<Option<QueryReadResult>, super::ToolFailure> {
+        let (deadline, budget) = self.query_material_budget().await?;
+        self.query_work(&budget, deadline, move |budget| {
+            budget.charge_bytes(captured.material().metadata())?;
+            let saved = crate::proxy::query_material::metadata(&captured)?;
+            let answer = saved
+                .answer
+                .decode_bytes(captured.material().records(), Some(selection.page))?;
+            let matches = match (&selection.form, &answer) {
+                (
+                    PageForm::Bindings {
+                        variables: selected,
+                    },
+                    QueryAnswer::Bindings { variables, .. },
+                ) => selected == variables,
+                (PageForm::Graph, QueryAnswer::Graph { .. }) => true,
+                _ => false,
+            };
+            if !matches {
+                return Ok(None);
+            }
+            let response = saved.answer.response(answer, selection.page)?;
+            budget.charge(&response)?;
+            Ok(Some(response))
+        })
+        .await
+    }
+
+    pub(in crate::server) async fn query_material_source(
+        &self,
+        params: rift_protocol::source_read::GetSourceParams,
+        captured: rift_server::CapturedQueryView,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
+    ) -> Result<rift_protocol::source_read::GetSourceResult, super::ToolFailure> {
+        let (deadline, budget) = self.query_material_budget().await?;
+        let views = Arc::clone(&self.local_views);
+        let selected = self
+            .query_work(&budget, deadline, move |budget| {
+                let views = views.get().ok_or_else(retention_failure)?;
+                material_source(params, &captured, views, budget)
+            })
+            .await?;
+        let (request, provider, view, public, global, digest) = match selected {
+            MaterialSource::Captured(response) => return Ok(response),
+            MaterialSource::Retained(selected) => {
+                let RetainedMaterialSource {
+                    request,
+                    provider,
+                    view,
+                    public,
+                    global,
+                    digest,
+                } = *selected;
+                (request, provider, view, public, global, digest)
+            }
+        };
+        let remote = if let Some(global) = global {
+            self.query_global_source_selected(&request, global, digest, context, deadline)
+                .await?
+        } else {
+            None
+        };
+        let (response, request) = if let Some(response) = remote {
+            (response, request)
+        } else {
+            let views = Arc::clone(&self.local_views);
+            self.query_work(&budget, deadline, move |_budget| {
+                let views = views.get().ok_or_else(retention_failure)?;
+                let mut request = request;
+                request.view = Some(provider.view.id);
+                let response = views.get_source(
+                    &request,
+                    std::path::Path::new(&provider.root),
+                    &provider.owner,
+                )?;
+                Ok((response, request))
+            })
+            .await?
+        };
+        self.query_work(&budget, deadline, move |budget| {
+            budget.charge(&response)?;
+            crate::proxy::query_material_read::qualify_source(
+                response,
+                &request,
+                "local",
+                view,
+                Some(public),
+            )
+        })
+        .await
+    }
+
+    pub(in crate::server) async fn query_material_symbol(
+        &self,
+        params: rift_protocol::symbol_read::GetSymbolParams,
+        captured: rift_server::CapturedQueryView,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
+    ) -> Result<rift_protocol::symbol_read::GetSymbolResult, super::ToolFailure> {
+        let (deadline, budget) = self.query_material_budget().await?;
+        let views = Arc::clone(&self.local_views);
+        let selected = self
+            .query_work(&budget, deadline, move |budget| {
+                let views = views.get().ok_or_else(retention_failure)?;
+                material_symbol(params, &captured, views, budget)
+            })
+            .await?;
+        let MaterialSymbol {
+            request,
+            provider,
+            view,
+            source_units,
+            global,
+        } = selected;
+        let remote = if let Some(global) = global {
+            self.query_global_symbol_selected(&request, global, context, deadline)
+                .await?
+        } else {
+            None
+        };
+        let (response, request) = if let Some(response) = remote {
+            (response, request)
+        } else {
+            let views = Arc::clone(&self.local_views);
+            self.query_work(&budget, deadline, move |_budget| {
+                let views = views.get().ok_or_else(retention_failure)?;
+                let mut request = request;
+                request.view = Some(provider.view.id);
+                let response = views.resolve(
+                    &request,
+                    std::path::Path::new(&provider.root),
+                    &provider.owner,
+                )?;
+                Ok((response, request))
+            })
+            .await?
+        };
+        self.query_work(&budget, deadline, move |budget| {
+            budget.charge(&response)?;
+            crate::proxy::query_material_read::qualify_symbol(
+                response,
+                &request,
+                "local",
+                view,
+                &source_units,
+            )
+        })
+        .await
+    }
+}
+
+enum MaterialSource {
+    Captured(rift_protocol::source_read::GetSourceResult),
+    Retained(Box<RetainedMaterialSource>),
+}
+
+struct RetainedMaterialSource {
+    request: rift_protocol::source_read::GetSourceParams,
+    provider: SavedSymbol,
+    view: CapturedView,
+    public: rift_protocol::read::SourceUnitId,
+    global: Option<global::SelectedGlobal>,
+    digest: Option<rift_protocol::identity::SourceDigest>,
+}
+
+struct MaterialSymbol {
+    request: rift_protocol::symbol_read::GetSymbolParams,
+    provider: SavedSymbol,
+    view: CapturedView,
+    source_units: Vec<(
+        rift_protocol::read::SourceUnitId,
+        rift_protocol::read::SourceUnitId,
+    )>,
+    global: Option<global::SelectedGlobal>,
+}
+
+fn material_provider(
+    provider: &crate::proxy::query_material::Provider,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<SavedSymbol, RiftError> {
+    if provider.backend != "local" {
+        return Err(retention_failure());
+    }
+    budget.charge(&(&provider.root, &provider.owner, &provider.view))?;
+    Ok(SavedSymbol {
+        root: provider.root.clone(),
+        owner: provider.owner.clone(),
+        view: provider.view.clone(),
+    })
+}
+
+fn material_global(
+    provider: &crate::proxy::query_material::Provider,
+    context: &SavedSymbol,
+    owner: &rift_protocol::identity::SymbolOwner,
+    views: &rift_server::LocalSymbolViews,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<Option<global::SelectedGlobal>, RiftError> {
+    let mut matches = provider
+        .upstream
+        .iter()
+        .filter(|selected| selected.owners.contains(owner));
+    let Some(selected) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(retention_failure());
+    }
+    budget.charge(selected)?;
+    budget.charge(context)?;
+    let facts = views
+        .selected_input(
+            &provider.view.id,
+            std::path::Path::new(&provider.root),
+            &provider.owner,
+        )
+        .ok()
+        .and_then(|material| material.package_facts());
+    Ok(Some(global::SelectedGlobal {
+        source: selected.clone(),
+        root: SavedSymbol {
+            root: context.root.clone(),
+            owner: context.owner.clone(),
+            view: context.view.clone(),
+        },
+        facts,
+    }))
+}
+
+fn material_source(
+    mut params: rift_protocol::source_read::GetSourceParams,
+    captured: &rift_server::CapturedQueryView,
+    views: &rift_server::LocalSymbolViews,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<MaterialSource, RiftError> {
+    budget.charge_bytes(captured.material().metadata())?;
+    let saved = crate::proxy::query_material::metadata(captured)?;
+    let source = crate::proxy::query_material_read::selected_source(&saved, &params.unit)?;
+    if let Some(bytes) = &source.bytes {
+        let bytes = captured
+            .material()
+            .sources()
+            .get(bytes.clone())
+            .ok_or_else(retention_failure)?;
+        return crate::proxy::query_material_read::captured_source(
+            params,
+            bytes,
+            captured.view(),
+            budget,
+        )
+        .map(MaterialSource::Captured);
+    }
+    budget.charge(&(
+        &source.original,
+        &params.unit,
+        &source.digest,
+        captured.view(),
+    ))?;
+    let provider = saved
+        .providers
+        .get(source.provider)
+        .ok_or_else(retention_failure)?;
+    let (owner, _) = rift_protocol::identity::parse_source_unit_identity(source.original.as_str())?;
+    let global = match owner {
+        Some(owner) => material_global(provider, &saved.answer.context, &owner, views, budget)?,
+        None => None,
+    };
+    let provider = material_provider(provider, budget)?;
+    let public = std::mem::replace(&mut params.unit, source.original.clone());
+    budget.charge_material(size_of::<RetainedMaterialSource>())?;
+    Ok(MaterialSource::Retained(Box::new(RetainedMaterialSource {
+        request: params,
+        provider,
+        view: captured.view().clone(),
+        public,
+        global,
+        digest: source.digest.clone(),
+    })))
+}
+
+fn material_symbol(
+    mut params: rift_protocol::symbol_read::GetSymbolParams,
+    captured: &rift_server::CapturedQueryView,
+    views: &rift_server::LocalSymbolViews,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<MaterialSymbol, RiftError> {
+    budget.charge_bytes(captured.material().metadata())?;
+    let saved = crate::proxy::query_material::metadata(captured)?;
+    let (index, original) =
+        crate::proxy::query_material_read::selected_symbol(&saved, params.id.as_str())?;
+    let provider = saved.providers.get(index).ok_or_else(retention_failure)?;
+    budget.charge(&(original, captured.view()))?;
+    let owner = rift_protocol::identity::SymbolIdentity::parse(original.as_str())?
+        .owner()
+        .clone();
+    let global = material_global(provider, &saved.answer.context, &owner, views, budget)?;
+    let provider = material_provider(provider, budget)?;
+    params.id = original.clone();
+    let count = saved
+        .sources
+        .iter()
+        .filter(|source| source.provider == index)
+        .count();
+    budget.charge_material(
+        count
+            .checked_mul(size_of::<(
+                rift_protocol::read::SourceUnitId,
+                rift_protocol::read::SourceUnitId,
+            )>())
+            .ok_or_else(retention_failure)?,
+    )?;
+    let mut source_units = Vec::new();
+    source_units
+        .try_reserve_exact(count)
+        .map_err(|_| retention_failure())?;
+    let extra = source_units
+        .capacity()
+        .checked_sub(count)
+        .and_then(|extra| {
+            extra.checked_mul(size_of::<(
+                rift_protocol::read::SourceUnitId,
+                rift_protocol::read::SourceUnitId,
+            )>())
+        })
+        .ok_or_else(retention_failure)?;
+    budget.charge_material(extra)?;
+    for source in saved
+        .sources
+        .iter()
+        .filter(|source| source.provider == index)
+    {
+        budget.check()?;
+        budget.charge(&(&source.original, &source.public))?;
+        source_units.push((source.original.clone(), source.public.clone()));
+    }
+    Ok(MaterialSymbol {
+        request: params,
+        provider,
+        view: captured.view().clone(),
+        source_units,
+        global,
+    })
+}
+
+#[cfg(test)]
+mod material_tests {
+    use rift_protocol::configuration::{ServerConfiguration, WorkspaceConfiguration};
+    use rift_protocol::identity::SymbolOwner;
+    use rift_protocol::query::{QueryAnswer, QueryConfiguration, QueryReadResult};
+    use rift_protocol::symbol_read::CapturedView;
+
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn material_input(
+        root: &std::path::Path,
+        original: &CapturedView,
+        selection: &rift_search::query::QueryProviderSelection,
+        budget: &mut rift_server::QueryFactBudget<'_>,
+    ) -> TestResult<crate::proxy::query_material::Input> {
+        let configuration = QueryConfiguration::default();
+        let limits = rift_search::sparql::QueryLimits::try_from(&configuration)?;
+        let maximum = rift_server::QueryProcessLimits::from_query(limits)?.material_bytes_max;
+        let body = crate::server::QueryFactSelection {
+            root: root.to_str().ok_or("UTF-8 workspace")?.to_owned(),
+            owner: SymbolOwner::Local,
+            view: original.clone(),
+            selection: selection.clone(),
+            requests: 0,
+            graph: Some(rift_search::sparql::LOCAL_GRAPH.to_owned()),
+            requirements: rift_search::sparql::FactRequirements::default(),
+            subjects: Vec::new(),
+            facts: rift_search::sparql::QueryFacts::default(),
+            services: rift_search::sparql::QueryServices::default(),
+            warnings: Vec::new(),
+            upstream: Vec::new(),
+        };
+        let (input, _, _, _) = crate::proxy::prepare_query_services(
+            vec![(
+                "local".to_owned(),
+                body,
+                rift_search::sparql::QueryServices::default(),
+                None,
+            )],
+            &[],
+            limits,
+            configuration,
+            maximum,
+            budget,
+        )?;
+        Ok(input)
+    }
+
+    #[test]
+    fn query_material_callback_refusal_keeps_previous_actor_authority() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        let reads = rift_server::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )?;
+        let material = reads.local_search_view_input(true)?;
+        let root = material.root().to_path_buf();
+        let selection = material.provider_selection(&WorkspaceConfiguration::default())?;
+        let views = rift_server::LocalSymbolViews::new(1 << 20, [73; 32]);
+        let original = views
+            .capture(material.with_provider_selection(selection.clone())?)?
+            .ok_or("original local view")?;
+        let responses = super::super::CandidateResponses::for_configuration(&ServerConfiguration {
+            retained_views: 1,
+            ..ServerConfiguration::default()
+        });
+        let limits = rift_search::sparql::QueryLimits::try_from(&QueryConfiguration::default())?;
+        let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+        let first = material_input(&root, &original, &selection, &mut budget)?.capture_with(
+            &views,
+            (&root, &SymbolOwner::Local),
+            &QueryAnswer::Boolean { value: true },
+            Vec::new(),
+            &mut budget,
+            |view| responses.save_symbol(&root, &SymbolOwner::Local, view),
+        )?;
+        let QueryReadResult::Results(first) = first else {
+            return Err("first query must be admitted".into());
+        };
+        let first = first.view.ok_or("first query view")?;
+        let before = {
+            let rows = responses.bytes.lock().expect("candidate responses");
+            assert_eq!(rows.len(), 1);
+            (rows[0].id.clone(), rows[0].expires, rows[0].bytes.clone())
+        };
+        let mut attempted = None;
+        let refusal = material_input(&root, &original, &selection, &mut budget)?.capture_with(
+            &views,
+            (&root, &SymbolOwner::Local),
+            &QueryAnswer::Boolean { value: false },
+            Vec::new(),
+            &mut budget,
+            |view| {
+                attempted = Some(view.clone());
+                responses.save_symbol(&root, &SymbolOwner::Local, view)
+            },
+        );
+        assert!(refusal.is_err());
+        let attempted = attempted.ok_or("actor admission callback must run")?;
+        assert_ne!(attempted.id, first.id);
+        assert!(
+            views
+                .query_view(&attempted.id, &root, &SymbolOwner::Local)
+                .is_err()
+        );
+        let held = views
+            .query_view(&first.id, &root, &SymbolOwner::Local)
+            .map_err(|reason| format!("previous query authority: {reason:?}"))?;
+        assert_eq!(held.view(), &first);
+        assert!(
+            views
+                .selected_input(&original.id, &root, &SymbolOwner::Local)
+                .is_ok()
+        );
+        let rows = responses.bytes.lock().expect("candidate responses");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].id.clone(), rows[0].expires, rows[0].bytes.clone()),
+            before
+        );
+        Ok(())
+    }
 }

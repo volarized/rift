@@ -118,6 +118,64 @@ impl LocalSymbolViewInput {
         budget: &mut QueryFactBudget<'_>,
         selection: &rift_search::query::QueryProviderSelection,
     ) -> Result<QueryFacts, RiftError> {
+        self.project_with_original_subjects(requirements, limits, budget, selection, |_, _| Ok(()))
+            .map(|(facts, ())| facts)
+    }
+
+    /// Projects facts and retains selectors for every original symbol row.
+    ///
+    /// Selectors include anonymous symbols and are captured before acquired targets.
+    ///
+    /// # Errors
+    /// Returns the existing projection or material admission refusal.
+    pub fn query_facts_with_subjects(
+        &self,
+        requirements: &FactRequirements,
+        limits: QueryLimits,
+        budget: &mut QueryFactBudget<'_>,
+        selection: &rift_search::query::QueryProviderSelection,
+    ) -> Result<(QueryFacts, Vec<usize>), RiftError> {
+        self.project_with_original_subjects(
+            requirements,
+            limits,
+            budget,
+            selection,
+            |facts, budget| {
+                let bytes = facts
+                    .symbols
+                    .len()
+                    .checked_mul(size_of::<usize>())
+                    .and_then(|bytes| bytes.checked_add(size_of::<Vec<usize>>()))
+                    .ok_or_else(|| {
+                        errors::server::read_unavailable()
+                            .operation("query acquisition")
+                            .detail("original subject selectors exceed the platform bound")
+                            .error()
+                    })?;
+                budget.charge_material(bytes)?;
+                let mut subjects = Vec::new();
+                subjects
+                    .try_reserve_exact(facts.symbols.len())
+                    .map_err(|error| {
+                        errors::server::read_unavailable()
+                            .operation("query acquisition")
+                            .detail(error.to_string())
+                            .error()
+                    })?;
+                subjects.extend(0..facts.symbols.len());
+                Ok(subjects)
+            },
+        )
+    }
+
+    fn project_with_original_subjects<T>(
+        &self,
+        requirements: &FactRequirements,
+        limits: QueryLimits,
+        budget: &mut QueryFactBudget<'_>,
+        selection: &rift_search::query::QueryProviderSelection,
+        capture: impl FnOnce(&QueryFacts, &mut QueryFactBudget<'_>) -> Result<T, RiftError>,
+    ) -> Result<(QueryFacts, T), RiftError> {
         self.validate_provider_selection(selection)?;
         let include_acquired = provider_relationships(requirements);
         let mut projection = requirements.clone();
@@ -131,12 +189,21 @@ impl LocalSymbolViewInput {
             budget.charge(package.as_ref())?;
             merge_query_facts(&mut facts, package.as_ref().clone())?;
         }
+        let original = capture(&facts, budget)?;
         if let Some(references) = self.query_references().filter(|_| include_acquired) {
             budget.charge_material(references.retained_material_bytes())?;
+            for relationship in references.query_local_relationships() {
+                budget.charge(relationship)?;
+                facts.relationships.push(relationship.clone());
+            }
+            for occurrence in references.query_occurrences() {
+                budget.charge(occurrence)?;
+                facts.occurrences.push(occurrence.clone());
+            }
             references.project_provider_edges(&mut facts)?;
         }
         history::require_foreign_histories(self.owner(), requirements, &mut facts);
-        Ok(facts)
+        Ok((facts, original))
     }
 
     /// Projects facts from this input's original publication and source selection.

@@ -2146,19 +2146,20 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    let declaration = proxied_call(
-        &client,
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
-    )
-    .await?;
-    let seed = declaration["answer"]["bindings"][0]["symbol"]["value"]
-        .as_str()
-        .ok_or("beacon declaration must carry its symbol identity")?;
     let result = proxied_engine_call(
         &client,
         "search",
-        &serde_json::to_value(workspace_client::query::incoming_references(seed)?)?,
+        &json!({"query":
+            "SELECT DISTINCT ?target ?caller ?name ?path ?source ?start ?end ?targetSource ?targetStart ?targetEnd ?derivation ?facet { \
+             ?target a :Symbol; :name 'beacon'; :language 'rust'; :declarations ?targetDeclaration . \
+             ?targetDeclaration :path 'hub.rs'; :source ?targetSource; :range ?targetRange . \
+             ?targetRange :start ?targetStart; :end ?targetEnd . \
+             ?caller :references ?target; :name ?name; :declarations ?declaration . \
+             ?declaration :path ?path; :source ?source; :range ?range . \
+             ?range :start ?start; :end ?end . \
+             ?relationship a :Relationship; :from ?caller; :to ?target; :derivation ?derivation; :facets ?facet . \
+             FILTER(?facet = :references) } ORDER BY ?caller"
+        }),
     )
     .await?;
     let caller = result["answer"]["bindings"]
@@ -2167,6 +2168,34 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         .iter()
         .find(|hit| hit["name"]["value"] == "total")
         .ok_or_else(|| format!("incoming references must reach the caller: {result:#}"))?;
+    for field in ["target", "caller"] {
+        assert!(
+            matches!(caller[field]["type"].as_str(), Some("iri" | "blank_node")),
+            "original reference endpoint: {caller}"
+        );
+    }
+    for (source, start, end, original) in [
+        (
+            "targetSource",
+            "targetStart",
+            "targetEnd",
+            harness::RUST_PROJECT_HUB,
+        ),
+        ("source", "start", "end", harness::RUST_PROJECT_CALLER),
+    ] {
+        let start = workspace_client::query::literal(caller, start)?.parse::<usize>()?;
+        let end = workspace_client::query::literal(caller, end)?.parse::<usize>()?;
+        assert_eq!(
+            original
+                .get(start..end)
+                .ok_or("original declaration range")?,
+            workspace_client::query::literal(caller, source)?
+        );
+    }
+    assert_eq!(
+        workspace_client::query::literal(caller, "path")?,
+        "caller.rs"
+    );
     assert_eq!(
         workspace_client::query::iri(caller, "facet")?,
         format!("{}references", rift_search::sparql::VOCABULARY)

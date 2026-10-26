@@ -11,6 +11,10 @@ use crate::global::candidates::{CANDIDATE_BYTES_MAX, SavedCandidateBackend};
 use super::RiftProxy;
 
 mod query;
+pub(crate) use query::{
+    prepare_selected_services as prepare_query_services, replay as query_replay,
+    retained as query_material, source as query_material_read,
+};
 mod read;
 mod reservation;
 #[cfg(test)]

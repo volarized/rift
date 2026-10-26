@@ -16,34 +16,35 @@ use crate::server::candidates::{SavedQuery, SavedSymbol};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Provider {
-    pub(super) backend: String,
-    pub(super) root: String,
-    pub(super) owner: SymbolOwner,
-    pub(super) view: CapturedView,
-    pub(super) selection: rift_search::query::QueryProviderSelection,
-    pub(super) symbols: Vec<(SymbolId, SymbolId)>,
+pub(crate) struct Provider {
+    pub(crate) backend: String,
+    pub(crate) root: String,
+    pub(crate) owner: SymbolOwner,
+    pub(crate) view: CapturedView,
+    pub(crate) selection: rift_search::query::QueryProviderSelection,
+    pub(crate) symbols: Vec<(SymbolId, SymbolId)>,
+    pub(crate) upstream: Vec<crate::server::candidates::QueryGlobalSelection>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Source {
-    pub(super) provider: usize,
-    pub(super) original: SourceUnitId,
-    pub(super) public: SourceUnitId,
-    pub(super) digest: Option<SourceDigest>,
-    pub(super) bytes: Option<std::ops::Range<usize>>,
+pub(crate) struct Source {
+    pub(crate) provider: usize,
+    pub(crate) original: SourceUnitId,
+    pub(crate) public: SourceUnitId,
+    pub(crate) digest: Option<SourceDigest>,
+    pub(crate) bytes: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Metadata {
-    pub(super) answer: SavedQuery,
-    pub(super) providers: Vec<Provider>,
-    pub(super) sources: Vec<Source>,
+pub(crate) struct Metadata {
+    pub(crate) answer: SavedQuery,
+    pub(crate) providers: Vec<Provider>,
+    pub(crate) sources: Vec<Source>,
 }
 
-pub(super) struct Input {
+pub(crate) struct Input {
     providers: Vec<Provider>,
     sources: Vec<Source>,
     facts: Vec<u8>,
@@ -55,7 +56,7 @@ pub(super) struct Input {
 }
 
 impl Input {
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         mut selections: Vec<(String, QueryFactSelection, QueryIdentities)>,
         configuration: QueryConfiguration,
         maximum: usize,
@@ -80,6 +81,7 @@ impl Input {
                 view: selected.view.clone(),
                 selection: selected.selection.clone(),
                 symbols: std::mem::take(&mut identities.symbols),
+                upstream: std::mem::take(&mut selected.upstream),
             });
             for source in &mut selected.facts.sources {
                 budget.check()?;
@@ -140,7 +142,12 @@ impl Input {
         })
     }
 
-    pub(super) fn capture(
+    pub(crate) fn original_context(&self) -> Result<(&str, &SymbolOwner), RiftError> {
+        let provider = self.providers.first().ok_or_else(unavailable)?;
+        Ok((&provider.root, &provider.owner))
+    }
+
+    pub(crate) fn capture(
         self,
         views: &rift_server::LocalSymbolViews,
         root: &Path,
@@ -148,6 +155,18 @@ impl Input {
         answer: &QueryAnswer,
         warnings: Vec<ReadWarning>,
         budget: &mut rift_server::QueryFactBudget<'_>,
+    ) -> Result<QueryReadResult, RiftError> {
+        self.capture_with(views, (root, owner), answer, warnings, budget, |_| Ok(true))
+    }
+
+    pub(crate) fn capture_with(
+        self,
+        views: &rift_server::LocalSymbolViews,
+        (root, owner): (&Path, &SymbolOwner),
+        answer: &QueryAnswer,
+        warnings: Vec<ReadWarning>,
+        budget: &mut rift_server::QueryFactBudget<'_>,
+        admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
     ) -> Result<QueryReadResult, RiftError> {
         budget.check()?;
         let context = SavedSymbol {
@@ -185,6 +204,9 @@ impl Input {
             })?;
             let first = saved.response(saved.decode_bytes(&page_records, Some(0))?, 0)?;
             budget.charge(&first)?;
+            if !admit(view)? {
+                return Ok(false);
+            }
             response = Some(first);
             Ok(true)
         })?;
@@ -195,14 +217,14 @@ impl Input {
     }
 }
 
-pub(super) fn metadata(captured: &rift_server::CapturedQueryView) -> Result<Metadata, RiftError> {
+pub(crate) fn metadata(captured: &rift_server::CapturedQueryView) -> Result<Metadata, RiftError> {
     let mut metadata: Metadata =
         serde_json::from_slice(captured.material().metadata()).map_err(encoding_failure)?;
     metadata.answer = metadata.answer.at_view(captured.view().clone());
     Ok(metadata)
 }
 
-pub(super) fn unavailable() -> RiftError {
+pub(crate) fn unavailable() -> RiftError {
     errors::server::read_unavailable()
         .operation("query retention")
         .detail("retained query material is unavailable; repeat the original query")

@@ -29,6 +29,14 @@ impl RiftMcp {
                     .error(),
             ));
         }
+        if let Some(view) = &params.view
+            && let Some(captured) = self.captured_query_material(view, "get_source")?
+        {
+            return self
+                .query_material_source(params, captured, context)
+                .await
+                .map(Json);
+        }
         if let Some(result) = self.query_global_source(&params, context).await? {
             return Ok(Json(result));
         }

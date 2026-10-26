@@ -27,31 +27,97 @@ impl IdentityMap {
     }
 
     pub(super) fn new(identities: QueryIdentities) -> Result<Self, QueryError> {
+        Self::new_admitted(identities, &mut |_| Ok(()))
+    }
+
+    pub(super) fn new_admitted(
+        identities: QueryIdentities,
+        admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+    ) -> Result<Self, QueryError> {
+        let prefix_bytes = identities
+            .blank_prefix
+            .as_str()
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| failure::bound("material_bytes_max"))?;
+        admit(prefix_bytes)?;
+        let mut blank_prefix = String::new();
+        blank_prefix
+            .try_reserve_exact(prefix_bytes)
+            .map_err(failure::invalid)?;
+        admit(
+            blank_prefix
+                .capacity()
+                .checked_sub(prefix_bytes)
+                .ok_or_else(|| failure::bound("material_bytes_max"))?,
+        )?;
+        blank_prefix.push_str(identities.blank_prefix.as_str());
+        blank_prefix.push('_');
         let mut result = Self {
-            blank_prefix: format!("{}_", identities.blank_prefix.as_str()),
+            blank_prefix,
             ..Self::default()
         };
+        let entries = identities
+            .symbols
+            .len()
+            .checked_add(identities.sources.len())
+            .ok_or_else(|| failure::bound("material_bytes_max"))?;
+        let map_bytes = entries
+            .checked_mul(size_of::<(Term, Term)>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .ok_or_else(|| failure::bound("material_bytes_max"))?;
+        admit(map_bytes)?;
+        result
+            .forward
+            .try_reserve(entries)
+            .map_err(failure::invalid)?;
+        admit(0)?;
+        result
+            .backward
+            .try_reserve(entries)
+            .map_err(failure::invalid)?;
+        let actual_entries = result
+            .forward
+            .capacity()
+            .checked_add(result.backward.capacity())
+            .ok_or_else(|| failure::bound("material_bytes_max"))?;
+        let extra = actual_entries
+            .checked_sub(
+                entries
+                    .checked_mul(2)
+                    .ok_or_else(|| failure::bound("material_bytes_max"))?,
+            )
+            .and_then(|count| count.checked_mul(size_of::<(Term, Term)>()))
+            .ok_or_else(|| failure::bound("material_bytes_max"))?;
+        admit(extra)?;
         for (original, public) in identities.symbols {
-            let owner = SymbolIdentity::parse(original.as_str())?.owner().clone();
+            admit(0)?;
+            let parsed = SymbolIdentity::parse(original.as_str())?;
+            admit(0)?;
             SymbolIdentity::parse(public.as_str())?;
-            if !matches!(owner, SymbolOwner::Local) && original != public {
+            if !matches!(parsed.owner(), SymbolOwner::Local) && original != public {
                 return Err(failure::invalid(
                     "canonical symbol ownership must not change",
                 ));
             }
+            admit_identity_terms(original.as_str(), public.as_str(), admit)?;
             result.insert(iri(original.as_str())?, iri(public.as_str())?)?;
         }
         for (original, public) in identities.sources {
+            admit(0)?;
             let (owner, _) = parse_source_unit_identity(original.as_str())?;
+            admit(0)?;
             parse_source_unit_identity(public.as_str())?;
             if owner.is_some() && original != public {
                 return Err(failure::invalid(
                     "canonical source ownership must not change",
                 ));
             }
+            admit_identity_terms(original.as_str(), public.as_str(), admit)?;
             result.insert(iri(original.as_str())?, iri(public.as_str())?)?;
         }
         for (original, public) in &result.forward {
+            admit(0)?;
             if original != public && result.forward.contains_key(public) {
                 return Err(failure::invalid("advertised query identities collide"));
             }
@@ -106,18 +172,46 @@ impl IdentityMap {
     }
 
     pub(super) fn public(&self, term: Term) -> Result<Term, QueryError> {
+        self.public_admitted(term, &mut |_| Ok(()))
+    }
+
+    pub(super) fn public_admitted(
+        &self,
+        term: Term,
+        admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+    ) -> Result<Term, QueryError> {
         if let Some(public) = self.forward.get(&term) {
+            admit(super::term_bytes(public))?;
             return Ok(public.clone());
         }
         if let Term::BlankNode(value) = &term
             && !self.blank_prefix.is_empty()
         {
+            let bytes = self
+                .blank_prefix
+                .len()
+                .checked_add(value.as_str().len())
+                .ok_or_else(|| failure::bound("material_bytes_max"))?;
+            admit(bytes)?;
             return BlankNode::new(format!("{}{}", self.blank_prefix, value.as_str()))
                 .map(Term::from)
                 .map_err(failure::invalid);
         }
         Ok(term)
     }
+}
+
+fn admit_identity_terms(
+    original: &str,
+    public: &str,
+    admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
+    let bytes = original
+        .len()
+        .checked_add(public.len())
+        .and_then(|bytes| bytes.checked_mul(2))
+        .ok_or_else(|| failure::bound("material_bytes_max"))?;
+    admit(bytes)
 }
 
 #[cfg(test)]
@@ -171,7 +265,7 @@ mod tests {
         let (original, public) = units()?;
         Ok(QueryServices {
             datasets: vec![QueryDataset {
-                graph: format!("{}docs", crate::sparql::EXTRA_PROJECTS),
+                graph: Some(format!("{}docs", crate::sparql::EXTRA_PROJECTS)),
                 facts: facts("profile bytes")?,
                 identities: QueryIdentities {
                     symbols: Vec::new(),
@@ -299,6 +393,75 @@ mod tests {
             })
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn owners_without_named_graphs_only_contribute_to_the_default_graph() -> Result<(), QueryError>
+    {
+        let mut selected = services()?;
+        selected.datasets[0].graph = None;
+        let (_, public) = units()?;
+        let public = public.as_str();
+        for (statement, expected) in [
+            (
+                format!("ASK {{ <{public}> :source 'profile bytes' }}"),
+                true,
+            ),
+            (
+                "ASK { GRAPH ?graph { ?unit :source 'profile bytes' } }".to_owned(),
+                false,
+            ),
+            (
+                "ASK { GRAPH extra:docs { ?unit :source 'profile bytes' } }".to_owned(),
+                false,
+            ),
+            (
+                "ASK { GRAPH <urn:rift:graph:local> { ?unit :source 'primary bytes' } }".to_owned(),
+                true,
+            ),
+        ] {
+            let answer = PreparedQuery::parse(&statement, limits())?.evaluate_with_services(
+                facts("primary bytes")?,
+                limits(),
+                QueryCancellation::default(),
+                selected.clone(),
+            )?;
+            assert_eq!(
+                answer,
+                QueryAnswer::Boolean { value: expected },
+                "{statement}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn admitted_identity_map_matches_existing_projection_and_refuses_before_growth()
+    -> Result<(), QueryError> {
+        let (original, public) = units()?;
+        let identities = QueryIdentities {
+            sources: vec![(original.clone(), public)],
+            symbols: Vec::new(),
+            blank_prefix: SourceDigest::parse(&"a".repeat(64))?,
+        };
+        let plain = IdentityMap::new(identities.clone())?;
+        let mut admitted = Vec::new();
+        let metered = IdentityMap::new_admitted(identities.clone(), &mut |bytes| {
+            admitted.push(bytes);
+            Ok(())
+        })?;
+        assert_eq!(
+            plain.public(iri(original.as_str())?)?,
+            metered.public(iri(original.as_str())?)?
+        );
+        assert!(admitted.iter().any(|bytes| *bytes > 0));
+        let mut calls = 0usize;
+        let refused = IdentityMap::new_admitted(identities, &mut |_| {
+            calls += 1;
+            Err(failure::bound("material_bytes_max"))
+        });
+        assert!(refused.is_err());
+        assert_eq!(calls, 1);
         Ok(())
     }
 }

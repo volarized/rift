@@ -12,6 +12,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use rift_core::{LanguageFileSelections, ProjectPath, SourceVisibility, TextFileInclusion};
 use rift_history::{Repository, WorkingForm};
@@ -29,12 +30,12 @@ use rift_syntax::SyntaxSymbol;
 
 use crate::history::{SymbolShape, SymbolState, classify};
 use crate::read::{
-    ReadService, RiftError, file_id, page, project_path, results_truncation_warning,
+    ReadService, RiftError, file_id, page, page_range, project_path, results_truncation_warning,
     source_warnings, wire_index_warning,
 };
 use crate::search::{
-    HitPayloads, bound_hits, build_symbol_hit, order_hits, path_matcher, search_page_limit,
-    validate_search,
+    HitPayloads, SelectedHit, bound_hits, build_selected_symbol_hit, hit_ordering, order_hits,
+    path_matcher, search_page_limit, validate_search,
 };
 
 /// Answers one `search` request that carries `change`: the declarations the two
@@ -63,7 +64,7 @@ pub fn search_change(
     let compared = ComparedRevisions::open(
         root,
         change,
-        current,
+        (current, &|| Ok(())),
         params.paths.as_ref(),
         limits,
         visibility,
@@ -89,10 +90,198 @@ pub fn search_change(
     })
 }
 
+/// One comparison's original selected declarations and both captured source owners.
+pub struct ChangeSnapshot {
+    params: SearchParams,
+    rows: Vec<ChangeRow>,
+    reads: [Arc<ReadService>; 2],
+    warnings: Vec<ReadWarning>,
+}
+
+struct ChangeRow {
+    selected: SelectedHit,
+    side: usize,
+}
+
+struct ChangeProjection<'query, 'cancel> {
+    payloads: HitPayloads,
+    budget: Option<&'query mut crate::QueryFactBudget<'cancel>>,
+}
+
+impl ChangeProjection<'_, '_> {
+    fn check(&self) -> Result<(), RiftError> {
+        match self.budget.as_deref() {
+            Some(budget) => budget.check(),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One original change page and the source owner associated with every result.
+pub struct ChangePage {
+    /// Original public rows and pagination.
+    pub result: SearchResult,
+    /// Original normalized contribution keys for every row.
+    pub contributions: Vec<Vec<rift_core::ContributionKey>>,
+    /// Association selectors into this comparison's base and head owners.
+    pub sides: Vec<usize>,
+}
+
+impl ReadService {
+    /// Captures one comparison without rebuilding either side for later pages.
+    ///
+    /// # Errors
+    /// Returns the existing comparison, source or query admission refusal.
+    pub fn capture_change(
+        self: Arc<Self>,
+        params: &SearchParams,
+        change: &SearchChange,
+        limits: WorkspaceIndexLimits,
+        visibility: &SourceVisibility,
+        languages: (&TextFileInclusion, &LanguageFileSelections),
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<ChangeSnapshot, RiftError> {
+        validate_search(params)?;
+        search_page_limit(params)?;
+        let compared = ComparedRevisions::open(
+            self.index().root(),
+            change,
+            (&self, &|| budget.check()),
+            params.paths.as_ref(),
+            limits,
+            visibility,
+            languages,
+        )?;
+        for index in [&compared.base, compared.head()] {
+            budget.charge_material(index.symbol_view()?.retained_material_bytes())?;
+        }
+        let (retained, warnings) = compared.capture_rows(params, budget)?;
+        let history = self.history_configuration().clone();
+        let base = Arc::new(Self::from_revision_index(
+            compared.base,
+            compared.base_revision,
+            history.clone(),
+        ));
+        let head = match compared.head {
+            HeadIndex::Revision { index, revision } => {
+                Arc::new(Self::from_revision_index(*index, revision, history))
+            }
+            // `open` stores precisely self.index() here. Its cached symbol_view and
+            // normalized graph therefore remain the same captured owner as every row.
+            HeadIndex::WorkingTree(_) => Arc::clone(&self),
+        };
+        if let Some(stored) = self.stored_history() {
+            base.attach_history_store(stored);
+            head.attach_history_store(stored);
+        }
+        budget.charge(params)?;
+        Ok(ChangeSnapshot {
+            params: params.clone(),
+            rows: retained,
+            reads: [base, head],
+            warnings,
+        })
+    }
+}
+
+impl ChangeSnapshot {
+    /// Returns the original base and head read services used by this comparison.
+    #[must_use]
+    pub const fn read_services(&self) -> &[Arc<ReadService>; 2] {
+        &self.reads
+    }
+
+    /// Returns both original source selections; committed sides retain their resolved revision.
+    ///
+    /// # Errors
+    /// Returns an original material capture failure.
+    pub fn view_inputs(
+        &self,
+        head_ready: bool,
+    ) -> Result<[crate::LocalSymbolViewInput; 2], RiftError> {
+        Ok([
+            self.reads[0].local_search_view_input(true)?,
+            self.reads[1]
+                .local_search_view_input(head_ready || self.reads[1].revision().is_some())?,
+        ])
+    }
+
+    /// Copies only one admitted page from the captured comparison.
+    ///
+    /// # Errors
+    /// Returns the existing page or complete-record admission refusal.
+    pub fn page(
+        &self,
+        page_index: u64,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<ChangePage, RiftError> {
+        use get_size2::{GetSize, StandardTracker};
+
+        let limit = search_page_limit(&self.params)?;
+        let (window, pagination) = page_range(self.rows.len(), page_index, limit);
+        let rows = &self.rows[window];
+        let element = size_of::<SearchHit>()
+            .checked_add(size_of::<Vec<rift_core::ContributionKey>>())
+            .and_then(|bytes| bytes.checked_add(size_of::<usize>()))
+            .ok_or_else(|| {
+                comparison_failure("comparison page exceeds the platform bound".to_owned())
+            })?;
+        let bytes = rows.len().checked_mul(element).ok_or_else(|| {
+            comparison_failure("comparison page exceeds the platform bound".to_owned())
+        })?;
+        budget.charge_material(bytes)?;
+        let mut results = Vec::new();
+        let mut contributions = Vec::new();
+        let mut sides = Vec::new();
+        results
+            .try_reserve_exact(rows.len())
+            .map_err(|error| comparison_failure(error.to_string()))?;
+        contributions
+            .try_reserve_exact(rows.len())
+            .map_err(|error| comparison_failure(error.to_string()))?;
+        sides
+            .try_reserve_exact(rows.len())
+            .map_err(|error| comparison_failure(error.to_string()))?;
+        for row in rows {
+            budget.charge(&(&row.selected.hit, row.side))?;
+            let keys = row.selected.contributions.as_slice();
+            let (bytes, _) = rift_protocol::retained_sequence_material(
+                keys,
+                std::mem::size_of_val(keys),
+                StandardTracker::default(),
+                GetSize::get_heap_size_with_tracker,
+            );
+            budget.charge_material(bytes)?;
+            results.push(row.selected.hit.clone());
+            contributions.push(row.selected.contributions.clone());
+            sides.push(row.side);
+        }
+        budget.charge(&self.warnings)?;
+        Ok(ChangePage {
+            result: SearchResult {
+                view: None,
+                results,
+                pagination,
+                warnings: self.warnings.clone(),
+            },
+            contributions,
+            sides,
+        })
+    }
+}
+
+fn comparison_failure(detail: String) -> RiftError {
+    rift_error::errors::server::read_unavailable()
+        .operation("revision comparison")
+        .detail(detail)
+        .error()
+}
+
 /// One comparison's two sides: the read index each side holds over the paths the
 /// two hold differently.
 struct ComparedRevisions<'current> {
     base: WorkspaceIndex,
+    base_revision: rift_protocol::read::RevisionId,
     head: HeadIndex<'current>,
     paths: Vec<ProjectPath>,
     truncated: bool,
@@ -105,7 +294,10 @@ struct ComparedRevisions<'current> {
 /// revision, or the published current index for the working tree.
 enum HeadIndex<'current> {
     /// The index over the changed paths of the committed head revision.
-    Revision(Box<WorkspaceIndex>),
+    Revision {
+        index: Box<WorkspaceIndex>,
+        revision: rift_protocol::read::RevisionId,
+    },
     /// The published current index, which serves the working tree.
     WorkingTree(&'current WorkspaceIndex),
 }
@@ -114,7 +306,7 @@ impl HeadIndex<'_> {
     /// The words a `change_truncated` detail names the two sides with.
     const fn sides(&self) -> &'static str {
         match self {
-            Self::Revision(_) => COMMITTED_SIDES,
+            Self::Revision { .. } => COMMITTED_SIDES,
             Self::WorkingTree(_) => WORKING_TREE_SIDES,
         }
     }
@@ -165,18 +357,20 @@ impl<'current> ComparedRevisions<'current> {
     fn open(
         root: &Path,
         change: &SearchChange,
-        current: &'current ReadService,
+        (current, check): (&'current ReadService, &dyn Fn() -> Result<(), RiftError>),
         selector: Option<&PathSelector>,
         limits: WorkspaceIndexLimits,
         visibility: &SourceVisibility,
         (text_inclusion, languages): (&TextFileInclusion, &LanguageFileSelections),
     ) -> Result<Self, RiftError> {
+        check()?;
         let repository = Repository::open(root)?;
         let base = repository.resolve(&change.base.0)?;
         let visible = RevisionPaths::build(root, visibility)?;
         let requested = path_matcher(root, selector)?;
         let compared = |path: &str| {
-            visible.includes(path)
+            check().is_ok()
+                && visible.includes(path)
                 && requested
                     .as_ref()
                     .is_none_or(|matcher| matcher.includes(&root.join(path)))
@@ -186,7 +380,7 @@ impl<'current> ComparedRevisions<'current> {
             return Self::against_working_tree(
                 &repository,
                 &base,
-                current.index(),
+                (current.index(), check),
                 &compared,
                 (limits, visibility, (text_inclusion, languages)),
             );
@@ -196,17 +390,21 @@ impl<'current> ComparedRevisions<'current> {
             rift_tracing::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_files(&base, &head, &compared, paths_max)
             })?;
+        check()?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let holds = |path: &str| selected.contains(path);
         let index_side = |revision| {
-            WorkspaceIndex::at_revision_with_selection(
-                &repository,
+            WorkspaceIndex::at_revision_with_owner(
+                (&repository, current.owner().clone()),
                 revision,
                 limits,
                 visibility,
-                text_inclusion,
-                languages,
+                (text_inclusion, languages),
                 &holds,
+                &mut |file, bytes_max| {
+                    check()?;
+                    repository.blob_bytes(file, bytes_max).map(Some)
+                },
             )
         };
         let base_index =
@@ -219,7 +417,11 @@ impl<'current> ComparedRevisions<'current> {
             })?;
         Ok(Self {
             base: base_index,
-            head: HeadIndex::Revision(Box::new(head_index)),
+            base_revision: rift_protocol::read::RevisionId(base.commit_id()),
+            head: HeadIndex::Revision {
+                index: Box::new(head_index),
+                revision: rift_protocol::read::RevisionId(head.commit_id()),
+            },
             paths: project_paths(changed.paths()),
             truncated: changed.is_truncated(),
             unconverted: BTreeMap::new(),
@@ -240,7 +442,7 @@ impl<'current> ComparedRevisions<'current> {
     fn against_working_tree(
         repository: &Repository,
         base: &rift_history::ResolvedRevision,
-        published: &'current WorkspaceIndex,
+        (published, check): (&'current WorkspaceIndex, &dyn Fn() -> Result<(), RiftError>),
         compared: &dyn Fn(&str) -> bool,
         (limits, visibility, (text_inclusion, languages)): (
             WorkspaceIndexLimits,
@@ -263,28 +465,35 @@ impl<'current> ComparedRevisions<'current> {
             rift_tracing::traced!(component = "search", operation = "search.change_paths", {
                 repository.changed_working_files(base, &served_paths, &listed, paths_max)
             })?;
+        check()?;
         let selected: HashSet<&str> = changed.paths().iter().map(String::as_str).collect();
         let mut forms = repository.working_forms()?;
         let mut unconverted: BTreeMap<String, Unconverted> = BTreeMap::new();
         let base_index =
             rift_tracing::traced!(component = "search", operation = "search.change_base", {
-                WorkspaceIndex::at_revision_with_blob_reader(
-                    repository,
+                WorkspaceIndex::at_revision_with_owner(
+                    (repository, published.owner().clone()),
                     base,
                     limits,
                     visibility,
                     (text_inclusion, languages),
                     &|path| selected.contains(path),
-                    &mut |file, bytes_max| match forms.form(file, bytes_max)? {
-                        WorkingForm::Converted(bytes) => Ok(Some(bytes)),
-                        WorkingForm::Filtered { driver } => {
-                            unconverted.insert(file.path().to_owned(), Unconverted::Driver(driver));
-                            Ok(None)
-                        }
-                        WorkingForm::Encoded { encoding } => {
-                            unconverted
-                                .insert(file.path().to_owned(), Unconverted::Encoding(encoding));
-                            Ok(None)
+                    &mut |file, bytes_max| {
+                        check()?;
+                        match forms.form(file, bytes_max)? {
+                            WorkingForm::Converted(bytes) => Ok(Some(bytes)),
+                            WorkingForm::Filtered { driver } => {
+                                unconverted
+                                    .insert(file.path().to_owned(), Unconverted::Driver(driver));
+                                Ok(None)
+                            }
+                            WorkingForm::Encoded { encoding } => {
+                                unconverted.insert(
+                                    file.path().to_owned(),
+                                    Unconverted::Encoding(encoding),
+                                );
+                                Ok(None)
+                            }
                         }
                     },
                 )
@@ -297,6 +506,7 @@ impl<'current> ComparedRevisions<'current> {
             .collect();
         Ok(Self {
             base: base_index,
+            base_revision: rift_protocol::read::RevisionId(base.commit_id()),
             head: HeadIndex::WorkingTree(published),
             paths: project_paths(&kept),
             truncated: changed.is_truncated(),
@@ -304,10 +514,51 @@ impl<'current> ComparedRevisions<'current> {
         })
     }
 
+    fn capture_rows(
+        &self,
+        params: &SearchParams,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<(Vec<ChangeRow>, Vec<ReadWarning>), RiftError> {
+        let mut rows = self.selected_hits(params, Some(budget))?;
+        let mut object_warnings = Vec::new();
+        let mut retained = Vec::new();
+        budget.charge_material(rows.len().checked_mul(size_of::<ChangeRow>()).ok_or_else(
+            || comparison_failure("comparison rows exceed the platform bound".to_owned()),
+        )?)?;
+        retained
+            .try_reserve_exact(rows.len())
+            .map_err(|error| comparison_failure(error.to_string()))?;
+        for row in rows.drain(..) {
+            budget.check()?;
+            let index = if row.side == 0 {
+                &self.base
+            } else {
+                self.head()
+            };
+            if let Some(warning) =
+                crate::search::public_symbol_warning(&row.selected.hit, &[Some(index)])?
+            {
+                object_warnings.push(warning);
+            } else {
+                retained.push(row);
+            }
+        }
+        let order = match params.order {
+            ResultOrder::Relevance => ResultOrder::Path,
+            order => order,
+        };
+        retained
+            .sort_by(|left, right| hit_ordering(&left.selected.hit, &right.selected.hit, order));
+        let truncated = bound_hits(&mut retained, self.head().results_max());
+        let mut warnings = self.warnings(truncated);
+        warnings.extend(object_warnings);
+        Ok((retained, warnings))
+    }
+
     /// The head side's read index.
     const fn head(&self) -> &WorkspaceIndex {
         match &self.head {
-            HeadIndex::Revision(index) => index,
+            HeadIndex::Revision { index, .. } => index,
             HeadIndex::WorkingTree(index) => index,
         }
     }
@@ -319,16 +570,32 @@ impl<'current> ComparedRevisions<'current> {
     /// `target: "file"` answers none of them, the way a traversal does: a
     /// comparison reaches declarations alone.
     fn hits(&self, params: &SearchParams) -> Result<Vec<SearchHit>, RiftError> {
+        Ok(self
+            .selected_hits(params, None)?
+            .into_iter()
+            .map(|row| row.selected.hit)
+            .collect())
+    }
+
+    fn selected_hits(
+        &self,
+        params: &SearchParams,
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<Vec<ChangeRow>, RiftError> {
         if params.target == SearchParamsTarget::File {
             return Ok(Vec::new());
         }
-        let payloads = HitPayloads::for_change(params);
+        let mut projection = ChangeProjection {
+            payloads: HitPayloads::for_change(params),
+            budget,
+        };
         let mut results = Vec::new();
         let mut unpaired = UnpairedDeclarations::default();
         for path in &self.paths {
-            self.compare_path(path, payloads, &mut results, &mut unpaired)?;
+            projection.check()?;
+            self.compare_path(path, &mut projection, &mut results, &mut unpaired)?;
         }
-        unpaired.resolve(payloads, &mut results)?;
+        unpaired.resolve(&mut projection, &mut results)?;
         Ok(results)
     }
 
@@ -339,20 +606,20 @@ impl<'current> ComparedRevisions<'current> {
     fn compare_path<'sides>(
         &'sides self,
         path: &ProjectPath,
-        payloads: HitPayloads,
-        results: &mut Vec<SearchHit>,
+        projection: &mut ChangeProjection<'_, '_>,
+        results: &mut Vec<ChangeRow>,
         unpaired: &mut UnpairedDeclarations<'sides>,
     ) -> Result<(), RiftError> {
         match (self.base.file(path), self.head().file(path)) {
             (Some(base_file), Some(head_file)) => {
-                self.compare_files(path, (base_file, head_file), payloads, results, unpaired)
+                self.compare_files(path, (base_file, head_file), projection, results, unpaired)
             }
             (None, Some(head_file)) => {
-                unpaired.added.extend(held(self.head(), head_file));
+                unpaired.added.extend(held(self.head(), head_file, 1));
                 Ok(())
             }
             (Some(base_file), None) => {
-                unpaired.removed.extend(held(&self.base, base_file));
+                unpaired.removed.extend(held(&self.base, base_file, 0));
                 Ok(())
             }
             (None, None) => Ok(()),
@@ -366,14 +633,15 @@ impl<'current> ComparedRevisions<'current> {
         &'sides self,
         path: &ProjectPath,
         (base_file, head_file): (&'sides IndexedFile, &'sides IndexedFile),
-        payloads: HitPayloads,
-        results: &mut Vec<SearchHit>,
+        projection: &mut ChangeProjection<'_, '_>,
+        results: &mut Vec<ChangeRow>,
         unpaired: &mut UnpairedDeclarations<'sides>,
     ) -> Result<(), RiftError> {
         let base = declarations(base_file);
         let head = declarations(head_file);
         for (key, head_symbol) in &head {
-            let added = Declaration::new(self.head(), head_file, head_symbol);
+            projection.check()?;
+            let added = Declaration::new(self.head(), head_file, head_symbol, 1);
             let Some(base_symbol) = base.get(key).copied() else {
                 // The base side holds no such declaration, in this path or any
                 // other yet: whether it moved here is decided once every path is
@@ -394,15 +662,16 @@ impl<'current> ComparedRevisions<'current> {
                 base_path: Some(wire_path.clone()),
                 head_path: Some(wire_path),
             };
-            results.push(changed_hit(&added, change, payloads)?);
+            results.push(changed_hit(&added, change, projection)?);
         }
         for (key, base_symbol) in &base {
+            projection.check()?;
             if head.contains_key(key) {
                 continue;
             }
             unpaired
                 .removed
-                .push(Declaration::new(&self.base, base_file, base_symbol));
+                .push(Declaration::new(&self.base, base_file, base_symbol, 0));
         }
         Ok(())
     }
@@ -513,10 +782,11 @@ fn declarations(file: &IndexedFile) -> BTreeMap<DeclarationKey<'_>, &SyntaxSymbo
 fn held<'side>(
     index: &'side WorkspaceIndex,
     file: &'side IndexedFile,
+    side: usize,
 ) -> impl Iterator<Item = Declaration<'side>> {
     declarations(file)
         .into_values()
-        .map(move |symbol| Declaration::new(index, file, symbol))
+        .map(move |symbol| Declaration::new(index, file, symbol, side))
 }
 
 /// One declaration as one side of the comparison holds it.
@@ -525,6 +795,7 @@ struct Declaration<'side> {
     index: &'side WorkspaceIndex,
     file: &'side IndexedFile,
     symbol: &'side SyntaxSymbol,
+    side: usize,
 }
 
 impl<'side> Declaration<'side> {
@@ -532,11 +803,13 @@ impl<'side> Declaration<'side> {
         index: &'side WorkspaceIndex,
         file: &'side IndexedFile,
         symbol: &'side SyntaxSymbol,
+        side: usize,
     ) -> Self {
         Self {
             index,
             file,
             symbol,
+            side,
         }
     }
 
@@ -566,12 +839,18 @@ impl UnpairedDeclarations<'_> {
     /// additions, two removals, or one of each in the same path - leaves both
     /// sides standing on their own, because no evidence says which addition
     /// answers which removal.
-    fn resolve(self, payloads: HitPayloads, results: &mut Vec<SearchHit>) -> Result<(), RiftError> {
+    fn resolve(
+        self,
+        projection: &mut ChangeProjection<'_, '_>,
+        results: &mut Vec<ChangeRow>,
+    ) -> Result<(), RiftError> {
         let mut groups: HashMap<MoveKey, MoveGroup> = HashMap::new();
         for (position, added) in self.added.iter().enumerate() {
+            projection.check()?;
             groups.entry(added.move_key()).or_default().0.push(position);
         }
         for (position, removed) in self.removed.iter().enumerate() {
+            projection.check()?;
             groups
                 .entry(removed.move_key())
                 .or_default()
@@ -581,6 +860,7 @@ impl UnpairedDeclarations<'_> {
         let mut moved_added = vec![false; self.added.len()];
         let mut moved_removed = vec![false; self.removed.len()];
         for (additions, removals) in groups.into_values() {
+            projection.check()?;
             let ([addition], [removal]) = (additions.as_slice(), removals.as_slice()) else {
                 continue;
             };
@@ -601,9 +881,10 @@ impl UnpairedDeclarations<'_> {
                 base_path: Some(project_path(removed_path)),
                 head_path: Some(project_path(added_path)),
             };
-            results.push(changed_hit(&added, change, payloads)?);
+            results.push(changed_hit(&added, change, projection)?);
         }
         for (position, added) in self.added.iter().enumerate() {
+            projection.check()?;
             if moved_added[position] {
                 continue;
             }
@@ -612,9 +893,10 @@ impl UnpairedDeclarations<'_> {
                 base_path: None,
                 head_path: Some(project_path(added.file.path())),
             };
-            results.push(changed_hit(added, change, payloads)?);
+            results.push(changed_hit(added, change, projection)?);
         }
         for (position, removed) in self.removed.iter().enumerate() {
+            projection.check()?;
             if moved_removed[position] {
                 continue;
             }
@@ -623,7 +905,7 @@ impl UnpairedDeclarations<'_> {
                 base_path: Some(project_path(removed.file.path())),
                 head_path: None,
             };
-            results.push(changed_hit(removed, change, payloads)?);
+            results.push(changed_hit(removed, change, projection)?);
         }
         Ok(())
     }
@@ -636,8 +918,11 @@ impl UnpairedDeclarations<'_> {
 fn changed_hit(
     declaration: &Declaration<'_>,
     change: SymbolChange,
-    payloads: HitPayloads,
-) -> Result<SearchHit, RiftError> {
+    projection: &mut ChangeProjection<'_, '_>,
+) -> Result<ChangeRow, RiftError> {
+    if let Some(budget) = projection.budget.as_deref_mut() {
+        budget.charge_material(size_of::<ChangeRow>())?;
+    }
     let matched = SymbolMatch {
         file: declaration.file,
         symbol: declaration.symbol,
@@ -645,9 +930,27 @@ fn changed_hit(
         rank: IdentifierMatchClass::Substring.into(),
     };
     let matched_by = vec![MatchedField::Change];
-    let mut hit = build_symbol_hit(declaration.index, matched, None, matched_by, payloads)?;
-    hit.change = Some(change);
-    Ok(hit)
+    if projection.payloads.source
+        && let Some(budget) = projection.budget.as_deref_mut()
+    {
+        budget.charge(&crate::read::excerpt_ref(
+            declaration.file,
+            declaration.symbol.range,
+        ))?;
+    }
+    let mut selected = build_selected_symbol_hit(
+        declaration.index,
+        matched,
+        None,
+        matched_by,
+        projection.payloads,
+        projection.budget.as_deref_mut(),
+    )?;
+    selected.hit.change = Some(change);
+    Ok(ChangeRow {
+        selected,
+        side: declaration.side,
+    })
 }
 
 /// Orders one comparison's hits.
@@ -786,6 +1089,169 @@ mod tests {
         fn baseline_to_head(&self) -> Result<SearchResult, RiftError> {
             self.search(&json!({"change": {"base": "baseline"}}))
         }
+    }
+
+    fn capture_fixture_change(
+        fixture: &Fixture,
+        head: &str,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> TestResult<(Arc<ReadService>, ChangeSnapshot)> {
+        let reads = Arc::new(ReadService::build(
+            fixture.directory.path(),
+            fixture.limits,
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?);
+        let selected_head = if head == "working_tree" {
+            json!({"kind":"working_tree"})
+        } else {
+            json!(head)
+        };
+        let params: SearchParams = serde_json::from_value(json!({
+            "change": {"base":"baseline", "head":selected_head},
+            "include":["source"], "limit":1
+        }))?;
+        let change = params.change.as_ref().ok_or("comparison request")?;
+        let snapshot = Arc::clone(&reads).capture_change(
+            &params,
+            change,
+            fixture.limits,
+            &SourceVisibility::default(),
+            (
+                &TextFileInclusion::default(),
+                &LanguageFileSelections::default(),
+            ),
+            budget,
+        )?;
+        Ok((reads, snapshot))
+    }
+
+    fn assert_captured_change(head: &str) -> TestResult {
+        use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
+        use rift_search::query::{FactRequirement, FactRequirements, QueryLimits};
+
+        let older = "pub fn removed() {}\npub fn changed() -> u8 { 1 }\n";
+        let newer = "pub fn added() {}\npub fn changed() -> u8 { 2 }\n";
+        let fixture = Fixture::revisions(&[("lib.rs", older)], &[("lib.rs", newer)], &[])?;
+        let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        let limits = QueryLimits::try_from(&configuration.search.query)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        let (reads, snapshot) = capture_fixture_change(&fixture, head, &mut budget)?;
+        if head == "working_tree" {
+            assert!(Arc::ptr_eq(&snapshot.reads[1], &reads));
+        }
+        let mut inputs = snapshot.view_inputs(true)?.into_iter();
+        let mut requirements = FactRequirements::default();
+        requirements.require(FactRequirement::Domain);
+        requirements.require(FactRequirement::Source);
+        let store = crate::LocalSymbolViews::new(1 << 20, [65; 32]);
+        let mut facts = Vec::new();
+        let mut captured_sources = Vec::new();
+        for (side, original) in [older, newer].into_iter().enumerate() {
+            let input = inputs.next().ok_or("original comparison material")?;
+            let selection = input.provider_selection(&configuration)?;
+            let input = input.with_provider_selection(selection.clone())?;
+            let selected =
+                input.query_facts_with_selection(&requirements, limits, &mut budget, &selection)?;
+            let source = selected
+                .sources
+                .iter()
+                .find(|source| source.unit.as_str().ends_with("lib.rs"))
+                .ok_or("original same-file source")?;
+            assert_eq!(source.text.as_deref(), Some(original));
+            let unit = source.unit.clone();
+            let view = store.capture(input)?.ok_or("retained comparison side")?;
+            captured_sources.push((side, unit, view));
+            facts.push(selected);
+        }
+        write_all(
+            fixture.directory.path(),
+            &[("lib.rs", "pub fn replacement() {}\n")],
+        )?;
+        commit_all(fixture.directory.path(), "advance head after comparison");
+        let mut names = std::collections::BTreeSet::new();
+        for page_index in 0..3 {
+            assert_original_change_page(&snapshot, &facts, &mut budget, page_index, &mut names)?;
+        }
+        assert_eq!(
+            names,
+            ["added", "changed", "removed"]
+                .map(str::to_owned)
+                .into_iter()
+                .collect()
+        );
+        for (side, unit, view) in captured_sources {
+            let answer = store.get_source(
+                &GetSourceParams {
+                    unit,
+                    range: None,
+                    view: Some(view.id.clone()),
+                    rev: None,
+                },
+                reads.index().root(),
+                reads.owner(),
+            )?;
+            let GetSourceResult::Found {
+                source,
+                view: answered,
+                source_complete,
+                ..
+            } = answer
+            else {
+                return Err("both original comparison sources must remain readable".into());
+            };
+            assert_eq!(source.text, [older, newer][side]);
+            assert_eq!(answered, view);
+            assert!(source_complete);
+        }
+        Ok(())
+    }
+
+    fn assert_original_change_page(
+        snapshot: &ChangeSnapshot,
+        facts: &[rift_search::query::QueryFacts],
+        budget: &mut crate::QueryFactBudget<'_>,
+        page_index: u64,
+        names: &mut std::collections::BTreeSet<String>,
+    ) -> TestResult {
+        use rift_protocol::read::SearchHitTarget;
+        let page = snapshot.page(page_index, budget)?;
+        assert_eq!(page.result.pagination.total_pages, 3);
+        assert_eq!(page.result.results.len(), 1);
+        assert_eq!(page.contributions.len(), 1);
+        assert_eq!(page.sides.len(), 1);
+        let SearchHitTarget::Symbol { symbol } = &page.result.results[0].hit else {
+            return Err("comparison row must retain its original symbol".into());
+        };
+        assert!(names.insert(symbol.name.clone()));
+        let side = page.sides[0];
+        assert_eq!(side, usize::from(symbol.name != "removed"));
+        assert!(!page.contributions[0].is_empty());
+        let selected = &facts[side];
+        let records: Vec<_> = selected
+            .providers
+            .iter()
+            .flat_map(|provider| provider.records.iter())
+            .filter(|record| {
+                page.contributions[0]
+                    .iter()
+                    .all(|key| record.contributions.contains(key))
+            })
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(selected.symbols[records[0].symbol_index].symbol, **symbol);
+        Ok(())
+    }
+
+    #[test]
+    fn change_pages_keep_both_original_revision_records_and_same_file_sources() -> TestResult {
+        assert_captured_change("HEAD")
+    }
+
+    #[test]
+    fn working_tree_change_keeps_the_actual_selected_read_owner_and_both_sources() -> TestResult {
+        assert_captured_change("working_tree")
     }
 
     fn write_all(root: &std::path::Path, files: &[(&str, &str)]) -> TestResult {

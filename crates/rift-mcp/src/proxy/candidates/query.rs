@@ -7,10 +7,13 @@ use rmcp::model::{CallToolRequestParams, CallToolResponse};
 mod acquire;
 mod evaluate;
 mod identity;
-mod retained;
-mod source;
+pub(crate) mod replay;
+pub(crate) mod retained;
+pub(crate) mod source;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use evaluate::prepare_selected_services;
 
 pub(super) struct QueryForward {
     pub(super) backend: String,
@@ -54,7 +57,7 @@ impl RiftProxy {
         drop(guard);
         if let Some(page) = plan.page_selection() {
             if let Some(response) = self.query_material_page(page.clone(), deadline).await? {
-                return Ok(owned(Ok(response)));
+                return Ok(owned(response));
             }
             let view = rift_protocol::symbol_read::CapturedViewId::parse(&page.view)?;
             if let Ok(Some(selected)) = self
@@ -69,7 +72,28 @@ impl RiftProxy {
                 });
             }
         }
-        let mut federated = false;
+        let mut retained_owner = false;
+        for service in &plan.requirements().services {
+            let Some((view, _)) = replay::result_service(service)? else {
+                continue;
+            };
+            if let Some(views) = self.query_views.get() {
+                let root = self
+                    .accepted_root
+                    .as_deref()
+                    .ok_or_else(retained::unavailable)?;
+                match views.query_view(&view, root, &self.owner) {
+                    Ok(_) => retained_owner = true,
+                    Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext) => {}
+                    Err(_) => return Err(retained::unavailable()),
+                }
+            }
+        }
+        let mut federated = retained_owner
+            || plan
+                .retrievals()
+                .iter()
+                .any(|request| request.change.is_some());
         federated |= plan
             .requirements()
             .datasets

@@ -78,18 +78,22 @@ impl EngineReferences {
         query::project_provider_edges(&self.query_provider_edges, facts)
     }
 
-    /// Keeps acquired scoped endpoints without copying their existing symbol or source payloads.
+    /// Keeps acquired relationships and occurrences without copying symbol or source payloads.
     #[must_use]
     pub fn into_provider_references(self) -> Self {
         Self {
             revision: self.revision,
             query_provider_edges: self.query_provider_edges,
+            query_relationships: self.query_relationships,
+            query_occurrences: self.query_occurrences,
             ..Self::default()
         }
     }
 
     pub(crate) fn has_provider_references(&self) -> bool {
         !self.query_provider_edges.is_empty()
+            || !self.query_relationships.is_empty()
+            || !self.query_occurrences.is_empty()
     }
 
     pub(crate) fn combine_provider_references(&self, other: &Self) -> Result<Self, RiftError> {
@@ -106,9 +110,15 @@ impl EngineReferences {
         );
         edges.extend(self.query_provider_edges.iter().cloned());
         edges.extend(other.query_provider_edges.iter().cloned());
+        let mut relationships = self.query_relationships.clone();
+        relationships.extend_from_slice(&other.query_relationships);
+        let mut occurrences = self.query_occurrences.clone();
+        occurrences.extend_from_slice(&other.query_occurrences);
         Ok(Self {
             revision: self.revision.clone(),
             query_provider_edges: edges,
+            query_relationships: relationships,
+            query_occurrences: occurrences,
             ..Self::default()
         })
     }

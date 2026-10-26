@@ -233,6 +233,7 @@ async fn packaged_child_refuses_unversioned_and_incompatible_requests() -> TestR
         serde_json::json!({"version":3,"payload":task.clone()}),
         serde_json::json!({"version":5,"payload":task.clone()}),
         serde_json::json!({"version":6,"payload":task.clone()}),
+        serde_json::json!({"version":8,"payload":task.clone()}),
         serde_json::json!({"version":0,"payload":task}),
     ] {
         let (status, diagnostic, response, acknowledgment) =
@@ -243,11 +244,7 @@ async fn packaged_child_refuses_unversioned_and_incompatible_requests() -> TestR
         assert!(refusal["payload"]["Err"]["Unsupported"]["capability"].is_string());
         assert!(refusal["payload"].get("Ok").is_none());
         let acknowledgment: serde_json::Value = serde_json::from_slice(&acknowledgment)?;
-        assert!(
-            acknowledgment["version"]
-                .as_u64()
-                .is_some_and(|version| version > 0)
-        );
+        assert_eq!(acknowledgment["version"], 9);
         assert!(acknowledgment["payload"].is_null());
     }
     Ok(())
@@ -263,11 +260,7 @@ async fn packaged_compatible_child_reports_an_observed_input_failure_without_an_
     assert!(!diagnostic.is_empty());
     assert!(response.is_empty());
     let acknowledgment: serde_json::Value = serde_json::from_slice(&acknowledgment)?;
-    assert!(
-        acknowledgment["version"]
-            .as_u64()
-            .is_some_and(|version| version > 0)
-    );
+    assert_eq!(acknowledgment["version"], 9);
     assert!(acknowledgment["payload"].is_null());
     Ok(())
 }

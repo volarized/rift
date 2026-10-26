@@ -938,3 +938,92 @@ fn test_dataset_clause_and_variable_graph_keep_library_selection() -> TestResult
     )?)?.is_empty());
     Ok(())
 }
+
+#[test]
+fn retained_subject_plan_proves_mandatory_joins_and_right_optional() -> TestResult {
+    for (statement, variable) in [
+        (
+            "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name }",
+            "symbol",
+        ),
+        (
+            "SELECT ?symbol ?name { ?symbol :name ?name SERVICE <urn:rift:result:held> {} }",
+            "symbol",
+        ),
+        (
+            "SELECT ?entry ?name { SERVICE <urn:rift:result:held> {} OPTIONAL { ?entry :name ?name } }",
+            "entry",
+        ),
+        (
+            "SELECT DISTINCT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name FILTER(BOUND(?name)) } ORDER BY ?name LIMIT 10",
+            "symbol",
+        ),
+        (
+            "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name SERVICE <urn:rift:result:held> {} }",
+            "symbol",
+        ),
+    ] {
+        let plan = super::QueryPlan::prepare(statement.to_owned(), limits())?;
+        let selected = plan
+            .retained_subject_selection()
+            .ok_or("mandatory retained subject")?;
+        assert_eq!(selected.service(), "urn:rift:result:held");
+        assert_eq!(selected.variable(), variable);
+        assert!(
+            plan.requirements()
+                .services
+                .iter()
+                .any(|service| service == selected.service())
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn retained_subject_plan_refuses_unsafe_or_unproved_bindings() -> TestResult {
+    for statement in [
+        "SELECT ?symbol ?name { OPTIONAL { SERVICE <urn:rift:result:held> {} } ?symbol :name ?name }",
+        "SELECT ?symbol ?name { SERVICE SILENT <urn:rift:result:held> {} ?symbol :name ?name }",
+        "SELECT ?symbol ?name { SERVICE <urn:other:held> {} ?symbol :name ?name }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name SERVICE <urn:rift:result:other> {} }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name OPTIONAL { SERVICE <urn:rift:result:held> {} } }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name SERVICE SILENT <urn:rift:result:held> {} }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> { ?symbol :name ?name } ?symbol :name ?name }",
+        "SELECT ?symbol ?name { { SERVICE <urn:rift:result:held> {} ?symbol :name ?name } UNION { ?symbol :name ?name } }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name . ?other :name ?name }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} GRAPH <urn:rift:graph:local> { ?symbol :name ?name } }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} BIND(<urn:other> AS ?symbol) ?symbol :name ?name }",
+        "SELECT ?symbol ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name FILTER EXISTS { ?symbol :kind ?kind } }",
+        "SELECT ?symbol ?name { { SELECT ?name { SERVICE <urn:rift:result:held> {} ?symbol :name ?name } } ?symbol :name ?name }",
+    ] {
+        let plan = super::QueryPlan::prepare(statement.to_owned(), limits())?;
+        assert!(plan.retained_subject_selection().is_none(), "{statement}");
+    }
+    Ok(())
+}
+
+#[test]
+fn retained_subject_plan_field_is_required_nullable_and_copy_bound() -> TestResult {
+    let plan = super::QueryPlan::prepare(
+        "SELECT ?symbol { ?symbol :name ?name }".to_owned(),
+        limits(),
+    )?;
+    let mut encoded = serde_json::to_value(&plan)?;
+    assert!(
+        encoded
+            .get("retained_subject_selection")
+            .is_some_and(serde_json::Value::is_null)
+    );
+    assert!(serde_json::from_value::<super::QueryPlan>(encoded.clone()).is_ok());
+    encoded
+        .as_object_mut()
+        .ok_or("query plan object")?
+        .remove("retained_subject_selection");
+    assert!(serde_json::from_value::<super::QueryPlan>(encoded).is_err());
+    let service = "urn:rift:result:held";
+    let variable = "symbol";
+    let bytes = service.len() + variable.len();
+    assert!(super::plan::RetainedSubjectSelection::new(service, variable, bytes).is_ok());
+    assert!(super::plan::RetainedSubjectSelection::new(service, variable, bytes - 1).is_err());
+    Ok(())
+}

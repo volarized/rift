@@ -9,6 +9,7 @@ use super::{
 };
 use crate::query::{QueryProviderEdge, QueryProviderEndpoint};
 use rift_provider::NormalizedTarget;
+use sha2::Digest as _;
 
 pub(super) struct ProviderIndex {
     pub(super) symbols: Vec<Term>,
@@ -95,10 +96,7 @@ impl ProviderIndex {
                     .symbols
                     .get(record.symbol_index)
                     .ok_or_else(|| failure::invalid("captured provider symbol is absent"))?;
-                let resource = match &symbol.symbol.id {
-                    Some(identity) => iri(identity.as_str())?,
-                    None => blank(&record.key(&snapshot.context).map_err(invalid)?)?,
-                };
+                let resource = Self::record_resource(symbol, snapshot, record, &mut |_| Ok(()))?;
                 result.symbols[record.symbol_index] = resource.clone();
                 for association in &record.declarations {
                     if cancellation.is_cancelled() {
@@ -173,24 +171,97 @@ impl ProviderIndex {
         limits: QueryLimits,
         cancellation: &CancellationToken,
     ) -> Result<usize, QueryError> {
+        let (symbols, bytes) =
+            Self::payload_resources(facts, limits, cancellation, &mut |_| Ok(()))?;
+        self.symbols = symbols;
+        Ok(bytes)
+    }
+
+    pub(super) fn symbol_resources_admitted(
+        facts: &QueryFacts,
+        limits: QueryLimits,
+        cancellation: &CancellationToken,
+        admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+    ) -> Result<Vec<Term>, QueryError> {
+        admit(0)?;
+        facts.validate_providers_admitted(admit)?;
+        let (mut symbols, _) = Self::payload_resources(facts, limits, cancellation, admit)?;
+        for snapshot in &facts.providers {
+            admit(0)?;
+            for record in &snapshot.records {
+                admit(0)?;
+                if cancellation.is_cancelled() {
+                    return Err(failure::cancelled());
+                }
+                let symbol = facts
+                    .symbols
+                    .get(record.symbol_index)
+                    .ok_or_else(|| failure::invalid("captured provider symbol is absent"))?;
+                symbols[record.symbol_index] =
+                    Self::record_resource(symbol, snapshot, record, admit)?;
+            }
+        }
+        Ok(symbols)
+    }
+
+    fn payload_resources(
+        facts: &QueryFacts,
+        limits: QueryLimits,
+        cancellation: &CancellationToken,
+        admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+    ) -> Result<(Vec<Term>, usize), QueryError> {
+        let mut symbols = super::subject_buffer(facts.symbols.len(), admit)?;
         let mut bytes = 0usize;
         for symbol in &facts.symbols {
+            admit(0)?;
             if cancellation.is_cancelled() {
                 return Err(failure::cancelled());
             }
-            let resource = match &symbol.symbol.id {
-                Some(identity) => iri(identity.as_str())?,
-                None => blank(&serde_json::to_vec(symbol).map_err(invalid)?)?,
-            };
+            let resource = Self::payload_resource(symbol, admit)?;
             bytes = bytes
                 .checked_add(term_bytes(&resource))
                 .ok_or_else(|| failure::bound("rdf_bytes_max"))?;
             if bytes > limits.rdf_bytes_max {
                 return Err(failure::bound("rdf_bytes_max"));
             }
-            self.symbols.push(resource);
+            symbols.push(resource);
         }
-        Ok(bytes)
+        Ok((symbols, bytes))
+    }
+
+    fn payload_resource(
+        symbol: &super::QuerySymbol,
+        admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+    ) -> Result<Term, QueryError> {
+        admit(0)?;
+        if let Some(identity) = &symbol.symbol.id {
+            admit(identity.as_str().len())?;
+            iri(identity.as_str())
+        } else {
+            admit(size_of::<[u8; 32]>() * 2)?;
+            let mut digest = digest_io::IoWrapper(sha2::Sha256::new());
+            serde_json::to_writer(&mut digest, symbol).map_err(invalid)?;
+            admit(0)?;
+            super::blank_digest(&digest.0.finalize())
+        }
+    }
+
+    fn record_resource(
+        symbol: &super::QuerySymbol,
+        snapshot: &crate::query::QueryProviderSnapshot,
+        record: &crate::query::QueryProviderRecord,
+        admit: &mut impl FnMut(usize) -> Result<(), QueryError>,
+    ) -> Result<Term, QueryError> {
+        if symbol.symbol.id.is_some() {
+            return Self::payload_resource(symbol, admit);
+        }
+        admit(size_of::<[u8; 32]>() * 2)?;
+        let mut digest = digest_io::IoWrapper(sha2::Sha256::new());
+        record
+            .write_key(&snapshot.context, &mut digest)
+            .map_err(invalid)?;
+        admit(0)?;
+        super::blank_digest(&digest.0.finalize())
     }
 
     fn resource(

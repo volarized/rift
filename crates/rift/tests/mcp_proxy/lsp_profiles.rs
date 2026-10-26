@@ -29,6 +29,7 @@ const MANIFEST: &str =
 fn engine_script(root: &Path, logs: &Path, name: &str) -> TestResult<String> {
     let root = root.canonicalize()?;
     let caller_uri = format!("file://{}/caller.rs", root.display());
+    let lib_uri = format!("file://{}/lib.rs", root.display());
     let cwd = logs.join(format!("{name}.cwd"));
     let requests = logs.join(format!("{name}.requests"));
     let progress = r#"frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis","value":{"kind":"begin","title":"analysis"}}}'
@@ -39,6 +40,22 @@ frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis",
         .replace("PROGRESS", progress)
         .replace("CALLEE_LINE", "0")
         .replace("CALLER_LINE", "2")
+        .replace(
+            r#"    *'"method":"textDocument/references"'*)"#,
+            r#"    *'"method":"textDocument/references"'*)
+      case "$uri:$body" in
+        "$CALLEE_URI:"*'"position":{"line":0,"character":7}'*) ;;
+        "$CALLEE_URI:"*'"position":{"line":1,"character":4}'*)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":1,\"character\":4},\"end\":{\"line\":1,\"character\":10}}}]}"
+          continue ;;
+        "$CALLER_URI:"*'"position":{"line":1,"character":7}'*)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":[{\"uri\":\"$uri\",\"range\":{\"start\":{\"line\":1,\"character\":7},\"end\":{\"line\":1,\"character\":13}}}]}"
+          continue ;;
+        *)
+          frame "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":null}"
+          continue ;;
+      esac"#,
+        )
         .replace(
             "while IFS= read -r header; do",
             "frames=0; bytes=0\nwhile IFS= read -r header; do",
@@ -51,7 +68,7 @@ frame '{"jsonrpc":"2.0","method":"$/progress","params":{"token":"fake/analysis",
             ),
         );
     Ok(format!(
-        "pwd > '{}'\nCALLER_URI='{caller_uri}'\n{script}",
+        "pwd > '{}'\nCALLER_URI='{caller_uri}'\nCALLEE_URI='{lib_uri}'\n{script}",
         cwd.display()
     ))
 }
@@ -69,7 +86,19 @@ async fn configure_engine(root: &Path, profile: Option<&str>, script: &str) -> T
         arguments.extend(["--profile=docs", "--profile-root=docs"]);
     }
     let output = run_rift(root, &arguments).await?;
-    require_success(&output, "configure profile engine")
+    require_success(&output, "configure profile engine")?;
+    let configuration = root.join("rift.toml");
+    let original = fs::read_to_string(&configuration)?;
+    let retry = if profile.is_some() {
+        "profiles.docs.languages.rust.lsp.retry"
+    } else {
+        "languages.rust.lsp.retry"
+    };
+    fs::write(
+        configuration,
+        format!("{original}\n[{retry}]\nattempts = 3\ndelay = \"250ms\"\ndelay_limit = \"2s\"\n"),
+    )?;
+    Ok(())
 }
 
 fn search() -> TestResult<Value> {
@@ -81,7 +110,7 @@ fn search() -> TestResult<Value> {
     };
     Ok(serde_json::to_value(QueryParams {
         query: format!(
-            "PREFIX : <{}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> SELECT ?symbol ?source ?path ?name {{ {} UNION {} }} ORDER BY ?path ?symbol",
+            "PREFIX : <{}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> SELECT ?symbol ?source ?path ?name ?unit ?full_source (COUNT(?caller) AS ?references) WHERE {{ {{ {} UNION {} }} ?symbol :declarations ?declaration . ?declaration :unit ?unit . ?unit :source ?full_source . OPTIONAL {{ ?caller :references ?symbol }} }} GROUP BY ?symbol ?source ?path ?name ?unit ?full_source ORDER BY ?path ?symbol",
             rift_search::sparql::VOCABULARY,
             selected("local"),
             selected("local#docs"),
@@ -120,6 +149,7 @@ fn hit(answer: &Value) -> TestResult<ProfileSymbol> {
 async fn symbol_read(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     hit: &ProfileSymbol,
+    expected_source: Option<(&str, &str)>,
 ) -> TestResult<Value> {
     let id = &hit.id;
     let view = &hit.view;
@@ -146,11 +176,39 @@ async fn symbol_read(
         Some(hit.source.as_str()),
         "{answer}"
     );
-    assert_eq!(
-        declarations[0].path.as_ref().map(|path| path.0.as_str()),
-        Some("lib.rs"),
-        "{answer}"
-    );
+    assert!(declarations[0].path.is_none(), "{answer}");
+    let unit = declarations[0]
+        .unit
+        .as_ref()
+        .ok_or("qualified source unit")?;
+    if let Some((expected_unit, expected_source)) = expected_source {
+        let expected_unit: rift_protocol::read::SourceUnitId =
+            serde_json::from_value(json!(expected_unit))?;
+        assert_eq!(unit, &expected_unit, "{answer}");
+        let source_answer =
+            proxied_call(client, "get_source", &json!({"unit":unit, "view":view.id})).await?;
+        let result: rift_protocol::source_read::GetSourceResult =
+            serde_json::from_value(source_answer.clone())?;
+        let rift_protocol::source_read::GetSourceResult::Found {
+            source,
+            source_complete,
+            view: source_view,
+            ..
+        } = result
+        else {
+            return Err(format!("original source not found: {source_answer}").into());
+        };
+        assert_eq!(&source_view, view, "{source_answer}");
+        assert_eq!(&source.span.unit, unit, "{source_answer}");
+        assert_eq!(source.span.range.start, 0, "{source_answer}");
+        assert_eq!(
+            source.span.range.end,
+            u64::try_from(expected_source.len())?,
+            "{source_answer}"
+        );
+        assert_eq!(source.text, expected_source, "{source_answer}");
+        assert!(source_complete, "{source_answer}");
+    }
     Ok(answer)
 }
 
@@ -255,6 +313,19 @@ async fn caller_read(
     Ok(())
 }
 
+fn engine_requests(logs: &Path) -> TestResult<Vec<Value>> {
+    let mut requests = Vec::new();
+    for name in ["main", "docs"] {
+        for line in fs::read_to_string(logs.join(format!("{name}.requests")))?.lines() {
+            let message: Value = serde_json::from_str(line)?;
+            if message.get("id").is_some() {
+                requests.push(json!({"engine": name, "request": message}));
+            }
+        }
+    }
+    Ok(requests)
+}
+
 async fn require_engine_root(logs: &Path, name: &str, root: &Path) -> TestResult {
     let requests = logs.join(format!("{name}.requests"));
     let expected_uri = format!("file://{}", root.canonicalize()?.display());
@@ -321,11 +392,55 @@ async fn require_profile_pattern(
             name: "docs".to_owned()
         }
     );
-    symbol_read(client, &symbol).await?;
+    symbol_read(client, &symbol, None).await?;
     Ok(())
 }
 
 /// A root-defined profile keeps one owner and one configured engine.
+async fn require_original_profile_hit(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    hit: &ProfileSymbol,
+    answer: &Value,
+    (main_source, docs_source): (&str, &str),
+    owners: &mut BTreeSet<&'static str>,
+) -> TestResult {
+    let rows = query::rows(answer)?;
+    let id = &hit.id;
+    let identity = SymbolIdentity::parse(id.as_str())?;
+    let (expected, full_source) = match identity.owner() {
+        SymbolOwner::Local => {
+            owners.insert("main");
+            (MAIN_SOURCE.trim(), main_source)
+        }
+        SymbolOwner::ProfileLocal { name } if name == "docs" => {
+            owners.insert("docs");
+            (DOCS_SOURCE.trim(), docs_source)
+        }
+        owner => return Err(format!("unexpected profile owner: {owner:?}").into()),
+    };
+    assert_eq!(hit.source.as_str(), expected, "{hit:?}");
+    assert_eq!(
+        query::literal(&rows[0], "full_source")?,
+        full_source,
+        "{answer}"
+    );
+    assert_eq!(
+        query::literal(&rows[0], "references")?.parse::<u64>()?,
+        1,
+        "original caller must be captured: {answer}"
+    );
+    symbol_read(
+        client,
+        hit,
+        Some((query::iri(&rows[0], "unit")?, full_source)),
+    )
+    .await?;
+    if matches!(identity.owner(), SymbolOwner::ProfileLocal { .. }) {
+        named_missing_read(client, hit).await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engine() -> TestResult {
     let main_source = format!("{MAIN_SOURCE}mod caller;\n");
@@ -339,7 +454,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             ("docs/lib.rs", &docs_source),
             ("docs/caller.rs", CALLER_SOURCE),
         ],
-        "[search.query]\npage_size = 1\n[global]\nenabled = false\n",
+        "[source]\ninclude = [\"lib.rs\", \"caller.rs\", \"docs/lib.rs\", \"docs/caller.rs\"]\n[search.query]\npage_size = 1\n[global]\nenabled = false\n",
     )?;
     let root = directory.path();
     let docs = root.join("docs");
@@ -379,39 +494,107 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     assert_eq!(second["view"], view, "pagination keeps original expiry");
     let hits = [hit(&first)?, hit(&second)?];
     let mut owners = BTreeSet::new();
-    for hit in &hits {
-        let id = &hit.id;
-        let identity = SymbolIdentity::parse(id.as_str())?;
-        let expected = match identity.owner() {
-            SymbolOwner::Local => {
-                owners.insert("main");
-                MAIN_SOURCE.trim()
-            }
-            SymbolOwner::ProfileLocal { name } if name == "docs" => {
-                owners.insert("docs");
-                DOCS_SOURCE.trim()
-            }
-            owner => return Err(format!("unexpected profile owner: {owner:?}").into()),
-        };
-        assert_eq!(hit.source.as_str(), expected, "{hit:?}");
-        symbol_read(&client, hit).await?;
-        if matches!(identity.owner(), SymbolOwner::ProfileLocal { .. }) {
-            named_missing_read(&client, hit).await?;
-        }
+    for (hit, answer) in hits.iter().zip([&first, &second]) {
+        require_original_profile_hit(
+            &client,
+            hit,
+            answer,
+            (main_source.as_str(), docs_source.as_str()),
+            &mut owners,
+        )
+        .await?;
     }
     assert_eq!(owners, BTreeSet::from(["main", "docs"]));
+    let requests = engine_requests(logs.path())?;
     fs::write(root.join("lib.rs"), main_source.replace("11", "33"))?;
     fs::write(docs.join("lib.rs"), docs_source.replace("22", "44"))?;
     let held_first = proxied_call(&client, "search", &retained_page(&first, 0)?).await?;
     let held_second = proxied_call(&client, "search", &second_arguments).await?;
     assert_eq!(held_first, first, "captured source and expiry stay fixed");
     assert_eq!(held_second, second, "both backend views stay fixed");
-    for hit in &hits {
-        symbol_read(&client, hit).await?;
+    for (hit, original) in hits.iter().zip([&first, &second]) {
+        let rows = query::rows(original)?;
+        symbol_read(
+            &client,
+            hit,
+            Some((
+                query::iri(&rows[0], "unit")?,
+                query::literal(&rows[0], "full_source")?,
+            )),
+        )
+        .await?;
         caller_read(&client, hit, logs.path()).await?;
     }
+    assert_eq!(
+        engine_requests(logs.path())?,
+        requests,
+        "held reads must not issue engine requests"
+    );
     require_engine_root(logs.path(), "main", root).await?;
     require_engine_root(logs.path(), "docs", &docs).await?;
     client.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn profile_engine_references_keep_original_declarations_and_callers() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    let logs = tempfile::tempdir()?;
+    let script = engine_script(&root, logs.path(), "references")?;
+    let configuration = serde_json::from_value(json!({ "command": ["sh", "-c", script] }))?;
+    let key = rift_server::LspProcessKey::named("rust");
+    let pool = rift_server::EnginePool::new(
+        &root,
+        std::collections::BTreeMap::from([(key.clone(), configuration)]),
+        std::collections::BTreeMap::from([("rust".to_owned(), key.clone())]),
+    );
+    let lib = format!("file://{}/lib.rs", root.display());
+    let caller = format!("file://{}/caller.rs", root.display());
+    let inputs = [
+        (format!("file://{}/unknown.rs", root.display()), 0, 7),
+        (lib.clone(), 1, 4),
+        (caller.clone(), 1, 7),
+        (lib.clone(), 0, 7),
+    ];
+    let answers = pool
+        .engine_by_key(&key)
+        .ok_or("configured Rust engine missing")?
+        .request(|session| {
+            let inputs = inputs.clone();
+            Box::pin(async move {
+                let mut answers = Vec::new();
+                for (uri, line, character) in inputs {
+                    let uri = uri.parse().expect("controlled file URI");
+                    let position = serde_json::from_value(json!({
+                        "line": line, "character": character,
+                    }))
+                    .expect("controlled reference position");
+                    answers.push(session.references_uri(&uri, position).await?);
+                }
+                Ok(answers)
+            })
+        })
+        .await;
+    pool.shutdown().await;
+    let answers = serde_json::to_value(answers?)?;
+    let location = |uri: &str, line: u32, start: u32, end: u32| {
+        json!({
+            "uri": uri,
+            "range": {
+                "start": { "line": line, "character": start },
+                "end": { "line": line, "character": end },
+            },
+        })
+    };
+    assert_eq!(
+        answers,
+        json!([
+            [],
+            [location(&lib, 1, 4, 10)],
+            [location(&caller, 1, 7, 13)],
+            [location(&lib, 0, 7, 13), location(&caller, 2, 4, 10)],
+        ]),
+    );
     Ok(())
 }

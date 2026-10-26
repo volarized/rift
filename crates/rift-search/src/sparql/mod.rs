@@ -20,8 +20,9 @@ pub use crate::query::{
     AdjacencyRequirement, FactRequirements, QueryFactFamily, QueryFacts, QueryLimits, QuerySource,
     QuerySymbol,
 };
+pub use dataset::{QuerySubjectResource, retained_subject_resources};
 pub use page::{PageForm, PageSelection, continuation_query};
-pub use plan::QueryPlan;
+pub use plan::{QueryPlan, RetainedSubjectSelection};
 pub use recipes::retrieval_query;
 pub use services::{
     QueryDataset, QueryIdentities, QueryServiceData, QueryServices, RetainedResult,
@@ -86,6 +87,7 @@ pub type QueryError = rift_error::RiftError;
 pub struct PreparedQuery {
     query: Query,
     requirements: FactRequirements,
+    retained_subject_selection: Option<RetainedSubjectSelection>,
 }
 
 impl PreparedQuery {
@@ -103,10 +105,12 @@ impl PreparedQuery {
             parser = parser.with_prefix(prefix, iri).map_err(failure::parse)?;
         }
         let query = parser.parse_query(statement).map_err(failure::parse)?;
-        let requirements = FactRequirements::from_query(&query, limits.algebra_nodes_max)?;
+        let (requirements, retained_subject_selection) =
+            FactRequirements::from_query(&query, limits)?;
         Ok(Self {
             query,
             requirements,
+            retained_subject_selection,
         })
     }
 
