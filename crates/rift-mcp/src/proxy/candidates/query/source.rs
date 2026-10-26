@@ -252,10 +252,7 @@ pub(crate) fn selected_source<'a>(
     saved: &'a Metadata,
     unit: &rift_protocol::read::SourceUnitId,
 ) -> Result<&'a super::retained::Source, RiftError> {
-    let mut matches = saved
-        .sources
-        .iter()
-        .filter(|source| source.public == *unit || source.original == *unit);
+    let mut matches = saved.sources.iter().filter(|source| source.public == *unit);
     let source = matches.next().ok_or_else(retained::unavailable)?;
     if matches.next().is_some() {
         return Err(retained::unavailable());

@@ -1569,7 +1569,7 @@ fn retained_subject_rows_partition_original_owners_without_borrowed_family_autho
     Ok(())
 }
 
-fn source_alias_capture()
+fn captured_source_fixture()
 -> Result<(tempfile::TempDir, rift_server::CapturedQueryView), Box<dyn std::error::Error>> {
     let mut fixture = fixture_with_file(Some(("lib.rs", "pub fn original() {}\n")));
     fixture.selected.graph = None;
@@ -1590,70 +1590,64 @@ fn source_alias_capture()
 }
 
 #[test]
-fn saved_source_aliases_keep_old_bytes_and_requested_units()
+fn saved_public_source_keeps_original_bytes_and_provider_view()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (root, captured) = source_alias_capture()?;
+    let (root, captured) = captured_source_fixture()?;
     let metadata = super::super::retained::metadata(&captured)?;
     let saved = metadata.sources.first().ok_or("original source metadata")?;
     assert_ne!(saved.public, saved.original);
     std::fs::write(root.path().join("lib.rs"), "pub fn replacement() {}\n")?;
     let mut budget = rift_server::QueryFactBudget::new(query_limits(), &|| false)?;
-    for unit in [&saved.original, &saved.public] {
-        let selected = super::super::source::selected_source(&metadata, unit)?;
-        assert!(std::ptr::eq(saved, selected));
-        let bytes = captured
-            .material()
-            .sources()
-            .get(selected.bytes.clone().ok_or("original source bytes")?)
-            .ok_or("original source range")?;
-        let params = rift_protocol::source_read::GetSourceParams {
-            unit: unit.clone(),
-            range: None,
-            view: Some(captured.view().id.clone()),
-            rev: None,
-        };
-        let response = super::super::source::captured_source(
-            params.clone(),
-            bytes,
-            captured.view(),
-            &mut budget,
-        )?;
-        assert!(response.is_valid_for(&params));
-        let upstream = rift_protocol::source_read::GetSourceParams {
-            unit: saved.original.clone(),
-            range: None,
-            view: Some(metadata.providers[saved.provider].view.id.clone()),
-            rev: None,
-        };
-        let forwarded = super::super::source::captured_source(
-            upstream.clone(),
-            bytes,
-            &metadata.providers[saved.provider].view,
-            &mut budget,
-        )?;
-        let qualified = super::super::source::qualify_source(
-            forwarded,
-            &upstream,
-            "local",
-            captured.view().clone(),
-            Some(unit.clone()),
-        )?;
-        assert!(qualified.is_valid_for(&params));
-        let rift_protocol::source_read::GetSourceResult::Found { source, view, .. } = response
-        else {
-            return Err("original source readback".into());
-        };
-        assert_eq!(source.span.unit, *unit);
-        assert_eq!(source.text, "pub fn original() {}\n");
-        assert_eq!(view, *captured.view());
-    }
+    assert!(super::super::source::selected_source(&metadata, &saved.original).is_err());
+    let unit = &saved.public;
+    let selected = super::super::source::selected_source(&metadata, unit)?;
+    assert!(std::ptr::eq(saved, selected));
+    let bytes = captured
+        .material()
+        .sources()
+        .get(selected.bytes.clone().ok_or("original source bytes")?)
+        .ok_or("original source range")?;
+    let params = rift_protocol::source_read::GetSourceParams {
+        unit: unit.clone(),
+        range: None,
+        view: Some(captured.view().id.clone()),
+        rev: None,
+    };
+    let response =
+        super::super::source::captured_source(params.clone(), bytes, captured.view(), &mut budget)?;
+    assert!(response.is_valid_for(&params));
+    let upstream = rift_protocol::source_read::GetSourceParams {
+        unit: saved.original.clone(),
+        range: None,
+        view: Some(metadata.providers[saved.provider].view.id.clone()),
+        rev: None,
+    };
+    let forwarded = super::super::source::captured_source(
+        upstream.clone(),
+        bytes,
+        &metadata.providers[saved.provider].view,
+        &mut budget,
+    )?;
+    let qualified = super::super::source::qualify_source(
+        forwarded,
+        &upstream,
+        "local",
+        captured.view().clone(),
+        Some(unit.clone()),
+    )?;
+    assert!(qualified.is_valid_for(&params));
+    let rift_protocol::source_read::GetSourceResult::Found { source, view, .. } = response else {
+        return Err("original source readback".into());
+    };
+    assert_eq!(source.span.unit, *unit);
+    assert_eq!(source.text, "pub fn original() {}\n");
+    assert_eq!(view, *captured.view());
     Ok(())
 }
 
 #[test]
-fn saved_source_aliases_refuse_duplicate_original_records() -> Result<(), Box<dyn std::error::Error>>
-{
-    let (_root, captured) = source_alias_capture()?;
+fn saved_public_source_refuses_duplicate_public_units() -> Result<(), Box<dyn std::error::Error>> {
+    let (_root, captured) = captured_source_fixture()?;
     let mut metadata = super::super::retained::metadata(&captured)?;
     let saved = metadata.sources.first().ok_or("original source metadata")?;
     let original = saved.original.clone();
@@ -1668,5 +1662,88 @@ fn saved_source_aliases_refuse_duplicate_original_records() -> Result<(), Box<dy
     metadata.sources.push(duplicate);
     assert!(super::super::source::selected_source(&metadata, &original).is_err());
     assert!(super::super::source::selected_source(&metadata, &public).is_err());
+    Ok(())
+}
+
+#[test]
+fn saved_public_sources_keep_distinct_provider_bytes_when_original_units_match()
+-> Result<(), Box<dyn std::error::Error>> {
+    let main = fixture_with_file(Some(("lib.rs", "pub fn main_original() {}\n")));
+    let docs = fixture_with_file(Some(("lib.rs", "pub fn docs_original() {}\n")));
+    let main_root = main.root.path().canonicalize()?;
+    let docs_root = docs.root.path().canonicalize()?;
+    let limits = query_limits();
+    let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+    let main_ids = super::super::identity::identities("local", &main.selected, &mut budget)?;
+    let docs_ids = super::super::identity::identities("docs", &docs.selected, &mut budget)?;
+    let main_public =
+        original_public_source(&main.selected, &main_ids, "pub fn main_original() {}\n")?;
+    let docs_public =
+        original_public_source(&docs.selected, &docs_ids, "pub fn docs_original() {}\n")?;
+    let input = super::super::retained::Input::prepare(
+        vec![
+            ("local".to_owned(), main.selected, main_ids),
+            ("docs".to_owned(), docs.selected, docs_ids),
+        ],
+        rift_protocol::query::QueryConfiguration::default(),
+        rift_server::QueryProcessLimits::from_query(limits)?.material_bytes_max,
+        &mut budget,
+    )?;
+    let response = input.capture(
+        &main.issuer,
+        &main_root,
+        &SymbolOwner::Local,
+        &rift_protocol::query::QueryAnswer::Boolean { value: true },
+        Vec::new(),
+        &mut budget,
+    )?;
+    let rift_protocol::query::QueryReadResult::Results(response) = response else {
+        return Err("retained query answer".into());
+    };
+    let view = response.view.ok_or("retained query view")?;
+    let captured = main
+        .issuer
+        .query_view(&view.id, &main_root, &SymbolOwner::Local)
+        .map_err(|reason| format!("original query material: {reason:?}"))?;
+    let metadata = super::super::retained::metadata(&captured)?;
+    let main_source = metadata
+        .sources
+        .iter()
+        .find(|source| source.public == main_public)
+        .ok_or("main original source metadata")?;
+    let docs_source = metadata
+        .sources
+        .iter()
+        .find(|source| source.public == docs_public)
+        .ok_or("docs original source metadata")?;
+    assert_eq!(main_source.original, docs_source.original);
+    assert_eq!(main_source.public, main_source.original);
+    assert_ne!(main_source.public, docs_source.public);
+    assert_ne!(main_source.provider, docs_source.provider);
+    assert_eq!(
+        metadata.providers[main_source.provider].root,
+        main_root.to_str().ok_or("main root")?
+    );
+    assert_eq!(
+        metadata.providers[docs_source.provider].root,
+        docs_root.to_str().ok_or("docs root")?
+    );
+    std::fs::write(main_root.join("lib.rs"), "pub fn main_replacement() {}\n")?;
+    std::fs::write(docs_root.join("lib.rs"), "pub fn docs_replacement() {}\n")?;
+    for (source, expected) in [
+        (main_source, "pub fn main_original() {}\n"),
+        (docs_source, "pub fn docs_original() {}\n"),
+    ] {
+        let selected = super::super::source::selected_source(&metadata, &source.public)?;
+        assert!(std::ptr::eq(source, selected));
+        let bytes = captured
+            .material()
+            .sources()
+            .get(selected.bytes.clone().ok_or("original source bytes")?)
+            .ok_or("original source range")?;
+        assert_eq!(std::str::from_utf8(bytes)?, expected);
+    }
+    let unknown = rift_protocol::read::SourceUnitId::parse("rift://source/project/unknown.rs")?;
+    assert!(super::super::source::selected_source(&metadata, &unknown).is_err());
     Ok(())
 }
