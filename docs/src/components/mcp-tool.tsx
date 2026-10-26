@@ -14,6 +14,7 @@ type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 type JsonSchema = {
   $defs?: Record<string, JsonSchema>;
   $ref?: string;
+  additionalProperties?: boolean | JsonSchema;
   allOf?: JsonSchema[];
   anyOf?: JsonSchema[];
   const?: JsonValue;
@@ -66,83 +67,9 @@ function dereference(schema: JsonSchema, root: JsonSchema): JsonSchema {
   return { ...target, ...siblings };
 }
 
-function isNullSchema(schema: JsonSchema, root: JsonSchema): boolean {
-  const resolved = dereference(schema, root);
-  return resolved.type === "null" || resolved.const === null;
-}
-
-function structuralSchema(schema: JsonSchema, root: JsonSchema): JsonSchema {
-  const resolved = dereference(schema, root);
-  const hasOwnShape = resolved.properties !== undefined || resolved.type !== undefined;
-  const variants = hasOwnShape ? undefined : (resolved.oneOf ?? resolved.anyOf);
-  if (variants) {
-    const selected = variants.find((variant) => !isNullSchema(variant, root)) ?? variants[0];
-    return {
-      ...structuralSchema(selected, root),
-      description: resolved.description ?? structuralSchema(selected, root).description,
-    };
-  }
-
-  if (!resolved.properties && resolved.allOf) {
-    const selected = resolved.allOf.find((part) => {
-      const candidate = dereference(part, root);
-      return candidate.properties !== undefined || candidate.type !== undefined;
-    });
-    if (selected) return { ...structuralSchema(selected, root), description: resolved.description };
-  }
-  return resolved;
-}
-
 function schemaType(schema: JsonSchema): string | undefined {
   if (Array.isArray(schema.type)) return schema.type.find((type) => type !== "null");
   return schema.type;
-}
-
-function terminalExample(schema: JsonSchema): JsonPrimitive {
-  const type = schemaType(schema);
-  if (type === "boolean") return false;
-  if (type === "integer" || type === "number") return schema.minimum ?? 0;
-  if (type === "null") return null;
-  return "string";
-}
-
-function exampleFromSchema(
-  schema: JsonSchema,
-  root: JsonSchema,
-  depth = 0,
-  references = new Set<string>(),
-): JsonValue {
-  const reference = schema.$ref;
-  const resolved = structuralSchema(schema, root);
-
-  if (resolved.examples?.length) return resolved.examples[0];
-  const resolvedType = schemaType(resolved);
-  const nullableCollectionDefault =
-    resolved.default === null && (resolvedType === "object" || resolvedType === "array");
-  if (resolved.default !== undefined && !nullableCollectionDefault) return resolved.default;
-  if (resolved.const !== undefined) return resolved.const;
-  if (resolved.enum?.length) return resolved.enum[0];
-
-  const repeatedReference = reference !== undefined && references.has(reference);
-  if (depth >= RECURSION_DEPTH_MAX || repeatedReference) return terminalExample(resolved);
-
-  const nextReferences = new Set(references);
-  if (reference) nextReferences.add(reference);
-
-  if (resolvedType === "object" || resolved.properties) {
-    return Object.fromEntries(
-      Object.entries(resolved.properties ?? {}).map(([name, property]) => [
-        name,
-        exampleFromSchema(property, root, depth + 1, nextReferences),
-      ]),
-    );
-  }
-  if (resolvedType === "array" || resolved.items) {
-    return resolved.items
-      ? [exampleFromSchema(resolved.items, root, depth + 1, nextReferences)]
-      : [];
-  }
-  return terminalExample(resolved);
 }
 
 function primitiveText(value: JsonPrimitive): string {
@@ -194,7 +121,7 @@ function JsonNode({
 }: JsonNodeProps) {
   const expandable = typeof value === "object" && value !== null;
   const [open, setOpen] = useState(true);
-  const resolved = structuralSchema(schema, root);
+  const resolved = dereference(schema, root);
   const suffix = comma ? "," : "";
   const indentation = { paddingInlineStart: `${depth * 0.75}rem` };
   const key =
@@ -290,7 +217,7 @@ function JsonNode({
 }
 
 function PayloadTree({ schema, value }: { schema: JsonSchema; value: JsonValue }) {
-  const resolved = structuralSchema(schema, schema);
+  const resolved = dereference(schema, schema);
 
   if (typeof value !== "object" || value === null) {
     return (
@@ -327,6 +254,156 @@ function PayloadTree({ schema, value }: { schema: JsonSchema; value: JsonValue }
   );
 }
 
+function schemaTypeText(schema: JsonSchema, root: JsonSchema): string {
+  const resolved = dereference(schema, root);
+  if (resolved.const !== undefined) return JSON.stringify(resolved.const);
+  if (resolved.enum) return resolved.enum.map((value) => JSON.stringify(value)).join(" | ");
+  if (resolved.oneOf) return "oneOf";
+  if (resolved.anyOf) return "anyOf";
+  if (resolved.allOf) return "allOf";
+  return Array.isArray(resolved.type)
+    ? resolved.type.join(" | ")
+    : (schemaType(resolved) ?? "unknown");
+}
+
+function SchemaProperties({
+  schema,
+  root,
+  depth = 0,
+  references = new Set<string>(),
+}: {
+  schema: JsonSchema;
+  root: JsonSchema;
+  depth?: number;
+  references?: Set<string>;
+}) {
+  const resolved = dereference(schema, root);
+  if (depth >= RECURSION_DEPTH_MAX || (schema.$ref && references.has(schema.$ref))) {
+    return <code className="text-xs">{schema.$ref ?? schemaTypeText(schema, root)}</code>;
+  }
+  const nextReferences = new Set(references);
+  if (schema.$ref) nextReferences.add(schema.$ref);
+  const groups = [
+    ["oneOf", resolved.oneOf],
+    ["anyOf", resolved.anyOf],
+    ["allOf", resolved.allOf],
+  ] as const;
+  return (
+    <div className="space-y-3">
+      {groups.map(([keyword, variants]) =>
+        variants?.map((variant, index) => {
+          const branch = dereference(variant, root);
+          return (
+            <details
+              key={`${keyword}-${index}`}
+              open={depth < 1}
+              className="border-l border-border pl-3"
+            >
+              <summary className="cursor-pointer text-xs font-medium">
+                {keyword} {index + 1}:{" "}
+                {branch.title ?? branch.description ?? schemaTypeText(branch, root)}
+              </summary>
+              <div className="mt-2">
+                <SchemaProperties
+                  schema={variant}
+                  root={root}
+                  depth={depth + 1}
+                  references={nextReferences}
+                />
+              </div>
+            </details>
+          );
+        }),
+      )}
+      {resolved.properties ? (
+        <table className="w-full border-collapse text-left text-xs">
+          <thead>
+            <tr className="border-b border-border text-muted-foreground">
+              <th className="py-2 pr-3">Property</th>
+              <th className="py-2 pr-3">Type</th>
+              <th className="py-2 pr-3">Required</th>
+              <th className="py-2">Description</th>
+            </tr>
+          </thead>
+          <tbody>
+            {Object.entries(resolved.properties).map(([name, property]) => {
+              const field = dereference(property, root);
+              const nested =
+                field.properties ||
+                field.items ||
+                typeof field.additionalProperties === "object" ||
+                field.oneOf ||
+                field.anyOf ||
+                field.allOf;
+              return (
+                <tr key={name} className="border-b border-border align-top">
+                  <td className="py-2 pr-3 font-mono">{name}</td>
+                  <td className="py-2 pr-3 font-mono">{schemaTypeText(property, root)}</td>
+                  <td className="py-2 pr-3">{resolved.required?.includes(name) ? "yes" : "no"}</td>
+                  <td className="py-2">
+                    {field.description ? <p>{field.description}</p> : null}
+                    {field.default !== undefined ? (
+                      <p className="mt-1">
+                        Default: <code>{JSON.stringify(field.default)}</code>
+                      </p>
+                    ) : null}
+                    {nested ? (
+                      <details className="mt-2" open={depth < 1}>
+                        <summary className="cursor-pointer">Properties</summary>
+                        <div className="mt-2">
+                          <SchemaProperties
+                            schema={property}
+                            root={root}
+                            depth={depth + 1}
+                            references={nextReferences}
+                          />
+                        </div>
+                      </details>
+                    ) : null}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      ) : null}
+      {resolved.items ? (
+        <div>
+          <p className="mb-2 text-xs font-medium">Items</p>
+          <SchemaProperties
+            schema={resolved.items}
+            root={root}
+            depth={depth + 1}
+            references={nextReferences}
+          />
+        </div>
+      ) : null}
+      {typeof resolved.additionalProperties === "boolean" ? (
+        <p className="text-xs">
+          Additional properties: <code>{String(resolved.additionalProperties)}</code>
+        </p>
+      ) : null}
+      {typeof resolved.additionalProperties === "object" ? (
+        <div>
+          <p className="mb-2 text-xs font-medium">Additional properties</p>
+          <SchemaProperties
+            schema={resolved.additionalProperties}
+            root={root}
+            depth={depth + 1}
+            references={nextReferences}
+          />
+        </div>
+      ) : null}
+      {!resolved.properties &&
+      !resolved.items &&
+      !groups.some(([, variants]) => variants) &&
+      typeof resolved.additionalProperties !== "object" ? (
+        <code className="text-xs">{schemaTypeText(schema, root)}</code>
+      ) : null}
+    </div>
+  );
+}
+
 function JsonShape({
   fullscreen = false,
   label,
@@ -353,9 +430,7 @@ function JsonShape({
         </div>
       ))}
     </div>
-  ) : (
-    <PayloadTree schema={schema} value={exampleFromSchema(schema, schema)} />
-  );
+  ) : null;
 
   return (
     <div
@@ -368,7 +443,15 @@ function JsonShape({
       <div className="flex shrink-0 items-center border-b border-border px-3 py-2 font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted-foreground">
         <span>{label}</span>
       </div>
-      <div className="min-h-0 min-w-0 flex-1 overflow-auto">{payload}</div>
+      <div className="min-h-0 min-w-0 flex-1 overflow-auto">
+        <div className="border-b border-border px-3 py-3">
+          <h4 className="mb-3 text-xs font-semibold">
+            {label === "input" ? "Arguments" : "Result properties"}
+          </h4>
+          <SchemaProperties schema={schema} root={schema} />
+        </div>
+        {payload}
+      </div>
     </div>
   );
 }
