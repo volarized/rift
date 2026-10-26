@@ -8,7 +8,9 @@ mod symbols;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use oxigraph::model::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
+use oxigraph::model::{
+    BlankNode, GraphName, Literal, NamedNode, NamedNodeRef, NamedOrBlankNode, Term,
+};
 use oxigraph::sparql::CancellationToken;
 use serde::Serialize;
 use serde_json::Value;
@@ -1052,7 +1054,9 @@ fn fact_count(facts: &QueryFacts) -> Result<usize, QueryError> {
 }
 
 fn iri(value: &str) -> Result<Term, QueryError> {
-    NamedNode::new(value).map(Term::from).map_err(invalid)
+    NamedNodeRef::new(value)
+        .map(|value| Term::from(value.into_owned()))
+        .map_err(invalid)
 }
 
 fn vocabulary(value: &str) -> Result<Term, QueryError> {

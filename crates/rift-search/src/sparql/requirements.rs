@@ -3,7 +3,7 @@
 use crate::query::FactRequirement;
 use rift_protocol::read::{RelationshipFacet, SymbolId, TraversalDirection};
 use spargebra::Query;
-use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
+use spargebra::algebra::{Expression, PropertyPathExpression, QueryExpression};
 use spargebra::term::{NamedNodePattern, TermPattern};
 
 use super::failure;
@@ -11,7 +11,7 @@ use super::{QueryError, VOCABULARY};
 use crate::query::{AdjacencyRequirement, FactRequirements};
 
 enum Pending<'a> {
-    Pattern(&'a GraphPattern),
+    Pattern(&'a QueryExpression),
     Expression(&'a Expression),
 }
 
@@ -42,7 +42,7 @@ fn uniform_path(
         }
         match item {
             PathPending::Visit(path, incoming) => match path {
-                PropertyPathExpression::NamedNode(name) => {
+                PropertyPathExpression::Link(name) => {
                     let Some(facet) = name.as_str().strip_prefix(VOCABULARY).and_then(facet) else {
                         return Ok(None);
                     };
@@ -52,31 +52,31 @@ fn uniform_path(
                         depth: Some(1),
                     });
                 }
-                PropertyPathExpression::Reverse(inner) => {
+                PropertyPathExpression::Inv(inner) => {
                     pending.push(PathPending::Visit(inner, !incoming));
                 }
-                PropertyPathExpression::Sequence(left, right) => {
+                PropertyPathExpression::Seq(left, right) => {
                     pending.extend([
                         PathPending::Sequence,
                         PathPending::Visit(right, incoming),
                         PathPending::Visit(left, incoming),
                     ]);
                 }
-                PropertyPathExpression::Alternative(left, right) => {
+                PropertyPathExpression::Alt(left, right) => {
                     pending.extend([
                         PathPending::Alternative,
                         PathPending::Visit(right, incoming),
                         PathPending::Visit(left, incoming),
                     ]);
                 }
-                PropertyPathExpression::ZeroOrMore(inner)
-                | PropertyPathExpression::OneOrMore(inner) => {
+                PropertyPathExpression::ZeroOrMorePath(inner)
+                | PropertyPathExpression::OneOrMorePath(inner) => {
                     pending.extend([PathPending::Closure, PathPending::Visit(inner, incoming)]);
                 }
-                PropertyPathExpression::ZeroOrOne(inner) => {
+                PropertyPathExpression::ZeroOrOnePath(inner) => {
                     pending.push(PathPending::Visit(inner, incoming));
                 }
-                PropertyPathExpression::NegatedPropertySet(_) => return Ok(None),
+                PropertyPathExpression::Nps(_) => return Ok(None),
             },
             PathPending::Closure => {
                 let value = values
@@ -115,13 +115,13 @@ fn uniform_path(
 impl FactRequirements {
     pub(super) fn from_query(query: &Query, nodes_max: usize) -> Result<Self, QueryError> {
         let pattern = match query {
-            Query::Select { pattern, .. }
-            | Query::Ask { pattern, .. }
-            | Query::Construct { pattern, .. }
-            | Query::Describe { pattern, .. } => pattern,
+            Query::Select(query) => &query.expression,
+            Query::Ask(query) => &query.expression,
+            Query::Construct(query) => &query.expression,
+            Query::Describe(query) => &query.pattern,
         };
         let mut result = Self::default();
-        if matches!(query, Query::Describe { .. }) {
+        if matches!(query, Query::Describe(_)) {
             result.require(FactRequirement::Domain);
             result.require(FactRequirement::Description);
             result.require(FactRequirement::Source);
@@ -163,12 +163,12 @@ impl FactRequirements {
 
     fn pattern<'a>(
         &mut self,
-        pattern: &'a GraphPattern,
+        pattern: &'a QueryExpression,
         pending: &mut Vec<Pending<'a>>,
         nodes_max: usize,
     ) -> Result<(), QueryError> {
         match pattern {
-            GraphPattern::Bgp { patterns } => {
+            QueryExpression::Bgp { patterns } => {
                 if !patterns.is_empty() {
                     self.require(FactRequirement::Domain);
                 }
@@ -206,7 +206,7 @@ impl FactRequirements {
                     }
                 }
             }
-            GraphPattern::Path {
+            QueryExpression::Path {
                 subject,
                 path,
                 object,
@@ -214,13 +214,13 @@ impl FactRequirements {
                 self.require(FactRequirement::Domain);
                 self.path(subject, path, object, nodes_max)?;
             }
-            GraphPattern::Join { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right }
-            | GraphPattern::Lateral { left, right } => {
+            QueryExpression::Join { left, right }
+            | QueryExpression::Union { left, right }
+            | QueryExpression::Minus { left, right }
+            | QueryExpression::Lateral { left, right } => {
                 pending.extend([Pending::Pattern(left), Pending::Pattern(right)]);
             }
-            GraphPattern::LeftJoin {
+            QueryExpression::LeftJoin {
                 left,
                 right,
                 expression,
@@ -228,18 +228,18 @@ impl FactRequirements {
                 pending.extend([Pending::Pattern(left), Pending::Pattern(right)]);
                 pending.extend(expression.iter().map(Pending::Expression));
             }
-            GraphPattern::Filter { expr, inner } => {
+            QueryExpression::Filter { expr, inner } => {
                 pending.extend([Pending::Pattern(inner), Pending::Expression(expr)]);
             }
-            GraphPattern::Extend {
+            QueryExpression::Extend {
                 expression, inner, ..
             } => pending.extend([Pending::Pattern(inner), Pending::Expression(expression)]),
-            GraphPattern::Graph { name, inner } => {
+            QueryExpression::Graph { name, inner } => {
                 self.selection(name, false);
                 pending.push(Pending::Pattern(inner));
             }
-            GraphPattern::Service { name, inner, .. } => self.service(name, inner, nodes_max)?,
-            GraphPattern::OrderBy { inner, expression } => {
+            QueryExpression::Service { name, inner, .. } => self.service(name, inner, nodes_max)?,
+            QueryExpression::OrderBy { inner, expression } => {
                 pending.push(Pending::Pattern(inner));
                 for order in expression {
                     let (spargebra::algebra::OrderExpression::Asc(value)
@@ -247,11 +247,11 @@ impl FactRequirements {
                     pending.push(Pending::Expression(value));
                 }
             }
-            GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. } => pending.push(Pending::Pattern(inner)),
-            GraphPattern::Group {
+            QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. } => pending.push(Pending::Pattern(inner)),
+            QueryExpression::Group {
                 inner, aggregates, ..
             } => {
                 pending.push(Pending::Pattern(inner));
@@ -263,7 +263,7 @@ impl FactRequirements {
                     }
                 }
             }
-            GraphPattern::Values { .. } => {}
+            QueryExpression::Values { .. } => {}
         }
         Ok(())
     }
@@ -281,7 +281,7 @@ impl FactRequirements {
     fn service(
         &mut self,
         name: &NamedNodePattern,
-        inner: &GraphPattern,
+        inner: &QueryExpression,
         nodes_max: usize,
     ) -> Result<(), QueryError> {
         self.selection(name, true);
@@ -451,7 +451,7 @@ impl FactRequirements {
                 return Err(failure::bound("algebra_nodes_max"));
             }
             match path {
-                PropertyPathExpression::NamedNode(name) => {
+                PropertyPathExpression::Link(name) => {
                     let Some(value) = name.as_str().strip_prefix(VOCABULARY).and_then(facet) else {
                         self.require(FactRequirement::CompleteDomain);
                         self.triple(subject, name.as_str(), object);
@@ -462,22 +462,22 @@ impl FactRequirements {
                     }
                     depth = depth.and_then(|value| value.checked_add(1));
                 }
-                PropertyPathExpression::Reverse(inner) => {
+                PropertyPathExpression::Inv(inner) => {
                     reverse = !reverse;
                     mixed = visited != 1;
                     pending.push(inner);
                 }
-                PropertyPathExpression::Sequence(left, right)
-                | PropertyPathExpression::Alternative(left, right) => {
+                PropertyPathExpression::Seq(left, right)
+                | PropertyPathExpression::Alt(left, right) => {
                     pending.extend([left.as_ref(), right.as_ref()]);
                 }
-                PropertyPathExpression::ZeroOrMore(inner)
-                | PropertyPathExpression::OneOrMore(inner) => {
+                PropertyPathExpression::ZeroOrMorePath(inner)
+                | PropertyPathExpression::OneOrMorePath(inner) => {
                     depth = None;
                     pending.push(inner);
                 }
-                PropertyPathExpression::ZeroOrOne(inner) => pending.push(inner),
-                PropertyPathExpression::NegatedPropertySet(_) => {
+                PropertyPathExpression::ZeroOrOnePath(inner) => pending.push(inner),
+                PropertyPathExpression::Nps(_) => {
                     self.require(FactRequirement::CompleteDomain);
                     self.require(FactRequirement::AllOccurrences);
                     self.all_families();
@@ -522,23 +522,9 @@ impl FactRequirements {
     fn expression<'a>(expression: &'a Expression, pending: &mut Vec<Pending<'a>>) {
         match expression {
             Expression::Exists(pattern) => pending.push(Pending::Pattern(pattern)),
-            Expression::Or(left, right)
-            | Expression::And(left, right)
-            | Expression::Equal(left, right)
-            | Expression::SameTerm(left, right)
-            | Expression::Greater(left, right)
-            | Expression::GreaterOrEqual(left, right)
-            | Expression::Less(left, right)
-            | Expression::LessOrEqual(left, right)
-            | Expression::Add(left, right)
-            | Expression::Subtract(left, right)
-            | Expression::Multiply(left, right)
-            | Expression::Divide(left, right) => {
+            Expression::Or(left, right) | Expression::And(left, right) => {
                 pending.extend([Pending::Expression(left), Pending::Expression(right)]);
             }
-            Expression::UnaryPlus(inner)
-            | Expression::UnaryMinus(inner)
-            | Expression::Not(inner) => pending.push(Pending::Expression(inner)),
             Expression::In(value, others) => {
                 pending.push(Pending::Expression(value));
                 pending.extend(others.iter().map(Pending::Expression));
@@ -643,15 +629,15 @@ fn linear_adjacency(patterns: &[spargebra::term::TriplePattern]) -> Option<Adjac
     None
 }
 
-fn single_name_pattern(mut pattern: &GraphPattern) -> Option<String> {
+fn single_name_pattern(mut pattern: &QueryExpression) -> Option<String> {
     loop {
         match pattern {
-            GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. }
-            | GraphPattern::OrderBy { inner, .. } => pattern = inner,
-            GraphPattern::Bgp { patterns } if patterns.len() == 2 => {
+            QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. }
+            | QueryExpression::OrderBy { inner, .. } => pattern = inner,
+            QueryExpression::Bgp { patterns } if patterns.len() == 2 => {
                 let triple = patterns.iter().find(|triple| matches!(&triple.predicate, NamedNodePattern::NamedNode(predicate) if predicate.as_str().strip_prefix(VOCABULARY) == Some("name")))?;
                 let TermPattern::Literal(value) = &triple.object else {
                     return None;
@@ -666,15 +652,15 @@ fn single_name_pattern(mut pattern: &GraphPattern) -> Option<String> {
     }
 }
 
-fn single_usage_pattern(mut pattern: &GraphPattern) -> Option<Vec<SymbolId>> {
+fn single_usage_pattern(mut pattern: &QueryExpression) -> Option<Vec<SymbolId>> {
     loop {
         match pattern {
-            GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. }
-            | GraphPattern::OrderBy { inner, .. } => pattern = inner,
-            GraphPattern::Bgp { patterns } => {
+            QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. }
+            | QueryExpression::OrderBy { inner, .. } => pattern = inner,
+            QueryExpression::Bgp { patterns } => {
                 let (anchor, usage) = patterns.iter().find_map(|triple| {
                     let NamedNodePattern::NamedNode(predicate) = &triple.predicate else {
                         return None;

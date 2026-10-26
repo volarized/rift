@@ -109,7 +109,7 @@ fn rows(answer: QueryAnswer) -> Result<Vec<BTreeMap<String, RdfTerm>>, Box<dyn E
 #[test]
 fn test_ranked_service_reuses_existing_hit_scores_and_symbol_identity() -> TestResult {
     let query = PreparedQuery::parse(
-        "SELECT ?symbol ?score { SERVICE :search { ?hit :query 'config'; :symbol ?symbol; :score ?score } }",
+        "SELECT ?symbol ?score (?score = 0.5e0 AS ?same) { SERVICE :search { ?hit :query 'config'; :symbol ?symbol; :score ?score } }",
         limits(),
     )?;
     assert!(!query.requirements().requires(FactRequirement::Domain));
@@ -130,7 +130,16 @@ fn test_ranked_service_reuses_existing_hit_scores_and_symbol_identity() -> TestR
             value: "rift://symbol/local/rust/app/config".to_owned()
         }
     );
-    assert!(matches!(&answer[0]["score"], RdfTerm::Literal { value, .. } if value == "0.5"));
+    assert!(
+        matches!(&answer[0]["score"], RdfTerm::Literal { datatype, .. } if datatype == "http://www.w3.org/2001/XMLSchema#double")
+    );
+    assert_eq!(
+        answer[0]["same"],
+        RdfTerm::Literal {
+            value: "true".to_owned(),
+            datatype: "http://www.w3.org/2001/XMLSchema#boolean".to_owned()
+        }
+    );
     Ok(())
 }
 

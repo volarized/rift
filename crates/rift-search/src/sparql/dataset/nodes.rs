@@ -58,7 +58,7 @@ pub(super) fn project(facts: &QueryFacts, output: &mut Projection) -> Result<(),
             output.push(
                 subject.clone(),
                 vocabulary("id")?,
-                Literal::new_simple_literal(row.node.id.0.as_str()).into(),
+                Literal::from(row.node.id.0.as_str()).into(),
             )?;
             output.push(
                 subject.clone(),

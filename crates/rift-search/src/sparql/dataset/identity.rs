@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use oxigraph::model::{BlankNode, Term};
+use oxigraph::model::{BlankNode, BlankNodeRef, Term};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity};
 
 use super::{Pattern, QueryError, iri};
@@ -93,7 +93,9 @@ impl IdentityMap {
         match term {
             Term::BlankNode(value) if !self.blank_prefix.is_empty() => {
                 let label = value.as_str().strip_prefix(&self.blank_prefix)?;
-                BlankNode::new(label).ok().map(Term::from)
+                BlankNodeRef::new(label)
+                    .ok()
+                    .map(|value| Term::from(value.into_owned()))
             }
             _ => self
                 .backward

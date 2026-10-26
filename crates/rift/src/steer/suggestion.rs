@@ -385,11 +385,11 @@ pub(super) mod tests {
             .parse_query(&request.query)
             .expect("standalone query parses");
         let (offset, length) = match parsed {
-            spargebra::Query::Select {
-                pattern: spargebra::algebra::GraphPattern::Slice { start, length, .. },
+            spargebra::Query::Select(spargebra::query::SelectQuery {
+                expression: spargebra::algebra::QueryExpression::Slice { offset, limit, .. },
                 ..
-            } => (start, length),
-            spargebra::Query::Select { .. } => (0, None),
+            }) => (offset, limit),
+            spargebra::Query::Select(_) => (0, None),
             _ => panic!("steering must select bindings"),
         };
         let mut options = json!({"pattern": producer.pattern});
@@ -404,9 +404,7 @@ pub(super) mod tests {
             options["target"] = serde_json::to_value(producer.target).expect("target serializes");
         }
         if let Some(limit) = length {
-            if limit != usize::try_from(super::GREP_HEAD_LIMIT_DEFAULT).expect("default fits")
-                || offset != 0
-            {
+            if limit != super::GREP_HEAD_LIMIT_DEFAULT || offset != 0 {
                 options["limit"] = json!(limit);
             }
             if offset != 0 {

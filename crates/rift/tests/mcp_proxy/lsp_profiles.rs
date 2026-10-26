@@ -225,7 +225,7 @@ async fn caller_read(
     hit: &ProfileSymbol,
     logs: &Path,
 ) -> TestResult {
-    let seed = oxigraph::model::NamedNode::new(hit.id.as_str())?;
+    let seed = oxigraph::model::NamedNodeRef::new(hit.id.as_str())?;
     let service =
         oxigraph::model::NamedNode::new(format!("urn:rift:result:{}", hit.view.id.as_str()))?;
     let arguments = json!({"query":format!(

@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use spargebra::Query;
-use spargebra::algebra::GraphPattern;
-use spargebra::term::{NamedNodePattern, TermPattern};
+use spargebra::algebra::QueryExpression;
+use spargebra::term::{NamedNodePattern, TermPattern, TermTemplate};
 
 use super::{PreparedQuery, RESULT_SERVICE_PREFIX};
 
@@ -16,7 +16,7 @@ pub fn continuation_query(
     view: &rift_protocol::symbol_read::CapturedViewId,
     page: u64,
 ) -> Result<String, super::QueryError> {
-    use oxigraph::model::{NamedNode, Variable};
+    use oxigraph::model::{NamedNode, Variable, VariableRef};
     let service = NamedNode::new(format!(
         "{RESULT_SERVICE_PREFIX}{}?page={page}",
         view.as_str()
@@ -26,7 +26,7 @@ pub fn continuation_query(
         rift_protocol::query::QueryAnswer::Bindings { variables, .. } => {
             let variables = variables
                 .iter()
-                .map(|name| Variable::new(name.as_str()).map(|variable| variable.to_string()))
+                .map(|name| VariableRef::new(name.as_str()).map(|variable| variable.to_string()))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(super::failure::invalid)?;
             let projected = if variables.is_empty() {
@@ -93,10 +93,10 @@ impl PreparedQuery {
             return None;
         }
         let (pattern, form) = match &self.query {
-            Query::Select {
-                pattern: GraphPattern::Project { inner, variables },
+            Query::Select(spargebra::query::SelectQuery {
+                expression: QueryExpression::Project { inner, variables },
                 ..
-            } => (
+            }) => (
                 inner.as_ref(),
                 PageForm::Bindings {
                     variables: variables
@@ -105,18 +105,20 @@ impl PreparedQuery {
                         .collect(),
                 },
             ),
-            Query::Construct {
-                template, pattern, ..
-            } if template.len() == 1 => {
+            Query::Construct(spargebra::query::ConstructQuery {
+                template,
+                expression: pattern,
+                ..
+            }) if template.len() == 1 => {
                 let triple = &template[0];
-                if !matches!(&triple.subject, TermPattern::Variable(variable) if variable.as_str() == "s")
+                if !matches!(&triple.subject, TermTemplate::Variable(variable) if variable.as_str() == "s")
                     || !matches!(&triple.predicate, NamedNodePattern::Variable(variable) if variable.as_str() == "p")
-                    || !matches!(&triple.object, TermPattern::Variable(variable) if variable.as_str() == "o")
+                    || !matches!(&triple.object, TermTemplate::Variable(variable) if variable.as_str() == "o")
                 {
                     return None;
                 }
                 let pattern = match pattern {
-                    GraphPattern::Project { inner, variables } => {
+                    QueryExpression::Project { inner, variables } => {
                         if variables.len() != 3
                             || !["s", "p", "o"].iter().all(|name| {
                                 variables.iter().any(|variable| variable.as_str() == *name)
@@ -132,7 +134,7 @@ impl PreparedQuery {
             }
             _ => return None,
         };
-        let GraphPattern::Service {
+        let QueryExpression::Service {
             name: NamedNodePattern::NamedNode(name),
             inner,
             silent: false,
@@ -140,7 +142,7 @@ impl PreparedQuery {
         else {
             return None;
         };
-        let GraphPattern::Bgp { patterns } = inner.as_ref() else {
+        let QueryExpression::Bgp { patterns } = inner.as_ref() else {
             return None;
         };
         let passthrough = match &form {

@@ -106,7 +106,7 @@ mod tests {
     use super::*;
     use crate::sparql::{PreparedQuery, QueryLimits};
     use spargebra::Query;
-    use spargebra::algebra::GraphPattern;
+    use spargebra::algebra::QueryExpression;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -155,25 +155,27 @@ mod tests {
         }))?;
         let recipe = retrieval_query(&producer)?;
         let parsed = spargebra::SparqlParser::new().parse_query(&recipe.query)?;
-        let Query::Select {
-            pattern: GraphPattern::Slice { start, length, .. },
+        let Query::Select(spargebra::query::SelectQuery {
+            expression: QueryExpression::Slice { offset, limit, .. },
             ..
-        } = parsed
+        }) = parsed
         else {
             return Err("recipe must carry the requested outer slice".into());
         };
-        assert_eq!((start, length), (100, Some(50)));
+        assert_eq!((offset, limit), (100, Some(50)));
         let prepared = PreparedQuery::parse(&recipe.query, limits())?;
         assert_eq!(prepared.retrievals()[0].page_index, 0);
         assert_eq!(prepared.retrievals()[0].limit, Some(50));
         let unbounded: SearchParams = serde_json::from_value(serde_json::json!({"pattern":"x"}))?;
         let recipe = retrieval_query(&unbounded)?;
-        let Query::Select { pattern, .. } =
-            spargebra::SparqlParser::new().parse_query(&recipe.query)?
+        let Query::Select(spargebra::query::SelectQuery {
+            expression: pattern,
+            ..
+        }) = spargebra::SparqlParser::new().parse_query(&recipe.query)?
         else {
             return Err("recipe must select bindings".into());
         };
-        assert!(!matches!(pattern, GraphPattern::Slice { .. }));
+        assert!(!matches!(pattern, QueryExpression::Slice { .. }));
         Ok(())
     }
 

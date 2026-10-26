@@ -86,10 +86,10 @@ fn admit_item(count: usize, limits: QueryLimits) -> Result<(), QueryError> {
 fn term(value: Term) -> RdfTerm {
     match value {
         Term::NamedNode(value) => RdfTerm::Iri {
-            value: value.into_string(),
+            value: value.into_string().into(),
         },
         Term::BlankNode(value) => RdfTerm::BlankNode {
-            value: value.into_string(),
+            value: value.into_string().into(),
         },
         Term::Literal(value) => match value.language() {
             Some(language) => RdfTerm::LanguageLiteral {

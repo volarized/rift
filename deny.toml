@@ -63,6 +63,11 @@ allow-wildcard-paths = true
 # candle-transformers pins, uses bit-set 0.8 and bit-vec 0.8 beside toasty's
 # bit-set 0.11 and bit-vec 0.10.
 skip = [
+  # Oxigraph's spargebra parser uses chumsky 0.13, which requires hashbrown 0.15
+  # and its foldhash 0.1 default hasher beside the workspace's newer versions.
+  { name = "hashbrown", version = "0.15.5" },
+  { name = "foldhash", version = "0.1.5" },
+
   # Rig 0.45 still requires sha2 0.10 and its digest 0.10
   # stack. Rift uses sha2 0.11, whose ARM and x86 backends detect CPU features
   # at runtime without the removed asm feature.
@@ -137,6 +142,8 @@ unknown-git = "deny"
 # come from the ruff repository at a pinned revision.
 # The Cython grammar is unpublished and pinned in the workspace dependencies.
 allow-git = [
+  # The pinned Oxigraph revision carries the maintained quick-xml security update.
+  "https://github.com/oxigraph/oxigraph",
   "https://github.com/astral-sh/ruff",
   "https://github.com/b0o/tree-sitter-cython",
   "https://github.com/tree-sitter/tree-sitter-typescript",

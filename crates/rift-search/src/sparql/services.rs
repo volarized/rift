@@ -3,15 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use oxigraph::model::{BlankNode, Literal, NamedNode, Term, Variable};
+use oxigraph::model::{BlankNode, Literal, NamedNode, NamedNodeRef, Term, Variable};
 use oxigraph::sparql::{QueryResults, QuerySolutionIter, ServiceHandler, SparqlEvaluator};
 use oxiri::Iri;
+use oxstr::OxString;
 use rift_protocol::query::{QueryAnswer, RdfTerm};
 use rift_protocol::read::{SearchParams, SearchResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use spargebra::Query;
-use spargebra::algebra::GraphPattern;
+use spargebra::algebra::QueryExpression;
 use spargebra::term::{NamedNodePattern, TermPattern};
 
 use super::dataset::VirtualDataset;
@@ -105,7 +106,9 @@ impl QueryServices {
                         if let Some(identity) = &symbol.id
                             && selected
                                 != Term::NamedNode(
-                                    NamedNode::new(identity.as_str()).map_err(failure::invalid)?,
+                                    NamedNodeRef::new(identity.as_str())
+                                        .map_err(failure::invalid)?
+                                        .into_owned(),
                                 )
                         {
                             return Err(failure::evaluation(
@@ -198,8 +201,8 @@ impl ServiceHandler for RetrievalHandler {
 
     fn handle(
         &self,
-        pattern: &GraphPattern,
-        base_iri: Option<&Iri<String>>,
+        pattern: &QueryExpression,
+        base_iri: Option<&Iri<OxString>>,
     ) -> Result<QuerySolutionIter<'static>, QueryError> {
         let request = request(pattern, self.limits.algebra_nodes_max)?;
         let record = self
@@ -213,11 +216,11 @@ impl ServiceHandler for RetrievalHandler {
             self.cancellation.0.clone(),
         )?
         .with_retrieval(Arc::clone(record), Arc::clone(&self.dataset));
-        let query = Query::Select {
+        let query = Query::Select(spargebra::query::SelectQuery {
             dataset: None,
-            pattern: execution_pattern(pattern, self.limits.algebra_nodes_max)?,
+            expression: execution_pattern(pattern, self.limits.algebra_nodes_max)?,
             base_iri: base_iri.cloned(),
-        };
+        });
         solutions(
             SparqlEvaluator::new()
                 .with_cancellation_token(self.cancellation.0.clone())
@@ -286,8 +289,8 @@ impl ServiceHandler for RetainedHandler {
 
     fn handle(
         &self,
-        pattern: &GraphPattern,
-        base_iri: Option<&Iri<String>>,
+        pattern: &QueryExpression,
+        base_iri: Option<&Iri<OxString>>,
     ) -> Result<QuerySolutionIter<'static>, QueryError> {
         match self {
             Self::Bindings(handler) => handler.handle(pattern, base_iri),
@@ -299,11 +302,11 @@ impl ServiceHandler for RetainedHandler {
                 let dataset =
                     VirtualDataset::new(QueryFacts::default(), *limits, cancellation.0.clone())?
                         .with_retained_graph(Arc::clone(triples));
-                let query = Query::Select {
+                let query = Query::Select(spargebra::query::SelectQuery {
                     dataset: None,
-                    pattern: pattern.clone(),
+                    expression: pattern.clone(),
                     base_iri: base_iri.cloned(),
-                };
+                });
                 solutions(
                     SparqlEvaluator::new()
                         .with_cancellation_token(cancellation.0.clone())
@@ -322,8 +325,8 @@ impl ServiceHandler for BindingHandler {
 
     fn handle(
         &self,
-        pattern: &GraphPattern,
-        base_iri: Option<&Iri<String>>,
+        pattern: &QueryExpression,
+        base_iri: Option<&Iri<OxString>>,
     ) -> Result<QuerySolutionIter<'static>, QueryError> {
         if self.bindings.len() > self.limits.result_items_max {
             return Err(failure::bound("result_items_max"));
@@ -338,14 +341,14 @@ impl ServiceHandler for BindingHandler {
                 variables.push(variable.clone());
             }
         });
-        let query = Query::Select {
+        let query = Query::Select(spargebra::query::SelectQuery {
             dataset: None,
-            pattern: GraphPattern::Project {
+            expression: QueryExpression::Project {
                 inner: Box::new(pattern.clone()),
                 variables: variables.clone(),
             },
             base_iri: base_iri.cloned(),
-        };
+        });
         let evaluator = SparqlEvaluator::new()
             .with_cancellation_token(self.cancellation.0.clone())
             .for_query(query);
@@ -397,7 +400,7 @@ fn solutions(result: QueryResults<'static>) -> Result<QuerySolutionIter<'static>
 }
 
 pub(super) fn request(
-    pattern: &GraphPattern,
+    pattern: &QueryExpression,
     nodes_max: usize,
 ) -> Result<SearchParams, QueryError> {
     let mut fields = Map::new();
@@ -410,7 +413,7 @@ pub(super) fn request(
             return Err(failure::bound("algebra_nodes_max"));
         }
         match pattern {
-            GraphPattern::Bgp { patterns } => {
+            QueryExpression::Bgp { patterns } => {
                 if patterns.len() > nodes_max {
                     return Err(failure::bound("algebra_nodes_max"));
                 }
@@ -429,28 +432,28 @@ pub(super) fn request(
                     }
                 }
             }
-            GraphPattern::Join { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right }
-            | GraphPattern::LeftJoin { left, right, .. }
-            | GraphPattern::Lateral { left, right } => {
+            QueryExpression::Join { left, right }
+            | QueryExpression::Union { left, right }
+            | QueryExpression::Minus { left, right }
+            | QueryExpression::LeftJoin { left, right, .. }
+            | QueryExpression::Lateral { left, right } => {
                 pending.extend([left.as_ref(), right.as_ref()]);
             }
-            GraphPattern::Filter { inner, .. }
-            | GraphPattern::Extend { inner, .. }
-            | GraphPattern::Graph { inner, .. }
-            | GraphPattern::OrderBy { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. }
-            | GraphPattern::Group { inner, .. } => pending.push(inner),
-            GraphPattern::Service { .. } => {
+            QueryExpression::Filter { inner, .. }
+            | QueryExpression::Extend { inner, .. }
+            | QueryExpression::Graph { inner, .. }
+            | QueryExpression::OrderBy { inner, .. }
+            | QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. }
+            | QueryExpression::Group { inner, .. } => pending.push(inner),
+            QueryExpression::Service { .. } => {
                 return Err(failure::parse(
                     "retrieval services cannot acquire another service",
                 ));
             }
-            GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
+            QueryExpression::Path { .. } | QueryExpression::Values { .. } => {}
         }
     }
     if !include.is_empty() && !fields.contains_key("include") {
@@ -488,7 +491,7 @@ fn input(
             TermPattern::Literal(value) => {
                 value.datatype().as_str() != "http://www.w3.org/2001/XMLSchema#string"
             }
-            TermPattern::Variable(_) | TermPattern::BlankNode(_) => false,
+            TermPattern::Variable(_) => false,
             TermPattern::NamedNode(_) => true,
         }
     {
@@ -513,7 +516,7 @@ fn input(
                 .unwrap_or(value.as_str())
                 .to_owned(),
         ),
-        TermPattern::Variable(_) | TermPattern::BlankNode(_) => return Ok(()),
+        TermPattern::Variable(_) => return Ok(()),
     };
     if let Some(previous) = fields.insert(key.to_owned(), value.clone())
         && previous != value
@@ -546,7 +549,10 @@ pub(super) fn rdf_term(value: &RdfTerm) -> Result<Term, QueryError> {
     }
 }
 
-fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPattern, QueryError> {
+fn execution_pattern(
+    pattern: &QueryExpression,
+    nodes_max: usize,
+) -> Result<QueryExpression, QueryError> {
     let rdf_type =
         oxigraph::model::NamedNode::new("http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
             .map_err(failure::parse)?;
@@ -561,7 +567,7 @@ fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPa
             return Err(failure::bound("algebra_nodes_max"));
         }
         match pattern {
-            GraphPattern::Bgp { patterns } => {
+            QueryExpression::Bgp { patterns } => {
                 let mut anchors = Vec::new();
                 patterns.retain(|triple| {
                     let NamedNodePattern::NamedNode(predicate) = &triple.predicate else {
@@ -571,10 +577,7 @@ fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPa
                         return true;
                     };
                     if !INPUT_FIELDS.contains(&key)
-                        || matches!(
-                            triple.object,
-                            TermPattern::Variable(_) | TermPattern::BlankNode(_)
-                        )
+                        || matches!(triple.object, TermPattern::Variable(_))
                     {
                         return true;
                     }
@@ -588,25 +591,25 @@ fn execution_pattern(pattern: &GraphPattern, nodes_max: usize) -> Result<GraphPa
                 });
                 patterns.extend(anchors);
             }
-            GraphPattern::Join { left, right }
-            | GraphPattern::Union { left, right }
-            | GraphPattern::Minus { left, right }
-            | GraphPattern::LeftJoin { left, right, .. }
-            | GraphPattern::Lateral { left, right } => {
+            QueryExpression::Join { left, right }
+            | QueryExpression::Union { left, right }
+            | QueryExpression::Minus { left, right }
+            | QueryExpression::LeftJoin { left, right, .. }
+            | QueryExpression::Lateral { left, right } => {
                 pending.extend([left.as_mut(), right.as_mut()]);
             }
-            GraphPattern::Filter { inner, .. }
-            | GraphPattern::Extend { inner, .. }
-            | GraphPattern::Graph { inner, .. }
-            | GraphPattern::OrderBy { inner, .. }
-            | GraphPattern::Project { inner, .. }
-            | GraphPattern::Distinct { inner }
-            | GraphPattern::Reduced { inner }
-            | GraphPattern::Slice { inner, .. }
-            | GraphPattern::Group { inner, .. } => pending.push(inner),
-            GraphPattern::Service { .. }
-            | GraphPattern::Path { .. }
-            | GraphPattern::Values { .. } => {}
+            QueryExpression::Filter { inner, .. }
+            | QueryExpression::Extend { inner, .. }
+            | QueryExpression::Graph { inner, .. }
+            | QueryExpression::OrderBy { inner, .. }
+            | QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. }
+            | QueryExpression::Group { inner, .. } => pending.push(inner),
+            QueryExpression::Service { .. }
+            | QueryExpression::Path { .. }
+            | QueryExpression::Values { .. } => {}
         }
     }
     Ok(pattern)

@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::fmt::Write as _;
 
-use oxigraph::model::{Literal, NamedNode};
+use oxigraph::model::{Literal, NamedNode, NamedNodeRef};
 use rift_protocol::query::{QueryLanguage, QueryParams};
 use rift_protocol::read::SearchParams;
 use serde_json::Value;
@@ -98,7 +98,7 @@ pub(crate) fn projected_retrieval(
 
 /// Projects a graph path and its endpoint names through the public SPARQL surface.
 pub(crate) fn path(seed: &str, expression: &str) -> TestResult<QueryParams> {
-    let seed = NamedNode::new(seed)?;
+    let seed = NamedNodeRef::new(seed)?;
     Ok(QueryParams {
         query: format!(
             "SELECT DISTINCT ?symbol ?name {{ {seed} {expression} ?symbol . ?symbol :name ?name }} ORDER BY ?name"
@@ -109,7 +109,7 @@ pub(crate) fn path(seed: &str, expression: &str) -> TestResult<QueryParams> {
 
 /// Physical occurrences of one symbol, with useful locations in the same request.
 pub(crate) fn usages(symbol: &str) -> TestResult<QueryParams> {
-    let symbol = NamedNode::new(symbol)?;
+    let symbol = NamedNodeRef::new(symbol)?;
     Ok(QueryParams {
         query: format!(
             "SELECT ?usage ?unit ?start ?end {{ {symbol} :usages ?usage . ?usage :unit ?unit; :start ?start; :end ?end }} ORDER BY ?unit ?start ?end"
@@ -120,7 +120,7 @@ pub(crate) fn usages(symbol: &str) -> TestResult<QueryParams> {
 
 /// Incoming reference endpoints and the original relationship evidence.
 pub(crate) fn incoming_references(symbol: &str) -> TestResult<QueryParams> {
-    let target = NamedNode::new(symbol)?;
+    let target = NamedNodeRef::new(symbol)?;
     Ok(QueryParams {
         query: format!(
             "SELECT DISTINCT ?caller ?name ?path ?derivation ?facet {{ ?caller :references {target}; :name ?name; :path ?path . ?relationship a :Relationship; :from ?caller; :to {target}; :derivation ?derivation; :facets ?facet . FILTER(?facet = :references) }} ORDER BY ?caller"
