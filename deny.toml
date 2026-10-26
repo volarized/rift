@@ -63,6 +63,10 @@ allow-wildcard-paths = true
 # candle-transformers pins, uses bit-set 0.8 and bit-vec 0.8 beside toasty's
 # bit-set 0.11 and bit-vec 0.10.
 skip = [
+  # Ruff and Candle require zip 8; direct archive readers use zip 9 with patched Zstandard.
+  { name = "zip", version = "8.6.0" },
+  # These two zip releases require typed-path 0.12 and 0.13 respectively.
+  { name = "typed-path", version = "0.12.3" },
   # Oxigraph's spargebra parser uses chumsky 0.13, which requires hashbrown 0.15
   # and its foldhash 0.1 default hasher beside the workspace's newer versions.
   { name = "hashbrown", version = "0.15.5" },

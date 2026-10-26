@@ -88,9 +88,15 @@ fn identical_zip_members_retain_one_file_after_normalization() -> TestResult {
 fn zip_members_bytes(
     entries: &[(&str, &[u8], tar::EntryType)],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    zip_members_bytes_with_options(entries, zip::write::SimpleFileOptions::default())
+}
+
+fn zip_members_bytes_with_options(
+    entries: &[(&str, &[u8], tar::EntryType)],
+    options: zip::write::SimpleFileOptions,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for &(path, content, kind) in entries {
-        let options = zip::write::SimpleFileOptions::default();
         match kind {
             tar::EntryType::Directory => archive.add_directory(path, options)?,
             tar::EntryType::Symlink => archive.add_symlink(path, "target", options)?,
@@ -146,7 +152,7 @@ fn unicode_name_zip(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         extra.extend_from_slice(&0_u32.to_le_bytes());
         extra.extend_from_slice(name.as_bytes());
         let mut options = zip::write::FullFileOptions::default();
-        options.add_extra_data(0x7075, extra, true)?;
+        options.add_extra_field(0x7075, extra, true)?;
         archive.start_file(path, options)?;
         archive.write_all(b"text")?;
     }
@@ -1509,6 +1515,29 @@ fn complete_member_inventory_refuses_file_and_link_parents_in_both_orders() -> T
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_zip_members_preserve_exact_bytes_for_supported_compression() -> TestResult {
+    let source = "pub fn beacon() { /* λ */ }\r\n".as_bytes();
+    for method in [
+        zip::CompressionMethod::Stored,
+        zip::CompressionMethod::Deflated,
+        zip::CompressionMethod::Zstd,
+    ] {
+        let bytes = zip_members_bytes_with_options(
+            &[("release/src/café.rs", source, tar::EntryType::Regular)],
+            zip::write::SimpleFileOptions::default().compression_method(method),
+        )?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))?;
+        assert_eq!(archive.by_index(0)?.compression(), method);
+        let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+        assert_eq!(files.files().len(), 1, "{method:?}");
+        assert_eq!(files.files()[&ProjectPath::new("src/café.rs")?], source);
+        assert!(files.skipped_links().is_empty(), "{method:?}");
+        assert_eq!(files.digest(), FileDigest::of(&bytes));
     }
     Ok(())
 }
