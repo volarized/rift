@@ -212,3 +212,7 @@ async def check_artifact(binary: Path, version: str) -> None:
             finally:
                 retain_collector(base, telemetry)
             print(collector_line(telemetry), flush=True)
+
+        from rift_dev.check_sparql_conformance import check
+
+        await check(binary, version, base / "sparql-query")

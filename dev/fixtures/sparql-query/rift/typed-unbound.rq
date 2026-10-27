@@ -1,0 +1,1 @@
+SELECT ?integer ?language ?missing WHERE { BIND(7 AS ?integer) BIND("bonjour"@fr AS ?language) }

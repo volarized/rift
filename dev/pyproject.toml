@@ -28,6 +28,7 @@ packages = ["src/rift_dev"]
 
 [dependency-groups]
 dev = [
+    { include-group = "conformance" },
     "ruff==0.17.2",
     "ty==0.0.91",
     "types-pywin32==312.0.0.20261006",
@@ -35,3 +36,5 @@ dev = [
     "tree-sitter==0.26.0",
     "tree-sitter-rust==0.24.2",
 ]
+
+conformance = ["rdflib==7.6.0"]

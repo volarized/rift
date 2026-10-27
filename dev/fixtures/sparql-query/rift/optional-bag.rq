@@ -1,0 +1,1 @@
+SELECT ?value ?label WHERE { VALUES ?value { 2 1 2 } OPTIONAL { VALUES (?value ?label) { (1 <urn:label:one>) } } } ORDER BY ?value

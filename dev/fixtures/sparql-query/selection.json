@@ -1,0 +1,413 @@
+{
+  "upstream": {
+    "repository": "https://github.com/w3c/rdf-tests",
+    "revision": "bfefa770267ec0e5b6e45764bbca4ee43789ba72"
+  },
+  "oracle": {
+    "name": "rdflib",
+    "version": "7.6.0",
+    "revision": "8b32146a0f9cb748c2068662e50d02b42fc86dfd",
+    "processor": "rdflib.plugins.sparql.processor.SPARQLProcessor",
+    "store": "Memory",
+    "use_store_provided": false
+  },
+  "scope": "Twelve data-independent upstream query cases and five Rift supplemental cases. This subset is a development check, not full W3C conformance or certification.",
+  "exclusions": [
+    "Upstream queries that read triples or named graphs",
+    "SERVICE and remote data",
+    "Update syntax",
+    "Cross-result blank-node label comparison",
+    "Unordered SELECT results with more than one row"
+  ],
+  "cases": [
+    {
+      "id": "functions/concat-empty",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#concat-empty",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/concat-empty.rq",
+      "result": "w3c/sparql/sparql11/functions/concat-empty.srx",
+      "data": "w3c/sparql/sparql11/functions/data.ttl"
+    },
+    {
+      "id": "functions/iri01",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri01",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/iri01.rq",
+      "result": "w3c/sparql/sparql11/functions/iri01.srx",
+      "data": "w3c/sparql/sparql11/functions/data.ttl"
+    },
+    {
+      "id": "functions/iri02",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#iri02",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/iri02.rq",
+      "result": "w3c/sparql/sparql11/functions/iri02.srx",
+      "data": "w3c/sparql/sparql11/functions/data.ttl"
+    },
+    {
+      "id": "functions/if02",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#if02",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/if02.rq",
+      "result": "w3c/sparql/sparql11/functions/if02.srx",
+      "data": "w3c/sparql/sparql11/functions/data2.ttl"
+    },
+    {
+      "id": "functions/strlang04",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#strlang04",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/strlang04.rq",
+      "result": "w3c/sparql/sparql11/functions/strlang04.srx",
+      "data": "w3c/sparql/sparql11/functions/data-empty.nt"
+    },
+    {
+      "id": "functions/now01",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#now01",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/now01.rq",
+      "result": "w3c/sparql/sparql11/functions/now01.srx",
+      "data": "w3c/sparql/sparql11/functions/data.ttl"
+    },
+    {
+      "id": "functions/uuid01",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#uuid01",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/uuid01.rq",
+      "result": "w3c/sparql/sparql11/functions/uuid01.srx",
+      "data": "w3c/sparql/sparql11/functions/data-empty.nt"
+    },
+    {
+      "id": "functions/struuid01",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/functions/manifest#struuid01",
+      "manifest": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "query": "w3c/sparql/sparql11/functions/struuid01.rq",
+      "result": "w3c/sparql/sparql11/functions/struuid01.srx",
+      "data": "w3c/sparql/sparql11/functions/data-empty.nt"
+    },
+    {
+      "id": "aggregates/agg-groupconcat-04",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-groupconcat-04",
+      "manifest": "w3c/sparql/sparql11/aggregates/manifest.ttl",
+      "query": "w3c/sparql/sparql11/aggregates/agg-groupconcat-4.rq",
+      "result": "w3c/sparql/sparql11/aggregates/agg-groupconcat-4.srx",
+      "data": null
+    },
+    {
+      "id": "aggregates/agg-groupconcat-05",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-groupconcat-05",
+      "manifest": "w3c/sparql/sparql11/aggregates/manifest.ttl",
+      "query": "w3c/sparql/sparql11/aggregates/agg-groupconcat-5.rq",
+      "result": "w3c/sparql/sparql11/aggregates/agg-groupconcat-5.srx",
+      "data": null
+    },
+    {
+      "id": "aggregates/agg-groupconcat-06",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-groupconcat-06",
+      "manifest": "w3c/sparql/sparql11/aggregates/manifest.ttl",
+      "query": "w3c/sparql/sparql11/aggregates/agg-groupconcat-6.rq",
+      "result": "w3c/sparql/sparql11/aggregates/agg-groupconcat-6.srx",
+      "data": null
+    },
+    {
+      "id": "aggregates/agg-groupconcat-distinct",
+      "case": "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/aggregates/manifest#agg-groupconcat-distinct",
+      "manifest": "w3c/sparql/sparql11/aggregates/manifest.ttl",
+      "query": "w3c/sparql/sparql11/aggregates/agg-groupconcat-distinct.rq",
+      "result": "w3c/sparql/sparql11/aggregates/agg-groupconcat-distinct.srx",
+      "data": null
+    }
+  ],
+  "supplemental": [
+    {
+      "id": "rift/ordered-window",
+      "query": "rift/ordered-window.rq"
+    },
+    {
+      "id": "rift/grouped-bag",
+      "query": "rift/grouped-bag.rq"
+    },
+    {
+      "id": "rift/optional-bag",
+      "query": "rift/optional-bag.rq",
+      "result": "rift/optional-bag.srj"
+    },
+    {
+      "id": "rift/typed-unbound",
+      "query": "rift/typed-unbound.rq"
+    },
+    {
+      "id": "rift/constructed-blank-nodes",
+      "query": "rift/constructed-blank-nodes.rq"
+    }
+  ],
+  "assets": [
+    {
+      "path": "w3c/LICENSE.md",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/LICENSE.md",
+      "sha256": "7fa36904d5d6d32848307af7b22d416b708aaa0b98f5c719b26adb5ed3594b2a",
+      "bytes": 173
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-4.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-4.rq",
+      "sha256": "481c4c774329ee995ac213778738e96327d656cdd3183dd768e576787b3bd46d",
+      "bytes": 153
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-4.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-4.srx",
+      "sha256": "e8f8b376266147fcb77ef51591d752aab8ddfcc4205db62322cf32d06caa3983",
+      "bytes": 124
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-5.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-5.rq",
+      "sha256": "a18af5e24499383acf581f6397c2eb9cfe832d7340b9aea80ca96c63a0102271",
+      "bytes": 153
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-5.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-5.srx",
+      "sha256": "f8f69b5faf7924060d4fd1426258513a05150512de8d2e1c205d2175a15bba98",
+      "bytes": 121
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-6.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-6.rq",
+      "sha256": "b2587ab1faa5aa2f3e8cc9b03ae1474551925971475a040b025a1c4f7281b179",
+      "bytes": 130
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-6.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-6.srx",
+      "sha256": "f8f69b5faf7924060d4fd1426258513a05150512de8d2e1c205d2175a15bba98",
+      "bytes": 121
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-distinct.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-distinct.rq",
+      "sha256": "3816c797a0867b2c1c3bda62a35d2a5a93b16c3e296316ead5b3fd7b62c2a164",
+      "bytes": 160
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/agg-groupconcat-distinct.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/agg-groupconcat-distinct.srx",
+      "sha256": "f8f69b5faf7924060d4fd1426258513a05150512de8d2e1c205d2175a15bba98",
+      "bytes": 121
+    },
+    {
+      "path": "w3c/sparql/sparql11/aggregates/manifest.ttl",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/aggregates/manifest.ttl",
+      "sha256": "9942c026d66bd84294f2d5bb6516234b09d3782fa6f106e502e812e86133ff53",
+      "bytes": 17544
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/concat-empty.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/concat-empty.rq",
+      "sha256": "409ec17e524032d19ea2a72a5b7306666181de7133bb196f0378632b3a20d9c9",
+      "bytes": 35
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/concat-empty.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/concat-empty.srx",
+      "sha256": "fecc8ba5f73bd1758a91d620e5a2f03d60489cebb8315b5227e00112b02063c4",
+      "bytes": 233
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/data-empty.nt",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/data-empty.nt",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/data.ttl",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/data.ttl",
+      "sha256": "82629b64020cb43c1133232d70a61073a2f939952e08330fe9a09aa8178a791e",
+      "bytes": 556
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/data2.ttl",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/data2.ttl",
+      "sha256": "455809da1b7767d297408f7bc3fadba3f7c79b35f5e29623b4498207a427d5e4",
+      "bytes": 253
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/if02.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/if02.rq",
+      "sha256": "d0b7bab62df3e7505168dbd5a430e7d293b7c8e3e09f31a045d988e47ad1abc1",
+      "bytes": 49
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/if02.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/if02.srx",
+      "sha256": "ca5515b315978ecfece511b69b6bfc2f3a76c079b262b750a25e67608b6d813f",
+      "bytes": 191
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/iri01.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/iri01.rq",
+      "sha256": "799fa84ed572e3aba7c40ba3ccc82354cd591ca2ca9f7363b9552f4b5d2d9e48",
+      "bytes": 85
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/iri01.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/iri01.srx",
+      "sha256": "32ee78552c303ea433ad63d5c99b68064a08ebcef01d320a475c98a6807ee464",
+      "bytes": 347
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/iri02.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/iri02.rq",
+      "sha256": "bf43cb790491a9c56cadde7f9cb7bb6ae990787ad3330eae9037cf115e4f6d8e",
+      "bytes": 85
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/iri02.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/iri02.srx",
+      "sha256": "32ee78552c303ea433ad63d5c99b68064a08ebcef01d320a475c98a6807ee464",
+      "bytes": 347
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/manifest.ttl",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/manifest.ttl",
+      "sha256": "26aacfbea8650ac72d2325105311b481771c89a40309e50cccacd6bac52fa67d",
+      "bytes": 28410
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/now01.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/now01.rq",
+      "sha256": "0422e8bbb99e8ae17ecc04247d915750b8641303008b3bf36555e9d1ad72357c",
+      "bytes": 112
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/now01.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/now01.srx",
+      "sha256": "e2f4eb3e00ed99eed94b0f4c817732ef0290f31582de26a3a81ba52d17f7c5a4",
+      "bytes": 137
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/strlang04.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/strlang04.rq",
+      "sha256": "de7cd7df8528c13626b1e9db728c1e8609145f1a073bfb5a2e6af3e09871eac3",
+      "bytes": 108
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/strlang04.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/strlang04.srx",
+      "sha256": "5620289420ed4054f831f6ae8edb70842a6350495106dcd39b4cff5e0adea6d8",
+      "bytes": 438
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/struuid01.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/struuid01.rq",
+      "sha256": "93839dae911cd528a996be24e99ed26c4ced5e30d7ff9c2d70a731a075de81b4",
+      "bytes": 262
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/struuid01.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/struuid01.srx",
+      "sha256": "b9f8feaeb0eaf02f1b40f82d862f51e195dbf1bedfbf1e21a76e29acbd802e0b",
+      "bytes": 306
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/uuid01.rq",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/uuid01.rq",
+      "sha256": "d5a178845de32ac69b70d3b1f22622ac870a298b85c4a928b6f633475a9a3bdc",
+      "bytes": 274
+    },
+    {
+      "path": "w3c/sparql/sparql11/functions/uuid01.srx",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/functions/uuid01.srx",
+      "sha256": "bbc32a94434b074dae1a55a5a39550d39e63c1fc37e2e902091bbcc9b3a71878",
+      "bytes": 306
+    },
+    {
+      "path": "w3c/sparql/sparql11/manifest-all.ttl",
+      "url": "https://raw.githubusercontent.com/w3c/rdf-tests/bfefa770267ec0e5b6e45764bbca4ee43789ba72/sparql/sparql11/manifest-all.ttl",
+      "sha256": "7a5f5f61106f84a2874ebc110d33ee4ea5bf00b7f53478d61ce8f58a4415f78d",
+      "bytes": 3815
+    },
+    {
+      "path": "w3c-bsd-license.html",
+      "url": "https://www.w3.org/copyright/3-clause-bsd-license-2008/",
+      "sha256": "1279d55896aa4fd4e67e5f0e69fc58b1b97deb198f30a017a4a18c337d89a106",
+      "bytes": 25669
+    },
+    {
+      "path": "rift/ordered-window.rq",
+      "sha256": "c5dd0e0c9bc5598c4574eff792166b2ccf0583737efd43e8208e772df4bd7386",
+      "bytes": 81,
+      "origin": "rift supplemental case"
+    },
+    {
+      "path": "rift/grouped-bag.rq",
+      "sha256": "fe0134b1c0a99438a3368919881ee440fd542ebbf86eda7fb192c9101e2a2803",
+      "bytes": 101,
+      "origin": "rift supplemental case"
+    },
+    {
+      "path": "rift/optional-bag.rq",
+      "sha256": "2d9bf84740c3e0b7027ac3089b2ba818d50a2c20d4e2c13f1763fa2f4cf8f481",
+      "bytes": 131,
+      "origin": "rift supplemental case"
+    },
+    {
+      "path": "rift/typed-unbound.rq",
+      "sha256": "400ef5c877c94af3d42b63af5579218092a148c3f17922737b2066fb69cb9582",
+      "bytes": 97,
+      "origin": "rift supplemental case"
+    },
+    {
+      "path": "rift/constructed-blank-nodes.rq",
+      "sha256": "d7b9b71089032e1279674e099f169193ad617e2be1b04d77995ce42b86d44a42",
+      "bytes": 73,
+      "origin": "rift supplemental case"
+    },
+    {
+      "path": "reference/rdflib-7.6.0-concat-empty.srj",
+      "sha256": "ca783f692463b166b7af278431890cb6c98ff0a5958ffd7658a12c72b0812fb0",
+      "bytes": 105,
+      "origin": "Pinned RDFLib 7.6.0 direct public processor result; explicit reference difference."
+    },
+    {
+      "path": "reference/rdflib-7.6.0-optional-bag.srj",
+      "sha256": "9e9f474fb3e2807d4d4d114caac92c495c9442aa018010ee78e5824cfbebbfff",
+      "bytes": 366,
+      "origin": "Pinned RDFLib 7.6.0 direct public processor result; explicit reference difference."
+    },
+    {
+      "path": "rift/optional-bag.srj",
+      "sha256": "f27d755157d6304bc276f1c2fe610c7bb1060f31c8927dcec299a2d510b487c4",
+      "bytes": 694,
+      "origin": "Rift supplemental expected multiset from SPARQL 1.1 LeftJoin/Diff cardinality definitions."
+    }
+  ],
+  "candidate_engine_source": {
+    "repository": "https://github.com/oxigraph/oxigraph",
+    "revision": "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149",
+    "oxigraph": "0.6.0-dev",
+    "spareval": "0.3.0-dev",
+    "spargebra": "0.5.0-dev",
+    "manifest_default_features": false,
+    "scope": "Declared workspace source; attach the supplied candidate build metadata to establish its actual resolved features."
+  },
+  "expected_failures": [],
+  "reference_differences": [
+    {
+      "id": "functions/concat-empty",
+      "oracle_version": "7.6.0",
+      "oracle_revision": "8b32146a0f9cb748c2068662e50d02b42fc86dfd",
+      "query_sha256": "409ec17e524032d19ea2a72a5b7306666181de7133bb196f0378632b3a20d9c9",
+      "observed_result": "reference/rdflib-7.6.0-concat-empty.srj",
+      "reason": "Empty CONCAT parses RDF.nil; pinned evaluator returns an unbound row instead of the official bound empty string."
+    },
+    {
+      "id": "rift/optional-bag",
+      "oracle_version": "7.6.0",
+      "oracle_revision": "8b32146a0f9cb748c2068662e50d02b42fc86dfd",
+      "query_sha256": "2d9bf84740c3e0b7027ac3089b2ba818d50a2c20d4e2c13f1763fa2f4cf8f481",
+      "observed_result": "reference/rdflib-7.6.0-optional-bag.srj",
+      "reason": "VALUES variables are absent from the left algebra variable set; pinned OPTIONAL fallback discards unmatched duplicate rows."
+    }
+  ]
+}
