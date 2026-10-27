@@ -190,6 +190,11 @@ impl LocalSymbolViewInput {
             budget.charge(package.as_ref())?;
             merge_query_facts(&mut facts, package.as_ref().clone())?;
         }
+        self.project_package_sources(
+            requirements.requires(FactRequirement::Source),
+            &mut facts,
+            budget,
+        )?;
         let original = capture(&facts, budget)?;
         if let Some(references) = self.query_references().filter(|_| include_acquired) {
             budget.charge_material(references.retained_material_bytes())?;

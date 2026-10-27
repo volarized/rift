@@ -9,7 +9,7 @@ use rift_protocol::read::{GetSymbolInclude, SourceUnitId, SymbolId};
 use rift_protocol::symbol_read::{
     CapturedView, GetSymbolParams, GetSymbolResult, SymbolUnavailableReason,
 };
-use rift_search::query::QueryFacts;
+use rift_search::query::{QueryFacts, QuerySource};
 
 use super::{
     CapturedMetadata, LocalSymbolMaterial, LocalSymbolViewInput, invalid, material_error,
@@ -39,6 +39,107 @@ impl LocalSymbolViewInput {
             .unwrap_or_default();
         crate::engine_read::merge_package_facts(&mut combined, facts)?;
         Ok(self.with_package_facts_arc(Some(Arc::new(combined))))
+    }
+
+    /// Adds missing requested declaration excerpts from the retained package sources.
+    ///
+    /// Existing excerpts and declarations without retained source stay unchanged.
+    ///
+    /// # Errors
+    /// Returns the existing range, cancellation or material admission refusal.
+    pub fn project_package_sources(
+        &self,
+        include_source: bool,
+        facts: &mut QueryFacts,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<(), RiftError> {
+        if !include_source {
+            return Ok(());
+        }
+        budget.check()?;
+        let Some(package) = self.material.package_facts.as_deref() else {
+            return Ok(());
+        };
+        let mut missing = false;
+        'selection: for symbol in &facts.symbols {
+            budget.check()?;
+            for declaration in &symbol.declarations {
+                budget.check()?;
+                if declaration.source.is_none() && declaration.unit.is_some() {
+                    missing = true;
+                    break 'selection;
+                }
+            }
+        }
+        if !missing || package.sources.is_empty() {
+            return Ok(());
+        }
+        let bytes = package
+            .sources
+            .len()
+            .checked_mul(std::mem::size_of::<&QuerySource>())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<Vec<&QuerySource>>()))
+            .ok_or_else(|| {
+                material_error(
+                    "query acquisition",
+                    &"dependency source lookup exceeds the platform bound",
+                )
+            })?;
+        budget.charge_material(bytes)?;
+        let mut sources = Vec::new();
+        sources
+            .try_reserve_exact(package.sources.len())
+            .map_err(|error| material_error("query acquisition", &error))?;
+        let extra = sources
+            .capacity()
+            .checked_sub(package.sources.len())
+            .and_then(|extra| extra.checked_mul(std::mem::size_of::<&QuerySource>()))
+            .ok_or_else(|| {
+                material_error(
+                    "query acquisition",
+                    &"dependency source lookup exceeds the platform bound",
+                )
+            })?;
+        budget.charge_material(extra)?;
+        for source in &package.sources {
+            budget.check()?;
+            sources.push(source);
+        }
+        sources.sort_unstable_by(|left, right| left.unit.as_str().cmp(right.unit.as_str()));
+        for pair in sources.windows(2) {
+            budget.check()?;
+            if pair[0].unit == pair[1].unit {
+                return Err(invalid(
+                    "unit",
+                    "dependency source unit is ambiguous within the selection",
+                ));
+            }
+        }
+        budget.check()?;
+        for symbol in &mut facts.symbols {
+            for declaration in &mut symbol.declarations {
+                budget.check()?;
+                if declaration.source.is_some() {
+                    continue;
+                }
+                let Some(unit) = &declaration.unit else {
+                    continue;
+                };
+                let Ok(index) =
+                    sources.binary_search_by(|source| source.unit.as_str().cmp(unit.as_str()))
+                else {
+                    continue;
+                };
+                let Some(text) = sources[index].text.as_deref() else {
+                    continue;
+                };
+                let excerpt = declaration_text(text, &declaration.range)?;
+                budget.charge(&excerpt)?;
+                declaration.source = Some(excerpt.to_owned());
+                declaration.source_complete = true;
+            }
+        }
+        Ok(())
     }
 
     /// Dependency facts captured by this immutable selection.
@@ -434,6 +535,83 @@ mod tests {
             declaration_cursor: None,
             declaration_limit: 1,
         }
+    }
+
+    fn omit_declaration_sources(facts: &mut QueryFacts) {
+        for symbol in &mut facts.symbols {
+            for declaration in &mut symbol.declarations {
+                declaration.source = None;
+                declaration.source_complete = false;
+            }
+        }
+    }
+
+    #[test]
+    fn requested_package_projection_preserves_provided_and_optional_source() -> TestResult {
+        let (_directory, reads, local) = super::super::tests::fixture(true);
+        let input = reads.local_search_view_input(true)?;
+        let original = facts(&input, &local)?;
+        let material = input.with_package_facts(original.clone())?;
+        let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        let limits = rift_search::query::QueryLimits::try_from(&configuration.search.query)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        let retained = serde_json::to_value(material.package_facts().as_deref())?;
+        for complete in [false, true] {
+            let mut provided = original.clone();
+            provided.symbols[0].declarations[0].source_complete = complete;
+            let before = serde_json::to_value(&provided)?;
+            material.project_package_sources(true, &mut provided, &mut budget)?;
+            assert_eq!(serde_json::to_value(&provided)?, before);
+        }
+        let mut unrequested = original.clone();
+        omit_declaration_sources(&mut unrequested);
+        let before = serde_json::to_value(&unrequested)?;
+        material.project_package_sources(false, &mut unrequested, &mut budget)?;
+        assert_eq!(serde_json::to_value(&unrequested)?, before);
+        assert_eq!(
+            serde_json::to_value(material.package_facts().as_deref())?,
+            retained
+        );
+        let mut unavailable = original;
+        omit_declaration_sources(&mut unavailable);
+        for source in &mut unavailable.sources {
+            source.text = None;
+        }
+        let material = reads
+            .local_search_view_input(true)?
+            .with_package_facts(unavailable.clone())?;
+        let before = serde_json::to_value(&unavailable)?;
+        material.project_package_sources(true, &mut unavailable, &mut budget)?;
+        assert_eq!(serde_json::to_value(&unavailable)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn requested_package_projection_admits_lookup_before_copied_excerpts() -> TestResult {
+        let (_directory, reads, local) = super::super::tests::fixture(true);
+        let input = reads.local_search_view_input(true)?;
+        let original = facts(&input, &local)?;
+        let material = input.with_package_facts(original.clone())?;
+        let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+        let mut limits = rift_search::query::QueryLimits::try_from(&configuration.search.query)?;
+        limits.material_bytes_max = Some(1);
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        let mut provided = original.clone();
+        material.project_package_sources(true, &mut provided, &mut budget)?;
+        assert_eq!(
+            serde_json::to_value(&provided)?,
+            serde_json::to_value(&original)?
+        );
+        let mut missing = original;
+        omit_declaration_sources(&mut missing);
+        let before = serde_json::to_value(&missing)?;
+        assert!(
+            material
+                .project_package_sources(true, &mut missing, &mut budget)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&missing)?, before);
+        Ok(())
     }
 
     #[test]

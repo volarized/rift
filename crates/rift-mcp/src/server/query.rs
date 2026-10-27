@@ -357,7 +357,13 @@ impl RiftMcp {
             global_selection.as_ref().map(|selected| &selected.view),
         )?;
         let (facts, material) = self
-            .attach_query_references(facts, material, references, execution)
+            .attach_query_references(
+                facts,
+                material,
+                references,
+                requirements.requires(FactRequirement::Source),
+                execution,
+            )
             .await?;
         Ok(Ok(QueryAcquisition {
             graph: Some(LOCAL_GRAPH.to_owned()),
@@ -660,6 +666,7 @@ impl RiftMcp {
         mut facts: QueryFacts,
         material: rift_server::LocalSymbolViewInput,
         references: rift_server::EngineReferences,
+        include_source: bool,
         execution: QueryExecution<'_>,
     ) -> Result<(QueryFacts, rift_server::LocalSymbolViewInput), ToolFailure> {
         let QueryExecution {
@@ -683,6 +690,7 @@ impl RiftMcp {
                 budget.charge(existing.as_ref())?;
             }
             let material = material.with_package_facts(package_facts.clone())?;
+            material.project_package_sources(include_source, &mut facts, budget)?;
             budget.charge_material(references.retained_material_bytes())?;
             if let Some(existing) = material.query_references() {
                 budget.charge_material(existing.retained_material_bytes())?;

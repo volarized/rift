@@ -936,6 +936,132 @@ mod tests {
     }
 
     #[test]
+    fn selected_physical_package_declarations_project_requested_captured_source() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let source = "interface Math { entry(...values: number[]): number; }\n";
+        std::fs::write(dependency.path().join("index.ts"), source)?;
+        // The admitted package has no types or typings entry for the selected file.
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let configuration = WorkspaceConfiguration::default();
+        let offset = u32::try_from(source.find("entry").ok_or("fixture entry name")?)?;
+        let target = QueryPackageTarget::prepare_selected_with_selection(
+            call_request_at(
+                workspace.path(),
+                dependency.path(),
+                &roots,
+                Position::new(0, offset),
+            )?,
+            &roots,
+            &[workspace.path()],
+            &configuration,
+            &|| false,
+            None,
+            None,
+        )?;
+        assert!(
+            target.symbol().is_none(),
+            "the supplied signature is physical"
+        );
+        let physical: Vec<_> = target
+            .facts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.symbol.name == "entry")
+            .collect();
+        assert_eq!(physical.len(), 1);
+        assert!(physical[0].symbol.id.is_none());
+        assert_eq!(physical[0].declarations.len(), 1);
+        let declaration = &physical[0].declarations[0];
+        assert!(declaration.source.is_none());
+        assert!(!declaration.source_complete);
+        assert_eq!(declaration.unit.as_ref(), Some(target.source_unit()));
+        let range = declaration.range.clone();
+        let excerpt = source
+            .get(usize::try_from(range.start)?..usize::try_from(range.end)?)
+            .ok_or("captured declaration UTF-8 range")?;
+        assert!(!excerpt.is_empty());
+        assert_eq!(target.source(&target.facts)?, source);
+        let unit = target.source_unit().as_str().to_owned();
+        let reads = crate::ReadService::build(
+            workspace.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )?;
+        let material = reads
+            .local_search_view_input(true)?
+            .with_package_facts(target.facts)?;
+        std::fs::remove_file(dependency.path().join("index.ts"))?;
+        assert_physical_package_source(&material, &configuration, source, unit, &range)
+    }
+
+    fn assert_physical_package_source(
+        material: &crate::LocalSymbolViewInput,
+        configuration: &WorkspaceConfiguration,
+        source: &str,
+        unit: String,
+        range: &rift_protocol::read::TextRange,
+    ) -> TestResult {
+        use rift_protocol::query::{QueryAnswer, RdfTerm};
+        use rift_search::query::{FactRequirement, QueryLimits};
+        use rift_search::sparql::{PreparedQuery, QueryCancellation};
+
+        let statement = "SELECT ?symbol ?unit ?source ?start ?end ?full_source { ?symbol :name 'entry'; :declarations ?declaration. ?declaration :unit ?unit; :source ?source; :range ?range. ?range :start ?start; :end ?end. ?unit :source ?full_source }";
+        let limits = QueryLimits::try_from(&configuration.search.query)?;
+        let prepared = PreparedQuery::parse(statement, limits)?;
+        assert!(prepared.requirements().requires(FactRequirement::Source));
+        let excerpt = source
+            .get(usize::try_from(range.start)?..usize::try_from(range.end)?)
+            .ok_or("captured declaration UTF-8 range")?;
+        let selection = material.provider_selection(configuration)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        let facts = material.query_facts_with_selection(
+            prepared.requirements(),
+            limits,
+            &mut budget,
+            &selection,
+        )?;
+        let QueryAnswer::Bindings { bindings, .. } =
+            prepared.evaluate(facts, limits, QueryCancellation::default())?
+        else {
+            panic!("SELECT bindings")
+        };
+        assert_eq!(
+            bindings.len(),
+            1,
+            "the physical declaration joins its captured source"
+        );
+        let row = &bindings[0];
+        assert!(matches!(row.get("symbol"), Some(RdfTerm::BlankNode { .. })));
+        assert_eq!(row.get("unit"), Some(&RdfTerm::Iri { value: unit }));
+        for (name, expected) in [("source", excerpt), ("full_source", source)] {
+            assert_eq!(
+                row.get(name),
+                Some(&RdfTerm::Literal {
+                    value: expected.to_owned(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#string".to_owned(),
+                })
+            );
+        }
+        for (name, expected) in [("start", range.start), ("end", range.end)] {
+            assert_eq!(
+                row.get(name),
+                Some(&RdfTerm::Literal {
+                    value: expected.to_string(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_runtime_target_uses_the_admitted_python_runtime_owner() -> TestResult {
         let workspace = tempfile::tempdir()?;
         let runtime = tempfile::tempdir()?;
