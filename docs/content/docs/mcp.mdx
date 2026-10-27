@@ -109,8 +109,8 @@ SELECT ?symbol ?kind {
 ```
 
 A symbol's IRI is its canonical identity. Its declarations carry source units, paths, ranges,
-and available source. Use returned identities with `get_symbol`, and source units with
-`get_source`, carrying the answer's `view` to retain the selected bytes.
+and available source. Use returned identities with `get_symbol`. Read source units through `SERVICE :source`,
+carrying the original captured view ID in its `:view` input to retain the selected bytes.
 
 ### Full-text search [#search-fulltext]
 
@@ -282,8 +282,8 @@ bound to that exact symbol:
 
 <ReadExample name="global-symbol-documentation" />
 
-A requested release can differ from the served release. Search reports the substitution
-and returns the served identity:
+A substituted release cannot answer the selected query. Search returns `outcome: "unavailable"`;
+its `package_substituted` warning names the requested entry and served package:
 
 <ReadExample name="requested-served" />
 
@@ -314,69 +314,73 @@ A malformed identity is refused before lookup:
 `outcome: "unavailable"` with its typed reason, rather than a definite miss.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
-## Source [#tool-get_source]
+## Source reads [#source-reads]
 
-`get_source` reads one physical source unit, independently of whether a declaration exists.
-For project documentation, omit `range` to read the whole unit:
+`SERVICE :source` reads one physical source unit independently of whether a declaration exists.
+The request uses the same `query` and optional `language` as other SPARQL queries:
+
+```sparql
+SELECT ?outcome ?text ?complete {
+  SERVICE :source {
+    ?read :unit <rift://source/project/README.md>; :outcome ?outcome .
+    OPTIONAL { ?read :source [ :text ?text ]; :source_complete ?complete }
+  }
+}
+```
+
+Omit `:range` to read the whole unit. A half-open UTF-8 byte range uses an `rdf:JSON` literal:
+
+```sparql
+SELECT ?outcome ?text ?start ?end {
+  SERVICE :source {
+    ?read :unit <rift://source/project/README.md>;
+          :range '{"start":0,"end":4}'^^rdf:JSON; :outcome ?outcome .
+    OPTIONAL {
+      ?read :source [ :text ?text; :span [ :range [ :start ?start; :end ?end ] ] ]
+    }
+  }
+}
+```
+
+Use an observed source-unit IRI. A captured read adds `:view` with the original captured view ID.
+The projected source result retains that selection and its expiry; the surrounding query retains
+its own result view for paging. A missing source binds `:outcome` to `"missing"`. Unavailable or
+incomplete source material prevents evaluation, including under `SERVICE SILENT`.
 
 <ReadExample name="project-source" />
 
-Pass a half-open UTF-8 byte range to read one section from the same unit:
-
 <ReadExample name="project-section" />
-
-The `view` returned by the preceding named-project symbol read selects that project's
-documentation. The project unit keeps its repository-relative path:
 
 <ReadExample name="named-project-source" />
 
 <ReadExample name="named-project-section" />
 
-The result names the actual unit and range in `source.span`, returns bytes in `source.text`,
-and states `source_complete`. A preceding `view` retains its exact selection. Released
-package and runtime units retain their defining owner:
+Package and runtime units retain their defining owner. `:rev` selects local Git source and is
+refused beside `:view` or for released sources.
 
 <ReadExample name="global-source" />
 
-For these units, `rev` selects local Git source alone.
-
 ## Nodes [#tool-nodes]
 
-After reading a declaration, the agent may need to change only its name, body, or one expression.
-`nodes` identifies the syntax around a position in a local file, giving the agent source ranges
-for a precise edit target.
+`nodes` accepts `query` and optional `language`, and uses the same SPARQL engine and vocabulary
+as `search`. Syntax facts retain their original source unit, byte range, kind, parent and named
+regions. A node's `:symbol` connects it to an established semantic identity when available.
 
-<Callout type="info">
+Read captured syntax fields from one source unit:
 
-The position is a UTF-8 byte offset, rather than a line or character number.
-
-</Callout>
-
-In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call:
+```sparql
+SELECT ?node ?kind ?start ?end {
+  ?node a :Node; :unit <rift://source/project/src/config.rs>; :kind ?kind;
+        :range [ :start ?start; :end ?end ] .
+}
+ORDER BY ?start DESC(?end)
+```
 
 <ReadExample name="local-nodes" />
 
-The response lists enclosing nodes from outermost to innermost, with source excerpts and byte ranges:
-
-| Node in this example | What the agent can inspect |
-| --- | --- |
-| File | The surrounding source |
-| `load_config` function | The complete declaration |
-| Function body | The implementation inside the braces |
-| `parse_config(&text)` call | The expression to change |
-| `parse_config` identifier | The name within that expression |
-
-In the text response:
-
-- Each node shows its syntax kind and line count, then its node identity, which carries the
-  byte range: `@334-353` is the `parse_config(&text)` call.
-- The function also shows its symbol identity and the ranges of its name and body.
-- The excerpt of the innermost node closes the answer; the structured output carries the excerpt
-  of every node.
-
-The agent chooses the range it needs and applies the change with its own editing tools.
-After the file changes, it should read again before using its ranges for another edit.
-See the [nodes reference](/docs/developer/protocol/mcp#tool-nodes) for the response shape and supported files.
+The projected variables determine the answer. Required syntax facts must already belong to the
+selected capture. A missing syntax family returns typed unavailability; evaluation does not
+parse current files to fill it. The agent applies changes with its own editing tools.
 
 ## Edits and index updates [#edit-and-index-updates]
 
@@ -390,8 +394,8 @@ the local index. See [Index](/docs/developer/architecture#index) for local updat
 
 ## Reading results [#reads]
 
-Search keeps responses small with `limit` and names another page with `page_index`.
-Its returned `pagination` states the served page and page count. An exact `get_symbol`
+SPARQL `LIMIT` and `OFFSET` select the query window. The returned `pagination` carries
+`next_query` when another transport page remains; submit it unchanged. An exact `get_symbol`
 read bounds declaration bindings with `declaration_limit` and continues with
 `declaration_cursor` in the same immutable `view`.
 
@@ -425,8 +429,9 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-The agent can read older project code by adding `rev` to `search`, `get_symbol`, or `nodes`.
-For example, this reads the function from `main` without changing the working tree:
+`get_symbol` accepts `rev` for older project code. Source reads and search producers accept
+`:rev` inside `SERVICE :source` and `SERVICE :search`. For example, this reads the function
+from `main` without changing the working tree:
 
 ```json
 { "id": "rift://symbol/local/rust/example_project/config/load_config", "rev": "main" }

@@ -365,8 +365,9 @@ A `local@name` owner selects an extra project accepted by the connection:
 <ReadExample name="named-symbol" />
 
 A package or runtime identity selects its exact served version. Search's `scope` and
-`packages` discover these identities. Requested package substitutions are reported by search;
-the returned identity names the served owner. Exact reads never silently replace that version.
+`packages` discover these identities. For the recorded substitution request, search returns
+`outcome: "unavailable"` with a `package_substituted` warning naming the requested entry and
+served package. Exact reads never silently replace a version.
 The declaration's `unit` keeps the physical defining owner even when the logical owner differs.
 
 <ReadExample name="global-search" />
@@ -383,45 +384,65 @@ selection failures. A malformed identity is refused before lookup:
 
 ## Source retrieval
 
-<McpTool name="get_source" />
+`SERVICE :source` acquires one exact source result before SPARQL evaluation. Its constant
+`:unit` input **MUST** be a canonical source-unit IRI. Omitted `:range` requests the whole
+unit; a range uses half-open UTF-8 byte offsets encoded as `rdf:JSON`:
 
-`unit` selects one physical source unit. Omitted `range` requests the whole unit; a supplied
-range is half-open UTF-8 byte offsets. Documentation does not require a symbol declaration:
+```sparql
+SELECT ?outcome ?text ?complete {
+  SERVICE :source {
+    ?read :unit <rift://source/project/README.md>;
+          :range '{"start":0,"end":4}'^^rdf:JSON; :outcome ?outcome .
+    OPTIONAL { ?read :source [ :text ?text ]; :source_complete ?complete }
+  }
+}
+```
+
+A declaration is not required. `:view` selects the original captured view; `:rev` selects local
+Git source and is refused beside `:view` or for released sources. Recorded package and runtime
+owners remain part of the source-unit address.
+
+`found` projects the existing `source.span`, `source.text`, `source_complete`, and original
+source view fields. `missing` requires complete captured coverage and leaves optional source
+fields unbound. The server **MUST** reject unavailable or incomplete source material before
+evaluation, including for `SERVICE SILENT`. Repeated identical requests share one authoritative
+result; different units, ranges or views remain separate requests.
+
+The projected source view retains the source selection's expiry. The enclosing query result
+has its own view and expiry for paging.
 
 <ReadExample name="project-source" />
 
 <ReadExample name="project-section" />
 
-The `view` returned by the preceding named-project symbol read selects that project's
-documentation. The project unit keeps its repository-relative path:
-
 <ReadExample name="named-project-source" />
 
 <ReadExample name="named-project-section" />
 
-A released source read uses its physical owner address:
-
 <ReadExample name="global-source" />
-
-`found` returns `source.span`, `source.text`, `source_complete`, and an immutable `view`.
-`missing` requires complete captured coverage; `unavailable` states why presence or absence
-could not be established. A package or runtime source address retains its defining owner.
-`view` retains a preceding selection; `rev` is refused beside `view` and for released sources.
 
 ## Nodes
 
 <McpTool name="nodes" />
 
-A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
-`capability_unavailable`, naming the extension, or stating that the path carries none.
+`nodes` accepts the same `query` and optional `language` as `search`. Currently, only SPARQL is
+supported. Both tools use the same parser, vocabulary, evaluation, bounds and result forms.
 
-During local preparation, the server **MAY** prepare the requested path within the remaining
-[`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
-the published prepared files carries [`local_index_preparing`](#reads), including when syntax
-is returned; this read does not advance published progress. Exhausted preparation returns empty
-nodes with that warning.
+A `:Node` record carries its original `:id`, `:unit`, `:kind`, `:language`, `:range`, parent and
+named regions. Optional `:symbol` retains the semantic association established by the original
+provider. Query projection preserves absent fields instead of inventing a symbol identity.
 
-This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
+```sparql
+SELECT ?node ?kind ?start ?end {
+  ?node a :Node; :unit <rift://source/project/src/config.rs>; :kind ?kind;
+        :range [ :start ?start; :end ?end ] .
+}
+ORDER BY ?start DESC(?end)
+```
+
+The server **MUST** refuse required syntax facts absent from the selected capture. Evaluation
+reads captured syntax records and source bytes without parsing current files or starting
+language-engine collection.
 
 <ReadExample name="local-nodes" />
 
@@ -432,16 +453,15 @@ Callers read code through these tools:
 | Tool | Result |
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
-| [`get_source`](#tool-get_source) | one physical source unit or byte range |
 | [`search`](#tool-search) | SPARQL bindings, a boolean, or a graph over captured facts |
-| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
+| [`nodes`](#tool-nodes) | SPARQL bindings, a boolean, or a graph over captured syntax facts |
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
 The index never follows or indexes a symlink, so no read returns one; the file a link points
 at answers under its own path.
 
-`search` returns the first bounded page of its captured answer. Its `pagination` carries
+`search` and `nodes` return the first bounded page of their captured answer. The returned `pagination` carries
 the served page, true page count, and `next_query` when another page remains. Submit that
 query unchanged to read the next page. SPARQL `LIMIT` and `OFFSET` select rows before
 transport paging.
@@ -591,7 +611,9 @@ answers for. The global warning naming why the global API did not answer rides b
 outside that bound. The `source_unavailable` bound above is separate, so an answer can carry
 eight of each.
 
-Every read carries an optional `rev`, and reads the workspace tree when it is absent.
+`get_symbol` accepts optional `rev`. Query-based reads select revisions through the
+`:rev` input of `SERVICE :source` or `SERVICE :search`. Project reads without a revision
+or captured view use the current workspace publication.
 
 ### Result content [#result-content]
 
@@ -628,12 +650,10 @@ paging. A missing result writes `error: symbol_not_found`, the requested identit
 alternatives below `closest matches:` when available. An unavailable result writes its typed
 reason and requested identity. A captured selection states `view ID · expires TIMESTAMP`.
 
-A `nodes` result lists enclosing nodes from outermost to innermost. Each node states its kind,
-line count when greater than one, exceptional generated or test facets, node identity, available
-symbol identity, and named region byte ranges. After the last node, text carries the innermost
-excerpt. Structured content retains every node's excerpt.
+`nodes` uses the same query result text as `search`: projected bindings, a boolean or triples.
+The statement selects node fields, source bytes and ordering explicitly.
 
-Exact reads and node excerpts use tabs for layout, preserving copied source whitespace after
+Exact symbol reads use tabs for layout, preserving copied source whitespace after
 the layout indent. Remove that indent to recover source bytes. A fact whose normal state is
 implicit in this layout remains available in structured content. Exceptional origin, package,
 source kind, deprecated and test facets, document-local identity, and incomplete history remain
@@ -660,8 +680,8 @@ Every tool's text remains subject to its accepted byte bound.
 
 ### Revision-addressed reads [#revision-reads]
 
-`get_symbol`, `get_source`, and `nodes` accept `rev`; `search` accepts it as the
-`:rev` input of `SERVICE :search`. It names a branch, tag, or commit id, spelled the way git spells it:
+`get_symbol` accepts `rev`. `SERVICE :source` and `SERVICE :search` accept `:rev` as a service
+input. It names a branch, tag, or commit id, spelled the way git spells it:
 `main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
 git objects, with no checkout, and indexes that commit's tree under the same
 [`[source]`](/docs/developer/configuration#source) policy and bounds as the working-tree scan. A revision
