@@ -48,20 +48,14 @@ pub(super) fn identities_for(
             _ => {}
         }
     }
+    include_declaration_sources(backend, selected, &mut sources, budget)?;
     for service in &selected.services.retrievals {
         for hit in &service.result.results {
             budget.check()?;
             if hit.unit.is_none()
                 && let Some(path) = &hit.path
             {
-                budget.charge(path)?;
-                let unit = rift_core::SourceUnitId::new(
-                    rift_core::SourceResolverId::new("project")?,
-                    rift_core::SourcePath::new(path.0.as_str())?,
-                )?;
-                let original = unit.to_string();
-                budget.charge(&original)?;
-                sources.insert(original);
+                include_project_source(&mut sources, path, budget)?;
             }
         }
     }
@@ -110,6 +104,58 @@ pub(super) fn identities_for(
     };
     budget.charge(&result)?;
     Ok(result)
+}
+
+fn include_declaration_sources(
+    backend: &str,
+    selected: &QueryFactSelection,
+    sources: &mut BTreeSet<String>,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<(), RiftError> {
+    if backend != "global"
+        && matches!(
+            selected.owner,
+            rift_protocol::identity::SymbolOwner::Local
+                | rift_protocol::identity::SymbolOwner::NamedLocal { .. }
+        )
+    {
+        for symbol in &selected.facts.symbols {
+            if let Some(id) = &symbol.symbol.id
+                && !matches!(
+                    SymbolIdentity::parse(id.as_str())?.owner(),
+                    rift_protocol::identity::SymbolOwner::Local
+                        | rift_protocol::identity::SymbolOwner::NamedLocal { .. }
+                )
+            {
+                continue;
+            }
+            for declaration in &symbol.declarations {
+                budget.check()?;
+                if declaration.unit.is_none()
+                    && let Some(path) = &declaration.path
+                {
+                    include_project_source(sources, path, budget)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn include_project_source(
+    sources: &mut BTreeSet<String>,
+    path: &rift_protocol::read::ProjectPath,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<(), RiftError> {
+    budget.charge(path)?;
+    let unit = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("project")?,
+        rift_core::SourcePath::new(path.0.as_str())?,
+    )?;
+    let original = unit.to_string();
+    budget.charge(&original)?;
+    sources.insert(original);
+    Ok(())
 }
 
 fn source_unit(

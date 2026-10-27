@@ -34,7 +34,10 @@ impl RiftProxy {
         requests: &rift_server::ProviderRequests,
         deadline: tokio::time::Instant,
     ) -> Result<Acquired, RiftError> {
-        let retained = match self.retained_query_inputs(plan, budget, deadline).await? {
+        let retained = match self
+            .retained_query_inputs(plan, budget, requests, deadline)
+            .await?
+        {
             Some(Acquired::Facts(facts)) => Some(facts),
             Some(response @ Acquired::Response(_)) => return Ok(response),
             None => None,
@@ -42,6 +45,7 @@ impl RiftProxy {
         if retained.is_some()
             && plan.retrievals().is_empty()
             && plan.requirements().datasets.is_empty()
+            && plan.requirements().source_reads.is_empty()
         {
             return Ok(Acquired::Facts(retained.unwrap_or_default()));
         }
@@ -71,6 +75,7 @@ impl RiftProxy {
                     selection.retrievals.clear();
                     selection.datasets.clear();
                     selection.services.clear();
+                    selection.source_reads.clear();
                     selection
                 });
                 let mut producer = producer.clone();
@@ -84,9 +89,10 @@ impl RiftProxy {
             }
         }
         if include_domain
-            && plan
+            && (plan
                 .requirements()
                 .requires(rift_search::query::FactRequirement::Domain)
+                || plan.requirements().selects_node_sources())
         {
             let selected = selections
                 .entry("local".to_owned())
@@ -126,7 +132,25 @@ impl RiftProxy {
         let mut acquired = Vec::new();
         for (name, requirements) in selections {
             match self
-                .query_input(&name, requirements, budget, requests, deadline)
+                .query_input(
+                    &name,
+                    requirements,
+                    (None, None),
+                    budget,
+                    requests,
+                    deadline,
+                )
+                .await?
+            {
+                Acquired::Facts(mut facts) => {
+                    append_selections(&mut acquired, &mut facts, &mut budget.clone())?;
+                }
+                response @ Acquired::Response(_) => return Ok(response),
+            }
+        }
+        for request in &plan.requirements().source_reads {
+            match self
+                .source_query_input(request, budget, requests, deadline)
                 .await?
             {
                 Acquired::Facts(mut facts) => {
@@ -138,14 +162,19 @@ impl RiftProxy {
         Ok(Acquired::Facts(acquired))
     }
 
-    async fn query_input(
+    pub(super) async fn query_input(
         &self,
         name: &str,
         requirements: FactRequirements,
+        selected: (
+            Option<rift_protocol::symbol_read::CapturedViewId>,
+            Option<crate::global::candidates::SavedCandidateBackend>,
+        ),
         budget: &rift_server::QueryFactBudget<'static>,
         requests: &rift_server::ProviderRequests,
         deadline: tokio::time::Instant,
     ) -> Result<Acquired, RiftError> {
+        let (view, context) = selected;
         let backend = if name == "local" {
             self
         } else {
@@ -164,19 +193,11 @@ impl RiftProxy {
         let maximum = allowance.maximum();
         let request = rift_server::QueryExchange::new(QueryFactRequest {
             requirements,
-            view: None,
+            view,
             requests: maximum,
         });
-        let (arguments, requirements) = self
-            .query_work(budget, deadline, move |budget| {
-                budget.charge(&request)?;
-                let arguments = serde_json::to_value(&request)
-                    .map_err(encoding_failure)?
-                    .as_object()
-                    .cloned()
-                    .ok_or_else(super::retained::unavailable)?;
-                Ok((arguments, request.into_payload()?.requirements))
-            })
+        let (request, requirements) = self
+            .prepare_query_fact_request(request, context, budget, deadline)
             .await?;
         let (peer, _) = backend.leased_peer(None).await?;
         requests.claim()?;
@@ -185,9 +206,7 @@ impl RiftProxy {
             deadline,
             backend.answered(
                 &peer,
-                ClientRequest::CallToolRequest(CallToolRequest::new(
-                    CallToolRequestParams::new("query_facts").with_arguments(arguments),
-                )),
+                ClientRequest::CallToolRequest(CallToolRequest::new(request)),
             ),
         )
         .await
@@ -245,6 +264,37 @@ impl RiftProxy {
             }
             Err(reason) => Ok(unavailable_response(reason)),
         }
+    }
+
+    async fn prepare_query_fact_request(
+        &self,
+        request: rift_server::QueryExchange<QueryFactRequest>,
+        context: Option<crate::global::candidates::SavedCandidateBackend>,
+        budget: &rift_server::QueryFactBudget<'static>,
+        deadline: tokio::time::Instant,
+    ) -> Result<(CallToolRequestParams, FactRequirements), RiftError> {
+        let (arguments, requirements) = self
+            .query_work(budget, deadline, move |budget| {
+                budget.charge(&request)?;
+                let arguments = serde_json::to_value(&request)
+                    .map_err(encoding_failure)?
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(super::retained::unavailable)?;
+                Ok((arguments, request.into_payload()?.requirements))
+            })
+            .await?;
+        let mut request = CallToolRequestParams::new("query_facts").with_arguments(arguments);
+        if let Some(context) = &context {
+            request = crate::proxy::candidates::read::with_backend_context(request, context);
+        }
+        let request = self
+            .query_work(budget, deadline, move |budget| {
+                budget.charge(&request)?;
+                Ok(request)
+            })
+            .await?;
+        Ok((request, requirements))
     }
 
     pub(super) async fn query_work<T: Send + 'static>(
@@ -311,6 +361,7 @@ fn domain_requirements(requirements: &FactRequirements) -> FactRequirements {
     selected.retrievals.clear();
     selected.datasets.clear();
     selected.services.clear();
+    selected.source_reads.clear();
     selected
 }
 
@@ -507,7 +558,7 @@ fn validate_graph_disposition(
         .iter()
         .filter(|body| body.graph.as_deref() == Some(rift_search::sparql::LOCAL_GRAPH))
         .count();
-    let expected = requirements.retrievals.is_empty()
+    let expected = (requirements.retrievals.is_empty() && requirements.source_reads.is_empty())
         || requirements
             .datasets
             .iter()

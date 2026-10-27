@@ -38,6 +38,35 @@ pub(crate) fn retrieval(parameters: &SearchParams) -> TestResult<QueryParams> {
     Ok(rift_search::sparql::retrieval_query(&selected)?)
 }
 
+/// Projects one authoritative source read through the public SPARQL surface.
+pub(crate) fn source(
+    parameters: &rift_protocol::source_read::GetSourceParams,
+) -> TestResult<QueryParams> {
+    if !parameters.is_valid() {
+        return Err("source selectors or byte range are invalid".into());
+    }
+    let unit = NamedNodeRef::new(parameters.unit.as_str())?;
+    let fields = serde_json::to_value(parameters)?;
+    let fields = fields
+        .as_object()
+        .ok_or("source parameters must serialize as an object")?;
+    let mut group = format!("?read :unit {unit}; :outcome ?outcome . ");
+    for (key, value) in fields {
+        if key == "unit" || value.is_null() {
+            continue;
+        }
+        let predicate = NamedNode::new(format!("{}{key}", rift_search::sparql::VOCABULARY))?;
+        let object = input(value)?;
+        write!(group, "?read {predicate} {object} . ")?;
+    }
+    Ok(QueryParams {
+        query: format!(
+            "SELECT ?outcome ?unit ?missing_unit ?text ?start ?end ?complete ?source_view ?source_expiry {{ SERVICE :source {{ {group} ?read :view [ :id ?source_view; :expires_at ?source_expiry ] . OPTIONAL {{ ?read :source [ :text ?text; :span [ :unit ?unit; :range [ :start ?start; :end ?end ] ] ]; :source_complete ?complete }} OPTIONAL {{ ?read :unit ?missing_unit }} }} }}"
+        ),
+        language: QueryLanguage::Sparql,
+    })
+}
+
 /// Adds explicit projected fields and graph patterns to an existing retrieval request.
 pub(crate) fn projected_retrieval(
     parameters: &SearchParams,

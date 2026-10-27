@@ -98,6 +98,15 @@ impl QueryFactSelection {
                         .as_ref()
                         .is_none_or(|selected| selected.iter().any(|id| !ids.contains(id)))
                 })))
+            || original.source_units.as_ref().is_some_and(|units| {
+                requested
+                    .source_units
+                    .as_ref()
+                    .is_none_or(|selected| selected.iter().any(|unit| !units.contains(unit)))
+            })
+            || (!requested.source_reads.is_empty()
+                && (requested.source_reads != original.source_reads
+                    || !self.source_records_complete()))
             || !facets_cover(&original.facets, &requested.facets)
         {
             return false;
@@ -142,6 +151,26 @@ impl QueryFactSelection {
         true
     }
 
+    fn source_records_complete(&self) -> bool {
+        self.services.sources.len() == self.requirements.source_reads.len()
+            && self
+                .requirements
+                .source_reads
+                .iter()
+                .zip(&self.services.sources)
+                .all(|(request, (captured, result))| {
+                    captured == request
+                        && result.is_valid_for(request)
+                        && matches!(
+                            result,
+                            rift_protocol::source_read::GetSourceResult::Found {
+                                source_complete: true,
+                                ..
+                            } | rift_protocol::source_read::GetSourceResult::Missing { .. }
+                        )
+                })
+    }
+
     fn original_subject(&self, seed: &rift_protocol::read::SymbolId) -> bool {
         self.subjects.iter().any(|index| {
             self.facts
@@ -159,6 +188,9 @@ impl QueryFactSelection {
         }
         self.requirements.validate_selection()?;
         self.requirements.validate_facts(&self.facts)?;
+        if !self.source_records_complete() {
+            return Err(acquisition_failure("required source result is unavailable"));
+        }
         let mut previous = None;
         for &subject in &self.subjects {
             if subject >= self.facts.symbols.len() || previous.is_some_and(|index| index >= subject)
@@ -216,6 +248,10 @@ impl RiftMcp {
         request: rmcp::model::CallToolRequestParams,
     ) -> Result<serde_json::Value, ToolFailure> {
         Box::pin(async move {
+            let source_context = crate::global::candidates::SavedCandidateBackend::from_request(
+                request.meta.as_ref(),
+            )
+            .map_err(failure)?;
             let deadline = self.request_deadline().await;
             let configuration = self.query_configuration().await;
             let limits = query_limits(&configuration)?;
@@ -265,6 +301,7 @@ impl RiftMcp {
                         budget: &budget,
                         deadline,
                         requests: &requests,
+                        source_context: source_context.as_ref(),
                     },
                     None,
                 )
@@ -335,7 +372,10 @@ impl RiftMcp {
                     }
                     Err(reason) => return Ok(Err(reason)),
                 };
-                if requirements.retrievals.is_empty() && requirements.datasets.is_empty() {
+                if requirements.retrievals.is_empty()
+                    && requirements.datasets.is_empty()
+                    && requirements.source_reads.is_empty()
+                {
                     return Ok(Ok(FactAcquisitions::Captured(restored)));
                 }
                 let mut admission = execution.budget.clone();
@@ -344,56 +384,81 @@ impl RiftMcp {
                 current.services.retain(|service| {
                     !service.starts_with(rift_search::sparql::RESULT_SERVICE_PREFIX)
                 });
+                if current.retrievals.is_empty() && current.datasets.is_empty() {
+                    current.required.clear();
+                    current.symbol_name = None;
+                    current.symbol_ids = None;
+                    current.source_units = None;
+                    current.occurrences.clear();
+                    current.adjacency.clear();
+                    current.history_symbols.clear();
+                    current.facets.clear();
+                }
                 current_requirements = Some(current);
                 retained = restored;
             }
             let requirements = current_requirements.as_ref().unwrap_or(requirements);
-            if requirements
-                .retrievals
-                .iter()
-                .all(|request| request.change.is_none())
-            {
-                let selected = match self
-                    .acquire_query_data(
-                        requirements,
-                        &requirements.retrievals,
-                        selected_view,
-                        execution,
-                    )
-                    .await?
-                {
-                    Ok(selected) => selected,
-                    Err(reason) => return Ok(Err(reason)),
-                };
-                let mut selected = selected;
-                if !requirements.retrievals.is_empty()
-                    && !requirements
-                        .datasets
-                        .iter()
-                        .any(|graph| graph == LOCAL_GRAPH)
-                {
-                    selected.graph = None;
-                }
-                let selected = self
-                    .query_work(execution.budget, execution.deadline, move |budget| {
-                        selected.bind_targets(budget)
-                    })
-                    .await?;
-                return Ok(Ok(FactAcquisitions::Current(vec![selected], retained)));
-            }
-            if selected_view.is_some() {
-                return Ok(Err(unavailable(SymbolUnavailableReason::ViewContext)));
-            }
+            self.acquire_current_fact_queries(requirements, selected_view, execution, retained)
+                .await
+        })
+        .await
+    }
+
+    async fn acquire_current_fact_queries(
+        &self,
+        requirements: &FactRequirements,
+        selected_view: Option<(rift_server::LocalSymbolViewInput, CapturedView)>,
+        execution: QueryExecution<'_>,
+        retained: Vec<(
+            QueryFactSelection,
+            QueryServices,
+            Option<rift_search::sparql::QueryIdentities>,
+        )>,
+    ) -> Result<Result<FactAcquisitions, SearchUnavailable>, ToolFailure> {
+        if requirements
+            .retrievals
+            .iter()
+            .all(|request| request.change.is_none())
+        {
             let selected = match self
-                .acquire_change_fact_queries(requirements, execution)
+                .acquire_query_data(
+                    requirements,
+                    &requirements.retrievals,
+                    selected_view,
+                    execution,
+                )
                 .await?
             {
                 Ok(selected) => selected,
                 Err(reason) => return Ok(Err(reason)),
             };
-            Ok(Ok(FactAcquisitions::Current(selected, retained)))
-        })
-        .await
+            let mut selected = selected;
+            if (!requirements.retrievals.is_empty() || !requirements.source_reads.is_empty())
+                && !requirements
+                    .datasets
+                    .iter()
+                    .any(|graph| graph == LOCAL_GRAPH)
+            {
+                selected.graph = None;
+            }
+            let selected = self
+                .query_work(execution.budget, execution.deadline, move |budget| {
+                    selected.bind_targets(budget)
+                })
+                .await?;
+            return Ok(Ok(FactAcquisitions::Current(vec![selected], retained)));
+        }
+        if selected_view.is_some() {
+            return Ok(Err(unavailable(SymbolUnavailableReason::ViewContext)));
+        }
+        let selected = match self
+            .acquire_change_fact_queries(requirements, execution)
+            .await?
+        {
+            Ok(selected) => selected,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        Ok(Ok(FactAcquisitions::Current(selected, retained)))
     }
 
     async fn acquire_change_fact_queries(
@@ -500,7 +565,7 @@ impl RiftMcp {
         Ok(Ok(selected))
     }
 
-    fn query_fact_view(
+    pub(super) fn query_fact_view(
         &self,
         view: Option<CapturedViewId>,
     ) -> Result<Result<SelectedFactView, SearchUnavailable>, ToolFailure> {
@@ -601,6 +666,7 @@ impl RiftMcp {
             FactAcquisitions::Current(selected, retained) => (selected, retained),
         };
         let (selected, mut retained) = selected;
+        let requirements = current_fact_requirements(requirements, !retained.is_empty());
         let views = std::sync::Arc::clone(&self.local_views);
         let responses = std::sync::Arc::clone(&self.candidate_responses);
         self.query_work(budget, deadline, move |budget| {
@@ -803,4 +869,28 @@ fn append_captured(
         .map_err(|_| retention_failure())?;
     selected.append(retained);
     Ok(())
+}
+
+fn current_fact_requirements(
+    mut requirements: FactRequirements,
+    has_retained: bool,
+) -> FactRequirements {
+    if has_retained
+        && requirements.retrievals.is_empty()
+        && requirements.datasets.is_empty()
+        && !requirements.source_reads.is_empty()
+    {
+        requirements.required.clear();
+        requirements.symbol_name = None;
+        requirements.symbol_ids = None;
+        requirements.source_units = None;
+        requirements.occurrences.clear();
+        requirements.adjacency.clear();
+        requirements.history_symbols.clear();
+        requirements.facets.clear();
+        requirements
+            .services
+            .retain(|service| !service.starts_with(rift_search::sparql::RESULT_SERVICE_PREFIX));
+    }
+    requirements
 }

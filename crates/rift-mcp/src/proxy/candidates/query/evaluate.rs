@@ -106,22 +106,33 @@ pub(crate) fn prepare_selected_services(
         budget.check()?;
         budget.charge(&selected.facts)?;
         budget.charge(&identities)?;
-        services.datasets.push(QueryDataset {
-            graph: selected.graph.as_ref().map(|graph| {
-                if backend == "local" {
-                    graph.clone()
-                } else {
-                    format!("{}{backend}", rift_search::sparql::EXTRA_PROJECTS)
-                }
-            }),
-            facts: selected.facts.clone(),
-            identities: identities.clone(),
-            default: true,
-        });
-        budget.charge(&producer_services)?;
-        if !producer_services.datasets.is_empty() {
+        if !selected.services.datasets.is_empty() {
             return Err(retained::unavailable());
         }
+        budget.charge(&producer_services)?;
+        include_selected_datasets(
+            &mut services,
+            &mut producer_services,
+            &selected,
+            &identities,
+            &backend,
+            budget,
+        )?;
+        budget.charge_material(
+            producer_services
+                .sources
+                .len()
+                .checked_mul(size_of::<(
+                    rift_protocol::source_read::GetSourceParams,
+                    rift_protocol::source_read::GetSourceResult,
+                )>())
+                .ok_or_else(retained::unavailable)?,
+        )?;
+        services
+            .sources
+            .try_reserve_exact(producer_services.sources.len())
+            .map_err(|_| retained::unavailable())?;
+        services.sources.append(&mut producer_services.sources);
         services.bindings.append(&mut producer_services.bindings);
         for service in &mut producer_services.retrievals {
             for (owner, _) in service.targets.iter_mut().flatten() {
@@ -148,8 +159,69 @@ pub(crate) fn prepare_selected_services(
         warnings.extend(selected.warnings.iter().cloned());
         captured.push((backend, selected, identities));
     }
-    let input = retained::Input::prepare(captured, configuration, maximum, budget)?;
+    let mut input = retained::Input::prepare(captured, configuration, maximum, budget)?;
+    for (request, result) in &services.sources {
+        budget.check()?;
+        let view = match result {
+            rift_protocol::source_read::GetSourceResult::Found { view, .. }
+            | rift_protocol::source_read::GetSourceResult::Missing { view, .. } => view,
+            rift_protocol::source_read::GetSourceResult::Unavailable { .. } => {
+                return Err(retained::unavailable());
+            }
+        };
+        input.include_view(view)?;
+        input.include_source(request, result, budget)?;
+    }
     Ok((input, facts, services, warnings))
+}
+
+fn include_selected_datasets(
+    services: &mut QueryServices,
+    producer_services: &mut QueryServices,
+    selected: &crate::server::QueryFactSelection,
+    identities: &rift_search::sparql::QueryIdentities,
+    backend: &str,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<(), RiftError> {
+    if producer_services.datasets.is_empty() {
+        services.datasets.push(QueryDataset {
+            graph: selected.graph.as_ref().map(|graph| {
+                if backend == "local" {
+                    graph.clone()
+                } else {
+                    format!("{}{backend}", rift_search::sparql::EXTRA_PROJECTS)
+                }
+            }),
+            facts: selected.facts.clone(),
+            identities: identities.clone(),
+            default: true,
+        });
+    } else {
+        budget.charge_material(
+            producer_services
+                .datasets
+                .len()
+                .checked_mul(size_of::<QueryDataset>())
+                .ok_or_else(retained::unavailable)?,
+        )?;
+        services
+            .datasets
+            .try_reserve_exact(producer_services.datasets.len())
+            .map_err(|_| retained::unavailable())?;
+        for dataset in &mut producer_services.datasets {
+            if backend != "local" && dataset.graph.is_some() {
+                budget.charge_material(
+                    rift_search::sparql::EXTRA_PROJECTS
+                        .len()
+                        .checked_add(backend.len())
+                        .ok_or_else(retained::unavailable)?,
+                )?;
+                dataset.graph = Some(format!("{}{backend}", rift_search::sparql::EXTRA_PROJECTS));
+            }
+        }
+        services.datasets.append(&mut producer_services.datasets);
+    }
+    Ok(())
 }
 
 fn owner_routing(
@@ -233,7 +305,7 @@ fn selected_identities(
     dictionaries
         .try_reserve_exact(selections.len())
         .map_err(|_| retained::unavailable())?;
-    for (backend, body, _, saved) in selections {
+    for (backend, body, services, saved) in selections {
         budget.check()?;
         let same_owner = |candidate: &&(
             String,
@@ -272,7 +344,14 @@ fn selected_identities(
             budget.charge(saved)?;
             saved.clone()
         } else {
-            let mut dictionary = if body.graph == anchor.1.graph {
+            let fresh_sources = if anchor.1.graph.is_none() && anchor.3.is_none() {
+                fresh_source_identities(backend, body, services, budget)?
+            } else {
+                None
+            };
+            let mut dictionary = if let Some(dictionary) = fresh_sources {
+                dictionary
+            } else if body.graph == anchor.1.graph {
                 identity::identities(backend, body, budget)?
             } else {
                 identity::identities_for(backend, body, &anchor.1, budget)?
@@ -304,6 +383,38 @@ fn selected_identities(
         dictionaries.push(dictionary);
     }
     Ok(dictionaries)
+}
+
+fn fresh_source_identities(
+    backend: &str,
+    body: &crate::server::QueryFactSelection,
+    services: &QueryServices,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<Option<rift_search::sparql::QueryIdentities>, RiftError> {
+    if body.graph.is_some()
+        || !body.requirements.required.is_empty()
+        || !body.requirements.retrievals.is_empty()
+        || body.requirements.source_reads.is_empty()
+        || services.sources.is_empty()
+    {
+        return Ok(None);
+    }
+    for (request, result) in &services.sources {
+        budget.check()?;
+        if !result.is_valid_for(request) {
+            return Err(retained::unavailable());
+        }
+    }
+    super::source::source_identities(
+        backend,
+        body,
+        services
+            .sources
+            .iter()
+            .map(|(request, _)| (&request.unit, &request.unit)),
+        budget,
+    )
+    .map(Some)
 }
 
 fn check_shared_dictionary(

@@ -1,7 +1,7 @@
 use super::*;
 use rift_protocol::configuration::WorkspaceConfiguration;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::symbol_read::SymbolUnavailableReason;
+use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use serde_json::json;
 use std::time::{Duration, SystemTime};
 
@@ -1594,7 +1594,15 @@ fn saved_public_source_keeps_original_bytes_and_provider_view()
 -> Result<(), Box<dyn std::error::Error>> {
     let (root, captured) = captured_source_fixture()?;
     let metadata = super::super::retained::metadata(&captured)?;
-    let saved = metadata.sources.first().ok_or("original source metadata")?;
+    let original_unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/lib.rs")?;
+    let mut original_sources = metadata
+        .sources
+        .iter()
+        .filter(|source| source.original == original_unit);
+    let saved = original_sources
+        .next()
+        .ok_or("original lib.rs source metadata")?;
+    assert!(original_sources.next().is_none());
     assert_ne!(saved.public, saved.original);
     std::fs::write(root.path().join("lib.rs"), "pub fn replacement() {}\n")?;
     let mut budget = rift_server::QueryFactBudget::new(query_limits(), &|| false)?;
@@ -1745,5 +1753,1023 @@ fn saved_public_sources_keep_distinct_provider_bytes_when_original_units_match()
     }
     let unknown = rift_protocol::read::SourceUnitId::parse("rift://source/project/unknown.rs")?;
     assert!(super::super::source::selected_source(&metadata, &unknown).is_err());
+    Ok(())
+}
+
+#[test]
+fn prepared_source_service_reaches_evaluation_with_original_public_parent_expiry()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rift_protocol::read::SourceUnitId;
+    use rift_protocol::source_read::GetSourceParams;
+    let original = "// λ only\n";
+    let mut fixture = fixture_with_file(Some(("lib.rs", original)));
+    let root = fixture.root.path().canonicalize()?;
+    let provider_view = fixture.selected.view.clone();
+    let parent = source_parent_view(&fixture, &root, &provider_view)?;
+    let unit = SourceUnitId::parse("rift://source/project/lib.rs")?;
+    let request = GetSourceParams {
+        unit: unit.clone(),
+        range: None,
+        view: Some(parent.id.clone()),
+        rev: None,
+    };
+    let raw_request = GetSourceParams {
+        view: Some(provider_view.id.clone()),
+        ..request.clone()
+    };
+    let (result, raw_result) = prepared_source_results(
+        &unit,
+        original,
+        &parent,
+        &provider_view,
+        &request,
+        &raw_request,
+    )?;
+    fixture
+        .selected
+        .services
+        .sources
+        .push((raw_request.clone(), raw_result));
+    fixture.selected.requirements.source_reads.push(raw_request);
+    let certificate = serde_json::to_value(&fixture.selected.services.sources)?;
+    fixture.selected.graph = None;
+    fixture.selected.facts = rift_search::sparql::QueryFacts::default();
+    fixture.selected.subjects.clear();
+    fixture.selected.requirements.required.clear();
+    let limits = query_limits();
+    let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+    let mut identities =
+        super::super::identity::identities("local", &fixture.selected, &mut budget)?;
+    assert_eq!(identities.sources.len(), 1);
+    identities.sources[0].1 = unit.clone();
+    let ready = rift_search::sparql::QueryServices {
+        sources: vec![(request, result)],
+        ..Default::default()
+    };
+    let (input, facts, services, warnings) = super::super::evaluate::prepare_selected_services(
+        vec![(
+            "local".to_owned(),
+            fixture.selected,
+            ready,
+            Some(identities),
+        )],
+        &[],
+        limits,
+        rift_protocol::query::QueryConfiguration::default(),
+        rift_server::QueryProcessLimits::from_query(limits)?.material_bytes_max,
+        &mut budget,
+    )?;
+    assert_eq!(
+        services.sources.len(),
+        1,
+        "the producer's typed source association must reach evaluation"
+    );
+    assert_eq!(
+        input.original_context()?.0,
+        root.to_str().ok_or("original root")?
+    );
+    assert_eq!(input.original_context()?.1, &SymbolOwner::Local);
+    let answer =
+        evaluate_prepared_source_service(facts, services, &unit, &parent, original, limits)?;
+    let captured = input.capture(
+        &fixture.issuer,
+        &root,
+        &SymbolOwner::Local,
+        &answer,
+        warnings,
+        &mut budget,
+    )?;
+    let rift_protocol::query::QueryReadResult::Results(captured) = captured else {
+        return Err("captured source answer".into());
+    };
+    let view = captured.view.ok_or("source query view")?;
+    assert!(crate::proxy::captured_expiry(&view)? <= crate::proxy::captured_expiry(&parent)?);
+    let captured = fixture
+        .issuer
+        .query_view(&view.id, &root, &SymbolOwner::Local)
+        .map_err(|reason| format!("original source query: {reason:?}"))?;
+    assert_captured_source_service(
+        &captured,
+        &unit,
+        &view,
+        &provider_view,
+        &certificate,
+        original,
+        &mut budget,
+    )?;
+    Ok(())
+}
+
+fn source_parent_view(
+    fixture: &Fixture,
+    root: &std::path::Path,
+    provider_view: &CapturedView,
+) -> Result<CapturedView, Box<dyn std::error::Error>> {
+    let provider_expiry = crate::proxy::captured_expiry(provider_view)?;
+    let parent = fixture
+        .issuer
+        .capture_query_with(
+            rift_server::QueryViewInput::new(
+                root.to_path_buf(),
+                SymbolOwner::Local,
+                provider_expiry - Duration::from_secs(1),
+            )?,
+            |_| Ok(true),
+        )?
+        .ok_or("shorter public parent")?;
+    assert!(crate::proxy::captured_expiry(&parent)? < provider_expiry);
+    Ok(parent)
+}
+
+fn prepared_source_results(
+    unit: &rift_protocol::read::SourceUnitId,
+    original: &str,
+    parent: &CapturedView,
+    provider_view: &CapturedView,
+    request: &rift_protocol::source_read::GetSourceParams,
+    raw_request: &rift_protocol::source_read::GetSourceParams,
+) -> Result<
+    (
+        rift_protocol::source_read::GetSourceResult,
+        rift_protocol::source_read::GetSourceResult,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    use rift_protocol::read::{SourceExcerpt, SourceUnitSpan, TextRange};
+    use rift_protocol::source_read::GetSourceResult;
+    let result = GetSourceResult::Found {
+        source: SourceExcerpt {
+            span: SourceUnitSpan {
+                unit: unit.clone(),
+                range: TextRange {
+                    start: 0,
+                    end: u64::try_from(original.len())?,
+                },
+            },
+            text: original.to_owned(),
+        },
+        source_complete: true,
+        view: parent.clone(),
+        warnings: Vec::new(),
+    };
+    assert!(result.is_valid_for(request));
+    let mut raw_result = result.clone();
+    let GetSourceResult::Found { view, .. } = &mut raw_result else {
+        return Err("original found source".into());
+    };
+    *view = provider_view.clone();
+    assert!(raw_result.is_valid_for(raw_request));
+    Ok((result, raw_result))
+}
+
+fn evaluate_prepared_source_service(
+    facts: rift_search::sparql::QueryFacts,
+    services: rift_search::sparql::QueryServices,
+    unit: &rift_protocol::read::SourceUnitId,
+    parent: &CapturedView,
+    original: &str,
+    limits: rift_search::sparql::QueryLimits,
+) -> Result<rift_protocol::query::QueryAnswer, Box<dyn std::error::Error>> {
+    let selected_view = oxigraph::model::Literal::from(parent.id.as_str());
+    let query = rift_search::sparql::PreparedQuery::parse(
+        &format!(
+            "SELECT ?outcome ?text ?unit ?source_view ?expiry {{ SERVICE :source {{ ?read :unit <{unit}>; :view {selected_view}; :outcome ?outcome; :source [ :text ?text; :span [ :unit ?unit ] ]; :view [ :id ?source_view; :expires_at ?expiry ] }} }}",
+            unit = unit.as_str(),
+        ),
+        limits,
+    )?;
+    let answer = query.evaluate_with_services(
+        facts,
+        limits,
+        rift_search::sparql::QueryCancellation::default(),
+        services,
+    )?;
+    let value = serde_json::to_value(&answer)?;
+    let rows = value["bindings"].as_array().ok_or("source bindings")?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["outcome"]["value"], "found");
+    assert_eq!(rows[0]["text"]["value"], original);
+    assert_eq!(rows[0]["unit"]["value"], unit.as_str());
+    assert_eq!(rows[0]["source_view"]["value"], parent.id.as_str());
+    assert_eq!(rows[0]["expiry"]["value"], parent.expires_at);
+    Ok(answer)
+}
+
+fn assert_captured_source_service(
+    captured: &rift_server::CapturedQueryView,
+    unit: &rift_protocol::read::SourceUnitId,
+    view: &CapturedView,
+    provider_view: &CapturedView,
+    certificate: &serde_json::Value,
+    original: &str,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
+    let metadata = super::super::retained::metadata(captured)?;
+    let saved = super::super::source::selected_source(&metadata, unit)?;
+    assert_eq!(&saved.original, unit);
+    let bytes = captured
+        .material()
+        .sources()
+        .get(saved.bytes.clone().ok_or("whole source promotion")?)
+        .ok_or("whole source buffer")?;
+    assert_eq!(bytes, original.as_bytes());
+    let own_request = GetSourceParams {
+        unit: unit.clone(),
+        range: None,
+        view: Some(view.id.clone()),
+        rev: None,
+    };
+    let own_result =
+        super::super::source::captured_source(own_request.clone(), bytes, view, budget)?;
+    assert!(own_result.is_valid_for(&own_request));
+    let GetSourceResult::Found {
+        source,
+        view: returned,
+        source_complete,
+        ..
+    } = own_result
+    else {
+        return Err("own outer view source result".into());
+    };
+    assert_eq!(source.text, original);
+    assert_eq!(&source.span.unit, unit);
+    assert_eq!(&returned, view);
+    assert!(source_complete);
+    let (_, bodies) = super::super::replay::restore(captured, budget)?;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        &bodies[0].1.view, provider_view,
+        "raw provider view and expiry must stay unchanged"
+    );
+    assert_eq!(
+        &serde_json::to_value(&bodies[0].1.services.sources)?,
+        certificate,
+        "raw source certificate stays unchanged"
+    );
+    Ok(())
+}
+
+#[test]
+fn raw_source_certificate_keeps_request_order_and_refuses_subset_coverage()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
+    let mut fixture = fixture();
+    for path in ["a.rs", "b.rs"] {
+        let request = GetSourceParams {
+            unit: rift_protocol::read::SourceUnitId::parse(&format!(
+                "rift://source/project/{path}"
+            ))?,
+            range: None,
+            view: Some(fixture.selected.view.id.clone()),
+            rev: None,
+        };
+        let result = GetSourceResult::Missing {
+            unit: request.unit.clone(),
+            view: fixture.selected.view.clone(),
+            warnings: Vec::new(),
+        };
+        assert!(result.is_valid_for(&request));
+        fixture
+            .selected
+            .requirements
+            .source_reads
+            .push(request.clone());
+        fixture.selected.services.sources.push((request, result));
+    }
+    let requirements = fixture.selected.requirements.clone();
+    fixture.selected.validate_coverage(&requirements)?;
+    assert!(fixture.selected.covers(&requirements));
+    let mut subset = requirements.clone();
+    subset.source_reads.pop();
+    assert!(!fixture.selected.covers(&subset));
+    subset.source_reads.clear();
+    assert!(fixture.selected.covers(&subset));
+    let mut reordered = requirements.clone();
+    reordered.source_reads.reverse();
+    assert!(!fixture.selected.covers(&reordered));
+    fixture.selected.services.sources.reverse();
+    assert!(fixture.selected.validate_coverage(&requirements).is_err());
+    assert!(!fixture.selected.covers(&requirements));
+    Ok(())
+}
+
+#[test]
+fn retained_source_directory_merges_only_the_same_original_authority()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture_with_file(Some(("lib.rs", "pub fn original() {}\n")));
+    let encoded = serde_json::to_vec(&fixture.selected)?;
+    let limits = query_limits();
+    for change in [
+        "none",
+        "root",
+        "owner",
+        "view",
+        "bytes",
+        "unknown_selection",
+    ] {
+        let mut first: QueryFactSelection = serde_json::from_slice(&encoded)?;
+        let mut second: QueryFactSelection = serde_json::from_slice(&encoded)?;
+        second.graph = None;
+        let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+        let identities = super::super::identity::identities("local", &first, &mut budget)?;
+        let second_identities = identities.clone();
+        let public = identities
+            .sources
+            .first()
+            .ok_or("source identity")?
+            .1
+            .clone();
+        change_source_authority(change, &mut first, &mut second, &fixture)?;
+        let input = super::super::retained::Input::prepare(
+            vec![
+                ("local".to_owned(), first, identities),
+                ("local".to_owned(), second, second_identities),
+            ],
+            rift_protocol::query::QueryConfiguration::default(),
+            rift_server::QueryProcessLimits::from_query(limits)?.material_bytes_max,
+            &mut budget,
+        );
+        if !matches!(change, "none" | "view") {
+            assert!(input.is_err(), "different {change} authority must refuse");
+            continue;
+        }
+        let root = fixture.root.path().canonicalize()?;
+        let response = input?.capture(
+            &fixture.issuer,
+            &root,
+            &SymbolOwner::Local,
+            &rift_protocol::query::QueryAnswer::Boolean { value: true },
+            Vec::new(),
+            &mut budget,
+        )?;
+        let rift_protocol::query::QueryReadResult::Results(response) = response else {
+            return Err("same authority capture".into());
+        };
+        let view = response.view.ok_or("same authority view")?;
+        let captured = fixture
+            .issuer
+            .query_view(&view.id, &root, &SymbolOwner::Local)
+            .map_err(|reason| format!("same authority query: {reason:?}"))?;
+        let metadata = super::super::retained::metadata(&captured)?;
+        assert_eq!(
+            metadata
+                .sources
+                .iter()
+                .filter(|source| source.public == public)
+                .count(),
+            1
+        );
+        let (_, bodies) = super::super::replay::restore(&captured, &mut budget)?;
+        assert_eq!(bodies.len(), 2);
+        for (_, body, _) in bodies {
+            assert!(
+                body.facts
+                    .sources
+                    .iter()
+                    .any(|source| source.text.as_deref() == Some("pub fn original() {}\n"))
+            );
+        }
+    }
+    Ok(())
+}
+
+fn change_source_authority(
+    change: &str,
+    first: &mut QueryFactSelection,
+    second: &mut QueryFactSelection,
+    fixture: &Fixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match change {
+        "none" => {}
+        "root" => second.root.push_str("/other"),
+        "owner" => {
+            second.owner = SymbolOwner::NamedLocal {
+                name: "other".into(),
+            }
+        }
+        "view" => {
+            second.view = fixture
+                .issuer
+                .capture_query_with(
+                    rift_server::QueryViewInput::new(
+                        fixture.root.path().canonicalize()?,
+                        SymbolOwner::Local,
+                        SystemTime::now() + Duration::from_secs(300),
+                    )?,
+                    |_| Ok(true),
+                )?
+                .ok_or("same owner independent view")?;
+            assert_ne!(second.view.id, first.view.id);
+        }
+        "unknown_selection" => {
+            for body in [&mut *first, &mut *second] {
+                for source in &mut body.facts.sources {
+                    source.digest = None;
+                    source.text = None;
+                }
+            }
+            second.selection.fingerprint =
+                rift_search::query::source_text_digest("another immutable source selection")?;
+            assert_eq!(first.root, second.root);
+            assert_eq!(first.owner, second.owner);
+            assert_ne!(first.selection.fingerprint, second.selection.fingerprint);
+            assert!(
+                first
+                    .facts
+                    .sources
+                    .iter()
+                    .chain(&second.facts.sources)
+                    .all(|source| source.digest.is_none() && source.text.is_none())
+            );
+        }
+        "bytes" => {
+            let source = second
+                .facts
+                .sources
+                .iter_mut()
+                .find(|source| source.text.is_some())
+                .ok_or("full original source")?;
+            source.text = Some("pub fn replacement() {}\n".to_owned());
+            source.digest = None;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+#[test]
+fn held_node_units_use_the_complete_source_directory_to_select_providers()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rift_search::query::FactRequirement;
+    let unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/lib.rs")?;
+    let selected = FactRequirements {
+        required: [FactRequirement::Nodes, FactRequirement::Source].into(),
+        source_units: Some(vec![unit]),
+        ..Default::default()
+    };
+    assert!(selected.selects_node_sources());
+    let main =
+        fixture_with_requirements(Some(("lib.rs", "pub fn original() {}\n")), Some(selected));
+    let mut docs = fixture_with_file(Some(("lib.rs", "pub fn documentation() {}\n")));
+    docs.selected
+        .facts
+        .unavailable_families
+        .push(rift_search::query::QueryFactFamily::Nodes);
+    assert!(main.selected.requirements.requires(FactRequirement::Nodes));
+    assert!(!docs.selected.requirements.requires(FactRequirement::Nodes));
+    let root = main.root.path().canonicalize()?;
+    let limits = query_limits();
+    let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+    let main_ids = super::super::identity::identities("local", &main.selected, &mut budget)?;
+    let docs_ids = super::super::identity::identities("docs", &docs.selected, &mut budget)?;
+    let main_public = original_public_source(&main.selected, &main_ids, "pub fn original() {}\n")?;
+    let docs_public =
+        original_public_source(&docs.selected, &docs_ids, "pub fn documentation() {}\n")?;
+    let input = super::super::retained::Input::prepare(
+        vec![
+            ("local".to_owned(), main.selected, main_ids),
+            ("docs".to_owned(), docs.selected, docs_ids),
+        ],
+        rift_protocol::query::QueryConfiguration::default(),
+        rift_server::QueryProcessLimits::from_query(limits)?.material_bytes_max,
+        &mut budget,
+    )?;
+    let response = input.capture(
+        &main.issuer,
+        &root,
+        &SymbolOwner::Local,
+        &rift_protocol::query::QueryAnswer::Boolean { value: true },
+        Vec::new(),
+        &mut budget,
+    )?;
+    let rift_protocol::query::QueryReadResult::Results(response) = response else {
+        return Err("source directory capture".into());
+    };
+    let view = response.view.ok_or("source directory view")?;
+    let captured = main
+        .issuer
+        .query_view(&view.id, &root, &SymbolOwner::Local)
+        .map_err(|reason| format!("source directory query: {reason:?}"))?;
+    assert_selected_node_directory(&captured, main_public, docs_public, limits, &mut budget)
+}
+
+fn assert_selected_node_directory(
+    captured: &rift_server::CapturedQueryView,
+    main_public: rift_protocol::read::SourceUnitId,
+    docs_public: rift_protocol::read::SourceUnitId,
+    limits: rift_search::sparql::QueryLimits,
+    budget: &mut rift_server::QueryFactBudget<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rift_search::query::FactRequirement;
+    let (metadata, bodies) = super::super::replay::restore(captured, budget)?;
+    let mut requested = FactRequirements {
+        required: [FactRequirement::Nodes, FactRequirement::Source].into(),
+        source_units: Some(vec![main_public]),
+        ..Default::default()
+    };
+    let mask = super::super::replay::selected_node_providers(&metadata, &requested, budget)?
+        .ok_or("proven selected provider")?;
+    assert_eq!(mask, [true, false]);
+    let services = rift_search::sparql::QueryServices::default();
+    assert!(super::super::replay::covers_retained_source_bindings(
+        &bodies,
+        &requested,
+        &services,
+        None,
+        limits,
+        Some(&mask),
+        budget
+    )?);
+    assert!(!super::super::replay::covers_retained_bindings(
+        &bodies, &requested, &services, None, limits, budget
+    )?);
+    let raw = serde_json::to_value(&bodies[1].1)?;
+    let mut excluded = rift_search::sparql::QueryServices::default();
+    super::super::replay::include_empty_node_domain(
+        &mut excluded,
+        &bodies[1].1,
+        &bodies[1].2,
+        budget,
+    )?;
+    assert_eq!(excluded.datasets.len(), 1);
+    assert!(excluded.datasets[0].facts.symbols.is_empty());
+    assert!(excluded.datasets[0].facts.nodes.is_empty());
+    assert_eq!(serde_json::to_value(&bodies[1].1)?, raw);
+    assert!(super::super::replay::covers_requested(
+        &bodies[..1],
+        &requested,
+        budget
+    )?);
+    let mut unknown = requested.clone();
+    unknown.source_units.as_mut().ok_or("selected unit")?.push(
+        rift_protocol::read::SourceUnitId::parse("rift://source/project/unknown.rs")?,
+    );
+    assert!(!super::super::replay::covers_requested(
+        &bodies[..1],
+        &unknown,
+        budget
+    )?);
+    assert!(!super::super::replay::covers_retained_source_bindings(
+        &bodies[..1],
+        &unknown,
+        &services,
+        None,
+        limits,
+        None,
+        budget,
+    )?);
+    requested.source_units = Some(vec![docs_public]);
+    let mask = super::super::replay::selected_node_providers(&metadata, &requested, budget)?
+        .ok_or("selected unavailable provider")?;
+    assert_eq!(mask, [false, true]);
+    assert!(requested.validate_facts(&bodies[1].1.facts).is_err());
+    assert!(!super::super::replay::covers_retained_source_bindings(
+        &bodies,
+        &requested,
+        &services,
+        None,
+        limits,
+        Some(&mask),
+        budget
+    )?);
+    requested.source_units = Some(vec![rift_protocol::read::SourceUnitId::parse(
+        "rift://source/project/unknown.rs",
+    )?]);
+    assert!(super::super::replay::selected_node_providers(&metadata, &requested, budget).is_err());
+    requested.source_units = None;
+    assert!(
+        super::super::replay::selected_node_providers(&metadata, &requested, budget)?.is_none()
+    );
+    Ok(())
+}
+
+fn assert_narrow_symbol_source_records(
+    selected: &QueryFactSelection,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use rift_search::query::FactRequirement;
+    assert!(!selected.requirements.requires(FactRequirement::Source));
+    let [original_source] = selected.facts.sources.as_slice() else {
+        return Err("one original declaration source record".into());
+    };
+    assert_eq!(
+        original_source.unit.as_str(),
+        "rift://source/project/lib.rs"
+    );
+    assert_eq!(
+        original_source.digest.as_ref(),
+        Some(&rift_search::query::source_text_digest(
+            "pub fn beacon() {}\n"
+        )?)
+    );
+    assert!(original_source.text.is_none());
+    Ok(())
+}
+
+#[test]
+fn narrow_symbol_source_directory_allows_only_selected_recorded_node_reacquisition()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rift_search::query::FactRequirement;
+    let requirements = rift_search::sparql::QueryPlan::prepare(
+        "SELECT ?symbol { ?symbol a :Symbol; :name 'beacon' }".to_owned(),
+        query_limits(),
+    )?
+    .requirements()
+    .clone();
+    assert_eq!(requirements.symbol_name.as_deref(), Some("beacon"));
+    let fixture =
+        fixture_with_requirements(Some(("lib.rs", "pub fn beacon() {}\n")), Some(requirements));
+    assert_narrow_symbol_source_records(&fixture.selected)?;
+    assert!(!fixture.selected.facts.symbols.is_empty());
+    let limits = query_limits();
+    let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+    let root = fixture.root.path().canonicalize()?;
+    let captured = capture_fact_body(
+        &fixture.issuer,
+        &root,
+        fixture.selected,
+        &rift_protocol::query::QueryAnswer::Boolean { value: true },
+        &mut budget,
+    )?;
+    std::fs::remove_file(root.join("lib.rs"))?;
+    let (metadata, bodies) = super::super::replay::restore(&captured, &mut budget)?;
+    let saved = metadata
+        .sources
+        .first()
+        .ok_or("retained Local declaration source authority")?;
+    assert!(saved.bytes.is_none());
+    let requested = FactRequirements {
+        required: [FactRequirement::Nodes, FactRequirement::Source].into(),
+        source_units: Some(vec![saved.public.clone()]),
+        ..Default::default()
+    };
+    let selected =
+        super::super::replay::selected_node_providers(&metadata, &requested, &mut budget)?
+            .ok_or("exact recorded provider")?;
+    assert_eq!(selected, [true]);
+    let (_, body, identities) = &bodies[0];
+    let original = serde_json::to_value(body)?;
+    assert!(
+        super::super::replay::source_requirements(
+            body,
+            identities,
+            &requested,
+            false,
+            &mut budget
+        )?
+        .is_none()
+    );
+    let acquired = super::super::replay::source_requirements(
+        body,
+        identities,
+        &requested,
+        selected[0],
+        &mut budget,
+    )?
+    .ok_or("closed Node scope on original provider")?;
+    assert!(acquired.selects_node_sources());
+    assert_eq!(
+        acquired.source_units.as_deref(),
+        Some(std::slice::from_ref(&saved.original))
+    );
+    assert_eq!(acquired.symbol_name, None);
+    assert_eq!(
+        serde_json::to_value(body)?,
+        original,
+        "raw name filter and certificate stay unchanged"
+    );
+    let mut unknown = requested.clone();
+    unknown.source_units = Some(vec![rift_protocol::read::SourceUnitId::parse(
+        "rift://source/project/unknown.rs",
+    )?]);
+    assert!(
+        super::super::replay::selected_node_providers(&metadata, &unknown, &mut budget).is_err()
+    );
+    assert!(
+        super::super::replay::source_requirements(body, identities, &unknown, true, &mut budget)
+            .is_err()
+    );
+    let mut generic = requested;
+    generic.required.insert(FactRequirement::Domain);
+    assert!(
+        super::super::replay::source_requirements(body, identities, &generic, true, &mut budget)
+            .is_err()
+    );
+    assert!(
+        super::super::replay::source_requirements(body, identities, &generic, false, &mut budget)?
+            .is_none()
+    );
+    Ok(())
+}
+
+const RECORDED_DEPENDENCY_SYMBOL: &str =
+    "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon";
+
+fn capture_missing_symbol_selection(
+    proxy: &super::super::RiftProxy,
+    fixture: &Fixture,
+    backend: &str,
+) -> Result<rift_protocol::symbol_read::CapturedView, Box<dyn std::error::Error>> {
+    let mut selected: QueryFactSelection =
+        serde_json::from_value(serde_json::to_value(&fixture.selected)?)?;
+    let symbol = selected
+        .facts
+        .symbols
+        .iter_mut()
+        .find(|row| row.symbol.name == "beacon")
+        .ok_or("original beacon record")?;
+    symbol.symbol.id = Some(rift_protocol::read::SymbolId::parse(
+        RECORDED_DEPENDENCY_SYMBOL,
+    )?);
+    selected.view.id = rift_protocol::symbol_read::CapturedViewId::parse("claims.remote")?;
+    let original_view = selected.view.clone();
+    let limits = query_limits();
+    let mut budget = rift_server::QueryFactBudget::new(limits, &|| false)?;
+    let identities = super::super::identity::identities(backend, &selected, &mut budget)?;
+    let input = super::super::retained::Input::prepare(
+        vec![(backend.to_owned(), selected, identities)],
+        rift_protocol::query::QueryConfiguration::default(),
+        rift_server::QueryProcessLimits::from_query(limits)?.material_bytes_max,
+        &mut budget,
+    )?;
+    let answer = rift_protocol::query::QueryAnswer::Bindings {
+        variables: vec!["symbol".to_owned()],
+        bindings: vec![std::collections::BTreeMap::from([(
+            "symbol".to_owned(),
+            rift_protocol::query::RdfTerm::Iri {
+                value: RECORDED_DEPENDENCY_SYMBOL.to_owned(),
+            },
+        )])],
+    };
+    let issuer = proxy.query_views.get().ok_or("query material owner")?;
+    let root = proxy.accepted_root.as_deref().ok_or("accepted root")?;
+    let response = input.capture(issuer, root, &proxy.owner, &answer, Vec::new(), &mut budget)?;
+    let rift_protocol::query::QueryReadResult::Results(response) = response else {
+        return Err("retained symbol selection".into());
+    };
+    assert_eq!(response.answer, answer);
+    let view = response.view.ok_or("public query view")?;
+    assert_ne!(view.id, original_view.id);
+    assert!(
+        crate::proxy::captured_expiry(&view)? <= crate::proxy::captured_expiry(&original_view)?
+    );
+    let captured = issuer
+        .query_view(&view.id, root, &proxy.owner)
+        .map_err(|reason| format!("original query material: {reason:?}"))?;
+    let metadata = super::super::retained::metadata(&captured)?;
+    assert_eq!(metadata.providers.len(), 1);
+    assert_eq!(metadata.providers[0].backend, backend);
+    assert_eq!(metadata.providers[0].root, fixture.selected.root);
+    assert_eq!(metadata.providers[0].owner, SymbolOwner::Local);
+    assert_eq!(metadata.providers[0].view, original_view);
+    assert_eq!(
+        serde_json::to_value(&metadata.providers[0].selection)?,
+        serde_json::to_value(&fixture.selected.selection)?
+    );
+    Ok(view)
+}
+
+async fn answer_recorded_missing_symbol(
+    backend: &super::super::RiftProxy,
+    project: &'static str,
+    raw_view: rift_protocol::symbol_read::CapturedView,
+    returned_view: Option<rift_protocol::symbol_read::CapturedView>,
+    returned_id: Option<&'static str>,
+) -> tokio::task::JoinHandle<std::io::Result<usize>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let (running, upstream) = crate::proxy::tests::direct_upstream();
+    {
+        let mut slot = backend.upstream.lock().await;
+        slot.connected = Some(crate::proxy::Upstream {
+            running,
+            generation: 0,
+        });
+        slot.generation_next = 1;
+    }
+    let returned_view = returned_view.unwrap_or_else(|| raw_view.clone());
+    let returned_id = returned_id.unwrap_or(RECORDED_DEPENDENCY_SYMBOL);
+    tokio::spawn(async move {
+        let (reading, mut writing) = tokio::io::split(upstream);
+        let mut lines = tokio::io::BufReader::new(reading).lines();
+        let line = lines
+            .next_line()
+            .await?
+            .ok_or(std::io::ErrorKind::UnexpectedEof)?;
+        let request: serde_json::Value = serde_json::from_str(&line)?;
+        let params = &request["params"];
+        assert_eq!(params["name"], "get_symbol");
+        assert_eq!(params["arguments"]["id"], RECORDED_DEPENDENCY_SYMBOL);
+        assert_eq!(params["arguments"]["view"], raw_view.id.as_str());
+        assert!(params["arguments"].get("rev").is_none());
+        let response = serde_json::json!({
+            "jsonrpc":"2.0", "id":request["id"], "result":{
+                "content":[], "isError":true,
+                "structuredContent":{
+                    "outcome":"missing", "symbol_not_found":{
+                        "id":returned_id,
+                        "alternatives":[], "detail":project
+                    }, "view":returned_view
+                }
+            }
+        });
+        writing
+            .write_all(format!("{response}\n").as_bytes())
+            .await?;
+        Ok(1)
+    })
+}
+
+#[tokio::test]
+async fn query_material_missing_symbols_keep_project_views_for_one_remote_token()
+-> Result<(), Box<dyn std::error::Error>> {
+    let main = fixture_with_file(Some(("lib.rs", "pub fn beacon() {}\n")));
+    let cloud = fixture_with_file(Some(("lib.rs", "pub fn beacon() {}\n")));
+    assert_ne!(main.selected.root, cloud.selected.root);
+    assert_ne!(main.selected.selection.root, cloud.selected.selection.root);
+    let proxy = crate::proxy::tests::named_proxy(main.root.path(), cloud.root.path())?;
+    let first = capture_missing_symbol_selection(&proxy, &main, "local")?;
+    let second = capture_missing_symbol_selection(&proxy, &cloud, "cloud")?;
+    assert_ne!(first.id, second.id);
+    let remote = |fixture: &Fixture| -> Result<_, rift_error::RiftError> {
+        Ok(rift_protocol::symbol_read::CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse("claims.remote")?,
+            expires_at: fixture.selected.view.expires_at.clone(),
+        })
+    };
+    let main_answer =
+        answer_recorded_missing_symbol(&proxy, "main", remote(&main)?, None, None).await;
+    let cloud_answer = answer_recorded_missing_symbol(
+        &proxy.backends["cloud"],
+        "cloud",
+        remote(&cloud)?,
+        None,
+        None,
+    )
+    .await;
+    for (expected, view) in [("main", &first), ("cloud", &second)] {
+        let request = rmcp::model::CallToolRequestParams::new("get_symbol").with_arguments(
+            serde_json::from_value(serde_json::json!({
+                "id":RECORDED_DEPENDENCY_SYMBOL, "view":view.id
+            }))?,
+        );
+        let rmcp::model::CallToolResponse::Complete(result) = proxy
+            .query_material_read(&request)
+            .await?
+            .ok_or("original query symbol directory")??
+        else {
+            return Err("complete missing symbol response".into());
+        };
+        assert_eq!(result.is_error, Some(true));
+        let body = result.structured_content.ok_or("typed Missing result")?;
+        assert_eq!(body["symbol_not_found"]["detail"], expected);
+        let typed: rift_protocol::symbol_read::GetSymbolResult = serde_json::from_value(body)?;
+        assert!(
+            matches!(typed, rift_protocol::symbol_read::GetSymbolResult::Missing {
+            view: selected, symbol_not_found, ..
+        } if selected == *view && symbol_not_found.id.as_str() == RECORDED_DEPENDENCY_SYMBOL)
+        );
+    }
+    assert_eq!(main_answer.await??, 1);
+    assert_eq!(cloud_answer.await??, 1);
+    assert_eq!(proxy.upstream.lock().await.generation_next, 1);
+    assert_eq!(
+        proxy.backends["cloud"]
+            .upstream
+            .lock()
+            .await
+            .generation_next,
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_material_missing_symbols_refuse_changed_original_view_or_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    for field in ["view", "expiry", "symbol"] {
+        assert_mismatched_missing_response(field).await?;
+    }
+    Ok(())
+}
+
+async fn assert_mismatched_missing_response(field: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let main = fixture_with_file(Some(("lib.rs", "pub fn beacon() {}\n")));
+    let cloud = fixture_with_file(Some(("lib.rs", "pub fn beacon() {}\n")));
+    let proxy = crate::proxy::tests::named_proxy(main.root.path(), cloud.root.path())?;
+    let public = capture_missing_symbol_selection(&proxy, &cloud, "cloud")?;
+    let mut original = cloud.selected.view.clone();
+    original.id = rift_protocol::symbol_read::CapturedViewId::parse("claims.remote")?;
+    let mut returned = original.clone();
+    let mut returned_id = None;
+    match field {
+        "view" => {
+            returned.id = rift_protocol::symbol_read::CapturedViewId::parse("claims.foreign")?;
+        }
+        "expiry" => {
+            returned.expires_at = jiff::Timestamp::now()
+                .checked_add(std::time::Duration::from_secs(600))?
+                .to_string();
+        }
+        "symbol" => {
+            returned_id = Some("rift://symbol/cargo/crates.io/other@1.0.0/rust/other/beacon");
+        }
+        _ => unreachable!(),
+    }
+    let answering = answer_recorded_missing_symbol(
+        &proxy.backends["cloud"],
+        "cloud",
+        original,
+        Some(returned),
+        returned_id,
+    )
+    .await;
+    let request = rmcp::model::CallToolRequestParams::new("get_symbol").with_arguments(
+        serde_json::from_value(serde_json::json!({
+            "id":RECORDED_DEPENDENCY_SYMBOL, "view":public.id
+        }))?,
+    );
+    let error = proxy
+        .query_material_read(&request)
+        .await
+        .expect_err("a different original symbol or full view cannot be qualified");
+    assert_eq!(error.slug(), rift_error::errors::server::read_invalid::SLUG);
+    assert_eq!(answering.await??, 1);
+    assert_eq!(
+        proxy.backends["cloud"]
+            .upstream
+            .lock()
+            .await
+            .generation_next,
+        1
+    );
+    assert_eq!(proxy.upstream.lock().await.generation_next, 0);
+    Ok(())
+}
+
+#[test]
+fn held_source_reads_do_not_require_symbol_facts_from_a_narrow_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rift_search::query::FactRequirement;
+    let plan = rift_search::sparql::QueryPlan::prepare(
+        "SELECT ?symbol { ?symbol a :Symbol; :name 'beacon' }".to_owned(),
+        query_limits(),
+    )?;
+    let fixture = fixture_with_requirements(
+        Some(("lib.rs", "pub fn beacon() {}\n")),
+        Some(plan.requirements().clone()),
+    );
+    assert_eq!(
+        fixture.selected.requirements.symbol_name.as_deref(),
+        Some("beacon")
+    );
+    let mut budget = rift_server::QueryFactBudget::new(query_limits(), &|| false)?;
+    let root = fixture.root.path().canonicalize()?;
+    let captured = capture_fact_body(
+        &fixture.issuer,
+        &root,
+        fixture.selected,
+        &rift_protocol::query::QueryAnswer::Boolean { value: true },
+        &mut budget,
+    )?;
+    let (metadata, bodies) = super::super::replay::restore(&captured, &mut budget)?;
+    let source = metadata
+        .sources
+        .iter()
+        .find(|source| source.original.as_str() == "rift://source/project/lib.rs")
+        .ok_or("original library source authority")?;
+    let view = oxigraph::model::Literal::from(captured.view().id.as_str());
+    let statement = format!(
+        "SELECT ?text {{ SERVICE <{}{}> {{}} SERVICE :source {{ ?read :unit <{}>; :view {view}; :outcome 'found'; :source [ :text ?text ] }} }}",
+        rift_search::sparql::RESULT_SERVICE_PREFIX,
+        captured.view().id.as_str(),
+        source.public.as_str(),
+    );
+    let plan = rift_search::sparql::QueryPlan::prepare(statement, query_limits())?;
+    let requested = plan.requirements();
+    assert!(requested.required.is_empty());
+    assert_eq!(requested.source_reads.len(), 1);
+    let original = serde_json::to_value(&bodies)?;
+    assert!(super::super::replay::covers_requested(
+        &bodies,
+        requested,
+        &mut budget
+    )?);
+    let mut domain = requested.clone();
+    domain.require(FactRequirement::Domain);
+    assert!(!super::super::replay::covers_requested(
+        &bodies,
+        &domain,
+        &mut budget
+    )?);
+    let mut other_service = requested.clone();
+    other_service
+        .services
+        .push(rift_search::sparql::SEARCH_SERVICE.to_owned());
+    assert!(!super::super::replay::covers_requested(
+        &bodies,
+        &other_service,
+        &mut budget
+    )?);
+    assert_eq!(serde_json::to_value(&bodies)?, original);
     Ok(())
 }

@@ -2231,3 +2231,130 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     failure_window.passed();
     Ok(())
 }
+
+#[tokio::test]
+async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() -> TestResult {
+    use workspace_client::query;
+    let directory = laid_out_workspace(
+        &[
+            ("Cargo.toml", harness::RUST_PROJECT_MANIFEST),
+            ("lib.rs", LIBRARY),
+        ],
+        "[dependencies]\nresolution = \"static\"\n",
+    )?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    let client = proxy_client(root).await?;
+    await_workspace_ready(&client).await?;
+    let initial = json!({"query":"SELECT ?symbol { SERVICE :search { ?hit :query 'beacon'; :target :symbol; :limit 1; :symbol ?symbol } ?symbol a :Symbol }"});
+    await_search_population(&client, &initial).await?;
+    let selected = proxied_call(&client, "search", &initial).await?;
+    let [row] = query::rows(&selected)? else {
+        return Err(format!("one original declaration: {selected}").into());
+    };
+    let symbol = query::iri(row, "symbol")?;
+    let view = selected["view"]["id"]
+        .as_str()
+        .ok_or("original proxy query view")?;
+    let statement = format!(
+        "SELECT ?id ?unit ?start ?end ?text {{ SERVICE <urn:rift:result:{view}> {{}} ?node a :Node; :symbol <{symbol}>; :unit ?unit; :id ?id; :range [ :start ?start; :end ?end ] . ?unit :source ?text }} ORDER BY ?start ?end"
+    );
+    let original = proxied_call(&client, "search", &json!({"query":statement})).await?;
+    let [node] = query::rows(&original)? else {
+        return Err(format!("one original semantic node: {original}").into());
+    };
+    assert!(!query::literal(node, "id")?.is_empty());
+    let unit = query::iri(node, "unit")?;
+    assert_eq!(query::literal(node, "text")?, LIBRARY);
+    let start = query::literal(node, "start")?.parse::<usize>()?;
+    let end = query::literal(node, "end")?.parse::<usize>()?;
+    let exact = proxied_call(
+        &client,
+        "get_symbol",
+        &json!({"id":symbol,"view":view,"include":["source"]}),
+    )
+    .await?;
+    assert_eq!(exact["view"], selected["view"]);
+    assert_eq!(exact["symbol"]["id"], symbol);
+    assert_eq!(
+        exact["declarations"][0]["source"],
+        LIBRARY.get(start..end).ok_or("original node range")?
+    );
+    for removed in [false, true] {
+        if removed {
+            fs::remove_file(root.join("lib.rs"))?;
+        } else {
+            fs::write(root.join("lib.rs"), "pub fn changed() {}\n")?;
+        }
+        let mut observed = false;
+        for _ in 0..SEARCH_POPULATION_POLLS_MAX {
+            let current = proxied_call(
+                &client,
+                "search",
+                &json!({"query":"ASK { ?symbol :name 'changed' }"}),
+            )
+            .await?;
+            if current["answer"]["value"] == !removed {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            observed,
+            "current index must observe the edit or removal before the held read"
+        );
+        let held = proxied_call(&client, "search", &json!({"query":statement})).await?;
+        assert_eq!(
+            query::rows(&held)?,
+            query::rows(&original)?,
+            "Node identity, unit, range and bytes stay captured"
+        );
+        let source = rift_protocol::source_read::GetSourceParams {
+            unit: rift_protocol::read::SourceUnitId::parse(unit)?,
+            range: None,
+            view: Some(rift_protocol::symbol_read::CapturedViewId::parse(view)?),
+            rev: None,
+        };
+        let answer = proxied_call(
+            &client,
+            "search",
+            &serde_json::to_value(query::source(&source)?)?,
+        )
+        .await?;
+        assert_original_proxy_source(&answer, &selected, unit, view)?;
+    }
+    let mixed = proxied_call(&client, "search", &json!({"query":"SELECT ?outcome ?name { ?symbol a :Symbol; :name 'beacon', ?name . SERVICE :source { ?read :unit <rift://source/project/lib.rs>; :outcome ?outcome } }"})).await?;
+    assert!(
+        query::rows(&mixed)?.is_empty(),
+        "removed current domain remains empty beside a typed source result"
+    );
+    client.cancel().await?;
+    failure_window.passed();
+    Ok(())
+}
+
+fn assert_original_proxy_source(
+    answer: &serde_json::Value,
+    selected: &serde_json::Value,
+    unit: &str,
+    view: &str,
+) -> TestResult {
+    use workspace_client::query;
+    let [row] = query::rows(answer)? else {
+        return Err(format!("one captured proxy source: {answer}").into());
+    };
+    assert_eq!(query::literal(row, "outcome")?, "found");
+    assert_eq!(query::iri(row, "unit")?, unit);
+    assert_eq!(query::literal(row, "text")?, LIBRARY);
+    assert_eq!(query::literal(row, "complete")?, "true");
+    assert_eq!(query::literal(row, "source_view")?, view);
+    assert_eq!(
+        query::literal(row, "source_expiry")?,
+        selected["view"]["expires_at"]
+            .as_str()
+            .ok_or("original proxy expiry")?
+    );
+    Ok(())
+}

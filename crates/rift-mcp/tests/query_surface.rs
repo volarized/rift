@@ -300,7 +300,9 @@ async fn query_children_preserve_source_and_metadata_responses_under_concurrent_
     .await?;
     assert_eq!(ready["answer"]["value"], true);
     let statement = json!({"query":"SELECT ?number { VALUES ?number { 1 2 3 } }"});
-    let source = json!({"unit":"rift://source/project/src/lib.rs"});
+    let source = serde_json::to_value(query::source(&serde_json::from_value(json!({
+        "unit":"rift://source/project/src/lib.rs"
+    }))?)?)?;
     let started = Instant::now();
     let work = async {
         tokio::join!(
@@ -309,7 +311,7 @@ async fn query_children_preserve_source_and_metadata_responses_under_concurrent_
             async {
                 let started = Instant::now();
                 let result =
-                    call_retrying_acceptance(&client, tool_request("get_source", &source)).await;
+                    call_retrying_acceptance(&client, tool_request("search", &source)).await;
                 (result, started.elapsed())
             },
             client.list_all_tools(),
@@ -319,7 +321,13 @@ async fn query_children_preserve_source_and_metadata_responses_under_concurrent_
         tokio::time::timeout(Duration::from_secs(30), work).await?;
     assert_eq!(query::rows(&left?)?.len(), 3);
     assert_eq!(query::rows(&right?)?.len(), 3);
-    assert!(serde_json::to_string(&source?)?.contains("pub fn beacon"));
+    let source = source?;
+    let [source_row] = query::rows(&source)? else {
+        return Err(format!("source query must return one original result: {source}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
+    assert!(query::literal(source_row, "text")?.contains("pub fn beacon"));
+    assert_eq!(query::literal(source_row, "complete")?, "true");
     assert!(tools?.iter().any(|tool| tool.name == "search"));
     let followup =
         call_retrying_acceptance(&client, tool_request("search", &json!({"query":"ASK {}"})))
@@ -845,7 +853,7 @@ async fn retrieval_count_acquires_every_transport_page_before_evaluation() -> Te
 #[tokio::test]
 async fn direct_query_source_reads_keep_original_utf8_bytes_and_ranges_after_edit() -> TestResult {
     use rift_protocol::read::TextRange;
-    use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
+    use rift_protocol::source_read::GetSourceParams;
 
     let original = "pub fn beacon() -> &'static str { \"café ☕\" }\n";
     let files = [("Cargo.toml", FILES[0].1), ("src/lib.rs", original)];
@@ -876,37 +884,49 @@ async fn direct_query_source_reads_keep_original_utf8_bytes_and_ranges_after_edi
         start: u64::try_from(start)?,
         end: u64::try_from(start + "café ☕".len())?,
     };
-    for selected in [None, Some(range)] {
-        let params = GetSourceParams {
-            range: selected,
-            ..params.clone()
-        };
-        let answer = call_retrying_acceptance(
-            &client,
-            tool_request("get_source", &serde_json::to_value(&params)?),
-        )
-        .await?;
-        let result: GetSourceResult = serde_json::from_value(answer.clone())?;
-        let GetSourceResult::Found {
-            source,
-            source_complete,
-            view,
-            ..
-        } = result
-        else {
-            return Err(format!("original source must remain readable: {answer}").into());
-        };
-        assert_eq!(source.span.unit, params.unit);
-        assert_eq!(serde_json::to_value(view)?, first["view"]);
-        let expected = params.range.unwrap_or(TextRange {
-            start: 0,
-            end: u64::try_from(original.len())?,
-        });
-        assert_eq!(source.span.range, expected);
-        let start = usize::try_from(expected.start)?;
-        let end = usize::try_from(expected.end)?;
-        assert_eq!(source.text, &original[start..end]);
-        assert!(source_complete);
+    for deleted in [false, true] {
+        if deleted {
+            std::fs::remove_file(directory.path().join("src/lib.rs"))?;
+        }
+        for selected in [None, Some(range.clone())] {
+            let params = GetSourceParams {
+                range: selected,
+                ..params.clone()
+            };
+            let answer = call_retrying_acceptance(
+                &client,
+                tool_request("search", &serde_json::to_value(query::source(&params)?)?),
+            )
+            .await?;
+            let [source] = query::rows(&answer)? else {
+                return Err(format!("original source must remain readable: {answer}").into());
+            };
+            assert_eq!(query::literal(source, "outcome")?, "found");
+            assert_eq!(query::iri(source, "unit")?, params.unit.as_str());
+            assert_eq!(
+                query::literal(source, "source_view")?,
+                first["view"]["id"].as_str().ok_or("original source view")?
+            );
+            assert_eq!(
+                query::literal(source, "source_expiry")?,
+                first["view"]["expires_at"]
+                    .as_str()
+                    .ok_or("original source expiry")?
+            );
+            let expected = params.range.unwrap_or(TextRange {
+                start: 0,
+                end: u64::try_from(original.len())?,
+            });
+            assert_eq!(
+                query::literal(source, "start")?.parse::<u64>()?,
+                expected.start
+            );
+            assert_eq!(query::literal(source, "end")?.parse::<u64>()?, expected.end);
+            let start = usize::try_from(expected.start)?;
+            let end = usize::try_from(expected.end)?;
+            assert_eq!(query::literal(source, "text")?, &original[start..end]);
+            assert_eq!(query::literal(source, "complete")?, "true");
+        }
     }
     client.cancel().await?;
     server_task.await?;
@@ -1230,6 +1250,475 @@ async fn retained_anonymous_subject_joins_keep_old_rows_after_edit() -> TestResu
             assert!(unavailable.get("answer").is_none());
         }
     }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_view_nodes_keep_original_source_and_semantic_identity_after_removal() -> TestResult {
+    assert_original_query_nodes("SELECT ?symbol { SERVICE :search { ?hit :query 'beacon'; :target :symbol; :limit 1; :symbol ?symbol } ?symbol a :Symbol }", true).await
+}
+
+#[tokio::test]
+async fn narrow_symbol_query_view_nodes_keep_original_source_after_removal() -> TestResult {
+    assert_original_query_nodes(
+        "SELECT ?symbol { ?symbol a :Symbol; :name 'beacon' }",
+        false,
+    )
+    .await
+}
+
+async fn assert_original_query_nodes(statement: &str, observe_unit: bool) -> TestResult {
+    let (directory, client, server_task) = served_workspace(FILES, None).await?;
+    let selected =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let (unit, statement, original) =
+        original_query_node_rows(&client, &selected, observe_unit).await?;
+    let unit = unit.as_str();
+    let original_rows = query::rows(&original)?;
+    let view = selected["view"]["id"]
+        .as_str()
+        .ok_or("original query view")?;
+    std::fs::write(directory.path().join("src/lib.rs"), "pub fn changed() {}\n")?;
+    let changed = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":"ASK { ?symbol :name 'changed' }"}),
+        ),
+    )
+    .await?;
+    assert_eq!(changed["answer"]["value"], true);
+    std::fs::remove_file(directory.path().join("src/lib.rs"))?;
+    let removed = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &json!({"query":"ASK { ?symbol :name 'changed' }"}),
+        ),
+    )
+    .await?;
+    assert_eq!(removed["answer"]["value"], false);
+    let held =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    assert_eq!(
+        query::rows(&held)?,
+        original_rows,
+        "original node identity, unit, range and bytes survive source and index removal"
+    );
+    let source = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse(unit)?,
+        range: None,
+        view: Some(rift_protocol::symbol_read::CapturedViewId::parse(view)?),
+        rev: None,
+    };
+    let mut source_query = query::source(&source)?;
+    source_query.query = source_query.query.replacen(
+        "{ SERVICE :source",
+        &format!("{{ SERVICE <urn:rift:result:{view}> {{}} SERVICE :source"),
+        1,
+    );
+    let held_source = call_retrying_acceptance(
+        &client,
+        tool_request("search", &serde_json::to_value(source_query)?),
+    )
+    .await?;
+    let [source_row] = query::rows(&held_source)? else {
+        return Err(format!("one captured source: {held_source}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
+    assert_eq!(query::iri(source_row, "unit")?, unit);
+    assert_eq!(query::literal(source_row, "text")?, FILES[1].1);
+    assert_eq!(query::literal(source_row, "complete")?, "true");
+    assert_eq!(query::literal(source_row, "source_view")?, view);
+    assert_eq!(
+        query::literal(source_row, "source_expiry")?,
+        selected["view"]["expires_at"]
+            .as_str()
+            .ok_or("original expiry")?
+    );
+    let unknown = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/missing.rs")?,
+        ..source
+    };
+    let unknown = client
+        .call_tool(tool_request(
+            "search",
+            &serde_json::to_value(query::source(&unknown)?)?,
+        ))
+        .await?;
+    assert_eq!(unknown.is_error, Some(true), "{unknown:?}");
+    assert!(unknown.structured_content.is_none(), "{unknown:?}");
+    let refusal = serde_json::to_string(&unknown)?;
+    assert!(
+        refusal.contains("rift.server.read_unavailable"),
+        "{refusal}"
+    );
+    assert!(
+        refusal.contains("retained query material is unavailable"),
+        "{refusal}"
+    );
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+async fn original_query_node_rows(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    selected: &Value,
+    observe_unit: bool,
+) -> TestResult<(String, String, Value)> {
+    let [row] = query::rows(selected)? else {
+        return Err(format!("one original declaration: {selected}").into());
+    };
+    let identity = query::iri(row, "symbol")?;
+    let view = selected["view"]["id"]
+        .as_str()
+        .ok_or("original query view")?;
+    let observed = call_retrying_acceptance(
+        client,
+        tool_request(
+            "get_symbol",
+            &json!({"id":identity,"view":view,"include":["source"]}),
+        ),
+    )
+    .await?;
+    assert_eq!(observed["outcome"], "found", "{observed}");
+    assert_eq!(observed["view"], selected["view"]);
+    let unit = if observe_unit {
+        let statement = format!(
+            "SELECT ?unit {{ SERVICE <urn:rift:result:{view}> {{}} ?node a :Node; :symbol <{identity}>; :unit ?unit }}"
+        );
+        let observed_nodes =
+            call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
+                .await?;
+        let [node] = query::rows(&observed_nodes)? else {
+            return Err(format!("one original semantic node unit: {observed_nodes}").into());
+        };
+        query::iri(node, "unit")?.to_owned()
+    } else if row.get("unit").is_some() {
+        query::iri(row, "unit")?.to_owned()
+    } else {
+        let path = observed["declarations"][0]["path"]
+            .as_str()
+            .ok_or("original Local declaration path")?;
+        rift_core::SourceUnitId::new(
+            rift_core::SourceResolverId::new("project")?,
+            rift_core::SourcePath::new(path)?,
+        )?
+        .to_string()
+    };
+    let unit_text = unit;
+    let unit = unit_text.as_str();
+    let statement = format!(
+        "SELECT ?id ?unit ?start ?end ?text {{ SERVICE <urn:rift:result:{view}> {{}} ?node a :Node; :symbol <{identity}>; :unit <{unit}>, ?unit; :id ?id; :range [ :start ?start; :end ?end ] . <{unit}> :source ?text }} ORDER BY ?start ?end"
+    );
+    let original =
+        call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let original_rows = query::rows(&original)?;
+    let [node] = original_rows else {
+        return Err(format!("one original semantic declaration node: {original}").into());
+    };
+    assert!(!query::literal(node, "id")?.is_empty());
+    assert_eq!(query::iri(node, "unit")?, unit);
+    assert_eq!(query::literal(node, "text")?, FILES[1].1);
+    let start = query::literal(node, "start")?.parse::<usize>()?;
+    let end = query::literal(node, "end")?.parse::<usize>()?;
+    let excerpt = FILES[1]
+        .1
+        .get(start..end)
+        .ok_or("original node byte range")?;
+    let exact = call_retrying_acceptance(
+        client,
+        tool_request(
+            "get_symbol",
+            &json!({"id":identity,"view":view,"include":["source"]}),
+        ),
+    )
+    .await?;
+    assert_eq!(exact["outcome"], "found", "{exact}");
+    assert_eq!(exact["symbol"]["id"], identity);
+    assert_eq!(exact["view"], selected["view"]);
+    assert_eq!(exact["declarations"][0]["source"], excerpt);
+    assert_eq!(
+        exact["declarations"][0]["range"],
+        json!({"start":start,"end":end})
+    );
+    Ok((unit_text, statement, original))
+}
+
+#[tokio::test]
+async fn source_queries_read_empty_and_symbolless_files_without_declarations() -> TestResult {
+    use rift_protocol::source_read::GetSourceParams;
+    let files = [
+        ("Cargo.toml", FILES[0].1),
+        ("src/lib.rs", FILES[1].1),
+        ("src/comment.rs", "// λ only\n"),
+        ("src/empty.rs", ""),
+    ];
+    let (directory, client, server_task) = served_workspace(&files, None).await?;
+    for (path, original) in &files[2..] {
+        let request = GetSourceParams {
+            unit: rift_protocol::read::SourceUnitId::parse(&format!(
+                "rift://source/project/{path}"
+            ))?,
+            range: None,
+            view: None,
+            rev: None,
+        };
+        let answer = call_retrying_acceptance(
+            &client,
+            tool_request("search", &serde_json::to_value(query::source(&request)?)?),
+        )
+        .await?;
+        let [row] = query::rows(&answer)? else {
+            return Err(format!("one complete source without declarations: {answer}").into());
+        };
+        assert_eq!(query::literal(row, "outcome")?, "found");
+        assert_eq!(query::iri(row, "unit")?, request.unit.as_str());
+        assert_eq!(query::literal(row, "text")?, *original);
+        assert_eq!(query::literal(row, "start")?, "0");
+        assert_eq!(
+            query::literal(row, "end")?.parse::<usize>()?,
+            original.len()
+        );
+        assert_eq!(query::literal(row, "complete")?, "true");
+        let source_view = query::literal(row, "source_view")?.to_owned();
+        let expiry = query::literal(row, "source_expiry")?.to_owned();
+        let outer = answer["view"].clone();
+        let chain = GetSourceParams {
+            unit: request.unit.clone(),
+            range: None,
+            view: Some(rift_protocol::symbol_read::CapturedViewId::parse(
+                outer["id"].as_str().ok_or("source query outer view")?,
+            )?),
+            rev: None,
+        };
+        let held = GetSourceParams {
+            view: Some(rift_protocol::symbol_read::CapturedViewId::parse(
+                &source_view,
+            )?),
+            ..request
+        };
+        std::fs::write(directory.path().join(path), "pub fn replacement() {}\n")?;
+        std::fs::remove_file(directory.path().join(path))?;
+        let answer = call_retrying_acceptance(
+            &client,
+            tool_request("search", &serde_json::to_value(query::source(&held)?)?),
+        )
+        .await?;
+        let [row] = query::rows(&answer)? else {
+            return Err(format!("one retained symbolless source: {answer}").into());
+        };
+        assert_eq!(query::iri(row, "unit")?, held.unit.as_str());
+        assert_eq!(query::literal(row, "text")?, *original);
+        assert_eq!(query::literal(row, "source_view")?, source_view);
+        assert_eq!(query::literal(row, "source_expiry")?, expiry);
+        assert_eq!(query::literal(row, "complete")?, "true");
+        let (chain, parent) = assert_source_query_chain(&client, chain, outer, original).await?;
+        if !original.is_empty() {
+            assert_source_query_ranges(&client, chain, &parent, held).await?;
+        }
+    }
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+async fn assert_source_query_chain(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    mut chain: rift_protocol::source_read::GetSourceParams,
+    mut parent: Value,
+    original: &str,
+) -> TestResult<(rift_protocol::source_read::GetSourceParams, Value)> {
+    for _ in 0..2 {
+        let answer = call_retrying_acceptance(
+            client,
+            tool_request("search", &serde_json::to_value(query::source(&chain)?)?),
+        )
+        .await?;
+        let [row] = query::rows(&answer)? else {
+            return Err(format!("one source from its own outer query view: {answer}").into());
+        };
+        assert_eq!(query::iri(row, "unit")?, chain.unit.as_str());
+        assert_eq!(query::literal(row, "text")?, original);
+        assert_eq!(query::literal(row, "start")?, "0");
+        assert_eq!(
+            query::literal(row, "end")?.parse::<usize>()?,
+            original.len()
+        );
+        assert_eq!(
+            query::literal(row, "source_view")?,
+            parent["id"].as_str().ok_or("parent id")?
+        );
+        assert_eq!(
+            query::literal(row, "source_expiry")?,
+            parent["expires_at"].as_str().ok_or("parent expiry")?
+        );
+        assert_eq!(query::literal(row, "complete")?, "true");
+        parent = answer["view"].clone();
+        chain.view = Some(rift_protocol::symbol_read::CapturedViewId::parse(
+            parent["id"]
+                .as_str()
+                .ok_or("next source query outer view")?,
+        )?);
+    }
+    Ok((chain, parent))
+}
+
+async fn assert_source_query_ranges(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    chain: rift_protocol::source_read::GetSourceParams,
+    parent: &Value,
+    held: rift_protocol::source_read::GetSourceParams,
+) -> TestResult {
+    use rift_protocol::source_read::GetSourceParams;
+    let chain_range = GetSourceParams {
+        range: Some(rift_protocol::read::TextRange { start: 3, end: 5 }),
+        ..chain
+    };
+    let answer = call_retrying_acceptance(
+        client,
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&chain_range)?)?,
+        ),
+    )
+    .await?;
+    let [row] = query::rows(&answer)? else {
+        return Err(format!("one UTF-8 range from chained source view: {answer}").into());
+    };
+    assert_eq!(query::iri(row, "unit")?, chain_range.unit.as_str());
+    assert_eq!(query::literal(row, "text")?, "λ");
+    assert_eq!(query::literal(row, "start")?, "3");
+    assert_eq!(query::literal(row, "end")?, "5");
+    assert_eq!(
+        query::literal(row, "source_view")?,
+        parent["id"].as_str().ok_or("range parent id")?
+    );
+    let partial = GetSourceParams {
+        range: Some(rift_protocol::read::TextRange { start: 3, end: 5 }),
+        ..held.clone()
+    };
+    let answer = call_retrying_acceptance(
+        client,
+        tool_request("search", &serde_json::to_value(query::source(&partial)?)?),
+    )
+    .await?;
+    let [row] = query::rows(&answer)? else {
+        return Err(format!("one exact UTF-8 range: {answer}").into());
+    };
+    assert_eq!(query::literal(row, "text")?, "λ");
+    assert_eq!(query::literal(row, "start")?, "3");
+    assert_eq!(query::literal(row, "end")?, "5");
+    let malformed = GetSourceParams {
+        range: Some(rift_protocol::read::TextRange { start: 3, end: 4 }),
+        ..held
+    };
+    for silent in [false, true] {
+        let mut request = query::source(&malformed)?;
+        if silent {
+            request.query = request
+                .query
+                .replacen("SERVICE :source", "SERVICE SILENT :source", 1);
+        }
+        let refused = client
+            .call_tool(tool_request("search", &serde_json::to_value(request)?))
+            .await?;
+        assert_eq!(refused.is_error, Some(true), "{refused:?}");
+        assert!(refused.structured_content.is_none());
+        assert!(
+            serde_json::to_string(&refused)?
+                .contains("source range must contain complete UTF-8 bytes")
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn source_service_and_domain_patterns_keep_one_local_graph() -> TestResult {
+    let (_directory, client, server_task) = served_workspace(FILES, None).await?;
+    let statement = "SELECT ?name ?text { ?symbol a :Symbol; :name 'beacon', ?name . SERVICE :source { ?read :unit <rift://source/project/src/lib.rs>; :outcome 'found'; :source [ :text ?text ] } }";
+    let answer =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let [row] = query::rows(&answer)? else {
+        return Err(format!("one domain row with exact source: {answer}").into());
+    };
+    assert_eq!(query::literal(row, "name")?, "beacon");
+    assert_eq!(query::literal(row, "text")?, FILES[1].1);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_source_requests_allow_subsets_and_reordered_service_groups() -> TestResult {
+    let a = "// a λ\n";
+    let b = "// b λ\n";
+    let files = [
+        ("Cargo.toml", FILES[0].1),
+        ("src/lib.rs", FILES[1].1),
+        ("src/a.rs", a),
+        ("src/b.rs", b),
+    ];
+    let (directory, client, server_task) = served_workspace(&files, None).await?;
+    let statement = "SELECT ?unit_a ?text_a ?view_a ?expiry_a ?unit_b ?text_b ?view_b ?expiry_b { SERVICE :source { ?a :unit <rift://source/project/src/a.rs>; :outcome 'found'; :source [ :text ?text_a; :span [ :unit ?unit_a ] ]; :view [ :id ?view_a; :expires_at ?expiry_a ] } SERVICE :source { ?b :unit <rift://source/project/src/b.rs>; :outcome 'found'; :source [ :text ?text_b; :span [ :unit ?unit_b ] ]; :view [ :id ?view_b; :expires_at ?expiry_b ] } }";
+    let selected =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let [row] = query::rows(&selected)? else {
+        return Err(format!("two original source associations: {selected}").into());
+    };
+    assert_eq!(query::literal(row, "text_a")?, a);
+    assert_eq!(query::literal(row, "text_b")?, b);
+    assert_eq!(
+        query::literal(row, "view_a")?,
+        query::literal(row, "view_b")?
+    );
+    assert_eq!(
+        query::literal(row, "expiry_a")?,
+        query::literal(row, "expiry_b")?
+    );
+    let view = query::literal(row, "view_a")?;
+    let expiry = query::literal(row, "expiry_a")?;
+    let unit_a = query::iri(row, "unit_a")?;
+    let unit_b = query::iri(row, "unit_b")?;
+    std::fs::remove_file(directory.path().join("src/a.rs"))?;
+    std::fs::remove_file(directory.path().join("src/b.rs"))?;
+    let request = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse(unit_a)?,
+        range: None,
+        view: Some(rift_protocol::symbol_read::CapturedViewId::parse(view)?),
+        rev: None,
+    };
+    let subset = call_retrying_acceptance(
+        &client,
+        tool_request("search", &serde_json::to_value(query::source(&request)?)?),
+    )
+    .await?;
+    let [subset_row] = query::rows(&subset)? else {
+        return Err(format!("one captured subset source: {subset}").into());
+    };
+    assert_eq!(query::literal(subset_row, "text")?, a);
+    assert_eq!(query::literal(subset_row, "source_view")?, view);
+    assert_eq!(query::literal(subset_row, "source_expiry")?, expiry);
+    let captured_view = oxigraph::model::Literal::from(view);
+    let statement = format!(
+        "SELECT ?text_a ?text_b {{ SERVICE :source {{ ?b :unit <{unit_b}>; :view {captured_view}; :outcome 'found'; :source [ :text ?text_b ] }} SERVICE :source {{ ?a :unit <{unit_a}>; :view {captured_view}; :outcome 'found'; :source [ :text ?text_a ] }} }}"
+    );
+    let reordered =
+        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    let [reordered_row] = query::rows(&reordered)? else {
+        return Err(format!("reordered captured source services: {reordered}").into());
+    };
+    assert_eq!(query::literal(reordered_row, "text_a")?, a);
+    assert_eq!(query::literal(reordered_row, "text_b")?, b);
     client.cancel().await?;
     server_task.await?;
     Ok(())

@@ -102,9 +102,7 @@ pub fn source_digest(source: &QuerySource) -> Result<Option<SourceDigest>, RiftE
     let Some(text) = &source.text else {
         return Ok(source.digest.clone());
     };
-    let digest = SourceDigest::parse(
-        &data_encoding::HEXLOWER.encode(rift_core::FileDigest::of(text.as_bytes()).as_bytes()),
-    )?;
+    let digest = source_text_digest(text)?;
     if source
         .digest
         .as_ref()
@@ -113,6 +111,16 @@ pub fn source_digest(source: &QuerySource) -> Result<Option<SourceDigest>, RiftE
         return unavailable("selected source bytes differ from their full digest").fail();
     }
     Ok(Some(digest))
+}
+
+/// Returns the complete lowercase SHA-256 digest of borrowed source text.
+///
+/// # Errors
+/// Returns the existing source digest encoding refusal.
+pub fn source_text_digest(text: &str) -> Result<SourceDigest, RiftError> {
+    SourceDigest::parse(
+        &data_encoding::HEXLOWER.encode(rift_core::FileDigest::of(text.as_bytes()).as_bytes()),
+    )
 }
 
 /// Compares two already checked witnesses for the same canonical source unit.

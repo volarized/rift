@@ -70,3 +70,16 @@ pub(super) fn include(
     }
     Ok(())
 }
+
+pub(super) fn source_selection(
+    unit: &rift_protocol::read::SourceUnitId,
+    view: &rift_protocol::symbol_read::CapturedView,
+    configuration: &GlobalConfiguration,
+) -> Result<Option<QueryGlobalSelection>, RiftError> {
+    let (owner, _) = parse_source_unit_identity(unit.as_str())?;
+    Ok(owner.map(|owner| QueryGlobalSelection {
+        owners: vec![owner],
+        view: view.clone(),
+        configuration: configuration.clone(),
+    }))
+}

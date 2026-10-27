@@ -333,77 +333,80 @@ fn project_query_facts_with_budget(
         unavailable_families: vec![QueryFactFamily::Nodes, QueryFactFamily::History],
         ..QueryFacts::default()
     };
-    for (identity, object) in view.objects() {
-        budget.check()?;
-        if requirements.symbol_ids.as_ref().is_some_and(|identities| {
-            !identities
-                .iter()
-                .any(|selected| selected.as_str() == identity.as_str())
-        }) {
-            continue;
-        }
-        let object = object?;
-        if requirements
-            .symbol_name
-            .as_deref()
-            .is_some_and(|name| object.facts().name() != name)
-        {
-            continue;
-        }
-        if facts.symbols.len() >= limits.quads_max {
-            return query_bound("search.query.statements");
-        }
-        let (first, total) = view.declarations_by_identity_page(identity, 0, 1)?;
-        if total > view.results_max() {
-            return query_bound("search.results");
-        }
-        let symbol = object.to_protocol_symbol();
-        budget.charge(&symbol)?;
-        let mut declarations = Vec::new();
-        let mut first = Some(first);
-        for offset in 0..total {
+    let node_sources_only = requirements.selects_node_sources();
+    if !node_sources_only {
+        for (identity, object) in view.objects() {
             budget.check()?;
-            let page = match first.take() {
-                Some(page) => page,
-                None => view.declarations_by_identity_page(identity, offset, 1)?.0,
-            };
-            let Some(mut declaration) = page.into_iter().next() else {
+            if requirements.symbol_ids.as_ref().is_some_and(|identities| {
+                !identities
+                    .iter()
+                    .any(|selected| selected.as_str() == identity.as_str())
+            }) {
+                continue;
+            }
+            let object = object?;
+            if requirements
+                .symbol_name
+                .as_deref()
+                .is_some_and(|name| object.facts().name() != name)
+            {
+                continue;
+            }
+            if facts.symbols.len() >= limits.quads_max {
+                return query_bound("search.query.statements");
+            }
+            let (first, total) = view.declarations_by_identity_page(identity, 0, 1)?;
+            if total > view.results_max() {
                 return query_bound("search.results");
-            };
-            budget.charge(&declaration)?;
-            if requirements.requires(FactRequirement::Source) {
-                let (bindings, _) = view.symbols_by_identity_page(identity, offset, 1)?;
-                if let Some(matched) = bindings.first() {
-                    budget.charge(&crate::read::excerpt_ref(
-                        matched.file,
-                        matched.symbol.range,
-                    ))?;
-                    declaration.source =
-                        Some(crate::read::excerpt(matched.file, matched.symbol.range));
-                    declaration.source_complete = true;
-                }
             }
-            declarations.push(declaration);
-        }
-        facts.symbols.push(QuerySymbol {
-            symbol,
-            declarations,
-        });
-        if requirements.requires(FactRequirement::CompleteDomain)
-            || requirements.requires(FactRequirement::Description)
-        {
-            for edge in view.relationships().outgoing(identity) {
+            let symbol = object.to_protocol_symbol();
+            budget.charge(&symbol)?;
+            let mut declarations = Vec::new();
+            let mut first = Some(first);
+            for offset in 0..total {
                 budget.check()?;
-                if facts.relationships.len() >= limits.quads_max {
-                    return query_bound("search.query.statements");
+                let page = match first.take() {
+                    Some(page) => page,
+                    None => view.declarations_by_identity_page(identity, offset, 1)?.0,
+                };
+                let Some(mut declaration) = page.into_iter().next() else {
+                    return query_bound("search.results");
+                };
+                budget.charge(&declaration)?;
+                if requirements.requires(FactRequirement::Source) {
+                    let (bindings, _) = view.symbols_by_identity_page(identity, offset, 1)?;
+                    if let Some(matched) = bindings.first() {
+                        budget.charge(&crate::read::excerpt_ref(
+                            matched.file,
+                            matched.symbol.range,
+                        ))?;
+                        declaration.source =
+                            Some(crate::read::excerpt(matched.file, matched.symbol.range));
+                        declaration.source_complete = true;
+                    }
                 }
-                let edge = edge.to_protocol();
-                budget.charge(&edge)?;
-                facts.relationships.push(edge);
+                declarations.push(declaration);
+            }
+            facts.symbols.push(QuerySymbol {
+                symbol,
+                declarations,
+            });
+            if requirements.requires(FactRequirement::CompleteDomain)
+                || requirements.requires(FactRequirement::Description)
+            {
+                for edge in view.relationships().outgoing(identity) {
+                    budget.check()?;
+                    if facts.relationships.len() >= limits.quads_max {
+                        return query_bound("search.query.statements");
+                    }
+                    let edge = edge.to_protocol();
+                    budget.charge(&edge)?;
+                    facts.relationships.push(edge);
+                }
             }
         }
+        project_physical_symbols(view, requirements, &mut facts, limits, budget)?;
     }
-    project_physical_symbols(view, requirements, &mut facts, limits, budget)?;
     project_sources(view, requirements, &mut facts, limits, budget)?;
     project_documentation(view, requirements, &mut facts, limits, budget)?;
     Ok(facts)
@@ -728,6 +731,16 @@ mod tests {
         assert!(source.nodes[same_span].node.symbol.is_some());
         assert_eq!(source.nodes[same_span].parent, Some(0));
         assert_eq!(facts.sources[0].text.as_deref(), Some(original));
+        let joined = PreparedQuery::parse(
+            "ASK { ?node a :Node; :kind 'function_item'; :symbol ?symbol . ?symbol a :Symbol; :name 'kept' }",
+            limits(),
+        )?;
+        assert!(joined.requirements().source_units.is_none());
+        assert!(joined.requirements().requires(FactRequirement::Domain));
+        assert!(
+            !joined.requirements().selects_node_sources(),
+            "a joined Symbol pattern must preserve the generic projection"
+        );
         for (statement, expected) in [
             (
                 "ASK { ?node a :Node; :kind 'function_item'; :symbol ?symbol . ?symbol a :Symbol; :name 'kept' }",
@@ -763,6 +776,95 @@ mod tests {
         requirements.source_units =
             Some(vec![SourceUnitId::parse("rift://source/project/lib.rs")?]);
         assert!(project_query_facts(&view, &requirements, bound).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unit_bound_nodes_omit_unrelated_symbol_source_under_the_original_budget()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = "pub fn kept() {}";
+        let unrelated = format!(
+            "pub fn unrelated() -> &'static str {{ \"{}\" }}",
+            "x".repeat(32_768)
+        );
+        let root = tempfile::tempdir()?;
+        for (path, source) in [
+            (
+                "Cargo.toml",
+                "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+            ),
+            ("lib.rs", original),
+            ("unrelated.rs", unrelated.as_str()),
+        ] {
+            std::fs::write(root.path().join(path), source)?;
+        }
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        let view = index.symbol_view()?;
+        let unit = SourceUnitId::parse("rift://source/project/lib.rs")?;
+        let requirements = FactRequirements {
+            required: [FactRequirement::Nodes, FactRequirement::Source].into(),
+            source_units: Some(vec![unit.clone()]),
+            ..Default::default()
+        };
+        let mut generic = requirements.clone();
+        generic.require(FactRequirement::Domain);
+        generic.require(FactRequirement::Description);
+        let complete = project_query_facts(&view, &generic, limits())?;
+        assert!(
+            complete
+                .symbols
+                .iter()
+                .any(|symbol| symbol.symbol.name == "unrelated")
+        );
+        let symbol = complete
+            .symbols
+            .iter()
+            .find(|symbol| symbol.symbol.name == "kept")
+            .and_then(|symbol| symbol.symbol.id.clone())
+            .ok_or("original canonical kept symbol")?;
+        drop(index);
+        std::fs::remove_file(root.path().join("lib.rs"))?;
+        std::fs::remove_file(root.path().join("unrelated.rs"))?;
+        let mut bounded = limits();
+        bounded.rdf_bytes_max = 8192;
+        bounded.material_bytes_max = Some(16_384);
+        let facts = project_query_facts(&view, &requirements, bounded)?;
+        assert!(
+            facts.symbols.is_empty(),
+            "unit-bound Node patterns require no Symbol payload"
+        );
+        assert_eq!(facts.sources.len(), 1);
+        assert_eq!(facts.sources[0].unit, unit);
+        assert_eq!(facts.sources[0].text.as_deref(), Some(original));
+        assert_eq!(facts.nodes.len(), 1);
+        let node = facts.nodes[0]
+            .nodes
+            .iter()
+            .find(|row| row.node.symbol.as_ref() == Some(&symbol))
+            .ok_or("Node keeps original canonical symbol without Symbol payload")?;
+        assert_eq!(
+            node.node.range,
+            rift_protocol::read::TextRange {
+                start: 0,
+                end: u64::try_from(original.len())?
+            }
+        );
+        assert!(node.node.id.0.contains('#'));
+        let answer = PreparedQuery::parse("SELECT ?symbol { ?node a :Node; :unit <rift://source/project/lib.rs>; :symbol ?symbol }", bounded)?.evaluate(facts, bounded, QueryCancellation::default())?;
+        let value = serde_json::to_value(answer)?;
+        let rows = value["bindings"].as_array().ok_or("Node symbol bindings")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["symbol"]["type"], "iri");
+        assert_eq!(rows[0]["symbol"]["value"], symbol.as_str());
+        assert!(
+            project_query_facts(&view, &generic, bounded).is_err(),
+            "the unchanged generic Symbol projection still accounts for unrelated source"
+        );
         Ok(())
     }
 

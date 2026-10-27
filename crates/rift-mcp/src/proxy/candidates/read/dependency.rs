@@ -100,7 +100,9 @@ fn dependency_backend(
     Ok(upstream)
 }
 
-pub(super) fn upstream_backend(selected: &SavedCandidateBackend) -> SavedCandidateBackend {
+pub(in crate::proxy) fn upstream_backend(
+    selected: &SavedCandidateBackend,
+) -> SavedCandidateBackend {
     let mut upstream = selected.clone();
     if let Some(view) = &selected.upstream_view {
         upstream.view = view.clone();
@@ -129,18 +131,25 @@ pub(super) fn upstream_request(
     if upstream.backend != "global" {
         return Ok(request);
     }
+    Ok(with_backend_context(request, &upstream))
+}
+
+pub(in crate::proxy) fn with_backend_context(
+    mut request: CallToolRequestParams,
+    selected: &SavedCandidateBackend,
+) -> CallToolRequestParams {
     let meta = request
         .meta
         .get_or_insert_with(rmcp::model::RequestMetaObject::new);
     for (field, value) in [
-        ("backend", serde_json::json!(upstream.backend)),
-        ("root", serde_json::json!(upstream.root)),
-        ("owner", serde_json::json!(upstream.owner)),
-        ("view", serde_json::json!(upstream.view)),
+        ("backend", serde_json::json!(selected.backend)),
+        ("root", serde_json::json!(selected.root)),
+        ("owner", serde_json::json!(selected.owner)),
+        ("view", serde_json::json!(selected.view)),
     ] {
         meta.0.insert(field.to_owned(), value);
     }
-    Ok(request)
+    request
 }
 
 pub(super) fn public_symbol_view(result: &mut GetSymbolResult, selected: &SavedCandidateBackend) {

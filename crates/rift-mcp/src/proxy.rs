@@ -2048,7 +2048,8 @@ mod tests {
 
     /// An upstream connection built without a handshake: its transport is a
     /// duplex pipe whose other half the caller keeps alive.
-    fn direct_upstream() -> (RunningService<RoleClient, ()>, tokio::io::DuplexStream) {
+    pub(in crate::proxy) fn direct_upstream()
+    -> (RunningService<RoleClient, ()>, tokio::io::DuplexStream) {
         let (kept_alive, transport) = tokio::io::duplex(1024);
         let running: RunningService<RoleClient, ()> = serve_directly((), transport, None);
         (running, kept_alive)
@@ -3906,7 +3907,10 @@ mod tests {
         Ok(())
     }
 
-    fn named_proxy(root: &std::path::Path, extra_root: &std::path::Path) -> TestResult<RiftProxy> {
+    pub(in crate::proxy) fn named_proxy(
+        root: &std::path::Path,
+        extra_root: &std::path::Path,
+    ) -> TestResult<RiftProxy> {
         let mut saved = rift_protocol::configuration::McpConfiguration::default();
         saved.extra.insert(
             "cloud".to_owned(),

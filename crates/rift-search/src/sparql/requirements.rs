@@ -228,6 +228,7 @@ impl FactRequirements {
         if !result.requires(FactRequirement::Description) {
             result.symbol_name = single_name_pattern(pattern);
             result.symbol_ids = single_usage_pattern(pattern);
+            result.source_units = single_node_unit_pattern(pattern);
         }
         if let Some(dataset) = query.dataset() {
             result
@@ -264,6 +265,14 @@ impl FactRequirements {
                     }
                     Self::expression(expression, &mut pending);
                 }
+            }
+        }
+        if result.source_units.is_some() {
+            result.required.remove(&FactRequirement::Domain);
+            if !result.selects_node_sources() {
+                return Err(failure::parse(
+                    "selected node units require only node and source facts",
+                ));
             }
         }
         result.occurrences.sort();
@@ -779,6 +788,105 @@ fn linear_adjacency(patterns: &[spargebra::term::TriplePattern]) -> Option<Adjac
     None
 }
 
+fn single_node_unit_pattern(
+    mut pattern: &QueryExpression,
+) -> Option<Vec<rift_protocol::read::SourceUnitId>> {
+    loop {
+        match pattern {
+            QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. } => pattern = inner,
+            QueryExpression::OrderBy { inner, expression } => {
+                if !expression.iter().all(|order| {
+                    matches!(
+                        order,
+                        spargebra::algebra::OrderExpression::Asc(Expression::Variable(_))
+                            | spargebra::algebra::OrderExpression::Desc(Expression::Variable(_))
+                    )
+                }) {
+                    return None;
+                }
+                pattern = inner;
+            }
+            QueryExpression::Join { left, right } => {
+                let result = |pattern: &QueryExpression| {
+                    matches!(pattern,
+                    QueryExpression::Service { name: NamedNodePattern::NamedNode(name), inner, silent: false }
+                        if name.as_str().strip_prefix(super::RESULT_SERVICE_PREFIX).is_some_and(|view| !view.is_empty())
+                        && matches!(inner.as_ref(), QueryExpression::Bgp { patterns } if patterns.is_empty()))
+                };
+                pattern = if result(left) {
+                    right
+                } else if result(right) {
+                    left
+                } else {
+                    return None;
+                };
+            }
+            QueryExpression::Bgp { patterns } => {
+                let node = patterns.iter().find(|triple|
+                    matches!(&triple.predicate, NamedNodePattern::NamedNode(predicate) if predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type")
+                    && matches!(&triple.object, TermPattern::NamedNode(class) if class.as_str().strip_prefix(VOCABULARY) == Some("Node")))?;
+                let unit = patterns.iter().find(|triple| triple.subject == node.subject
+                    && matches!(&triple.predicate, NamedNodePattern::NamedNode(predicate) if predicate.as_str().strip_prefix(VOCABULARY) == Some("unit"))
+                    && matches!(triple.object, TermPattern::NamedNode(_)))?;
+                let TermPattern::NamedNode(value) = &unit.object else {
+                    return None;
+                };
+                let selected = rift_protocol::read::SourceUnitId::parse(value.as_str()).ok()?;
+                let range = patterns.iter().find(|triple| triple.subject == node.subject && matches!(&triple.predicate, NamedNodePattern::NamedNode(predicate) if predicate.as_str().strip_prefix(VOCABULARY) == Some("range"))).map(|triple| &triple.object);
+                for triple in patterns {
+                    let NamedNodePattern::NamedNode(predicate) = &triple.predicate else {
+                        return None;
+                    };
+                    if triple.subject == node.subject {
+                        if predicate.as_str().strip_prefix(VOCABULARY) == Some("range")
+                            && range != Some(&triple.object)
+                        {
+                            return None;
+                        }
+                        if predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
+                            if triple.object != node.object {
+                                return None;
+                            }
+                        } else if !matches!(
+                            predicate.as_str().strip_prefix(VOCABULARY),
+                            Some(
+                                "id" | "symbol"
+                                    | "unit"
+                                    | "language"
+                                    | "kind"
+                                    | "facets"
+                                    | "range"
+                                    | "regions"
+                                    | "parent"
+                                    | "extensions"
+                            )
+                        ) {
+                            return None;
+                        }
+                    } else if triple.subject == unit.object
+                        && predicate.as_str().strip_prefix(VOCABULARY) == Some("source")
+                    {
+                        // This is the same unit's existing source-text projection.
+                    } else if matches!(
+                        predicate.as_str().strip_prefix(VOCABULARY),
+                        Some("start" | "end")
+                    ) && range == Some(&triple.subject)
+                    {
+                        // These fields belong to this node's existing TextRange.
+                    } else {
+                        return None;
+                    }
+                }
+                return Some(vec![selected]);
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn single_name_pattern(mut pattern: &QueryExpression) -> Option<String> {
     loop {
         match pattern {
@@ -864,6 +972,60 @@ mod service_name_tests {
             let error = PreparedQuery::parse(&query, limits)
                 .expect_err("variable service acquisition is not established");
             assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod node_unit_tests {
+    use crate::sparql::{PreparedQuery, QueryLimits};
+
+    #[test]
+    fn only_complete_mandatory_node_unit_domain_is_selected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())?;
+        let unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/lib.rs")?;
+        for query in [
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> }",
+            "SELECT DISTINCT ?node { ?node :unit <rift://source/project/lib.rs>; a :Node } ORDER BY ?node LIMIT 1",
+            "ASK { ?node a :Node; :unit <rift://source/project/lib.rs> }",
+            "SELECT ?id ?language ?start ?end ?text { ?node a :Node; :unit <rift://source/project/lib.rs>; :id ?id; :language ?language; :range [ :start ?start; :end ?end ] . <rift://source/project/lib.rs> :source ?text }",
+            "SELECT ?id ?language ?start ?end ?text { SERVICE <urn:rift:result:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef> {} ?node a :Node; :unit <rift://source/project/lib.rs>; :id ?id; :language ?language; :range [ :start ?start; :end ?end ] . <rift://source/project/lib.rs> :source ?text }",
+        ] {
+            let plan = PreparedQuery::parse(query, limits)?;
+            assert_eq!(
+                plan.requirements().source_units.as_deref(),
+                Some(std::slice::from_ref(&unit))
+            );
+            assert!(plan.requirements().selects_node_sources());
+            assert!(
+                !plan
+                    .requirements()
+                    .requires(crate::query::FactRequirement::Domain)
+            );
+        }
+        for query in [
+            "SELECT ?node { ?node a :Node; :unit ?unit }",
+            "SELECT ?node { ?node a :Node . ?other :unit <rift://source/project/lib.rs> }",
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> . ?other :id ?id }",
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs>; :range ?range . ?other :start ?start }",
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs>; :range ?first, ?second . ?first :start ?start . ?second :end ?end }",
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> . <rift://source/project/other.rs> :source ?text }",
+            "SELECT ?node { SERVICE SILENT <urn:rift:result:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef> {} ?node a :Node; :unit <rift://source/project/lib.rs> }",
+            "SELECT ?node { ?node a :Node OPTIONAL { ?node :unit <rift://source/project/lib.rs> } }",
+            "SELECT ?node { { ?node a :Node; :unit <rift://source/project/lib.rs> } UNION { ?other a :Node } }",
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> FILTER NOT EXISTS { ?other a :Node } }",
+            "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> } ORDER BY EXISTS { ?other a :Node }",
+            "SELECT ?node { SERVICE :source { ?read :unit <rift://source/project/other.rs>; :outcome ?outcome } ?node a :Node; :unit <rift://source/project/lib.rs> }",
+        ] {
+            assert!(
+                PreparedQuery::parse(query, limits)?
+                    .requirements()
+                    .source_units
+                    .is_none(),
+                "{query}"
+            );
         }
         Ok(())
     }

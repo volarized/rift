@@ -24,6 +24,7 @@ mod global;
 mod replay;
 mod retrieval;
 mod selection;
+mod source;
 
 type QueryBudget = rift_server::QueryFactBudget<'static>;
 
@@ -34,6 +35,7 @@ struct QueryExecution<'a> {
     budget: &'a QueryBudget,
     deadline: super::RequestDeadline,
     requests: &'a rift_server::ProviderRequests,
+    source_context: Option<&'a crate::global::candidates::SavedCandidateBackend>,
 }
 
 type QueryProjection = (
@@ -83,6 +85,23 @@ impl RiftMcp {
         &self,
         params: QueryParams,
     ) -> Result<Json<QueryReadResult>, ToolFailure> {
+        self.graph_query_with_context(params, None).await
+    }
+
+    pub(super) async fn graph_query_with_context(
+        &self,
+        params: QueryParams,
+        context: Option<
+            &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >,
+    ) -> Result<Json<QueryReadResult>, ToolFailure> {
+        // Nested source selection is input context, not the new query's serving context.
+        let source_context = context.and_then(|context| {
+            context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+        });
         Box::pin(async move {
             let deadline = self.request_deadline().await;
             let configuration = self.query_configuration().await;
@@ -116,7 +135,8 @@ impl RiftMcp {
                     budget.charge(prepared.requirements())?;
                     budget.charge(&prepared.retrievals())?;
                     let mut requirements = prepared.requirements().clone();
-                    if requirements.requires(FactRequirement::Domain)
+                    if (requirements.requires(FactRequirement::Domain)
+                        || requirements.selects_node_sources())
                         && !requirements
                             .services
                             .iter()
@@ -145,6 +165,7 @@ impl RiftMcp {
                 budget: &budget,
                 deadline,
                 requests: &requests,
+                source_context: source_context.as_ref(),
             };
             let selected = match self
                 .acquire_fact_queries(&requirements, None, execution, Some(&prepared))
@@ -239,7 +260,7 @@ impl RiftMcp {
             Err(reason) => return Ok(Err(reason)),
         };
         let requires_semantic = requires_engine(requirements);
-        if !requirements.requires(FactRequirement::Domain) {
+        if !requirements.requires(FactRequirement::Domain) && !requirements.selects_node_sources() {
             let material = self
                 .query_selection_material(selected.material.take(), selected.expiry.take())
                 .await?;
@@ -403,6 +424,7 @@ impl RiftMcp {
         let QueryExecution {
             budget, deadline, ..
         } = execution;
+        let source_view = selected_view.as_ref().map(|(_, view)| view.clone());
         let mut selected = match self
             .query_services(requirements, retrievals, execution)
             .await?
@@ -424,7 +446,8 @@ impl RiftMcp {
                 }));
             }
         }
-        Ok(Ok(selected))
+        self.include_query_sources(selected, requirements, source_view.as_ref(), execution)
+            .await
     }
 
     async fn query_selection_material(

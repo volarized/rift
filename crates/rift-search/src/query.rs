@@ -4,8 +4,8 @@ mod provider;
 mod source;
 
 pub use source::{
-    qualify_source_unit, require_source_agreement, source_digest, validate_source_selections,
-    validate_source_selections_by_unit,
+    qualify_source_unit, require_source_agreement, source_digest, source_text_digest,
+    validate_source_selections, validate_source_selections_by_unit,
 };
 
 pub use provider::{
@@ -237,8 +237,8 @@ pub struct FactRequirements {
 impl FactRequirements {
     /// Validates domain selection before request metadata enters acquisition.
     ///
-    /// Empty requirements select no domain facts. A requested domain family requires
-    /// the domain selection that causes the serving owner to acquire those facts.
+    /// Empty requirements select no domain facts. Ordinary families require the domain
+    /// selection. Proved source units may select only node and source records.
     ///
     /// # Errors
     /// Returns an invalid request when a required family has no domain selection.
@@ -255,13 +255,37 @@ impl FactRequirements {
                 .violation("selected source units must not be empty")
                 .error());
         }
-        if !self.requires(FactRequirement::Domain) && !self.required.is_empty() {
+        if !self.requires(FactRequirement::Domain)
+            && !self.required.is_empty()
+            && !self.selects_node_sources()
+        {
             return Err(rift_error::errors::server::read_invalid()
                 .field("requirements")
                 .violation("required fact families must include the domain selection")
                 .error());
         }
         Ok(())
+    }
+
+    /// Returns whether proved source units require only node and source records.
+    #[must_use]
+    pub fn selects_node_sources(&self) -> bool {
+        self.source_units
+            .as_ref()
+            .is_some_and(|units| !units.is_empty())
+            && !self.requires(FactRequirement::Domain)
+            && self.requires(FactRequirement::Nodes)
+            && self.required.iter().all(|required| {
+                matches!(required, FactRequirement::Nodes | FactRequirement::Source)
+            })
+            && self.symbol_name.is_none()
+            && self.symbol_ids.is_none()
+            && self.occurrences.is_empty()
+            && self.adjacency.is_empty()
+            && self.history_symbols.is_empty()
+            && self.facets.is_empty()
+            && self.retrievals.is_empty()
+            && self.source_reads.is_empty()
     }
 
     /// Returns whether this acquisition is required before evaluation.
@@ -308,6 +332,42 @@ mod tests {
             requirements.require(FactRequirement::Domain);
             assert!(requirements.validate_selection().is_ok());
         }
+    }
+
+    #[test]
+    fn selected_node_sources_do_not_claim_generic_domain_records()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut node = FactRequirements {
+            required: [FactRequirement::Nodes, FactRequirement::Source].into(),
+            source_units: Some(vec![rift_protocol::read::SourceUnitId::parse(
+                "rift://source/project/lib.rs",
+            )?]),
+            ..Default::default()
+        };
+        assert!(node.selects_node_sources());
+        node.validate_selection()?;
+        for family in [
+            FactRequirement::Description,
+            FactRequirement::CompleteDomain,
+            FactRequirement::History,
+            FactRequirement::Documentation,
+            FactRequirement::AllOccurrences,
+        ] {
+            let mut invalid = node.clone();
+            invalid.require(family);
+            assert!(!invalid.selects_node_sources());
+            assert!(invalid.validate_selection().is_err());
+        }
+        let mut invalid = node.clone();
+        invalid.symbol_name = Some("kept".to_owned());
+        assert!(invalid.validate_selection().is_err());
+        let mut invalid = node.clone();
+        invalid.source_units = None;
+        assert!(invalid.validate_selection().is_err());
+        node.require(FactRequirement::Domain);
+        assert!(!node.selects_node_sources());
+        node.validate_selection()?;
+        Ok(())
     }
 
     #[test]

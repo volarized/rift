@@ -11,6 +11,7 @@ use rmcp::model::{
 use std::time::SystemTime;
 
 mod dependency;
+pub(in crate::proxy) use dependency::{upstream_backend, with_backend_context};
 #[cfg(test)]
 mod unavailable_tests;
 
@@ -490,7 +491,7 @@ impl RiftProxy {
         Ok(Some(response))
     }
 
-    fn selected_read_backend<'a>(
+    pub(in crate::proxy) fn selected_read_backend<'a>(
         &'a self,
         view: &CapturedViewId,
         owner: Option<&SymbolOwner>,
@@ -670,7 +671,7 @@ fn decode_symbol(result: &rmcp::model::CallToolResult) -> Result<GetSymbolResult
         .map_err(|source| errors::mcp::forward_failed().source(source).error())
 }
 
-fn canonical_symbol_response(result: &rmcp::model::CallToolResult) -> bool {
+pub(in crate::proxy) fn canonical_symbol_response(result: &rmcp::model::CallToolResult) -> bool {
     result.is_error != Some(true)
         || result.structured_content.as_ref().is_some_and(|value| {
             value.get("outcome").and_then(serde_json::Value::as_str) == Some("missing")
@@ -802,7 +803,7 @@ fn symbol_view(result: &GetSymbolResult) -> Option<&CapturedView> {
     }
 }
 
-fn validate_symbol(
+pub(in crate::proxy) fn validate_symbol(
     params: &GetSymbolParams,
     result: &GetSymbolResult,
     expected: Option<&CapturedView>,
