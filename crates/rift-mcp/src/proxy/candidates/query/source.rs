@@ -646,8 +646,13 @@ impl RiftProxy {
                 Err(_) => return Err(retained::unavailable()),
             }
         }
-        let (_, selected) = self.selected_read_backend(view, None)?;
-        let context = crate::proxy::candidates::read::upstream_backend(&selected);
+        let (backend, selected) = self.selected_read_backend(view, None)?;
+        let mut context = crate::proxy::candidates::read::upstream_backend(&selected);
+        if context.backend != "global" && context.owner.is_none() {
+            let mut admission = budget.clone();
+            admission.charge(&backend.owner)?;
+            context.owner = Some(backend.owner.clone());
+        }
         let mut original = request.clone();
         original.view = Some(context.view.id.clone());
         let backend = selected.project.as_deref().unwrap_or(&selected.backend);

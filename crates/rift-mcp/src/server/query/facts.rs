@@ -340,9 +340,34 @@ impl RiftMcp {
         Box::pin(async move {
             let selected_view = match selected_view {
                 Some(SelectedFactOwner::Query(captured)) => {
-                    return self
-                        .restore_fact_queries(requirements, Some(captured), execution, plan)
-                        .await;
+                    // Source reads acquire a new request-bound result from the original provider.
+                    // Replaying the original query would return its original fact requirements.
+                    if !requirements.source_reads.is_empty()
+                        && requirements.required.is_empty()
+                        && requirements.source_units.is_none()
+                        && requirements.symbol_name.is_none()
+                        && requirements.symbol_ids.is_none()
+                        && requirements.occurrences.is_empty()
+                        && requirements.adjacency.is_empty()
+                        && requirements.history_symbols.is_empty()
+                        && requirements.facets.is_empty()
+                        && requirements.datasets.is_empty()
+                        && requirements.retrievals.is_empty()
+                        && requirements
+                            .services
+                            .iter()
+                            .all(|service| service == rift_search::sparql::SOURCE_SERVICE)
+                        && requirements
+                            .source_reads
+                            .iter()
+                            .all(|request| request.view.as_ref() == Some(&captured.view().id))
+                    {
+                        None
+                    } else {
+                        return self
+                            .restore_fact_queries(requirements, Some(captured), execution, plan)
+                            .await;
+                    }
                 }
                 Some(SelectedFactOwner::Local(material, view)) => Some((material, view)),
                 None => None,
