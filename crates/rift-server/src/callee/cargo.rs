@@ -319,7 +319,20 @@ mod tests {
         let workspace = &fixture.workspace;
         let roots = &fixture.roots;
         let configuration = &fixture.configuration;
-        let root = roots.packages.iter().find(|root| matches!(root.origin(), rift_core::SourceLocation::Dependency { package } if package.manager == "cargo" && package.registry == "crates.io" && package.name == "tokio")).ok_or("Cargo-reported Tokio source root")?;
+        let root = roots.packages.iter().find(|root| matches!(root.origin(), rift_core::SourceLocation::Dependency { package } if package.manager == "cargo" && package.registry == "crates.io" && package.name == "tokio")).ok_or_else(|| {
+            let cargo_context = fixture.reads.dependency_context().install_folders()
+                .filter(|folder| matches!(folder.location, InstallLocation::CargoRegistry { .. }))
+                .count();
+            let retained_error_slug = roots.registry_unavailable.as_ref().map(|error| error.slug());
+            let frozen_refused = roots.registry_unavailable.as_ref().is_some_and(|error| {
+                error.to_string().contains("Cargo metadata is unavailable in frozen mode")
+            });
+            format!(
+                "Cargo-reported Tokio source root; roots={}; cargo_context={cargo_context}; registry_unresolved={}; retained_error_slug={retained_error_slug:?}; frozen_refused={frozen_refused}",
+                roots.packages.len(),
+                roots.registry_unresolved,
+            )
+        })?;
         let uri = root
             .root()
             .document_uri(&rift_core::ProjectPath::new("src/sync/mpsc/bounded.rs")?)?;
