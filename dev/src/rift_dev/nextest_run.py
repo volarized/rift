@@ -13,7 +13,7 @@ import time
 import tomllib
 import uuid
 import zlib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from statistics import median
@@ -258,7 +258,7 @@ class RunSummary(CollectionSummary):
 
 
 @contextmanager
-def retained_collector(directory: Path) -> Iterator[Collector]:
+def retained_collector(directory: Path) -> Generator[Collector]:
     """Keep scenario telemetry through server cleanup and collector shutdown."""
     directory.mkdir(parents=True, exist_ok=True)
     artifact = ArtifactStore(directory / "telemetry.jsonl.gz", {})
@@ -805,8 +805,18 @@ def reuse_archive(
             .with_environment(command.environment() or os.environ)
             .with_env(CARGO_TARGET_DIR=str(directory))
         )
+        environment_started = time.monotonic()
+        print("nextest archive coverage environment started", flush=True)
+        try:
+            coverage_output = coverage.output()
+        finally:
+            print(
+                "nextest archive coverage environment "
+                f"elapsed_seconds={time.monotonic() - environment_started:.6f}",
+                flush=True,
+            )
         command.with_env(
-            **parse_coverage_environment(coverage.output()),
+            **parse_coverage_environment(coverage_output),
             CARGO_TARGET_DIR=str(directory),
         )
     command.arguments = ["nextest", "run", *retained]
@@ -963,7 +973,16 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         command.directory
     )
     discovery.with_timeout(RUN_SECONDS_MAX).with_output_limit(RUN_LOG_BYTES_MAX)
-    discovered_bytes = discovery.output_bytes(echo_stderr=False)
+    discovery_started = time.monotonic()
+    print(f"nextest discovery started archive={archived}", flush=True)
+    try:
+        discovered_bytes = discovery.output_bytes(echo_stderr=False)
+    finally:
+        print(
+            f"nextest discovery archive={archived} "
+            f"elapsed_seconds={time.monotonic() - discovery_started:.6f}",
+            flush=True,
+        )
     (directory / "discovery.json").write_bytes(discovered_bytes)
     discovered = TestList.model_validate_json(discovered_bytes)
     if archive_directory is not None:

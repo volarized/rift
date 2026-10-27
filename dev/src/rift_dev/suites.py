@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -193,7 +194,15 @@ def unit(archive: Path | None) -> None:
     downloads.
     """
     coverage_target()
-    CargoCommand("llvm-cov", "clean", "--workspace").run()
+    clean_started = time.monotonic()
+    print("unit setup coverage clean started", flush=True)
+    try:
+        CargoCommand("llvm-cov", "clean", "--workspace").run()
+    finally:
+        print(
+            f"unit setup coverage clean elapsed_seconds={time.monotonic() - clean_started:.6f}",
+            flush=True,
+        )
     selection = archive_selection(
         archive, ["--workspace", "--all-targets", "--all-features", "--locked"]
     )
