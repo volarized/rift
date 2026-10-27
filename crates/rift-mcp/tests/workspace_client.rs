@@ -287,6 +287,27 @@ pub(crate) async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &rift_protocol::query::QueryParams,
 ) -> TestResult<Value> {
+    search_after_population_when(client, arguments, |answer| {
+        answer["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|warning| {
+                matches!(
+                    warning["code"].as_str(),
+                    Some("lexical_ranking_unavailable" | "stale_index")
+                )
+            })
+    })
+    .await
+}
+
+/// Calls the current query while the caller's exact population condition holds.
+pub(crate) async fn search_after_population_when(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: &rift_protocol::query::QueryParams,
+    pending: fn(&Value) -> bool,
+) -> TestResult<Value> {
     const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
     const SEARCH_TIER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -294,17 +315,7 @@ pub(crate) async fn search_after_population(
     let arguments = serde_json::to_value(arguments)?;
     let mut answer = call_retrying_acceptance(client, tool_request("search", &arguments)).await?;
     for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-        let population_pending =
-            answer["warnings"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|warning| {
-                    matches!(
-                        warning["code"].as_str(),
-                        Some("lexical_ranking_unavailable" | "stale_index")
-                    )
-                });
+        let population_pending = pending(&answer);
         if !population_pending {
             return Ok(answer);
         }

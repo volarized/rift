@@ -1269,11 +1269,85 @@ async fn narrow_symbol_query_view_nodes_keep_original_source_after_removal() -> 
     .await
 }
 
+fn initial_query_is_committing(answer: &Value) -> bool {
+    if answer["outcome"] != "unavailable" || answer["reason"] != "insufficient_coverage" {
+        return false;
+    }
+    let Some(warnings) = answer["warnings"].as_array() else {
+        return false;
+    };
+    let [warning] = warnings.as_slice() else {
+        return false;
+    };
+    if warning["code"] != "lexical_ranking_unavailable" {
+        return false;
+    }
+    let Some(revision) = warning["detail"]
+        .as_str()
+        .and_then(|detail| detail.strip_prefix("the lexical index is still committing tree revision "))
+        .and_then(|detail| detail.strip_suffix(", so the answer was ranked by identifier matching alone; resend the request once the commit lands"))
+    else {
+        return false;
+    };
+    revision.len() == 8
+        && revision
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+#[test]
+fn initial_query_waits_only_for_the_current_lexical_commit() {
+    let detail = "the lexical index is still committing tree revision 714b1542, so the answer was ranked by identifier matching alone; resend the request once the commit lands";
+    let pending = json!({"outcome":"unavailable", "reason":"insufficient_coverage", "warnings":[{"code":"lexical_ranking_unavailable", "detail":detail}]});
+    assert!(initial_query_is_committing(&pending));
+    for code in ["stale_index", "results_truncated", "unknown"] {
+        let mut answer = pending.clone();
+        answer["warnings"][0]["code"] = json!(code);
+        assert!(!initial_query_is_committing(&answer), "{code}");
+    }
+    for invalid in [
+        detail.replace("714b1542", "714B1542"),
+        detail.replace("714b1542", "714b154"),
+        format!("{detail} trailing"),
+        "the lexical index holds no indexed tree and no commit is under way for tree revision 714b1542, so the answer was ranked by identifier matching alone; rift server logs names what the lexical lane did, and a restart retries it".to_owned(),
+        "the workspace search database could not be opened, so the answer was ranked by identifier matching alone; the server log names the open failure, and a restart retries it".to_owned(),
+    ] {
+        let mut answer = pending.clone();
+        answer["warnings"][0]["detail"] = json!(invalid);
+        assert!(!initial_query_is_committing(&answer));
+    }
+    let mut mixed = pending.clone();
+    mixed["warnings"] = json!([pending["warnings"][0].clone(), {"code":"source_unavailable"}]);
+    assert!(!initial_query_is_committing(&mixed));
+    let mut wrong_reason = pending;
+    wrong_reason["reason"] = json!("unknown");
+    assert!(!initial_query_is_committing(&wrong_reason));
+    assert!(!initial_query_is_committing(
+        &json!({"answer":{"result":"bindings", "bindings":[]}})
+    ));
+}
+
+async fn select_original_query_nodes(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    statement: &str,
+    observe_unit: bool,
+) -> TestResult<Value> {
+    if observe_unit {
+        let arguments = serde_json::from_value(json!({"query":statement}))?;
+        workspace_client::search_after_population_when(
+            client,
+            &arguments,
+            initial_query_is_committing,
+        )
+        .await
+    } else {
+        call_retrying_acceptance(client, tool_request("search", &json!({"query":statement}))).await
+    }
+}
+
 async fn assert_original_query_nodes(statement: &str, observe_unit: bool) -> TestResult {
     let (directory, client, server_task) = served_workspace(FILES, None).await?;
-    let selected =
-        call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
-            .await?;
+    let selected = select_original_query_nodes(&client, statement, observe_unit).await?;
     let (unit, statement, original) =
         original_query_node_rows(&client, &selected, observe_unit).await?;
     let unit = unit.as_str();
