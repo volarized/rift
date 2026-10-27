@@ -346,18 +346,31 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
 fn decode_examples(node: &Value, checked: &mut usize) -> TestResult {
     match node {
         Value::Object(object) => {
-            if let (Some(reference), Some(examples)) = (
-                object
-                    .get("schema")
-                    .and_then(|schema| schema.get("$ref"))
-                    .and_then(Value::as_str),
+            if let (Some(schema), Some(examples)) = (
+                object.get("schema"),
                 object.get("examples").and_then(Value::as_object),
             ) {
                 for example in examples.values() {
                     let value = example
                         .get("value")
                         .ok_or("a contract example must carry a value")?;
-                    if decode_generated_response_example(reference, value.clone())? {
+                    let decoded =
+                        if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+                            decode_generated_response_example(reference, value.clone())?
+                        } else if schema
+                            == &serde_json::json!({"oneOf":[
+                                {"$ref":"#/components/schemas/PackageSearchPage"},
+                                {"$ref":"#/components/schemas/RelationshipSearchPage"}
+                            ]})
+                        {
+                            serde_json::from_value::<rift_cloud_client::Search200Response>(
+                                value.clone(),
+                            )?;
+                            true
+                        } else {
+                            false
+                        };
+                    if decoded {
                         *checked += 1;
                     }
                 }

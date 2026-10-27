@@ -12,7 +12,6 @@ import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
 
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
@@ -27,6 +26,7 @@ from rift_dev.corpus_assertions import (
     chunked_answer,
     churn_answer,
     database_bytes,
+    declaration_pool,
     exact_degradation,
     language_counts,
     last_line_pattern,
@@ -57,6 +57,16 @@ from rift_dev.log_records import (
 )
 from rift_dev.machine import machine, machine_line
 from rift_dev.nextest_run import CollectionSummary, retained_collector
+from rift_dev.query import (
+    bindings,
+    iri,
+    literal,
+    name_request,
+    node_request,
+    optional_iri,
+    project_source_unit,
+    retrieval_request,
+)
 from rift_dev.rift_test_client import (
     LOG_FILTER,
     Client,
@@ -150,15 +160,52 @@ REQUIRED_LANGUAGES = {
 }
 
 
+def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
+    """Select catalog paths that are literal under the existing glob selector.
+
+    This is a source sample, not a complete listing of the workspace. Paths with
+    glob syntax remain covered by the independent path and declaration gates.
+
+    >>> catalog_paths({"source": [{"path": "src/test.rs", "digest": "0123abcd", "language": "rust"}, {"path": "app/[slug]/page.tsx", "digest": "0123abcd", "language": "typescript:tsx"}]})
+    {'rust': ['src/test.rs']}
+    >>> catalog_paths({"source": [{"path": "README.md", "digest": "0123abcd"}]})
+    {}
+    """
+    paths: dict[str, list[str]] = {}
+    for source in objects(workspace, "source"):
+        path = string_value(source.get("path"), "catalog source path")
+        string_value(source.get("digest"), "catalog source digest")
+        language = source.get("language")
+        if language is None:
+            continue
+        language = string_value(language, "catalog source language")
+        if path.isascii() and all(c.isalnum() or c in "/_.-" for c in path):
+            paths.setdefault(language, []).append(path)
+    return paths
+
+
+def corpus_request(parameters: JsonObject) -> JsonObject:
+    """Project corpus facts through the served SPARQL retrieval service."""
+    columns = ["symbol", "name", "kind", "language", "path", "unit", "start", "end"]
+    if parameters.get("target") == "file":
+        columns.extend(("target", "size"))
+    for include in array_value(parameters.get("include", []), "retrieval include"):
+        field = string_value(include, "retrieval field")
+        if field in {"source", "score"}:
+            columns.append(field)
+    return retrieval_request(parameters, columns)
+
+
+CHURN_SEARCH_INPUTS: JsonObject = {
+    "query": "corpus_probe",
+    "target": "symbol",
+    "include": ["source"],
+    "limit": 1,
+}
 CHURN_REQUESTS: dict[str, JsonObject] = {
-    "search": {
-        "query": "corpus_probe",
-        "target": "symbol",
-        "include": ["source"],
-        "limit": 1,
-    },
+    "search": corpus_request(CHURN_SEARCH_INPUTS),
     "get_symbol": {"include": ["source"]},
-    "nodes": {"path": PROBE_PATH, "position": 0},
+    "nodes": node_request(project_source_unit(PROBE_PATH), position=0),
 }
 # The convergence loop resends every churn tool until the newest source lands, so it
 # stands outside the reads it repeats: one whole read budget for each of them.
@@ -464,26 +511,214 @@ class Corpus:
             CONFIGURATION + extra, encoding="utf-8"
         )
 
+    async def source_catalog(
+        self, client: Client
+    ) -> tuple[JsonObject, dict[str, list[str]]]:
+        """Read typed source paths through the existing resource page contract."""
+        first = await client.resource("rift://workspace")
+        revision = string_value(
+            first.get("configuration_revision"), "configuration revision"
+        )
+        pagination = object_value(first.get("pagination"), "catalog pagination")
+        pages = number(pagination.get("total_pages"), "catalog total pages")
+        groups: dict[str, list[str]] = {}
+        previous = ""
+        for index in range(pages):
+            page = (
+                first
+                if index == 0
+                else await client.resource(f"rift://workspace?page_index={index}")
+            )
+            require(
+                page.get("configuration_revision") == revision,
+                "catalog configuration changed",
+            )
+            require(
+                page.get("languages") == first.get("languages"),
+                "catalog languages changed",
+            )
+            position = object_value(page.get("pagination"), "catalog pagination")
+            require(
+                position.get("page_index") == index
+                and position.get("total_pages") == pages,
+                "catalog page changed",
+            )
+            require(not warnings(page), "source catalog is still preparing")
+            for source in objects(page, "source"):
+                path = string_value(source.get("path"), "catalog source path")
+                require(path > previous, "catalog paths must be unique and sorted")
+                previous = path
+            for language, paths in catalog_paths(page).items():
+                groups.setdefault(language, []).extend(paths)
+        return first, groups
+
+    async def symbol_candidates(
+        self, client: Client, *, minimum: int = SYMBOL_COUNT
+    ) -> list[JsonObject]:
+        """Collect complete exact-path results for the existing physical sample.
+
+        The callback boundary covers a first catalog page with no sampled language
+        and final exhaustion of an optional language. These typed callback rows
+        test control flow; the owning corpus run checks actual declarations.
+
+        >>> from types import SimpleNamespace
+        >>> from typing import cast
+        >>> from unittest.mock import AsyncMock
+        >>> def term(value, datatype="string"):
+        ...     return {"type": "literal", "value": str(value), "datatype": "http://www.w3.org/2001/XMLSchema#" + datatype}
+        >>> rows = [{**{key: term(value) for key, value in {"name": f"entry{index}", "kind": "function", "language": "typescript", "path": "src/test.ts"}.items()}, "start": term(index * 2, "integer"), "end": term(index * 2 + 1, "integer"), "symbol": {"type": "iri", "value": f"urn:fixture:sample:{index}"}} for index in range(SYMBOL_COUNT)]
+        >>> def answer(bindings):
+        ...     return {"answer": {"result": "bindings", "variables": list(rows[0]), "bindings": bindings}}
+        >>> languages = [{"language": language, "enabled": True, "syntax": True, "include": ["**"]} for language in ("rust", "typescript", "typescript:tsx", "markdown")]
+        >>> common = {"configuration_revision": "0123abcd", "languages": languages}
+        >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
+        >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
+        >>> admission = {"answer": {"result": "bindings", "variables": ["symbol"], "bindings": [{"symbol": {"type": "iri", "value": "urn:fixture:startup"}}]}}
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows), answer([])]))
+        >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
+        >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
+        >>> len(selected), client.call.await_count, client.resource.await_count
+        (200, 3, 2)
+        >>> all(literal(row, "path") == "src/test.ts" for row in selected)
+        True
+        >>> client.call.await_args_list[0].args[1] == name_request("corpus_probe")
+        True
+        >>> "SERVICE" in client.call.await_args_list[0].args[1]["query"]
+        False
+        """
+        languages = SAMPLE_LANGUAGES[self.pin.name]
+
+        async def read(path: str, query: str = "test") -> list[JsonObject]:
+            answer = await settled_local(
+                client,
+                "search",
+                corpus_request(
+                    {
+                        "query": query,
+                        "target": "symbol",
+                        "paths": {"include": [path]},
+                        "limit": 1000,
+                        "order": "identity",
+                    }
+                ),
+            )
+            warnings(answer)
+            found = bindings(answer)
+            require(
+                all(literal(hit, "path") == path for hit in found),
+                "literal sample path matched another file",
+            )
+            return found
+
+        # The Domain query waits for index preparation without lexical ranking.
+        # Its identity rows are admission evidence, not declarations in the sample.
+        bindings(await settled_local(client, "search", name_request("corpus_probe")))
+        pool: list[JsonObject] = []
+        represented: set[str] = set()
+        workspace, groups = await self.source_catalog(client)
+        configured = objects(workspace, "languages")
+        for language in languages:
+            matching = [row for row in configured if row.get("language") == language]
+            require(len(matching) == 1, f"workspace lost language {language}")
+            row = matching[0]
+            require(
+                row.get("enabled") is True and row.get("syntax") is True,
+                f"workspace does not serve syntax for {language}",
+            )
+            require(
+                bool(array_value(row.get("include"), "language include patterns")),
+                f"workspace lost include patterns for {language}",
+            )
+        anchor = (
+            {
+                "bun": "rift://symbol/local/rust/bun_bundler/defines/TEST",
+                "fastapi": "rift://symbol/local/python/fastapi/routing/APIRouter",
+            }.get(self.pin.name)
+            if minimum == SYMBOL_COUNT
+            else None
+        )
+        if anchor is not None:
+            detail = await client.call("get_symbol", {"id": anchor})
+            require(
+                detail.get("outcome") == "found"
+                and object_value(detail.get("symbol"), "anchor symbol").get("id")
+                == anchor,
+                "canonical sample anchor was not found",
+            )
+            paths = {
+                path for language in languages for path in groups.get(language, [])
+            }
+            for declaration in objects(detail, "declarations"):
+                path = string_value(declaration.get("path"), "anchor declaration path")
+                require(
+                    path in paths, "anchor declaration is outside literal catalog paths"
+                )
+                added = await read(path, anchor.rsplit("/", 1)[1])
+                pool.extend(added)
+                if added:
+                    represented.update(
+                        language
+                        for language in languages
+                        if path in groups.get(language, [])
+                    )
+            require(
+                anchor in symbol_pool(pool),
+                "scoped search lost the canonical sample anchor",
+            )
+        pending = {
+            language: iter(
+                sorted(
+                    groups.get(language, []),
+                    key=lambda path: ("test" not in path.lower(), path),
+                )
+            )
+            for language in languages
+        }
+        exhausted: set[str] = set()
+        seen: set[str] = set()
+        while True:
+            counts = language_counts(pool)
+            enough = len(declaration_pool(pool)) >= minimum
+            if minimum == SYMBOL_COUNT:
+                enough = (
+                    enough
+                    and REQUIRED_LANGUAGES[self.pin.name].issubset(counts)
+                    and bool(symbol_pool(pool))
+                    and set(languages).issubset(represented | exhausted)
+                )
+            if enough:
+                return pool
+            progress = False
+            for language in languages:
+                if language in exhausted:
+                    continue
+                path = next(pending[language], None)
+                if path is None:
+                    exhausted.add(language)
+                    progress = True
+                    continue
+                progress = True
+                if path in seen:
+                    continue
+                seen.add(path)
+                added = await read(path)
+                pool.extend(added)
+                if added:
+                    represented.add(language)
+            require(
+                progress,
+                f"source catalog has fewer than {minimum} sampled declarations",
+            )
+
     async def baseline(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                answer = await settled_local(
-                    client,
-                    "search",
-                    {
-                        "query": "test",
-                        "target": "symbol",
-                        "limit": 1000,
-                        "order": "identity",
-                    },
-                )
-                candidates = objects(answer, "results")
+                candidates = await self.symbol_candidates(client)
                 require(
                     len(candidates) >= SYMBOL_COUNT,
                     f"{self.pin.name}: fewer than {SYMBOL_COUNT} symbols",
                 )
                 self.record("publication", symbols=len(candidates))
-                warnings(answer)
                 await client.resource("rift://workspace")
                 workspace_map = await client.resource("rift://map")
                 found = await observed(
@@ -682,44 +917,6 @@ class Corpus:
         """Check 200 physical declarations and every sampled established identity."""
         initial = language_counts(candidates)
         pool = list(candidates)
-        workspace = await client.resource("rift://workspace")
-        configured = objects(workspace, "languages")
-        for language in SAMPLE_LANGUAGES[self.pin.name]:
-            matching = [row for row in configured if row.get("language") == language]
-            require(len(matching) == 1, f"workspace lost language {language}")
-            row = matching[0]
-            require(
-                row.get("enabled") is True and row.get("syntax") is True,
-                f"workspace does not serve syntax for {language}",
-            )
-            included = array_value(row.get("include"), "language include patterns")
-            require(bool(included), f"workspace lost include patterns for {language}")
-            paths: JsonObject = {"include": included, "exclude": row.get("exclude", [])}
-            answer = await client.call(
-                "search",
-                {
-                    "query": "test",
-                    "target": "symbol",
-                    "paths": paths,
-                    "limit": 1000,
-                    "order": "identity",
-                },
-            )
-            warnings(answer)
-            pool.extend(objects(answer, "results"))
-        if self.pin.name == "fastapi":
-            answer = await client.call(
-                "search",
-                {
-                    "query": "APIRouter",
-                    "target": "symbol",
-                    "paths": {"include": ["fastapi/**"]},
-                    "limit": 1000,
-                    "order": "identity",
-                },
-            )
-            warnings(answer)
-            pool.extend(objects(answer, "results"))
         selected = sample_symbols(
             pool, SYMBOL_COUNT, SEED, REQUIRED_LANGUAGES[self.pin.name]
         )
@@ -738,30 +935,25 @@ class Corpus:
                 anchor in canonical, "FastAPI lost its established APIRouter identity"
             )
         anchor_hit = canonical[anchor]
-        anchor_symbol = object_value(
-            object_value(anchor_hit["hit"], "search hit")["symbol"], "symbol"
-        )
+        anchor_language = literal(anchor_hit, "language")
         if anchor_hit not in selected:
             position = next(
                 index
                 for index, hit in enumerate(selected)
-                if object_value(
-                    object_value(hit["hit"], "search hit")["symbol"], "symbol"
-                )["language"]
-                == anchor_symbol["language"]
+                if literal(hit, "language") == anchor_language
             )
             selected[position] = anchor_hit
         details: list[Json] = []
         for hit in selected:
-            symbol = object_value(
-                object_value(hit.get("hit"), "search hit").get("symbol"), "symbol"
-            )
             details.append(
                 {
-                    "identity": symbol.get("id"),
-                    "language": symbol.get("language"),
-                    "path": hit.get("path"),
-                    "range": hit.get("range"),
+                    "identity": optional_iri(hit, "symbol"),
+                    "language": literal(hit, "language"),
+                    "path": literal(hit, "path"),
+                    "range": {
+                        "start": int(literal(hit, "start")),
+                        "end": int(literal(hit, "end")),
+                    },
                 }
             )
         self.record(
@@ -773,10 +965,7 @@ class Corpus:
         )
         identities: set[str] = set()
         for hit in selected:
-            symbol = object_value(
-                object_value(hit.get("hit"), "search hit").get("symbol"), "symbol"
-            )
-            identity = symbol.get("id")
+            identity = optional_iri(hit, "symbol")
             if identity is not None:
                 identity = string_value(identity, "symbol identity")
                 require(
@@ -784,57 +973,67 @@ class Corpus:
                     f"duplicate sampled identity: {identity}",
                 )
                 identities.add(identity)
-            path = self.root / string_value(hit.get("path"), "symbol path")
-            span = object_value(hit.get("range"), "symbol range")
+            path = self.root / literal(hit, "path")
             start, end = (
-                number(span.get("start"), "range start"),
-                number(span.get("end"), "range end"),
+                int(literal(hit, "start")),
+                int(literal(hit, "end")),
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
-            # Declarations can start with attached comments or attributes. Extraction
-            # keeps their end equal to the item end, so its final byte is in the item.
-            answer = await client.call(
-                "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
+            # Declarations can start with attached comments or attributes. Their
+            # final byte remains inside the original declaration node.
+            # This existing corpus check reads the current default local workspace.
+            # Held or named selections must use an observed public unit instead.
+            unit = project_source_unit(literal(hit, "path"))
+            answer = await client.call("nodes", node_request(unit, position=end - 1))
+            rows = bindings(answer)
+            require(bool(rows), f"nodes omitted captured syntax for {path}")
+            current_view = object_value(answer.get("view"), "node query view")
+            require(
+                bool(string_value(current_view.get("id"), "node query view id"))
+                and instant(
+                    string_value(current_view.get("expires_at"), "node query expiry")
+                )
+                is not None,
+                "node query has an invalid captured view",
             )
-            nodes = objects(answer, "nodes")
-            excerpts = array_value(answer.get("source"), "node sources")
-            require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
-            for node, excerpt in zip(nodes, excerpts, strict=True):
-                node_span = object_value(node.get("range"), "node range")
-                node_start = number(node_span.get("start"), "node start")
-                node_end = number(node_span.get("end"), "node end")
+            for node in rows:
+                node_start = int(literal(node, "node_start"))
+                node_end = int(literal(node, "node_end"))
                 require(
-                    0 <= node_start <= node_end <= len(content),
-                    "node range exceeds source",
+                    0 <= node_start <= end - 1 < node_end <= len(content),
+                    "node range exceeds original source or misses requested byte",
+                )
+                require(iri(node, "node_unit") == unit, "nodes changed captured unit")
+                require(
+                    literal(node, "node_language") == literal(hit, "language"),
+                    "nodes changed original language",
+                )
+                string_value(literal(node, "node_id"), "original Node id")
+                captured = literal(node, "text").encode()
+                require(
+                    captured == content,
+                    f"node source disagrees with captured bytes at {path}",
                 )
                 require(
-                    isinstance(excerpt, str)
-                    and excerpt.encode() == content[node_start:node_end],
-                    f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
+                    captured[node_start:node_end] == content[node_start:node_end],
+                    f"node source span changed at {path}:{node_start}-{node_end}",
                 )
             if identity is not None:
                 require(
-                    any(node.get("symbol") == identity for node in nodes),
-                    f"nodes omitted sampled declaration: {identity} at {end - 1}; "
-                    f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
+                    any(optional_iri(node, "node_symbol") == identity for node in rows),
+                    f"nodes omitted sampled declaration: {identity} at {end - 1}; {rows}",
                 )
             else:
                 matching = [
                     node
-                    for node in nodes
-                    if number(
-                        object_value(node.get("range"), "node range").get("end"),
-                        "node end",
-                    )
-                    >= end
-                    and number(
-                        cast(JsonObject, node["range"]).get("start"), "node start"
-                    )
-                    <= end - 1
+                    for node in rows
+                    if int(literal(node, "node_end")) >= end
+                    and int(literal(node, "node_start")) <= end - 1
                     and (
-                        cast(JsonObject, node["range"]).get("end") == end
-                        or "declaration" in node.get("facets", [])
+                        int(literal(node, "node_end")) == end
+                        or optional_iri(node, "facet")
+                        == "urn:rift:vocabulary:declaration"
                     )
                 ]
                 require(
@@ -842,7 +1041,7 @@ class Corpus:
                     f"nodes omitted raw declaration at {path}:{start}-{end}",
                 )
                 require(
-                    all(node.get("symbol") is None for node in matching),
+                    all(node.get("node_symbol") is None for node in matching),
                     f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
                 )
             require(path.read_bytes() == content, f"read changed {path}")
@@ -854,17 +1053,19 @@ class Corpus:
         sizes = database_bytes(self.root)
         path = self.root / PROBE_PATH
         path.write_bytes(PROBE_SOURCE.encode())
-        request: JsonObject = {
-            "query": "corpus_probe",
-            "target": "symbol",
-            "paths": {"include": [PROBE_PATH]},
-            "include": ["source"],
-            "limit": 5,
-        }
+        request: JsonObject = corpus_request(
+            {
+                "query": "corpus_probe",
+                "target": "symbol",
+                "paths": {"include": [PROBE_PATH]},
+                "include": ["source"],
+                "limit": 5,
+            }
+        )
         answer = await client.call("search", request)
-        hits = objects(answer, "results")
+        hits = bindings(answer)
         require(
-            len(hits) == 1 and hits[0].get("source") == PROBE_SOURCE.rstrip("\n"),
+            len(hits) == 1 and literal(hits[0], "source") == PROBE_SOURCE.rstrip("\n"),
             f"new source was absent from reads: {answer}",
         )
         await self.await_probe(True)
@@ -881,9 +1082,7 @@ class Corpus:
         )
         path.unlink()
         answer = await client.call("search", request)
-        require(
-            not objects(answer, "results"), f"removed source remained indexed: {answer}"
-        )
+        require(not bindings(answer), f"removed source remained indexed: {answer}")
         await self.await_probe(False)
         require(
             lexical_content(self.root) == before,
@@ -912,16 +1111,18 @@ class Corpus:
         workspace = map_paths(await client.resource("rift://map"))
         control = await client.call(
             "search",
-            {
-                "query": "next",
-                "paths": {"include": ["package.json"], "exclude": ["*/**"]},
-                "limit": 100,
-            },
+            corpus_request(
+                {
+                    "query": "next",
+                    "paths": {"include": ["package.json"], "exclude": ["*/**"]},
+                    "limit": 100,
+                }
+            ),
         )
-        control_hits = objects(control, "results")
+        control_hits = bindings(control)
         require(
             bool(control_hits)
-            and all(hit.get("path") == "package.json" for hit in control_hits),
+            and all(literal(hit, "path") == "package.json" for hit in control_hits),
             "root-only selector lost the regular package.json control",
         )
         chain = "test/development/app-dir/hmr-symlink/app/symlink-chain/page.tsx"
@@ -946,10 +1147,13 @@ class Corpus:
     ) -> None:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
         try:
-            await client.call("nodes", {"path": path, "position": 0})
+            await client.call(
+                "nodes", node_request(project_source_unit(path), position=0)
+            )
         except ToolFailure as error:
             require(
-                error.code == "resource_not_found",
+                error.code == "temporarily_unavailable"
+                and "required Nodes facts" in str(error),
                 f"symlink nodes wrong refusal: {error}",
             )
         else:
@@ -957,9 +1161,11 @@ class Corpus:
         selector: JsonObject = {"include": [path]}
         if "/" not in path:
             selector["exclude"] = ["*/**"]
-        answer = await client.call("search", {"query": "next", "paths": selector})
+        answer = await client.call(
+            "search", corpus_request({"query": "next", "paths": selector})
+        )
         require(
-            not objects(answer, "results"),
+            not bindings(answer),
             f"search indexed symlink {path}: {answer}",
         )
         require(path not in workspace, "workspace map lists a symlink")
@@ -980,7 +1186,11 @@ class Corpus:
                 async with server.connect() as client:
                     # Listener readiness precedes file preparation. Observe the existing
                     # startup budget before measuring reads against external writes.
-                    await settled_local(client, "search", CHURN_REQUESTS["search"])
+                    bindings(
+                        await settled_local(
+                            client, "search", name_request("corpus_probe")
+                        )
+                    )
                     await self.churn(client, probe.relative_to(self.root).as_posix())
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
@@ -994,8 +1204,10 @@ class Corpus:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
-        requests["nodes"]["path"] = probe_path
-        requests["search"]["paths"] = {"include": [probe_path]}
+        requests["nodes"] = node_request(project_source_unit(probe_path), position=0)
+        requests["search"] = corpus_request(
+            {**CHURN_SEARCH_INPUTS, "paths": {"include": [probe_path]}}
+        )
         sources: list[str] = []
         written: list[float] = []
         timings: dict[str, list[float]] = {name: [] for name in CHURN_REQUESTS}
@@ -1031,6 +1243,7 @@ class Corpus:
                         requests[name],
                         seconds=budget,
                         poll_seconds=POLL_SECONDS,
+                        selection="current",
                     )
                 codes = [
                     string_value(warning.get("code"), "warning code")
@@ -1072,6 +1285,9 @@ class Corpus:
         try:
             identity, _revision = await read("search", None)
             requests["get_symbol"]["id"] = identity
+            requests["nodes"] = node_request(
+                project_source_unit(probe_path), position=0, symbol=identity
+            )
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
@@ -1139,13 +1355,8 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
-                answer = await settled_local(
-                    client, "search", {"query": "test", "limit": 1}
-                )
-                require(
-                    bool(objects(answer, "results")),
-                    "symlink root has no search results",
-                )
+                candidates = await self.symbol_candidates(client, minimum=1)
+                require(bool(candidates), "symlink root has no search results")
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("symlink_root", reads=True)
@@ -1158,32 +1369,28 @@ class Corpus:
                 found = await settled_local(
                     client,
                     "search",
-                    {
-                        "query": "FastAPI",
-                        "target": "symbol",
-                        "paths": {"include": ["fastapi/**/*.py"]},
-                        "limit": 1000,
-                    },
+                    corpus_request(
+                        {
+                            "query": "FastAPI",
+                            "target": "symbol",
+                            "paths": {"include": ["fastapi/**/*.py"]},
+                            "limit": 1000,
+                        }
+                    ),
                 )
                 selected = []
-                for hit in objects(found, "results"):
-                    target = object_value(hit.get("hit"), "shallow hit")
-                    symbol = object_value(target.get("symbol"), "shallow symbol")
+                for hit in bindings(found):
                     if (
-                        symbol.get("name") == "FastAPI"
-                        and symbol.get("kind") == "class"
+                        literal(hit, "name") == "FastAPI"
+                        and literal(hit, "kind") == "class"
                     ):
-                        identity = string_value(
-                            symbol.get("id"), "shallow class identity"
-                        )
+                        identity = iri(hit, "symbol")
                         require(
                             identity.startswith("rift://symbol/local/python/"),
                             "shallow class lost its canonical Python identity",
                         )
                         require(
-                            string_value(
-                                hit.get("path"), "shallow class path"
-                            ).endswith(".py"),
+                            literal(hit, "path").endswith(".py"),
                             "shallow class lost its original Python source path",
                         )
                         selected.append(hit)
@@ -1192,25 +1399,22 @@ class Corpus:
                     "shallow checkout must have one canonical FastAPI class",
                 )
                 hit = selected[0]
-                symbol = object_value(
-                    object_value(hit.get("hit"), "shallow hit").get("symbol"),
-                    "shallow symbol",
-                )
+                identity = iri(hit, "symbol")
                 answer = await settled_local(
                     client,
                     "get_symbol",
-                    {"id": symbol["id"], "include": ["history"]},
+                    {"id": identity, "include": ["history"]},
                 )
                 require(answer.get("outcome") == "found", "shallow class was not found")
                 require(
                     object_value(answer.get("symbol"), "shallow symbol").get("id")
-                    == symbol["id"],
+                    == identity,
                     "shallow class changed its identity",
                 )
                 evidence = {
-                    "name": symbol.get("name"),
-                    "id": symbol.get("id"),
-                    "path": hit.get("path"),
+                    "name": literal(hit, "name"),
+                    "id": identity,
+                    "path": literal(hit, "path"),
                     "history": answer.get("history"),
                     "view": answer.get("view"),
                     "root": str(root),
@@ -1305,7 +1509,9 @@ class Corpus:
         self.configure("[search.lexical]\nunits_max = 20000\n")
         with self.server() as server:
             async with server.connect() as client:
-                await settled_local(client, "search", {"query": "test", "limit": 1})
+                await settled_local(
+                    client, "search", corpus_request({"query": "test", "limit": 1})
+                )
                 await observed(
                     server,
                     "search",
@@ -1317,16 +1523,16 @@ class Corpus:
                         for row in rows
                     ),
                 )
-                answer = await client.call("search", {"query": "test", "limit": 1})
+                answer = await client.call(
+                    "search", corpus_request({"query": "test", "limit": 1})
+                )
                 count = lexical_breach(answer, 20000)
                 require(
-                    bool(objects(answer, "results")),
-                    "lexical overflow removed identifier matches",
+                    answer.get("outcome") == "unavailable",
+                    "incomplete lexical ranking reported a complete answer",
                 )
-                captured = await client.call(
-                    "search", {"query": "TEST", "target": "symbol", "limit": 1000}
-                )
-                canonical = symbol_pool(objects(captured, "results"))
+                captured = await client.call("search", name_request("TEST"))
+                canonical = {iri(row, "symbol") for row in bindings(captured)}
                 anchor = "rift://symbol/local/rust/bun_bundler/defines/TEST"
                 require(
                     anchor in canonical, "Bun lost its established Rust TEST identity"
@@ -1350,7 +1556,9 @@ class Corpus:
     async def stop_states(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                await client.call("search", {"query": "test", "limit": 1})
+                await client.call(
+                    "search", corpus_request({"query": "test", "limit": 1})
+                )
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("stop", state="idle", process_gone=True)
@@ -1429,9 +1637,10 @@ async def observed_state(
 
 
 async def settled_local(client: Client, name: str, request: JsonObject) -> JsonObject:
-    """Resend partial local reads until local index preparation completes.
+    """Resend partial current reads until local index preparation completes.
 
-    The wait is bounded by `LOCAL_PREPARATION_SECONDS`.
+    The wait is bounded by `LOCAL_PREPARATION_SECONDS`. Captured selections use
+    `read_settled_local` with its captured selection instead.
     """
     return await read_settled_local(
         client,
@@ -1439,6 +1648,7 @@ async def settled_local(client: Client, name: str, request: JsonObject) -> JsonO
         request,
         seconds=LOCAL_PREPARATION_SECONDS,
         poll_seconds=POLL_SECONDS,
+        selection="current",
     )
 
 
@@ -1450,8 +1660,9 @@ async def settled_pattern(client: Client, request: JsonObject) -> JsonObject:
     deadline alone bounds the loop, as in `Corpus.await_probe`.
     """
     deadline = time.monotonic() + OBSERVATION_SECONDS
+    query = corpus_request(request)
     while time.monotonic() < deadline:
-        answer = await client.call("search", request)
+        answer = await client.call("search", query)
         preparing = [
             warning
             for warning in warnings(answer)

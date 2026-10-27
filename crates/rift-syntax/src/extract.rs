@@ -484,7 +484,7 @@ pub(crate) fn callable_signature(
         type_parameters: Vec::new(),
         throws: Vec::new(),
         effects: Vec::new(),
-        extensions: Extensions(std::collections::BTreeMap::new()),
+        extensions: Extensions::from(std::collections::BTreeMap::new()),
     })
 }
 

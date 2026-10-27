@@ -29,7 +29,6 @@ use crate::http::{
     HttpServer, IdleTracker, MCP_PATH, RequestGate, STOP_PATH, TokenCheck, WORKSPACE_ROOT_HEADER,
     authorize_request, bind_loopback_listener, guard_loopback_boundary, mint_token, watch_idle,
 };
-use crate::identity::BuildCheckout;
 use crate::repository::{ServerConfigurationSelection, select_server_configuration};
 use crate::server::{BlockingExecutor, EngineHold};
 use crate::storage::WorkspaceStorage;
@@ -82,8 +81,9 @@ pub(crate) async fn serve_repository_http(
     shutdown: CancellationToken,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<HttpServer, RiftError> {
+    let checkout = checkout.into();
     let authority_root = tokio::fs::canonicalize(authority_root)
         .await
         .map_err(|error| {
@@ -101,7 +101,7 @@ pub(crate) async fn serve_repository_http(
                 .error()
         })?;
     let blocking = BlockingExecutor::for_configuration(&server_configuration)?;
-    let identity = crate::identity::product_identity(checkout)
+    let identity = crate::identity::product_identity(checkout.checkout)
         .await
         .map_err(|error| {
             errors::mcp::http_serve_failed()
@@ -200,7 +200,7 @@ pub(crate) struct RepositoryWorkspaceRegistry {
     common_directory: std::path::PathBuf,
     server_configuration: ServerConfiguration,
     limits: WorkspaceIndexLimits,
-    checkout: BuildCheckout,
+    checkout: crate::ServeOptions,
     blocking: BlockingExecutor,
     stop: CancellationToken,
     idle_timeout: Duration,
@@ -496,11 +496,12 @@ impl RepositoryWorkspaceRegistry {
             &root,
             self.limits,
             storage,
-            self.checkout,
+            self.checkout.checkout,
             self.blocking.clone(),
         )
         .await
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "workspace build failed"))?;
+        let server = self.checkout.clone().apply(server);
         let settings_changed = server.server_configuration().await != self.server_configuration;
         let supervisor = server.index_supervisor();
         let engines = server.engine_hold();
@@ -941,28 +942,48 @@ mod tests {
         );
         let service = ().serve(StreamableHttpClientTransport::from_config(config)).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let literal = oxigraph::model::Literal::from(name);
+        let query = format!(
+            "SELECT ?symbol ?name {{ ?symbol a :Symbol; :name ?name . FILTER(?name = {literal}) }}"
+        );
         let selected = loop {
             let response = service
                 .call_tool(
                     CallToolRequestParams::new("search").with_arguments(
-                        serde_json::json!({"pattern": name, "target": "symbol", "scope": "local"})
+                        serde_json::json!({"query": query})
                             .as_object()
                             .cloned()
                             .ok_or("tool arguments must be an object")?,
                     ),
                 )
                 .await?;
+            let content = response.structured_content.as_ref().ok_or_else(|| {
+                format!("workspace query must return structured content: {response:?}")
+            })?;
+            if response.is_error == Some(true)
+                || (content["outcome"] == "unavailable" && content["reason"] != "index_preparing")
+            {
+                return Err(format!("workspace query refused: {response:?}").into());
+            }
             let ids = response
                 .structured_content
                 .as_ref()
-                .and_then(|content| content["results"].as_array())
+                .and_then(|content| content["answer"]["bindings"].as_array())
                 .into_iter()
                 .flatten()
-                .filter(|hit| hit["hit"]["symbol"]["name"] == name)
-                .filter_map(|hit| hit["hit"]["symbol"]["id"].as_str())
+                .filter(|row| row["name"]["value"] == name && row["symbol"]["type"] == "iri")
+                .filter_map(|row| row["symbol"]["value"].as_str())
                 .collect::<Vec<_>>();
             if let [id] = ids.as_slice() {
-                break rift_protocol::read::SymbolId::parse(id)?;
+                let view = response
+                    .structured_content
+                    .as_ref()
+                    .and_then(|content| content["view"]["id"].as_str())
+                    .ok_or("query retains its selected workspace view")?;
+                break (
+                    rift_protocol::read::SymbolId::parse(id)?,
+                    rift_protocol::symbol_read::CapturedViewId::parse(view)?,
+                );
             }
             if ids.len() > 1 || tokio::time::Instant::now() >= deadline {
                 return Err(format!(
@@ -975,7 +996,7 @@ mod tests {
         let response = service
             .call_tool(
                 CallToolRequestParams::new("get_symbol").with_arguments(
-                    serde_json::json!({"id": selected})
+                    serde_json::json!({"id": selected.0, "view": selected.1})
                         .as_object()
                         .cloned()
                         .ok_or("tool arguments must be an object")?,
@@ -1236,7 +1257,7 @@ mod tests {
             workspaces_max: 1,
             server_configuration,
             limits: WorkspaceIndexLimits::default(),
-            checkout: BuildCheckout::Unversioned,
+            checkout: BuildCheckout::Unversioned.into(),
             stop: CancellationToken::new(),
             build_gate: tokio::sync::Mutex::new(()),
             workspaces: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),

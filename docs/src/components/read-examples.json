@@ -1,361 +1,10 @@
 {
-  "all-search": {
-    "tool": "search",
-    "arguments": {
-      "query": "beacon",
-      "scope": "all",
-      "target": "symbol",
-      "include": ["source"],
-      "limit": 10,
-      "paths": {
-        "include": ["src/**"]
-      }
-    },
-    "text": "4 results\n\t[1] pub fn beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature, content \u00b7 view 185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91 \u00b7 expires 2026-10-12T16:01:30.984578+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/beacon\n\n\t\tpub fn beacon() {}\n\t[2] pub fn beacon()\n\t\tsrc/lib.rs:2 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/beacon\n\n\t\tpub fn beacon() {}\n\t[3] function beacon\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\t\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\t\tpub fn beacon() {}\n\t[4] pub fn local_beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/local_beacon\n\n\t\tpub fn local_beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n",
-    "json": {
-      "view": {
-        "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
-        "expires_at": "2026-10-12T16:01:30.980861+00:00"
-      },
-      "results": [
-        {
-          "view": {
-            "id": "185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91",
-            "expires_at": "2026-10-12T16:01:30.984578+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local@sdk/rust/docs_sdk/beacon",
-              "language": "rust",
-              "name": "beacon",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn beacon()",
-                  "language": "rust"
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature", "content"],
-          "source": "pub fn beacon() {}",
-          "range": {
-            "start": 0,
-            "end": 18
-          },
-          "line": 1,
-          "path": "src/lib.rs"
-        },
-        {
-          "view": {
-            "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
-            "expires_at": "2026-10-12T16:01:30.980861+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/docs_global_app/beacon",
-              "language": "rust",
-              "name": "beacon",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn beacon()",
-                  "language": "rust"
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature"],
-          "source": "pub fn beacon() {}",
-          "range": {
-            "start": 25,
-            "end": 43
-          },
-          "line": 2,
-          "path": "src/lib.rs"
-        },
-        {
-          "view": {
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2099-10-10T10:05:00Z"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-              "language": "rust",
-              "name": "beacon",
-              "kind": "function",
-              "origin": {
-                "location": "dependency",
-                "package": {
-                  "manager": "cargo",
-                  "registry": "crates.io",
-                  "name": "demo",
-                  "version": "1.0.0"
-                },
-                "source_kind": "authored"
-              }
-            }
-          },
-          "matched_by": ["name"],
-          "source": "pub fn beacon() {}",
-          "range": {
-            "start": 26,
-            "end": 44
-          },
-          "line": 2,
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
-        },
-        {
-          "view": {
-            "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
-            "expires_at": "2026-10-12T16:01:30.980861+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/docs_global_app/local_beacon",
-              "language": "rust",
-              "name": "local_beacon",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn local_beacon()",
-                  "language": "rust"
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature"],
-          "source": "pub fn local_beacon() {}",
-          "range": {
-            "start": 0,
-            "end": 24
-          },
-          "line": 1,
-          "path": "src/lib.rs"
-        }
-      ],
-      "pagination": {
-        "page_index": 0,
-        "total_pages": 1
-      },
-      "warnings": [
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "npm",
-            "name": "typescript",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "stdlib",
-            "name": "node",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "stdlib",
-            "name": "rust",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        }
-      ]
-    }
-  },
-  "named-search": {
-    "tool": "search",
-    "arguments": {
-      "query": "load_config",
-      "scope": "local@sdk",
-      "target": "symbol",
-      "include": ["source"],
-      "limit": 10
-    },
-    "text": "6 results\n\t[1] pub fn load_config() -> u32\n\t\tsrc/lib.rs:1 \u00b7 name, signature, documentation, content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\t\tLoads configuration.\n\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\n\t[2] heading Configuration\n\t\tREADME.md:5 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t43..81\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Example project\n\t\tREADME.md:1 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t0..81\n\n\t\t# Example project\n\n\t\tProject documentation.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] member name\n\t\tCargo.toml:2 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t10..27\n\n\t\tname = \"docs_sdk\"\n\t[5] member version\n\t\tCargo.toml:3 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t28..45\n\n\t\tversion = \"0.1.0\"\n\t[6] table package\n\t\tCargo.toml:1 \u00b7 content \u00b7 view 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n\t\t0..63\n\n\t\t[package]\n\t\tname = \"docs_sdk\"\n\t\tversion = \"0.1.0\"\n\t\tedition = \"2021\"\n\nview 577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272 \u00b7 expires 2026-10-12T15:50:28.704474+00:00\n",
-    "json": {
-      "view": {
-        "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-        "expires_at": "2026-10-12T15:50:28.704474+00:00"
-      },
-      "results": [
-        {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config",
-              "language": "rust",
-              "name": "load_config",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn load_config() -> u32",
-                  "language": "rust"
-                }
-              ],
-              "documentation": [
-                {
-                  "format": "markdown",
-                  "text": "Loads configuration."
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature", "documentation", "content"],
-          "source": "/// Loads configuration.\npub fn load_config() -> u32 { 42 }",
-          "range": {
-            "start": 0,
-            "end": 59
-          },
-          "line": 1,
-          "path": "src/lib.rs"
-        },
-        {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "markdown",
-              "name": "Configuration",
-              "kind": "heading"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "## Configuration\n\nCall `load_config`.\n",
-          "range": {
-            "start": 43,
-            "end": 81
-          },
-          "line": 5,
-          "path": "README.md"
-        },
-        {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "markdown",
-              "name": "Example project",
-              "kind": "heading"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "# Example project\n\nProject documentation.\n\n## Configuration\n\nCall `load_config`.\n",
-          "range": {
-            "start": 0,
-            "end": 81
-          },
-          "line": 1,
-          "path": "README.md"
-        },
-        {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "toml",
-              "name": "name",
-              "kind": "member"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "name = \"docs_sdk\"",
-          "range": {
-            "start": 10,
-            "end": 27
-          },
-          "line": 2,
-          "path": "Cargo.toml"
-        },
-        {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "toml",
-              "name": "version",
-              "kind": "member"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "version = \"0.1.0\"",
-          "range": {
-            "start": 28,
-            "end": 45
-          },
-          "line": 3,
-          "path": "Cargo.toml"
-        },
-        {
-          "view": {
-            "id": "577a692138ddb25b768f1b0a326bbe0511ab8f16b920f5ba7d071e7561450272",
-            "expires_at": "2026-10-12T15:50:28.704474+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "toml",
-              "name": "package",
-              "kind": "table"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "[package]\nname = \"docs_sdk\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-          "range": {
-            "start": 0,
-            "end": 63
-          },
-          "line": 1,
-          "path": "Cargo.toml"
-        }
-      ],
-      "pagination": {
-        "page_index": 0,
-        "total_pages": 1
-      }
-    }
-  },
   "local-symbol": {
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\n\t\trift://node/rust/src/config.rs@162-355#3e7a78cf\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\n\t\trift://node/rust/src/config.rs@162-355#3e7a78cf\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 · expires 2026-10-12T15:50:28.711117+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -409,7 +58,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\n\t\trift://node/rust/src/lib.rs@0-59#b0b58466\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\n\t\trift://node/rust/src/lib.rs@0-59#b0b58466\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd · expires 2026-10-12T16:17:02.916991+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -463,7 +112,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_configs"
     },
-    "text": "\tunavailable \u00b7 InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\nview 52889776a11e04e3e6d9e9cc23476830656e159470c991b595ff493600732298 \u00b7 expires 2026-10-12T15:50:28.794765+00:00\n",
+    "text": "\tunavailable · InsufficientCoverage\n\trift://symbol/local/rust/example_project/config/load_configs\nview 52889776a11e04e3e6d9e9cc23476830656e159470c991b595ff493600732298 · expires 2026-10-12T15:50:28.794765+00:00\n",
     "json": {
       "outcome": "unavailable",
       "id": "rift://symbol/local/rust/example_project/config/load_configs",
@@ -479,211 +128,151 @@
     "arguments": {
       "id": "rift://symbol/rust/src/lib.rs/load_config"
     },
-    "text": "1 error\n\tinvalid_request \u00b7 retry never\n\t\ttool arguments do not match the served schema: accepted rift://symbol/<owner>/<language>/<qualified_path>; an occurrence uses ~2?rev=<revision>, example {\"id\":\"rift://symbol/local/rust/example_project/config/Config\"}, {\"id\":\"rift://symbol/local/rust/example_project/config/load_config\"}, field id, tool get_symbol; correct the reported field and resend the request\n\t\trift.mcp.parameter_invalid\n",
+    "text": "1 error\n\tinvalid_request · retry never\n\t\ttool arguments do not match the served schema: accepted rift://symbol/<owner>/<language>/<qualified_path>; an occurrence uses ~2?rev=<revision>, example {\"id\":\"rift://symbol/local/rust/example_project/config/Config\"}, {\"id\":\"rift://symbol/local/rust/example_project/config/load_config\"}, field id, tool get_symbol; correct the reported field and resend the request\n\t\trift.mcp.parameter_invalid\n",
     "json": null
   },
   "project-source": {
-    "tool": "get_source",
+    "tool": "search",
     "arguments": {
-      "unit": "rift://source/project/README.md"
+      "query": "SELECT ?outcome ?unit ?text ?start ?end ?complete ?source_view ?source_expiry { SERVICE :source { ?read :unit <rift://source/project/README.md>; :outcome ?outcome . ?read :view [ :id ?source_view; :expires_at ?source_expiry ] . OPTIONAL { ?read :source [ :text ?text; :span [ :unit ?unit; :range [ :start ?start; :end ?end ] ] ]; :source_complete ?complete } } }",
+      "language": "sparql"
     },
-    "text": "rift://source/project/README.md\n0..398\n\t# Example project\n\n\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t- `src/main.rs` starts the application.\n\t- `src/config.rs` loads the workspace configuration.\n\t- `src/error.rs` defines the error type returned by the loader.\n\n\tRift reads the project structure, source, and documentation to help\n\tan agent find the code relevant to its task.\n\n\t## Configuration\n\n\tCall `load_config`.\n\nview 815047e7e6f2f275e58e2b16ada429efb25cb8fc6bd70e4ad5153b6ed8540aae \u00b7 expires 2026-10-12T15:50:28.799521+00:00\n",
+    "text": "1 results · page 1/1\n\toutcome unit text start end complete source_view source_expiry\n\t{\"complete\":{\"type\":\"literal\",\"value\":\"true\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#boolean\"},\"end\":{\"type\":\"literal\",\"value\":\"15\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"outcome\":{\"type\":\"literal\",\"value\":\"found\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_expiry\":{\"type\":\"literal\",\"value\":\"2026-10-27T04:14:38.316577+00:00\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_view\":{\"type\":\"literal\",\"value\":\"0690a91aa155689cff1f2fff10ef97af2d2be5f2141c3802e27b96b7575499ea\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"text\":{\"type\":\"literal\",\"value\":\"# Beacon café\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/README.md\"}}\nview 9570f2186e82ecfc7c3e019696625c7dd0c81f9a39c908513b6d5e71f146609b · expires 2026-10-27T04:14:38.316577+00:00\n",
     "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 0,
-            "end": 398
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "outcome",
+          "unit",
+          "text",
+          "start",
+          "end",
+          "complete",
+          "source_view",
+          "source_expiry"
+        ],
+        "bindings": [
+          {
+            "complete": {
+              "type": "literal",
+              "value": "true",
+              "datatype": "http://www.w3.org/2001/XMLSchema#boolean"
+            },
+            "end": {
+              "type": "literal",
+              "value": "15",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "outcome": {
+              "type": "literal",
+              "value": "found",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_expiry": {
+              "type": "literal",
+              "value": "2026-10-27T04:14:38.316577+00:00",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_view": {
+              "type": "literal",
+              "value": "0690a91aa155689cff1f2fff10ef97af2d2be5f2141c3802e27b96b7575499ea",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "text": {
+              "type": "literal",
+              "value": "# Beacon café\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/project/README.md"
+            }
           }
-        },
-        "text": "# Example project\n\nA Rust project that reads workspace configuration from `rift.toml`.\n\n- `src/main.rs` starts the application.\n- `src/config.rs` loads the workspace configuration.\n- `src/error.rs` defines the error type returned by the loader.\n\nRift reads the project structure, source, and documentation to help\nan agent find the code relevant to its task.\n\n## Configuration\n\nCall `load_config`.\n"
+        ]
       },
-      "source_complete": true,
       "view": {
-        "id": "815047e7e6f2f275e58e2b16ada429efb25cb8fc6bd70e4ad5153b6ed8540aae",
-        "expires_at": "2026-10-12T15:50:28.799521+00:00"
+        "id": "9570f2186e82ecfc7c3e019696625c7dd0c81f9a39c908513b6d5e71f146609b",
+        "expires_at": "2026-10-27T04:14:38.316577+00:00"
+      },
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
       }
     }
   },
   "project-section": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/project/README.md",
-      "range": {
-        "start": 360,
-        "end": 398
-      }
-    },
-    "text": "rift://source/project/README.md\n360..398\n\t## Configuration\n\n\tCall `load_config`.\n\nview 4c04e9840ee7a9d270a923cd35c010c840baef4da46fc29c64f921b2e76e4bc4 \u00b7 expires 2026-10-12T15:50:28.847106+00:00\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 360,
-            "end": 398
-          }
-        },
-        "text": "## Configuration\n\nCall `load_config`.\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "4c04e9840ee7a9d270a923cd35c010c840baef4da46fc29c64f921b2e76e4bc4",
-        "expires_at": "2026-10-12T15:50:28.847106+00:00"
-      }
-    }
-  },
-  "pattern-search": {
     "tool": "search",
     "arguments": {
-      "pattern": "load_config",
-      "include": ["source"],
-      "limit": 10
+      "query": "SELECT ?outcome ?unit ?text ?start ?end ?complete ?source_view ?source_expiry { SERVICE :source { ?read :unit <rift://source/project/README.md>; :outcome ?outcome . ?read :range \"{\\\"start\\\":2,\\\"end\\\":14}\"^^rdf:JSON . ?read :view [ :id ?source_view; :expires_at ?source_expiry ] . OPTIONAL { ?read :source [ :text ?text; :span [ :unit ?unit; :range [ :start ?start; :end ?end ] ] ]; :source_complete ?complete } } }",
+      "language": "sparql"
     },
-    "text": "7 results\n\t[1] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[2] README.md:14 \u00b7 content\n\t\tCall `load_config`.\n\t[3] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[4] src/config.rs:11 \u00b7 content\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t[5] src/main.rs:6 \u00b7 content\n\t\tuse config::load_config;\n\t[6] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\n\t[7] src/main.rs:12 \u00b7 content\n\t\t        load_config(Path::new(\"rift.toml\"))\n",
+    "text": "1 results · page 1/1\n\toutcome unit text start end complete source_view source_expiry\n\t{\"complete\":{\"type\":\"literal\",\"value\":\"true\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#boolean\"},\"end\":{\"type\":\"literal\",\"value\":\"14\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"outcome\":{\"type\":\"literal\",\"value\":\"found\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_expiry\":{\"type\":\"literal\",\"value\":\"2026-10-27T04:14:38.708196+00:00\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_view\":{\"type\":\"literal\",\"value\":\"51aa4a45c1469c732b1ddabf6f87ef7192dbc478b00b4b318c9987bf0c2ce4ed\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"2\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"text\":{\"type\":\"literal\",\"value\":\"Beacon café\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/README.md\"}}\nview 0393db6901dae924218dc8eddb409c3e457b4f97c53cb1f6d0d675eb674c37fe · expires 2026-10-27T04:14:38.708196+00:00\n",
     "json": {
-      "results": [
-        {
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "markdown",
-              "name": "Configuration",
-              "kind": "heading"
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "outcome",
+          "unit",
+          "text",
+          "start",
+          "end",
+          "complete",
+          "source_view",
+          "source_expiry"
+        ],
+        "bindings": [
+          {
+            "complete": {
+              "type": "literal",
+              "value": "true",
+              "datatype": "http://www.w3.org/2001/XMLSchema#boolean"
+            },
+            "end": {
+              "type": "literal",
+              "value": "14",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "outcome": {
+              "type": "literal",
+              "value": "found",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_expiry": {
+              "type": "literal",
+              "value": "2026-10-27T04:14:38.708196+00:00",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_view": {
+              "type": "literal",
+              "value": "51aa4a45c1469c732b1ddabf6f87ef7192dbc478b00b4b318c9987bf0c2ce4ed",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "2",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "text": {
+              "type": "literal",
+              "value": "Beacon café",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/project/README.md"
             }
-          },
-          "matched_by": ["content"],
-          "source": "## Configuration\n\nCall `load_config`.\n",
-          "range": {
-            "start": 360,
-            "end": 398
-          },
-          "line": 12,
-          "path": "README.md"
-        },
-        {
-          "hit": {
-            "target": "file",
-            "size": 398,
-            "languages": ["markdown"]
-          },
-          "matched_by": ["content"],
-          "source": "Call `load_config`.",
-          "range": {
-            "start": 384,
-            "end": 395
-          },
-          "line": 14,
-          "path": "README.md"
-        },
-        {
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/config/load_config",
-              "language": "rust",
-              "name": "load_config",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                  "language": "rust"
-                }
-              ],
-              "documentation": [
-                {
-                  "format": "markdown",
-                  "text": "Loads the workspace configuration from `rift.toml`."
-                }
-              ]
-            }
-          },
-          "matched_by": ["content"],
-          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-          "range": {
-            "start": 162,
-            "end": 355
-          },
-          "line": 10,
-          "path": "src/config.rs"
-        },
-        {
-          "hit": {
-            "target": "file",
-            "size": 356,
-            "languages": ["rust"]
-          },
-          "matched_by": ["content"],
-          "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {",
-          "range": {
-            "start": 225,
-            "end": 236
-          },
-          "line": 11,
-          "path": "src/config.rs"
-        },
-        {
-          "hit": {
-            "target": "file",
-            "size": 344,
-            "languages": ["rust"]
-          },
-          "matched_by": ["content"],
-          "source": "use config::load_config;",
-          "range": {
-            "start": 58,
-            "end": 69
-          },
-          "line": 6,
-          "path": "src/main.rs"
-        },
-        {
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "rust",
-              "name": "main",
-              "kind": "function",
-              "facets": ["value", "callable", "entrypoint"],
-              "visibility": "private",
-              "signatures": [
-                {
-                  "display": "async fn main() -> Result<(), ConfigError>",
-                  "language": "rust"
-                }
-              ]
-            }
-          },
-          "matched_by": ["content"],
-          "source": "#[tokio::main]\nasync fn main() -> Result<(), ConfigError> {\n    let config = tokio::task::spawn_blocking(|| {\n        load_config(Path::new(\"rift.toml\"))\n    })\n    .await??;\n\n    println!(\"Workspace root: {}\", config.root.display());\n    Ok(())\n}",
-          "range": {
-            "start": 96,
-            "end": 343
-          },
-          "line": 9,
-          "path": "src/main.rs"
-        },
-        {
-          "hit": {
-            "target": "file",
-            "size": 344,
-            "languages": ["rust"]
-          },
-          "matched_by": ["content"],
-          "source": "        load_config(Path::new(\"rift.toml\"))",
-          "range": {
-            "start": 214,
-            "end": 225
-          },
-          "line": 12,
-          "path": "src/main.rs"
-        }
-      ],
+          }
+        ]
+      },
+      "view": {
+        "id": "0393db6901dae924218dc8eddb409c3e457b4f97c53cb1f6d0d675eb674c37fe",
+        "expires_at": "2026-10-27T04:14:38.708196+00:00"
+      },
       "pagination": {
         "page_index": 0,
         "total_pages": 1
@@ -693,697 +282,580 @@
   "local-nodes": {
     "tool": "nodes",
     "arguments": {
-      "path": "src/config.rs",
-      "position": 338
+      "query": "SELECT ?node ?node_id ?node_unit ?node_kind ?node_language ?node_start ?node_end ?node_symbol ?facet ?text { ?node a :Node; :unit <rift://source/project/lib.rs>, ?node_unit; :id ?node_id; :kind ?node_kind; :language ?node_language; :range [ :start ?node_start; :end ?node_end ] . OPTIONAL { ?node :symbol ?node_symbol } OPTIONAL { ?node :facets ?facet } <rift://source/project/lib.rs> :source ?text . } ORDER BY ?node_start ?node_end ?node_id ?facet",
+      "language": "sparql"
     },
-    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\trift://node/rust/src/config.rs@0-356#dcbef6dd\n\t[2] function_item \u00b7 4 lines\n\t\trift://node/rust/src/config.rs@218-355#67ecfb36\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\trift://node/rust/src/config.rs@281-355#4e554fa8\n\t[4] call_expression\n\t\trift://node/rust/src/config.rs@334-353#4df4426e\n\t[5] identifier\n\t\trift://node/rust/src/config.rs@334-346#03f22dac\n\n\t\tparse_config\n",
+    "text": "7 results · page 1/1\n\tnode node_id node_unit node_kind node_language node_start node_end node_symbol facet text\n\t{\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_06e49f542cc997c26b55c55d80b6019e4474a3b989ac67f93f007492e45df0cf\"},\"node_end\":{\"type\":\"literal\",\"value\":\"3\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@0-3#0017dea7\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"visibility_modifier\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\n\t{\"facet\":{\"type\":\"iri\",\"value\":\"urn:rift:vocabulary:declaration\"},\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_8f561129f03ab14524f734e523ffeaff8978cc64cd1b95b69f72ac5cfe3f5fc4\"},\"node_end\":{\"type\":\"literal\",\"value\":\"18\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@0-18#324b7a89\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"function_item\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_symbol\":{\"type\":\"iri\",\"value\":\"rift://symbol/local/rust/beacon/beacon\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\n\t{\"facet\":{\"type\":\"iri\",\"value\":\"urn:rift:vocabulary:definition\"},\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_8f561129f03ab14524f734e523ffeaff8978cc64cd1b95b69f72ac5cfe3f5fc4\"},\"node_end\":{\"type\":\"literal\",\"value\":\"18\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@0-18#324b7a89\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"function_item\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_symbol\":{\"type\":\"iri\",\"value\":\"rift://symbol/local/rust/beacon/beacon\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\n\t{\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_4029caaae7a9b0e2cf9947f799eca722dabb7decbf0311ed39a02b1513d582b9\"},\"node_end\":{\"type\":\"literal\",\"value\":\"19\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@0-19#6b4a0455\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"source_file\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\n\t{\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_35192b3692b6bb5c9a1566539233800bb317599f0d1d1c76cfeb691f9597d4ae\"},\"node_end\":{\"type\":\"literal\",\"value\":\"13\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@7-13#8a62e967\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"identifier\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"7\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\n\t{\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_87e900dab500fdc7a7c31957e7e15404a0b8e7ca7abc4739e86940ced053495f\"},\"node_end\":{\"type\":\"literal\",\"value\":\"15\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@13-15#2e38e77b\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"parameters\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"13\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\n\t{\"node\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_8f36ebbfc5d54c80189a75b7876e991426e7582ef4b2db6d808b42b1daedb0a5\"},\"node_end\":{\"type\":\"literal\",\"value\":\"18\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_id\":{\"type\":\"literal\",\"value\":\"rift://node/rust/lib.rs@16-18#44136fa3\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_kind\":{\"type\":\"literal\",\"value\":\"block\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"node_start\":{\"type\":\"literal\",\"value\":\"16\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"node_unit\":{\"type\":\"iri\",\"value\":\"rift://source/project/lib.rs\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"}}\nview 1b17922dbd5f37f1762a3dd8e52b12c495a5f4be1b5643eeb567cbb5c7423ce9 · expires 2026-10-27T04:14:39.375582+00:00\n",
     "json": {
-      "nodes": [
-        {
-          "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
-          "unit": "rift://file/src/config.rs",
-          "language": "rust",
-          "kind": "source_file",
-          "range": {
-            "start": 0,
-            "end": 356
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "node",
+          "node_id",
+          "node_unit",
+          "node_kind",
+          "node_language",
+          "node_start",
+          "node_end",
+          "node_symbol",
+          "facet",
+          "text"
+        ],
+        "bindings": [
+          {
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_06e49f542cc997c26b55c55d80b6019e4474a3b989ac67f93f007492e45df0cf"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "3",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@0-3#0017dea7",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "visibility_modifier",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
+          },
+          {
+            "facet": {
+              "type": "iri",
+              "value": "urn:rift:vocabulary:declaration"
+            },
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_8f561129f03ab14524f734e523ffeaff8978cc64cd1b95b69f72ac5cfe3f5fc4"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "18",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@0-18#324b7a89",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "function_item",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_symbol": {
+              "type": "iri",
+              "value": "rift://symbol/local/rust/beacon/beacon"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
+          },
+          {
+            "facet": {
+              "type": "iri",
+              "value": "urn:rift:vocabulary:definition"
+            },
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_8f561129f03ab14524f734e523ffeaff8978cc64cd1b95b69f72ac5cfe3f5fc4"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "18",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@0-18#324b7a89",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "function_item",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_symbol": {
+              "type": "iri",
+              "value": "rift://symbol/local/rust/beacon/beacon"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
+          },
+          {
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_4029caaae7a9b0e2cf9947f799eca722dabb7decbf0311ed39a02b1513d582b9"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "19",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@0-19#6b4a0455",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "source_file",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
+          },
+          {
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_35192b3692b6bb5c9a1566539233800bb317599f0d1d1c76cfeb691f9597d4ae"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "13",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@7-13#8a62e967",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "identifier",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "7",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
+          },
+          {
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_87e900dab500fdc7a7c31957e7e15404a0b8e7ca7abc4739e86940ced053495f"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "15",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@13-15#2e38e77b",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "parameters",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "13",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
+          },
+          {
+            "node": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_8f36ebbfc5d54c80189a75b7876e991426e7582ef4b2db6d808b42b1daedb0a5"
+            },
+            "node_end": {
+              "type": "literal",
+              "value": "18",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_id": {
+              "type": "literal",
+              "value": "rift://node/rust/lib.rs@16-18#44136fa3",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_kind": {
+              "type": "literal",
+              "value": "block",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "node_start": {
+              "type": "literal",
+              "value": "16",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "node_unit": {
+              "type": "iri",
+              "value": "rift://source/project/lib.rs"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            }
           }
-        },
-        {
-          "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
-          "symbol": "rift://symbol/local/rust/example_project/config/load_config",
-          "unit": "rift://file/src/config.rs",
-          "language": "rust",
-          "kind": "function_item",
-          "facets": ["declaration", "definition"],
-          "range": {
-            "start": 218,
-            "end": 355
-          }
-        },
-        {
-          "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
-          "unit": "rift://file/src/config.rs",
-          "language": "rust",
-          "kind": "block",
-          "range": {
-            "start": 281,
-            "end": 355
-          }
-        },
-        {
-          "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
-          "unit": "rift://file/src/config.rs",
-          "language": "rust",
-          "kind": "call_expression",
-          "facets": ["expression"],
-          "range": {
-            "start": 334,
-            "end": 353
-          }
-        },
-        {
-          "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
-          "unit": "rift://file/src/config.rs",
-          "language": "rust",
-          "kind": "identifier",
-          "range": {
-            "start": 334,
-            "end": 346
-          }
-        }
-      ],
-      "source": [
-        "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-        "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-        "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-        "parse_config(&text)",
-        "parse_config"
-      ]
+        ]
+      },
+      "view": {
+        "id": "1b17922dbd5f37f1762a3dd8e52b12c495a5f4be1b5643eeb567cbb5c7423ce9",
+        "expires_at": "2026-10-27T04:14:39.375582+00:00"
+      },
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
+      }
     }
   },
   "local-search": {
     "tool": "search",
     "arguments": {
-      "query": "load configuration",
-      "include": ["source"],
-      "limit": 5
+      "query": "SELECT ?symbol ?name ?path ?unit ?source { SERVICE :search { ?hit :query \"beacon\" . ?hit :scope \"local\" . ?hit :target \"symbol\" . ?hit :include \"[\\\"source\\\"]\"^^rdf:JSON . ?hit :index ?index . OPTIONAL { ?hit :symbol ?symbol . OPTIONAL { ?symbol :name ?name } } OPTIONAL { ?hit :path ?path } OPTIONAL { ?hit :unit ?unit } OPTIONAL { ?hit :source ?source } } } ORDER BY ?index LIMIT 20 OFFSET 0"
     },
-    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 name, signature, documentation, content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] Example project\n\t\tREADME.md:3 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t[3] Example project > Example project > Configuration\n\t\tREADME.md:12 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\t## Configuration\n\n\t[4] private module config\n\t\tsrc/main.rs:1 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\t0..11\n\n\t\tmod config;\n\t[5] pub module config\n\t\tsrc/lib.rs:1 \u00b7 content \u00b7 view c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n\t\trift://symbol/local/rust/example_project/config\n\n\t\tpub mod config;\nview c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68 \u00b7 expires 2026-10-12T15:50:28.932788+00:00\n",
+    "text": "3 results · page 1/1\n\tsymbol name path unit source\n\t{\"name\":{\"type\":\"literal\",\"value\":\"beacon\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"path\":{\"type\":\"literal\",\"value\":\"lib.rs\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"symbol\":{\"type\":\"iri\",\"value\":\"rift://symbol/local/rust/beacon/beacon\"}}\n\t{\"name\":{\"type\":\"literal\",\"value\":\"Beacon café\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"path\":{\"type\":\"literal\",\"value\":\"README.md\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source\":{\"type\":\"literal\",\"value\":\"# Beacon café\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"symbol\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_a70dbe830632fbb4d81063cef48aeade02019c253f297b93bf5e787bc1ce200f\"}}\n\t{\"name\":{\"type\":\"literal\",\"value\":\"name\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"path\":{\"type\":\"literal\",\"value\":\"Cargo.toml\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source\":{\"type\":\"literal\",\"value\":\"name='beacon'\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"symbol\":{\"type\":\"blank_node\",\"value\":\"05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_9ab35c5fd0c44cbfc572f59fc8a89ac44f0ae19cbc2029bfe52542072a6bd5aa\"}}\nview 9ae0371a07f926b3902bf704efbca222b62f9cb3992a5df2eb459baf3bd9ea2f · expires 2026-10-27T04:14:39.024982+00:00\n",
     "json": {
-      "view": {
-        "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-        "expires_at": "2026-10-12T15:50:28.932788+00:00"
+      "answer": {
+        "result": "bindings",
+        "variables": ["symbol", "name", "path", "unit", "source"],
+        "bindings": [
+          {
+            "name": {
+              "type": "literal",
+              "value": "beacon",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "path": {
+              "type": "literal",
+              "value": "lib.rs",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source": {
+              "type": "literal",
+              "value": "pub fn beacon() {}",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "symbol": {
+              "type": "iri",
+              "value": "rift://symbol/local/rust/beacon/beacon"
+            }
+          },
+          {
+            "name": {
+              "type": "literal",
+              "value": "Beacon café",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "path": {
+              "type": "literal",
+              "value": "README.md",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source": {
+              "type": "literal",
+              "value": "# Beacon café\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "symbol": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_a70dbe830632fbb4d81063cef48aeade02019c253f297b93bf5e787bc1ce200f"
+            }
+          },
+          {
+            "name": {
+              "type": "literal",
+              "value": "name",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "path": {
+              "type": "literal",
+              "value": "Cargo.toml",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source": {
+              "type": "literal",
+              "value": "name='beacon'",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "symbol": {
+              "type": "blank_node",
+              "value": "05db064e06ade0d881c0a2de1067ce47c0988236fa023415b694b0ce99ec84c9_9ab35c5fd0c44cbfc572f59fc8a89ac44f0ae19cbc2029bfe52542072a6bd5aa"
+            }
+          }
+        ]
       },
-      "results": [
-        {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/config/load_config",
-              "language": "rust",
-              "name": "load_config",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                  "language": "rust"
-                }
-              ],
-              "documentation": [
-                {
-                  "format": "markdown",
-                  "text": "Loads the workspace configuration from `rift.toml`."
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature", "documentation", "content"],
-          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-          "range": {
-            "start": 162,
-            "end": 355
-          },
-          "line": 10,
-          "path": "src/config.rs"
-        },
-        {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
-          "hit": {
-            "target": "documentation",
-            "documentation": {
-              "block": {
-                "identity": "267a7120d9e291a212e357b27cef32af9cc0712bee291b04be6c7ba33e9586d0",
-                "source": {
-                  "source": {
-                    "kind": "project",
-                    "path": "README.md"
-                  }
-                },
-                "content_digest": "7622d3a710feb453a9b9b41e7b5667ec6b91615aa02f3297213dda1084046fc9",
-                "heading_path": [
-                  {
-                    "level": 1,
-                    "name": "Example project"
-                  }
-                ],
-                "range": {
-                  "start": 19,
-                  "end": 87
-                },
-                "line": 3,
-                "kind": "prose",
-                "chunks": [
-                  {
-                    "identity": "README.md",
-                    "range": {
-                      "start": 0,
-                      "end": 398
-                    }
-                  }
-                ]
-              },
-              "source": {
-                "identity": {
-                  "source": {
-                    "kind": "project",
-                    "path": "README.md"
-                  }
-                },
-                "revision": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
-                "content_digest": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
-                "origin": {
-                  "location": "project",
-                  "source_kind": "authored"
-                },
-                "format": "markdown",
-                "media_type": "text/markdown",
-                "selection": "workspace",
-                "byte_length": 398
-              },
-              "documentation_revision": "c4629d47"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "A Rust project that reads workspace configuration from `rift.toml`.\n",
-          "range": {
-            "start": 19,
-            "end": 87
-          },
-          "line": 3,
-          "path": "README.md"
-        },
-        {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
-          "hit": {
-            "target": "documentation",
-            "documentation": {
-              "block": {
-                "identity": "5eba7f9860bfbaf37fa910ede4b4b3181f70e5fa2199b169f949f5f08766bc41",
-                "source": {
-                  "source": {
-                    "kind": "project",
-                    "path": "README.md"
-                  }
-                },
-                "content_digest": "af2764b825b4b9417dbf637a70b4e95be01e0f45626134189f47d9b0c046d0c4",
-                "heading_path": [
-                  {
-                    "level": 1,
-                    "name": "Example project"
-                  },
-                  {
-                    "level": 2,
-                    "name": "Example project > Configuration"
-                  }
-                ],
-                "range": {
-                  "start": 360,
-                  "end": 377
-                },
-                "line": 12,
-                "kind": "prose",
-                "chunks": [
-                  {
-                    "identity": "README.md",
-                    "range": {
-                      "start": 0,
-                      "end": 398
-                    }
-                  }
-                ]
-              },
-              "source": {
-                "identity": {
-                  "source": {
-                    "kind": "project",
-                    "path": "README.md"
-                  }
-                },
-                "revision": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
-                "content_digest": "c490c4e0b8fd55aa8523de3586191da1b5798f5142af2f2257d129595760315c",
-                "origin": {
-                  "location": "project",
-                  "source_kind": "authored"
-                },
-                "format": "markdown",
-                "media_type": "text/markdown",
-                "selection": "workspace",
-                "byte_length": 398
-              },
-              "documentation_revision": "c4629d47"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "## Configuration\n",
-          "range": {
-            "start": 360,
-            "end": 377
-          },
-          "line": 12,
-          "path": "README.md"
-        },
-        {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "rust",
-              "name": "config",
-              "kind": "module",
-              "facets": ["namespace", "module"],
-              "visibility": "private"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "mod config;",
-          "range": {
-            "start": 0,
-            "end": 11
-          },
-          "line": 1,
-          "path": "src/main.rs"
-        },
-        {
-          "view": {
-            "id": "c0f3028f35892effeaaa46555f60a2d9641bcc6a11779b4534ff820203d4ba68",
-            "expires_at": "2026-10-12T15:50:28.932788+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/config",
-              "language": "rust",
-              "name": "config",
-              "kind": "module",
-              "facets": ["namespace", "module", "public"],
-              "visibility": "pub"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "pub mod config;",
-          "range": {
-            "start": 0,
-            "end": 15
-          },
-          "line": 1,
-          "path": "src/lib.rs"
-        }
-      ],
+      "view": {
+        "id": "9ae0371a07f926b3902bf704efbca222b62f9cb3992a5df2eb459baf3bd9ea2f",
+        "expires_at": "2026-10-27T04:14:39.024982+00:00"
+      },
       "pagination": {
         "page_index": 0,
-        "total_pages": 4
+        "total_pages": 1
       }
     }
-  },
-  "documentation-search": {
-    "tool": "search",
-    "arguments": {
-      "query": "loads workspace configuration",
-      "target": "symbol",
-      "include": ["source"],
-      "limit": 5
-    },
-    "text": "5 results \u00b7 page 1/4\n\t[1] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 documentation, content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[2] heading Example project\n\t\tREADME.md:1 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t0..398\n\n\t\t# Example project\n\n\t\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t\t- `src/main.rs` starts the application.\n\t\t- `src/config.rs` loads the workspace configuration.\n\t\t- `src/error.rs` defines the error type returned by the loader.\n\n\t\tRift reads the project structure, source, and documentation to help\n\t\tan agent find the code relevant to its task.\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[3] heading Configuration\n\t\tREADME.md:12 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[4] pub struct Config\n\t\tsrc/config.rs:5 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\trift://symbol/local/rust/example_project/config/Config\n\t\tWorkspace configuration read from `rift.toml`.\n\n\t\t/// Workspace configuration read from `rift.toml`.\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n\t[5] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content \u00b7 view 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\nview 9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f \u00b7 expires 2026-10-12T15:50:28.954251+00:00\n",
-    "json": {
-      "view": {
-        "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-        "expires_at": "2026-10-12T15:50:28.954251+00:00"
-      },
-      "results": [
-        {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/config/load_config",
-              "language": "rust",
-              "name": "load_config",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn load_config(path: &Path) -> Result<Config, ConfigError>",
-                  "language": "rust"
-                }
-              ],
-              "documentation": [
-                {
-                  "format": "markdown",
-                  "text": "Loads the workspace configuration from `rift.toml`."
-                }
-              ]
-            }
-          },
-          "matched_by": ["documentation", "content"],
-          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-          "range": {
-            "start": 162,
-            "end": 355
-          },
-          "line": 10,
-          "path": "src/config.rs"
-        },
-        {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "markdown",
-              "name": "Example project",
-              "kind": "heading"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "# Example project\n\nA Rust project that reads workspace configuration from `rift.toml`.\n\n- `src/main.rs` starts the application.\n- `src/config.rs` loads the workspace configuration.\n- `src/error.rs` defines the error type returned by the loader.\n\nRift reads the project structure, source, and documentation to help\nan agent find the code relevant to its task.\n\n## Configuration\n\nCall `load_config`.\n",
-          "range": {
-            "start": 0,
-            "end": 398
-          },
-          "line": 1,
-          "path": "README.md"
-        },
-        {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "markdown",
-              "name": "Configuration",
-              "kind": "heading"
-            }
-          },
-          "matched_by": ["content"],
-          "source": "## Configuration\n\nCall `load_config`.\n",
-          "range": {
-            "start": 360,
-            "end": 398
-          },
-          "line": 12,
-          "path": "README.md"
-        },
-        {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/config/Config",
-              "language": "rust",
-              "name": "Config",
-              "kind": "struct",
-              "facets": ["type", "public"],
-              "visibility": "pub",
-              "documentation": [
-                {
-                  "format": "markdown",
-                  "text": "Workspace configuration read from `rift.toml`."
-                }
-              ]
-            }
-          },
-          "matched_by": ["content"],
-          "source": "/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}",
-          "range": {
-            "start": 54,
-            "end": 160
-          },
-          "line": 5,
-          "path": "src/config.rs"
-        },
-        {
-          "view": {
-            "id": "9c837386b70d36f6731cfd40666290a438fdd9a37a9d53deeb243cb31e68445f",
-            "expires_at": "2026-10-12T15:50:28.954251+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "rust",
-              "name": "main",
-              "kind": "function",
-              "facets": ["value", "callable", "entrypoint"],
-              "visibility": "private",
-              "signatures": [
-                {
-                  "display": "async fn main() -> Result<(), ConfigError>",
-                  "language": "rust"
-                }
-              ]
-            }
-          },
-          "matched_by": ["content"],
-          "source": "#[tokio::main]\nasync fn main() -> Result<(), ConfigError> {\n    let config = tokio::task::spawn_blocking(|| {\n        load_config(Path::new(\"rift.toml\"))\n    })\n    .await??;\n\n    println!(\"Workspace root: {}\", config.root.display());\n    Ok(())\n}",
-          "range": {
-            "start": 96,
-            "end": 343
-          },
-          "line": 9,
-          "path": "src/main.rs"
-        }
-      ],
-      "pagination": {
-        "page_index": 0,
-        "total_pages": 4
-      }
-    }
-  },
-  "incoming-traversal": {
-    "tool": "search",
-    "arguments": {
-      "traversal": {
-        "seed": "rift://symbol/local/rust/example_project/config/load_config",
-        "direction": "incoming",
-        "depth": 1
-      },
-      "target": "symbol",
-      "include": ["source"]
-    },
-    "text": "1 error\n\tcapability_unavailable \u00b7 retry operator_action\n\t\trequest uses unsupported capability relationship traversal (no language engine serves the seed); adjust the request to a served capability, or configure a provider that serves it\n\t\trift.server.read_unsupported\n",
-    "json": null
-  },
-  "outgoing-traversal": {
-    "tool": "search",
-    "arguments": {
-      "traversal": {
-        "seed": "rift://symbol/local/rust/example_project/config/load_config",
-        "direction": "outgoing",
-        "depth": 2
-      },
-      "target": "symbol",
-      "include": ["source"]
-    },
-    "text": "1 error\n\tcapability_unavailable \u00b7 retry operator_action\n\t\trequest uses unsupported capability relationship traversal (no language engine serves the seed); adjust the request to a served capability, or configure a provider that serves it\n\t\trift.server.read_unsupported\n",
-    "json": null
   },
   "global-search": {
     "tool": "search",
     "arguments": {
-      "query": "beacon",
-      "scope": "global",
-      "packages": [
-        {
-          "manager": "cargo",
-          "registry": "crates.io",
-          "name": "demo",
-          "version": "1.0.0"
-        }
-      ],
-      "target": "symbol",
-      "include": ["source"]
+      "query": "PREFIX : <urn:rift:vocabulary:> SELECT ?hit ?symbol ?name ?kind ?language ?index ?path ?unit ?start ?end ?line ?source { SERVICE <urn:rift:vocabulary:search> { ?hit <urn:rift:vocabulary:target> \"symbol\" . ?hit <urn:rift:vocabulary:query> \"beacon\" . ?hit <urn:rift:vocabulary:scope> \"global\" . ?hit <urn:rift:vocabulary:packages> \"[{\\\"manager\\\":\\\"cargo\\\",\\\"name\\\":\\\"demo\\\",\\\"registry\\\":\\\"crates.io\\\",\\\"version\\\":\\\"1.0.0\\\"}]\"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> . ?hit <urn:rift:vocabulary:include> \"[\\\"source\\\"]\"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> . ?hit <urn:rift:vocabulary:limit> \"20\"^^<http://www.w3.org/2001/XMLSchema#integer> . ?hit :index ?index . OPTIONAL { ?hit :symbol ?symbol . OPTIONAL { ?symbol :name ?name } OPTIONAL { ?symbol :kind ?kind } OPTIONAL { ?symbol :language ?language } } OPTIONAL { ?hit :path ?path } OPTIONAL { ?hit :unit ?unit } OPTIONAL { ?hit :start ?start } OPTIONAL { ?hit :end ?end } OPTIONAL { ?hit :line ?line } OPTIONAL { ?hit :source ?source }  } } ORDER BY ?index LIMIT 20 OFFSET 0",
+      "language": "sparql"
     },
-    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\tpub fn beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405 \u00b7 expires 2026-10-12T16:01:30.993123+00:00\n",
+    "text": "2 results · page 1/1\n\thit symbol name kind language index path unit start end line source\n\t{\"end\":{\"type\":\"literal\",\"value\":\"44\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"hit\":{\"type\":\"blank_node\",\"value\":\"35ca4ee609559a4827dd89886efe36dc5378715bcf62423878e1e2eade87f61a\"},\"index\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"kind\":{\"type\":\"literal\",\"value\":\"function\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"line\":{\"type\":\"literal\",\"value\":\"2\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"name\":{\"type\":\"literal\",\"value\":\"beacon\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source\":{\"type\":\"literal\",\"value\":\"pub fn beacon() {}\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"26\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"symbol\":{\"type\":\"iri\",\"value\":\"rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs\"}}\n\t{\"end\":{\"type\":\"literal\",\"value\":\"25\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"hit\":{\"type\":\"blank_node\",\"value\":\"a3efbf5bea785b71426fa7ab4a3a6da43cd13965b27d949b21562c65817a1e15\"},\"index\":{\"type\":\"literal\",\"value\":\"1\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"kind\":{\"type\":\"literal\",\"value\":\"function\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"language\":{\"type\":\"literal\",\"value\":\"rust\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"line\":{\"type\":\"literal\",\"value\":\"1\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"name\":{\"type\":\"literal\",\"value\":\"helper_beacon\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source\":{\"type\":\"literal\",\"value\":\"pub fn helper_beacon() {}\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"symbol\":{\"type\":\"iri\",\"value\":\"rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/helper_beacon\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs\"}}\nview a4d27b1d066c103b82fab38a68731ebeb005ea20321a57e0dab151c7234140eb · expires 2026-10-27T04:13:29.802500+00:00\n",
     "json": {
-      "view": {
-        "id": "aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405",
-        "expires_at": "2026-10-12T16:01:30.993123+00:00"
-      },
-      "results": [
-        {
-          "view": {
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2099-10-10T10:05:00Z"
-          },
-          "hit": {
-            "target": "symbol",
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "hit",
+          "symbol",
+          "name",
+          "kind",
+          "language",
+          "index",
+          "path",
+          "unit",
+          "start",
+          "end",
+          "line",
+          "source"
+        ],
+        "bindings": [
+          {
+            "end": {
+              "type": "literal",
+              "value": "44",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "hit": {
+              "type": "blank_node",
+              "value": "35ca4ee609559a4827dd89886efe36dc5378715bcf62423878e1e2eade87f61a"
+            },
+            "index": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "kind": {
+              "type": "literal",
+              "value": "function",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "line": {
+              "type": "literal",
+              "value": "2",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "name": {
+              "type": "literal",
+              "value": "beacon",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source": {
+              "type": "literal",
+              "value": "pub fn beacon() {}",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "26",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
             "symbol": {
-              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-              "language": "rust",
-              "name": "beacon",
-              "kind": "function",
-              "origin": {
-                "location": "dependency",
-                "package": {
-                  "manager": "cargo",
-                  "registry": "crates.io",
-                  "name": "demo",
-                  "version": "1.0.0"
-                },
-                "source_kind": "authored"
-              }
+              "type": "iri",
+              "value": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
             }
           },
-          "matched_by": ["name"],
-          "source": "pub fn beacon() {}",
-          "range": {
-            "start": 26,
-            "end": 44
-          },
-          "line": 2,
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
-        }
-      ],
+          {
+            "end": {
+              "type": "literal",
+              "value": "25",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "hit": {
+              "type": "blank_node",
+              "value": "a3efbf5bea785b71426fa7ab4a3a6da43cd13965b27d949b21562c65817a1e15"
+            },
+            "index": {
+              "type": "literal",
+              "value": "1",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "kind": {
+              "type": "literal",
+              "value": "function",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "language": {
+              "type": "literal",
+              "value": "rust",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "line": {
+              "type": "literal",
+              "value": "1",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "name": {
+              "type": "literal",
+              "value": "helper_beacon",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source": {
+              "type": "literal",
+              "value": "pub fn helper_beacon() {}",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "symbol": {
+              "type": "iri",
+              "value": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/helper_beacon"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+            }
+          }
+        ]
+      },
+      "view": {
+        "id": "a4d27b1d066c103b82fab38a68731ebeb005ea20321a57e0dab151c7234140eb",
+        "expires_at": "2026-10-27T04:13:29.802500+00:00"
+      },
       "pagination": {
         "page_index": 0,
         "total_pages": 1
-      },
-      "warnings": [
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "npm",
-            "name": "typescript",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "stdlib",
-            "name": "node",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "stdlib",
-            "name": "rust",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        }
-      ]
+      }
     }
   },
   "requested-served": {
     "tool": "search",
     "arguments": {
-      "query": "beacon",
-      "scope": "global",
-      "packages": [
-        {
-          "manager": "cargo",
-          "registry": "crates.io",
-          "name": "demo",
-          "version": "1.1.0"
-        }
-      ],
-      "target": "symbol",
-      "include": ["source"]
+      "query": "PREFIX : <urn:rift:vocabulary:> SELECT ?hit ?symbol ?name ?kind ?language ?index ?path ?unit ?start ?end ?line ?source { SERVICE <urn:rift:vocabulary:search> { ?hit <urn:rift:vocabulary:target> \"symbol\" . ?hit <urn:rift:vocabulary:query> \"beacon\" . ?hit <urn:rift:vocabulary:scope> \"global\" . ?hit <urn:rift:vocabulary:packages> \"[{\\\"manager\\\":\\\"cargo\\\",\\\"name\\\":\\\"demo\\\",\\\"registry\\\":\\\"crates.io\\\",\\\"version\\\":\\\"1.1.0\\\"}]\"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> . ?hit <urn:rift:vocabulary:include> \"[\\\"source\\\"]\"^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON> . ?hit <urn:rift:vocabulary:limit> \"20\"^^<http://www.w3.org/2001/XMLSchema#integer> . ?hit :index ?index . OPTIONAL { ?hit :symbol ?symbol . OPTIONAL { ?symbol :name ?name } OPTIONAL { ?symbol :kind ?kind } OPTIONAL { ?symbol :language ?language } } OPTIONAL { ?hit :path ?path } OPTIONAL { ?hit :unit ?unit } OPTIONAL { ?hit :start ?start } OPTIONAL { ?hit :end ?end } OPTIONAL { ?hit :line ?line } OPTIONAL { ?hit :source ?source }  } } ORDER BY ?index LIMIT 20 OFFSET 0",
+      "language": "sparql"
     },
-    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\tpub fn beacon() {}\n4 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\n\tpackage_substituted \u00b7 entry demo@1.1.0 (cargo) \u00b7 package demo@1.0.0 (cargo)\nview 1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058 \u00b7 expires 2026-10-12T16:01:30.999711+00:00\n",
+    "text": "unavailable · InsufficientCoverage\nview c7c30b4bb8b6cdb43ab64f2fd1ae730ff1a637f02c9cb68a779cc9c151f32a9b · expires 2026-10-27T04:13:31.026567+00:00\n1 warning\n\tpackage_substituted · entry demo@1.1.0 (cargo) · package demo@1.0.0 (cargo)\n",
     "json": {
+      "outcome": "unavailable",
+      "reason": "insufficient_coverage",
       "view": {
-        "id": "1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058",
-        "expires_at": "2026-10-12T16:01:30.999711+00:00"
-      },
-      "results": [
-        {
-          "view": {
-            "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "expires_at": "2099-10-10T10:05:00Z"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-              "language": "rust",
-              "name": "beacon",
-              "kind": "function",
-              "origin": {
-                "location": "dependency",
-                "package": {
-                  "manager": "cargo",
-                  "registry": "crates.io",
-                  "name": "demo",
-                  "version": "1.0.0"
-                },
-                "source_kind": "authored"
-              }
-            }
-          },
-          "matched_by": ["name"],
-          "source": "pub fn beacon() {}",
-          "range": {
-            "start": 26,
-            "end": 44
-          },
-          "line": 2,
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
-        }
-      ],
-      "pagination": {
-        "page_index": 0,
-        "total_pages": 1
+        "id": "c7c30b4bb8b6cdb43ab64f2fd1ae730ff1a637f02c9cb68a779cc9c151f32a9b",
+        "expires_at": "2026-10-27T04:13:31.026567+00:00"
       },
       "warnings": [
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "npm",
-            "name": "typescript",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "stdlib",
-            "name": "node",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
-        {
-          "code": "package_requirement_absent",
-          "entry": {
-            "manager": "stdlib",
-            "name": "rust",
-            "requirement": ">=0",
-            "availability": "canonical"
-          }
-        },
         {
           "code": "package_substituted",
           "entry": {
@@ -1409,7 +881,7 @@
       "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
       "include": ["source", "documentation"]
     },
-    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\n\t\tpub fn beacon() {}\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\n\t\tpub fn beacon() {}\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1523,27 +995,77 @@
     }
   },
   "global-source": {
-    "tool": "get_source",
+    "tool": "search",
     "arguments": {
-      "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+      "query": "SELECT ?outcome ?unit ?missing_unit ?text ?start ?end ?complete ?source_view ?source_expiry { SERVICE :source { ?read :unit <rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs>; :outcome ?outcome . ?read <urn:rift:vocabulary:view> \"a4d27b1d066c103b82fab38a68731ebeb005ea20321a57e0dab151c7234140eb\" .  ?read :view [ :id ?source_view; :expires_at ?source_expiry ] . OPTIONAL { ?read :source [ :text ?text; :span [ :unit ?unit; :range [ :start ?start; :end ?end ] ] ]; :source_complete ?complete } OPTIONAL { ?read :unit ?missing_unit } } }",
+      "language": "sparql"
     },
-    "text": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs\n0..45\n\tpub fn helper_beacon() {}\n\tpub fn beacon() {}\n\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "1 results · page 1/1\n\toutcome unit missing_unit text start end complete source_view source_expiry\n\t{\"complete\":{\"type\":\"literal\",\"value\":\"true\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#boolean\"},\"end\":{\"type\":\"literal\",\"value\":\"45\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"outcome\":{\"type\":\"literal\",\"value\":\"found\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_expiry\":{\"type\":\"literal\",\"value\":\"2026-10-27T04:13:29.802500+00:00\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_view\":{\"type\":\"literal\",\"value\":\"a4d27b1d066c103b82fab38a68731ebeb005ea20321a57e0dab151c7234140eb\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn helper_beacon() {}\\npub fn beacon() {}\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs\"}}\nview adba632f63985f1b6d2cc53d93813950e9ad18d26b54c6044625d12f31ab404c · expires 2026-10-27T04:13:29.802500+00:00\n",
     "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
-          "range": {
-            "start": 0,
-            "end": 45
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "outcome",
+          "unit",
+          "missing_unit",
+          "text",
+          "start",
+          "end",
+          "complete",
+          "source_view",
+          "source_expiry"
+        ],
+        "bindings": [
+          {
+            "complete": {
+              "type": "literal",
+              "value": "true",
+              "datatype": "http://www.w3.org/2001/XMLSchema#boolean"
+            },
+            "end": {
+              "type": "literal",
+              "value": "45",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "outcome": {
+              "type": "literal",
+              "value": "found",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_expiry": {
+              "type": "literal",
+              "value": "2026-10-27T04:13:29.802500+00:00",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_view": {
+              "type": "literal",
+              "value": "a4d27b1d066c103b82fab38a68731ebeb005ea20321a57e0dab151c7234140eb",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn helper_beacon() {}\npub fn beacon() {}\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+            }
           }
-        },
-        "text": "pub fn helper_beacon() {}\npub fn beacon() {}\n"
+        ]
       },
-      "source_complete": true,
       "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
+        "id": "adba632f63985f1b6d2cc53d93813950e9ad18d26b54c6044625d12f31ab404c",
+        "expires_at": "2026-10-27T04:13:29.802500+00:00"
+      },
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
       }
     }
   },
@@ -1552,7 +1074,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1581,7 +1103,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
     },
-    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1605,7 +1127,7 @@
     "arguments": {
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1684,7 +1206,7 @@
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
       "declaration_limit": 1
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1743,7 +1265,7 @@
       "declaration_cursor": "fixture-next",
       "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa · expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1791,86 +1313,6 @@
           "documentation_indices": []
         }
       ]
-    }
-  },
-  "multi-declaration-discovery": {
-    "tool": "search",
-    "arguments": {
-      "query": "format",
-      "scope": "local",
-      "target": "symbol",
-      "include": ["source"]
-    },
-    "text": "2 results\n\t[1] function format(value: string): string\n\t\toverload.d.ts:1 \u00b7 name, signature \u00b7 view 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n\t\t0..46\n\n\t\texport function format(value: string): string;\n\t[2] function format(value: number): string\n\t\toverload.d.ts:2 \u00b7 name, signature \u00b7 view 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n\t\t47..93\n\n\t\texport function format(value: number): string;\nview 2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af \u00b7 expires 2026-10-12T16:01:31.145575+00:00\n",
-    "json": {
-      "view": {
-        "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
-        "expires_at": "2026-10-12T16:01:31.145575+00:00"
-      },
-      "results": [
-        {
-          "view": {
-            "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
-            "expires_at": "2026-10-12T16:01:31.145575+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "typescript",
-              "name": "format",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "signatures": [
-                {
-                  "display": "function format(value: string): string",
-                  "language": "typescript"
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature"],
-          "source": "export function format(value: string): string;",
-          "range": {
-            "start": 0,
-            "end": 46
-          },
-          "line": 1,
-          "path": "overload.d.ts"
-        },
-        {
-          "view": {
-            "id": "2114a0691a72144a74f0c4652bdf5ce8f96c135c91f315f307e76000c834c1af",
-            "expires_at": "2026-10-12T16:01:31.145575+00:00"
-          },
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "language": "typescript",
-              "name": "format",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "signatures": [
-                {
-                  "display": "function format(value: number): string",
-                  "language": "typescript"
-                }
-              ]
-            }
-          },
-          "matched_by": ["name", "signature"],
-          "source": "export function format(value: number): string;",
-          "range": {
-            "start": 47,
-            "end": 93
-          },
-          "line": 2,
-          "path": "overload.d.ts"
-        }
-      ],
-      "pagination": {
-        "page_index": 0,
-        "total_pages": 1
-      }
     }
   },
   "map": {
@@ -1955,145 +1397,151 @@
       }
     }
   },
-  "change": {
+  "named-project-source": {
     "tool": "search",
     "arguments": {
-      "change": {
-        "base": "8422c73786ef5c78648ad3168949cb974e073e22",
-        "head": {
-          "kind": "working_tree"
-        }
-      },
-      "target": "symbol",
-      "include": ["source"],
-      "limit": 10
+      "query": "SELECT ?outcome ?unit ?text ?start ?end ?complete ?source_view ?source_expiry { SERVICE :source { ?read :unit <rift://source/rift.sources.project/f6e39d0c01d17fb2cb7c53885670055ee0a4251499dff73f3735d2664aab14c8/f384a7a492417140ec7d966b52e19a821e32138d2494b842c0e2aae35ec13afe>; :outcome ?outcome . ?read :view \"a4ff19b4466deeaac19bf69920d0e034ccedc48884ed892864f76d4c742dfd7c\" . ?read :view [ :id ?source_view; :expires_at ?source_expiry ] . OPTIONAL { ?read :source [ :text ?text; :span [ :unit ?unit; :range [ :start ?start; :end ?end ] ] ]; :source_complete ?complete } } }",
+      "language": "sparql"
     },
-    "text": "2 results\n\t[1] pub fn load_config() -> u32\n\t\tsrc/lib.rs:1 \u00b7 change\n\t\trift://symbol/local/rust/example_project/load_config\n\t\tbody changed\n\n\t\tpub fn load_config() -> u32 { 43 }\n\t[2] pub fn old_loader() -> u32\n\t\tsrc/lib.rs:2 \u00b7 change\n\t\trift://symbol/local/rust/example_project/old_loader\n\t\tremoved\n\n\t\tpub fn old_loader() -> u32 { 1 }\n",
+    "text": "1 results · page 1/1\n\toutcome unit text start end complete source_view source_expiry\n\t{\"complete\":{\"type\":\"literal\",\"value\":\"true\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#boolean\"},\"end\":{\"type\":\"literal\",\"value\":\"29\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"outcome\":{\"type\":\"literal\",\"value\":\"found\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_expiry\":{\"type\":\"literal\",\"value\":\"2026-10-27T04:14:39.847948+00:00\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_view\":{\"type\":\"literal\",\"value\":\"a4ff19b4466deeaac19bf69920d0e034ccedc48884ed892864f76d4c742dfd7c\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() -> u32 { 2 }\\n\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/rift.sources.project/f6e39d0c01d17fb2cb7c53885670055ee0a4251499dff73f3735d2664aab14c8/f384a7a492417140ec7d966b52e19a821e32138d2494b842c0e2aae35ec13afe\"}}\nview 4ab462ae1d90cf004255cf1750d9076ecae5479e2dc8c9c76a3656435eca4958 · expires 2026-10-27T04:14:39.847948+00:00\n",
     "json": {
-      "results": [
-        {
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/load_config",
-              "language": "rust",
-              "name": "load_config",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn load_config() -> u32",
-                  "language": "rust"
-                }
-              ]
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "outcome",
+          "unit",
+          "text",
+          "start",
+          "end",
+          "complete",
+          "source_view",
+          "source_expiry"
+        ],
+        "bindings": [
+          {
+            "complete": {
+              "type": "literal",
+              "value": "true",
+              "datatype": "http://www.w3.org/2001/XMLSchema#boolean"
+            },
+            "end": {
+              "type": "literal",
+              "value": "29",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "outcome": {
+              "type": "literal",
+              "value": "found",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_expiry": {
+              "type": "literal",
+              "value": "2026-10-27T04:14:39.847948+00:00",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_view": {
+              "type": "literal",
+              "value": "a4ff19b4466deeaac19bf69920d0e034ccedc48884ed892864f76d4c742dfd7c",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() -> u32 { 2 }\n",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/rift.sources.project/f6e39d0c01d17fb2cb7c53885670055ee0a4251499dff73f3735d2664aab14c8/f384a7a492417140ec7d966b52e19a821e32138d2494b842c0e2aae35ec13afe"
             }
-          },
-          "matched_by": ["change"],
-          "source": "pub fn load_config() -> u32 { 43 }",
-          "range": {
-            "start": 0,
-            "end": 34
-          },
-          "line": 1,
-          "path": "src/lib.rs",
-          "change": {
-            "kind": "body_changed",
-            "base_path": "src/lib.rs",
-            "head_path": "src/lib.rs"
           }
-        },
-        {
-          "hit": {
-            "target": "symbol",
-            "symbol": {
-              "id": "rift://symbol/local/rust/example_project/old_loader",
-              "language": "rust",
-              "name": "old_loader",
-              "kind": "function",
-              "facets": ["value", "callable", "public"],
-              "visibility": "pub",
-              "signatures": [
-                {
-                  "display": "pub fn old_loader() -> u32",
-                  "language": "rust"
-                }
-              ]
-            }
-          },
-          "matched_by": ["change"],
-          "source": "pub fn old_loader() -> u32 { 1 }",
-          "range": {
-            "start": 35,
-            "end": 67
-          },
-          "line": 2,
-          "path": "src/lib.rs",
-          "change": {
-            "kind": "removed",
-            "base_path": "src/lib.rs"
-          }
-        }
-      ],
+        ]
+      },
+      "view": {
+        "id": "4ab462ae1d90cf004255cf1750d9076ecae5479e2dc8c9c76a3656435eca4958",
+        "expires_at": "2026-10-27T04:14:39.847948+00:00"
+      },
       "pagination": {
         "page_index": 0,
         "total_pages": 1
       }
     }
   },
-  "named-project-source": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/project/README.md",
-      "view": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd"
-    },
-    "text": "rift://source/project/README.md\n0..81\n\t# Example project\n\n\tProject documentation.\n\n\t## Configuration\n\n\tCall `load_config`.\n\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 0,
-            "end": 81
-          }
-        },
-        "text": "# Example project\n\nProject documentation.\n\n## Configuration\n\nCall `load_config`.\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-        "expires_at": "2026-10-12T16:17:02.916991+00:00"
-      }
-    }
-  },
   "named-project-section": {
-    "tool": "get_source",
+    "tool": "search",
     "arguments": {
-      "unit": "rift://source/project/README.md",
-      "view": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-      "range": {
-        "start": 43,
-        "end": 81
-      }
+      "query": "SELECT ?outcome ?unit ?text ?start ?end ?complete ?source_view ?source_expiry { SERVICE :source { ?read :unit <rift://source/rift.sources.project/f6e39d0c01d17fb2cb7c53885670055ee0a4251499dff73f3735d2664aab14c8/f384a7a492417140ec7d966b52e19a821e32138d2494b842c0e2aae35ec13afe>; :outcome ?outcome . ?read :view \"a4ff19b4466deeaac19bf69920d0e034ccedc48884ed892864f76d4c742dfd7c\" . ?read :range \"{\\\"start\\\":0,\\\"end\\\":28}\"^^rdf:JSON . ?read :view [ :id ?source_view; :expires_at ?source_expiry ] . OPTIONAL { ?read :source [ :text ?text; :span [ :unit ?unit; :range [ :start ?start; :end ?end ] ] ]; :source_complete ?complete } } }",
+      "language": "sparql"
     },
-    "text": "rift://source/project/README.md\n43..81\n\t## Configuration\n\n\tCall `load_config`.\n\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "1 results · page 1/1\n\toutcome unit text start end complete source_view source_expiry\n\t{\"complete\":{\"type\":\"literal\",\"value\":\"true\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#boolean\"},\"end\":{\"type\":\"literal\",\"value\":\"28\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"outcome\":{\"type\":\"literal\",\"value\":\"found\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_expiry\":{\"type\":\"literal\",\"value\":\"2026-10-27T04:14:39.847948+00:00\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"source_view\":{\"type\":\"literal\",\"value\":\"a4ff19b4466deeaac19bf69920d0e034ccedc48884ed892864f76d4c742dfd7c\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"start\":{\"type\":\"literal\",\"value\":\"0\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#integer\"},\"text\":{\"type\":\"literal\",\"value\":\"pub fn beacon() -> u32 { 2 }\",\"datatype\":\"http://www.w3.org/2001/XMLSchema#string\"},\"unit\":{\"type\":\"iri\",\"value\":\"rift://source/rift.sources.project/f6e39d0c01d17fb2cb7c53885670055ee0a4251499dff73f3735d2664aab14c8/f384a7a492417140ec7d966b52e19a821e32138d2494b842c0e2aae35ec13afe\"}}\nview da583f7b60ea84ef7d7581c15edb63fdd46d8749aae649f6d92823c433ac7947 · expires 2026-10-27T04:14:39.847948+00:00\n",
     "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 43,
-            "end": 81
+      "answer": {
+        "result": "bindings",
+        "variables": [
+          "outcome",
+          "unit",
+          "text",
+          "start",
+          "end",
+          "complete",
+          "source_view",
+          "source_expiry"
+        ],
+        "bindings": [
+          {
+            "complete": {
+              "type": "literal",
+              "value": "true",
+              "datatype": "http://www.w3.org/2001/XMLSchema#boolean"
+            },
+            "end": {
+              "type": "literal",
+              "value": "28",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "outcome": {
+              "type": "literal",
+              "value": "found",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_expiry": {
+              "type": "literal",
+              "value": "2026-10-27T04:14:39.847948+00:00",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "source_view": {
+              "type": "literal",
+              "value": "a4ff19b4466deeaac19bf69920d0e034ccedc48884ed892864f76d4c742dfd7c",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "start": {
+              "type": "literal",
+              "value": "0",
+              "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+            },
+            "text": {
+              "type": "literal",
+              "value": "pub fn beacon() -> u32 { 2 }",
+              "datatype": "http://www.w3.org/2001/XMLSchema#string"
+            },
+            "unit": {
+              "type": "iri",
+              "value": "rift://source/rift.sources.project/f6e39d0c01d17fb2cb7c53885670055ee0a4251499dff73f3735d2664aab14c8/f384a7a492417140ec7d966b52e19a821e32138d2494b842c0e2aae35ec13afe"
+            }
           }
-        },
-        "text": "## Configuration\n\nCall `load_config`.\n"
+        ]
       },
-      "source_complete": true,
       "view": {
-        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-        "expires_at": "2026-10-12T16:17:02.916991+00:00"
+        "id": "da583f7b60ea84ef7d7581c15edb63fdd46d8749aae649f6d92823c433ac7947",
+        "expires_at": "2026-10-27T04:14:39.847948+00:00"
+      },
+      "pagination": {
+        "page_index": 0,
+        "total_pages": 1
       }
     }
   }

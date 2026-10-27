@@ -31,7 +31,7 @@ pub struct AssociationCandidate {
 }
 
 /// Target retained after normalization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum NormalizedTarget {
     /// Target record has established workspace identity.
     Symbol(SymbolId),

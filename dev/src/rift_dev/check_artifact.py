@@ -8,6 +8,13 @@ from dulwich.repo import Repo
 
 from rift_dev.local_index_read import settled_local
 from rift_dev.nextest_run import retained_collector
+from rift_dev.query import (
+    bindings,
+    declaration_request,
+    incoming_references_request,
+    iri,
+    literal,
+)
 from rift_dev.rift_test_client import (
     POLL_SECONDS,
     Client,
@@ -20,7 +27,6 @@ from rift_dev.rift_test_client import (
     require,
     retain_collector,
     retained_directory,
-    string_value,
     verify_version,
 )
 from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
@@ -46,32 +52,26 @@ def lay_out_workspace(root: Path) -> None:
 
 async def symbol_hit(client: Client, name: str, language: str = "rust") -> JsonObject:
     """Select an exact named declaration from the validated lookup answer."""
-    answer = await client.call(
+    answer = await settled_local(
+        client,
         "search",
-        {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
+        declaration_request(name),
+        seconds=ARTIFACT_SECONDS,
+        poll_seconds=POLL_SECONDS,
+        selection="current",
     )
-    hits = array_value(answer.get("results"), "search.results")
-    matches = []
-    for hit in hits:
-        row = object_value(hit, "hit")
-        target = object_value(row.get("hit"), "hit")
-        if target.get("target") != "symbol":
-            continue
-        symbol = object_value(target.get("symbol"), "symbol")
-        if symbol.get("name") == name and symbol.get("language") == language:
-            matches.append(row)
+    matches = [
+        row
+        for row in bindings(answer)
+        if literal(row, "name") == name and literal(row, "language") == language
+    ]
     require(len(matches) == 1, f"expected one {name} declaration: {answer}")
     return matches[0]
 
 
 def symbol_id(hit: JsonObject) -> str:
     """Use the read side's emitted identity as the traversal seed."""
-    return string_value(
-        object_value(object_value(hit.get("hit"), "hit").get("symbol"), "symbol").get(
-            "id"
-        ),
-        "symbol.id",
-    )
+    return iri(hit, "symbol")
 
 
 async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
@@ -86,28 +86,22 @@ async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path", "range", "source"):
+    for field in ("path", "source"):
         require(
-            declaration.get(field) == hit.get(field),
+            declaration.get(field) == literal(hit, field),
             f"symbol declaration changed {field}: {answer}",
         )
+    require(
+        declaration.get("range")
+        == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
+        f"symbol declaration changed range: {answer}",
+    )
     return declaration
 
 
 async def incoming_references(client: Client, seed: str) -> JsonObject:
-    """Read one incoming reference step through the served traversal surface."""
-    return await client.call(
-        "search",
-        {
-            "traversal": {
-                "seed": seed,
-                "direction": "incoming",
-                "facets": ["references"],
-                "depth": 1,
-            },
-            "target": "symbol",
-        },
-    )
+    """Read incoming reference relationships through the served query surface."""
+    return await client.call("search", incoming_references_request(seed))
 
 
 async def check_reads(client: Client) -> None:
@@ -115,18 +109,19 @@ async def check_reads(client: Client) -> None:
     search = await settled_local(
         client,
         "search",
-        {"query": "beacon_one", "target": "symbol"},
+        declaration_request("beacon_one"),
         seconds=ARTIFACT_SECONDS,
         poll_seconds=POLL_SECONDS,
+        selection="current",
     )
     require(
-        bool(array_value(search.get("results"), "search.results")),
+        bool(bindings(search)),
         f"search missed beacon_one: {search}",
     )
     before = await symbol_hit(client, "beacon_one")
     await symbol_read(client, before)
     require(
-        before.get("source") == "pub fn beacon_one() -> u8 { 1 }",
+        literal(before, "source") == "pub fn beacon_one() -> u8 { 1 }",
         f"unexpected source: {before}",
     )
 
@@ -139,7 +134,7 @@ async def check_external_change(client: Client, root: Path) -> None:
     after = await symbol_hit(client, "beacon_one")
     await symbol_read(client, after)
     require(
-        after.get("source") == "pub fn beacon_one() -> u8 { 3 }",
+        literal(after, "source") == "pub fn beacon_one() -> u8 { 3 }",
         f"filesystem change was absent from reads: {after}",
     )
     require(
@@ -217,3 +212,7 @@ async def check_artifact(binary: Path, version: str) -> None:
             finally:
                 retain_collector(base, telemetry)
             print(collector_line(telemetry), flush=True)
+
+        from rift_dev.check_sparql_conformance import check
+
+        await check(binary, version, base / "sparql-query")

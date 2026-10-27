@@ -19,6 +19,9 @@ pub struct SearchCandidateItem {
     pub ranked: RankedIdentity,
     /// Readable facts from the same captured index.
     pub hit: SearchHit,
+    /// Original record contributions, scoped by this input's captured publication.
+    #[serde(with = "rift_search::query::contribution_keys")]
+    pub contributions: Vec<rift_core::ContributionKey>,
 }
 
 /// One bounded input order before combined ranking.
@@ -59,7 +62,7 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchCandidateInputs, RiftError> {
-        self.selected_candidate_inputs(params, store, references)
+        self.selected_candidate_inputs(params, store, references, None)
             .map(|(inputs, _sources)| inputs)
     }
 
@@ -74,11 +77,38 @@ impl ReadService {
         references: &EngineReferences,
         ready: bool,
     ) -> Result<(SearchCandidateInputs, crate::LocalSymbolViewInput), RiftError> {
-        let (inputs, sources) = self.selected_candidate_inputs(params, store, references)?;
+        self.candidate_view_input(params, store, references, ready, None)
+    }
+
+    /// Captures original candidate associations under the caller's existing fact budget.
+    ///
+    /// # Errors
+    /// Returns the existing search, source selection or material admission refusal.
+    pub fn search_candidate_view_input_with_budget(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        ready: bool,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<(SearchCandidateInputs, crate::LocalSymbolViewInput), RiftError> {
+        self.candidate_view_input(params, store, references, ready, Some(budget))
+    }
+
+    fn candidate_view_input(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        ready: bool,
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<(SearchCandidateInputs, crate::LocalSymbolViewInput), RiftError> {
+        let (inputs, sources) =
+            self.selected_candidate_inputs(params, store, references, budget)?;
         let material = self.local_search_view_input(ready)?;
         let material = match sources {
             Some(sources) if params.scope != SearchScope::Global => {
-                material.with_sources(&sources)?
+                material.with_selected_sources(&sources)?
             }
             _ => material,
         };
@@ -90,6 +120,7 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
         references: &EngineReferences,
+        mut budget: Option<&mut crate::QueryFactBudget<'_>>,
     ) -> Result<(SearchCandidateInputs, Option<rift_index::WorkspaceIndex>), RiftError> {
         let query = self.candidate_query(params, store, references)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
@@ -152,6 +183,7 @@ impl ReadService {
             QueryPhase::Precise,
             criteria,
             &mut answer.warnings,
+            budget.as_deref_mut(),
         )?;
         answer.broad = projected_inputs(
             &screen,
@@ -160,6 +192,7 @@ impl ReadService {
             QueryPhase::Broad,
             criteria,
             &mut answer.warnings,
+            budget,
         )?;
         Ok((answer, selected.force_include))
     }
@@ -204,6 +237,7 @@ fn projected_inputs(
     phase: QueryPhase,
     criteria: SearchCriteria<'_>,
     warnings: &mut Vec<ReadWarning>,
+    mut budget: Option<&mut crate::QueryFactBudget<'_>>,
 ) -> Result<Vec<SearchCandidateInput>, RiftError> {
     let inputs = screen.projected(inputs, query, phase)?;
     let mut results = Vec::with_capacity(inputs.len());
@@ -215,20 +249,23 @@ fn projected_inputs(
         }
         let mut order = Vec::with_capacity(projected.len());
         for candidate in projected.candidates() {
-            let hit = if let Some(hit) = screen
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+            }
+            let selected = if let Some(hit) = screen
                 .documentation
                 .and_then(|documentation| documentation.hit(candidate))
             {
-                hit
+                super::SelectedHit::from(hit)
             } else {
                 let Some(resolved) =
                     resolve_candidate(screen.index, screen.resolution, candidate.identity())?
                 else {
                     continue;
                 };
-                resolved.into_hit(criteria, candidate)?
+                resolved.into_selected_hit(criteria, candidate, budget.as_deref_mut())?
             };
-            let mut hit = vec![hit];
+            let mut hit = vec![selected.hit];
             retain_public_symbol_hits(
                 &mut hit,
                 warnings,
@@ -247,6 +284,7 @@ fn projected_inputs(
                 order.push(SearchCandidateItem {
                     ranked: candidate.ranked_identity(),
                     hit,
+                    contributions: selected.contributions,
                 });
             }
         }
@@ -266,6 +304,69 @@ mod tests {
         DocumentIdentity, FieldSet, RankedIdentity, RankingInputKind, SearchableField,
     };
 
+    fn test_key() -> rift_core::ContributionKey {
+        rift_core::ContributionKey::new(
+            rift_core::ProviderId::new("syntax").expect("provider"),
+            rift_core::ProviderRevision::new(1).expect("revision"),
+            rift_core::ProviderSymbolId::new("member").expect("record"),
+        )
+    }
+
+    #[test]
+    fn candidate_projection_keeps_original_unestablished_json_member() {
+        let directory = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            directory.path().join("notes for café.json"),
+            r#"{"beacon":"helper_beacon"}"#,
+        )
+        .expect("original JSON source");
+        let reads = super::ReadService::build(
+            directory.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )
+        .expect("original publication");
+        let params = serde_json::from_value(
+            serde_json::json!({"query":"beacon","scope":"all","target":"symbol"}),
+        )
+        .expect("candidate request");
+        let limits = rift_search::query::QueryLimits::try_from(
+            &rift_protocol::query::QueryConfiguration::default(),
+        )
+        .expect("accepted query limits");
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false).expect("shared budget");
+        let (inputs, _) = reads
+            .search_candidate_view_input_with_budget(
+                &params,
+                &super::StoreAnswer::identifier_only(),
+                &crate::EngineReferences::default(),
+                true,
+                &mut budget,
+            )
+            .expect("same-operation candidate capture");
+        let row = inputs.precise.iter().chain(&inputs.broad).flat_map(|input| &input.order)
+            .find(|row| matches!(&row.hit.hit, SearchHitTarget::Symbol { symbol } if symbol.name == "beacon"))
+            .expect("original JSON member");
+        let matched = reads
+            .index()
+            .symbols("beacon", 1)
+            .expect("original declaration")[0];
+        let readable = reads
+            .index()
+            .assembled_symbol(matched)
+            .expect("original record");
+        assert_eq!(row.contributions, readable.assembled().contributions());
+        assert!(!row.contributions.is_empty());
+        assert_eq!(row.hit.unit, None);
+        assert!(matches!(&row.hit.hit, SearchHitTarget::Symbol { symbol } if symbol.id.is_none()));
+        assert_eq!(
+            row.hit.path.as_ref().expect("original path").0,
+            "notes for café.json"
+        );
+    }
+
     #[test]
     fn candidate_inputs_preserve_raw_physical_facts_without_a_canonical_id() {
         let hit: SearchHit = serde_json::from_value(serde_json::json!({
@@ -282,7 +383,11 @@ mod tests {
         let input = SearchCandidateInputs {
             precise: vec![SearchCandidateInput {
                 kind: RankingInputKind::Identifier,
-                order: vec![SearchCandidateItem { ranked, hit }],
+                order: vec![SearchCandidateItem {
+                    ranked,
+                    hit,
+                    contributions: vec![test_key()],
+                }],
             }],
             ..SearchCandidateInputs::default()
         };
@@ -292,6 +397,13 @@ mod tests {
         let row = &decoded.precise[0].order[0];
         assert_eq!(row.ranked, input.precise[0].order[0].ranked);
         assert_eq!(row.hit, input.precise[0].order[0].hit);
+        assert_eq!(row.contributions, vec![test_key()]);
+        let mut old = serde_json::to_value(&input).expect("candidate layout");
+        old["precise"][0]["order"][0]
+            .as_object_mut()
+            .expect("candidate")
+            .remove("contributions");
+        assert!(serde_json::from_value::<SearchCandidateInputs>(old).is_err());
         let SearchHitTarget::Symbol { symbol } = &row.hit.hit else {
             panic!("the physical symbol remains a symbol");
         };
@@ -314,6 +426,7 @@ mod tests {
             invalid["precise"] = serde_json::json!([{
                 "kind": "identifier", "order": [{
                     "ranked": {"identity": identity, "fields": ["name"]},
+                    "contributions": [],
                     "hit": {"hit": {"target": "symbol", "symbol": {
                         "language": "toml", "name": "lib", "kind": "table"
                     }}, "path": "Cargo.toml", "range": {"start": 0, "end": 4}}

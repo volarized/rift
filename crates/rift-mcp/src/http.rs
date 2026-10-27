@@ -119,6 +119,19 @@ pub async fn serve_http(
     shutdown: CancellationToken,
     check: TokenCheck,
 ) -> Result<HttpServer, RiftError> {
+    serve_http_with_options(root, shutdown, check, BuildCheckout::Unversioned.into()).await
+}
+
+/// Serves a workspace with explicit build identity and query executable selection.
+///
+/// # Errors
+/// Returns the same listener, storage and runtime failures as [`serve_http`].
+pub async fn serve_http_with_options(
+    root: &Path,
+    shutdown: CancellationToken,
+    check: TokenCheck,
+    options: crate::ServeOptions,
+) -> Result<HttpServer, RiftError> {
     let storage = WorkspaceStorage::open(root).await;
     serve_http_with_storage(
         root,
@@ -126,7 +139,7 @@ pub async fn serve_http(
         storage,
         WorkspaceIndexLimits::default(),
         check,
-        BuildCheckout::Unversioned,
+        options,
     )
     .await
 }
@@ -140,7 +153,7 @@ pub(crate) async fn serve_http_with_storage(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<HttpServer, RiftError> {
     serve_http_with_storage_for_owner(
         (root, rift_protocol::identity::SymbolOwner::Local),
@@ -159,8 +172,9 @@ pub(crate) async fn serve_http_with_storage_for_owner(
     storage: WorkspaceStorage,
     limits: WorkspaceIndexLimits,
     check: TokenCheck,
-    checkout: BuildCheckout,
+    checkout: impl Into<crate::ServeOptions>,
 ) -> Result<HttpServer, RiftError> {
+    let options = checkout.into();
     rift_tracing::info!(
         component = "mcp",
         transport = "http",
@@ -169,7 +183,9 @@ pub(crate) async fn serve_http_with_storage_for_owner(
     );
     let logs = storage.logs();
     let server =
-        RiftMcp::build_with_storage_for_owner((root, owner), limits, storage, checkout).await?;
+        RiftMcp::build_with_storage_for_owner((root, owner), limits, storage, options.checkout)
+            .await?;
+    let server = options.apply(server);
     let identity = server.product_identity().clone();
     let search_index = server.search_index_handle();
     let server_table = server.server_configuration().await;

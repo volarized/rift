@@ -8,6 +8,7 @@ global API client from `oas3-gen` over the published OpenAPI document, and
 from __future__ import annotations
 
 import difflib
+import json
 import tempfile
 from pathlib import Path
 
@@ -53,25 +54,38 @@ def generate(check: bool) -> None:
 
 def write_client(destination: Path) -> None:
     """Generates the global API client's Rust types into `destination`."""
-    Command(
-        "oas3-gen",
-        "generate",
-        "types",
-        "-q",
-        "--enum-mode",
-        "relaxed",
-        "--no-ordered-collections",
-        "-i",
-        OPENAPI,
-        "-o",
-        destination,
-    ).run()
+    document = json.loads((REPOSITORY / OPENAPI).read_text(encoding="utf-8"))
+    request = document["components"]["schemas"]["RelationshipSearchRequest"]
+    if request.get("type") != "object" or "properties" not in request:
+        fail("relationship request must retain its shared object schema")
+    # oas3-gen 0.28 treats this object-presence condition as enum<Value>, then
+    # emits a struct constructor for it. Rust owns the fields and admission;
+    # the committed contract retains its complete condition unchanged.
+    request.pop("anyOf", None)
+    with tempfile.TemporaryDirectory() as directory:
+        source_contract = Path(directory) / "global-api.openapi.json"
+        source_contract.write_text(json.dumps(document), encoding="utf-8")
+        Command(
+            "oas3-gen",
+            "generate",
+            "types",
+            "-q",
+            "--enum-mode",
+            "relaxed",
+            "--no-ordered-collections",
+            "-i",
+            source_contract,
+            "-o",
+            destination,
+        ).run()
 
     # oas3-gen leaves these u64 bounds unsuffixed. validator also records each as an
     # error parameter, where Rust otherwise infers i32 and refuses the literal.
     source = destination.read_text(encoding="utf-8")
     destination.write_text(
         source.replace(
+            f"//! Source: {source_contract}", f"//! Source: {OPENAPI}"
+        ).replace(
             "#[validate(range(min = 0, max = 9007199254740991))]",
             "#[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]",
         ).replace(

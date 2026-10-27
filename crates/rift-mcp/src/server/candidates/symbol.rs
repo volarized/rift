@@ -16,18 +16,19 @@ pub(super) enum SavedRead {
     Search(Box<SavedResponse>),
     Symbol(SavedSymbol),
     Traversal(Box<super::traversal::SavedTraversal>),
+    Query(Box<super::query::SavedQuery>),
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SavedSymbol {
-    pub(super) root: String,
-    pub(super) owner: SymbolOwner,
-    pub(super) view: CapturedView,
+pub(crate) struct SavedSymbol {
+    pub(crate) root: String,
+    pub(crate) owner: SymbolOwner,
+    pub(crate) view: CapturedView,
 }
 
 impl CandidateResponses {
-    pub(super) fn save_symbol(
+    pub(in crate::server) fn save_symbol(
         &self,
         root: &Path,
         owner: &SymbolOwner,
@@ -67,7 +68,7 @@ impl RiftMcp {
             .any(|row| row.id == view.as_str())
     }
 
-    pub(super) fn captured_context(
+    pub(in crate::server) fn captured_context(
         &self,
         view: &CapturedViewId,
         operation: &str,
@@ -91,6 +92,7 @@ impl RiftMcp {
                 view: saved.response.view,
             },
             SavedRead::Symbol(saved) => saved,
+            SavedRead::Query(saved) => saved.context,
             SavedRead::Traversal(saved) => SavedSymbol {
                 root: saved.root,
                 owner: saved.owner,
@@ -122,6 +124,17 @@ impl RiftMcp {
             &std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
         >,
     ) -> Result<Json<GetSymbolResult>, super::ToolFailure> {
+        if let Some(view) = &params.view
+            && let Some(captured) = self.captured_query_material(view, "get_symbol")?
+        {
+            return self
+                .query_material_symbol(params, captured, context)
+                .await
+                .map(Json);
+        }
+        if let Some(result) = self.query_global_symbol(&params, context).await? {
+            return Ok(Json(result));
+        }
         let owner = SymbolIdentity::parse(params.id.as_str())
             .map_err(read_failure)?
             .owner()

@@ -130,7 +130,7 @@ fn validate_request(request: &GetSymbolParams) -> Result<(), RiftError> {
     Ok(())
 }
 
-fn valid_result(
+pub(super) fn valid_result(
     request: &GetSymbolParams,
     result: &GetSymbolResult,
     source_bytes_max: usize,

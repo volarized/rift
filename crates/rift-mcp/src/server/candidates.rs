@@ -1,9 +1,12 @@
+mod query;
 mod source;
 mod symbol;
 mod traversal;
+pub(crate) use query::{QueryGlobalSelection, SavedQuery};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 use symbol::SavedRead;
+pub(crate) use symbol::SavedSymbol;
 
 use rift_error::{RiftError, errors};
 use rift_protocol::read::{ReadWarning, SearchParams};
@@ -18,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::{ReadAnswer, RiftMcp, ToolFailure, wire};
 
 const BYTES_MAX: usize = crate::global::candidates::CANDIDATE_BYTES_MAX;
+#[cfg(test)]
 const SLOTS_MAX: usize = 256;
 
 pub(in crate::server) fn write_captured_context(
@@ -77,12 +81,51 @@ fn global_context(
     Ok(())
 }
 
+#[derive(Clone)]
+pub(in crate::server) struct CapturedSearchContributions {
+    budget: rift_server::QueryFactBudget<'static>,
+    rows: Arc<Mutex<Option<Vec<Vec<rift_core::ContributionKey>>>>>,
+}
+
+impl CapturedSearchContributions {
+    pub(in crate::server) fn new(budget: rift_server::QueryFactBudget<'static>) -> Self {
+        Self {
+            budget,
+            rows: Arc::default(),
+        }
+    }
+
+    pub(in crate::server) fn take(
+        &self,
+    ) -> Result<Option<Vec<Vec<rift_core::ContributionKey>>>, ToolFailure> {
+        self.rows
+            .lock()
+            .map(|mut rows| rows.take())
+            .map_err(|_| unavailable("producer record associations are unavailable"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SearchCandidateRequest {
     pub(crate) params: SearchParams,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) view: Option<CapturedView>,
+}
+
+impl SearchCandidateRequest {
+    fn decode(request: CallToolRequestParams) -> Result<Self, ToolFailure> {
+        let arguments = request.arguments.unwrap_or_default();
+        crate::proxy::encode_bounded(&arguments, BYTES_MAX).map_err(transport_failure)?;
+        serde_json::from_value(arguments.into()).map_err(|error| {
+            errors::mcp::parameter_invalid()
+                .tool("search_candidates")
+                .field("arguments")
+                .accepted(error.to_string())
+                .mcp()
+                .tool_failure(wire::ErrorPhase::Read)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,6 +151,7 @@ pub(crate) enum SearchCandidateResult {
 #[derive(Debug)]
 pub(super) struct CandidateResponses {
     bytes: Mutex<Vec<SavedCandidateBytes>>,
+    slots_max: u64,
 }
 
 #[derive(Debug)]
@@ -120,7 +164,8 @@ struct SavedCandidateBytes {
 impl Default for CandidateResponses {
     fn default() -> Self {
         Self {
-            bytes: Mutex::new(Vec::with_capacity(SLOTS_MAX)),
+            bytes: Mutex::new(Vec::new()),
+            slots_max: rift_protocol::configuration::ServerConfiguration::default().retained_views,
         }
     }
 }
@@ -153,6 +198,22 @@ fn validate_candidate_query(params: &SearchParams) -> Result<(), ToolFailure> {
     Ok(())
 }
 
+fn candidate_query_budget(
+    resolved: &super::ResolvedWorkspace,
+    budget: Option<rift_server::QueryFactBudget<'static>>,
+    deadline: super::RequestDeadline,
+) -> Result<rift_server::QueryFactBudget<'static>, ToolFailure> {
+    if let Some(budget) = budget {
+        Ok(budget)
+    } else {
+        let configuration = resolved.published.configuration.search_configuration();
+        let limits = rift_search::query::QueryLimits::try_from(&configuration.query)
+            .map_err(read_failure)?;
+        rift_server::QueryFactBudget::for_request(limits, deadline.at().into_std(), &|| false)
+            .map_err(read_failure)
+    }
+}
+
 fn preparing_candidates(
     resolved: &super::ResolvedWorkspace,
     warnings: &[ReadWarning],
@@ -177,6 +238,8 @@ impl RiftMcp {
     pub(in crate::server) async fn captured_query(
         &self,
         params: &SearchParams,
+        contributions: Option<&CapturedSearchContributions>,
+        global_views: Option<&crate::global::CapturedGlobalViews>,
     ) -> Result<Option<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
         use rift_protocol::symbol_read::SymbolUnavailableReason;
         let unavailable = |reason, view| {
@@ -248,8 +311,9 @@ impl RiftMcp {
         .cloned()
         .ok_or_else(|| super::candidates::unavailable("candidate request is not an object"))?;
         let captured = self
-            .search_candidates_request(
+            .search_candidates_with_budget(
                 CallToolRequestParams::new("search_candidates").with_arguments(arguments),
+                contributions.map(|captured| captured.budget.clone()),
             )
             .await?;
         let captured = match captured {
@@ -260,6 +324,24 @@ impl RiftMcp {
                 ));
             }
         };
+        if let Some(global) = &captured.global
+            && let Some(views) = global_views
+        {
+            views
+                .include_view(Some(&global.view))
+                .map_err(read_failure)?;
+        }
+        self.merge_captured_candidates(params, captured, contributions)
+            .await
+            .map(Some)
+    }
+
+    async fn merge_captured_candidates(
+        &self,
+        params: &SearchParams,
+        captured: SearchCandidateResponse,
+        contributions: Option<&CapturedSearchContributions>,
+    ) -> Result<rift_protocol::search_read::SearchReadResult, ToolFailure> {
         let mut pools = vec![crate::global::candidates::SearchCandidatePool {
             backend: "local".to_owned(),
             root: captured.root,
@@ -268,14 +350,41 @@ impl RiftMcp {
             inputs: captured.inputs,
         }];
         pools.extend(captured.global);
-        Self::merge_captured_query(
-            params,
-            &captured.ranking,
-            captured.view,
-            captured.results_max,
-            &pools,
-        )
-        .map(Some)
+        let params = params.clone();
+        let mut budget = contributions.map(|captured| captured.budget.clone());
+        let (result, keys) = self
+            .blocking
+            .run("captured search merge", move || {
+                if let Some(budget) = &budget {
+                    budget.check()?;
+                }
+                let result = Self::merge_captured_query(
+                    &params,
+                    &captured.ranking,
+                    captured.view,
+                    captured.results_max,
+                    &pools,
+                    budget.as_mut(),
+                )?;
+                if let Some(budget) = &budget {
+                    budget.check()?;
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(read_failure)?;
+        if let Some(captured) = contributions {
+            let mut rows = captured.rows.lock().map_err(|_| {
+                super::candidates::unavailable("producer record associations are unavailable")
+            })?;
+            if rows.is_some() {
+                return Err(super::candidates::unavailable(
+                    "producer record associations were already captured",
+                ));
+            }
+            *rows = Some(keys);
+        }
+        Ok(result)
     }
 
     fn merge_captured_query(
@@ -284,20 +393,32 @@ impl RiftMcp {
         view: CapturedView,
         results_max: usize,
         pools: &[crate::global::candidates::SearchCandidatePool],
-    ) -> Result<rift_protocol::search_read::SearchReadResult, ToolFailure> {
+        budget: Option<&mut rift_server::QueryFactBudget<'_>>,
+    ) -> Result<
+        (
+            rift_protocol::search_read::SearchReadResult,
+            Vec<Vec<rift_core::ContributionKey>>,
+        ),
+        RiftError,
+    > {
         let weights = rift_ranking::RankingWeights::new(
             ranking.identifier_weight,
             ranking.lexical_weight,
             ranking.vector_weight,
             ranking.fusion_k,
-        )
-        .map_err(read_failure)?;
-        let mut result =
-            crate::global::candidates::merge_candidate_pools(params, pools, weights, results_max)
-                .map_err(read_failure)?;
+        )?;
+        let (mut result, contributions) =
+            crate::global::candidates::merge_candidate_pools_with_contributions(
+                params,
+                pools,
+                weights,
+                results_max,
+                budget,
+            )?;
         result.view = Some(view);
-        Ok(rift_protocol::search_read::SearchReadResult::Results(
-            Box::new(result),
+        Ok((
+            rift_protocol::search_read::SearchReadResult::Results(Box::new(result)),
+            contributions,
         ))
     }
 
@@ -371,17 +492,15 @@ impl RiftMcp {
         &self,
         request: CallToolRequestParams,
     ) -> Result<SearchCandidateResult, ToolFailure> {
-        let arguments = request.arguments.unwrap_or_default();
-        crate::proxy::encode_bounded(&arguments, BYTES_MAX).map_err(transport_failure)?;
-        let requested: SearchCandidateRequest =
-            serde_json::from_value(arguments.into()).map_err(|error| {
-                errors::mcp::parameter_invalid()
-                    .tool("search_candidates")
-                    .field("arguments")
-                    .accepted(error.to_string())
-                    .mcp()
-                    .tool_failure(wire::ErrorPhase::Read)
-            })?;
+        self.search_candidates_with_budget(request, None).await
+    }
+
+    async fn search_candidates_with_budget(
+        &self,
+        request: CallToolRequestParams,
+        budget: Option<rift_server::QueryFactBudget<'static>>,
+    ) -> Result<SearchCandidateResult, ToolFailure> {
+        let requested = SearchCandidateRequest::decode(request)?;
         let views = self
             .local_views
             .get()
@@ -408,13 +527,28 @@ impl RiftMcp {
             return Ok(SearchCandidateResult::Unavailable(answer));
         }
         let ready = resolved.published.preparation.is_none();
+        let accepted = resolved
+            .published
+            .configuration
+            .accepted_for_tool(wire::ErrorPhase::Read)?;
+        let mut budget = candidate_query_budget(&resolved, budget, deadline)?;
+        let mut projection_budget = budget.clone();
         let params = requested.params.clone();
         let (mut inputs, material) = self
             .current_captured_read(&resolved, true, move |reads, capture_warnings| {
-                let (mut inputs, material) =
-                    reads.search_candidate_view_input(&params, &answer, &references, ready)?;
+                projection_budget.check()?;
+                let (mut inputs, material) = reads.search_candidate_view_input_with_budget(
+                    &params,
+                    &answer,
+                    &references,
+                    ready,
+                    &mut projection_budget,
+                )?;
+                projection_budget.check()?;
                 inputs.warnings.extend(capture_warnings.iter().cloned());
                 let material = material.with_warnings(capture_warnings)?;
+                let selection = material.provider_selection(&accepted)?;
+                let material = material.with_provider_selection(selection)?;
                 Ok((inputs, material))
             })
             .await?
@@ -449,6 +583,7 @@ impl RiftMcp {
                     results_max,
                     global,
                 };
+                budget.charge(&answer)?;
                 self.save_candidates(requested.params, answer.clone())?;
                 response = Some(answer);
                 Ok(true)
@@ -530,33 +665,6 @@ impl RiftMcp {
         self.candidate_responses.save_bytes(id, expires, encoded)
     }
 
-    pub(super) fn captured_nodes(
-        &self,
-        params: &rift_protocol::read::NodesParams,
-        view: &rift_protocol::symbol_read::CapturedViewId,
-    ) -> Result<rift_protocol::read::NodesResult, ToolFailure> {
-        let context = self.captured_context(view, "nodes")?;
-        let owner = context.owner;
-        let root = std::path::Path::new(&context.root);
-        let views = self.local_views.get().ok_or_else(|| {
-            captured_node_refusal(
-                view,
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
-            )
-        })?;
-        let (nodes, selected) = views
-            .nodes(params, view, root, &owner)
-            .map_err(read_failure)?
-            .map_err(|reason| captured_node_refusal(view, reason))?;
-        if nodes.view.as_ref() != Some(&selected) || selected.id != *view {
-            return Err(captured_node_refusal(
-                view,
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-            ));
-        }
-        Ok(nodes)
-    }
-
     fn saved_candidates(
         &self,
         params: &SearchParams,
@@ -629,16 +737,9 @@ fn captured_read_refusal(
     read_failure(error)
 }
 
-fn captured_node_refusal(
-    view: &rift_protocol::symbol_read::CapturedViewId,
-    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
-) -> ToolFailure {
-    captured_read_refusal("nodes", view, reason)
-}
-
 #[cfg(test)]
 mod captured_node_error_tests {
-    use super::captured_node_refusal;
+    use super::captured_read_refusal;
     use super::wire;
     use crate::{failure::WireFailure, output::ToolFailure};
     use rift_protocol::symbol_read::{CapturedViewId, SymbolUnavailableReason};
@@ -658,7 +759,9 @@ mod captured_node_error_tests {
                 "matching workspace",
             ),
         ] {
-            let ToolFailure::Registered(error, phase) = captured_node_refusal(&view, reason) else {
+            let ToolFailure::Registered(error, phase) =
+                captured_read_refusal("nodes", &view, reason)
+            else {
                 panic!("captured refusal must retain its registered error");
             };
             assert_eq!(error.registered().slug().as_str(), slug);
@@ -683,6 +786,7 @@ mod captured_search_startup_tests {
     #[tokio::test]
     async fn direct_search_keeps_original_capture_after_source_changes()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use rift_protocol::query::{QueryAnswer, QueryReadResult, RdfTerm};
         let directory = tempfile::tempdir()?;
         super::super::hermetic_workspace(directory.path(), "")?;
         std::fs::write(
@@ -693,70 +797,102 @@ mod captured_search_startup_tests {
         let root = directory.path().canonicalize()?;
         let server =
             RiftMcp::build_settled(&root, super::super::WorkspaceIndexLimits::default()).await?;
-        let mut params: SearchParams = serde_json::from_value(serde_json::json!({
-            "query": "beacon", "scope": "local", "include": ["source"]
-        }))?;
         let initial = server
-            .search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
-            )
+            .graph_query_with_context(serde_json::from_value(serde_json::json!({
+                "query": "SELECT ?symbol ?name ?source { ?symbol a :Symbol; :name 'beacon', ?name; :declarations [ :source ?source ] }"
+            }))?, None)
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
-        let rift_protocol::search_read::SearchReadResult::Results(initial) = initial else {
-            return Err("initial search must return captured results".into());
+        let QueryReadResult::Results(initial) = initial else {
+            return Err("initial query must return captured results".into());
         };
-        assert!(!initial.results.is_empty());
+        let QueryAnswer::Bindings { bindings, .. } = &initial.answer else {
+            return Err("initial query must return bindings".into());
+        };
+        assert!(!bindings.is_empty());
+        assert!(bindings.iter().all(|row| {
+            matches!(row.get("symbol"), Some(RdfTerm::Iri { .. }))
+                && matches!(row.get("name"), Some(RdfTerm::Literal { value, .. }) if value == "beacon")
+                && matches!(row.get("source"), Some(RdfTerm::Literal { value, .. }) if value == "pub fn beacon() {}")
+        }));
         let view = initial
             .view
             .clone()
-            .ok_or("initial search must issue a view")?;
-        assert!(
-            initial
-                .results
-                .iter()
-                .all(|hit| hit.view.as_ref() == Some(&view))
-        );
+            .ok_or("initial query must issue a view")?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn replacement() {}\n")?;
-        params.view = Some(view.id.clone());
+        let query = rift_search::sparql::continuation_query(&initial.answer, &view.id, 0)?;
         let later = server
-            .search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({"query":query}))?,
+                None,
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
-        let rift_protocol::search_read::SearchReadResult::Results(later) = later else {
-            return Err("held search must return original results".into());
+        let QueryReadResult::Results(later) = later else {
+            return Err("held query must return original results".into());
         };
         assert_eq!(later, initial);
-        params.page_index = 1;
+        let query = rift_search::sparql::continuation_query(&initial.answer, &view.id, 1)?;
         let page = server
-            .search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({"query":query}))?,
+                None,
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
-        let rift_protocol::search_read::SearchReadResult::Results(page) = page else {
+        let QueryReadResult::Results(page) = page else {
             return Err("empty later page must keep capture".into());
         };
-        assert!(page.results.is_empty());
+        let QueryAnswer::Bindings { bindings, .. } = &page.answer else {
+            return Err("empty later page must return bindings".into());
+        };
+        assert!(bindings.is_empty());
         assert_eq!(page.view.as_ref(), Some(&view));
-        params.query = Some("replacement".to_owned());
+        let fresh = server
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({
+                    "query":"SELECT ?symbol { ?symbol a :Symbol; :name 'replacement' }"
+                }))?,
+                None,
+            )
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(fresh) = fresh else {
+            return Err("fresh query must capture the replacement".into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = &fresh.answer else {
+            return Err("fresh query must return bindings".into());
+        };
+        assert!(!bindings.is_empty());
+        let fresh_view = fresh.view.ok_or("fresh query view")?;
+        refuse_mixed_query_views(&server, view.id.as_str(), fresh_view.id.as_str()).await?;
+        Ok(())
+    }
+
+    async fn refuse_mixed_query_views(
+        server: &RiftMcp,
+        original_view: &str,
+        fresh_view: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let prefix = rift_search::sparql::RESULT_SERVICE_PREFIX;
+        let query = format!(
+            "SELECT ?symbol {{ SERVICE <{prefix}{original_view}> {{}} SERVICE <{prefix}{fresh_view}> {{}} }}"
+        );
+        let refused = server
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({"query":query}))?,
+                None,
+            )
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
         assert!(matches!(
-            server
-                .search(
-                    super::super::Parameters(params),
-                    rmcp::model::Extensions::default()
-                )
-                .await
-                .map_err(|failure| format!("{failure:?}"))?
-                .0,
-            rift_protocol::search_read::SearchReadResult::Unavailable(
+            refused,
+            rift_protocol::query::QueryReadResult::Unavailable(
                 rift_protocol::search_read::SearchUnavailable::Unavailable {
                     reason: rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
                     ..
@@ -910,32 +1046,65 @@ mod captured_search_startup_tests {
 }
 
 impl CandidateResponses {
+    pub(super) fn for_configuration(
+        server: &rift_protocol::configuration::ServerConfiguration,
+    ) -> Self {
+        Self {
+            bytes: Mutex::new(Vec::new()),
+            slots_max: server.retained_views,
+        }
+    }
+
+    fn retained_bytes(
+        saved: &[SavedCandidateBytes],
+        table_capacity: usize,
+        now: SystemTime,
+        incoming: Option<usize>,
+    ) -> Option<usize> {
+        saved.iter().filter(|row| row.expires > now).fold(
+            table_capacity
+                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
+                .and_then(|bytes| incoming.and_then(|incoming| bytes.checked_add(incoming))),
+            |sum, row| {
+                sum.and_then(|bytes| bytes.checked_add(row.id.capacity()))
+                    .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
+            },
+        )
+    }
+
     fn save_bytes(
         &self,
         id: String,
         expires: SystemTime,
         encoded: Vec<u8>,
     ) -> Result<(), RiftError> {
+        let unavailable = || {
+            errors::server::read_unavailable()
+                .operation("search_candidates")
+                .detail("captured candidates exceed the byte or view bound")
+                .error()
+        };
         let mut saved = self
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        saved.retain(|row| row.expires > SystemTime::now());
-        let retained = saved.iter().fold(
-            saved
-                .capacity()
-                .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
-                .and_then(|bytes| bytes.checked_add(id.capacity()))
-                .and_then(|bytes| bytes.checked_add(encoded.capacity())),
-            |sum, row| {
-                sum.and_then(|bytes| bytes.checked_add(row.id.capacity()))
-                    .and_then(|bytes| bytes.checked_add(row.bytes.capacity()))
-            },
-        );
-        if saved.len() >= SLOTS_MAX
-            || retained.is_none_or(|bytes| bytes > BYTES_MAX)
-            || saved.iter().any(|row| row.id == id)
-        {
+        let now = SystemTime::now();
+        let live = saved.iter().filter(|row| row.expires > now).count();
+        if u64::try_from(live).unwrap_or(u64::MAX) >= self.slots_max {
+            return Err(unavailable());
+        }
+        let next_len = live.checked_add(1).ok_or_else(unavailable)?;
+        let growth = next_len > saved.capacity();
+        let planned_capacity = if growth {
+            saved.capacity().checked_add(next_len)
+        } else {
+            Some(saved.capacity())
+        };
+        let incoming = id.capacity().checked_add(encoded.capacity());
+        let retained = planned_capacity
+            .and_then(|capacity| Self::retained_bytes(&saved, capacity, now, incoming));
+        let duplicate = saved.iter().any(|row| row.expires > now && row.id == id);
+        if retained.is_none_or(|bytes| bytes > BYTES_MAX) || duplicate {
             let stored_bytes = saved
                 .iter()
                 .try_fold(0usize, |sum, row| sum.checked_add(row.bytes.len()));
@@ -946,20 +1115,38 @@ impl CandidateResponses {
                 component = "mcp",
                 operation = "search_candidates",
                 rows = saved.len(),
-                views_max = SLOTS_MAX,
+                views_max = self.slots_max,
                 ?retained,
                 bytes_max = BYTES_MAX,
                 ?stored_bytes,
                 ?stored_capacity,
                 incoming_bytes = encoded.len(),
                 incoming_capacity = encoded.capacity(),
-                duplicate = saved.iter().any(|row| row.id == id),
+                duplicate,
                 "captured candidates exceed the byte or view bound"
             );
-            return Err(errors::server::read_unavailable()
-                .operation("search_candidates")
-                .detail("captured candidates exceed the byte or view bound")
-                .error());
+            return Err(unavailable());
+        }
+        let mut replacement = Vec::new();
+        if growth {
+            replacement.try_reserve_exact(next_len).map_err(|source| {
+                unavailable().with(rift_error::ErrorContext::new(
+                    "source",
+                    rift_error::ErrorValue::source(source),
+                ))
+            })?;
+            let retained = saved
+                .capacity()
+                .checked_add(replacement.capacity())
+                .and_then(|capacity| Self::retained_bytes(&saved, capacity, now, incoming));
+            if retained.is_none_or(|bytes| bytes > BYTES_MAX) {
+                return Err(unavailable());
+            }
+        }
+        saved.retain(|row| row.expires > now);
+        if growth {
+            replacement.append(&mut saved);
+            *saved = replacement;
         }
         saved.push(SavedCandidateBytes {
             id,
@@ -992,15 +1179,10 @@ mod tests {
     async fn preparing_query_refuses_unterminated_quote_without_retaining_candidates() -> TestResult
     {
         let (_directory, assembled) = super::super::tests::starting_fixture().await?;
-        let params = serde_json::from_value(serde_json::json!({
-            "query": "\"beacon", "scope": "local", "target": "symbol"
-        }))?;
+        let params = serde_json::from_value(serde_json::json!({"query":"\"beacon"}))?;
         let failure = assembled
             .server
-            .search(
-                super::super::Parameters(params),
-                rmcp::model::Extensions::default(),
-            )
+            .graph_query_with_context(params, None)
             .await
             .err()
             .expect("preparing publication must refuse the malformed query");
@@ -1052,18 +1234,25 @@ mod tests {
             );
             if attempt == 0 {
                 let params = serde_json::from_value(serde_json::json!({
-                    "query": "beacon", "scope": "local", "target": "symbol"
+                    "query":"SELECT ?symbol { ?symbol a :Symbol; :name 'beacon' }"
                 }))?;
                 let direct = assembled
                     .server
-                    .search(
-                        super::super::Parameters(params),
-                        rmcp::model::Extensions::default(),
-                    )
+                    .graph_query_with_context(params, None)
                     .await
                     .map_err(|failure| format!("{failure:?}"))?
                     .0;
-                assert_eq!(serde_json::to_value(direct)?, value);
+                assert!(matches!(
+                    direct,
+                    rift_protocol::query::QueryReadResult::Unavailable(
+                        rift_protocol::search_read::SearchUnavailable::Unavailable {
+                            reason:
+                                rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
+                            view: None,
+                            ..
+                        }
+                    )
+                ));
             }
             assert!(
                 assembled
@@ -1170,12 +1359,15 @@ mod tests {
     fn aggregate_capacity_refusal_preserves_original_candidate() -> TestResult {
         let responses = CandidateResponses::default();
         let id = String::from("first");
-        let table_bytes = responses
-            .bytes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .capacity()
-            * std::mem::size_of::<super::SavedCandidateBytes>();
+        let table_capacity = {
+            let mut saved = responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            saved.try_reserve_exact(1)?;
+            saved.capacity()
+        };
+        let table_bytes = table_capacity * std::mem::size_of::<super::SavedCandidateBytes>();
         let mut bytes = Vec::with_capacity(BYTES_MAX - table_bytes - id.capacity());
         bytes.push(7);
         let capacity = bytes.capacity();
@@ -1190,11 +1382,53 @@ mod tests {
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.capacity(), table_capacity);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].id, "first");
         assert_eq!(saved[0].bytes, [7]);
         assert_eq!(saved[0].bytes.capacity(), capacity);
         assert_eq!(saved[0].expires, expires);
+        Ok(())
+    }
+
+    #[test]
+    fn refused_candidate_growth_preserves_empty_and_expired_rows() -> TestResult {
+        let responses = CandidateResponses::default();
+        let expired = SystemTime::UNIX_EPOCH;
+        let incoming = || Vec::with_capacity(BYTES_MAX);
+        assert!(
+            responses
+                .save_bytes(String::from("first"), expired, incoming())
+                .is_err()
+        );
+        {
+            let saved = responses
+                .bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(saved.len(), 0);
+            assert_eq!(saved.capacity(), 0);
+        }
+        responses.save_bytes(String::from("expired"), expired, vec![7])?;
+        let capacity = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity();
+        assert!(
+            responses
+                .save_bytes(String::from("next"), expired, incoming())
+                .is_err()
+        );
+        let saved = responses
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(saved.capacity(), capacity);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, "expired");
+        assert_eq!(saved[0].bytes, [7]);
+        assert_eq!(saved[0].expires, expired);
         Ok(())
     }
 

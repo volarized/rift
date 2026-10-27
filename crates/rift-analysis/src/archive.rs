@@ -421,13 +421,20 @@ fn read_zip(
             directory,
             entry.is_symlink(),
             entry.unix_mode().unwrap_or(0),
+            entry.external_attributes(),
         )? == ArchiveMemberKind::Link
         {
-            let path = entry.name().to_owned();
+            let path = entry
+                .name()
+                .map_err(|error| zip_entry_error(&error))?
+                .into_owned();
             output.push_skipped_link(&path)?;
             continue;
         }
-        let path = entry.name().to_owned();
+        let path = entry
+            .name()
+            .map_err(|error| zip_entry_error(&error))?
+            .into_owned();
         let size = entry.size();
         output.push(&path, directory, size, &mut entry)?;
     }
@@ -549,8 +556,15 @@ fn repeated_zip_member_metadata(
         entry.is_dir(),
         entry.is_symlink(),
         entry.unix_mode().unwrap_or(0),
+        entry.external_attributes(),
     )?;
-    Ok((entry.name().to_owned(), kind))
+    Ok((
+        entry
+            .name()
+            .map_err(|error| zip_entry_error(&error))?
+            .into_owned(),
+        kind,
+    ))
 }
 
 enum ZipCompression {
@@ -598,8 +612,12 @@ fn zip_member_kind(
     directory: bool,
     symlink: bool,
     mode: u32,
+    external_attributes: u32,
 ) -> Result<ArchiveMemberKind, ArchiveError> {
-    if symlink {
+    // Nonzero high attributes contain Unix mode, including archives created on Windows.
+    let unix_mode = external_attributes >> 16;
+    let mode = if unix_mode == 0 { mode } else { unix_mode };
+    if symlink || mode & 0o120_000 == 0o120_000 {
         return Ok(ArchiveMemberKind::Link);
     }
     let file_type = mode & 0o170_000;
@@ -624,7 +642,7 @@ fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
     }
 }
 
-// zip 8.6 allocates its central-directory Vec before exposing `len()`. Its fixed-size
+// zip decodes central-directory members before exposing `len()`. Its fixed-size
 // EOCD reads are 22 bytes (ZIP32) and 56 bytes (ZIP64), including the signature. Refuse
 // declared counts at that read boundary, before the library can reserve member storage.
 // Container interpretation and all field decoding remain in zip; this guard only bounds

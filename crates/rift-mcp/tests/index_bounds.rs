@@ -73,11 +73,10 @@ fn deep_source() -> String {
 
 /// The project paths the hits on one search page name.
 fn hit_paths(answer: &Value) -> Vec<&str> {
-    answer["results"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|hit| hit["path"].as_str())
+    workspace_client::query::rows(answer)
+        .expect("fixture query returns bindings")
+        .iter()
+        .filter_map(|row| workspace_client::query::literal(row, "path").ok())
         .collect()
 }
 
@@ -86,8 +85,12 @@ async fn search_page(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     query: &str,
 ) -> TestResult<Value> {
+    let name = oxigraph::model::Literal::from(query);
+    let statement = format!(
+        "SELECT ?symbol ?name ?path {{ ?symbol a :Symbol; :name {name}; :declarations ?declaration . ?declaration :path ?path . BIND({name} AS ?name) }}"
+    );
     let answer = client
-        .call_tool(tool_request("search", &json!({"query": query})))
+        .call_tool(tool_request("search", &json!({"query":statement})))
         .await?;
     answer
         .structured_content
@@ -135,7 +138,7 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
 
     // The lexical commit runs behind the publication, so the store's refusal reaches the
     // answer once the lane has run it; until then the answer names the commit it waits on.
-    let answer = search_until(
+    let answer = retrieval_until(
         &client,
         "beacon",
         "the refused commit never reached search",
@@ -148,16 +151,19 @@ async fn a_workspace_past_units_max_serves_and_search_names_the_key() -> TestRes
         },
     )
     .await?;
+    assert_eq!(answer["outcome"], "unavailable", "{answer}");
+    assert_eq!(answer["reason"], "insufficient_coverage", "{answer}");
+    let exact = search_page(&client, "beacon").await?;
     assert!(
-        hit_paths(&answer).contains(&"lib.rs"),
-        "identifier matching still answers: {answer:#}"
+        hit_paths(&exact).contains(&"lib.rs"),
+        "published declaration remains available: {exact}"
     );
 
     // Issue #623: removing excess input restores the lexical ranking without a restart.
     for index in 0..200 {
         fs::remove_file(directory.path().join(format!("note-{index:04}.txt")))?;
     }
-    let recovered = search_until(
+    let recovered = retrieval_until(
         &client,
         "beacon",
         "the lexical ranking never recovered after removing excess input",
@@ -276,7 +282,9 @@ async fn a_force_included_file_the_contract_refuses_is_left_out_and_the_answer_w
     let forced = client
         .call_tool(tool_request(
             "search",
-            &json!({"query": "beacon", "paths": {"force_include": ["src/wide.rs"]}}),
+            &retrieval_request(
+                &json!({"query": "beacon", "paths": {"force_include": ["src/wide.rs"]}}),
+            )?,
         ))
         .await?;
     let forced = forced
@@ -326,7 +334,7 @@ async fn a_workspace_past_workspace_size_refuses_to_build_naming_the_key() -> Te
 
     let (client, server_task) = served_root_unsettled(directory.path()).await?;
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-    let params = tool_request("search", &json!({"query": "beacon"}));
+    let params = tool_request("search", &retrieval_request(&json!({"query": "beacon"}))?);
     let refusal = loop {
         let result = tokio::time::timeout_at(deadline, client.call_tool(params.clone())).await??;
         if result.is_error == Some(true) {
@@ -447,7 +455,9 @@ async fn a_force_include_past_its_file_bound_refuses_with_the_match_count_as_evi
     let refused = client
         .call_tool(tool_request(
             "search",
-            &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+            &retrieval_request(
+                &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+            )?,
         ))
         .await;
     let failure = failed_call(refused)?;
@@ -481,7 +491,9 @@ async fn a_force_include_past_its_file_bound_refuses_when_the_index_fills_the_po
     let refused = client
         .call_tool(tool_request(
             "search",
-            &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+            &retrieval_request(
+                &json!({ "query": "note", "paths": { "force_include": ["extra/**"] } }),
+            )?,
         ))
         .await;
     let failure = failed_call(refused)?;
@@ -498,4 +510,32 @@ async fn a_force_include_past_its_file_bound_refuses_when_the_index_fills_the_po
     client.cancel().await?;
     server_task.await?;
     Ok(())
+}
+
+fn retrieval_request(parameters: &Value) -> TestResult<Value> {
+    Ok(serde_json::to_value(workspace_client::query::retrieval(
+        &serde_json::from_value(parameters.clone())?,
+    )?)?)
+}
+
+async fn retrieval_until(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    query: &str,
+    what: &str,
+    accept: impl Fn(&Value) -> bool,
+) -> TestResult<Value> {
+    let request = retrieval_request(&json!({"query":query}))?;
+    let mut answer = Value::Null;
+    for _attempt in 0..ANSWER_ATTEMPTS_MAX {
+        answer = client
+            .call_tool(tool_request("search", &request))
+            .await?
+            .structured_content
+            .ok_or("retrieval answer")?;
+        if accept(&answer) {
+            return Ok(answer);
+        }
+        tokio::time::sleep(ANSWER_POLL).await;
+    }
+    Err(format!("{what}; last answer {answer}").into())
 }

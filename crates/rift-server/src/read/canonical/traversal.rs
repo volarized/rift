@@ -1,5 +1,5 @@
 use super::{
-    CapturedMetadata, CapturedView, CapturedViewId, HeldView, LocalSymbolMaterial,
+    CapturedMetadata, CapturedView, CapturedViewId, HeldLocalView, LocalSymbolMaterial,
     LocalSymbolViews, SymbolUnavailableReason, invalid, material_error,
 };
 use rift_error::RiftError;
@@ -127,8 +127,10 @@ impl LocalSymbolViews {
         view: &CapturedViewId,
         root: &Path,
         owner: &SymbolOwner,
-    ) -> Result<Result<(HeldView, rift_index::TraversalWalk), SymbolUnavailableReason>, RiftError>
-    {
+    ) -> Result<
+        Result<(HeldLocalView, rift_index::TraversalWalk), SymbolUnavailableReason>,
+        RiftError,
+    > {
         crate::traversal::validate_traversal(request)?;
         let seed = request
             .seed

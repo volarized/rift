@@ -1,0 +1,23 @@
+{
+  "results": {
+    "bindings": [
+      {
+        "value": {
+          "type": "literal",
+          "value": "1",
+          "datatype": "http://www.w3.org/2001/XMLSchema#integer"
+        },
+        "label": {
+          "type": "uri",
+          "value": "urn:label:one"
+        }
+      }
+    ]
+  },
+  "head": {
+    "vars": [
+      "value",
+      "label"
+    ]
+  }
+}

@@ -3,7 +3,8 @@ use super::{
     DocumentationSourceIdentity, IdentifierMatcher, IndexDocument, IndexedFile, Language,
     NormalizedGraph, NotebookFiles, Path, PathBuf, ProjectPath, ReadableSymbol, RelationshipStore,
     RiftError, SymbolDeclarations, SymbolId, SymbolMatch, SymbolOwner, TextSourceFile,
-    WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSemantics, errors, symbol_rank,
+    WorkspaceFingerprint, WorkspaceIndex, WorkspaceIndexLimits, WorkspaceSemantics, errors,
+    symbol_rank,
 };
 
 mod retained_size;
@@ -18,6 +19,7 @@ mod tests;
 pub struct WorkspaceSymbolView {
     root: PathBuf,
     owner: SymbolOwner,
+    fingerprint: WorkspaceFingerprint,
     files: BTreeMap<ProjectPath, Arc<IndexedFile>>,
     frameworks: BTreeMap<ProjectPath, rift_analysis::ResolvedFramework>,
     identities: BTreeMap<(ProjectPath, usize), SymbolId>,
@@ -54,6 +56,7 @@ impl WorkspaceIndex {
         let mut view = WorkspaceSymbolView {
             root: self.root.clone(),
             owner: self.owner.clone(),
+            fingerprint: self.fingerprint.clone(),
             files: self.files.clone(),
             frameworks: self
                 .files
@@ -106,6 +109,12 @@ impl SymbolDeclarations {
 }
 
 impl WorkspaceSymbolView {
+    /// Returns the source identity captured with this immutable publication.
+    #[must_use]
+    pub const fn fingerprint(&self) -> &WorkspaceFingerprint {
+        &self.fingerprint
+    }
+
     /// Retains already captured source bytes without adding semantic facts.
     ///
     /// # Errors
@@ -132,6 +141,91 @@ impl WorkspaceSymbolView {
         }
         view.retained_bytes = retained_size::measure(&view);
         Ok(view)
+    }
+
+    /// Validates overlapping captured source identities without reading source again.
+    ///
+    /// # Errors
+    /// Refuses different roots, owners or captured file identities.
+    pub fn validate_source_selection(&self, other: &Self) -> Result<(), RiftError> {
+        if self.root != other.root || self.owner != other.owner || self.limits != other.limits {
+            return errors::analysis::package_input_identity_invalid().fail();
+        }
+        for file in other.files() {
+            let conflict = self.file(file.path()).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            }) || self.text_files.get(file.path()).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            });
+            if conflict {
+                return errors::analysis::package_input_identity_invalid().fail();
+            }
+        }
+        for (path, file) in &other.text_files {
+            let conflict = self.text_files.get(path).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            }) || self.files.get(path).is_some_and(|held| {
+                held.digest() != file.digest() || held.executable() != file.executable()
+            });
+            if conflict {
+                return errors::analysis::package_input_identity_invalid().fail();
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterates original canonical declaration bindings without cloning their payload.
+    pub fn canonical_declarations<'view>(
+        &'view self,
+        identity: &SymbolId,
+    ) -> impl Iterator<
+        Item = Result<
+            (
+                &'view ProjectPath,
+                usize,
+                SymbolMatch<'view>,
+                &'view rift_protocol::symbol_read::SymbolDeclaration,
+            ),
+            RiftError,
+        >,
+    > + use<'view> {
+        self.declarations
+            .canonical
+            .get(identity)
+            .into_iter()
+            .flatten()
+            .map(move |(path, index)| {
+                let missing = || errors::index::workspace_provider().error();
+                let file = self.file(path).ok_or_else(missing)?;
+                let symbol = file.syntax().symbols().get(*index).ok_or_else(missing)?;
+                let rank = symbol_rank(symbol, &IdentifierMatcher::new(&symbol.qualified_name))
+                    .ok_or_else(missing)?;
+                let declaration = self
+                    .declarations
+                    .facts
+                    .get(&(path.clone(), *index))
+                    .ok_or_else(missing)?;
+                Ok((
+                    path,
+                    *index,
+                    SymbolMatch { file, symbol, rank },
+                    declaration,
+                ))
+            })
+    }
+
+    /// Returns one original declaration only under its established identity.
+    #[must_use]
+    pub fn canonical_declaration(
+        &self,
+        identity: &SymbolId,
+        path: &ProjectPath,
+        index: usize,
+    ) -> Option<&rift_protocol::symbol_read::SymbolDeclaration> {
+        let key = (path.clone(), index);
+        (self.identities.get(&key) == Some(identity))
+            .then(|| self.declarations.facts.get(&key))
+            .flatten()
     }
 
     /// Root of the captured workspace, independent of the caller's current directory.
@@ -199,6 +293,16 @@ impl WorkspaceSymbolView {
             .get(path)
             .map(|file| file.source())
             .or_else(|| self.text_files.get(path).map(|file| file.content()))
+    }
+
+    /// Iterates accepted source bytes from the captured syntax and text catalogs.
+    pub fn sources(&self) -> impl Iterator<Item = (&ProjectPath, &str)> {
+        self.files
+            .iter()
+            .map(|(path, file)| (path, file.source()))
+            .chain(self.text_files.iter().filter_map(|(path, file)| {
+                (!self.files.contains_key(path)).then_some((path, file.content()))
+            }))
     }
 
     /// Parses captured bytes with their admitted language, framework context and bounds.
@@ -306,6 +410,56 @@ impl WorkspaceSymbolView {
             .get(identity)
             .map(|object| object.as_ref().cloned().map_err(Clone::clone))
             .transpose()
+    }
+
+    /// Iterates established objects without cloning their captured presentation.
+    pub fn objects(&self) -> impl Iterator<Item = (&SymbolId, Result<&ReadableSymbol, RiftError>)> {
+        self.declarations
+            .assembled
+            .iter()
+            .map(|(identity, object)| (identity, object.as_ref().map_err(Clone::clone)))
+    }
+
+    /// Iterates captured declarations whose normalized object has no canonical identity.
+    ///
+    /// # Errors
+    /// Returns the original provider failure when captured facts cannot be assembled.
+    pub fn unestablished_declarations(
+        &self,
+    ) -> impl Iterator<
+        Item = Result<
+            (
+                ReadableSymbol,
+                SymbolMatch<'_>,
+                &rift_protocol::symbol_read::SymbolDeclaration,
+            ),
+            RiftError,
+        >,
+    > {
+        self.declarations
+            .provider
+            .iter()
+            .flat_map(move |(provider, bindings)| {
+                bindings
+                    .iter()
+                    .filter(|binding| !self.identities.contains_key(*binding))
+                    .map(move |(path, index)| {
+                        let missing = || errors::index::workspace_provider().error();
+                        let file = self.file(path).ok_or_else(missing)?;
+                        let symbol = file.syntax().symbols().get(*index).ok_or_else(missing)?;
+                        let rank =
+                            symbol_rank(symbol, &IdentifierMatcher::new(&symbol.qualified_name))
+                                .ok_or_else(missing)?;
+                        let object = ReadableSymbol::assembled_by(&self.semantics, provider)
+                            .ok_or_else(missing)?;
+                        let declaration = self
+                            .declarations
+                            .facts
+                            .get(&(path.clone(), *index))
+                            .ok_or_else(missing)?;
+                        Ok((object, SymbolMatch { file, symbol, rank }, declaration))
+                    })
+            })
     }
 
     /// Whether the captured facts establish exact absence for this language.

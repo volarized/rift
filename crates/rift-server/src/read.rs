@@ -33,7 +33,9 @@ use sha2::{Digest as _, Sha256};
 use crate::history::{StoredHistory, SymbolTimelines};
 
 mod canonical;
-pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
+pub use canonical::{
+    CapturedQueryView, LocalSymbolViewInput, LocalSymbolViews, QueryMaterial, QueryViewInput,
+};
 
 /// Inputs for one cancellable current-tree read-service build.
 pub struct ReadServiceBuild<'a> {
@@ -772,17 +774,36 @@ impl ReadService {
             &|_| true,
             &mut |file, bytes_max| repository.blob_bytes(file, bytes_max).map(Some),
         )?;
+        Ok(Self::from_revision_index(
+            index,
+            RevisionId(resolved.commit_id()),
+            history,
+        ))
+    }
+
+    /// Serves an already built revision index without another source read or analysis.
+    pub(crate) fn from_revision_index(
+        index: WorkspaceIndex,
+        revision: RevisionId,
+        history: HistoryConfiguration,
+    ) -> Self {
         let revisions = captured_revisions(&index);
-        Ok(Self {
+        Self {
             index,
             revisions,
-            revision: Some(RevisionId(resolved.commit_id())),
+            revision: Some(revision),
             history,
             source_policy: None,
             context: Arc::new(DependencyContext::default()),
             dependency_configuration: DependenciesConfiguration::default(),
             stored_history: OnceLock::new(),
-        })
+        }
+    }
+
+    /// Returns the fixed local owner of this captured workspace.
+    #[must_use]
+    pub const fn owner(&self) -> &rift_protocol::identity::SymbolOwner {
+        self.index.owner()
     }
 
     /// Returns the immutable workspace index this snapshot serves.
@@ -1423,15 +1444,23 @@ fn accepted_symbol_name(name: &str) -> Result<(), RiftError> {
 ///
 /// Returns `invalid_request` naming `limit` when the size is outside its bounds.
 pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
+    accepted_limit_for(requested, "limit")
+}
+
+pub(crate) fn accepted_declaration_limit(requested: u64) -> Result<usize, RiftError> {
+    accepted_limit_for(requested, "declaration_limit")
+}
+
+fn accepted_limit_for(requested: u64, field: &'static str) -> Result<usize, RiftError> {
     if requested == 0 {
         return errors::server::read_invalid()
-            .field("limit")
+            .field(field)
             .violation("zero")
             .fail();
     }
     if requested > PAGE_LIMIT_MAX {
         return errors::server::read_invalid()
-            .field("limit")
+            .field(field)
             .violation(format!("{requested} exceeds the maximum {PAGE_LIMIT_MAX}"))
             .fail();
     }
@@ -1518,11 +1547,23 @@ fn requested_packages_violation(
 /// `page_index` past the last page yields an empty page carrying the requested index
 /// and the true page count.
 pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>, Pagination) {
+    let (window, pagination) = page_range(results.len(), page_index, limit);
+    let count = window.end - window.start;
+    (
+        results.into_iter().skip(window.start).take(count).collect(),
+        pagination,
+    )
+}
+
+pub(crate) fn page_range(
+    total: usize,
+    page_index: u64,
+    limit: usize,
+) -> (std::ops::Range<usize>, Pagination) {
     assert!(
         limit > 0,
         "page limit must be positive after acceptance: limit={limit}"
     );
-    let total = results.len();
     let total_pages = u64::try_from(total.div_ceil(limit)).unwrap_or(u64::MAX);
     let pagination = Pagination {
         page_index,
@@ -1532,8 +1573,8 @@ pub(crate) fn page<T>(results: Vec<T>, page_index: u64, limit: usize) -> (Vec<T>
         .ok()
         .and_then(|index| index.checked_mul(limit));
     let window = match start {
-        Some(start) if start < total => results.into_iter().skip(start).take(limit).collect(),
-        _ => Vec::new(),
+        Some(start) if start < total => start..start.saturating_add(limit).min(total),
+        _ => 0..0,
     };
     (window, pagination)
 }
@@ -1561,7 +1602,6 @@ fn wire_node_facts(
     range: ByteRange,
     kind: &'static str,
 ) -> Result<Node, RiftError> {
-    let language = file.syntax().language();
     let symbol = index
         .file(file.path())
         .filter(|captured| captured.digest() == file.digest())
@@ -1569,7 +1609,57 @@ fn wire_node_facts(
         .map(|symbol| symbol_id(index, crate::search::declared(file, symbol)))
         .transpose()?
         .flatten();
-    Ok(Node {
+    Ok(wire_node_with_symbol(file, range, kind, symbol))
+}
+
+/// Reserves variable node output and bounded address/classification scratch before copying.
+///
+/// The admitted source unit already carries the existing path encoding. Its length bounds
+/// each retained address path and one temporary path encoding. The same three quantities
+/// cover the original language, its address segment and the temporary segment. One Node
+/// allocation also reserves the fixed facet classifier rows; these contain no strings.
+pub(crate) fn wire_node_material_bytes(
+    file: &IndexedFile,
+    unit: &SourceUnitId,
+    kind: &str,
+    symbol: Option<&str>,
+    parent: Option<&NodeId>,
+) -> Option<usize> {
+    let path = unit.as_str().len();
+    let language = file.syntax().language();
+    let dialect = language
+        .dialect
+        .as_ref()
+        .map_or(Some(0), |dialect| dialect.len().checked_add(1))?;
+    let language = language.name.len().checked_add(dialect)?;
+    let digits = usize::try_from(u64::MAX.ilog10() + 1).ok()?;
+    let fixed = size_of::<Node>()
+        .checked_add("rift://node/".len())?
+        .checked_add("rift://file/".len())?
+        .checked_add("/@-#".len())?
+        .checked_add(digits.checked_mul(2)?)?
+        .checked_add(DIGEST_WIRE_CHARS)?
+        .checked_add(size_of::<sha2::digest::Output<Sha256>>().checked_mul(2)?)?;
+    [
+        path.checked_mul(3)?,
+        language.checked_mul(3)?,
+        kind.len(),
+        symbol.map_or(0, str::len),
+        parent.map_or(0, |parent| parent.0.len()),
+    ]
+    .into_iter()
+    .try_fold(fixed, usize::checked_add)
+}
+
+/// Projects one original syntax row with its captured declaration association.
+pub(crate) fn wire_node_with_symbol(
+    file: &IndexedFile,
+    range: ByteRange,
+    kind: &'static str,
+    symbol: Option<SymbolId>,
+) -> Node {
+    let language = file.syntax().language();
+    Node {
         id: node_id(file, range),
         symbol,
         unit: file_id(file.path()),
@@ -1579,8 +1669,8 @@ fn wire_node_facts(
         range: text_range(range),
         regions: Vec::new(),
         parent: None,
-        extensions: Extensions(BTreeMap::new()),
-    })
+        extensions: Extensions::from(BTreeMap::new()),
+    }
 }
 
 /// Builds one hit's wire symbol, and the `symbol_disagreement` warning its retained
@@ -1590,20 +1680,31 @@ pub(crate) fn wire_symbol(
     index: &WorkspaceIndex,
     matched: SymbolMatch<'_>,
 ) -> Result<(Symbol, Option<ReadWarning>), RiftError> {
+    wire_symbol_with(index, matched, |_| Ok(())).map(|(symbol, warning, ())| (symbol, warning))
+}
+
+pub(crate) fn wire_symbol_with<T>(
+    index: &WorkspaceIndex,
+    matched: SymbolMatch<'_>,
+    selected: impl FnOnce(Option<&ReadableSymbol>) -> Result<T, RiftError>,
+) -> Result<(Symbol, Option<ReadWarning>, T), RiftError> {
     if !rift_core::is_portable_name(&matched.symbol.name)
         || !rift_core::is_portable_name(&matched.symbol.qualified_name)
     {
         let placement = rift_syntax::DocumentPlacement::project_path(matched.file.path())?;
         let facts = matched.symbol.facts(matched.file.syntax().language());
+        let selected = selected(None)?;
         return Ok((
             rift_provider::AssembledSymbol::wire_facts(&facts, placement.origin()),
             None,
+            selected,
         ));
     }
     let readable = index.assembled_symbol(matched)?;
+    let selected = selected(Some(&readable))?;
     let symbol = assembled_wire_symbol(&readable);
     let disagreement = symbol_disagreement_warning(readable.assembled());
-    Ok((symbol, disagreement))
+    Ok((symbol, disagreement, selected))
 }
 
 fn assembled_wire_symbol(readable: &ReadableSymbol) -> Symbol {
@@ -1675,13 +1776,17 @@ fn symbol_disagreement_warning(assembled: &rift_provider::AssembledSymbol) -> Op
 }
 
 pub(crate) fn excerpt(file: &IndexedFile, range: ByteRange) -> String {
+    excerpt_ref(file, range).to_owned()
+}
+
+pub(crate) fn excerpt_ref(file: &IndexedFile, range: ByteRange) -> &str {
     let start = usize::try_from(range.start)
         .unwrap_or(file.source().len())
         .min(file.source().len());
     let end = usize::try_from(range.end)
         .unwrap_or(file.source().len())
         .min(file.source().len());
-    file.source().get(start..end).unwrap_or_default().to_owned()
+    file.source().get(start..end).unwrap_or_default()
 }
 
 pub(crate) fn text_range(range: ByteRange) -> TextRange {

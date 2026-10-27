@@ -50,6 +50,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 candle-core = { version = "0.11.0", default-features = false }
 candle-nn = { version = "0.11.0", default-features = false }
 candle-transformers = { version = "0.11.0", default-features = false }
+cap = "=0.1.2"
 clap = { version = "4.6.5", features = ["derive"] }
 data-encoding = "2.6.0"
 digest-io = "=0.1.0"
@@ -69,6 +70,11 @@ nix = { version = "0.31.3", features = ["signal"] }
 notify = "=8.2.0"
 oas3-gen-support = "=0.28.0"
 oas3 = "=0.22.0"
+oxigraph = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.6.0-dev", default-features = false }
+oxiri = { version = "=0.3.1", default-features = false }
+oxstr = { version = "=0.2.0", default-features = false }
+spareval = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.3.0-dev", default-features = false }
+spargebra = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.5.0-dev", default-features = false }
 # The OTLP export stack rift-tracing owns. tracing-opentelemetry pins the opentelemetry minor it
 # builds against (0.34.0 requires opentelemetry ^0.33.0), and opentelemetry_sdk /
 # opentelemetry-otlp move in lockstep with opentelemetry itself, so every member is
@@ -189,11 +195,11 @@ tempfile = "3.27.0"
 unicode-normalization = "0.1.24"
 unicode-ident = "1.0.24"
 unicode-width = "0.2.2"
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
 
 # Embedded ty: git dependencies pinned to the ruff submodule sha of ty release
 # 0.0.84. ty_project and ty_ide are unpublished, so git is the only route.
-ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a", default-features = false, features = ["deflate"] }
 ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
 ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a", features = ["os"] }
 ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }

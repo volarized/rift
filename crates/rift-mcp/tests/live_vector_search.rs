@@ -20,6 +20,8 @@
 //! The serving helper is local rather than `workspace_client`'s, because every
 //! fixture that helper lays out carries the table this suite must not have.
 
+#[path = "query/mod.rs"]
+mod query;
 mod search_live_gate;
 
 use std::error::Error;
@@ -96,7 +98,13 @@ async fn served_configured_workspace(
     if let Some(configuration) = configuration {
         fs::write(directory.path().join("rift.toml"), configuration)?;
     }
-    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(directory.path(), WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(
+            std::env::var_os("CARGO_BIN_EXE_rift")
+                .ok_or("test runner must provide CARGO_BIN_EXE_rift")?
+                .into(),
+        );
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     let server_task = tokio::spawn(async move {
         let service = server
@@ -116,7 +124,9 @@ fn workspace() -> [(&'static str, &'static str); 2] {
 
 /// Runs one `search` and returns its structured result.
 async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestResult<Value> {
-    let arguments = json!({ "query": query })
+    let producer = serde_json::from_value(json!({ "query": query }))?;
+    let request = query::retrieval(&producer)?;
+    let arguments = serde_json::to_value(request)?
         .as_object()
         .cloned()
         .ok_or("search arguments are an object")?;
@@ -199,9 +209,10 @@ fn assert_shares_no_token(query: &str, sources: &[(&str, &str)]) {
 
 /// Whether one answer carries a hit at `path`.
 fn reaches(answer: &Value, path: &str) -> bool {
-    answer["results"]
-        .as_array()
-        .is_some_and(|results| results.iter().any(|hit| hit["path"] == json!(path)))
+    query::rows(answer).is_ok_and(|rows| {
+        rows.iter()
+            .any(|row| query::literal(row, "path").ok() == Some(path))
+    })
 }
 
 /// The control's table: the same files, served with the tier the suite is about

@@ -2,14 +2,12 @@ use super::{CANDIDATE_BYTES_MAX, CapturedView, CapturedViewId, RiftError, Symbol
 use super::{CandidateViews, SavedCandidateBackend, SavedCandidateBytes, SavedCandidateRead};
 use super::{captured_expiry, invalid, saved_backends, view_key};
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::SystemTime;
 
-// CapturedViewId is bounded at 4096 ASCII-safe bytes. The local owner emits
-// chrono UTC RFC 3339: signed year 7 + date 6 + T 1 + time 8 + fraction 10
-// + offset 6 = 38 bytes. Oversized foreign metadata is refused before exposure.
+// CapturedViewId is bounded at 4096 ASCII-safe bytes.
 const VIEW_KEY_BYTES_MAX: usize = 4096;
-const VIEW_EXPIRY_BYTES_MAX: usize = 38;
-const VIEW_LIFETIME: Duration = Duration::from_mins(15);
 
 pub(super) struct CandidateReservation<'a> {
     store: &'a CandidateViews,
@@ -37,9 +35,9 @@ impl CandidateViews {
     ) -> Result<CandidateReservation<'_>, RiftError> {
         self.reserve_captured(
             &SavedCandidateBackend {
-                owner: owner.cloned(),
-                backend: backend.to_owned(),
-                root: root.to_owned(),
+                owner,
+                backend,
+                root,
                 view: CapturedView {
                     id: CapturedViewId::parse("claims.pending")?,
                     expires_at: String::new(),
@@ -51,22 +49,16 @@ impl CandidateViews {
         )
     }
 
-    pub(super) fn reserve_captured(
+    pub(super) fn reserve_captured<Text: serde::Serialize, Owner: serde::Serialize>(
         &self,
-        selected: &SavedCandidateBackend,
+        selected: &SavedCandidateBackend<Text, Owner>,
         now: SystemTime,
     ) -> Result<CandidateReservation<'_>, RiftError> {
         let expires = now
-            .checked_add(VIEW_LIFETIME)
+            .checked_add(self.view_lifetime)
             .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
-        let mut template = selected.clone();
-        template.view = CapturedView {
-            id: CapturedViewId::parse(&format!("{}.x", "a".repeat(VIEW_KEY_BYTES_MAX - 2)))?,
-            // Worst JSON escaping is charged; final metadata uses these same bounds.
-            expires_at: "\u{0001}".repeat(VIEW_EXPIRY_BYTES_MAX),
-        };
         let bytes = super::super::encode_bounded(
-            &SavedCandidateRead::Symbol(Box::new(template)),
+            &SavedCandidateRead::Symbol(selected),
             CANDIDATE_BYTES_MAX,
         )
         .map_err(|source| {
@@ -79,13 +71,24 @@ impl CandidateViews {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         rows.retain(|row| row.expires > now);
+        if u64::try_from(rows.len()).unwrap_or(u64::MAX) >= self.views_max {
+            return Err(invalid(
+                "view",
+                "captured search exceeds the byte or view bound",
+            ));
+        }
+        rows.try_reserve_exact(1).map_err(|source| {
+            rift_error::errors::mcp::forward_failed()
+                .source(source)
+                .error()
+        })?;
         let retained = rows.iter().fold(
             rows.capacity()
                 .checked_mul(std::mem::size_of::<SavedCandidateBytes>())
                 .and_then(|size| size.checked_add(bytes.capacity())),
             |sum, row| sum.and_then(|sum| sum.checked_add(row.bytes.capacity())),
         );
-        if rows.len() == 256 || retained.is_none_or(|size| size > CANDIDATE_BYTES_MAX) {
+        if retained.is_none_or(|size| size > CANDIDATE_BYTES_MAX) {
             return Err(invalid(
                 "view",
                 "captured search exceeds the byte or view bound",
@@ -118,9 +121,7 @@ impl CandidateReservation<'_> {
         now: SystemTime,
     ) -> Result<(), RiftError> {
         let view = &selected.view;
-        if view.id.as_str().len() > VIEW_KEY_BYTES_MAX
-            || view.expires_at.len() > VIEW_EXPIRY_BYTES_MAX
-        {
+        if view.id.as_str().len() > VIEW_KEY_BYTES_MAX {
             return Err(invalid("view", "captured view metadata exceeds the bound"));
         }
         let expires = captured_expiry(view)?;
@@ -134,7 +135,7 @@ impl CandidateReservation<'_> {
             .position(|row| row.reservation == Some(self.serial))
             .ok_or_else(|| invalid("view", "captured view reservation is unavailable"))?;
         let latest_expiry = now
-            .checked_add(VIEW_LIFETIME)
+            .checked_add(self.store.view_lifetime)
             .ok_or_else(|| invalid("view", "captured view expiry exceeds the clock bound"))?;
         if rows[position].expires <= now || expires <= now || expires > latest_expiry {
             rift_tracing::warn!(
@@ -158,9 +159,7 @@ impl CandidateReservation<'_> {
                     .source(source)
                     .error()
             })?;
-        let SavedCandidateRead::Symbol(mut backend) = saved else {
-            return Err(invalid("view", "captured view reservation does not match"));
-        };
+        let SavedCandidateRead::Symbol(backend) = saved;
         if backend.owner != selected.owner
             || backend.backend != selected.backend
             || backend.root != selected.root
@@ -192,29 +191,45 @@ impl CandidateReservation<'_> {
             }
             return Err(invalid("view", "captured search view is already retained"));
         }
-        backend.view = view.clone();
-        let bytes =
-            super::super::encode_bounded(&SavedCandidateRead::Symbol(backend), CANDIDATE_BYTES_MAX)
-                .map_err(|source| {
-                    rift_error::errors::mcp::forward_failed()
-                        .source(source)
-                        .error()
-                })?;
+        let allowance = remaining_bytes(&rows, rows.capacity(), position)?;
+        let bytes = super::super::encode_bounded(&SavedCandidateRead::Symbol(selected), allowance)
+            .map_err(|source| {
+                rift_error::errors::mcp::forward_failed()
+                    .source(source)
+                    .error()
+            })?;
         let row = &mut rows[position];
-        if bytes.len() > row.bytes.capacity() {
+        if bytes.capacity() > allowance {
             return Err(invalid(
                 "view",
                 "captured view metadata exceeds the reservation",
             ));
         }
-        row.bytes.clear();
-        row.bytes.extend_from_slice(&bytes);
+        row.bytes = bytes;
         row.key = view_key(view.id.as_str());
         row.expires = expires;
         row.reservation = None;
         self.finished = true;
         Ok(())
     }
+}
+
+fn remaining_bytes(
+    rows: &[SavedCandidateBytes],
+    capacity: usize,
+    position: usize,
+) -> Result<usize, RiftError> {
+    let retained = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != position)
+        .fold(
+            capacity.checked_mul(std::mem::size_of::<SavedCandidateBytes>()),
+            |sum, (_, row)| sum.and_then(|sum| sum.checked_add(row.bytes.capacity())),
+        );
+    retained
+        .and_then(|retained| CANDIDATE_BYTES_MAX.checked_sub(retained))
+        .ok_or_else(|| invalid("view", "captured view metadata exceeds the reservation"))
 }
 
 impl Drop for CandidateReservation<'_> {
@@ -263,7 +278,7 @@ mod tests {
         let mut response = selected("claims.delayed");
         response.view.expires_at = "2030-01-01T00:15:01+00:00".to_owned();
         let finalized = clock() + Duration::from_secs(2);
-        assert!(captured_expiry(&response.view).expect("expiry") > clock() + VIEW_LIFETIME);
+        assert!(captured_expiry(&response.view).expect("expiry") > clock() + store.view_lifetime);
         pending
             .finalize(&response, finalized)
             .expect("delayed issue");
@@ -386,7 +401,7 @@ mod tests {
         response.view.expires_at = "2030-01-01T00:29:59+00:00".to_owned();
         assert!(
             pending
-                .finalize(&response, clock() + VIEW_LIFETIME)
+                .finalize(&response, clock() + store.view_lifetime)
                 .is_err()
         );
         drop(pending);
@@ -438,6 +453,74 @@ mod tests {
     }
 
     #[test]
+    fn symbol_reservation_remeasures_final_metadata_and_preserves_held_views() {
+        let store = CandidateViews::default();
+        let held = selected("claims.held");
+        let mut first = store
+            .reserve_captured(&held, clock())
+            .expect("reserve held");
+        first.finalize(&held, clock()).expect("retain held");
+        let mut response = selected(&format!("{}.x", "a".repeat(VIEW_KEY_BYTES_MAX - 2)));
+        response.view.expires_at = "2030-01-01T00:10:00.123456789+00:00".to_owned();
+        let mut pending = store
+            .reserve_symbol("local", "/fixture/main", &SymbolOwner::Local, clock())
+            .expect("reserve response");
+        {
+            let mut rows = store.rows.lock().expect("rows");
+            let pending_capacity = rows[1].bytes.capacity();
+            let encoded = super::super::super::encode_bounded(
+                &SavedCandidateRead::Symbol(Box::new(response.clone())),
+                CANDIDATE_BYTES_MAX,
+            )
+            .expect("actual metadata");
+            let borrowed = super::super::super::encode_bounded(
+                &SavedCandidateRead::Symbol(&response),
+                CANDIDATE_BYTES_MAX,
+            )
+            .expect("borrowed metadata");
+            assert_eq!(borrowed, encoded);
+            let SavedCandidateRead::Symbol(decoded) =
+                serde_json::from_slice::<SavedCandidateRead>(&borrowed).expect("owned decode");
+            assert_eq!(*decoded, response);
+            assert!(encoded.len() > pending_capacity);
+            let available = CANDIDATE_BYTES_MAX
+                - rows.capacity() * std::mem::size_of::<SavedCandidateBytes>()
+                - pending_capacity;
+            let mut retained = Vec::new();
+            retained
+                .try_reserve_exact(available)
+                .expect("retained capacity");
+            retained.extend_from_slice(&rows[0].bytes);
+            rows[0].bytes = retained;
+        }
+        assert!(pending.finalize(&response, clock()).is_err());
+        drop(pending);
+        assert_eq!(store.rows.lock().expect("rows").len(), 1);
+        assert_eq!(
+            store
+                .backend(&held.view.id, clock())
+                .expect("decode")
+                .expect("authority"),
+            Some(held)
+        );
+
+        let store = CandidateViews::default();
+        let mut pending = store
+            .reserve_captured(&response, clock())
+            .expect("reserve fraction");
+        pending
+            .finalize(&response, clock())
+            .expect("valid fraction");
+        assert_eq!(
+            store
+                .backend(&response.view.id, clock())
+                .expect("decode")
+                .expect("authority"),
+            Some(response)
+        );
+    }
+
+    #[test]
     fn symbol_reservation_refuses_capacity_before_dispatch() {
         let store = CandidateViews::default();
         let reservations = (0..256)
@@ -472,7 +555,7 @@ mod tests {
                 .expect("reserve extra");
             let mut response = selected("claims.first");
             if oversized {
-                response.view.expires_at = "x".repeat(VIEW_EXPIRY_BYTES_MAX + 1);
+                response.view.expires_at = "x".repeat(CANDIDATE_BYTES_MAX + 1);
             }
             assert!(pending.finalize(&response, clock()).is_err());
             drop(pending);

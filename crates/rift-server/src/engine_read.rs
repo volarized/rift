@@ -29,6 +29,13 @@ use crate::traversal::{
     walk_traversal_with_references,
 };
 
+#[path = "engine_query.rs"]
+mod query;
+pub use query::{
+    EngineQuery, ProviderRequests, QueryPackageTarget, QuerySourceRequest, resolve_query_references,
+};
+pub(crate) use query::{merge_package_facts, retained_package_bytes};
+
 /// References and calls resolved from one published source revision.
 #[derive(Debug, Default)]
 pub struct EngineReferences {
@@ -46,9 +53,140 @@ pub struct EngineReferences {
     unconfirmed: BTreeSet<String>,
     analysis_unavailable: Option<ReadWarning>,
     registry_unresolved: bool,
+    query_occurrences: Vec<rift_protocol::query::QueryOccurrence>,
+    query_relationships: Vec<Relationship>,
+    query_package_facts: rift_search::query::QueryFacts,
+    query_source_requests: Vec<QuerySourceRequest>,
+    query_provider_edges: Vec<query::PreparedEdge>,
 }
 
 impl EngineReferences {
+    /// Dependency declarations and source bytes admitted for this query.
+    #[must_use]
+    pub const fn query_package_facts(&self) -> &rift_search::query::QueryFacts {
+        &self.query_package_facts
+    }
+
+    /// Projects acquired endpoints after the original provider records have been combined.
+    ///
+    /// # Errors
+    /// Refuses an endpoint whose original captured provider is absent.
+    pub fn project_provider_edges(
+        &self,
+        facts: &mut rift_search::query::QueryFacts,
+    ) -> Result<(), RiftError> {
+        query::project_provider_edges(&self.query_provider_edges, facts)
+    }
+
+    /// Keeps acquired relationships and occurrences without copying symbol or source payloads.
+    #[must_use]
+    pub fn into_provider_references(self) -> Self {
+        Self {
+            revision: self.revision,
+            query_provider_edges: self.query_provider_edges,
+            query_relationships: self.query_relationships,
+            query_occurrences: self.query_occurrences,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn has_provider_references(&self) -> bool {
+        !self.query_provider_edges.is_empty()
+            || !self.query_relationships.is_empty()
+            || !self.query_occurrences.is_empty()
+    }
+
+    pub(crate) fn combine_provider_references(&self, other: &Self) -> Result<Self, RiftError> {
+        if self.revision != other.revision {
+            return errors::server::read_unavailable()
+                .operation("query relationships")
+                .detail("source revision changed between engine batches")
+                .fail();
+        }
+        let mut edges = Vec::with_capacity(
+            self.query_provider_edges
+                .len()
+                .saturating_add(other.query_provider_edges.len()),
+        );
+        edges.extend(self.query_provider_edges.iter().cloned());
+        edges.extend(other.query_provider_edges.iter().cloned());
+        let mut relationships = self.query_relationships.clone();
+        relationships.extend_from_slice(&other.query_relationships);
+        let mut occurrences = self.query_occurrences.clone();
+        occurrences.extend_from_slice(&other.query_occurrences);
+        Ok(Self {
+            revision: self.revision.clone(),
+            query_provider_edges: edges,
+            query_relationships: relationships,
+            query_occurrences: occurrences,
+            ..Self::default()
+        })
+    }
+
+    /// Combines complete query batches captured from the same source revision.
+    ///
+    /// # Errors
+    /// Returns unavailable when the source revisions differ.
+    pub fn append_query(&mut self, other: Self) -> Result<(), RiftError> {
+        if self.revision.is_some() && other.revision.is_some() && self.revision != other.revision {
+            return errors::server::read_unavailable()
+                .operation("query relationships")
+                .detail("source revision changed between engine batches")
+                .fail();
+        }
+        self.revision = self.revision.take().or(other.revision);
+        self.query_occurrences.extend(other.query_occurrences);
+        self.query_relationships.extend(other.query_relationships);
+        self.query_source_requests
+            .extend(other.query_source_requests);
+        self.query_provider_edges.extend(other.query_provider_edges);
+        merge_package_facts(&mut self.query_package_facts, other.query_package_facts)?;
+        self.package_callees.extend(other.package_callees);
+        self.package_declarations.extend(other.package_declarations);
+        self.dropped_callees = self.dropped_callees.saturating_add(other.dropped_callees);
+        self.analysis_unavailable = self
+            .analysis_unavailable
+            .take()
+            .or(other.analysis_unavailable);
+        self.unconfirmed.extend(other.unconfirmed);
+        self.registry_unresolved |= other.registry_unresolved;
+        Ok(())
+    }
+
+    /// Physical occurrences retained before declaration-level traversal projection.
+    #[must_use]
+    pub fn query_occurrences(&self) -> &[rift_protocol::query::QueryOccurrence] {
+        &self.query_occurrences
+    }
+
+    /// Complete relationships acquired for the selected query subjects.
+    #[must_use]
+    pub fn query_relationships(&self) -> Vec<Relationship> {
+        self.query_local_relationships()
+            .cloned()
+            .chain(
+                self.query_package_facts
+                    .relationship_records
+                    .iter()
+                    .map(|record| record.relationship.clone()),
+            )
+            .collect()
+    }
+
+    /// Locally acquired relationships, excluding original remote record payloads.
+    pub fn query_local_relationships(&self) -> impl Iterator<Item = &Relationship> {
+        self.query_relationships.iter()
+    }
+
+    /// Whether every requested engine contribution was retained in full.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.analysis_unavailable.is_none()
+            && self.dropped_callees == 0
+            && self.package_callees.is_empty()
+            && self.query_source_requests.is_empty()
+    }
+
     /// Whether the engines contributed any traversal edges.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -93,6 +231,10 @@ impl EngineReferences {
     fn degrade(&mut self, warning: ReadWarning) {
         self.incoming.clear();
         self.outgoing.clear();
+        self.query_occurrences.clear();
+        self.query_relationships.clear();
+        self.query_source_requests.clear();
+        self.query_package_facts = rift_search::query::QueryFacts::default();
         self.package_callees.clear();
         self.package_declarations.clear();
         self.dropped_callees = 0;
@@ -164,6 +306,15 @@ impl EngineReferences {
                 continue;
             };
             let caller = SymbolId(callee.caller().as_str().to_owned());
+            if let Some(sources) = callee.query_sources() {
+                query::name_package_occurrences(
+                    &mut self.query_occurrences,
+                    &mut self.query_relationships,
+                    &caller,
+                    &id,
+                    sources,
+                );
+            }
             let edges = self.outgoing.entry(callee.caller().clone()).or_default();
             if !edges.iter().any(|edge| edge.relationship.to == id) {
                 edges.push(call_hop(&caller, id));
@@ -196,13 +347,15 @@ impl EngineReferences {
         reads.engine_index_current() && self.revision.as_deref() == Some(reads.engine_revision())
     }
 
-    pub(crate) fn retained_material_bytes(&self) -> usize {
+    /// Material retained by these acquired references, including vector capacity and shared context.
+    #[must_use]
+    pub fn retained_material_bytes(&self) -> usize {
         use get_size2::{GetSize, StandardTracker};
         use rift_protocol::{
             btree_material_bytes, retained_map_material, retained_sequence_material,
             retained_vector_material,
         };
-        if !self.package_callees.is_empty() {
+        if !self.package_callees.is_empty() || !self.query_source_requests.is_empty() {
             return usize::MAX;
         }
         let tracker = StandardTracker::default();
@@ -211,6 +364,12 @@ impl EngineReferences {
             retained_map_material(&self.incoming, tracker, retained_vector_material);
         let (outgoing, tracker) =
             retained_map_material(&self.outgoing, tracker, retained_vector_material);
+        let (query_relationships, tracker) =
+            retained_vector_material(&self.query_relationships, tracker);
+        let (provider_edges, tracker) =
+            retained_vector_material(&self.query_provider_edges, tracker);
+        let query_occurrences = query::retained_occurrence_bytes(&self.query_occurrences);
+        let query_package_facts = query::retained_package_bytes(&self.query_package_facts);
         let (declarations, tracker) = retained_map_material(
             &self.package_declarations,
             tracker,
@@ -248,6 +407,10 @@ impl EngineReferences {
             revision,
             incoming,
             outgoing,
+            query_relationships,
+            provider_edges,
+            query_occurrences,
+            query_package_facts,
             declarations,
             unconfirmed,
             warning,
@@ -361,7 +524,7 @@ fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &Symb
     (current && symbols && served).then_some((traversal, seed))
 }
 
-type ReferenceSource<'source> = (
+pub(super) type ReferenceSource<'source> = (
     &'source EngineSlot,
     &'source IndexedFile,
     &'source SyntaxSymbol,
@@ -859,20 +1022,20 @@ async fn callees_on_engine(
     target: &ReferenceTarget,
     deadline: Instant,
 ) -> Result<OutgoingAnswer<CalleeReport>, RiftError> {
-    let request_path = target.path.clone();
+    let request_uri = target.uri.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
     slot.request_outgoing(
         target.opening(),
         move |session: &mut EngineSession| {
-            let path = request_path.clone();
+            let uri = request_uri.clone();
             Box::pin(async move {
                 let encoding = session.capabilities().position_encoding;
                 let position = match encoding {
                     PositionEncoding::Utf8 => utf8,
                     PositionEncoding::Utf16 => utf16,
                 };
-                let items = session.prepare_call_hierarchy(&path, position).await?;
+                let items = session.prepare_call_hierarchy_uri(&uri, position).await?;
                 if items.is_empty() {
                     return Ok(None);
                 }
@@ -951,7 +1114,7 @@ fn map_callees(
                 "engine calls",
             )?,
             CalleeFile::Package(held) => {
-                mapped.held.push(held);
+                mapped.held.push(*held);
                 continue;
             }
             CalleeFile::Unaddressed => None,
@@ -1027,7 +1190,6 @@ fn symbol_references(
 }
 
 struct ReferenceTarget {
-    path: ProjectPath,
     language: String,
     source: String,
     utf8: Position,
@@ -1045,14 +1207,14 @@ impl ReferenceTarget {
         &'session mut EngineSession,
     ) -> SessionFuture<'session, Result<(), RiftError>>
     + use<> {
-        let path = self.path.clone();
+        let uri = self.uri.clone();
         let language = self.language.clone();
         let source = self.source.clone();
         move |session: &mut EngineSession| {
-            let path = path.clone();
+            let uri = uri.clone();
             let language = language.clone();
             let source = source.clone();
-            Box::pin(async move { session.open(&path, &language, source).await })
+            Box::pin(async move { session.open_uri(&uri, &language, source).await })
         }
     }
 
@@ -1064,11 +1226,11 @@ impl ReferenceTarget {
         &self,
     ) -> impl for<'session> FnMut(&'session mut EngineSession) -> SessionFuture<'session, ()> + use<>
     {
-        let path = self.path.clone();
+        let uri = self.uri.clone();
         move |session: &mut EngineSession| {
-            let path = path.clone();
+            let uri = uri.clone();
             Box::pin(async move {
-                if let Err(error) = session.close(&path).await {
+                if let Err(error) = session.close_uri(&uri).await {
                     rift_tracing::warn!(
                         component = "engine",
                         operation = "textDocument/didClose",
@@ -1098,7 +1260,6 @@ impl ReferenceTarget {
             })
         };
         Ok(Self {
-            path: file.path().clone(),
             language: file.syntax().language().name.clone(),
             uri: TreeRoot::new(workspace_root)
                 .and_then(|root| root.document_uri(file.path()))
@@ -1135,7 +1296,24 @@ async fn references_on_engine(
     target: &ReferenceTarget,
     deadline: Instant,
 ) -> Result<(ReferenceReport, bool), RiftError> {
-    let request_path = target.path.clone();
+    Box::pin(references_on_engine_with_bound(
+        slot,
+        target,
+        deadline,
+        TRAVERSAL_NODES_MAX,
+        None,
+    ))
+    .await
+}
+
+async fn references_on_engine_with_bound(
+    slot: &EngineSlot,
+    target: &ReferenceTarget,
+    deadline: Instant,
+    maximum: usize,
+    requests: Option<query::ProviderRequests>,
+) -> Result<(ReferenceReport, bool), RiftError> {
+    let request_uri = target.uri.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
     let uri = target.uri.clone();
@@ -1143,17 +1321,21 @@ async fn references_on_engine(
     slot.request_settled(
         target.opening(),
         move |session: &mut EngineSession| {
-            let path = request_path.clone();
+            let request_uri = request_uri.clone();
             let uri = uri.clone();
             let canonical_uri = canonical_uri.clone();
+            let requests = requests.clone();
             Box::pin(async move {
                 let encoding = session.capabilities().position_encoding;
                 let position = match encoding {
                     PositionEncoding::Utf8 => utf8,
                     PositionEncoding::Utf16 => utf16,
                 };
-                let mut locations = session.references(&path, position).await?;
-                if locations.len() > TRAVERSAL_NODES_MAX {
+                if let Some(requests) = requests {
+                    requests.claim()?;
+                }
+                let mut locations = session.references_uri(&request_uri, position).await?;
+                if locations.len() > maximum {
                     return Ok(ReferenceReport {
                         locations: Err(locations.len()),
                         encoding,
@@ -1446,7 +1628,7 @@ mod tests {
     }
 
     /// One call hierarchy item naming `name` at `location`.
-    fn item(location: Location, name: &str) -> lsp_types::CallHierarchyItem {
+    pub(super) fn item(location: Location, name: &str) -> lsp_types::CallHierarchyItem {
         lsp_types::CallHierarchyItem {
             name: name.to_owned(),
             kind: lsp_types::SymbolKind::FUNCTION,
@@ -1585,7 +1767,7 @@ mod tests {
             encoding: PositionEncoding::Utf8,
         };
         match crate::callee::callee_file(&CalleeRoots::default(), &[], &caller, call)? {
-            crate::callee::CalleeFile::Package(held) => Ok(held),
+            crate::callee::CalleeFile::Package(held) => Ok(*held),
             _ => Err("a typeshed stub is held for the global API".into()),
         }
     }
@@ -1772,7 +1954,7 @@ mod tests {
         }
     }
 
-    fn reads(root: &std::path::Path) -> Result<ReadService, crate::RiftError> {
+    pub(super) fn reads(root: &std::path::Path) -> Result<ReadService, crate::RiftError> {
         let manifest = root.join("Cargo.toml");
         fs::write(
             &manifest,
@@ -1793,7 +1975,10 @@ mod tests {
         )
     }
 
-    fn python_module_metadata(root: &std::path::Path, modules: &str) -> std::io::Result<()> {
+    pub(super) fn python_module_metadata(
+        root: &std::path::Path,
+        modules: &str,
+    ) -> std::io::Result<()> {
         fs::write(
             root.join("pyproject.toml"),
             format!(
@@ -1802,7 +1987,7 @@ mod tests {
         )
     }
 
-    fn symbol(reads: &ReadService, name: &str) -> SymbolId {
+    pub(super) fn symbol(reads: &ReadService, name: &str) -> SymbolId {
         let params: GetSymbolParams =
             serde_json::from_value(json!({"name": name})).expect("lookup");
         reads.get_symbol(&params).expect("lookup answer").hits[0]
@@ -1816,7 +2001,13 @@ mod tests {
         serde_json::from_value(json!({"target":"symbol","traversal":{"seed":seed,"direction":"incoming","facets":["references"]}})).expect("traversal request")
     }
 
-    fn location(root: &std::path::Path, path: &str, line: u32, start: u32, end: u32) -> Location {
+    pub(super) fn location(
+        root: &std::path::Path,
+        path: &str,
+        line: u32,
+        start: u32,
+        end: u32,
+    ) -> Location {
         let tree = TreeRoot::new(root).expect("tree root");
         let path = ProjectPath::new(path).expect("project path");
         Location {

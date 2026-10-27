@@ -297,6 +297,13 @@ impl<'input> NamespaceInput<'input> {
         self.library
     }
 
+    /// Returns the Cargo library target established by the original package manifest.
+    #[must_use]
+    pub fn library_target(self) -> Option<(rift_core::ProjectPath, String)> {
+        let (path, name) = crate::analyzer::namespace::library(&self)?;
+        Some((rift_core::ProjectPath::new(path).ok()?, name))
+    }
+
     /// Captured build-path observations, or no supplied observations.
     #[must_use]
     pub const fn build_paths(
@@ -355,11 +362,36 @@ impl<'input> NamespaceInput<'input> {
         selected: &std::collections::BTreeSet<rift_core::ProjectPath>,
     ) -> Result<std::collections::BTreeSet<rift_core::ProjectPath>, RiftError> {
         self.validate_count(documents.len())?;
+        if selected.is_empty() {
+            return Ok(std::collections::BTreeSet::new());
+        }
         crate::analyzer::namespace::namespace_paths(
             &self,
             documents,
             contains,
             selected,
+            self.files_max,
+        )
+    }
+
+    /// Requests the bounded literal module closure needed for captured macro scope.
+    ///
+    /// Paths retain the selected package's spelling. This only requests original source
+    /// witnesses; namespace placement still validates those bytes during assembly.
+    ///
+    /// # Errors
+    /// Returns the existing input refusal when source observations exceed the input bound.
+    pub fn namespace_closure_paths(
+        self,
+        documents: &[&crate::IndexedFile],
+        contains: &dyn Fn(&str) -> bool,
+    ) -> Result<std::collections::BTreeSet<rift_core::ProjectPath>, RiftError> {
+        self.validate_count(documents.len())?;
+        crate::analyzer::namespace::namespace_paths(
+            &self,
+            documents,
+            contains,
+            &std::collections::BTreeSet::new(),
             self.files_max,
         )
     }

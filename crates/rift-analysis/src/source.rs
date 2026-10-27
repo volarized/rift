@@ -96,7 +96,7 @@ impl IndexedFile {
         self.executable = executable;
     }
 
-    /// Returns syntax facts without the complete node table.
+    /// Returns captured syntax facts and their recorded complete named tree.
     #[must_use]
     pub fn syntax(&self) -> &SyntaxFacts {
         &self.syntax
@@ -161,7 +161,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn indexed_file_keeps_declaration_node_fact_without_full_node_rows() {
+    fn indexed_file_keeps_complete_nodes_and_declaration_association() {
         let path = ProjectPath::new("src/lib.rs").expect("valid source path");
         let source = "pub fn beacon() {}\n";
         let document = registry::provider_for_extension("rs")
@@ -174,6 +174,7 @@ mod tests {
                 SyntaxLimits::default(),
             )
             .expect("Rust source parses");
+        let expected_nodes = document.nodes().to_vec();
         let symbol_range = document.symbols()[0].range;
         let expected_kind = document
             .nodes()
@@ -194,5 +195,6 @@ mod tests {
         );
 
         assert_eq!(file.syntax().symbols()[0].node_kind, expected_kind);
+        assert_eq!(file.syntax().nodes(), Some(expected_nodes.as_slice()));
     }
 }

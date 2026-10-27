@@ -1,1 +1,13 @@
 crates/rift-cloud-client/src/generated.rs whitespace=-blank-at-eof
+dev/fixtures/sparql-query/w3c-bsd-license.html whitespace=-blank-at-eol
+dev/fixtures/sparql-query/w3c/sparql/sparql11/aggregates/manifest.ttl whitespace=-blank-at-eol
+dev/fixtures/sparql-query/w3c/sparql/sparql11/functions/manifest.ttl whitespace=-blank-at-eol
+dev/fixtures/sparql-query/w3c/sparql/sparql11/functions/if02.srx whitespace=-blank-at-eof
+dev/fixtures/sparql-query/w3c/sparql/sparql11/functions/iri01.srx whitespace=-blank-at-eof
+dev/fixtures/sparql-query/w3c/sparql/sparql11/functions/iri02.srx whitespace=-blank-at-eof
+dev/fixtures/sparql-query/w3c/** -text
+dev/fixtures/sparql-query/w3c-bsd-license.html -text
+dev/fixtures/sparql-query/rift/*.rq -text
+dev/fixtures/sparql-query/reference/rdflib-7.6.0-concat-empty.srj -text
+dev/fixtures/sparql-query/reference/rdflib-7.6.0-optional-bag.srj -text
+dev/fixtures/sparql-query/rift/optional-bag.srj -text

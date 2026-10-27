@@ -28,7 +28,7 @@ mod traversal;
 #[cfg(feature = "collector")]
 pub use analyzer::{
     AnalyzedFile, PackageAnalysis, PackageAnalyzer, PackageLanguage, StubForm,
-    public_qualified_names,
+    public_qualified_names, relationship_facet,
 };
 pub use chunk::{TextChunk, text_chunks};
 pub use enclosing::EnclosingDefinitions;
@@ -43,7 +43,7 @@ pub use input::{
 #[cfg(feature = "collector")]
 pub use input::{NamespaceInput, NamespaceModule, PackageDependency};
 #[cfg(feature = "collector")]
-pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
+pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore, role_facet};
 pub use revision::{
     ManifestError, analyzer_digest, analyzer_manifest_path, analyzer_revision,
     render_analyzer_manifest,

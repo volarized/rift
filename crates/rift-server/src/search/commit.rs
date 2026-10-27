@@ -123,6 +123,59 @@ impl ReadService {
         })
     }
 
+    pub(super) fn capture_commit_search(
+        &self,
+        params: &SearchParams,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<SearchResult, RiftError> {
+        if let Some(conflict) = commit_conflict(params) {
+            return conflict.fail();
+        }
+        let parsed = parsed_query(required_query(params)?)?;
+        search_page_limit(params)?;
+        let stored = self.commit_store()?;
+        let reads = stored.connect()?;
+        reads.begin_snapshot()?;
+        budget.check()?;
+        let matched = matched_commits(&reads, &parsed, self.index().results_max())?;
+        budget.charge(&matched.ids)?;
+        let mut results = Vec::new();
+        for id in &matched.ids {
+            budget.check()?;
+            let hit = commit_hit_with_budget(&reads, id, Some(budget))?.ok_or_else(|| {
+                errors::server::read_unavailable()
+                    .operation("capture commit search")
+                    .detail("matched commit is unavailable in its original history snapshot")
+                    .error()
+            })?;
+            budget.charge_material(size_of::<SearchHit>())?;
+            results.try_reserve_exact(1).map_err(commit_reservation)?;
+            results.push(hit);
+        }
+        let mut warnings: Vec<ReadWarning> = stored
+            .filling(&reads, self.index().root())?
+            .into_iter()
+            .collect();
+        if parsed.is_narrowed() {
+            warnings.push(query_narrowing_warning());
+        }
+        if matched.truncated {
+            warnings.push(results_truncation_warning(self.index().results_max()));
+        }
+        budget.charge(&warnings)?;
+        // Every retained row is owned; dropping the connection ends the read transaction.
+        drop(reads);
+        Ok(SearchResult {
+            view: None,
+            pagination: rift_protocol::read::Pagination {
+                page_index: 0,
+                total_pages: u64::from(!results.is_empty()),
+            },
+            results,
+            warnings,
+        })
+    }
+
     /// The attached history store a commit search reads.
     fn commit_store(&self) -> Result<&StoredHistory, RiftError> {
         if !self.history_configuration().enabled {
@@ -192,6 +245,14 @@ fn append_unseen(
 /// One matched commit as a hit, or `None` when a trim deleted it between the match and
 /// this read.
 pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHit>, RiftError> {
+    commit_hit_with_budget(reads, id, None)
+}
+
+fn commit_hit_with_budget(
+    reads: &StoreReads,
+    id: &str,
+    budget: Option<&mut crate::QueryFactBudget<'_>>,
+) -> Result<Option<SearchHit>, RiftError> {
     let Some(commit) = reads.commit(id)? else {
         return Ok(None);
     };
@@ -199,6 +260,28 @@ pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHi
     let paths_truncated = paths.len() > COMMIT_PATHS_MAX;
     paths.truncate(COMMIT_PATHS_MAX);
     let (message, message_truncated) = bounded_message(&commit.message);
+    if let Some(budget) = budget {
+        budget.check()?;
+        budget.charge_material(size_of::<CommitHit>())?;
+        budget.charge_material(
+            paths
+                .capacity()
+                .checked_mul(size_of::<ProjectPath>())
+                .ok_or_else(|| {
+                    errors::server::read_unavailable()
+                        .operation("capture commit search")
+                        .detail("commit paths exceed the platform bound")
+                        .error()
+                })?,
+        )?;
+        budget.charge(&(
+            &commit.id,
+            message,
+            &commit.author,
+            &commit.committed_at,
+            &paths,
+        ))?;
+    }
     let hit = CommitHit {
         revision: RevisionId(commit.id.clone()),
         message: message.to_owned(),
@@ -231,4 +314,11 @@ pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHi
 fn bounded_message(message: &str) -> (&str, bool) {
     let end = message.floor_char_boundary(COMMIT_MESSAGE_BYTES_MAX);
     (&message[..end], end < message.len())
+}
+
+fn commit_reservation(source: std::collections::TryReserveError) -> RiftError {
+    errors::server::read_unavailable()
+        .operation("capture commit search")
+        .detail(source)
+        .error()
 }

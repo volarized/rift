@@ -7,6 +7,11 @@ pub(crate) fn remote(
     meta: &ResponseMeta,
     problem: Option<&ProblemDetails>,
 ) -> RiftError {
+    if unsupported_operation(operation, meta, problem) {
+        return rift_error::errors::server::read_unsupported()
+            .capability("global relationship operation")
+            .error();
+    }
     let metadata = serde_json::json!({
         "status": meta.status,
         "content_type": meta.content_type,
@@ -51,6 +56,22 @@ pub(crate) fn remote(
             .maybe_problem(problem)
             .error(),
     }
+}
+
+pub(crate) fn unsupported_operation(
+    operation: &str,
+    meta: &ResponseMeta,
+    problem: Option<&ProblemDetails>,
+) -> bool {
+    operation == crate::contract::Endpoint::Search.operation_id()
+        && meta.status == 503
+        && problem.is_some_and(|problem| {
+            problem
+                .additional_properties
+                .get("code")
+                .and_then(serde_json::Value::as_str)
+                == Some("rift.server.read_unsupported")
+        })
 }
 
 pub(crate) fn request_invalid(operation: &str, field: &str, violation: &str) -> RiftError {

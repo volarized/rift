@@ -5,11 +5,10 @@ use rift_protocol::error::{
 };
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeId,
-    NodeRegion, NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole,
-    RelationshipFacet, RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol,
-    SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin, SymbolVersion, SymbolVersionKind,
-    TextRange,
+    Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, NodeId, PackageIdentity,
+    Pagination, ProjectPath, ReadWarning, RelationshipFacet, RevisionId, Signature, SourceKind,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin,
+    SymbolVersion, SymbolVersionKind, TextRange,
 };
 use rift_protocol::search::{
     CommitHit, GraphHop, MatchedField, SearchHit, SearchHitTarget, SearchResult, SymbolChange,
@@ -242,21 +241,6 @@ fn stale_index() -> ReadWarning {
     }
 }
 
-fn node(id: &str, kind: &str, start: u64, end: u64) -> Node {
-    Node {
-        id: NodeId(id.to_owned()),
-        symbol: None,
-        unit: FileId("rift://file/src/lib.rs".to_owned()),
-        language: rust(),
-        kind: ExactKind(kind.to_owned()),
-        facets: Vec::new(),
-        range: range(start, end),
-        regions: Vec::new(),
-        parent: None,
-        extensions: Extensions::default(),
-    }
-}
-
 /// Joins `lines` with a line feed after each, the way the writer ends every line.
 fn text(lines: &[&str]) -> String {
     let mut joined = lines.join("\n");
@@ -346,15 +330,6 @@ fn symbol_result(hits: Vec<GetSymbolHit>, page: Pagination) -> GetSymbolResult {
     GetSymbolResult {
         hits,
         pagination: page,
-        warnings: Vec::new(),
-    }
-}
-
-fn nodes_result(nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
-    NodesResult {
-        view: None,
-        nodes,
-        source: source.into_iter().map(str::to_owned).collect(),
         warnings: Vec::new(),
     }
 }
@@ -709,17 +684,6 @@ fn warnings_follow_the_items_of_the_other_answers() {
     golden(
         &symbols,
         &["0 results", "1 warning", "\tglobal_access_disabled"],
-    );
-    let mut nodes = nodes_result(Vec::new(), Vec::new());
-    nodes.warnings = vec![stale_index(), ReadWarning::GlobalAccessDisabled];
-    golden(
-        &nodes,
-        &[
-            "0 nodes",
-            "2 warnings",
-            "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
-            "\tglobal_access_disabled",
-        ],
     );
 }
 
@@ -2201,7 +2165,6 @@ fn no_line_of_a_sample_of_each_tool_starts_with_a_space() {
     let mut texts = vec![
         rendered(&example::<SearchResult>(0)),
         rendered(&example::<GetSymbolResult>(0)),
-        rendered(&example::<NodesResult>(0)),
         rendered(&error_data(ErrorCode::InternalError, "first")),
         rendered(&search_result(
             vec![readme_hit(), main_hit(), reload_hit()],
@@ -3421,32 +3384,6 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
 }
 
 #[test]
-fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
-    let answer = nodes_result(
-        vec![
-            node("rift://node/rust/lib.rs@0-9#aaaaaaaa", "a · b", 0, 9),
-            node("rift://node/rust/lib.rs@1-8#bbbbbbbb", "c: d", 1, 8),
-            node("rift://node/rust/lib.rs@2-7#cccccccc", "e:f·g", 2, 7),
-        ],
-        vec!["a", "b", "c"],
-    );
-    golden(
-        &answer,
-        &[
-            "3 nodes",
-            "\t[1] \"a · b\"",
-            "\t\trift://node/rust/lib.rs@0-9#aaaaaaaa",
-            "\t[2] \"c: d\"",
-            "\t\trift://node/rust/lib.rs@1-8#bbbbbbbb",
-            "\t[3] e:f·g",
-            "\t\trift://node/rust/lib.rs@2-7#cccccccc",
-            "",
-            "\t\tc",
-        ],
-    );
-}
-
-#[test]
 fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let page: WorkspaceResourcePage = serde_json::from_value(json!({
         "configuration_revision": "3f9a1c2e",
@@ -3670,232 +3607,6 @@ fn control_characters_in_get_symbol_facts_are_escaped_and_source_keeps_its_bytes
         .and_then(|rest| rest.strip_suffix('\n').map(str::to_owned))
         .expect("source closes the single hit");
     assert_eq!(unindented(&written), source);
-}
-
-// Nodes answers.
-
-fn outer_and_inner() -> NodesResult {
-    let outer = node(
-        "rift://node/rust/lib.rs@0-20#aaaaaaaa",
-        "function_item",
-        0,
-        20,
-    );
-    let mut inner = node("rift://node/rust/lib.rs@3-9#bbbbbbbb", "identifier", 3, 9);
-    inner.parent = Some(outer.id.clone());
-    nodes_result(vec![outer, inner], vec!["fn name() {}\n// tail", "name"])
-}
-
-#[test]
-fn an_empty_nodes_answer_writes_only_the_header() {
-    let answer = nodes_result(Vec::new(), Vec::new());
-    golden(&answer, &["0 nodes"]);
-}
-
-#[test]
-fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
-    let answer = nodes_result(
-        vec![node(
-            "rift://node/rust/lib.rs@3-9#bbbbbbbb",
-            "identifier",
-            3,
-            9,
-        )],
-        vec!["name"],
-    );
-    golden(
-        &answer,
-        &[
-            "1 node",
-            "\tidentifier",
-            "\trift://node/rust/lib.rs@3-9#bbbbbbbb",
-            "",
-            "\tname",
-        ],
-    );
-}
-
-#[test]
-fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_innermost_excerpt_is_written()
-{
-    let answer = outer_and_inner();
-    golden(
-        &answer,
-        &[
-            "2 nodes",
-            "\t[1] function_item · 2 lines",
-            "\t\trift://node/rust/lib.rs@0-20#aaaaaaaa",
-            "\t[2] identifier",
-            "\t\trift://node/rust/lib.rs@3-9#bbbbbbbb",
-            "",
-            "\t\tname",
-        ],
-    );
-    assert!(
-        !rendered(&answer).contains("tail"),
-        "the outer excerpt is not written"
-    );
-}
-
-#[test]
-fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
-    let mut item = node(
-        "rift://node/rust/lib.rs@0-20#aaaaaaaa",
-        "function_item",
-        0,
-        20,
-    );
-    item.symbol = Some(SymbolId(A_ID.to_owned()));
-    item.facets = vec![
-        NodeFacet::Declaration,
-        NodeFacet::Test,
-        NodeFacet::Definition,
-        NodeFacet::Generated,
-    ];
-    item.regions = vec![
-        NodeRegion {
-            role: RegionRole::Name,
-            range: range(3, 4),
-        },
-        NodeRegion {
-            role: RegionRole::Body,
-            range: range(8, 20),
-        },
-    ];
-    let mut plain = node("rift://node/rust/lib.rs@9-10#bbbbbbbb", "block", 9, 10);
-    plain.facets = vec![NodeFacet::Body, NodeFacet::Block];
-    golden(
-        &nodes_result(vec![item, plain], vec!["fn a() {\n    b\n}", "{"]),
-        &[
-            "2 nodes",
-            "\t[1] function_item · 3 lines · generated · test",
-            "\t\trift://node/rust/lib.rs@0-20#aaaaaaaa",
-            "\t\trift://symbol/local/rust/app/a/A",
-            "\t\tname 3..4 · body 8..20",
-            "\t[2] block",
-            "\t\trift://node/rust/lib.rs@9-10#bbbbbbbb",
-            "",
-            "\t\t{",
-        ],
-    );
-}
-
-#[test]
-fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
-    let nodes = vec![
-        node("rift://node/rust/lib.rs@0-1#aaaaaaaa", "a", 0, 1),
-        node("rift://node/rust/lib.rs@1-2#bbbbbbbb", "b", 1, 2),
-        node("rift://node/rust/lib.rs@2-3#cccccccc", "c", 2, 3),
-        node("rift://node/rust/lib.rs@3-4#dddddddd", "d", 3, 4),
-    ];
-    golden(
-        &nodes_result(nodes, vec!["", "x\n", "x\ny\n", "z"]),
-        &[
-            "4 nodes",
-            "\t[1] a",
-            "\t\trift://node/rust/lib.rs@0-1#aaaaaaaa",
-            "\t[2] b",
-            "\t\trift://node/rust/lib.rs@1-2#bbbbbbbb",
-            "\t[3] c · 2 lines",
-            "\t\trift://node/rust/lib.rs@2-3#cccccccc",
-            "\t[4] d",
-            "\t\trift://node/rust/lib.rs@3-4#dddddddd",
-            "",
-            "\t\tz",
-        ],
-    );
-}
-
-#[test]
-fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
-    let answer = nodes_result(
-        vec![node("rift://node/rust/lib.rs@0-1#aaaaaaaa", "a", 0, 1)],
-        vec![""],
-    );
-    assert_eq!(
-        rendered(&answer),
-        text(&[
-            "1 node",
-            "\ta",
-            "\trift://node/rust/lib.rs@0-1#aaaaaaaa",
-            "",
-            ""
-        ])
-    );
-}
-
-#[test]
-fn warnings_follow_the_innermost_excerpt_of_the_nodes() {
-    let mut answer = outer_and_inner();
-    answer.warnings = vec![stale_index()];
-    golden(
-        &answer,
-        &[
-            "2 nodes",
-            "\t[1] function_item · 2 lines",
-            "\t\trift://node/rust/lib.rs@0-20#aaaaaaaa",
-            "\t[2] identifier",
-            "\t\trift://node/rust/lib.rs@3-9#bbbbbbbb",
-            "",
-            "\t\tname",
-            "1 warning",
-            "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
-        ],
-    );
-}
-
-#[test]
-fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
-    let excerpt = "````rust\n```\n! stale_index\n2 nodes\n[1] fake\n\tnested\n````";
-    let nodes = vec![node("rift://node/rust/lib.rs@0-9#aaaaaaaa", "a", 0, 9)];
-    let single = nodes_result(nodes, vec![excerpt]);
-    golden(
-        &single,
-        &[
-            "1 node",
-            "\ta · 7 lines",
-            "\trift://node/rust/lib.rs@0-9#aaaaaaaa",
-            "",
-            "\t````rust",
-            "\t```",
-            "\t! stale_index",
-            "\t2 nodes",
-            "\t[1] fake",
-            "\t\tnested",
-            "\t````",
-        ],
-    );
-    let two = nodes_result(
-        vec![
-            node("rift://node/rust/lib.rs@0-9#aaaaaaaa", "a", 0, 9),
-            node("rift://node/rust/lib.rs@1-9#bbbbbbbb", "b", 1, 9),
-        ],
-        vec!["x", excerpt],
-    );
-    let output = rendered(&two);
-    assert_no_trailing_space(&output);
-    let block: Vec<&str> = output.lines().skip(6).collect();
-    assert_eq!(block.len(), 7);
-    let recovered: Vec<&str> = block
-        .iter()
-        .map(|line| line.strip_prefix("\t\t").unwrap_or(line))
-        .collect();
-    assert_eq!(recovered.join("\n"), excerpt);
-}
-
-#[test]
-fn nodes_and_excerpts_that_differ_in_length_are_refused() {
-    let one_node = || vec![node("rift://node/rust/lib.rs@0-1#aaaaaaaa", "a", 0, 1)];
-    for answer in [
-        nodes_result(one_node(), Vec::new()),
-        nodes_result(Vec::new(), vec!["extra"]),
-        nodes_result(one_node(), vec!["a", "b"]),
-    ] {
-        assert_eq!(
-            text_of(&answer),
-            Err(TextError::Unsupported("nodes and source differ in length"))
-        );
-    }
 }
 
 // Failures.
@@ -4154,7 +3865,6 @@ fn identities_are_written_whole_and_hashes_are_cut() {
     let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService~2?rev=0000000000000000000000000000000000000000000000000000000000000000";
     let node_id = "rift://node/rust/src/config.rs@218-355#67ecfb36";
     let unit = "rift://source/project/packages/@scope/name/package.json";
-    let file = "rift://file/src/dir%20name/lib.rs";
     let mut hit = search_hit(symbol_target(Some(symbol_id), "ReadService"));
     hit.unit = Some(source_unit(unit));
     let search = rendered(&only_page(vec![hit]));
@@ -4172,39 +3882,10 @@ fn identities_are_written_whole_and_hashes_are_cut() {
         get_symbol.lines().any(|line| line == entry(symbol_id)),
         "{get_symbol}"
     );
-    let mut node_item = node(node_id, "function_item", 0, 1);
-    node_item.unit = FileId(file.to_owned());
-    let nodes = rendered(&nodes_result(vec![node_item], vec!["x"]));
-    assert!(nodes.lines().any(|line| line == entry(node_id)), "{nodes}");
     let mut commit = commit_hit();
     commit.revision = RevisionId("main^2".to_owned());
     let by_branch = rendered(&commit_answer(commit));
     assert!(by_branch.contains("\n\tmain^2 · "), "{by_branch}");
-}
-
-/// The authored `nodes` example, rendered unmodified.
-#[test]
-fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_source() {
-    golden(
-        &example::<NodesResult>(0),
-        &[
-            "5 nodes",
-            "\t[1] source_file · 14 lines",
-            "\t\trift://node/rust/src/config.rs@0-356#dcbef6dd",
-            "\t[2] function_item · 4 lines",
-            "\t\trift://node/rust/src/config.rs@218-355#67ecfb36",
-            "\t\trift://symbol/local/rust/app/config/load_config",
-            "\t\tname 225..236 · body 281..355",
-            "\t[3] block · 4 lines",
-            "\t\trift://node/rust/src/config.rs@281-355#4e554fa8",
-            "\t[4] call_expression",
-            "\t\trift://node/rust/src/config.rs@334-353#4df4426e",
-            "\t[5] identifier",
-            "\t\trift://node/rust/src/config.rs@334-346#03f22dac",
-            "",
-            "\t\tparse_config",
-        ],
-    );
 }
 
 // Limits.
@@ -4233,7 +3914,6 @@ fn an_answer_over_the_byte_limit_yields_no_text() {
 fn the_compact_text_of_every_authored_example_is_shorter_in_bytes_than_its_json_text() {
     assert_text_shorter_than_json::<SearchResult>();
     assert_text_shorter_than_json::<GetSymbolResult>();
-    assert_text_shorter_than_json::<NodesResult>();
 }
 
 // StatsAlloc is used only by this ignored measurement; run it alone in a release build.
@@ -4400,24 +4080,6 @@ fn output_allocation_cost() {
 
     measure_allocations::<SearchResult>("search");
     measure_allocations::<GetSymbolResult>("get_symbol");
-    measure_allocations::<NodesResult>("nodes");
-}
-
-#[test]
-fn nodes_captured_view_renders_original_key_and_expiry() {
-    let mut answer = nodes_result(Vec::new(), Vec::new());
-    answer.view = Some(rift_protocol::symbol_read::CapturedView {
-        id: rift_protocol::symbol_read::CapturedViewId::parse("claims.nodes")
-            .expect("issued fixture key"),
-        expires_at: "2030-01-01T00:15:00Z".to_owned(),
-    });
-    let text = rendered(&answer);
-    assert!(
-        text.contains("view claims.nodes · expires 2030-01-01T00:15:00Z"),
-        "{text}"
-    );
-    answer.view = None;
-    assert!(!rendered(&answer).contains("view "));
 }
 
 #[test]
@@ -4509,32 +4171,4 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
     let text = rendered(&unavailable);
     assert!(text.contains("unavailable · ViewExpired"));
     assert!(!text.contains("symbol_not_found"));
-}
-
-#[test]
-fn canonical_source_render_keeps_utf8_bytes_and_original_view() {
-    use rift_protocol::source_read::GetSourceResult;
-    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
-    let unit = SourceUnitId::parse("rift://source/project/src/lib.rs").expect("modeled source");
-    let text = "// café\nstruct A;\n";
-    let answer = GetSourceResult::Found {
-        source: rift_protocol::read::SourceExcerpt {
-            span: rift_protocol::read::SourceUnitSpan {
-                unit: unit.clone(),
-                range: range(0, text.len() as u64),
-            },
-            text: text.to_owned(),
-        },
-        source_complete: true,
-        view: CapturedView {
-            id: CapturedViewId::parse("claims.signature").expect("view"),
-            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
-        },
-        warnings: Vec::new(),
-    };
-    let output = rendered(&answer);
-    assert!(output.contains(unit.as_str()));
-    assert!(output.contains("// café\n\tstruct A;\n"));
-    assert!(output.contains(&format!("0..{}", text.len())));
-    assert!(output.contains("view claims.signature · expires 2030-01-01T00:10:00+00:00"));
 }

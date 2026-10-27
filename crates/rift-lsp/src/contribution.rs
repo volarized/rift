@@ -223,7 +223,7 @@ impl LspContributionAdapter {
                 })?,
             )
             .source(binding)
-            .namespaced(Extensions(extensions));
+            .namespaced(Extensions::from(extensions));
             if let Some(target) = syntax_matches.get(&symbol.address) {
                 builder = builder.equivalence(vec![EquivalenceEvidence::Explicit(target.clone())]);
             }
@@ -628,7 +628,6 @@ mod tests {
         assert_eq!(
             contribution
                 .namespaced()
-                .0
                 .get(&rift_core::ExtensionKey("org.lsp.symbol".to_owned()))
                 .expect("LSP data")
                 .data["container_name"],

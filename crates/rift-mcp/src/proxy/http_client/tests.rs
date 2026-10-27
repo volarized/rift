@@ -108,9 +108,11 @@ fn full_json_rpc_envelope_counts_escaping_before_allocation() {
     let mut buffer = MessageBuffer::new(4);
     buffer.write_all(b"abc").expect("within limit");
     assert!(buffer.write_all(b"de").is_err());
-    assert_eq!(buffer.bytes, b"abc", "crossing chunk never appended");
-    assert_eq!(next_length(usize::MAX, 1, usize::MAX), None);
-    assert_eq!(next_length(3, 1, 4), Some(4));
+    assert_eq!(buffer.as_bytes(), b"abc", "crossing chunk never appended");
+    assert_eq!(
+        encode_message(&message, expected.len()).expect("transport wrapper"),
+        rift_protocol::message::encode_bounded(&message, expected.len()).expect("shared owner")
+    );
 }
 
 #[tokio::test]

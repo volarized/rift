@@ -47,13 +47,17 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
         .as_ref()
         .ok_or("the result must carry structured content")?;
     let verdict = match tool {
+        SEARCH_TOOL | NODES_TOOL
+            if structured.get("answer").is_some() || structured["outcome"] == "unavailable" =>
+        {
+            query_text_states(text, structured)
+        }
         SEARCH_TOOL => layout::text_states(Tool::Search, text, structured),
         GET_SYMBOL_TOOL if structured.get("outcome").is_some() => {
             canonical_text_states(text, structured)
         }
-        "get_source" => source_text_states(text, structured),
         GET_SYMBOL_TOOL => layout::text_states(Tool::GetSymbol, text, structured),
-        NODES_TOOL => layout::text_states(Tool::Nodes, text, structured),
+        NODES_TOOL => Err("nodes must carry a query result".to_owned()),
         other => Err(format!("no text check for the tool `{other}`")),
     };
     verdict.map_err(|failure| format!("{failure}\n--- text ---\n{text}"))
@@ -125,28 +129,6 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
     view_text(text, structured)
 }
 
-fn source_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
-    if structured["outcome"] == "found" {
-        token(
-            text,
-            &structured["source"]["span"]["unit"],
-            "$.source.span.unit",
-        )?;
-        source_lines(text, &structured["source"]["text"], "\t")?;
-        let range = format!(
-            "{}..{}",
-            structured["source"]["span"]["range"]["start"],
-            structured["source"]["span"]["range"]["end"]
-        );
-        if !text.contains(&range) {
-            return Err("$.source.span.range".to_owned());
-        }
-    } else {
-        token(text, &structured["unit"], "$.unit")?;
-    }
-    view_text(text, structured)
-}
-
 fn token(text: &str, value: &serde_json::Value, at: &str) -> Result<(), String> {
     let value = value.as_str().ok_or_else(|| at.to_owned())?;
     if !text.contains(value) {
@@ -165,6 +147,121 @@ fn source_lines(text: &str, value: &serde_json::Value, indent: &str) -> Result<(
         }
     }
     Ok(())
+}
+
+fn query_continuation_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+    let continuations = text
+        .lines()
+        .filter_map(|line| line.strip_prefix("next_query "))
+        .collect::<Vec<_>>();
+    match (
+        structured["pagination"]["next_query"].as_str(),
+        continuations.as_slice(),
+    ) {
+        (Some(expected), [encoded]) => {
+            let actual =
+                serde_json::from_str::<String>(encoded).map_err(|error| error.to_string())?;
+            if actual != expected {
+                return Err("$.pagination.next_query differs".into());
+            }
+        }
+        (None, []) => {}
+        _ => return Err("$.pagination.next_query missing or repeated".into()),
+    }
+    Ok(())
+}
+
+/// Parses the existing compact query rows without changing RDF terms or row order.
+pub(crate) fn query_rows(text: &str) -> Result<Vec<serde_json::Value>, String> {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with('{'))
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line.trim())
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// Checks independently parsed JSON rows and the published query result metadata.
+fn query_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
+    if structured["outcome"] == "unavailable" {
+        if !text.contains("unavailable") {
+            return Err("$.outcome unavailable".into());
+        }
+    } else {
+        let answer = &structured["answer"];
+        match answer["result"].as_str() {
+            Some("boolean") => {
+                let value = text
+                    .lines()
+                    .next()
+                    .ok_or("boolean text")?
+                    .trim()
+                    .parse::<bool>()
+                    .map_err(|_| "boolean text value")?;
+                if Some(value) != answer["value"].as_bool() {
+                    return Err("$.answer.value".into());
+                }
+            }
+            Some(form @ ("bindings" | "graph")) => {
+                let key = if form == "bindings" {
+                    "bindings"
+                } else {
+                    "triples"
+                };
+                let expected = answer[key].as_array().ok_or("query result array")?;
+                let parsed = query_rows(text)?;
+                if &parsed != expected {
+                    return Err(format!("$.answer.{key}: text rows differ"));
+                }
+                let title = text.lines().next().ok_or("query title")?;
+                let count = title
+                    .split_whitespace()
+                    .next()
+                    .ok_or("query item count")?
+                    .parse::<usize>()
+                    .map_err(|_| "query item count")?;
+                if count != expected.len() {
+                    return Err("query item count differs".into());
+                }
+                let page = title.split_whitespace().last().ok_or("query page title")?;
+                let (index, pages) = page.split_once('/').ok_or("query page title")?;
+                if index
+                    .parse::<u64>()
+                    .map_err(|_| "query page index")?
+                    .checked_sub(1)
+                    != structured["pagination"]["page_index"].as_u64()
+                    || pages.parse::<u64>().map_err(|_| "query page count")?
+                        != structured["pagination"]["total_pages"]
+                            .as_u64()
+                            .ok_or("query page count")?
+                {
+                    return Err("query pagination differs".into());
+                }
+                if form == "bindings" {
+                    let variables = answer["variables"]
+                        .as_array()
+                        .ok_or("query variables")?
+                        .iter()
+                        .map(|value| value.as_str().ok_or("query variable"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if !variables.is_empty()
+                        && !text
+                            .lines()
+                            .any(|line| line.split_whitespace().collect::<Vec<_>>() == variables)
+                    {
+                        return Err("query variable order differs".into());
+                    }
+                }
+            }
+            _ => return Err("$.answer.result".into()),
+        }
+    }
+    query_continuation_text(text, structured)?;
+    for warning in structured["warnings"].as_array().into_iter().flatten() {
+        token(text, &warning["code"], "$.warnings.code")?;
+    }
+    view_text(text, structured)
 }
 
 fn view_text(text: &str, structured: &serde_json::Value) -> Result<(), String> {
@@ -202,15 +299,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_source_keeps_one_layout_tab_and_original_bytes() {
-        let source = json!("    pub fn beacon() {}\n");
-        let text = "\t    pub fn beacon() {}\n";
-        assert_eq!(source_lines(text, &source, "\t"), Ok(()));
-        assert!(source_lines(&text.replace("beacon", "changed"), &source, "\t").is_err());
-        assert!(source_lines(&text.replacen('\t', "\t\t", 1), &source, "\t").is_err());
-    }
-
-    #[test]
     fn a_result_without_structured_content_or_text_is_refused() {
         let no_structured = CallToolResult::success(vec![ContentBlock::text("0 nodes\n")]);
         let no_content = CallToolResult::success(Vec::new());
@@ -239,7 +327,55 @@ mod tests {
         assert!(text_states(GET_SYMBOL_TOOL, &search).is_err());
         assert!(text_states(NODES_TOOL, &search).is_err());
         let nodes = result_of("0 nodes\n", json!({ "nodes": [], "source": [] }));
-        assert_eq!(text_states(NODES_TOOL, &nodes), Ok(()));
-        assert!(text_states(SEARCH_TOOL, &nodes).is_err());
+        assert!(text_states(NODES_TOOL, &nodes).is_err());
+        let answer = result_of(
+            "true\n",
+            json!({
+                "answer": { "result": "boolean", "value": true },
+                "pagination": { "page_index": 0, "total_pages": 1 },
+                "warnings": []
+            }),
+        );
+        assert_eq!(text_states(NODES_TOOL, &answer), Ok(()));
+        assert_eq!(text_states(SEARCH_TOOL, &answer), Ok(()));
+    }
+
+    #[test]
+    fn nodes_query_requires_its_exact_captured_view_and_original_expiry() {
+        let structured = json!({
+            "answer": { "result": "boolean", "value": true },
+            "pagination": { "page_index": 0, "total_pages": 1 },
+            "warnings": [],
+            "view": { "id": "claims.nodes", "expires_at": "2030-01-01T00:15:00Z" }
+        });
+        let original = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
+        assert_eq!(
+            text_states(NODES_TOOL, &result_of(original, structured.clone())),
+            Ok(())
+        );
+        for text in [
+            "true\n",
+            "true\nview claims.other · expires 2030-01-01T00:15:00Z\n",
+            "true\nview claims.nodes · expires 2030-01-01T00:16:00Z\n",
+        ] {
+            assert!(text_states(NODES_TOOL, &result_of(text, structured.clone())).is_err());
+        }
+    }
+
+    #[test]
+    fn query_captured_view_does_not_replace_required_warning() {
+        let structured = json!({
+            "answer": { "result": "boolean", "value": true },
+            "pagination": { "page_index": 0, "total_pages": 1 },
+            "warnings": [{ "code": "stale_index", "detail": "index lags" }],
+            "view": { "id": "claims.nodes", "expires_at": "2030-01-01T00:15:00Z" }
+        });
+        let missing = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
+        assert!(text_states(NODES_TOOL, &result_of(missing, structured.clone())).is_err());
+        let complete = "true\n1 warning\n\tstale_index: index lags\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
+        assert_eq!(
+            text_states(NODES_TOOL, &result_of(complete, structured)),
+            Ok(())
+        );
     }
 }

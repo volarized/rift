@@ -914,7 +914,7 @@ fn convert_extensions(value: Option<&Value>) -> Result<rift_protocol::read::Exte
             rift_protocol::read::ExtensionValue { version, data },
         );
     }
-    Ok(rift_protocol::read::Extensions(extensions))
+    Ok(rift_protocol::read::Extensions::from(extensions))
 }
 
 fn invalid(field: &'static str) -> RiftError {
@@ -1281,7 +1281,7 @@ mod tests {
             symbol.signatures[0].parameters[0].name.as_deref(),
             Some("value")
         );
-        assert_eq!(symbol.extensions.0.len(), 1);
+        assert_eq!(symbol.extensions.len(), 1);
     }
 
     #[test]

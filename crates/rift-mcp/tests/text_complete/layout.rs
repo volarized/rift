@@ -1,16 +1,16 @@
-//! Check of what the compact text of a `search`, `get_symbol`, or `nodes` answer promises.
+//! Check of what the compact text of a retrieval or symbol answer promises.
 //!
 //! The text is a curated layout, so it does not state every field of the structured answer: the
 //! normal state is implicit. This check asserts only what `crates/rift-mcp/src/output/render.rs`
-//! and `render/{layout,facts,search,symbol,nodes,warning}.rs` write for the exceptional state, and
+//! and `render/{layout,facts,search,symbol,warning}.rs` write for the exceptional state, and
 //! never asserts the absence of other text.
 //!
 //! The text is a sequence of counted sections. A section is a title at column 0, then its
 //! entries indented by one level. Any non-empty line at column 0 is a title. A level is one tab.
 //!
-//! - Items section, always first: the title is `N result` or `N results` (`N node` or `N nodes`
-//!   for `nodes`), then ` · page P/T` when `total_pages > 1` or the page lies past the end. A
-//!   `nodes` answer has no page. No blank line follows the title or separates two items.
+//! - Items section, always first: the title is `N result` or `N results`, then ` · page P/T`
+//!   when `total_pages > 1` or the page lies past the end. No blank line follows the title or
+//!   separates two items.
 //! - Warnings section, second and only when the answer has warnings: the title `N warning` or
 //!   `N warnings`, then one line per warning at one level that opens with its `code`. Without
 //!   warnings the text has no second section.
@@ -27,10 +27,6 @@
 //! - Per `get_symbol` hit: the location line, the symbol identity, every history version, the
 //!   `history (incomplete):` label exactly when the history is incomplete, and the source.
 //!   A single-item answer ends its items section with its source.
-//! - Per `nodes` entry: the kind on the head line, ` · <L> lines` exactly when the excerpt has
-//!   more than one line, `generated` and `test` when the facet holds, the node identity on the
-//!   next line, the symbol identity and the regions line when present. The innermost excerpt ends
-//!   the items section, line by line, after one blank line; outer excerpts are not checked.
 
 mod walk;
 
@@ -61,15 +57,12 @@ const MESSAGE_TRUNCATED_LINE: &str = "message truncated";
 const PATHS_TRUNCATED_TAIL: &str = "+ paths · truncated";
 /// Noun counted by the title of the warnings section.
 const WARNING_NOUN: &str = "warning";
-/// Facets of a node that the head line states.
-const NODE_FACT_FACETS: [&str; 2] = ["generated", "test"];
 
 /// The tool whose answer the text states.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Tool {
     Search,
     GetSymbol,
-    Nodes,
 }
 
 impl Tool {
@@ -78,7 +71,6 @@ impl Tool {
         match self {
             Self::Search => "results",
             Self::GetSymbol => "hits",
-            Self::Nodes => "nodes",
         }
     }
 
@@ -86,7 +78,6 @@ impl Tool {
     fn noun(self) -> &'static str {
         match self {
             Self::Search | Self::GetSymbol => "result",
-            Self::Nodes => "node",
         }
     }
 }
@@ -163,16 +154,11 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
         rest
     };
     warnings_states(rest, structured.get("warnings"))?;
-    items_states(tool, &first.entries, items, structured)
+    items_states(tool, &first.entries, items)
 }
 
 /// Checks the items section: its markers, indents, blank lines, every item, and the walk tree.
-fn items_states(
-    tool: Tool,
-    entries: &[&str],
-    items: &[Value],
-    structured: &Value,
-) -> Result<(), String> {
+fn items_states(tool: Tool, entries: &[&str], items: &[Value]) -> Result<(), String> {
     let key = tool.items_key();
     require(entries.first() != Some(&""), &format!("$.{key}"), || {
         "no blank line may follow the title".to_owned()
@@ -183,7 +169,7 @@ fn items_states(
     let chunks = chunk_items(&item_entries, listed.len(), key)?;
     for ((index, hit), chunk) in listed.iter().zip(&chunks) {
         let at = format!("$.{key}[{index}]");
-        let may_end_blank = may_end_blank(tool, hit, structured, *index, items.len());
+        let may_end_blank = source_may_end_blank(hit.get("source"));
         require(
             may_end_blank || chunk.len() < 2 || chunk.last() != Some(&""),
             &at,
@@ -193,28 +179,13 @@ fn items_states(
         match tool {
             Tool::Search => search_hit(&item, hit, &at)?,
             Tool::GetSymbol => symbol_hit(&item, hit, &at)?,
-            Tool::Nodes => node_entry(&item, hit, structured, *index, &at)?,
         }
     }
     plan.states(&nodes)?;
     match tool {
         Tool::Search => Ok(()),
         Tool::GetSymbol => single_symbol_ends_with_source(entries, items),
-        Tool::Nodes => innermost_ends_section(entries, structured, items.len()),
     }
-}
-
-/// Whether the text of item `index` may end in an empty line.
-///
-/// That is the case when the source the item writes last is empty or ends in a line feed. A
-/// `nodes` answer writes only the innermost excerpt, so only its last item may.
-fn may_end_blank(tool: Tool, hit: &Value, structured: &Value, index: usize, count: usize) -> bool {
-    let source = match tool {
-        Tool::Nodes if index + 1 == count => structured.pointer(&format!("/source/{index}")),
-        Tool::Nodes => None,
-        Tool::Search | Tool::GetSymbol => hit.get("source"),
-    };
-    source_may_end_blank(source)
 }
 
 /// Whether a hit with this `source` may end in an empty line: the source is empty or ends in a
@@ -294,13 +265,6 @@ fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Re
         &format!("$.{}", tool.items_key()),
         || format!("the title must open with `{counted}`, got `{title}`"),
     )?;
-    if tool == Tool::Nodes {
-        return require(
-            facts.next().is_none(),
-            &format!("$.{}", tool.items_key()),
-            || format!("a nodes title states no page, got `{title}`"),
-        );
-    }
     let number = |name: &str| {
         structured
             .pointer(&format!("/pagination/{name}"))
@@ -840,122 +804,6 @@ fn version_states(entry: Option<&str>, version: &Value, at: &str) -> Result<(), 
         })?;
     }
     Ok(())
-}
-
-/// Checks one `nodes` entry against its lines: head, identity, symbol, and regions.
-fn node_entry(
-    item: &Item<'_>,
-    node: &Value,
-    structured: &Value,
-    index: usize,
-    at: &str,
-) -> Result<(), String> {
-    let id = text_at(node, "/id").ok_or_else(|| format!("{at}.id: must be a string"))?;
-    let excerpt = structured
-        .pointer(&format!("/source/{index}"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("$.source[{index}]: must be a string"))?;
-    node_head_states(item, node, excerpt, (at, &format!("$.source[{index}]")))?;
-    require(item.plain(1) == id, &format!("{at}.id"), || {
-        format!("the second line must be `{id}`, got `{}`", item.plain(1))
-    })?;
-    if let Some(symbol) = text_at(node, "/symbol") {
-        require(item.has_line(symbol), &format!("{at}.symbol"), || {
-            format!("no line equals the symbol `{symbol}`")
-        })?;
-    }
-    regions_states(item, node, at)
-}
-
-/// Checks the head line: the kind, the line count, and the `generated` and `test` facts.
-///
-/// `(at, excerpt_at)` are the JSON paths of the node and of its excerpt.
-fn node_head_states(
-    item: &Item<'_>,
-    node: &Value,
-    excerpt: &str,
-    (at, excerpt_at): (&str, &str),
-) -> Result<(), String> {
-    let kind = text_at(node, "/kind").ok_or_else(|| format!("{at}.kind: must be a string"))?;
-    let head: Vec<&str> = item.plain(0).split(SEPARATOR).collect();
-    let kind = visible(kind);
-    require(head.first() == Some(&kind.as_str()), at, || {
-        format!("the head line must open with the kind `{kind}`, got {head:?}")
-    })?;
-    let count = excerpt.lines().count();
-    let counted = format!("{count} lines");
-    require(
-        head.contains(&counted.as_str()) == (count > 1),
-        excerpt_at,
-        || format!("`{counted}` must appear exactly when the excerpt has several lines: {head:?}"),
-    )?;
-    let facet_list = node.get("facets").and_then(Value::as_array);
-    for name in NODE_FACT_FACETS {
-        let holds = facet_list
-            .into_iter()
-            .flatten()
-            .any(|facet| facet.as_str() == Some(name));
-        require(
-            head.iter().skip(1).any(|fact| *fact == name) == holds,
-            &format!("{at}.facets"),
-            || format!("`{name}` must appear exactly when the facet holds: {head:?}"),
-        )?;
-    }
-    Ok(())
-}
-
-/// Checks the regions line: `<role> <START>..<END>` per region, joined by ` · `.
-fn regions_states(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String> {
-    let regions: Vec<String> = node
-        .get("regions")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|region| {
-            let number = |name: &str| region.pointer(&format!("/range/{name}"))?.as_u64();
-            Some(format!(
-                "{} {}..{}",
-                text_at(region, "/role")?,
-                number("start")?,
-                number("end")?
-            ))
-        })
-        .collect::<Option<_>>()
-        .ok_or_else(|| format!("{at}.regions: each region needs a role and a range"))?;
-    if regions.is_empty() {
-        return Ok(());
-    }
-    let line = regions.join(SEPARATOR);
-    require(item.has_line(&line), &format!("{at}.regions"), || {
-        format!("no line equals the regions `{line}`")
-    })
-}
-
-/// Checks that the items section ends with the innermost excerpt, after one blank line.
-///
-/// The innermost node is the last. Its lines carry the item indent. An answer without nodes
-/// has no excerpt.
-fn innermost_ends_section(
-    entries: &[&str],
-    structured: &Value,
-    count: usize,
-) -> Result<(), String> {
-    let Some(last) = count.checked_sub(1) else {
-        return Ok(());
-    };
-    let at = format!("$.source[{last}]");
-    let excerpt = structured
-        .pointer(&format!("/source/{last}"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{at}: must be a string"))?;
-    let levels = item_indent(count > 1);
-    let mut expected = vec![String::new()];
-    expected.extend(indented_lines(excerpt, levels));
-    require(ends_with_lines(entries, &expected), &at, || {
-        format!(
-            "the items section must end with a blank line and the excerpt indented by {levels} levels"
-        )
-    })
 }
 
 #[cfg(test)]
@@ -2217,185 +2065,5 @@ mod tests {
         assert_eq!(cut_hash("0123456789abcdef"), "01234567");
         assert_eq!(cut_hash("main"), "main");
         assert_eq!(cut_hash("0123456"), "0123456");
-    }
-
-    /// A `nodes` answer: an outer node with a symbol, regions, and facets, and an inner node.
-    fn nodes_answer() -> Value {
-        json!({
-            "nodes": [
-                {
-                    "id": "rift://node/rust/a.rs@0-20#aaaaaaaa",
-                    "symbol": "rift://symbol/rust/a.rs/A",
-                    "kind": "function_item",
-                    "facets": ["declaration", "test", "generated"],
-                    "range": { "start": 0, "end": 20 },
-                    "regions": [
-                        { "role": "name", "range": { "start": 3, "end": 4 } },
-                        { "role": "body", "range": { "start": 8, "end": 20 } }
-                    ]
-                },
-                {
-                    "id": "rift://node/rust/a.rs@3-9#bbbbbbbb",
-                    "kind": "identifier",
-                    "range": { "start": 3, "end": 9 }
-                }
-            ],
-            "source": ["fn a() {\n    b\n}\n// tail", "a\n\nb"],
-            "warnings": [{ "code": "stale_index", "detail": "index lags" }]
-        })
-    }
-
-    /// The text the layout writes for [`nodes_answer`].
-    const NODES_TEXT: &str = "\
-2 nodes
-\t[1] function_item · 4 lines · generated · test
-\t\trift://node/rust/a.rs@0-20#aaaaaaaa
-\t\trift://symbol/rust/a.rs/A
-\t\tname 3..4 · body 8..20
-\t[2] identifier · 3 lines
-\t\trift://node/rust/a.rs@3-9#bbbbbbbb
-
-\t\ta
-
-\t\tb
-1 warning
-\tstale_index: index lags
-";
-
-    /// Asserts the failure of the nodes text edited by `from` to `to` names `path`.
-    fn nodes_refusal(from: &str, to: &str, path: &str) -> Result<(), String> {
-        let text = edited(NODES_TEXT, from, to)?;
-        let failure = refused(Tool::Nodes, &text, &nodes_answer())?;
-        assert!(failure.contains(path), "{path} not in {failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn the_layout_text_of_nodes_passes() {
-        assert_eq!(
-            text_states(Tool::Nodes, NODES_TEXT, &nodes_answer()),
-            Ok(())
-        );
-    }
-
-    #[test]
-    fn one_node_has_no_marker_and_no_indent() {
-        let answer = json!({
-            "nodes": [{
-                "id": "rift://node/rust/a.rs@3-9#bbbbbbbb",
-                "kind": "identifier",
-                "range": { "start": 3, "end": 9 }
-            }],
-            "source": ["name"]
-        });
-        let text = "1 node\n\tidentifier\n\trift://node/rust/a.rs@3-9#bbbbbbbb\n\n\tname\n";
-        assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
-        let indented = text.replace("\n\tname\n", "\n\t\tname\n");
-        assert!(text_states(Tool::Nodes, &indented, &answer).is_err());
-    }
-
-    #[test]
-    fn an_empty_nodes_answer_needs_only_its_header() {
-        let answer = json!({ "nodes": [], "source": [] });
-        assert_eq!(text_states(Tool::Nodes, "0 nodes\n", &answer), Ok(()));
-        assert!(text_states(Tool::Nodes, "1 node\n", &answer).is_err());
-    }
-
-    #[test]
-    fn a_wrong_node_count_or_a_page_in_the_header_is_refused() -> Result<(), String> {
-        nodes_refusal("2 nodes", "3 nodes", "$.nodes")?;
-        nodes_refusal("2 nodes", "2 results", "$.nodes")
-    }
-
-    #[test]
-    fn a_node_head_states_its_kind_and_identity_in_order() -> Result<(), String> {
-        nodes_refusal("[1] function_item", "[1] block", "$.nodes[0]")?;
-        nodes_refusal("#aaaaaaaa", "#cccccccc", "$.nodes[0].id")?;
-        nodes_refusal("[2] identifier", "[2] function_item", "$.nodes[1]")?;
-        nodes_refusal("#bbbbbbbb", "#cccccccc", "$.nodes[1].id")?;
-        nodes_refusal("\t\trift://symbol/rust/a.rs/A\n", "", "$.nodes[0].symbol")?;
-        nodes_refusal("\t\tname 3..4 · body 8..20\n", "", "$.nodes[0].regions")?;
-        nodes_refusal("name 3..4", "name 3..5", "$.nodes[0].regions")
-    }
-
-    #[test]
-    fn the_line_count_and_the_facets_appear_exactly_when_they_hold() -> Result<(), String> {
-        nodes_refusal(" · 4 lines", "", "$.source[0]")?;
-        nodes_refusal(" · 3 lines", "", "$.source[1]")?;
-        nodes_refusal("function_item · 4 lines", "function_item", "$.source[0]")?;
-        nodes_refusal(" · generated", "", "$.nodes[0].facets")?;
-        nodes_refusal(" · test", "", "$.nodes[0].facets")?;
-        let answer = with(nodes_answer(), "/nodes/1/kind", json!("block"))?;
-        let text = edited(NODES_TEXT, "[2] identifier", "[2] block")?;
-        assert_eq!(text_states(Tool::Nodes, &text, &answer), Ok(()));
-        let spurious = edited(
-            NODES_TEXT,
-            "[2] identifier · 3 lines",
-            "[2] identifier · 2 lines",
-        )?;
-        let failure = refused(Tool::Nodes, &spurious, &nodes_answer())?;
-        assert!(failure.contains("$.source[1]"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn only_the_innermost_excerpt_ends_the_text_and_outer_excerpts_are_not_checked()
-    -> Result<(), String> {
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.source[1]")?;
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.source[1]")?;
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.warnings")?;
-        let blank = edited(NODES_TEXT, "#bbbbbbbb\n\n\t\ta", "#bbbbbbbb\n\t\ta")?;
-        let failure = refused(Tool::Nodes, &blank, &nodes_answer())?;
-        assert!(failure.contains("$.source[1]"), "{failure}");
-        Ok(())
-    }
-
-    #[test]
-    fn a_missing_nodes_warnings_section_is_refused() -> Result<(), String> {
-        nodes_refusal(
-            "1 warning\n\tstale_index: index lags\n",
-            "",
-            "$.warnings[0].code",
-        )
-    }
-}
-
-#[cfg(test)]
-mod captured_view_tests {
-    use super::{Tool, text_states};
-    use serde_json::json;
-
-    #[test]
-    fn nodes_text_requires_exact_captured_view_and_original_expiry() {
-        let result = json!({"nodes":[],"source":[],"view":{"id":"claims.nodes","expires_at":"2030-01-01T00:15:00Z"}});
-        assert!(
-            text_states(
-                Tool::Nodes,
-                "0 nodes\nview claims.nodes · expires 2030-01-01T00:15:00Z\n",
-                &result
-            )
-            .is_ok()
-        );
-        for text in [
-            "0 nodes\n",
-            "0 nodes\nview claims.other · expires 2030-01-01T00:15:00Z\n",
-            "0 nodes\nview claims.nodes · expires 2030-01-01T00:16:00Z\n",
-        ] {
-            assert!(text_states(Tool::Nodes, text, &result).is_err());
-        }
-    }
-
-    #[test]
-    fn captured_view_does_not_replace_required_warning_section() {
-        let result = json!({"nodes":[],"source":[],"warnings":[{"code":"stale_index","detail":"index lags"}],"view":{"id":"claims.nodes","expires_at":"2030-01-01T00:15:00Z"}});
-        assert!(
-            text_states(
-                Tool::Nodes,
-                "0 nodes\nview claims.nodes · expires 2030-01-01T00:15:00Z\n",
-                &result
-            )
-            .is_err()
-        );
-        assert!(text_states(Tool::Nodes, "0 nodes\n1 warning\n\tstale_index: index lags\nview claims.nodes · expires 2030-01-01T00:15:00Z\n", &result).is_ok());
     }
 }

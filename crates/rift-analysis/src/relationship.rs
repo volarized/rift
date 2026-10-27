@@ -153,7 +153,9 @@ impl UnitDefinitions {
 /// store's edges carry. `Unknown` - a provider exposing no sharper role - and every role this
 /// mapping has no sharper facet for falls back to `References`, the facet's general-mention
 /// sense.
-const fn role_facet(role: ReferenceRole) -> RelationshipFacet {
+/// Returns the existing portable relationship facet of a supplied reference role.
+#[must_use]
+pub const fn role_facet(role: ReferenceRole) -> RelationshipFacet {
     match role {
         ReferenceRole::Definition => RelationshipFacet::Declares,
         ReferenceRole::Read => RelationshipFacet::Reads,

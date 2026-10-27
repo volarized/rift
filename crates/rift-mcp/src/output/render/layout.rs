@@ -82,16 +82,6 @@ impl<'a> Lines<'a> {
         }
     }
 
-    /// Lines that continue the last of `count` items after its head and facts.
-    pub(super) fn after_last(out: &'a mut TextWriter, count: usize) -> Self {
-        Self {
-            out,
-            indent: item_indent(count),
-            head_indent: SECTION_INDENT,
-            lead: None,
-        }
-    }
-
     /// Writes the first line of the item, behind its marker or lead when it has one.
     ///
     /// Empty text writes no line for an item without either, and only the marker or lead for

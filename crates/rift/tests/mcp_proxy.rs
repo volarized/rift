@@ -28,6 +28,9 @@
 //! `end_to_end.rs`; this file's own tests prove election, adoption,
 //! sharing, and re-election, and add the few helpers only they use.
 
+#[cfg(unix)]
+#[path = "mcp_proxy/dependency_query.rs"]
+mod dependency_query;
 mod engine_fixture;
 #[path = "../../rift-mcp/tests/global_api.rs"]
 #[allow(
@@ -45,12 +48,20 @@ mod lsp_profiles;
 #[cfg(unix)]
 #[path = "mcp_proxy/map_recommendations.rs"]
 mod map_recommendations;
+#[path = "mcp_proxy/query_process.rs"]
+mod query_process;
 mod rust_engine;
 #[path = "../../rift-mcp/tests/surface_corpus.rs"]
 mod surface_corpus;
 mod test_case;
 #[path = "../../rift-mcp/tests/text_complete/mod.rs"]
 mod text_complete;
+#[path = "../../rift-mcp/tests/workspace_client.rs"]
+#[allow(
+    dead_code,
+    reason = "shared fixture helpers serve several integration suites"
+)]
+mod workspace_client;
 
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
@@ -85,7 +96,7 @@ use surface_corpus::SurfaceFixture;
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 4] = ["get_source", "get_symbol", "nodes", "search"];
+const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -185,15 +196,17 @@ async fn beacon_lookup(
     proxied_call(
         client,
         "search",
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
     )
     .await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
+    let rows = workspace_client::query::rows(lookup).expect("beacon query returns bindings");
+    assert_eq!(rows.len(), 1, "{lookup}");
     assert_eq!(
-        lookup["results"][0]["hit"]["symbol"]["name"],
-        json!("beacon")
+        workspace_client::query::literal(&rows[0], "name").expect("beacon name"),
+        "beacon"
     );
 }
 
@@ -301,12 +314,12 @@ async fn repository_workspace_reads(
     let lookup = proxied_call(
         client,
         "search",
-        &json!({"query": name, "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration(name, "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("positive search: {error:?}"))?;
     assert_eq!(
-        lookup["results"][0]["hit"]["symbol"]["name"], name,
+        lookup["answer"]["bindings"][0]["name"]["value"], name,
         "{lookup}"
     );
     let other = names
@@ -316,12 +329,12 @@ async fn repository_workspace_reads(
     let absent = proxied_call(
         client,
         "search",
-        &json!({"query": other, "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration(other, "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("negative search: {error:?}"))?;
     assert!(
-        absent["results"]
+        absent["answer"]["bindings"]
             .as_array()
             .ok_or("search carries results")?
             .is_empty(),
@@ -330,29 +343,40 @@ async fn repository_workspace_reads(
     let search = proxied_call(
         client,
         "search",
-        &json!({"query": name, "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration(name, "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("search: {error:?}"))?;
     assert!(
-        search["results"]
+        search["answer"]["bindings"]
             .as_array()
             .ok_or("search carries results")?
             .iter()
-            .any(|hit| hit["hit"]["symbol"]["name"] == name),
+            .any(|hit| hit["name"]["value"] == name),
         "{search}"
     );
-    let nodes = proxied_call(client, "nodes", &json!({"path": "lib.rs", "position": 8}))
-        .await
-        .map_err(|error| format!("nodes: {error:?}"))?;
-    assert!(
-        nodes["source"]
-            .as_array()
-            .ok_or("nodes carries source")?
-            .iter()
-            .any(|source| source.as_str().is_some_and(|source| source.contains(name))),
-        "{nodes}"
-    );
+    let unit = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("project")?,
+        rift_core::SourcePath::new("lib.rs")?,
+    )?;
+    let nodes = proxied_call(
+        client,
+        "nodes",
+        &json!({
+            "query": format!("SELECT ?node ?start ?end ?text {{ ?node a :Node; :unit <{unit}>; :range [ :start ?start; :end ?end ] . <{unit}> :source ?text . FILTER(?start <= 8 && 8 < ?end) }}"),
+            "language": "sparql"
+        }),
+    )
+    .await
+    .map_err(|error| format!("nodes: {error:?}"))?;
+    let rows = workspace_client::query::rows(&nodes)?;
+    assert!(!rows.is_empty(), "position 8 has captured nodes: {nodes}");
+    for row in rows {
+        assert!(
+            workspace_client::query::literal(row, "text")?.contains(name),
+            "{nodes}"
+        );
+    }
     Ok(revision)
 }
 
@@ -629,12 +653,12 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let pinned = proxied_call(
         &clients[3],
         "search",
-        &json!({"query": "quartz", "target": "symbol"}),
+        &serde_json::to_value(workspace_client::query::declaration("quartz", "lib.rs"))?,
     )
     .await
     .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
     assert_eq!(
-        pinned["results"][0]["hit"]["symbol"]["name"], "quartz",
+        pinned["answer"]["bindings"][0]["name"]["value"], "quartz",
         "{pinned}"
     );
     require_success(
@@ -753,7 +777,7 @@ async fn beacon_result(
     proxied_result(
         client,
         "search",
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
     )
     .await
 }
@@ -937,6 +961,8 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
 
 /// Most polls of a search before the lexical population pass has landed.
 const SEARCH_POPULATION_POLLS_MAX: usize = 60;
+const COMMIT_POPULATION_TIMEOUT_SECONDS: u64 = 30;
+const COMMIT_POPULATION_POLL_MILLISECONDS: u64 = 50;
 
 /// Calls `search` until its warnings no longer report a lexical pass still catching up, so
 /// two later calls answer from one settled index.
@@ -968,11 +994,12 @@ async fn await_search_population(
 async fn await_commit_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult {
-    let request = json!({"target": "commit", "query": "witness"});
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let request = json!({"query":"SELECT ?hit { SERVICE :search { ?hit :target 'commit'; :query 'witness' } }"});
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(COMMIT_POPULATION_TIMEOUT_SECONDS);
     loop {
         let answer = proxied_call(client, "search", &request).await?;
-        if answer["results"]
+        if answer["answer"]["bindings"]
             .as_array()
             .is_some_and(|hits| !hits.is_empty())
         {
@@ -981,7 +1008,7 @@ async fn await_commit_population(
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("the history store did not answer commit search: {answer}").into());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(COMMIT_POPULATION_POLL_MILLISECONDS)).await;
     }
 }
 
@@ -996,17 +1023,18 @@ fn stated_identities<'value>(
     if name == "get_symbol" {
         return structured["symbol"]["id"].as_str().into_iter().collect();
     }
-    let (key, pointer) = match name {
-        "search" => ("results", "/hit/symbol/id"),
-        _ => ("nodes", "/id"),
-    };
-    structured
-        .get(key)
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|item| item.pointer(pointer)?.as_str())
-        .collect()
+    if matches!(name, "search" | "nodes") {
+        return structured["answer"]["bindings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_object)
+            .flat_map(|row| row.values())
+            .filter(|term| term["type"] == "iri")
+            .filter_map(|term| term["value"].as_str())
+            .collect();
+    }
+    Vec::new()
 }
 
 /// The text of a result that is one text block.
@@ -1094,52 +1122,82 @@ async fn proxy_row_source(
             rift_protocol::identity::encode_source_unit_key(path)
         ))?
     };
-    let request = json!({"unit": unit, "range": row["range"], "view": view.id});
-    let response = proxied_result(client, "get_source", &request).await?;
-    assert_ne!(
-        response.is_error,
-        Some(true),
-        "captured row source: {response:?}"
-    );
-    let (body, answered) = proxy_text_view(text_of(&response)?)?;
+    let range = if row["range"].is_null() {
+        None
+    } else {
+        Some(serde_json::from_value(row["range"].clone())?)
+    };
+    proxy_source_query(client, &unit, range, view).await
+}
+
+/// Validates the actual Source SERVICE bindings before returning the original bytes.
+async fn proxy_source_query(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    unit: &rift_protocol::read::SourceUnitId,
+    range: Option<rift_protocol::read::TextRange>,
+    view: &rift_protocol::symbol_read::CapturedView,
+) -> TestResult<String> {
+    let request = workspace_client::query::source(&rift_protocol::source_read::GetSourceParams {
+        unit: unit.clone(),
+        range: range.clone(),
+        view: Some(view.id.clone()),
+        rev: None,
+    })?;
+    let request = serde_json::to_value(request)?;
+    let response = proxied_result(client, "search", &request).await?;
+    assert_ne!(response.is_error, Some(true), "{response:?}");
+    let parsed = text_complete::query_rows(text_of(&response)?)?;
     assert_eq!(
-        answered.as_ref(),
-        Some(view),
-        "row source retains the original view and expiry"
+        parsed.len(),
+        1,
+        "Source SERVICE returns one selected result: unit={:.512}; range={range:?}; view={view:?}; structured={}; is_error={:?}; header={:.256}; metadata={:?}",
+        unit.as_str(),
+        response.structured_content.is_some(),
+        response.is_error,
+        text_of(&response)?.lines().next().unwrap_or_default(),
+        response.structured_content.as_ref().map(|value| (
+            value.get("outcome"),
+            value.get("reason"),
+            value.get("view"),
+            value.get("answer").and_then(|answer| answer.get("result")),
+            value
+                .get("answer")
+                .and_then(|answer| answer.get("bindings"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+        ))
     );
-    if let Some(structured) = &response.structured_content {
-        let result: rift_protocol::source_read::GetSourceResult =
-            serde_json::from_value(structured.clone())?;
-        let rift_protocol::source_read::GetSourceResult::Found {
-            source,
-            source_complete,
-            view: selected,
-            ..
-        } = result
-        else {
-            return Err(format!(
-                "captured row source must remain available: request {request}, response {response:?}"
-            )
-            .into());
-        };
-        assert!(source_complete, "captured row source must be complete");
-        assert_eq!(
-            source.span.unit, unit,
-            "captured row source unit is unchanged"
-        );
-        if !row["range"].is_null() {
-            assert_eq!(
-                serde_json::to_value(source.span.range)?,
-                row["range"],
-                "captured row source range is unchanged"
-            );
-        }
-        assert_eq!(
-            &selected, view,
-            "captured row source retains the original selection"
-        );
+    let row = &parsed[0];
+    let literal = workspace_client::query::literal;
+    assert_eq!(literal(row, "outcome")?, "found");
+    assert_eq!(workspace_client::query::iri(row, "unit")?, unit.as_str());
+    assert_eq!(literal(row, "complete")?, "true");
+    assert_eq!(literal(row, "source_view")?, view.id.as_str());
+    assert_eq!(literal(row, "source_expiry")?, view.expires_at);
+    let start = literal(row, "start")?.parse::<u64>()?;
+    let end = literal(row, "end")?.parse::<u64>()?;
+    let text = literal(row, "text")?;
+    assert_eq!(end.checked_sub(start), Some(u64::try_from(text.len())?));
+    if let Some(range) = range {
+        assert_eq!(start, range.start);
+        assert_eq!(end, range.end);
+    } else {
+        assert_eq!(start, 0);
     }
-    Ok(body)
+    if let Some(structured) = &response.structured_content {
+        assert_eq!(
+            workspace_client::query::rows(structured)?,
+            parsed.as_slice()
+        );
+        text_complete::assert_text_states("search", &response);
+        let (_, outer) = proxy_text_view(text_of(&response)?)?;
+        let outer = outer.ok_or("Source query retains its own view")?;
+        assert_eq!(structured["view"], serde_json::to_value(&outer)?);
+        let outer_expiry: jiff::Timestamp = outer.expires_at.parse()?;
+        let selected_expiry: jiff::Timestamp = view.expires_at.parse()?;
+        assert!(outer_expiry <= selected_expiry);
+    }
+    Ok(text.to_owned())
 }
 
 /// Validates each row selection before comparing source bytes between the proxies.
@@ -1181,6 +1239,136 @@ async fn validated_proxy_rows(
     Ok((body, sources))
 }
 
+/// Checks the one generated blank node alongside every fixed term in the fixture.
+fn assert_term_kind_text(text: &str) -> TestResult {
+    use rift_protocol::query::RdfTerm;
+    use std::collections::BTreeMap;
+
+    let row = text.lines().nth(2).ok_or("term-kind row missing")?;
+    let binding: BTreeMap<String, RdfTerm> = serde_json::from_str(
+        row.strip_prefix('\t')
+            .ok_or("term-kind row is not indented")?,
+    )?;
+    let Some(RdfTerm::BlankNode { value }) = binding.get("blank") else {
+        return Err("term-kind blank node missing".into());
+    };
+    assert!(
+        !value.is_empty(),
+        "the execution retains a blank-node identity"
+    );
+    let expected: BTreeMap<String, RdfTerm> = serde_json::from_value(json!({
+        "blank":{"type":"blank_node","value":value},
+        "iri":{"type":"iri","value":"urn:fixture:term"},
+        "language":{"type":"language_literal","value":"hello","language":"en"},
+        "number":{"type":"literal","value":"1","datatype":"http://www.w3.org/2001/XMLSchema#integer"}
+    }))?;
+    assert_eq!(binding, expected);
+    assert_eq!(
+        text,
+        format!(
+            "1 results · page 1/1\n\tblank iri number language\n\t{}\n",
+            serde_json::to_string(&expected)?
+        )
+    );
+    Ok(())
+}
+
+fn validate_query_without_continuation(
+    request: &serde_json::Value,
+    reference: &serde_json::Value,
+) -> TestResult {
+    let answer: rift_protocol::query::QueryReadResult = serde_json::from_value(reference.clone())?;
+    match answer {
+        rift_protocol::query::QueryReadResult::Unavailable(_) => {}
+        rift_protocol::query::QueryReadResult::Results(result) => {
+            assert_eq!(
+                request["query"],
+                "ASK { ?symbol a :Symbol; :name 'beacon_one' }"
+            );
+            assert_eq!(
+                result.answer,
+                rift_protocol::query::QueryAnswer::Boolean { value: true }
+            );
+            assert!(
+                result.view.is_some(),
+                "the reference query retains its own view"
+            );
+            assert_eq!(result.pagination.page.page_index, 0);
+            assert_eq!(result.pagination.page.total_pages, 1);
+            assert!(result.pagination.next_query.is_none());
+        }
+    }
+    Ok(())
+}
+
+/// Compares Source values only after each proxy proves its own original selection.
+async fn validated_proxy_source_query(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    result: &CallToolResult,
+) -> TestResult<(String, Vec<String>)> {
+    use workspace_client::query;
+    let original = text_of(result)?;
+    let (body, outer) = proxy_text_view(original)?;
+    let outer = outer.ok_or("Source query has an outer captured view")?;
+    let rows = text_complete::query_rows(original)?;
+    let [row] = rows.as_slice() else {
+        return Err(format!("one Source result: {rows:?}").into());
+    };
+    assert_eq!(query::literal(row, "outcome")?, "found");
+    assert_eq!(query::literal(row, "complete")?, "true");
+    let unit = rift_protocol::read::SourceUnitId::parse(query::iri(row, "unit")?)?;
+    assert_eq!(unit.as_str(), "rift://source/project/lib.rs");
+    let range = rift_protocol::read::TextRange {
+        start: query::literal(row, "start")?.parse()?,
+        end: query::literal(row, "end")?.parse()?,
+    };
+    assert_eq!(range.start, 0);
+    let source = query::literal(row, "text")?;
+    assert_eq!(
+        source,
+        "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n"
+    );
+    assert_eq!(range.end, u64::try_from(source.len())?);
+    let selected = rift_protocol::symbol_read::CapturedView {
+        id: serde_json::from_value(json!(query::literal(row, "source_view")?))?,
+        expires_at: query::literal(row, "source_expiry")?.to_owned(),
+    };
+    let outer_expiry: jiff::Timestamp = outer.expires_at.parse()?;
+    let selected_expiry: jiff::Timestamp = selected.expires_at.parse()?;
+    assert!(outer_expiry <= selected_expiry);
+    assert_eq!(
+        proxy_source_query(client, &unit, Some(range), &selected).await?,
+        source,
+        "the owning proxy reads the exact original source bytes"
+    );
+    if let Some(structured) = &result.structured_content {
+        assert_eq!(query::rows(structured)?, rows.as_slice());
+        assert_eq!(structured["view"], serde_json::to_value(outer)?);
+        text_complete::assert_text_states("search", result);
+    }
+    // The two output selections issue independent captures. Compare every stable
+    // Source binding after checking each view and expiry through its own proxy.
+    let stable = [
+        "outcome",
+        "unit",
+        "missing_unit",
+        "text",
+        "start",
+        "end",
+        "complete",
+    ]
+    .map(|name| (name, &row[name]));
+    let metadata = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('{'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((
+        format!("{metadata}\n{}", serde_json::to_string(&stable)?),
+        vec![source.to_owned()],
+    ))
+}
+
 /// Reads each advertised view through its owning proxy before comparing the remaining text.
 async fn validated_proxy_text(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -1202,12 +1390,45 @@ async fn validated_proxy_text(
         );
     }
     if let Some(view) = view {
-        let mut held_request = request.clone();
-        held_request["view"] = serde_json::to_value(&view.id)?;
-        held_request
-            .as_object_mut()
-            .ok_or("tool arguments must be an object")?
-            .remove("rev");
+        if name == "search"
+            && (reference["answer"].is_null() || reference["answer"]["result"] == "boolean")
+        {
+            validate_query_without_continuation(request, reference)?;
+            let source = proxy_source_query(
+                client,
+                &rift_protocol::read::SourceUnitId::parse("rift://source/project/lib.rs")?,
+                None,
+                &view,
+            )
+            .await
+            .map_err(|error| {
+                format!("query view read failed: {error}; query {request}; answer {reference}")
+            })?;
+            assert_eq!(
+                source,
+                "pub fn beacon_one() {}\npub fn beacon_two() {}\npub fn beacon_three() {}\n"
+            );
+            let (body, mut sources) =
+                validated_proxy_rows(client, &body, result, reference).await?;
+            sources.push(source);
+            return Ok((body, sources));
+        }
+        let held_request = if matches!(name, "search" | "nodes") {
+            let answer: rift_protocol::query::QueryAnswer =
+                serde_json::from_value(reference["answer"].clone())?;
+            let page = reference["pagination"]["page_index"]
+                .as_u64()
+                .ok_or("query pagination.page_index must be an integer")?;
+            json!({"query":rift_search::sparql::continuation_query(&answer, &view.id, page)?})
+        } else {
+            let mut held_request = request.clone();
+            held_request["view"] = serde_json::to_value(&view.id)?;
+            held_request
+                .as_object_mut()
+                .ok_or("tool arguments must be an object")?
+                .remove("rev");
+            held_request
+        };
         let held = proxied_result(client, name, &held_request).await?;
         assert_ne!(held.is_error, Some(true), "{name}: {held:?}");
         assert_eq!(
@@ -1226,6 +1447,68 @@ async fn validated_proxy_text(
     validated_proxy_rows(client, &body, result, reference).await
 }
 
+fn assert_proxy_result_forms(
+    name: &str,
+    all_result: &rmcp::model::CallToolResult,
+    text_result: &rmcp::model::CallToolResult,
+) {
+    assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
+    assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
+    assert_eq!(
+        text_result.structured_content, None,
+        "{name}: {text_result:?}"
+    );
+}
+
+fn assert_stated_identities<'answer>(
+    name: &str,
+    result: &'answer rmcp::model::CallToolResult,
+    text: &str,
+) -> TestResult<&'answer serde_json::Value> {
+    let structured = result
+        .structured_content
+        .as_ref()
+        .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
+    for identity in stated_identities(name, structured) {
+        assert!(
+            (if matches!(name, "search" | "nodes") {
+                text.contains(&serde_json::to_string(identity)?)
+            } else {
+                text.split_whitespace().any(|token| token == identity)
+            }),
+            "{name}: identity {identity} is no bare token of the text:\n{text}"
+        );
+    }
+    Ok(structured)
+}
+
+/// Configures the view count for the fixed corpus and its bounded readiness reads.
+async fn surface_proxy_fixture() -> TestResult<SurfaceFixture> {
+    let entries = u64::try_from(surface_corpus::corpus().len())?;
+    let polls = u64::try_from(SEARCH_POPULATION_POLLS_MAX)?;
+    let attempts = u64::try_from(harness::ACCEPTANCE_ATTEMPTS_MAX)?;
+    let commit_polls =
+        COMMIT_POPULATION_TIMEOUT_SECONDS * 1_000 / COMMIT_POPULATION_POLL_MILLISECONDS + 1;
+    // An entry has two discovery seeds, two output forms and one population pass.
+    // Each fixed request has at most two local source owners. Allow producer,
+    // fact and query captures for each owner on every acceptance attempt.
+    let calls = entries
+        .checked_mul(polls.checked_add(4).ok_or("surface call count overflow")?)
+        .and_then(|count| count.checked_add(polls))
+        .and_then(|count| count.checked_add(commit_polls))
+        .ok_or("surface call count overflow")?;
+    let views = calls
+        .checked_mul(attempts)
+        .and_then(|count| count.checked_mul(6))
+        .ok_or("surface view count overflow")?;
+    SurfaceFixture::start_with_configuration(move |configuration| {
+        let mut document = configuration.parse::<toml_edit::DocumentMut>()?;
+        document["server"]["retained_views"] = toml_edit::value(i64::try_from(views)?);
+        Ok(document.to_string())
+    })
+    .await
+}
+
 /// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
 /// view is read back through that proxy with its original expiry. The `text` result carries no
 /// structured content, and each symbol and node identity is a bare token in the `all` text.
@@ -1235,7 +1518,7 @@ async fn validated_proxy_text(
 /// there.
 #[tokio::test]
 async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -> TestResult {
-    let fixture = SurfaceFixture::start().await?;
+    let fixture = surface_proxy_fixture().await?;
     let root = fixture.root();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
@@ -1245,9 +1528,7 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
         proxy_client_with(root, &["--output", "text"]),
     );
     let (all, text) = (all?, text?);
-    await_workspace_ready(&all).await?;
-    await_search_population(&all, &json!({"query": "beacon"})).await?;
-    await_commit_population(&all).await?;
+    await_surface_population(&all).await?;
 
     'cases: for (name, initial_request) in surface_corpus::prepared_corpus(&all).await? {
         let mut request = initial_request;
@@ -1259,7 +1540,9 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
                 // XFAIL: https://github.com/volarized/rift/issues/583
                 // Only this traversal refusal with the recorded upstream panic is expected.
                 let message = error.to_string();
-                if request.get("traversal").is_some()
+                if request["query"]
+                    .as_str()
+                    .is_some_and(|query| query.contains(":calls") || query.contains(":references"))
                     && message.contains("the embedded ty database cache is poisoned")
                     && message.contains("rift.lsp.engine_refused_terminal")
                 {
@@ -1297,38 +1580,36 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
                 proxied_result(&text, name, &request),
             );
             let (all_result, text_result) = (all_result?, text_result?);
-            assert_ne!(all_result.is_error, Some(true), "{name}: {all_result:?}");
-            assert_ne!(text_result.is_error, Some(true), "{name}: {text_result:?}");
-            assert_eq!(
-                text_result.structured_content, None,
-                "{name}: {text_result:?}"
-            );
+            assert_proxy_result_forms(name, &all_result, &text_result);
             text_complete::assert_text_states(name, &all_result);
             let all_text = text_of(&all_result)?;
             let reference = all_result
                 .structured_content
                 .as_ref()
                 .ok_or("all proxy must return structured content")?;
-            let (all_body, text_body) = tokio::join!(
-                validated_proxy_text(&all, name, &request, &all_result, reference),
-                validated_proxy_text(&text, name, &request, &text_result, reference),
-            );
-            assert_eq!(all_body?, text_body?, "{name}: texts differ");
+            assert_proxy_texts(
+                &all,
+                &text,
+                name,
+                &request,
+                &all_result,
+                &text_result,
+                reference,
+            )
+            .await?;
 
-            let structured = all_result
-                .structured_content
-                .as_ref()
-                .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
-            for identity in stated_identities(name, structured) {
-                assert!(
-                    all_text.split_whitespace().any(|token| token == identity),
-                    "{name}: identity {identity} is no bare token of the text:\n{all_text}"
-                );
-            }
+            let structured = assert_stated_identities(name, &all_result, all_text)?;
 
             let Some(pagination) = structured.get("pagination") else {
                 break;
             };
+            if matches!(name, "search" | "nodes") {
+                let Some(next_query) = pagination["next_query"].as_str() else {
+                    break;
+                };
+                request = json!({"query":next_query});
+                continue;
+            }
             let total_pages = pagination["total_pages"]
                 .as_u64()
                 .ok_or_else(|| format!("{name}: pagination.total_pages must be an integer"))?;
@@ -1343,6 +1624,132 @@ async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -
     all.cancel().await?;
     text.cancel().await?;
     failure_window.passed();
+    Ok(())
+}
+
+async fn await_surface_population(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+) -> TestResult {
+    await_workspace_ready(client).await?;
+    await_search_population(
+        client,
+        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
+    )
+    .await?;
+    await_commit_population(client).await?;
+    Ok(())
+}
+
+fn is_paged_index_request(name: &str, request: &serde_json::Value) -> bool {
+    name == "search"
+        && request["query"]
+            .as_str()
+            .is_some_and(|query| query.starts_with("SELECT ?index { VALUES ?index { "))
+        && surface_corpus::corpus()
+            .last()
+            .is_some_and(|(tool, expected)| *tool == name && expected == request)
+}
+
+fn assert_paged_index_text(
+    result: &CallToolResult,
+    body: &str,
+    answer: &rift_protocol::query::QueryAnswer,
+) -> TestResult {
+    use rift_protocol::query::{QueryAnswer, QueryReadResult, RdfTerm};
+
+    let QueryAnswer::Bindings {
+        variables,
+        bindings,
+    } = answer
+    else {
+        return Err("paged index query returns bindings".into());
+    };
+    assert_eq!(variables, &vec!["index".to_owned()]);
+    assert_eq!(bindings.len(), 1000);
+    let (_, view) = proxy_text_view(text_of(result)?)?;
+    let view = view.ok_or("paged index query retains its own view")?;
+    let next = rift_search::sparql::continuation_query(answer, &view.id, 1)?;
+    let mut expected = String::from("1000 results · page 1/2\n\tindex\n");
+    for (index, row) in bindings.iter().enumerate() {
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row.get("index"),
+            Some(&RdfTerm::Literal {
+                value: index.to_string(),
+                datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
+            })
+        );
+        expected.push('\t');
+        expected.push_str(&serde_json::to_string(row)?);
+        expected.push('\n');
+    }
+    expected.push_str("next_query ");
+    expected.push_str(&serde_json::to_string(&next)?);
+    expected.push('\n');
+    assert_eq!(body, expected);
+    if let Some(structured) = &result.structured_content {
+        let QueryReadResult::Results(own) = serde_json::from_value(structured.clone())? else {
+            return Err("paged index query returns structured bindings".into());
+        };
+        assert_eq!(&own.answer, answer);
+        assert_eq!(own.view.as_ref(), Some(&view));
+        assert_eq!(own.pagination.page.page_index, 0);
+        assert_eq!(own.pagination.page.total_pages, 2);
+        assert_eq!(own.pagination.next_query.as_deref(), Some(next.as_str()));
+    }
+    Ok(())
+}
+
+async fn assert_proxy_texts(
+    all: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    text: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &'static str,
+    request: &serde_json::Value,
+    all_result: &CallToolResult,
+    text_result: &CallToolResult,
+    reference: &serde_json::Value,
+) -> TestResult {
+    let source_projection = reference["answer"]["variables"]
+        == json!([
+            "outcome",
+            "unit",
+            "missing_unit",
+            "text",
+            "start",
+            "end",
+            "complete",
+            "source_view",
+            "source_expiry"
+        ]);
+    if source_projection {
+        let (all_body, text_body) = tokio::join!(
+            validated_proxy_source_query(all, all_result),
+            validated_proxy_source_query(text, text_result),
+        );
+        assert_eq!(all_body?, text_body?, "Source values differ");
+    } else {
+        let (all_body, text_body) = tokio::join!(
+            validated_proxy_text(all, name, request, all_result, reference),
+            validated_proxy_text(text, name, request, text_result, reference),
+        );
+        let (all_body, text_body) = (all_body?, text_body?);
+        if name == "search"
+            && request["query"]
+                == "SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"
+        {
+            assert_term_kind_text(&all_body.0)?;
+            assert_term_kind_text(&text_body.0)?;
+            assert_eq!(all_body.1, text_body.1, "{name}: source bytes differ");
+        } else if is_paged_index_request(name, request) {
+            let answer: rift_protocol::query::QueryAnswer =
+                serde_json::from_value(reference["answer"].clone())?;
+            assert_paged_index_text(all_result, &all_body.0, &answer)?;
+            assert_paged_index_text(text_result, &text_body.0, &answer)?;
+            assert_eq!(all_body.1, text_body.1, "{name}: source bytes differ");
+        } else {
+            assert_eq!(all_body, text_body, "{name}: texts differ");
+        }
+    }
     Ok(())
 }
 
@@ -1751,8 +2158,9 @@ async fn assert_refused_without_a_stop(version: &str) -> TestResult {
     let refusal = within(
         "the refusal from a server this proxy does not replace",
         client.call_tool(
-            CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+            CallToolRequestParams::new("search").with_arguments(arguments(&serde_json::to_value(
+                workspace_client::query::declaration("beacon", "lib.rs"),
+            )?)?),
         ),
     )
     .await?
@@ -1882,8 +2290,9 @@ async fn held_election_without_a_server_refuses_with_operator_guidance() -> Test
     let refusal = within(
         "the unserved workspace's refusal",
         client.call_tool(
-            CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+            CallToolRequestParams::new("search").with_arguments(arguments(&serde_json::to_value(
+                workspace_client::query::declaration("beacon", "lib.rs"),
+            )?)?),
         ),
     )
     .await?
@@ -1950,8 +2359,9 @@ async fn a_spawned_server_that_cannot_bind_its_port_refuses_with_redacted_stderr
     let refusal = within(
         "the refusal from a server that could not bind its port",
         client.call_tool(
-            CallToolRequestParams::new("search")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
+            CallToolRequestParams::new("search").with_arguments(arguments(&serde_json::to_value(
+                workspace_client::query::declaration("beacon", "lib.rs"),
+            )?)?),
         ),
     )
     .await?
@@ -2034,34 +2444,63 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    let declaration = proxied_call(
-        &client,
-        "search",
-        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
-    )
-    .await?;
-    let seed = declaration["results"][0]["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("beacon declaration must carry its symbol identity")?;
     let result = proxied_engine_call(
         &client,
         "search",
-        &json!({"traversal": {
-            "seed": seed, "direction": "incoming", "facets": ["references"], "depth": 1
-        }}),
+        &json!({"query":
+            "SELECT DISTINCT ?target ?caller ?name ?path ?source ?start ?end ?targetSource ?targetStart ?targetEnd ?derivation ?facet { \
+             ?target a :Symbol; :name 'beacon'; :language 'rust'; :declarations ?targetDeclaration . \
+             ?targetDeclaration :path 'hub.rs'; :source ?targetSource; :range ?targetRange . \
+             ?targetRange :start ?targetStart; :end ?targetEnd . \
+             ?caller :references ?target; :name ?name; :declarations ?declaration . \
+             ?declaration :path ?path; :source ?source; :range ?range . \
+             ?range :start ?start; :end ?end . \
+             ?relationship a :Relationship; :from ?caller; :to ?target; :derivation ?derivation; :facets ?facet . \
+             FILTER(?facet = :references) } ORDER BY ?caller"
+        }),
     )
     .await?;
-    let caller = result["results"]
+    let caller = result["answer"]["bindings"]
         .as_array()
         .ok_or("search must return its results")?
         .iter()
-        .find(|hit| hit["hit"]["symbol"]["name"] == "total")
+        .find(|hit| hit["name"]["value"] == "total")
         .ok_or_else(|| format!("incoming references must reach the caller: {result:#}"))?;
-    assert_eq!(caller["traversal_path"][0]["direction"], "incoming");
-    assert_eq!(caller["traversal_path"][0]["relationship"]["to"], seed);
+    for field in ["target", "caller"] {
+        assert!(
+            matches!(caller[field]["type"].as_str(), Some("iri" | "blank_node")),
+            "original reference endpoint: {caller}"
+        );
+    }
+    for (source, start, end, original) in [
+        (
+            "targetSource",
+            "targetStart",
+            "targetEnd",
+            harness::RUST_PROJECT_HUB,
+        ),
+        ("source", "start", "end", harness::RUST_PROJECT_CALLER),
+    ] {
+        let start = workspace_client::query::literal(caller, start)?.parse::<usize>()?;
+        let end = workspace_client::query::literal(caller, end)?.parse::<usize>()?;
+        assert_eq!(
+            original
+                .get(start..end)
+                .ok_or("original declaration range")?,
+            workspace_client::query::literal(caller, source)?
+        );
+    }
     assert_eq!(
-        caller["traversal_path"][0]["relationship"]["derivation"],
-        "resolution"
+        workspace_client::query::literal(caller, "path")?,
+        "caller.rs"
+    );
+    assert_eq!(
+        workspace_client::query::iri(caller, "facet")?,
+        format!("{}references", rift_search::sparql::VOCABULARY)
+    );
+    assert_eq!(
+        workspace_client::query::iri(caller, "derivation")?,
+        format!("{}resolution", rift_search::sparql::VOCABULARY)
     );
     let workspace = within(
         "workspace resource",
@@ -2088,5 +2527,132 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
         "stop after reference read",
     )?;
     failure_window.passed();
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() -> TestResult {
+    use workspace_client::query;
+    let directory = laid_out_workspace(
+        &[
+            ("Cargo.toml", harness::RUST_PROJECT_MANIFEST),
+            ("lib.rs", LIBRARY),
+        ],
+        "[dependencies]\nresolution = \"static\"\n",
+    )?;
+    let root = directory.path();
+    let _cleanup = StopOnDrop::new(root);
+    let failure_window = FailureWindow::begin(root);
+    let client = proxy_client(root).await?;
+    await_workspace_ready(&client).await?;
+    let initial = json!({"query":"SELECT ?symbol { SERVICE :search { ?hit :query 'beacon'; :target :symbol; :limit 1; :symbol ?symbol } ?symbol a :Symbol }"});
+    await_search_population(&client, &initial).await?;
+    let selected = proxied_call(&client, "search", &initial).await?;
+    let [row] = query::rows(&selected)? else {
+        return Err(format!("one original declaration: {selected}").into());
+    };
+    let symbol = query::iri(row, "symbol")?;
+    let view = selected["view"]["id"]
+        .as_str()
+        .ok_or("original proxy query view")?;
+    let statement = format!(
+        "SELECT ?id ?unit ?start ?end ?text {{ SERVICE <urn:rift:result:{view}> {{}} ?node a :Node; :symbol <{symbol}>; :unit ?unit; :id ?id; :range [ :start ?start; :end ?end ] . ?unit :source ?text }} ORDER BY ?start ?end"
+    );
+    let original = proxied_call(&client, "search", &json!({"query":statement})).await?;
+    let [node] = query::rows(&original)? else {
+        return Err(format!("one original semantic node: {original}").into());
+    };
+    assert!(!query::literal(node, "id")?.is_empty());
+    let unit = query::iri(node, "unit")?;
+    assert_eq!(query::literal(node, "text")?, LIBRARY);
+    let start = query::literal(node, "start")?.parse::<usize>()?;
+    let end = query::literal(node, "end")?.parse::<usize>()?;
+    let exact = proxied_call(
+        &client,
+        "get_symbol",
+        &json!({"id":symbol,"view":view,"include":["source"]}),
+    )
+    .await?;
+    assert_eq!(exact["view"], selected["view"]);
+    assert_eq!(exact["symbol"]["id"], symbol);
+    assert_eq!(
+        exact["declarations"][0]["source"],
+        LIBRARY.get(start..end).ok_or("original node range")?
+    );
+    for removed in [false, true] {
+        if removed {
+            fs::remove_file(root.join("lib.rs"))?;
+        } else {
+            fs::write(root.join("lib.rs"), "pub fn changed() {}\n")?;
+        }
+        let mut observed = false;
+        for _ in 0..SEARCH_POPULATION_POLLS_MAX {
+            let current = proxied_call(
+                &client,
+                "search",
+                &json!({"query":"ASK { ?symbol :name 'changed' }"}),
+            )
+            .await?;
+            if current["answer"]["value"] == !removed {
+                observed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            observed,
+            "current index must observe the edit or removal before the held read"
+        );
+        let held = proxied_call(&client, "search", &json!({"query":statement})).await?;
+        assert_eq!(
+            query::rows(&held)?,
+            query::rows(&original)?,
+            "Node identity, unit, range and bytes stay captured"
+        );
+        let source = rift_protocol::source_read::GetSourceParams {
+            unit: rift_protocol::read::SourceUnitId::parse(unit)?,
+            range: None,
+            view: Some(rift_protocol::symbol_read::CapturedViewId::parse(view)?),
+            rev: None,
+        };
+        let answer = proxied_call(
+            &client,
+            "search",
+            &serde_json::to_value(query::source(&source)?)?,
+        )
+        .await?;
+        assert_original_proxy_source(&answer, &selected, unit, view)?;
+    }
+    let mixed = proxied_call(&client, "search", &json!({"query":"SELECT ?outcome ?name { ?symbol a :Symbol; :name 'beacon', ?name . SERVICE :source { ?read :unit <rift://source/project/lib.rs>; :outcome ?outcome } }"})).await?;
+    assert!(
+        query::rows(&mixed)?.is_empty(),
+        "removed current domain remains empty beside a typed source result"
+    );
+    client.cancel().await?;
+    failure_window.passed();
+    Ok(())
+}
+
+fn assert_original_proxy_source(
+    answer: &serde_json::Value,
+    selected: &serde_json::Value,
+    unit: &str,
+    view: &str,
+) -> TestResult {
+    use workspace_client::query;
+    let [row] = query::rows(answer)? else {
+        return Err(format!("one captured proxy source: {answer}").into());
+    };
+    assert_eq!(query::literal(row, "outcome")?, "found");
+    assert_eq!(query::iri(row, "unit")?, unit);
+    assert_eq!(query::literal(row, "text")?, LIBRARY);
+    assert_eq!(query::literal(row, "complete")?, "true");
+    assert_eq!(query::literal(row, "source_view")?, view);
+    assert_eq!(
+        query::literal(row, "source_expiry")?,
+        selected["view"]["expires_at"]
+            .as_str()
+            .ok_or("original proxy expiry")?
+    );
     Ok(())
 }

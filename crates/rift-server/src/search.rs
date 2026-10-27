@@ -15,6 +15,8 @@ pub(crate) use documentation::populate_sources_from;
 #[cfg(test)]
 mod documentation_tests;
 mod pattern;
+mod snapshot;
+pub use snapshot::SearchSnapshot;
 #[cfg(test)]
 mod pattern_tests;
 use body::BodyMatching;
@@ -54,7 +56,7 @@ use crate::read::file_id;
 use crate::read::{
     CURRENT_TREE_ALONE, ReadService, RiftError, accepted_limit, excerpt, page, project_path,
     results_truncation_warning, source_warnings, text_range, validate_common,
-    validate_requested_packages, wire_symbol,
+    validate_requested_packages,
 };
 use crate::traversal::{
     TraversalReport, collect_traversal_hits, traversal_truncation_warning, validate_traversal,
@@ -251,12 +253,47 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<SearchResult, RiftError> {
+        self.search_selected_with_references(params, store, references, None, None)
+            .map(|(result, _)| result)
+    }
+
+    /// Returns search hits with their original normalized Contribution keys.
+    ///
+    /// # Errors
+    /// Returns the existing search, source selection or normalized assembly refusal.
+    pub fn search_with_contributions(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<(SearchResult, Vec<Vec<rift_core::ContributionKey>>), RiftError> {
+        self.search_selected_with_references(params, store, references, Some(budget), None)
+    }
+
+    fn search_selected_with_references(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &EngineReferences,
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selected: Option<&SelectedPaths>,
+    ) -> Result<(SearchResult, Vec<Vec<rift_core::ContributionKey>>), RiftError> {
         self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
         if params.target == SearchParamsTarget::Commit {
-            return self.search_commits(params);
+            return self
+                .search_commits(params)
+                .map(|result| (result, Vec::new()));
         }
         if let Some(pattern) = self.validated_pattern(params, store, references)? {
-            return self.search_pattern(params, &pattern, store);
+            return match budget {
+                Some(budget) => {
+                    self.search_pattern_in(params, &pattern, store, Some(budget), selected)
+                }
+                None => self
+                    .search_pattern(params, &pattern, store)
+                    .map(|result| (result, Vec::new())),
+            };
         }
         if params.change.is_some() {
             // One snapshot holds one tree; a comparison needs two, and reaches its own
@@ -270,22 +307,29 @@ impl ReadService {
                 .capability("force_include at a revision")
                 .fail();
         }
-        let ((results, pagination), warnings) = self.ordered_search_hits(
+        let capture = budget.is_some();
+        let (((results, contributions), pagination), warnings) = self.ordered_search_hits(
             params,
             store,
             references,
+            budget,
+            selected,
             |results, selected, payloads, limit| {
-                let (mut results, pagination) = page(results, params.page_index, limit);
+                let (results, pagination) = page(results, params.page_index, limit);
+                let (mut results, contributions) = selected_hits(results, capture);
                 let warnings = self.populate_search_payloads(&mut results, selected, payloads)?;
-                Ok(((results, pagination), warnings))
+                Ok((((results, contributions), pagination), warnings))
             },
         )?;
-        Ok(SearchResult {
-            view: None,
-            results,
-            pagination,
-            warnings,
-        })
+        Ok((
+            SearchResult {
+                view: None,
+                results,
+                pagination,
+                warnings,
+            },
+            contributions,
+        ))
     }
 
     /// Returns the ordered traversal search results before applying a page window.
@@ -315,7 +359,10 @@ impl ReadService {
             params,
             store,
             references,
-            |mut results, selected, payloads, _| {
+            None,
+            None,
+            |results, selected, payloads, _| {
+                let (mut results, _) = selected_hits(results, false);
                 let warnings = self.populate_search_payloads(
                     &mut results,
                     selected,
@@ -334,8 +381,10 @@ impl ReadService {
         params: &SearchParams,
         store: &StoreAnswer,
         references: &EngineReferences,
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selected: Option<&SelectedPaths>,
         finish: impl FnOnce(
-            Vec<SearchHit>,
+            Vec<SelectedHit>,
             &SelectedPaths,
             HitPayloads,
             usize,
@@ -343,7 +392,13 @@ impl ReadService {
     ) -> Result<(Output, Vec<ReadWarning>), RiftError> {
         let query = accepted_query(params)?;
         let limit = search_page_limit(params)?;
-        let selected = self.selected_paths(params.paths.as_ref())?;
+        let original;
+        let selected = if let Some(selected) = selected {
+            selected
+        } else {
+            original = self.selected_paths(params.paths.as_ref())?;
+            &original
+        };
         let payloads = HitPayloads::requested(params);
         // The whole candidate pool is collected up to the index's own `results_max` bound -
         // bounded work whatever the page size - then ordered and truncated to that same
@@ -352,7 +407,7 @@ impl ReadService {
         let fetch_limit = self.index().results_max();
 
         let mut results = Vec::new();
-        let mut warnings = self.initial_search_warnings(&selected, params.target, references);
+        let mut warnings = self.initial_search_warnings(selected, params.target, references);
         let mut ranked_truncated_at = None;
         if let Some(query) = query {
             let parsed = parsed_query(query)?;
@@ -367,9 +422,10 @@ impl ReadService {
             ranked_truncated_at = self.collect_query_hits(
                 criteria,
                 &params.scope,
-                &selected,
+                selected,
                 (&parsed, store),
                 (&mut results, &mut warnings),
+                budget,
             )?;
         }
         let mut traversal_report = TraversalReport::default();
@@ -382,6 +438,7 @@ impl ReadService {
                 SearchParamsTarget::All | SearchParamsTarget::Symbol
             )
         {
+            let mut traversed = Vec::new();
             traversal_report = collect_traversal_hits(
                 self,
                 selected.matcher.as_ref(),
@@ -389,20 +446,21 @@ impl ReadService {
                 (traversal, seed),
                 references,
                 payloads,
-                &mut results,
+                &mut traversed,
             )?;
+            merge_selected_traversal_hits(&mut results, traversed);
         }
         // Either bound reaching `results_max` costs the caller the same hits, so the two
         // carry one warning: the candidate pool cut before resolution, and the hit set
         // cut after it.
-        retain_public_symbol_hits(
+        retain_selected_symbol_hits(
             &mut results,
             &mut warnings,
             &[Some(self.index()), selected.force_include.as_ref()],
         )?;
         let results_max_reached =
             order_and_bound_hits(&mut results, params.order, fetch_limit).or(ranked_truncated_at);
-        let (output, payload_warnings) = finish(results, &selected, payloads, limit)?;
+        let (output, payload_warnings) = finish(results, selected, payloads, limit)?;
         warnings.extend(payload_warnings);
         Ok((
             output,
@@ -573,7 +631,8 @@ impl ReadService {
         scope: &SearchScope,
         selected: &SelectedPaths,
         (query, store): (&ParsedQuery, &StoreAnswer),
-        (results, warnings): (&mut Vec<SearchHit>, &mut Vec<ReadWarning>),
+        (results, warnings): (&mut Vec<SelectedHit>, &mut Vec<ReadWarning>),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
     ) -> Result<Option<usize>, RiftError> {
         rift_tracing::traced!(component = "search", operation = "search.query_hits", {
             let index = self.index();
@@ -647,6 +706,7 @@ impl ReadService {
                     documentation.as_ref(),
                     &ranked,
                     results,
+                    budget,
                 )
             })?;
             Ok(ranked.truncated_at())
@@ -778,9 +838,61 @@ fn force_include_requested(params: &SearchParams) -> bool {
 /// Project symbol lines wait for pagination when this is a search request.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct HitPayloads {
-    source: bool,
+    pub(crate) source: bool,
     score: bool,
     defer_line: bool,
+}
+
+pub(crate) struct SelectedHit {
+    pub(crate) hit: SearchHit,
+    pub(crate) contributions: Vec<rift_core::ContributionKey>,
+}
+
+impl From<SearchHit> for SelectedHit {
+    fn from(hit: SearchHit) -> Self {
+        Self {
+            hit,
+            contributions: Vec::new(),
+        }
+    }
+}
+
+fn merge_selected_traversal_hits(results: &mut Vec<SelectedHit>, traversed: Vec<SearchHit>) {
+    for hit in traversed {
+        let existing = hit_symbol_id(&hit).and_then(|identity| {
+            results
+                .iter_mut()
+                .find(|selected| hit_symbol_id(&selected.hit) == Some(identity))
+        });
+        match (existing, hit) {
+            (
+                Some(existing),
+                SearchHit {
+                    traversal_path: Some(path),
+                    distance: Some(distance),
+                    ..
+                },
+            ) => crate::traversal::absorb_traversal_match(&mut existing.hit, path, distance),
+            (_, hit) => results.push(SelectedHit::from(hit)),
+        }
+    }
+}
+
+fn selected_hits(
+    selected: Vec<SelectedHit>,
+    capture: bool,
+) -> (Vec<SearchHit>, Vec<Vec<rift_core::ContributionKey>>) {
+    if capture {
+        selected
+            .into_iter()
+            .map(|selected| (selected.hit, selected.contributions))
+            .unzip()
+    } else {
+        (
+            selected.into_iter().map(|selected| selected.hit).collect(),
+            Vec::new(),
+        )
+    }
 }
 
 impl HitPayloads {
@@ -1258,12 +1370,17 @@ fn resolve_ranked_hits(
     resolution: Resolution<'_>,
     documentation: Option<&SearchDocumentation<'_>>,
     ranked: &RankedCandidates,
-    results: &mut Vec<SearchHit>,
+    results: &mut Vec<SelectedHit>,
+    mut budget: Option<&mut crate::QueryFactBudget<'_>>,
 ) -> Result<(), RiftError> {
     let mut answered: Vec<ProjectPath> = Vec::new();
     for candidate in ranked.candidates() {
         if let Some(hit) = documentation.and_then(|documentation| documentation.hit(candidate)) {
-            results.push(hit);
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.check()?;
+                budget.charge_material(std::mem::size_of::<SelectedHit>())?;
+            }
+            results.push(hit.into());
             continue;
         }
         let Some(resolved) = resolve_candidate(index, resolution, candidate.identity())? else {
@@ -1279,7 +1396,11 @@ fn resolve_ranked_hits(
             }
             answered.push(path.clone());
         }
-        results.push(resolved.into_hit(criteria, candidate)?);
+        if let Some(budget) = budget.as_deref_mut() {
+            budget.check()?;
+            budget.charge_material(std::mem::size_of::<SelectedHit>())?;
+        }
+        results.push(resolved.into_selected_hit(criteria, candidate, budget.as_deref_mut())?);
     }
     Ok(())
 }
@@ -1346,17 +1467,17 @@ impl ResolvedCandidate<'_> {
         }
     }
 
-    /// The wire hit this candidate becomes, scored by its place in the fused order.
-    fn into_hit(
+    fn into_selected_hit(
         self,
         criteria: SearchCriteria<'_>,
         candidate: &FusedCandidate,
-    ) -> Result<SearchHit, RiftError> {
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<SelectedHit, RiftError> {
         let score = Some(candidate.score());
         let matched_by = matched_fields(candidate);
         match self {
             Self::Declaration(held, found) => {
-                build_symbol_hit(held, found, score, matched_by, criteria.payloads)
+                build_selected_symbol_hit(held, found, score, matched_by, criteria.payloads, budget)
             }
             Self::SourceFile(file) => {
                 let (line, range, text) = locate_query_line(file.source(), criteria.query);
@@ -1365,7 +1486,8 @@ impl ResolvedCandidate<'_> {
                     (line, range, text),
                     (score, matched_by),
                     criteria.payloads,
-                ))
+                )
+                .into())
             }
             Self::TextFile(file) => {
                 let (line, range, text) = locate_query_line(file.content(), criteria.query);
@@ -1374,7 +1496,8 @@ impl ResolvedCandidate<'_> {
                     (line, range, text),
                     (score, matched_by),
                     criteria.payloads,
-                ))
+                )
+                .into())
             }
         }
     }
@@ -1497,20 +1620,58 @@ pub(crate) fn build_symbol_hit(
     matched_by: Vec<MatchedField>,
     payloads: HitPayloads,
 ) -> Result<SearchHit, RiftError> {
+    build_selected_symbol_hit(index, matched, score, matched_by, payloads, None)
+        .map(|selected| selected.hit)
+}
+
+pub(crate) fn build_selected_symbol_hit(
+    index: &WorkspaceIndex,
+    matched: SymbolMatch<'_>,
+    score: Option<f64>,
+    matched_by: Vec<MatchedField>,
+    payloads: HitPayloads,
+    budget: Option<&mut crate::QueryFactBudget<'_>>,
+) -> Result<SelectedHit, RiftError> {
     // A retained disagreement surfaces as a `symbol_disagreement` warning on `get_symbol`
     // (crates/rift-server/src/read.rs); doing the same for a search hit needs the same
     // warnings accumulator threaded through every collector this file merges hits
     // through, and no shipped provider produces a disagreement today. Scoped out of this
     // change; `get_symbol` already carries it.
-    let (symbol, _disagreement) = wire_symbol(index, matched)?;
-    Ok(assembled_symbol_hit(
-        symbol,
-        matched,
-        project_path(matched.file.path()),
-        score,
-        matched_by,
-        payloads,
-    ))
+    let (symbol, _disagreement, contributions) =
+        crate::read::wire_symbol_with(index, matched, |readable| {
+            capture_contributions(readable, budget)
+        })?;
+    Ok(SelectedHit {
+        hit: assembled_symbol_hit(
+            symbol,
+            matched,
+            project_path(matched.file.path()),
+            score,
+            matched_by,
+            payloads,
+        ),
+        contributions,
+    })
+}
+
+fn capture_contributions(
+    readable: Option<&rift_index::ReadableSymbol>,
+    budget: Option<&mut crate::QueryFactBudget<'_>>,
+) -> Result<Vec<rift_core::ContributionKey>, RiftError> {
+    use get_size2::{GetSize, StandardTracker};
+
+    let (Some(readable), Some(budget)) = (readable, budget) else {
+        return Ok(Vec::new());
+    };
+    let keys = readable.assembled().contributions();
+    let (bytes, _) = rift_protocol::retained_sequence_material(
+        keys,
+        std::mem::size_of_val(keys),
+        StandardTracker::default(),
+        GetSize::get_heap_size_with_tracker,
+    );
+    budget.charge_material(bytes)?;
+    Ok(keys.to_vec())
 }
 
 /// One symbol hit over `matched`'s declaration bytes: `symbol` already assembled, addressed
@@ -1790,28 +1951,63 @@ pub(crate) fn retain_public_symbol_hits(
     }
     let mut retained = Vec::with_capacity(results.len());
     for hit in std::mem::take(results) {
-        if let SearchHitTarget::Symbol { symbol } = &hit.hit
-            && !symbol.name_is_public()
-        {
-            let unit = match (&hit.unit, &hit.path) {
-                (Some(unit), _) => Some(unit.clone()),
-                (None, Some(path)) => Some(crate::read::source_unit_id(
-                    &rift_core::ProjectPath::new(path.0.clone())?,
-                )),
-                (None, None) => None,
-            };
-            let qualified_name = retained_hit_qualified_name(&hit, symbol, indices)?;
-            let (unit, range) = match (unit, hit.range) {
-                (Some(unit), Some(range)) => (Some(unit), Some(range)),
-                _ => (None, None),
-            };
-            warnings.push(crate::read::object_unavailable_at(
-                &qualified_name,
-                unit,
-                range,
-            ));
+        if let Some(warning) = public_symbol_warning(&hit, indices)? {
+            warnings.push(warning);
         } else {
             retained.push(hit);
+        }
+    }
+    *results = retained;
+    Ok(())
+}
+
+pub(crate) fn public_symbol_warning(
+    hit: &SearchHit,
+    indices: &[Option<&WorkspaceIndex>],
+) -> Result<Option<ReadWarning>, RiftError> {
+    let SearchHitTarget::Symbol { symbol } = &hit.hit else {
+        return Ok(None);
+    };
+    if symbol.name_is_public() {
+        return Ok(None);
+    }
+    let unit = match (&hit.unit, &hit.path) {
+        (Some(unit), _) => Some(unit.clone()),
+        (None, Some(path)) => Some(crate::read::source_unit_id(&rift_core::ProjectPath::new(
+            path.0.clone(),
+        )?)),
+        (None, None) => None,
+    };
+    let qualified_name = retained_hit_qualified_name(hit, symbol, indices)?;
+    let (unit, range) = match (unit, hit.range.clone()) {
+        (Some(unit), Some(range)) => (Some(unit), Some(range)),
+        _ => (None, None),
+    };
+    Ok(Some(crate::read::object_unavailable_at(
+        &qualified_name,
+        unit,
+        range,
+    )))
+}
+
+fn retain_selected_symbol_hits(
+    results: &mut Vec<SelectedHit>,
+    warnings: &mut Vec<ReadWarning>,
+    indices: &[Option<&WorkspaceIndex>],
+) -> Result<(), RiftError> {
+    if results.iter().all(|selected| {
+        !matches!(
+            &selected.hit.hit, SearchHitTarget::Symbol { symbol } if !symbol.name_is_public()
+        )
+    }) {
+        return Ok(());
+    }
+    let mut retained = Vec::with_capacity(results.len());
+    for selected in std::mem::take(results) {
+        if let Some(warning) = public_symbol_warning(&selected.hit, indices)? {
+            warnings.push(warning);
+        } else {
+            retained.push(selected);
         }
     }
     *results = retained;
@@ -1823,19 +2019,19 @@ pub(crate) fn retain_public_symbol_hits(
 /// many hits counts as reached: the answer warns that the bound was met, whether or not
 /// a hit past it existed.
 fn order_and_bound_hits(
-    results: &mut Vec<SearchHit>,
+    results: &mut Vec<SelectedHit>,
     order: ResultOrder,
     results_max: usize,
 ) -> Option<usize> {
     rift_tracing::traced!(component = "search", operation = "search.order", {
-        order_hits(results, order);
+        results.sort_by(|left, right| hit_ordering(&left.hit, &right.hit, order));
         bound_hits(results, results_max)
     })
 }
 
 /// Cuts an ordered hit set to the server's result bound, answering the bound when the set
 /// reached it so the answer can warn `results_truncated`.
-pub(crate) fn bound_hits(results: &mut Vec<SearchHit>, results_max: usize) -> Option<usize> {
+pub(crate) fn bound_hits<T>(results: &mut Vec<T>, results_max: usize) -> Option<usize> {
     let reached = results.len() >= results_max;
     results.truncate(results_max);
     reached.then_some(results_max)
@@ -1852,7 +2048,7 @@ pub(crate) fn order_hits(results: &mut [SearchHit], order: ResultOrder) {
     results.sort_by(|left, right| hit_ordering(left, right, order));
 }
 
-fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Ordering {
+pub(crate) fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Ordering {
     match order {
         ResultOrder::Relevance => right
             .score
@@ -1916,6 +2112,126 @@ mod tests {
     use crate::read::tests::{captured_rust_library, local_identity, project_fixture};
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+    fn original_search_symbols(
+        service: &ReadService,
+    ) -> TestResult<Vec<(super::Symbol, Vec<rift_core::ContributionKey>)>> {
+        let mut expected = Vec::new();
+        for name in ["beacon_alpha", "beacon_beta"] {
+            let identity = declaration_identity("lib.rs", name)?;
+            let Some(super::ResolvedCandidate::Declaration(index, matched)) =
+                super::resolve_declaration(service.index(), None, identity.as_str())?
+            else {
+                return Err("original declaration".into());
+            };
+            let (symbol, _, keys) = crate::read::wire_symbol_with(index, matched, |readable| {
+                Ok(readable.map_or_else(Vec::new, |readable| {
+                    readable.assembled().contributions().to_vec()
+                }))
+            })?;
+            assert!(
+                symbol.id.is_none(),
+                "original fixture has no canonical identity"
+            );
+            assert!(!keys.is_empty());
+            expected.push((symbol, keys));
+        }
+        Ok(expected)
+    }
+
+    #[test]
+    fn search_contributions_follow_original_symbols_through_fusion_order_and_pages() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        fs::write(
+            directory.path().join("lib.rs"),
+            "pub fn beacon_alpha() {}\npub fn beacon_beta() {}\n",
+        )?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let expected = original_search_symbols(&service)?;
+        let fused = StoreAnswer::new(
+            vec![
+                lexical_input(vec![
+                    (
+                        declaration_identity("lib.rs", "beacon_alpha")?,
+                        FieldSet::of(SearchableField::Name),
+                    ),
+                    (
+                        DocumentIdentity::new("lib.rs")?,
+                        FieldSet::of(SearchableField::FileContent),
+                    ),
+                ]),
+                ranked_input(
+                    RankingInputKind::Vector,
+                    vec![
+                        (
+                            declaration_identity("lib.rs", "beacon_beta")?,
+                            FieldSet::EMPTY,
+                        ),
+                        (
+                            declaration_identity("lib.rs", "beacon_alpha")?,
+                            FieldSet::EMPTY,
+                        ),
+                    ],
+                ),
+            ],
+            Vec::new(),
+            configured_weights(),
+        );
+        let limits = rift_search::query::QueryLimits::try_from(
+            &rift_protocol::query::QueryConfiguration::default(),
+        )?;
+        let mut budget = crate::QueryFactBudget::for_request(
+            limits,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &|| false,
+        )?;
+        for store in [&StoreAnswer::identifier_only(), &fused] {
+            for order in ["relevance", "path", "identity"] {
+                let mut seen = Vec::new();
+                let mut page_index = 0;
+                loop {
+                    let params: SearchParams = serde_json::from_value(json!({
+                        "query":"beacon", "target":"all", "order":order,
+                        "limit":1, "page_index":page_index,
+                    }))?;
+                    let ordinary = service.search(&params, store)?;
+                    let (selected, keys) = service.search_with_contributions(
+                        &params,
+                        store,
+                        &crate::EngineReferences::default(),
+                        &mut budget,
+                    )?;
+                    assert_eq!(selected, ordinary, "association capture preserves search");
+                    assert_eq!(keys.len(), selected.results.len());
+                    for (hit, keys) in selected.results.iter().zip(keys) {
+                        if let SearchHitTarget::Symbol { symbol } = &hit.hit {
+                            let (_, original) = expected
+                                .iter()
+                                .find(|(original, _)| original == symbol.as_ref())
+                                .ok_or("selected original symbol")?;
+                            assert_eq!(&keys, original);
+                            seen.push(symbol.name.clone());
+                        } else {
+                            assert!(keys.is_empty());
+                        }
+                    }
+                    page_index += 1;
+                    if page_index >= selected.pagination.total_pages {
+                        break;
+                    }
+                }
+                seen.sort();
+                assert_eq!(seen, ["beacon_alpha", "beacon_beta"]);
+            }
+        }
+        Ok(())
+    }
 
     /// The shares `[search.ranking]` fuses under when an operator sets none.
     fn configured_weights() -> RankingWeights {
@@ -2016,8 +2332,16 @@ mod tests {
             32,
         );
         let mut results = Vec::new();
-        super::resolve_ranked_hits(index, criteria, resolution, None, &ranked, &mut results)?;
-        Ok(results)
+        super::resolve_ranked_hits(
+            index,
+            criteria,
+            resolution,
+            None,
+            &ranked,
+            &mut results,
+            None,
+        )?;
+        Ok(super::selected_hits(results, false).0)
     }
 
     /// The hits the identifier ranking alone places for `query`, fused and resolved the

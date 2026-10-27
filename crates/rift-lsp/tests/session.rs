@@ -709,6 +709,92 @@ async fn cancelled_request_response_is_discarded_by_the_next_call() {
     join(engine_task).await;
 }
 
+#[tokio::test]
+async fn admitted_dependency_uri_preserves_call_items_and_closes_its_document() {
+    let dependency = tempfile::tempdir().expect("dependency root");
+    let root = rift_lsp::uri::TreeRoot::new(dependency.path()).expect("dependency URI root");
+    let uri = root
+        .document_uri(&path("lib.rs"))
+        .expect("dependency document URI");
+    let expected_uri = uri.as_str().to_owned();
+    let (_workspace, mut session, engine_task) = started(move |mut engine| async move {
+        let mut capabilities = full_capabilities();
+        capabilities["callHierarchyProvider"] = json!(true);
+        engine.handshake(capabilities).await;
+        let opened = engine.next_message().await;
+        assert_eq!(opened["method"], "textDocument/didOpen");
+        assert_eq!(opened["params"]["textDocument"]["uri"], expected_uri);
+        let (id, references) = engine.expect_request("textDocument/references").await;
+        assert_eq!(references["textDocument"]["uri"], expected_uri);
+        assert_eq!(references["context"]["includeDeclaration"], true);
+        engine.respond(&id, json!([])).await;
+        let (id, prepared) = engine
+            .expect_request("textDocument/prepareCallHierarchy")
+            .await;
+        assert_eq!(prepared["textDocument"]["uri"], expected_uri);
+        let range = json!({"start":{"line":0,"character":3},"end":{"line":0,"character":9}});
+        let item = json!({"name":"beacon","kind":12,"uri":expected_uri,
+            "range":range,"selectionRange":range,"data":{"token":"session-owned"}});
+        engine.respond(&id, json!([item])).await;
+        let (id, outgoing) = engine.expect_request("callHierarchy/outgoingCalls").await;
+        assert_eq!(outgoing["item"], item);
+        engine
+            .respond(&id, json!([{"to":item,"fromRanges":[range,range]}]))
+            .await;
+        let (id, incoming) = engine.expect_request("callHierarchy/incomingCalls").await;
+        assert_eq!(incoming["item"], item);
+        engine
+            .respond(&id, json!([{"from":item,"fromRanges":[range,range]}]))
+            .await;
+        let closed = engine.next_message().await;
+        assert_eq!(closed["method"], "textDocument/didClose");
+        assert_eq!(closed["params"]["textDocument"]["uri"], expected_uri);
+        let (id, _) = engine.expect_request("shutdown").await;
+        engine.respond(&id, Value::Null).await;
+        engine.next_message().await;
+    })
+    .await;
+    session
+        .open_uri(&uri, "rust", "fn beacon() {}\n".to_owned())
+        .await
+        .expect("dependency opened");
+    let position = Position {
+        line: 0,
+        character: 3,
+    };
+    assert!(
+        session
+            .references_uri(&uri, position)
+            .await
+            .expect("dependency references")
+            .is_empty()
+    );
+    let items = session
+        .prepare_call_hierarchy_uri(&uri, position)
+        .await
+        .expect("dependency prepared");
+    let item = items.into_iter().next().expect("prepared dependency item");
+    assert_eq!(item.data, Some(json!({"token":"session-owned"})));
+    let calls = session
+        .outgoing_calls(item.clone())
+        .await
+        .expect("dependency calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].from_ranges.len(), 2);
+    let incoming = session
+        .incoming_calls(item)
+        .await
+        .expect("incoming dependency calls");
+    assert_eq!(incoming.len(), 1);
+    assert_eq!(incoming[0].from_ranges.len(), 2);
+    session
+        .close_open_documents()
+        .await
+        .expect("dependency closed");
+    session.shutdown().await;
+    join(engine_task).await;
+}
+
 /// The session records each document it opened and has not closed, and
 /// `close_open_documents` sends `didClose` for exactly those, once: a document
 /// already closed is not closed again, and a second call sends nothing.

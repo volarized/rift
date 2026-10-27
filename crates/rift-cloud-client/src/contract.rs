@@ -117,6 +117,13 @@ impl Endpoint {
 /// Why the published global API contract could not be validated.
 #[derive(Debug)]
 pub enum ContractError {
+    /// The shared Rust schemas could not be written to the authored contract.
+    Write {
+        /// Artifact path.
+        path: PathBuf,
+        /// Write failure.
+        source: io::Error,
+    },
     /// The artifact could not be read.
     Read {
         /// Artifact path.
@@ -143,6 +150,9 @@ pub enum ContractError {
 impl fmt::Display for ContractError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Write { path, source } => {
+                write!(formatter, "cannot write `{}`: {source}", path.display())
+            }
             Self::Read { path, source } => {
                 write!(formatter, "cannot read `{}`: {source}", path.display())
             }
@@ -163,7 +173,7 @@ impl fmt::Display for ContractError {
 impl Error for ContractError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Read { source, .. } => Some(source),
+            Self::Write { source, .. } | Self::Read { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::Invalid { .. } => None,
         }
@@ -337,8 +347,10 @@ fn validate_response_media(
             }
             continue;
         }
-        if matches!(endpoint, Endpoint::Source | Endpoint::Symbols)
-            && *status == StatusCode::SERVICE_UNAVAILABLE
+        if matches!(
+            endpoint,
+            Endpoint::Source | Endpoint::Symbols | Endpoint::Search
+        ) && *status == StatusCode::SERVICE_UNAVAILABLE
         {
             if response.content.len() != 2
                 || !response.content.contains_key("application/json")
@@ -770,6 +782,21 @@ fn validate_patterns(document: &Value) -> Result<(), String> {
 /// Compares each shared schema with its Rust model's, in the form the MCP surface serves:
 /// with the `null` arm stripped from every optional property.
 fn validate_shared_schemas(document: &Value) -> Result<(), String> {
+    let components = component_schemas(document)?;
+    for (name, expected) in shared_schemas() {
+        let actual = components
+            .get(&name)
+            .ok_or_else(|| format!("shared schema `{name}` is missing"))?;
+        if actual != &expected {
+            return Err(format!(
+                "shared schema `{name}` differs from its Rust model"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn shared_schemas() -> serde_json::Map<String, Value> {
     let mut settings = SchemaSettings::draft2020_12();
     settings.definitions_path = "/components/schemas".into();
     settings.meta_schema = None;
@@ -789,25 +816,84 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<rift_protocol::source_read::GetSourceResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
+    let _ =
+        generator.subschema_for::<rift_protocol::relationship_read::RelationshipSearchRequest>();
+    let _ = generator.subschema_for::<rift_protocol::relationship_read::RelationshipSearchResult>();
+    let _ = generator.subschema_for::<rift_protocol::relationship_read::RelationshipCapability>();
 
     // oas3 0.22 omits JSON Schema keywords used by shared models, including
     // patternProperties. Compare those schemas as JSON to retain their exact shape.
-    let components = component_schemas(document)?;
+    let mut schemas = serde_json::Map::new();
     for (name, mut expected) in generator.take_definitions(true) {
         normalize_shared_string_enum(&mut expected);
         if let Some(schema) = expected.as_object_mut() {
             rift_protocol::schema::strip_optional_null_arms(schema);
         }
-        let actual = components
-            .get(&name)
-            .ok_or_else(|| format!("shared schema `{name}` is missing"))?;
-        if actual != &expected {
-            return Err(format!(
-                "shared schema `{name}` differs from its Rust model"
-            ));
-        }
+        schemas.insert(name, expected);
     }
-    Ok(())
+    schemas
+}
+
+/// Updates shared Rust schemas while preserving the authored operation contract.
+///
+/// # Errors
+/// Returns the original contract read, JSON or write failure.
+pub fn synchronize(path: &Path) -> Result<(), ContractError> {
+    let bytes = fs::read(path).map_err(|source| ContractError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut document: Value =
+        serde_json::from_slice(&bytes).map_err(|source| ContractError::Parse {
+            path: path.to_owned(),
+            source,
+        })?;
+    let schemas = document
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| ContractError::Invalid {
+            path: path.to_owned(),
+            rule: "components/schemas must be an object".to_owned(),
+        })?;
+    schemas.extend(shared_schemas());
+    let capability_properties = schemas
+        .get_mut("Capabilities")
+        .and_then(|schema| schema.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| ContractError::Invalid {
+            path: path.to_owned(),
+            rule: "capability properties must be an object".to_owned(),
+        })?;
+    capability_properties.insert(
+        "relationship_capabilities".to_owned(),
+        json!({
+            "description":"Complete relationship operations supported by existing collected facts. Absence establishes no supported operation.",
+            "type":"array", "maxItems":2,
+            "items":{"$ref":"#/components/schemas/RelationshipCapability"}
+        }),
+    );
+    let unavailable = document
+        .pointer_mut("/paths/~1v1~1search/post/responses/503/content")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| ContractError::Invalid {
+            path: path.to_owned(),
+            rule: "search unavailable response content must be an object".to_owned(),
+        })?;
+    unavailable.insert(
+        "application/json".to_owned(),
+        json!({"schema": {"$ref": "#/components/schemas/SearchUnavailable"}}),
+    );
+    let mut bytes =
+        serde_json::to_vec_pretty(&document).map_err(|source| ContractError::Parse {
+            path: path.to_owned(),
+            source,
+        })?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).map_err(|source| ContractError::Write {
+        path: path.to_owned(),
+        source,
+    })
 }
 
 fn normalize_shared_string_enum(schema: &mut Value) {

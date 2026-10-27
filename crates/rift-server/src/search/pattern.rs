@@ -20,8 +20,8 @@ use rift_protocol::read::{
 use rift_ranking::{IdentifierMatchClass, Pattern};
 
 use super::{
-    HitPayloads, SelectedPaths, StoreAnswer, bound_hits, build_symbol_hit, includes, order_hits,
-    populate_symbol_lines, text_file_hit_target,
+    HitPayloads, SelectedHit, SelectedPaths, StoreAnswer, assembled_symbol_hit, bound_hits,
+    capture_contributions, hit_ordering, includes, populate_symbol_lines, text_file_hit_target,
 };
 use crate::read::{
     ReadService, RiftError, file_id, page, project_path, results_truncation_warning,
@@ -202,22 +202,29 @@ fn text_span(span: &Range<u64>) -> Range<usize> {
 
 /// What one verification pass gathered: the hits, the bytes it read, and the files it cut
 /// at their match bound.
-struct Verification {
+struct Verification<'budget, 'cancelled> {
     target: SearchParamsTarget,
     payloads: HitPayloads,
     bounds: PatternBounds,
-    results: Vec<SearchHit>,
+    results: Vec<SelectedHit>,
+    budget: Option<&'budget mut crate::QueryFactBudget<'cancelled>>,
     verified_bytes: u64,
     cut: Vec<ProjectPath>,
 }
 
-impl Verification {
-    fn new(target: SearchParamsTarget, payloads: HitPayloads, bounds: PatternBounds) -> Self {
+impl<'budget, 'cancelled> Verification<'budget, 'cancelled> {
+    fn new(
+        target: SearchParamsTarget,
+        payloads: HitPayloads,
+        bounds: PatternBounds,
+        budget: Option<&'budget mut crate::QueryFactBudget<'cancelled>>,
+    ) -> Self {
         Self {
             target,
             payloads,
             bounds,
             results: Vec::new(),
+            budget,
             verified_bytes: 0,
             cut: Vec::new(),
         }
@@ -266,12 +273,22 @@ impl Verification {
         let start = u64::try_from(matched.start).unwrap_or(u64::MAX);
         let end = u64::try_from(matched.end).unwrap_or(u64::MAX);
         if self.target != SearchParamsTarget::File
-            && let Some(hit) = file.declaration_hit(start, end, self.payloads)?
+            && let Some(hit) =
+                file.declaration_hit(start, end, self.payloads, self.budget.as_deref_mut())?
         {
+            if let Some(budget) = self.budget.as_deref_mut() {
+                budget.charge_material(std::mem::size_of::<SelectedHit>())?;
+            }
             self.results.push(hit);
         }
         if self.target != SearchParamsTarget::Symbol {
-            self.results.push(file.match_hit(start..end, self.payloads));
+            if let Some(budget) = self.budget.as_deref_mut() {
+                budget.charge_material(std::mem::size_of::<SelectedHit>())?;
+            }
+            self.results.push(SelectedHit {
+                hit: file.match_hit(start..end, self.payloads),
+                contributions: Vec::new(),
+            });
         }
         Ok(())
     }
@@ -301,7 +318,8 @@ impl<'a> FileMatches<'a> {
         start: u64,
         end: u64,
         payloads: HitPayloads,
-    ) -> Result<Option<SearchHit>, RiftError> {
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<Option<SelectedHit>, RiftError> {
         let owner = self.candidate.owner;
         let Some(parsed) = owner.file(self.candidate.path()) else {
             return Ok(None);
@@ -319,7 +337,21 @@ impl<'a> FileMatches<'a> {
             // the one class a text match reaches a declaration through.
             rank: IdentifierMatchClass::Substring.into(),
         };
-        build_symbol_hit(owner, matched, None, vec![MatchedField::Content], payloads).map(Some)
+        let (symbol, _, contributions) =
+            crate::read::wire_symbol_with(owner, matched, |readable| {
+                capture_contributions(readable, budget)
+            })?;
+        Ok(Some(SelectedHit {
+            hit: assembled_symbol_hit(
+                symbol,
+                matched,
+                project_path(matched.file.path()),
+                None,
+                vec![MatchedField::Content],
+                payloads,
+            ),
+            contributions,
+        }))
     }
 
     /// The file hit for one match: its byte range, its line, and the line itself when
@@ -398,18 +430,72 @@ impl ReadService {
         pattern: &Pattern,
         store: &StoreAnswer,
     ) -> Result<SearchResult, RiftError> {
+        self.search_pattern_selected(params, pattern, store, None)
+            .map(|(result, _)| result)
+    }
+
+    /// Returns pattern hits with the original normalized Contribution keys.
+    ///
+    /// # Errors
+    /// Returns the existing pattern, source selection or normalized assembly refusal.
+    pub fn search_pattern_with_contributions(
+        &self,
+        params: &SearchParams,
+        store: &StoreAnswer,
+        references: &crate::EngineReferences,
+        budget: &mut crate::QueryFactBudget<'_>,
+    ) -> Result<(SearchResult, Vec<Vec<rift_core::ContributionKey>>), RiftError> {
+        let pattern = self
+            .validated_pattern(params, store, references)?
+            .ok_or_else(|| {
+                errors::server::read_invalid()
+                    .field("pattern")
+                    .violation("pattern selection is required")
+                    .error()
+            })?;
+        self.search_pattern_selected(params, &pattern, store, Some(budget))
+    }
+
+    pub(super) fn search_pattern_selected(
+        &self,
+        params: &SearchParams,
+        pattern: &Pattern,
+        store: &StoreAnswer,
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<(SearchResult, Vec<Vec<rift_core::ContributionKey>>), RiftError> {
+        self.search_pattern_in(params, pattern, store, budget, None)
+    }
+
+    pub(super) fn search_pattern_in(
+        &self,
+        params: &SearchParams,
+        pattern: &Pattern,
+        store: &StoreAnswer,
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selected: Option<&SelectedPaths>,
+    ) -> Result<(SearchResult, Vec<Vec<rift_core::ContributionKey>>), RiftError> {
         self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
         let bounds = store.pattern_bounds();
         let limit = super::search_page_limit(params)?;
-        let selected = self.selected_paths(params.paths.as_ref())?;
+        let original;
+        let selected = if let Some(selected) = selected {
+            selected
+        } else {
+            original = self.selected_paths(params.paths.as_ref())?;
+            &original
+        };
         let (candidates, preparing) = if params.scope == SearchScope::Global {
             (Vec::new(), None)
         } else {
-            self.pattern_candidates(pattern, store.pattern_candidates(), &selected, bounds)?
+            self.pattern_candidates(pattern, store.pattern_candidates(), selected, bounds)?
         };
         let results_max = self.index().results_max();
-        let mut verification =
-            Verification::new(params.target, HitPayloads::requested(params), bounds);
+        let mut verification = Verification::new(
+            params.target,
+            HitPayloads::requested(params),
+            bounds,
+            budget,
+        );
         for candidate in &candidates {
             if verification.results.len() >= results_max {
                 break;
@@ -422,19 +508,26 @@ impl ReadService {
         warnings.extend(matches_truncation_warning(&verification.cut, bounds));
         warnings.extend(preparing);
         if params.order != ResultOrder::Relevance {
-            order_hits(&mut results, params.order);
+            results.sort_by(|left, right| hit_ordering(&left.hit, &right.hit, params.order));
         }
         if let Some(bound) = bound_hits(&mut results, results_max) {
             warnings.push(results_truncation_warning(bound));
         }
-        let (mut results, pagination) = page(results, params.page_index, limit);
+        let (results, pagination) = page(results, params.page_index, limit);
+        let (mut results, contributions): (Vec<_>, Vec<_>) = results
+            .into_iter()
+            .map(|selected| (selected.hit, selected.contributions))
+            .unzip();
         populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
-        Ok(SearchResult {
-            view: None,
-            results,
-            pagination,
-            warnings,
-        })
+        Ok((
+            SearchResult {
+                view: None,
+                results,
+                pagination,
+                warnings,
+            },
+            contributions,
+        ))
     }
 
     /// The files to verify, in path order, and the warning the answer carries when rows

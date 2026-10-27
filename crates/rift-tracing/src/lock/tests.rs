@@ -312,21 +312,54 @@ async fn a_lock_held_across_an_await_stays_in_flight_until_dropped() -> TestResu
 async fn a_held_lock_moved_into_a_blocking_closure_records_its_hold_there() -> TestResult {
     let (recorder, mut drain) = ScopedRecorder::builder().install()?;
     let writes = Arc::new(Mutex::new(()));
-    let turn = lock("index.write")
-        .acquire(Arc::clone(&writes).lock_owned())
-        .await;
+    let turn = crate::traced!("lexical.commit", async {
+        lock("index.write")
+            .acquire(Arc::clone(&writes).lock_owned())
+            .await
+    })
+    .await;
+    assert!(closed(&drain.queued_records(), "lexical.commit").is_empty());
     tokio::task::spawn_blocking(move || drop(turn)).await?;
     assert!(writes.try_lock().is_ok(), "the closure released the lock");
     let metrics = recorder.metrics();
     drop(recorder);
 
-    assert_eq!(closed(&drain.queued_records(), "lock.held").len(), 1);
+    let records = drain.queued_records();
+    assert_eq!(closed(&records, "lock.held").len(), 1);
+    assert_eq!(closed(&records, "lexical.commit").len(), 1);
     let labels = [("lock.name", "index.write"), ("lock.mode", "exclusive")];
     assert_eq!(
         count(&metrics, "lock.held.duration", &labels),
         1,
         "the hold records through the dispatcher it was taken under"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_hold_dropped_under_another_recorder_restores_that_recorder() -> TestResult {
+    let (_recorder, mut drain) = ScopedRecorder::builder().install()?;
+    let writes = Arc::new(Mutex::new(()));
+    let turn = crate::traced!("lexical.commit", async {
+        lock("index.write")
+            .acquire(Arc::clone(&writes).lock_owned())
+            .await
+    })
+    .await;
+    let foreign = tokio::task::spawn_blocking(move || {
+        let (recorder, mut drain) = ScopedRecorder::builder().install()?;
+        drop(turn);
+        crate::info!("after hold");
+        drop(recorder);
+        Ok::<_, crate::LogFilterError>(drain.queued_records())
+    })
+    .await??;
+    assert!(writes.try_lock().is_ok(), "the closure released the lock");
+    let records = drain.queued_records();
+    assert_eq!(closed(&records, "lock.held").len(), 1);
+    assert_eq!(closed(&records, "lexical.commit").len(), 1);
+    assert_eq!(foreign.len(), 1);
+    assert_eq!(foreign[0].message(), "after hold");
     Ok(())
 }
 

@@ -21,7 +21,9 @@ use workspace_client::{await_workspace_ready, search_after_population};
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
-    let server = RiftMcp::build(root, WorkspaceIndexLimits::default()).await?;
+    let server = RiftMcp::build(root, WorkspaceIndexLimits::default())
+        .await?
+        .with_query_program(workspace_client::query_program()?);
     let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
     tokio::spawn(async move {
         let service = server
@@ -36,22 +38,15 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
 }
 
 /// Each hit's declared name, or its path for a file hit, in answer order.
-fn named(answer: &Value) -> Vec<String> {
-    answer["results"]
-        .as_array()
-        .map(|results| {
-            results
-                .iter()
-                .map(|hit| {
-                    hit["hit"]["symbol"]["name"]
-                        .as_str()
-                        .or_else(|| hit["path"].as_str())
-                        .unwrap_or_default()
-                        .to_owned()
-                })
-                .collect()
+fn named(answer: &Value) -> TestResult<Vec<String>> {
+    workspace_client::query::rows(answer)?
+        .iter()
+        .map(|row| {
+            workspace_client::query::literal(row, "name")
+                .or_else(|_| workspace_client::query::literal(row, "path"))
+                .map(str::to_owned)
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 fn workspace() -> TestResult<tempfile::TempDir> {
@@ -75,26 +70,35 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
     let directory = workspace()?;
     let client = client_for(directory.path()).await?;
 
-    let symbol_arguments = json!({ "query": "quokka", "target": "symbol" });
+    let symbol_arguments = serde_json::from_value(
+        json!({"query":"SELECT ?name ?path ?matched_by { SERVICE :search { ?hit :query 'quokka'; :target 'symbol'; :symbol ?symbol; :matched_by ?entry . ?entry :value ?matched_by . ?symbol :name ?name . OPTIONAL { ?hit :path ?path } } }"}),
+    )?;
     let symbols = search_after_population(&client, &symbol_arguments).await?;
-    assert_eq!(named(&symbols), ["alpha"], "{symbols:#}");
+    assert_eq!(named(&symbols)?, ["alpha"], "{symbols:#}");
     assert_eq!(
-        symbols["results"][0]["matched_by"],
-        json!(["content"]),
+        workspace_client::query::literal(
+            &workspace_client::query::rows(&symbols)?[0],
+            "matched_by"
+        )?,
+        "content",
         "a declaration its body placed answers through its content: {symbols:#}"
     );
 
-    let file_arguments = json!({ "query": "quokka", "target": "file" });
+    let file_arguments = workspace_client::query::retrieval(&serde_json::from_value(
+        json!({ "query": "quokka", "target": "file" }),
+    )?)?;
     let files = search_after_population(&client, &file_arguments).await?;
     assert_eq!(
-        named(&files),
+        named(&files)?,
         ["src/lib.rs"],
         "no lockfile answers: {files:#}"
     );
 
-    let selected_arguments = json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } });
+    let selected_arguments = workspace_client::query::retrieval(&serde_json::from_value(
+        json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } }),
+    )?)?;
     let selected = search_after_population(&client, &selected_arguments).await?;
-    assert!(named(&selected).is_empty(), "{selected:#}");
+    assert!(named(&selected)?.is_empty(), "{selected:#}");
     let warning = selected["warnings"]
         .as_array()
         .and_then(|warnings| {

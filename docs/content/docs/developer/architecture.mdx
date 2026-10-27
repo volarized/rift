@@ -343,9 +343,7 @@ one named or inline process for an exact language identity: rust-analyzer for `r
 select the same named process. [LSP profiles](/docs/developer/configuration#lsp-profiles) register
 directories as separate projects, each with its own configuration and language processes.
 
-[`search`](/docs/mcp#search-engine-references) uses the engine for relationship traversal: the
-engine is the one source of the references an incoming walk follows and of the calls an outgoing
-walk follows. Source and configuration must match the captured index before and after the engine
+[`search`](/docs/mcp#search-engine-references) acquires required local reference and call facts from the configured engine. Physical occurrences remain separate from optional enclosing declarations; call hierarchy supplies established edges and actual ranges. Source and configuration must match the captured index before and after the engine
 request.
 
 Before a running engine's next request, the server sends it each publication's changed files
@@ -355,6 +353,8 @@ then answers from the published source, including files the walk never opens.
 
 The embedded [ty](https://github.com/astral-sh/ty) engine serves Python over an in-memory
 transport through the same LSP session contract. Its version ships with the Rift binary.
+
+Query-owned dependency continuation uses admitted captured source and existing sessions. Global serving reads collected facts and performs no language-engine collection or backfill. Local request facts do not enter global collection.
 
 ### History
 
@@ -556,10 +556,21 @@ in a `large_file_skipped` warning.
 
 ### Search
 
-[`search`](/docs/mcp#tool-search) is for reads where the exact name isn't known.
-It ranks declaration names, signatures, documentation, and file content from the index, and it
-answers a regex [`pattern`](/docs/developer/protocol/mcp#search-pattern) from the same stored
-text.
+[`search`](/docs/mcp#tool-search) evaluates SPARQL over immutable selected domain facts.
+The SPARQL adapter in `rift-search` owns library parsing, algebra inspection, RDF term mapping,
+and evaluation over the virtual dataset. Shared domain records carry symbols, declarations,
+sources, occurrences, relationships, documentation, and captured history without RDF types.
+Existing publication, source validation, engine, dependency, and retained-view owners acquire
+those records before evaluation; synchronous dataset callbacks perform no engine or remote I/O.
+
+The library owns joins, filters, property paths, aggregates, and result forms. Acquisition can
+restrict a proven anchored query, and uses a complete required-domain fallback otherwise.
+Missing required facts, admission bounds, or cancellation prevent a complete answer. Retained
+binding and graph answers preserve their original source context, blank nodes, and expiry.
+
+`SERVICE :search` exposes the existing ranking and regex producers described below. SPARQL
+then projects and combines their complete selected results; producer transport pages remain
+separate from query `LIMIT` and `OFFSET`.
 
 #### The document shape
 
@@ -607,7 +618,7 @@ write clears it before it writes.
 
 #### Documentation
 
-`search` with `target: "documentation"` returns blocks from selected documentation sources.
+`SERVICE :search` with `:target "documentation"` returns blocks from selected documentation sources.
 Workspace selection includes `.md`, `.markdown`, `.mdx`, `.rst`, and `.ipynb`, plus `.txt`
 selected by `[search.text].include`. Source visibility applies before collection.
 
@@ -624,7 +635,7 @@ It neither executes code nor follows links to acquire more sources.
 
 Before fusion, the read maps existing ranked documents to block identities and keeps the best
 position once per ranking input. A heading and its text chunk therefore return one documentation
-hit. Under `target: "all"`, an attached comment keeps its symbol result when that symbol answered;
+hit. Under `:target "all"`, an attached comment keeps its symbol result when that symbol answered;
 a file match outside the comment remains a file result.
 
 For example, a guide containing the inline code `Compass` can contribute context to
@@ -639,7 +650,7 @@ paths and source bytes remain local.
 
 #### Query phases
 
-A caller's text is parsed once, into quoted phrases and unquoted terms, and every member is
+The retrieval service's `:query` text is parsed once, into quoted phrases and unquoted terms, and every member is
 rendered as a quoted string literal, so an FTS operator a caller typed cannot become an
 operator the store executes. The parse is bounded: 4,096 bytes of query, 32 members, 256 bytes
 per member. A question carrying more terms than the bound narrows rather than failing - every
@@ -753,8 +764,7 @@ query text while a caller searches. The configuration page states both transfers
 default sends nothing: it starts without a key and makes no request once the weights are
 acquired.
 
-Preparation runs behind the answers. A search issued before the vectors are in is answered by
-the other two inputs and says so, rather than waiting for a model to load.
+Preparation runs behind query serving. A producer records unavailable ranking inputs in typed warnings. A query requiring incomplete producer coverage returns unavailability; independent published-fact queries remain available.
 
 ### Retrieve symbol
 

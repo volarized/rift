@@ -1,0 +1,1449 @@
+//! Admitted dependency source preparation for request-owned engine reads.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use lsp_types::{Range, Uri};
+use rift_analysis::{PackageImportRoot, PackageImportRootOrigin};
+use rift_core::{FileDigest, ProjectPath, SourceLocation};
+use rift_lsp::capabilities::PositionEncoding;
+use rift_lsp::position::LineIndex;
+use rift_protocol::configuration::WorkspaceConfiguration;
+use rift_protocol::identity::SymbolOwner;
+use rift_protocol::read::{Language, SourceUnitId, SourceUnitSpan, SymbolId, TextRange};
+use rift_protocol::symbol_read::SymbolDeclaration;
+use rift_search::query::{QueryFacts, QuerySource, QuerySymbol};
+
+use super::{CalleeRoots, RiftError, unavailable};
+use crate::PackageCallee;
+
+/// A dependency source that must be admitted before completing an engine answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuerySourceRequest {
+    /// A provider-supplied physical location whose normalized declaration is not canonical.
+    Provider {
+        /// Original caller or referenced target, retained in its captured source context.
+        subject: rift_search::query::QueryProviderTarget,
+        /// Direction established by the provider response.
+        direction: rift_protocol::read::TraversalDirection,
+        /// Relationship established by this location.
+        facet: rift_protocol::read::RelationshipFacet,
+        /// Original supplied URI.
+        uri: Uri,
+        /// Original declaration selection or reference occurrence.
+        range: Range,
+        /// Negotiated position encoding.
+        encoding: PositionEncoding,
+        /// Accepted provider supplying this location.
+        provider: Language,
+        /// Actual supplied target name, absent for a reference occurrence.
+        name: Option<String>,
+        /// Original caller ranges in the supplied source's encoding.
+        ranges: Vec<Range>,
+        /// Already converted outgoing occurrences in the original caller source.
+        sources: Vec<SourceUnitSpan>,
+        /// The provider established a file-level occurrence.
+        file_level: bool,
+    },
+    /// An outgoing target whose exact package declaration has not been named.
+    Call(PackageCallee),
+    /// A caller whose original source must be admitted before mapping its call ranges.
+    IncomingCall {
+        /// Established called declaration.
+        target: SymbolId,
+        /// Caller location selected by the engine.
+        caller: PackageCallee,
+        /// Physical call ranges in the caller's negotiated encoding.
+        ranges: Vec<Range>,
+    },
+    /// A physical reference in a dependency file not yet held by the request.
+    Reference {
+        /// The established symbol this source occurrence references.
+        target: SymbolId,
+        /// Engine URI whose owner must be established before source is read.
+        uri: Uri,
+        /// Range in the engine's negotiated position encoding.
+        range: Range,
+        /// Negotiated position encoding of the returned range.
+        encoding: PositionEncoding,
+        /// Accepted language binding whose engine produced the location.
+        provider: Language,
+        /// Relationship established by this physical occurrence.
+        facet: rift_protocol::read::RelationshipFacet,
+        /// The engine established a file-level caller without an enclosing declaration.
+        file_level: bool,
+    },
+}
+
+impl QuerySourceRequest {
+    /// Exact dependency owner selected by accepted roots, without reading source bytes.
+    ///
+    /// # Errors
+    /// Returns unavailable when no exact package or runtime owner admits this location.
+    pub fn origin(
+        &self,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+    ) -> Result<SourceLocation, RiftError> {
+        match self {
+            Self::Call(callee) | Self::IncomingCall { caller: callee, .. } => callee
+                .query_origin()
+                .ok_or_else(|| unavailable("dependency runtime version is unavailable")),
+            Self::Reference { uri, .. } | Self::Provider { uri, .. } => {
+                if let Some((origin, _, _)) = CalleeRoots::runtime_query_source(uri, trees)? {
+                    return Ok(origin);
+                }
+                match roots.address(trees, uri)? {
+                    Some(rift_lsp::uri::EngineAddress::Package(file)) => Ok(file.origin().clone()),
+                    _ => {
+                        unavailable("the reference source has no admitted dependency owner").fail()
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[path = "engine_query_package/capture.rs"]
+mod capture;
+#[path = "engine_query_package/provider.rs"]
+mod provider;
+
+#[derive(Debug)]
+pub(super) struct DeclarationLocation {
+    pub(super) source: SourceUnitSpan,
+    pub(super) uri: Uri,
+}
+
+/// Captured dependency facts and engine positions established from the same bytes.
+#[derive(Debug)]
+pub struct QueryPackageTarget {
+    pub(super) request: QuerySourceRequest,
+    pub(super) unit: SourceUnitId,
+    pub(super) provider: Language,
+    pub(super) facts: QueryFacts,
+    pub(super) name_ranges: BTreeMap<SymbolId, DeclarationLocation>,
+    pub(super) digest: FileDigest,
+    pub(super) selected: Option<SymbolId>,
+    pub(super) provider_names: Vec<(rift_search::query::QueryProviderTarget, DeclarationLocation)>,
+    context: Vec<(Uri, FileDigest)>,
+}
+
+struct Preparation<'input, 'budget> {
+    request: QuerySourceRequest,
+    roots: &'input CalleeRoots,
+    trees: &'input [&'input Path],
+    configuration: &'input WorkspaceConfiguration,
+    cancelled: &'input (dyn Fn() -> bool + Sync),
+    budget: Option<&'input mut crate::QueryFactBudget<'budget>>,
+    selection: Option<&'input rift_search::query::QueryProviderSelection>,
+}
+
+struct SelectedSource {
+    origin: SourceLocation,
+    path: ProjectPath,
+    uri: Uri,
+    provider: Language,
+    text: String,
+    offset: usize,
+}
+
+impl QueryPackageTarget {
+    /// Physical source unit captured by this target.
+    #[must_use]
+    pub const fn source_unit(&self) -> &SourceUnitId {
+        &self.unit
+    }
+
+    /// Revalidates admitted source ownership and bytes, blocking.
+    ///
+    /// The caller runs this check on its bounded worker before evaluating acquired facts.
+    ///
+    /// # Errors
+    /// Returns unavailable when source bytes, ownership or accepted access no longer match.
+    pub fn validate(
+        &self,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+    ) -> Result<(), RiftError> {
+        self.validate_with_cancellation(roots, trees, configuration, &|| false)
+    }
+
+    /// Revalidates source ownership and bytes while observing worker cancellation.
+    ///
+    /// # Errors
+    /// Returns cancelled before another source read; source changes retain their
+    /// original admission and byte validation failures.
+    pub fn validate_with_cancellation(
+        &self,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(), RiftError> {
+        if cancelled() {
+            return rift_error::errors::server::read_cancelled().fail();
+        }
+        let source = selected_source(
+            &self.request,
+            roots,
+            trees,
+            configuration.providers.syntax.max_file.bytes(),
+        )?;
+        let unit = rift_core::SourceUnitId::for_origin(&source.origin, &source.path)?;
+        if unit.to_string() != self.unit.0 || FileDigest::of(source.text.as_bytes()) != self.digest
+        {
+            return unavailable("dependency source changed during query acquisition").fail();
+        }
+        for (uri, digest) in &self.context {
+            if cancelled() {
+                return rift_error::errors::server::read_cancelled().fail();
+            }
+            let (_, text) = roots.capture_query_file(
+                uri,
+                trees,
+                configuration.providers.syntax.max_file.bytes(),
+            )?;
+            if FileDigest::of(text.as_bytes()) != *digest {
+                return unavailable("dependency source context changed during query acquisition")
+                    .fail();
+            }
+        }
+        if cancelled() {
+            return rift_error::errors::server::read_cancelled().fail();
+        }
+        Ok(())
+    }
+
+    /// Captures and analyzes one admitted dependency source, blocking.
+    ///
+    /// The caller runs this operation on its existing bounded worker pool.
+    /// Package ownership comes from accepted roots. Source, syntax and publication
+    /// bounds come from the same accepted configuration as the request.
+    ///
+    /// # Errors
+    /// Returns unavailable for unadmitted sources and preserves parser and filesystem failures.
+    pub fn prepare(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_with_cancellation(request, roots, trees, configuration, &|| false)
+    }
+
+    /// Captures admitted source facts while observing the owning worker's cancellation.
+    ///
+    /// # Errors
+    /// Returns cancelled before another source or parse pass starts; other failures
+    /// retain the original admission, source and syntax validation errors.
+    pub fn prepare_with_cancellation(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Self, RiftError> {
+        Self::prepare_with_budget(request, roots, trees, configuration, cancelled, None)
+    }
+
+    /// Captures provider facts within the existing request admission.
+    ///
+    /// # Errors
+    /// Returns cancellation, changed ownership, unavailable source or exhausted admission.
+    pub fn prepare_with_budget(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_with_selection(
+            request,
+            roots,
+            trees,
+            configuration,
+            cancelled,
+            budget,
+            None,
+        )
+    }
+
+    /// Captures provider facts under the original serving selection.
+    ///
+    /// # Errors
+    /// Returns changed ownership, unavailable source or exhausted request admission.
+    pub fn prepare_with_selection(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selection: Option<&rift_search::query::QueryProviderSelection>,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_captured(
+            Preparation {
+                request,
+                roots,
+                trees,
+                configuration,
+                cancelled,
+                budget,
+                selection,
+            },
+            true,
+        )
+    }
+
+    /// Captures the supplied physical target without requiring namespace expansion.
+    ///
+    /// Canonical identity remains available when the captured selected sources establish it.
+    /// The explicit canonical preparation path retains bounded namespace enrichment.
+    ///
+    /// # Errors
+    /// Refuses missing source ownership, invalid physical declarations, cancellation or bounds.
+    pub fn prepare_selected_with_selection(
+        request: QuerySourceRequest,
+        roots: &CalleeRoots,
+        trees: &[&Path],
+        configuration: &WorkspaceConfiguration,
+        cancelled: &(dyn Fn() -> bool + Sync),
+        budget: Option<&mut crate::QueryFactBudget<'_>>,
+        selection: Option<&rift_search::query::QueryProviderSelection>,
+    ) -> Result<Self, RiftError> {
+        Self::prepare_captured(
+            Preparation {
+                request,
+                roots,
+                trees,
+                configuration,
+                cancelled,
+                budget,
+                selection,
+            },
+            false,
+        )
+    }
+
+    fn prepare_captured(input: Preparation<'_, '_>, namespace: bool) -> Result<Self, RiftError> {
+        let Preparation {
+            request,
+            roots,
+            trees,
+            configuration,
+            cancelled,
+            budget,
+            selection,
+        } = input;
+        if cancelled() {
+            return rift_error::errors::server::read_cancelled().fail();
+        }
+        let source = selected_source(
+            &request,
+            roots,
+            trees,
+            configuration.providers.syntax.max_file.bytes(),
+        )?;
+        let owner = source_owner(&source.origin)?;
+        let context = package_context(&source, roots, trees, configuration)?;
+        let digest = FileDigest::of(source.text.as_bytes());
+        let (analysis, captured) = capture::analyze(
+            &source,
+            &context,
+            roots,
+            trees,
+            configuration,
+            cancelled,
+            namespace,
+        )?;
+        let unit = SourceUnitId(
+            rift_core::SourceUnitId::for_origin(&source.origin, &source.path)?.to_string(),
+        );
+        let uris = captured
+            .iter()
+            .map(|(uri, path, _)| (path.as_str().to_owned(), uri.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let (name_ranges, selected) = captured_names(&analysis, &source, &unit, &uris)?;
+        let mut facts = publication_facts(analysis.publication());
+        let root = roots.query_source_root(&source.uri, trees)?;
+        let providers = provider::capture(
+            analysis,
+            &mut facts,
+            provider::ProviderCapture {
+                source: &source,
+                owner,
+                root,
+                digest,
+                inputs: &context,
+                captured: &captured,
+                enclosing: matches!(
+                    &request,
+                    QuerySourceRequest::Reference { .. }
+                        | QuerySourceRequest::Provider { name: None, .. }
+                ),
+                uris: &uris,
+                configuration,
+                selection,
+            },
+            cancelled,
+            budget,
+        )?;
+        validate_call_target(&request, &providers, &facts, &source)?;
+        let mut context = context
+            .into_iter()
+            .map(|(uri, _, text)| (uri, FileDigest::of(text.as_bytes())))
+            .collect::<Vec<_>>();
+        for (uri, path, text) in captured {
+            if path != source.path {
+                context.push((uri, FileDigest::of(text.as_bytes())));
+            }
+            facts.sources.push(QuerySource {
+                unit: SourceUnitId(
+                    rift_core::SourceUnitId::for_origin(&source.origin, &path)?.to_string(),
+                ),
+                digest: Some(rift_protocol::identity::SourceDigest::parse(
+                    &data_encoding::HEXLOWER.encode(FileDigest::of(text.as_bytes()).as_bytes()),
+                )?),
+                text: Some(text),
+            });
+        }
+        for snapshot in &mut facts.providers {
+            snapshot.source_indices = (0..facts.sources.len()).collect();
+        }
+        if cancelled() {
+            return rift_error::errors::server::read_cancelled().fail();
+        }
+        Ok(Self {
+            request,
+            unit,
+            provider: source.provider,
+            facts,
+            name_ranges,
+            digest,
+            selected,
+            provider_names: providers.names,
+            context,
+        })
+    }
+
+    /// Canonical declaration selected by a call target, or its enclosing reference declaration.
+    #[must_use]
+    pub fn symbol(&self) -> Option<&SymbolId> {
+        self.selected.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(super) fn source<'facts>(
+        &self,
+        facts: &'facts QueryFacts,
+    ) -> Result<&'facts str, RiftError> {
+        Self::source_for(facts, &self.unit)
+    }
+
+    pub(super) fn source_for<'facts>(
+        facts: &'facts QueryFacts,
+        unit: &SourceUnitId,
+    ) -> Result<&'facts str, RiftError> {
+        facts
+            .sources
+            .iter()
+            .find(|source| &source.unit == unit)
+            .and_then(|source| source.text.as_deref())
+            .ok_or_else(|| unavailable("the admitted dependency source is no longer retained"))
+    }
+}
+
+fn captured_names(
+    analysis: &rift_analysis::PackageAnalysis,
+    source: &SelectedSource,
+    unit: &SourceUnitId,
+    uris: &BTreeMap<String, Uri>,
+) -> Result<(BTreeMap<SymbolId, DeclarationLocation>, Option<SymbolId>), RiftError> {
+    let files = analysis
+        .files()
+        .iter()
+        .map(|file| (file.file().path().as_str(), file.file()))
+        .collect::<BTreeMap<_, _>>();
+    let mut name_ranges = BTreeMap::new();
+    for declaration in &analysis.publication().declarations {
+        let (_, path) =
+            rift_protocol::identity::parse_source_unit_identity(declaration.unit.as_str())?;
+        let Some(file) = files.get(path.as_str()) else {
+            continue;
+        };
+        let Some(uri) = uris.get(path.as_str()) else {
+            continue;
+        };
+        let syntax = file.enclosing_symbol(declaration.range.start, declaration.range.end);
+        if let Some(range) = syntax.and_then(|symbol| symbol.name_range) {
+            let location = DeclarationLocation {
+                source: SourceUnitSpan {
+                    unit: declaration.unit.clone(),
+                    range: TextRange {
+                        start: range.start,
+                        end: range.end,
+                    },
+                },
+                uri: uri.clone(),
+            };
+            if declaration.unit == *unit
+                && declaration.range.start <= source.offset as u64
+                && (source.offset as u64) < declaration.range.end
+            {
+                name_ranges.insert(declaration.symbol.clone(), location);
+            } else {
+                name_ranges
+                    .entry(declaration.symbol.clone())
+                    .or_insert(location);
+            }
+        }
+    }
+    let selected = analysis
+        .publication()
+        .declarations
+        .iter()
+        .filter(|declaration| {
+            declaration.unit == *unit
+                && declaration.range.start <= source.offset as u64
+                && (source.offset as u64) < declaration.range.end
+        })
+        .min_by_key(|declaration| declaration.range.end - declaration.range.start)
+        .map(|declaration| declaration.symbol.clone());
+    Ok((name_ranges, selected))
+}
+
+fn validate_call_target(
+    request: &QuerySourceRequest,
+    providers: &provider::CapturedProviders,
+    facts: &QueryFacts,
+    source: &SelectedSource,
+) -> Result<(), RiftError> {
+    if matches!(
+        request,
+        QuerySourceRequest::Call(_) | QuerySourceRequest::IncomingCall { .. }
+    ) && providers.selected.is_none()
+    {
+        let candidate = providers
+            .names
+            .iter()
+            .min_by_key(|(_, location)| {
+                location
+                    .source
+                    .range
+                    .start
+                    .abs_diff(u64::try_from(source.offset).unwrap_or(u64::MAX))
+            })
+            .map(|(target, location)| {
+                let name = facts
+                    .provider_record(target)
+                    .and_then(|(_, record)| facts.symbols.get(record.symbol_index))
+                    .map(|symbol| symbol.symbol.name.as_str());
+                (
+                    name,
+                    location.source.unit.as_str(),
+                    location.source.range.start,
+                    location.source.range.end,
+                )
+            });
+        return unavailable(format!(
+                "the admitted call target has no original declaration binding: source {}, position {}, captured name position candidate {candidate:?}",
+                source.path.as_str(), source.offset,
+            )).fail();
+    }
+    Ok(())
+}
+
+fn captured_revision(digest: FileDigest) -> u64 {
+    let mut revision = [0_u8; size_of::<u64>()];
+    revision.copy_from_slice(&digest.as_bytes()[..size_of::<u64>()]);
+    u64::from_be_bytes(revision).max(1)
+}
+
+fn admitted_import_roots(
+    source: &SelectedSource,
+    roots: &CalleeRoots,
+    trees: &[&Path],
+) -> Result<Vec<PackageImportRoot>, RiftError> {
+    if source.provider.name != "python" {
+        return Ok(Vec::new());
+    }
+    if matches!(source.origin, SourceLocation::Stdlib { runtime: Some(_) }) {
+        return Ok(vec![PackageImportRoot::runtime(
+            source_owner(&source.origin)?,
+            None,
+        )?]);
+    }
+    let Some(rift_lsp::uri::EngineAddress::Package(file)) = roots.address(trees, &source.uri)?
+    else {
+        return unavailable("the Python source has no admitted import root").fail();
+    };
+    let Some(root) = file.import_root() else {
+        return unavailable("the installed Python source has no established import module").fail();
+    };
+    let root = root.as_str();
+    let module = root
+        .strip_suffix(".pyi")
+        .or_else(|| root.strip_suffix(".py"))
+        .unwrap_or(root);
+    Ok(vec![PackageImportRoot::new(
+        None,
+        vec![module.replace('/', ".")],
+        PackageImportRootOrigin::Wheel,
+    )?])
+}
+
+fn package_context(
+    source: &SelectedSource,
+    roots: &CalleeRoots,
+    trees: &[&Path],
+    configuration: &WorkspaceConfiguration,
+) -> Result<Vec<(Uri, ProjectPath, String)>, RiftError> {
+    let metadata = match &source.origin {
+        SourceLocation::Dependency { package } if package.manager == "npm" => "package.json",
+        SourceLocation::Dependency { package } if package.manager == "cargo" => "Cargo.toml",
+        _ => return Ok(Vec::new()),
+    };
+    let Some(rift_lsp::uri::EngineAddress::Package(file)) = roots.address(trees, &source.uri)?
+    else {
+        return unavailable("the dependency metadata has no admitted source owner").fail();
+    };
+    let path = ProjectPath::new(metadata)?;
+    let uri = file.root().document_uri(&path)?;
+    let (metadata, text) =
+        roots.capture_query_file(&uri, trees, configuration.providers.syntax.max_file.bytes())?;
+    if metadata.origin() != &source.origin {
+        return unavailable("dependency metadata owner differs from the selected target").fail();
+    }
+    Ok(vec![(uri, path, text)])
+}
+
+fn selected_source(
+    request: &QuerySourceRequest,
+    roots: &CalleeRoots,
+    trees: &[&Path],
+    bytes_max: u64,
+) -> Result<SelectedSource, RiftError> {
+    match request {
+        QuerySourceRequest::Call(callee)
+        | QuerySourceRequest::IncomingCall { caller: callee, .. } => {
+            let captured = roots.capture_query_source(callee, trees, bytes_max)?;
+            let origin = captured
+                .query_origin()
+                .ok_or_else(|| unavailable("dependency runtime version is unavailable"))?;
+            let uri = captured
+                .query_uri()
+                .cloned()
+                .ok_or_else(|| unavailable("dependency URI is unavailable"))?;
+            let provider = captured
+                .query_provider()
+                .cloned()
+                .ok_or_else(|| unavailable("dependency provider is unavailable"))?;
+            let text = captured
+                .captured_source()
+                .ok_or_else(|| unavailable("dependency source is unavailable"))?
+                .to_owned();
+            let offset =
+                LineIndex::new(&text).byte_offset(captured.encoding(), captured.position())?;
+            Ok(SelectedSource {
+                origin,
+                path: captured.path().clone(),
+                uri,
+                provider,
+                text,
+                offset,
+            })
+        }
+        QuerySourceRequest::Reference {
+            uri,
+            range,
+            encoding,
+            provider,
+            ..
+        }
+        | QuerySourceRequest::Provider {
+            uri,
+            range,
+            encoding,
+            provider,
+            ..
+        } => {
+            if let Some((origin, path, source)) = CalleeRoots::runtime_query_source(uri, trees)? {
+                if source.len() as u64 > bytes_max {
+                    return unavailable("dependency source exceeds the accepted byte bound").fail();
+                }
+                let offset = LineIndex::new(&source).byte_offset(*encoding, range.start)?;
+                return Ok(SelectedSource {
+                    origin,
+                    path,
+                    uri: uri.clone(),
+                    provider: provider.clone(),
+                    text: source.to_string(),
+                    offset,
+                });
+            }
+            let (file, text) = roots.capture_query_file(uri, trees, bytes_max)?;
+            let offset = LineIndex::new(&text).byte_offset(*encoding, range.start)?;
+            Ok(SelectedSource {
+                origin: file.origin().clone(),
+                path: file.path().clone(),
+                uri: uri.clone(),
+                provider: provider.clone(),
+                text,
+                offset,
+            })
+        }
+    }
+}
+
+fn source_owner(origin: &SourceLocation) -> Result<SymbolOwner, RiftError> {
+    match origin {
+        SourceLocation::Dependency { package } => package.owner(),
+        SourceLocation::Stdlib {
+            runtime: Some(runtime),
+        } => Ok(SymbolOwner::Runtime {
+            runtime: runtime.runtime.clone(),
+            version: runtime.version.clone(),
+        }),
+        _ => unavailable("the selected source has no exact dependency or runtime owner").fail(),
+    }
+}
+
+fn publication_facts(publication: &rift_protocol::index::PackagePublication) -> QueryFacts {
+    let mut declarations: BTreeMap<&SymbolId, Vec<SymbolDeclaration>> = BTreeMap::new();
+    for declaration in &publication.declarations {
+        declarations
+            .entry(&declaration.symbol)
+            .or_default()
+            .push(SymbolDeclaration {
+                origin: declaration.origin.clone(),
+                path: None,
+                unit: Some(declaration.unit.clone()),
+                range: declaration.range.clone(),
+                line: declaration.line,
+                node: None,
+                source: Some(declaration.source.clone()),
+                source_complete: declaration.source_complete,
+                signature_indices: declaration.signature_indices.clone(),
+                type_indices: declaration.type_indices.clone(),
+                documentation_indices: declaration.documentation_indices.clone(),
+            });
+    }
+    let symbols = publication
+        .objects
+        .iter()
+        .filter_map(|symbol| {
+            let identity = symbol.id.as_ref()?;
+            Some(QuerySymbol {
+                symbol: symbol.clone(),
+                declarations: declarations.remove(identity).unwrap_or_default(),
+            })
+        })
+        .collect();
+    QueryFacts {
+        symbols,
+        relationships: publication.relationships.clone(),
+        ..QueryFacts::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use lsp_types::Position;
+    use rift_core::{PackageIdentity, ProjectPath};
+    use rift_lsp::capabilities::PositionEncoding;
+    use rift_lsp::uri::{PackageRoot, TreeRoot};
+    use rift_protocol::configuration::WorkspaceConfiguration;
+    use rift_protocol::read::Language;
+
+    use super::{QueryPackageTarget, QuerySourceRequest};
+    use crate::callee::{CalleeFile, CalleeRoots, NamedCallee, callee_file};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    fn package() -> PackageIdentity {
+        PackageIdentity {
+            manager: "npm".to_owned(),
+            registry: "npmjs.org".to_owned(),
+            name: "helper".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+    }
+
+    fn roots(root: &Path, package: PackageIdentity) -> Result<CalleeRoots, rift_error::RiftError> {
+        Ok(CalleeRoots::from_packages(vec![PackageRoot::new(
+            TreeRoot::new(root)?,
+            package,
+        )]))
+    }
+
+    fn call_request(
+        workspace: &Path,
+        dependency: &Path,
+        roots: &CalleeRoots,
+    ) -> Result<QuerySourceRequest, rift_error::RiftError> {
+        call_request_at(workspace, dependency, roots, Position::new(0, 16))
+    }
+
+    fn call_request_at(
+        workspace: &Path,
+        dependency: &Path,
+        roots: &CalleeRoots,
+        position: Position,
+    ) -> Result<QuerySourceRequest, rift_error::RiftError> {
+        let uri = TreeRoot::new(dependency)?.document_uri(&ProjectPath::new("index.ts")?)?;
+        let seed = rift_core::SymbolId::new("rift://symbol/local/typescript/app/caller")?;
+        let named = NamedCallee {
+            uri: &uri,
+            name: "entry",
+            position,
+            encoding: PositionEncoding::Utf16,
+        };
+        let CalleeFile::Package(callee) = callee_file(roots, &[workspace], &seed, named)? else {
+            panic!("fixture URI must name its admitted package source");
+        };
+        let provider = Language::from_identity_segment("typescript")
+            .expect("fixture uses the accepted TypeScript language identity");
+        Ok(QuerySourceRequest::Call(
+            callee.with_query_sources(Vec::new(), provider),
+        ))
+    }
+
+    #[test]
+    fn test_package_call_refuses_the_exclusive_end_of_the_original_name() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        std::fs::write(
+            dependency.path().join("index.ts"),
+            "export function entry() { return 7; }\n",
+        )?;
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0","types":"./index.ts"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let admitted = QueryPackageTarget::prepare(
+            call_request(workspace.path(), dependency.path(), &roots)?,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )?;
+        assert!(admitted.symbol().is_some());
+        let request = call_request_at(
+            workspace.path(),
+            dependency.path(),
+            &roots,
+            Position::new(0, 21),
+        )?;
+        let error = QueryPackageTarget::prepare(
+            request,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )
+        .expect_err("an enclosing canonical declaration cannot replace the supplied name position");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_unavailable::SLUG
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_package_target_keeps_exact_owner_internal_declarations_and_source_validation()
+    -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let source =
+            "export function entry() { return helper(); }\nfunction helper() { return 7; }\n";
+        std::fs::write(dependency.path().join("index.ts"), source)?;
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0","types":"./index.ts"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let request = call_request(workspace.path(), dependency.path(), &roots)?;
+        let configuration = WorkspaceConfiguration::default();
+        let trees = [workspace.path()];
+        let uncached =
+            QueryPackageTarget::prepare(request.clone(), &roots, &trees, &configuration)?;
+        let QuerySourceRequest::Call(callee) = request else {
+            panic!("call source fixture");
+        };
+        let request = QuerySourceRequest::Call(roots.capture_query_source(
+            &callee,
+            &trees,
+            configuration.providers.syntax.max_file.bytes(),
+        )?);
+        let target = QueryPackageTarget::prepare(request.clone(), &roots, &trees, &configuration)?;
+        let symbol = target.symbol().expect("canonical package entry");
+        let parsed = rift_protocol::identity::SymbolIdentity::parse(symbol.as_str())?;
+        assert_eq!(parsed.owner(), &package().owner()?);
+        assert!(
+            target
+                .facts
+                .symbols
+                .iter()
+                .any(|symbol| symbol.symbol.name == "helper")
+        );
+        for provider in &target.facts.providers {
+            for record in &provider.records {
+                let symbol = &target.facts.symbols[record.symbol_index];
+                assert_eq!(symbol.declarations.len(), record.declarations.len());
+                for declaration in &record.declarations {
+                    let published = &symbol.declarations[declaration.declaration_index];
+                    assert!(published.source_complete);
+                    assert!(
+                        published
+                            .source
+                            .as_ref()
+                            .is_some_and(|text| !text.is_empty())
+                    );
+                    assert_eq!(published.node, declaration.binding.node().cloned());
+                }
+            }
+        }
+        assert_eq!(target.source(&target.facts)?, source);
+        target.validate(&roots, &trees, &configuration)?;
+        assert_eq!(
+            target
+                .validate_with_cancellation(&roots, &trees, &configuration, &|| true)
+                .expect_err("cancelled validation")
+                .slug(),
+            rift_error::errors::server::read_cancelled::SLUG
+        );
+        std::fs::write(
+            dependency.path().join("index.ts"),
+            source.replace("return 7", "return 8"),
+        )?;
+        assert!(target.validate(&roots, &trees, &configuration).is_err());
+        assert!(uncached.validate(&roots, &trees, &configuration).is_err());
+        assert_eq!(uncached.source(&uncached.facts)?, source);
+        assert_eq!(target.source(&target.facts)?, source);
+        let fresh = call_request(workspace.path(), dependency.path(), &roots)?;
+        let changed = QueryPackageTarget::prepare(fresh, &roots, &trees, &configuration)?;
+        assert_ne!(target.digest, changed.digest);
+        assert_ne!(
+            super::captured_revision(target.digest),
+            super::captured_revision(changed.digest)
+        );
+        changed.validate(&roots, &trees, &configuration)?;
+        Ok(())
+    }
+
+    #[test]
+    fn selected_physical_package_declarations_project_requested_captured_source() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let source = "interface Math { entry(...values: number[]): number; }\n";
+        std::fs::write(dependency.path().join("index.ts"), source)?;
+        // The admitted package has no types or typings entry for the selected file.
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let configuration = WorkspaceConfiguration::default();
+        let offset = u32::try_from(source.find("entry").ok_or("fixture entry name")?)?;
+        let target = QueryPackageTarget::prepare_selected_with_selection(
+            call_request_at(
+                workspace.path(),
+                dependency.path(),
+                &roots,
+                Position::new(0, offset),
+            )?,
+            &roots,
+            &[workspace.path()],
+            &configuration,
+            &|| false,
+            None,
+            None,
+        )?;
+        assert!(
+            target.symbol().is_none(),
+            "the supplied signature is physical"
+        );
+        let physical: Vec<_> = target
+            .facts
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.symbol.name == "entry")
+            .collect();
+        assert_eq!(physical.len(), 1);
+        assert!(physical[0].symbol.id.is_none());
+        assert_eq!(physical[0].declarations.len(), 1);
+        let declaration = &physical[0].declarations[0];
+        assert!(declaration.source.is_none());
+        assert!(!declaration.source_complete);
+        assert_eq!(declaration.unit.as_ref(), Some(target.source_unit()));
+        let range = declaration.range.clone();
+        let excerpt = source
+            .get(usize::try_from(range.start)?..usize::try_from(range.end)?)
+            .ok_or("captured declaration UTF-8 range")?;
+        assert!(!excerpt.is_empty());
+        assert_eq!(target.source(&target.facts)?, source);
+        let unit = target.source_unit().as_str().to_owned();
+        let reads = crate::ReadService::build(
+            workspace.path(),
+            rift_index::WorkspaceIndexLimits::default(),
+            &rift_core::SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            rift_protocol::configuration::HistoryConfiguration::default(),
+        )?;
+        let material = reads
+            .local_search_view_input(true)?
+            .with_package_facts(target.facts)?;
+        std::fs::remove_file(dependency.path().join("index.ts"))?;
+        assert_physical_package_source(&material, &configuration, source, unit, &range)
+    }
+
+    fn assert_physical_package_source(
+        material: &crate::LocalSymbolViewInput,
+        configuration: &WorkspaceConfiguration,
+        source: &str,
+        unit: String,
+        range: &rift_protocol::read::TextRange,
+    ) -> TestResult {
+        use rift_protocol::query::{QueryAnswer, RdfTerm};
+        use rift_search::query::{FactRequirement, QueryLimits};
+        use rift_search::sparql::{PreparedQuery, QueryCancellation};
+
+        let statement = "SELECT ?symbol ?unit ?source ?start ?end ?full_source { ?symbol :name 'entry'; :declarations ?declaration. ?declaration :unit ?unit; :source ?source; :range ?range. ?range :start ?start; :end ?end. ?unit :source ?full_source }";
+        let limits = QueryLimits::try_from(&configuration.search.query)?;
+        let prepared = PreparedQuery::parse(statement, limits)?;
+        assert!(prepared.requirements().requires(FactRequirement::Source));
+        let excerpt = source
+            .get(usize::try_from(range.start)?..usize::try_from(range.end)?)
+            .ok_or("captured declaration UTF-8 range")?;
+        let selection = material.provider_selection(configuration)?;
+        let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+        let facts = material.query_facts_with_selection(
+            prepared.requirements(),
+            limits,
+            &mut budget,
+            &selection,
+        )?;
+        let QueryAnswer::Bindings { bindings, .. } =
+            prepared.evaluate(facts, limits, QueryCancellation::default())?
+        else {
+            panic!("SELECT bindings")
+        };
+        assert_eq!(
+            bindings.len(),
+            1,
+            "the physical declaration joins its captured source"
+        );
+        let row = &bindings[0];
+        assert!(matches!(row.get("symbol"), Some(RdfTerm::BlankNode { .. })));
+        assert_eq!(row.get("unit"), Some(&RdfTerm::Iri { value: unit }));
+        for (name, expected) in [("source", excerpt), ("full_source", source)] {
+            assert_eq!(
+                row.get(name),
+                Some(&RdfTerm::Literal {
+                    value: expected.to_owned(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#string".to_owned(),
+                })
+            );
+        }
+        for (name, expected) in [("start", range.start), ("end", range.end)] {
+            assert_eq!(
+                row.get(name),
+                Some(&RdfTerm::Literal {
+                    value: expected.to_string(),
+                    datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_runtime_target_uses_the_admitted_python_runtime_owner() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let runtime = tempfile::tempdir()?;
+        std::fs::write(
+            runtime.path().join("builtins.pyi"),
+            "def beacon() -> int: ...\n",
+        )?;
+        let origin = rift_core::SourceLocation::Stdlib {
+            runtime: Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "cpython".to_owned(),
+                version: "3.12.4".to_owned(),
+            }),
+        };
+        let root = TreeRoot::new(runtime.path())?;
+        let uri = root.document_uri(&ProjectPath::new("builtins.pyi")?)?;
+        let roots = CalleeRoots::from_packages(vec![PackageRoot::with_origin(root, origin)]);
+        let request = QuerySourceRequest::Reference {
+            target: rift_protocol::read::SymbolId(
+                "rift://symbol/local/python/app/beacon".to_owned(),
+            ),
+            uri,
+            range: lsp_types::Range::new(Position::new(0, 4), Position::new(0, 10)),
+            encoding: PositionEncoding::Utf16,
+            provider: Language::from_identity_segment("python")?,
+            facet: rift_protocol::read::RelationshipFacet::References,
+            file_level: false,
+        };
+        let target = QueryPackageTarget::prepare(
+            request,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )?;
+        let symbol = target
+            .facts
+            .symbols
+            .iter()
+            .find(|symbol| symbol.symbol.name == "beacon")
+            .expect("canonical runtime declaration");
+        let identity = symbol
+            .symbol
+            .id
+            .as_ref()
+            .expect("runtime declaration identity");
+        let identity = rift_protocol::identity::SymbolIdentity::parse(identity.as_str())?;
+        assert_eq!(
+            identity.owner(),
+            &rift_protocol::identity::SymbolOwner::Runtime {
+                runtime: "cpython".to_owned(),
+                version: "3.12.4".to_owned(),
+            }
+        );
+        target.validate(
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_package_target_refuses_owner_substitution_and_source_byte_overflow() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let source = format!("export function entry() {{}}\n// {}\n", "x".repeat(2_000));
+        std::fs::write(dependency.path().join("index.ts"), source)?;
+        let accepted = roots(dependency.path(), package())?;
+        let request = call_request(workspace.path(), dependency.path(), &accepted)?;
+        let mut changed = package();
+        changed.version = "2.0.0".to_owned();
+        let substituted = roots(dependency.path(), changed)?;
+        let trees = [workspace.path()];
+        let mut configuration = WorkspaceConfiguration::default();
+        assert!(
+            QueryPackageTarget::prepare(request.clone(), &substituted, &trees, &configuration)
+                .is_err()
+        );
+        configuration.providers.syntax.max_file =
+            rift_protocol::configuration::ByteSize::from_bytes(1_024);
+        assert!(QueryPackageTarget::prepare(request, &accepted, &trees, &configuration).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_package_target_refuses_a_symlink_outside_its_admitted_root() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let path = outside.path().join("index.ts");
+        std::fs::write(&path, "export function entry() {}\n")?;
+        std::os::unix::fs::symlink(&path, dependency.path().join("index.ts"))?;
+        let roots = roots(dependency.path(), package())?;
+        let request = call_request(workspace.path(), dependency.path(), &roots)?;
+        let configuration = WorkspaceConfiguration::default();
+        let trees = [workspace.path()];
+        assert!(QueryPackageTarget::prepare(request, &roots, &trees, &configuration).is_err());
+        assert_eq!(
+            std::fs::read_to_string(path)?,
+            "export function entry() {}\n"
+        );
+        Ok(())
+    }
+    #[test]
+    fn test_rust_target_captures_original_module_witnesses() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        std::fs::create_dir(dependency.path().join("src"))?;
+        let manifest = "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\nedition = \"2024\"\n";
+        std::fs::write(dependency.path().join("Cargo.toml"), manifest)?;
+        std::fs::write(
+            dependency.path().join("src/lib.rs"),
+            "mod inner;\npub fn top() { inner::middle(); }\n",
+        )?;
+        let source = "pub fn middle() { leaf(); }\nfn leaf() {}\n";
+        std::fs::write(dependency.path().join("src/inner.rs"), source)?;
+        let package = PackageIdentity {
+            manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
+            name: "beacon".to_owned(),
+            version: "1.0.0".to_owned(),
+        };
+        let roots = roots(dependency.path(), package.clone())?;
+        let uri =
+            TreeRoot::new(dependency.path())?.document_uri(&ProjectPath::new("src/inner.rs")?)?;
+        let seed = rift_core::SymbolId::new("rift://symbol/local/rust/app/entry")?;
+        let named = NamedCallee {
+            uri: &uri,
+            name: "middle",
+            position: Position::new(0, 7),
+            encoding: PositionEncoding::Utf16,
+        };
+        let CalleeFile::Package(callee) = callee_file(&roots, &[workspace.path()], &seed, named)?
+        else {
+            panic!("admitted Cargo source");
+        };
+        let request = QuerySourceRequest::Call(
+            callee.with_query_sources(Vec::new(), Language::from_identity_segment("rust")?),
+        );
+        let configuration = WorkspaceConfiguration::default();
+        let target =
+            QueryPackageTarget::prepare(request, &roots, &[workspace.path()], &configuration)?;
+        let symbol = target.symbol().expect("canonical Rust declaration");
+        let identity = rift_protocol::identity::SymbolIdentity::parse(symbol.as_str())?;
+        assert_eq!(identity.owner(), &package.owner()?);
+        assert!(
+            symbol.as_str().ends_with("/beacon/inner/middle"),
+            "{symbol:?}"
+        );
+        assert!(
+            target
+                .facts
+                .symbols
+                .iter()
+                .any(|symbol| symbol.symbol.name == "leaf")
+        );
+        assert_eq!(target.facts.sources.len(), 2);
+        target.validate(&roots, &[workspace.path()], &configuration)?;
+        let checks = std::sync::atomic::AtomicUsize::new(0);
+        let cancelled = QueryPackageTarget::prepare_with_cancellation(
+            target.request.clone(),
+            &roots,
+            &[workspace.path()],
+            &configuration,
+            &|| checks.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 2,
+        )
+        .expect_err("cancelled Rust source pass");
+        assert_eq!(
+            cancelled.slug(),
+            rift_error::errors::server::read_cancelled::SLUG
+        );
+        std::fs::write(dependency.path().join("src/lib.rs"), "mod other;\n")?;
+        assert!(
+            target
+                .validate(&roots, &[workspace.path()], &configuration)
+                .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn package_source_preparation_observes_cancellation_before_reading() -> TestResult {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        let roots = roots(dependency.path(), package())?;
+        let request = call_request(workspace.path(), dependency.path(), &roots)?;
+        let error = QueryPackageTarget::prepare_with_cancellation(
+            request,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+            &|| true,
+        )
+        .expect_err("cancelled before missing source read");
+        assert_eq!(
+            error.slug(),
+            rift_error::errors::server::read_cancelled::SLUG
+        );
+        Ok(())
+    }
+    fn package_facts_with_equal_declarations()
+    -> Result<(rift_search::query::QueryFacts, usize), Box<dyn std::error::Error>> {
+        let workspace = tempfile::tempdir()?;
+        let dependency = tempfile::tempdir()?;
+        std::fs::write(
+            dependency.path().join("index.ts"),
+            "export function entry() { return 7; }\n",
+        )?;
+        std::fs::write(
+            dependency.path().join("package.json"),
+            r#"{"name":"helper","version":"1.0.0","types":"./index.ts"}"#,
+        )?;
+        let roots = roots(dependency.path(), package())?;
+        let target = QueryPackageTarget::prepare(
+            call_request(workspace.path(), dependency.path(), &roots)?,
+            &roots,
+            &[workspace.path()],
+            &WorkspaceConfiguration::default(),
+        )?;
+        let mut facts = target.facts;
+        let symbol = facts
+            .symbols
+            .iter()
+            .position(|entry| entry.symbol.name == "entry")
+            .expect("original package entry");
+        let record = facts
+            .providers
+            .iter_mut()
+            .flat_map(|provider| &mut provider.records)
+            .find(|record| record.symbol_index == symbol)
+            .expect("original provider record");
+        let original = record.declarations[0].clone();
+        let key = rift_core::ContributionKey::new(
+            original.contribution.reference().provider().clone(),
+            original.contribution.publication(),
+            rift_core::ProviderSymbolId::for_symbol("rift://symbol/local/typescript/secondary")?,
+        );
+        assert_ne!(key, original.contribution);
+        record.contributions.push(key.clone());
+        record.contributions.sort();
+        let declarations = &mut facts.symbols[symbol].declarations;
+        let index = declarations.len();
+        declarations.push(declarations[original.declaration_index].clone());
+        assert_eq!(
+            declarations[original.declaration_index],
+            declarations[index]
+        );
+        record
+            .declarations
+            .push(rift_search::query::QueryProviderDeclaration {
+                declaration_index: index,
+                contribution: key,
+                binding: original.binding,
+            });
+        facts.validate_providers()?;
+        Ok((facts, symbol))
+    }
+
+    #[test]
+    fn original_package_declaration_selectors_survive_repeated_merge() -> TestResult {
+        let (facts, symbol) = package_facts_with_equal_declarations()?;
+        let selectors = |facts: &rift_search::query::QueryFacts| {
+            facts
+                .providers
+                .iter()
+                .flat_map(|provider| &provider.records)
+                .flat_map(|record| &record.declarations)
+                .map(|declaration| {
+                    (
+                        declaration.contribution.clone(),
+                        declaration.declaration_index,
+                    )
+                })
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let expected = selectors(&facts);
+        let encoded = serde_json::to_vec(&facts)?;
+        let mut held = rift_search::query::QueryFacts::default();
+        crate::engine_read::merge_package_facts(&mut held, serde_json::from_slice(&encoded)?)?;
+        assert_eq!(selectors(&held), expected);
+        for reversed in [false, true] {
+            let mut incoming: rift_search::query::QueryFacts = serde_json::from_slice(&encoded)?;
+            if reversed {
+                incoming.symbols[symbol].declarations.reverse();
+                for record in incoming
+                    .providers
+                    .iter_mut()
+                    .flat_map(|provider| &mut provider.records)
+                    .filter(|record| record.symbol_index == symbol)
+                {
+                    for declaration in &mut record.declarations {
+                        declaration.declaration_index = 1 - declaration.declaration_index;
+                    }
+                }
+            }
+            incoming.validate_providers()?;
+            crate::engine_read::merge_package_facts(&mut held, incoming)?;
+            assert_eq!(
+                selectors(&held),
+                expected,
+                "original key selectors changed; reversed {reversed}"
+            );
+        }
+        let records = &held.providers[0].records;
+        let record = records
+            .iter()
+            .find(|record| record.symbol_index == symbol)
+            .expect("held original provider record");
+        assert_eq!(held.symbols[record.symbol_index].declarations.len(), 2);
+        assert_eq!(
+            record
+                .declarations
+                .iter()
+                .map(|declaration| declaration.declaration_index)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([0, 1])
+        );
+        held.validate_providers()?;
+        Ok(())
+    }
+    #[test]
+    fn original_package_declaration_selectors_keep_distinct_captured_roots() -> TestResult {
+        let (first, symbol) = package_facts_with_equal_declarations()?;
+        let (second, second_symbol) = package_facts_with_equal_declarations()?;
+        assert_ne!(
+            first.providers[0].context.root,
+            second.providers[0].context.root
+        );
+        assert_eq!(first.symbols[symbol], second.symbols[second_symbol]);
+        let encoded = serde_json::to_vec(&second)?;
+        let mut held = first;
+        let original = held.providers[0]
+            .records
+            .iter()
+            .find(|record| record.symbol_index == symbol)
+            .expect("first original record")
+            .declarations
+            .clone();
+        for _ in 0..2 {
+            crate::engine_read::merge_package_facts(&mut held, serde_json::from_slice(&encoded)?)?;
+            assert_eq!(held.providers.len(), 2);
+            let first_record = held.providers[0]
+                .records
+                .iter()
+                .find(|record| record.symbol_index == symbol)
+                .expect("first original record");
+            assert_eq!(first_record.declarations, original);
+            let second_record = held.providers[1]
+                .records
+                .iter()
+                .find(|record| record.symbol_index == symbol)
+                .expect("second original record");
+            assert_eq!(second_record.declarations.len(), original.len());
+            for (first, second) in original.iter().zip(&second_record.declarations) {
+                assert_eq!(first.contribution, second.contribution);
+                assert_eq!(second.declaration_index, first.declaration_index + 2);
+            }
+            assert_eq!(held.symbols[symbol].declarations.len(), 4);
+            held.validate_providers()?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn unassociated_package_declarations_keep_canonical_merge_behavior() -> TestResult {
+        let (mut facts, _) = package_facts_with_equal_declarations()?;
+        facts.providers.clear();
+        for symbol in &mut facts.symbols {
+            for declaration in &mut symbol.declarations {
+                declaration.node = None;
+            }
+        }
+        facts.validate_providers()?;
+        let symbols = serde_json::to_value(&facts.symbols)?;
+        let sources = serde_json::to_value(&facts.sources)?;
+        let encoded = serde_json::to_vec(&facts)?;
+        let mut held = rift_search::query::QueryFacts::default();
+        for _ in 0..2 {
+            crate::engine_read::merge_package_facts(&mut held, serde_json::from_slice(&encoded)?)?;
+            assert_eq!(serde_json::to_value(&held.symbols)?, symbols);
+            assert_eq!(serde_json::to_value(&held.sources)?, sources);
+            assert!(held.providers.is_empty());
+            held.validate_providers()?;
+        }
+        Ok(())
+    }
+}

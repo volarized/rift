@@ -122,6 +122,8 @@ impl AnalyzedFile {
     }
 }
 
+type DeclarationPositions = Vec<(usize, usize, usize)>;
+
 /// What one analyzer run produced: the canonical publication, and the parsed material the
 /// same pass built it from.
 ///
@@ -131,6 +133,7 @@ impl AnalyzedFile {
 #[derive(Debug)]
 pub struct PackageAnalysis {
     publication: PackagePublication,
+    declaration_positions: DeclarationPositions,
     files: Vec<AnalyzedFile>,
     semantics: WorkspaceSemantics,
     notebook_cells: BTreeMap<DocumentationContentIdentity, String>,
@@ -161,6 +164,30 @@ impl PackageAnalysis {
     #[must_use]
     pub fn files(&self) -> &[AnalyzedFile] {
         &self.files
+    }
+
+    /// Takes the original declaration positions with the publication and captured graph.
+    ///
+    /// Each position selects a normalized record and one of that record's contributions.
+    /// The final index selects that symbol's declaration in the publication.
+    /// Positions are ordered by normalized record and contribution.
+    #[must_use]
+    pub fn into_parts_with_declarations(
+        self,
+    ) -> (
+        PackagePublication,
+        Vec<AnalyzedFile>,
+        WorkspaceSemantics,
+        BTreeMap<DocumentationContentIdentity, String>,
+        DeclarationPositions,
+    ) {
+        (
+            self.publication,
+            self.files,
+            self.semantics,
+            self.notebook_cells,
+            self.declaration_positions,
+        )
     }
 
     /// Takes the run apart for a consumer that keeps every part.
@@ -389,7 +416,7 @@ impl PackageAnalyzer {
                 .path(path.as_str())
                 .fail();
         }
-        let (publication, notebook_cells) = publish(
+        let (publication, notebook_cells, declaration_positions) = publish(
             &input,
             &analyzed,
             &built.semantics,
@@ -397,6 +424,7 @@ impl PackageAnalyzer {
         )?;
         Ok(PackageAnalysis {
             publication,
+            declaration_positions,
             files: analyzed,
             semantics: built.semantics,
             notebook_cells,
@@ -406,7 +434,11 @@ impl PackageAnalyzer {
     }
 }
 
-fn relationship_facet(kind: rift_core::RelationshipKind) -> rift_protocol::read::RelationshipFacet {
+/// Returns the existing portable facet of one normalized provider relationship.
+#[must_use]
+pub const fn relationship_facet(
+    kind: rift_core::RelationshipKind,
+) -> rift_protocol::read::RelationshipFacet {
     match kind {
         rift_core::RelationshipKind::Reference => {
             rift_protocol::read::RelationshipFacet::References
@@ -491,6 +523,7 @@ fn publish(
     (
         PackagePublication,
         BTreeMap<DocumentationContentIdentity, String>,
+        DeclarationPositions,
     ),
     RiftError,
 > {
@@ -527,16 +560,16 @@ fn publish(
         .sort_by(|left, right| left.unit.0.cmp(&right.unit.0));
     records.declarations.sort_by(|left, right| {
         (
-            &left.symbol.0,
-            &left.unit.0,
-            left.range.start,
-            left.range.end,
+            &left.publication.symbol.0,
+            &left.publication.unit.0,
+            left.publication.range.start,
+            left.publication.range.end,
         )
             .cmp(&(
-                &right.symbol.0,
-                &right.unit.0,
-                right.range.start,
-                right.range.end,
+                &right.publication.symbol.0,
+                &right.publication.unit.0,
+                right.publication.range.start,
+                right.publication.range.end,
             ))
     });
     records
@@ -561,6 +594,7 @@ fn publish(
         unresolved_exports,
         retained_syntax_complete,
     );
+    let (declarations, declaration_positions) = records.take_declarations(package)?;
     Ok((
         PackagePublication {
             format_revision: PACKAGE_PUBLICATION_FORMAT_REVISION,
@@ -571,7 +605,7 @@ fn publish(
             units: records.units,
             coverage,
             objects: records.objects,
-            declarations: records.declarations,
+            declarations,
             relationships: records.relationships,
             artifact: input.artifact().cloned(),
             documents: records.documents,
@@ -579,6 +613,7 @@ fn publish(
             warnings: records.warnings,
         },
         notebook_cells,
+        declaration_positions,
     ))
 }
 
@@ -1231,6 +1266,7 @@ fn package_declarations<'declaration>(
     }
     let mut declarations = Vec::with_capacity(records.declarations.len());
     for declaration in &records.declarations {
+        let declaration = &declaration.publication;
         let facts = bindings
             .get(&(
                 declaration.unit.0.clone(),
@@ -1350,11 +1386,16 @@ struct SourceFingerprint<'analysis> {
 /// A collection that reaches its bound reports the cut once. Every record past the bound
 /// meets the same full collection, so warning per record would fill the warning list with
 /// one repeated entry and drop everything else the analysis met.
+struct Declaration {
+    publication: PackageSymbol,
+    position: (usize, usize),
+}
+
 #[derive(Default)]
 struct Records {
     units: Vec<PackageSourceUnit>,
     objects: Vec<Symbol>,
-    declarations: Vec<PackageSymbol>,
+    declarations: Vec<Declaration>,
     relationships: Vec<rift_protocol::read::Relationship>,
     documents: Vec<PackageDocument>,
     warnings: Vec<PackageAnalysisWarning>,
@@ -1369,6 +1410,61 @@ struct Records {
 }
 
 impl Records {
+    fn take_declarations(
+        &mut self,
+        owner: &SymbolOwner,
+    ) -> Result<(Vec<PackageSymbol>, DeclarationPositions), RiftError> {
+        let mut declarations = Vec::new();
+        let mut declaration_positions = Vec::new();
+        let allocation = |error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(owner))
+                .source(error)
+                .error()
+        };
+        declarations
+            .try_reserve_exact(self.declarations.len())
+            .map_err(allocation)?;
+        declaration_positions
+            .try_reserve_exact(self.declarations.len())
+            .map_err(allocation)?;
+        let mut first = 0;
+        for declaration in std::mem::take(&mut self.declarations) {
+            if declarations
+                .last()
+                .is_none_or(|last: &PackageSymbol| last.symbol != declaration.publication.symbol)
+            {
+                first = declarations.len();
+            }
+            declaration_positions.push((
+                declaration.position.0,
+                declaration.position.1,
+                declarations.len() - first,
+            ));
+            declarations.push(declaration.publication);
+        }
+        declaration_positions.sort_unstable_by_key(|position| (position.0, position.1));
+        Ok((declarations, declaration_positions))
+    }
+
+    fn declaration_capacity(&mut self, owner: &SymbolOwner) -> Result<bool, RiftError> {
+        if self.declarations.len() >= bound(self.publication.symbols) {
+            self.symbols_truncated = true;
+            self.warn(truncation(
+                "declarations",
+                u64::from(self.publication.symbols),
+            ));
+            return Ok(false);
+        }
+        self.declarations.try_reserve(1).map_err(|error| {
+            errors::analysis::package_provider_failed()
+                .package(package_label(owner))
+                .source(error)
+                .error()
+        })?;
+        Ok(true)
+    }
+
     /// Records one warning, dropping it once the publication's warning bound is reached:
     /// the bound is what a reader can act on, and the log carries the rest.
     fn warn(&mut self, warning: PackageAnalysisWarning) {
@@ -1648,7 +1744,7 @@ impl Records {
             .iter()
             .map(|unit| unit.unit.0.clone())
             .collect::<BTreeSet<_>>();
-        for record in semantics.graph().records() {
+        for (record_index, record) in semantics.graph().records().iter().enumerate() {
             if self.objects.len() >= bound(self.publication.symbols) {
                 self.symbols_truncated = true;
                 self.warn(truncation("objects", u64::from(self.publication.symbols)));
@@ -1704,11 +1800,17 @@ impl Records {
                     });
                     continue;
                 };
+                let contribution_index =
+                    record.contributions().binary_search(key).map_err(|_| {
+                        errors::analysis::package_provider_failed()
+                            .package(package_label(owner))
+                            .error()
+                    })?;
                 self.declaration(
                     owner,
                     &object,
                     document_signature,
-                    contribution,
+                    (contribution, (record_index, contribution_index)),
                     held,
                     starts,
                 )?;
@@ -1848,7 +1950,7 @@ impl Records {
         owner: &SymbolOwner,
         object: &Symbol,
         document_signature: Option<&str>,
-        contribution: &rift_core::Contribution,
+        (contribution, position): (&rift_core::Contribution, (usize, usize)),
         held: &AnalyzedFile,
         starts: &[usize],
     ) -> Result<(), RiftError> {
@@ -1856,12 +1958,7 @@ impl Records {
             .id
             .as_ref()
             .expect("established declaration identity");
-        if self.declarations.len() >= bound(self.publication.symbols) {
-            self.symbols_truncated = true;
-            self.warn(truncation(
-                "declarations",
-                u64::from(self.publication.symbols),
-            ));
+        if !self.declaration_capacity(owner)? {
             return Ok(());
         }
         let binding = contribution.source().expect("captured source binding");
@@ -1948,7 +2045,10 @@ impl Records {
         } else if public && object.name_is_public() && !self.document_capacity() {
             self.warn_document_full();
         }
-        self.declarations.push(record);
+        self.declarations.push(Declaration {
+            publication: record,
+            position,
+        });
         Ok(())
     }
 

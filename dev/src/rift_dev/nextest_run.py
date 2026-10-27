@@ -13,7 +13,7 @@ import time
 import tomllib
 import uuid
 import zlib
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Generator, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from statistics import median
@@ -131,15 +131,35 @@ class ListedSuite(BaseModel):
     """Discovery owns binary IDs; JSON+ owns display names."""
 
     package_name: str = Field(alias="package-name")
+    package_id: str = Field(alias="package-id")
     binary_id: str = Field(alias="binary-id")
     binary_name: str = Field(alias="binary-name")
     testcases: dict[str, ListedTest]
+
+
+class NonTestBinary(BaseModel):
+    """One executable or library in Nextest's build inventory."""
+
+    name: str
+    kind: str
+    path: Path
+    build_platform: Literal["target", "host"] | None = Field(
+        default=None, alias="build-platform"
+    )
+
+
+class RustBuildMetadata(BaseModel):
+    """Artifact paths after Nextest applies any archive relocation."""
+
+    target_directory: Path = Field(alias="target-directory")
+    non_test_binaries: dict[str, list[NonTestBinary]] = Field(alias="non-test-binaries")
 
 
 class TestList(BaseModel):
     """Nextest's public test list, validated before execution."""
 
     rust_suites: dict[str, ListedSuite] = Field(alias="rust-suites")
+    rust_build_meta: RustBuildMetadata = Field(alias="rust-build-meta")
 
 
 class CaseIdentity(BaseModel):
@@ -238,7 +258,7 @@ class RunSummary(CollectionSummary):
 
 
 @contextmanager
-def retained_collector(directory: Path) -> Iterator[Collector]:
+def retained_collector(directory: Path) -> Generator[Collector]:
     """Keep scenario telemetry through server cleanup and collector shutdown."""
     directory.mkdir(parents=True, exist_ok=True)
     artifact = ArtifactStore(directory / "telemetry.jsonl.gz", {})
@@ -785,8 +805,18 @@ def reuse_archive(
             .with_environment(command.environment() or os.environ)
             .with_env(CARGO_TARGET_DIR=str(directory))
         )
+        environment_started = time.monotonic()
+        print("nextest archive coverage environment started", flush=True)
+        try:
+            coverage_output = coverage.output()
+        finally:
+            print(
+                "nextest archive coverage environment "
+                f"elapsed_seconds={time.monotonic() - environment_started:.6f}",
+                flush=True,
+            )
         command.with_env(
-            **parse_coverage_environment(coverage.output()),
+            **parse_coverage_environment(coverage_output),
             CARGO_TARGET_DIR=str(directory),
         )
     command.arguments = ["nextest", "run", *retained]
@@ -799,6 +829,67 @@ def reuse_archive(
         "--target-dir-remap",
         str(directory / "target"),
     )
+
+
+def query_program(discovered: TestList) -> Path | None:
+    """Select the actual Rift executable from the current build inventory.
+
+    Nextest exposes a binary only to tests in its own package. The shared
+    environment supplies the same artifact to in-process MCP fixtures.
+
+    >>> root = Path.cwd().resolve() / "worker-selection"
+    >>> binary = {"name": "rift", "kind": "bin-exe", "path": "debug/rift", "build-platform": "target"}
+    >>> suite = {"package-name": "rift", "package-id": "rift-package", "binary-id": "rift-tests", "binary-name": "rift-tests", "testcases": {}}
+    >>> build = {"target-directory": root, "non-test-binaries": {"rift-package": [binary]}}
+    >>> listed = TestList.model_validate({"rust-suites": {"rift-tests": suite}, "rust-build-meta": build})
+    >>> query_program(listed) == root / "debug/rift"
+    True
+    >>> relocated = listed.model_copy(update={"rust_build_meta": listed.rust_build_meta.model_copy(update={"target_directory": root / "relocated"})})
+    >>> query_program(relocated) == root / "relocated/debug/rift"
+    True
+    >>> query_program(listed.model_copy(update={"rust_suites": {}})) is None
+    True
+    >>> bad = listed.rust_build_meta.model_copy(update={"target_directory": Path("relative")})
+    >>> query_program(listed.model_copy(update={"rust_build_meta": bad}))
+    Traceback (most recent call last):
+        ...
+    ValueError: Nextest Rift executable path is outside its target directory
+    >>> escaped = NonTestBinary.model_validate({**binary, "path": "../rift"})
+    >>> bad = listed.rust_build_meta.model_copy(update={"non_test_binaries": {"rift-package": [escaped]}})
+    >>> query_program(listed.model_copy(update={"rust_build_meta": bad}))
+    Traceback (most recent call last):
+        ...
+    ValueError: Nextest Rift executable path is outside its target directory
+    >>> other = NonTestBinary.model_validate({**binary, "path": "other/rift"})
+    >>> original = NonTestBinary.model_validate(binary)
+    >>> bad = listed.rust_build_meta.model_copy(update={"non_test_binaries": {"rift-package": [original, other]}})
+    >>> query_program(listed.model_copy(update={"rust_build_meta": bad}))
+    Traceback (most recent call last):
+        ...
+    ValueError: Nextest inventory contains more than one Rift executable
+    """
+    owners = {
+        suite.package_id
+        for suite in discovered.rust_suites.values()
+        if suite.package_name == "rift"
+    }
+    paths = {
+        binary.path
+        for owner in owners
+        for binary in discovered.rust_build_meta.non_test_binaries.get(owner, [])
+        if binary.name == "rift"
+        and binary.kind == "bin-exe"
+        and binary.build_platform == "target"
+    }
+    if not paths:
+        return None
+    if len(paths) != 1:
+        raise ValueError("Nextest inventory contains more than one Rift executable")
+    path = paths.pop()
+    root = discovered.rust_build_meta.target_directory
+    if not root.is_absolute() or path.is_absolute() or ".." in path.parts:
+        raise ValueError("Nextest Rift executable path is outside its target directory")
+    return root / path
 
 
 def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path]:
@@ -882,11 +973,25 @@ def prepare(command: Command, directory: Path) -> tuple[dict[str, Outcome], Path
         command.directory
     )
     discovery.with_timeout(RUN_SECONDS_MAX).with_output_limit(RUN_LOG_BYTES_MAX)
-    discovered_bytes = discovery.output_bytes(echo_stderr=False)
+    discovery_started = time.monotonic()
+    print(f"nextest discovery started archive={archived}", flush=True)
+    try:
+        discovered_bytes = discovery.output_bytes(echo_stderr=False)
+    finally:
+        print(
+            f"nextest discovery archive={archived} "
+            f"elapsed_seconds={time.monotonic() - discovery_started:.6f}",
+            flush=True,
+        )
     (directory / "discovery.json").write_bytes(discovered_bytes)
     discovered = TestList.model_validate_json(discovered_bytes)
     if archive_directory is not None:
         reuse_archive(command, arguments, archive_directory, llvm_cov=llvm_cov)
+    program = query_program(discovered)
+    if program is not None:
+        if not program.is_file():
+            raise ValueError(f"Nextest Rift executable is missing: {program}")
+        command.with_env(CARGO_BIN_EXE_rift=str(program))
     outcomes: dict[str, Outcome] = {}
     for suite in discovered.rust_suites.values():
         for name, test in suite.testcases.items():

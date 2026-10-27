@@ -25,6 +25,7 @@ pub struct LocalSymbolViewInput {
     pub ready: bool,
     /// Owning material charge, including retained source, facts and admitted caches.
     retained_bytes: usize,
+    expiry_limit: Option<SystemTime>,
 }
 
 impl LocalSymbolViewInput {
@@ -36,10 +37,16 @@ impl LocalSymbolViewInput {
         Ok(local_view_input(
             Arc::new(self.material.index.with_sources(sources)?),
             self.material.metadata.to_vec(),
-            self.material.history.clone(),
+            Arc::clone(&self.material.history),
             self.material.traversal.clone(),
             self.ready,
-        ))
+        )
+        .with_expiry_limit(self.expiry_limit)
+        .with_query_result_arc(self.material.query_result.clone())
+        .with_package_facts_arc(self.material.package_facts.clone())
+        .with_query_references_arc(self.material.query_references.clone())
+        .with_provider_selection_arc(self.material.provider_selection.clone())
+        .with_selected_indices(Arc::clone(&self.material.selected)))
     }
 
     /// Returns the warnings retained by this immutable input.
@@ -50,6 +57,16 @@ impl LocalSymbolViewInput {
         let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         Ok(metadata.warnings)
+    }
+
+    /// Returns the version-control revision retained by this immutable input.
+    ///
+    /// # Errors
+    /// Returns the original captured metadata read failure.
+    pub fn captured_revision(&self) -> Result<Option<rift_protocol::read::RevisionId>, RiftError> {
+        let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
+            .map_err(|error| material_error("decode captured metadata", &error))?;
+        Ok(metadata.revision)
     }
 
     /// Adds caller-owned warnings before the immutable material is admitted.
@@ -71,10 +88,16 @@ impl LocalSymbolViewInput {
         Ok(local_view_input(
             Arc::clone(&self.material.index),
             metadata,
-            self.material.history.clone(),
+            Arc::clone(&self.material.history),
             self.material.traversal.clone(),
             self.ready,
-        ))
+        )
+        .with_expiry_limit(self.expiry_limit)
+        .with_query_result_arc(self.material.query_result.clone())
+        .with_package_facts_arc(self.material.package_facts.clone())
+        .with_query_references_arc(self.material.query_references.clone())
+        .with_provider_selection_arc(self.material.provider_selection.clone())
+        .with_selected_indices(Arc::clone(&self.material.selected)))
     }
 
     /// Root of the immutable publication admitted by this input.
@@ -88,14 +111,184 @@ impl LocalSymbolViewInput {
     pub fn owner(&self) -> &SymbolOwner {
         self.material.index.owner()
     }
+
+    pub(crate) fn index(&self) -> &rift_index::WorkspaceSymbolView {
+        &self.material.index
+    }
+
+    /// Retains one encoded execution result under the existing material admission bound.
+    #[must_use]
+    pub fn with_query_result(self, bytes: Vec<u8>) -> Self {
+        self.with_query_result_arc(Some(Arc::from(bytes)))
+    }
+
+    fn with_query_result_arc(mut self, bytes: Option<Arc<[u8]>>) -> Self {
+        let previous = self
+            .material
+            .query_result
+            .as_ref()
+            .map_or(0, |bytes| bytes.len());
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_sub(previous)
+            .saturating_add(bytes.as_ref().map_or(0, |bytes| bytes.len()));
+        self.material = Arc::new(LocalSymbolMaterial {
+            index: Arc::clone(&self.material.index),
+            selected: Arc::clone(&self.material.selected),
+            metadata: Arc::clone(&self.material.metadata),
+            history: Arc::clone(&self.material.history),
+            traversal: self.material.traversal.clone(),
+            query_result: bytes,
+            package_facts: self.material.package_facts.clone(),
+            provider_selection: self.material.provider_selection.clone(),
+            query_references: self.material.query_references.clone(),
+        });
+        self
+    }
+
+    /// Returns encoded results from this exact selection without copying their allocation.
+    #[must_use]
+    pub fn query_result(&self) -> Option<Arc<[u8]>> {
+        self.material.query_result.clone()
+    }
+
+    /// Retains the original serving context after checking this immutable publication.
+    ///
+    /// # Errors
+    /// Refuses a different root, owner or captured revision.
+    pub fn with_provider_selection(
+        self,
+        selection: rift_search::query::QueryProviderSelection,
+    ) -> Result<Self, RiftError> {
+        self.validate_provider_selection(&selection)?;
+        if self
+            .captured_provider_selection()
+            .is_some_and(|captured| captured != &selection)
+        {
+            return Err(invalid(
+                "view",
+                "captured query provider selection does not match",
+            ));
+        }
+        Ok(self.with_provider_selection_arc(Some(Arc::new(selection))))
+    }
+
+    /// Returns the original serving context retained by this immutable publication.
+    #[must_use]
+    pub fn captured_provider_selection(
+        &self,
+    ) -> Option<&rift_search::query::QueryProviderSelection> {
+        self.material.provider_selection.as_deref()
+    }
+
+    fn with_provider_selection_arc(
+        mut self,
+        selection: Option<Arc<rift_search::query::QueryProviderSelection>>,
+    ) -> Self {
+        let bytes = |selection: &rift_search::query::QueryProviderSelection| {
+            get_size2::GetSize::get_size(selection).saturating_add(2 * std::mem::size_of::<usize>())
+        };
+        let previous = self.material.provider_selection.as_deref().map_or(0, bytes);
+        self.retained_bytes = self
+            .retained_bytes
+            .saturating_sub(previous)
+            .saturating_add(selection.as_deref().map_or(0, bytes));
+        self.material = Arc::new(LocalSymbolMaterial {
+            index: Arc::clone(&self.material.index),
+            selected: Arc::clone(&self.material.selected),
+            metadata: Arc::clone(&self.material.metadata),
+            history: Arc::clone(&self.material.history),
+            traversal: self.material.traversal.clone(),
+            query_result: self.material.query_result.clone(),
+            package_facts: self.material.package_facts.clone(),
+            provider_selection: selection,
+            query_references: self.material.query_references.clone(),
+        });
+        self
+    }
+
+    fn with_expiry_limit(mut self, expiry_limit: Option<SystemTime>) -> Self {
+        self.expiry_limit = expiry_limit;
+        self
+    }
+
+    /// Combines selections of the same immutable workspace publication.
+    ///
+    /// # Errors
+    /// Refuses selections backed by different publications.
+    pub fn combine(mut self, other: &Self) -> Result<Self, SymbolUnavailableReason> {
+        if !Arc::ptr_eq(&self.material.index, &other.material.index) {
+            return Err(SymbolUnavailableReason::ViewContext);
+        }
+        match (
+            &self.material.provider_selection,
+            &other.material.provider_selection,
+        ) {
+            (Some(left), Some(right)) if left != right => {
+                return Err(SymbolUnavailableReason::ViewContext);
+            }
+            (None, Some(selected)) => {
+                self = self.with_provider_selection_arc(Some(Arc::clone(selected)));
+            }
+            _ => {}
+        }
+        self.expiry_limit = match (self.expiry_limit, other.expiry_limit) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        self.ready &= other.ready;
+        for selected in other.material.selected.iter() {
+            self = self
+                .with_selected_view(Arc::clone(selected))
+                .map_err(|_| SymbolUnavailableReason::ViewContext)?;
+        }
+        self = self
+            .combine_histories(other)
+            .map_err(|_| SymbolUnavailableReason::ViewContext)?;
+        if let Some(facts) = other.material.package_facts.as_deref() {
+            self = self
+                .with_package_facts(facts.clone())
+                .map_err(|_| SymbolUnavailableReason::ViewContext)?;
+        }
+        if let Some(references) = &other.material.query_references {
+            let combined = match &self.material.query_references {
+                Some(existing) if Arc::ptr_eq(existing, references) => Arc::clone(existing),
+                Some(existing) => Arc::new(
+                    existing
+                        .combine_provider_references(references)
+                        .map_err(|_| SymbolUnavailableReason::ViewContext)?,
+                ),
+                None => Arc::clone(references),
+            };
+            self = self.with_query_references_arc(Some(combined));
+        }
+        Ok(self)
+    }
+
+    /// Limits a derived selection to the provider's original expiry.
+    ///
+    /// # Errors
+    /// Returns the original error when the provider expiry cannot be decoded.
+    pub fn limited_by(mut self, view: &CapturedView) -> Result<Self, RiftError> {
+        let expiry = chrono::DateTime::parse_from_rfc3339(&view.expires_at)
+            .map_err(|error| material_error("read provider view expiry", &error))?;
+        let expiry = SystemTime::from(expiry);
+        self.expiry_limit = Some(self.expiry_limit.map_or(expiry, |held| held.min(expiry)));
+        Ok(self)
+    }
 }
 
 #[derive(Debug)]
 struct LocalSymbolMaterial {
     index: Arc<rift_index::WorkspaceSymbolView>,
+    selected: Arc<[Arc<rift_index::WorkspaceSymbolView>]>,
     metadata: Arc<[u8]>,
-    history: Option<(String, Arc<[u8]>)>,
+    history: Arc<history::CapturedHistories>,
     traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
+    query_result: Option<Arc<[u8]>>,
+    package_facts: Option<Arc<rift_search::query::QueryFacts>>,
+    provider_selection: Option<Arc<rift_search::query::QueryProviderSelection>>,
+    query_references: Option<Arc<crate::EngineReferences>>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -106,11 +299,65 @@ struct CapturedMetadata {
 
 #[derive(Debug, Clone)]
 struct HeldView {
+    material: HeldMaterial,
+    ready: bool,
+    retained_bytes: usize,
+    view: CapturedView,
+    expires: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+enum HeldMaterial {
+    Local(Arc<LocalSymbolMaterial>),
+    Query(Arc<QueryMaterial>),
+}
+
+impl HeldMaterial {
+    fn root(&self) -> &Path {
+        match self {
+            Self::Local(material) => material.index.root(),
+            Self::Query(material) => material.root(),
+        }
+    }
+
+    fn owner(&self) -> &SymbolOwner {
+        match self {
+            Self::Local(material) => material.index.owner(),
+            Self::Query(material) => material.owner(),
+        }
+    }
+}
+
+struct CaptureInput {
+    material: HeldMaterial,
+    ready: bool,
+    retained_bytes: usize,
+    expiry_limit: Option<SystemTime>,
+    index_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+struct HeldLocalView {
     material: Arc<LocalSymbolMaterial>,
     ready: bool,
     retained_bytes: usize,
     view: CapturedView,
     expires: SystemTime,
+}
+
+impl HeldView {
+    fn into_local(self) -> Result<HeldLocalView, SymbolUnavailableReason> {
+        let HeldMaterial::Local(material) = self.material else {
+            return Err(SymbolUnavailableReason::ViewContext);
+        };
+        Ok(HeldLocalView {
+            material,
+            ready: self.ready,
+            retained_bytes: self.retained_bytes,
+            view: self.view,
+            expires: self.expires,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -148,7 +395,7 @@ struct State {
 }
 
 impl State {
-    fn expire(&mut self, now: SystemTime) {
+    fn expire(&mut self, now: SystemTime, views_max: usize) {
         let expired: Vec<_> = self
             .views
             .iter()
@@ -159,7 +406,7 @@ impl State {
             self.views.remove(&key);
             self.expired.insert(key);
         }
-        while self.expired.len() > VIEW_SLOTS {
+        while self.expired.len() > views_max {
             self.expired.pop_first();
         }
         self.cursors.retain(|key, cursor| {
@@ -170,7 +417,7 @@ impl State {
                 false
             }
         });
-        while self.expired.len() > VIEW_SLOTS {
+        while self.expired.len() > views_max {
             self.expired.pop_first();
         }
     }
@@ -204,19 +451,28 @@ impl State {
                 .saturating_add(std::mem::size_of::<HeldView>())
                 .saturating_add(held.view.id.get_heap_size())
                 .saturating_add(held.view.expires_at.capacity());
-            if charged.track(Arc::as_ptr(&held.material.index)) {
-                let bytes = if shared {
-                    let (bytes, next) = held.material.index.as_ref().get_size_with_tracker(charged);
-                    charged = next;
-                    bytes
-                } else {
-                    held.material.index.retained_material_bytes()
-                };
-                total = total
-                    .saturating_add(bytes)
-                    .saturating_add(2 * std::mem::size_of::<usize>());
+            if let HeldMaterial::Local(material) = &held.material {
+                for index in std::iter::once(&material.index).chain(material.selected.iter()) {
+                    if !charged.track(Arc::as_ptr(index)) {
+                        continue;
+                    }
+                    let bytes = if shared {
+                        let (bytes, next) = index.as_ref().get_size_with_tracker(charged);
+                        charged = next;
+                        bytes
+                    } else {
+                        index.retained_material_bytes()
+                    };
+                    total = total
+                        .saturating_add(bytes)
+                        .saturating_add(2 * std::mem::size_of::<usize>());
+                }
             }
-            if charged.track(Arc::as_ptr(&held.material)) {
+            let first = match &held.material {
+                HeldMaterial::Local(material) => charged.track(Arc::as_ptr(material)),
+                HeldMaterial::Query(material) => charged.track(Arc::as_ptr(material)),
+            };
+            if first {
                 total = total.saturating_add(held.retained_bytes);
             }
         }
@@ -235,19 +491,62 @@ impl State {
 #[derive(Debug)]
 pub struct LocalSymbolViews {
     material_bytes_max: usize,
+    views_max: usize,
+    view_lifetime: Duration,
     service_key: [u8; 32],
     state: Mutex<State>,
 }
 
 impl LocalSymbolViews {
+    /// Reuses one selected publication without extending its original expiry.
+    ///
+    /// # Errors
+    /// Returns the selected view's typed expiry or ownership refusal.
+    pub fn selected_input(
+        &self,
+        id: &CapturedViewId,
+        root: &Path,
+        owner: &SymbolOwner,
+    ) -> Result<LocalSymbolViewInput, SymbolUnavailableReason> {
+        let held = self
+            .selected_view_at(id, root, owner, SystemTime::now())?
+            .into_local()?;
+        Ok(LocalSymbolViewInput {
+            material: held.material,
+            ready: held.ready,
+            retained_bytes: held.retained_bytes,
+            expiry_limit: Some(held.expires),
+        })
+    }
     /// Creates a service-local authority store with a caller-owned material budget.
     #[must_use]
     pub fn new(material_bytes_max: usize, service_key: [u8; 32]) -> Self {
         Self {
             material_bytes_max,
+            views_max: VIEW_SLOTS,
+            view_lifetime: VIEW_LIFETIME,
             service_key,
             state: Mutex::new(State::default()),
         }
+    }
+
+    /// Creates a service-local store with accepted byte, count and lifetime bounds.
+    ///
+    /// # Errors
+    /// Returns a registered read refusal for a zero count, byte bound or lifetime.
+    pub fn bounded(
+        material_bytes_max: usize,
+        service_key: [u8; 32],
+        views_max: usize,
+        view_lifetime: Duration,
+    ) -> Result<Self, RiftError> {
+        if material_bytes_max == 0 || views_max == 0 || view_lifetime.is_zero() {
+            return Err(invalid("view", "captured view bounds must be positive"));
+        }
+        let mut views = Self::new(material_bytes_max, service_key);
+        views.views_max = views_max;
+        views.view_lifetime = view_lifetime;
+        Ok(views)
     }
 
     /// Captures one exact publication, or refuses admission without discarding active views.
@@ -287,18 +586,47 @@ impl LocalSymbolViews {
         now: SystemTime,
         admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
     ) -> Result<Option<CapturedView>, RiftError> {
+        let mut expiry_limit = input.expiry_limit;
+        if let Some((_, references)) = &input.material.traversal {
+            for selected in references.package_views() {
+                let selected = chrono::DateTime::parse_from_rfc3339(&selected.expires_at)
+                    .map_err(|error| material_error("read package view expiry", &error))?;
+                let selected = SystemTime::from(selected);
+                expiry_limit = Some(expiry_limit.map_or(selected, |limit| limit.min(selected)));
+            }
+        }
+        let index_bytes = input.material.index.retained_material_bytes();
+        self.capture_material_with_at(
+            CaptureInput {
+                material: HeldMaterial::Local(input.material),
+                ready: input.ready,
+                retained_bytes: input.retained_bytes,
+                expiry_limit,
+                index_bytes,
+            },
+            now,
+            admit,
+        )
+    }
+
+    fn capture_material_with_at(
+        &self,
+        input: CaptureInput,
+        now: SystemTime,
+        admit: impl FnOnce(&CapturedView) -> Result<bool, RiftError>,
+    ) -> Result<Option<CapturedView>, RiftError> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire(now);
-        if input.retained_bytes == 0 || state.views.len() == VIEW_SLOTS {
+        state.expire(now, self.views_max);
+        if input.retained_bytes == 0 || state.views.len() >= self.views_max {
             rift_tracing::warn!(
                 component = "server",
                 rows = state.views.len(),
-                views_max = VIEW_SLOTS,
+                views_max = self.views_max,
                 incoming_bytes = input.retained_bytes,
-                index_bytes = input.material.index.retained_material_bytes(),
+                index_bytes = input.index_bytes,
                 ready = input.ready,
                 bytes_max = self.material_bytes_max,
                 "retained read material exceeds the byte or view bound"
@@ -306,25 +634,34 @@ impl LocalSymbolViews {
             return Ok(None);
         }
         let retained_bytes = input.retained_bytes;
-        let index_bytes = input.material.index.retained_material_bytes();
+        let index_bytes = input.index_bytes;
         let ready = input.ready;
         let id = self.next_key(&mut state)?;
         let mut expires = now
-            .checked_add(VIEW_LIFETIME)
+            .checked_add(self.view_lifetime)
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
-        if let Some((_, references)) = &input.material.traversal {
-            for selected in references.package_views() {
-                let selected = chrono::DateTime::parse_from_rfc3339(&selected.expires_at)
-                    .map_err(|error| material_error("read package view expiry", &error))?;
-                expires = expires.min(SystemTime::from(selected));
-            }
+        if let Some(limit) = input.expiry_limit {
+            expires = expires.min(limit);
         }
         if expires <= now {
             return Ok(None);
         }
+        let elapsed = expires
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|_| invalid("view", "view expiry exceeds the clock bound"))?;
+        let seconds = i64::try_from(elapsed.as_secs())
+            .map_err(|_| invalid("view", "view expiry exceeds the clock bound"))?;
+        let timestamp = chrono::DateTime::from_timestamp(seconds, elapsed.subsec_nanos())
+            .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
+        let expires_at = timestamp.to_rfc3339();
+        let decoded = chrono::DateTime::parse_from_rfc3339(&expires_at)
+            .map_err(|_| invalid("view", "view expiry exceeds the clock bound"))?;
+        if SystemTime::from(decoded) != expires {
+            return Err(invalid("view", "view expiry exceeds the clock bound"));
+        }
         let view = CapturedView {
             id: CapturedViewId::parse(&id)?,
-            expires_at: chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339(),
+            expires_at,
         };
         state.views.insert(
             id.clone(),
@@ -342,7 +679,7 @@ impl LocalSymbolViews {
                 component = "server",
                 rows = state.views.len(),
                 cursors = state.cursors.len(),
-                views_max = VIEW_SLOTS,
+                views_max = self.views_max,
                 material_bytes,
                 incoming_bytes = retained_bytes,
                 index_bytes,
@@ -402,11 +739,28 @@ impl LocalSymbolViews {
         owner: &SymbolOwner,
         now: SystemTime,
     ) -> Result<CapturedView, SymbolUnavailableReason> {
-        self.held_view_at(id, root, owner, now)
-            .map(|held| held.view)
+        let held = self.selected_view_at(id, root, owner, now)?;
+        if !held.ready {
+            return Err(SymbolUnavailableReason::IndexPreparing);
+        }
+        Ok(held.view)
     }
 
     fn held_view_at(
+        &self,
+        id: &CapturedViewId,
+        root: &Path,
+        owner: &SymbolOwner,
+        now: SystemTime,
+    ) -> Result<HeldLocalView, SymbolUnavailableReason> {
+        let held = self.selected_view_at(id, root, owner, now)?;
+        if !held.ready {
+            return Err(SymbolUnavailableReason::IndexPreparing);
+        }
+        held.into_local()
+    }
+
+    fn selected_view_at(
         &self,
         id: &CapturedViewId,
         root: &Path,
@@ -417,7 +771,7 @@ impl LocalSymbolViews {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.expire(now);
+        state.expire(now, self.views_max);
         let Some(held) = state.views.get(id.as_str()) else {
             return Err(if state.expired.contains(id.as_str()) {
                 SymbolUnavailableReason::ViewExpired
@@ -425,11 +779,8 @@ impl LocalSymbolViews {
                 SymbolUnavailableReason::ViewContext
             });
         };
-        if held.material.index.root() != root || held.material.index.owner() != owner {
+        if held.material.root() != root || held.material.owner() != owner {
             return Err(SymbolUnavailableReason::ViewContext);
-        }
-        if !held.ready {
-            return Err(SymbolUnavailableReason::IndexPreparing);
         }
         Ok(held.clone())
     }
@@ -454,21 +805,13 @@ impl LocalSymbolViews {
         owner: &SymbolOwner,
         now: SystemTime,
     ) -> Result<GetSymbolResult, RiftError> {
-        let identity = SymbolIdentity::parse(request.id.as_str())?;
-        super::accepted_limit(request.declaration_limit)?;
-        if request.rev.is_some() && (request.view.is_some() || request.declaration_cursor.is_some())
-        {
-            return Err(invalid(
-                "rev",
-                "rev cannot accompany a captured view or continuation",
-            ));
-        }
+        let identity = symbol_request_identity(request)?;
         let (held, offset) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expire(now);
+            state.expire(now, self.views_max);
             let continuation = match &request.declaration_cursor {
                 Some(key) => match state.cursors.get(key) {
                     Some(cursor) if cursor.matches(request) => Some(cursor),
@@ -500,9 +843,13 @@ impl LocalSymbolViews {
                 };
                 return Ok(unavailable(request, None, reason));
             };
+            let held = match held.clone().into_local() {
+                Ok(held) => held,
+                Err(reason) => return Ok(unavailable(request, Some(held.view.clone()), reason)),
+            };
             if held.material.index.root() != root
                 || held.material.index.owner() != owner
-                || identity.owner() != owner
+                || (identity.owner() != owner && !held.material.admits_package_symbol(&request.id))
             {
                 return Ok(unavailable(
                     request,
@@ -534,7 +881,7 @@ impl LocalSymbolViews {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expire(now);
+            state.expire(now, self.views_max);
             let key = self.next_key(&mut state)?;
             state.cursors.insert(key.clone(), continuation);
             if state.admitted_material_bytes(self.material_bytes_max) > self.material_bytes_max {
@@ -554,6 +901,18 @@ impl LocalSymbolViews {
         }
         Ok(result)
     }
+}
+
+fn symbol_request_identity(request: &GetSymbolParams) -> Result<SymbolIdentity, RiftError> {
+    let identity = SymbolIdentity::parse(request.id.as_str())?;
+    super::accepted_declaration_limit(request.declaration_limit)?;
+    if request.rev.is_some() && (request.view.is_some() || request.declaration_cursor.is_some()) {
+        return Err(invalid(
+            "rev",
+            "rev cannot accompany a captured view or continuation",
+        ));
+    }
+    Ok(identity)
 }
 
 fn invalid(field: &'static str, violation: &'static str) -> RiftError {
@@ -583,7 +942,13 @@ impl ReadService {
     /// Returns the original captured index or read failure.
     pub fn local_search_view_input(&self, ready: bool) -> Result<LocalSymbolViewInput, RiftError> {
         let (index, metadata) = self.local_view_material()?;
-        Ok(local_view_input(index, metadata, None, None, ready))
+        Ok(local_view_input(
+            index,
+            metadata,
+            Arc::default(),
+            None,
+            ready,
+        ))
     }
 
     /// Captures one traversal's engine rows from the same source and index revision.
@@ -609,7 +974,13 @@ impl ReadService {
         } else {
             None
         };
-        Ok(local_view_input(index, metadata, None, traversal, ready))
+        Ok(local_view_input(
+            index,
+            metadata,
+            Arc::default(),
+            traversal,
+            ready,
+        ))
     }
 
     fn local_view_material(
@@ -660,7 +1031,13 @@ impl ReadService {
         } else {
             None
         };
-        Ok(local_view_input(index, metadata, history, None, ready))
+        Ok(local_view_input(
+            index,
+            metadata,
+            Arc::new(history::CapturedHistories::single(history)),
+            None,
+            ready,
+        ))
     }
 }
 
@@ -679,6 +1056,9 @@ impl LocalSymbolMaterial {
         offset: usize,
     ) -> Result<(GetSymbolResult, Option<usize>), RiftError> {
         let identity = SymbolIdentity::parse(request.id.as_str())?;
+        if identity.owner() != self.index.owner() {
+            return self.package_symbol(request, view, offset);
+        }
         let key = rift_core::SymbolId::new(request.id.as_str())?;
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
@@ -696,8 +1076,11 @@ impl LocalSymbolMaterial {
                 None,
             ));
         }
-        let Some(readable) = self.index.object_by_identity(&key)? else {
-            if !self.index.identity_coverage_complete(identity.language()) {
+        let Some(readable) = self.selected_object(&key)? else {
+            if !self
+                .indices()
+                .all(|index| index.identity_coverage_complete(identity.language()))
+            {
                 return Ok((
                     unavailable(
                         request,
@@ -842,16 +1225,41 @@ impl LocalSymbolMaterial {
         key: &rift_core::SymbolId,
         offset: usize,
     ) -> Result<(Vec<rift_protocol::symbol_read::SymbolDeclaration>, usize), RiftError> {
-        let limit = super::accepted_limit(request.declaration_limit)?.min(self.index.results_max());
-        let (mut declarations, total) = self
-            .index
-            .declarations_by_identity_page(key, offset, limit)?;
-        if request.include.contains(&GetSymbolInclude::Source) {
-            let (bindings, _) = self.index.symbols_by_identity_page(key, offset, limit)?;
-            for (declaration, matched) in declarations.iter_mut().zip(bindings) {
-                declaration.node = Some(super::node_id(matched.file, matched.symbol.range));
-                declaration.source = Some(super::excerpt(matched.file, matched.symbol.range));
-                declaration.source_complete = true;
+        let limit = super::accepted_declaration_limit(request.declaration_limit)?
+            .min(self.index.results_max());
+        let mut declarations = Vec::new();
+        let mut total = 0usize;
+        for (owner, index) in self.indices().enumerate() {
+            for binding in index.canonical_declarations(key) {
+                let (path, position, matched, declaration) = binding?;
+                let mut duplicate = false;
+                for previous in self.indices().take(owner) {
+                    if let Some(held) = previous.canonical_declaration(key, path, position) {
+                        if held != declaration {
+                            return Err(invalid("view", "captured declaration bindings disagree"));
+                        }
+                        duplicate = true;
+                    }
+                }
+                if duplicate {
+                    continue;
+                }
+                if total >= offset && declarations.len() < limit {
+                    let mut declaration = declaration.clone();
+                    if request.include.contains(&GetSymbolInclude::Source) {
+                        declaration.node = Some(super::node_id(matched.file, matched.symbol.range));
+                        declaration.source =
+                            Some(super::excerpt(matched.file, matched.symbol.range));
+                        declaration.source_complete = true;
+                    }
+                    declarations.push(declaration);
+                }
+                total = total.checked_add(1).ok_or_else(|| {
+                    invalid(
+                        "view",
+                        "captured declaration count exceeds the platform bound",
+                    )
+                })?;
             }
         }
         Ok((declarations, total))
@@ -864,8 +1272,8 @@ impl LocalSymbolMaterial {
         if !request.include.contains(&GetSymbolInclude::History) {
             return Ok(None);
         }
-        match &self.history {
-            Some((id, bytes)) if id == request.id.as_str() => serde_json::from_slice(bytes)
+        match self.history.get(request.id.as_str()) {
+            Some(bytes) => serde_json::from_slice(bytes)
                 .map(Some)
                 .map_err(|error| material_error("decode captured history", &error)),
             _ => Ok(None),
@@ -876,24 +1284,25 @@ impl LocalSymbolMaterial {
 fn local_view_input(
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Vec<u8>,
-    history: Option<(String, Arc<[u8]>)>,
+    history: Arc<history::CapturedHistories>,
     traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
     ready: bool,
 ) -> LocalSymbolViewInput {
     let material = Arc::new(LocalSymbolMaterial {
         index,
+        selected: Arc::from([]),
         metadata: Arc::from(metadata),
         history,
         traversal,
+        query_result: None,
+        package_facts: None,
+        provider_selection: None,
+        query_references: None,
     });
     let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
-        .saturating_add(4 * std::mem::size_of::<usize>())
+        .saturating_add(6 * std::mem::size_of::<usize>())
         .saturating_add(material.metadata.len())
-        .saturating_add(material.history.as_ref().map_or(0, |(id, bytes)| {
-            id.capacity()
-                .saturating_add(bytes.len())
-                .saturating_add(2 * std::mem::size_of::<usize>())
-        }))
+        .saturating_add(material.history.retained_bytes())
         .saturating_add(
             material
                 .traversal
@@ -909,10 +1318,17 @@ fn local_view_input(
         material,
         ready,
         retained_bytes,
+        expiry_limit: None,
     }
 }
 
+mod history;
 mod nodes;
+mod package;
+mod query;
+mod query_references;
+pub use query::{CapturedQueryView, QueryMaterial, QueryViewInput};
+mod selected;
 mod source;
 mod traversal;
 

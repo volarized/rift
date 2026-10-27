@@ -1,0 +1,1 @@
+CONSTRUCT { _:entry <urn:value> ?value } WHERE { VALUES ?value { 1 2 } }

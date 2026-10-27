@@ -118,6 +118,27 @@ macro_rules! heap_fields {
 }
 
 heap_fields!(crate::read::Digest, 0);
+heap_fields!(crate::relationship_read::RelationshipRecordId, 0);
+heap_fields!(
+    crate::relationship_read::RelationshipRecord,
+    id,
+    relationship
+);
+heap_fields!(
+    crate::query::QueryOccurrence,
+    target,
+    enclosing,
+    source,
+    facet
+);
+heap_fields!(
+    crate::relationship_read::RelationshipOccurrence,
+    id,
+    relationship,
+    occurrence
+);
+heap_fields!(crate::query::QuerySymbol, symbol, declarations => vector);
+heap_fields!(crate::query::QuerySource, unit, digest, text);
 heap_fields!(crate::read::ProjectPath, 0);
 heap_fields!(crate::documentation::DocumentationDigest, 0);
 heap_fields!(crate::documentation::NotebookCell, identity);
@@ -348,42 +369,8 @@ impl GetSize for Extensions {
     }
 
     fn get_heap_size_with_tracker<T: GetSizeTracker>(&self, tracker: T) -> (usize, T) {
-        let mut total =
-            btree_material_bytes::<ExtensionKey, crate::read::ExtensionValue>(self.0.len());
-        let mut tracker = tracker;
-        for (key, value) in &self.0 {
-            let (bytes, next) = key.get_heap_size_with_tracker(tracker);
-            tracker = next;
-            total = total
-                .saturating_add(bytes)
-                .saturating_add(json_heap(&value.data));
-        }
-        (total, tracker)
+        (self.retained_heap_size(), tracker)
     }
-}
-
-fn json_heap(value: &serde_json::Value) -> usize {
-    let mut values = vec![value];
-    let mut total = 0usize;
-    while let Some(value) = values.pop() {
-        match value {
-            serde_json::Value::String(text) => total = total.saturating_add(text.capacity()),
-            serde_json::Value::Array(array) => {
-                total = total.saturating_add(
-                    array
-                        .capacity()
-                        .saturating_mul(std::mem::size_of::<serde_json::Value>()),
-                );
-                values.extend(array);
-            }
-            // Map does not expose its private backing allocation's capacity. Admission
-            // refuses this unmeasured value until its owning construction supplies a bound.
-            serde_json::Value::Object(_) => return usize::MAX,
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
-            }
-        }
-    }
-    total
 }
 
 /// Counts an owned value without overflowing an unmeasured heap refusal.
@@ -541,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_relationship_material_counts_capacity_and_refuses_unmeasured_facts() {
+    fn retained_relationship_material_counts_capacity_and_owned_extensions() {
         let mut kind = String::with_capacity(256);
         kind.push_str("calls");
         let mut facets = Vec::with_capacity(32);
@@ -573,20 +560,19 @@ mod tests {
             .0;
         assert!(measured >= std::mem::size_of_val(&hop) + minimum);
         assert_ne!(measured, usize::MAX);
-        let mut unmeasured = hop;
-        unmeasured.relationship.extensions = Extensions(std::collections::BTreeMap::from([(
+        let mut extended = hop;
+        extended.relationship.extensions = Extensions::from(std::collections::BTreeMap::from([(
             ExtensionKey("example.org.fact".to_owned()),
             crate::read::ExtensionValue {
                 version: 1,
                 data: serde_json::json!({"held": true}),
             },
         )]));
-        assert_eq!(unmeasured.get_size(), usize::MAX);
-        let values = vec![unmeasured];
-        assert_eq!(
-            retained_vector_material(&values, get_size2::StandardTracker::new()).0,
-            usize::MAX
-        );
+        assert!(extended.get_size() > measured);
+        assert_ne!(extended.get_size(), usize::MAX);
+        let values = vec![extended];
+        let bytes = retained_vector_material(&values, get_size2::StandardTracker::new()).0;
+        assert!(bytes >= values[0].get_size() && bytes < usize::MAX);
     }
 
     #[test]
@@ -665,8 +651,8 @@ mod tests {
     }
 
     #[test]
-    fn unmeasured_extensions_refuse_nested_material_without_overflow() {
-        let extensions = Extensions(std::collections::BTreeMap::from([(
+    fn owned_extensions_admit_nested_rust_signature_material() {
+        let extensions = Extensions::from(std::collections::BTreeMap::from([(
             ExtensionKey("example.org.fact".to_owned()),
             crate::read::ExtensionValue {
                 version: 1,
@@ -696,58 +682,43 @@ mod tests {
             effects: Vec::new(),
             extensions: Extensions::default(),
         };
-        assert_eq!(extensions.get_size(), usize::MAX);
-        assert_eq!(signature.get_size(), usize::MAX);
+        assert!(extensions.get_heap_size() > 0 && extensions.get_size() < usize::MAX);
+        assert!(signature.get_heap_size() >= extensions.get_heap_size());
+        assert!(signature.get_size() < usize::MAX);
         let values = vec![signature.clone(), signature.clone()];
-        assert_eq!(
-            retained_vector_material(&values, get_size2::StandardTracker::new()).0,
-            usize::MAX
-        );
+        let bytes = retained_vector_material(&values, get_size2::StandardTracker::new()).0;
+        assert!(bytes >= 2 * signature.get_heap_size() && bytes < usize::MAX);
         let slice: std::sync::Arc<[Signature]> = std::sync::Arc::from(values);
-        assert_eq!(
-            retained_arc_slice_material(&slice, get_size2::StandardTracker::new()).0,
-            usize::MAX
-        );
+        let bytes = retained_arc_slice_material(&slice, get_size2::StandardTracker::new()).0;
+        assert!(bytes >= 2 * signature.get_heap_size() && bytes < usize::MAX);
         let boxed = vec![signature.clone()].into_boxed_slice();
-        assert_eq!(
-            retained_sequence_material(
-                boxed.iter(),
-                std::mem::size_of_val(boxed.as_ref()),
-                get_size2::StandardTracker::new(),
-                GetSize::get_heap_size_with_tracker,
-            )
-            .0,
-            usize::MAX
-        );
+        let bytes = retained_sequence_material(
+            boxed.iter(),
+            std::mem::size_of_val(boxed.as_ref()),
+            get_size2::StandardTracker::new(),
+            GetSize::get_heap_size_with_tracker,
+        )
+        .0;
+        assert!(bytes >= signature.get_heap_size() && bytes < usize::MAX);
+        let signature_bytes = signature.get_heap_size();
         let shared = std::sync::Arc::new(signature);
         let values = std::collections::BTreeMap::from([
             ("first".to_owned(), std::sync::Arc::clone(&shared)),
             ("second".to_owned(), shared),
         ]);
-        assert_eq!(
-            retained_map_material(
-                &values,
-                get_size2::StandardTracker::new(),
-                |value, tracker| {
-                    retained_arc_material(value, tracker, GetSize::get_heap_size_with_tracker)
-                }
-            )
-            .0,
-            usize::MAX
-        );
+        let bytes = retained_map_material(
+            &values,
+            get_size2::StandardTracker::new(),
+            |value, tracker| {
+                retained_arc_material(value, tracker, GetSize::get_heap_size_with_tracker)
+            },
+        )
+        .0;
+        assert!(bytes >= signature_bytes && bytes < usize::MAX);
     }
 
     #[test]
-    fn json_material_refuses_hidden_object_capacity() {
-        assert_eq!(json_heap(&serde_json::json!({"value": "held"})), usize::MAX);
-        assert_eq!(
-            json_heap(&serde_json::Value::String(String::with_capacity(128))),
-            128
-        );
-    }
-
-    #[test]
-    fn retained_type_vectors_refuse_nested_unmeasured_values_without_overflow() {
+    fn retained_type_vectors_count_owned_nested_extensions() {
         let binding = TypeBinding {
             role: crate::read::TypeBindingRole::Return,
             origin: crate::read::TypeBindingOrigin::Declared,
@@ -758,7 +729,7 @@ mod tests {
                 },
                 source: "Result".to_owned(),
                 resolved: None,
-                extensions: Extensions(std::collections::BTreeMap::from([(
+                extensions: Extensions::from(std::collections::BTreeMap::from([(
                     ExtensionKey("example.org.fact".to_owned()),
                     crate::read::ExtensionValue {
                         version: 1,
@@ -767,7 +738,8 @@ mod tests {
                 )])),
             },
         };
-        assert_eq!(binding.get_size(), usize::MAX);
+        let binding_bytes = binding.get_heap_size();
+        assert!(binding_bytes > 0 && binding.get_size() < usize::MAX);
         let nested = vec![vec![binding.clone()], vec![binding]];
         let (bytes, _) = retained_sequence_material(
             &nested,
@@ -777,6 +749,6 @@ mod tests {
             get_size2::StandardTracker::new(),
             retained_vector_material,
         );
-        assert_eq!(bytes, usize::MAX);
+        assert!(bytes >= 2 * binding_bytes && bytes < usize::MAX);
     }
 }

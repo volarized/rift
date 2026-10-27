@@ -60,7 +60,7 @@ fn rust_module_path_facts_restore_exact_source_and_keep_old_facts_unknown() {
     ));
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
         .expect("exact module path facts");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
 
     let mut old = captured.clone();
     old.symbols[0].module_path = None;
@@ -96,7 +96,7 @@ fn python_overload_import_and_decorator_ranges_restore_without_inventing_old_fac
     ));
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
         .expect("exact original import and decorator");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
     let mut old = captured.clone();
     old.symbols[0].python_overload = None;
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), old)
@@ -256,7 +256,7 @@ fn complete_facts_restore_for_every_shipped_language() {
         let restored =
             SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(document.facts()))
                 .expect("complete restored facts");
-        assert_eq!(&restored, document.facts(), "{shipped:?}");
+        assert_restored_semantic_facts(&restored, document.facts());
         let names = SyntaxNames::new(document.language()).expect("shipped names");
         for symbol in restored.symbols() {
             let resolved_kind = {
@@ -283,7 +283,7 @@ fn duplicate_suffixes_parser_errors_and_omissions_are_preserved() {
         let restored =
             SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts(document.facts()))
                 .expect("normalized facts");
-        assert_eq!(&restored, document.facts());
+        assert_restored_semantic_facts(&restored, document.facts());
     }
     let text = format!(
         "pub fn {}() {{}}\n",
@@ -293,7 +293,7 @@ fn duplicate_suffixes_parser_errors_and_omissions_are_preserved() {
     assert!(document.left_out_declaration_count() > 0);
     let restored = SyntaxFacts::from_parts(&text, SyntaxLimits::default(), parts(document.facts()))
         .expect("omissions");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
 }
 
 #[test]
@@ -894,7 +894,7 @@ fn full_omitted_names_restore_with_source_ranges_and_parent_validation() {
         );
         let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(original))
             .expect("full omitted facts restore");
-        assert_eq!(&restored, original);
+        assert_restored_semantic_facts(&restored, original);
         let mut invalid = parts(original);
         invalid.left_out_declarations = 0;
         assert_eq!(
@@ -941,7 +941,7 @@ fn retained_namespace_export_bindings_resolve_original_container_facts() {
     );
     let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(original))
         .expect("retained container and export bindings restore together");
-    assert_eq!(&restored, original);
+    assert_restored_semantic_facts(&restored, original);
     let mut invalid = parts(original);
     invalid.export_bindings.as_mut().expect("recorded exports")[0].container =
         Some("absent".to_owned());
@@ -976,7 +976,7 @@ fn retained_source_whitespace_roundtrips_without_portable_identity() {
         ));
         let restored = SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(facts))
             .expect("original retained selectors and child containers restore");
-        assert_eq!(&restored, facts);
+        assert_restored_semantic_facts(&restored, facts);
         assert!(
             restored
                 .symbols()
@@ -1030,7 +1030,7 @@ fn rust_macro_invocations_keep_original_top_level_ranges_and_unknown_state() {
     );
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
         .expect("captured macro ranges restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
     assert!(
         restored
             .symbols()
@@ -1085,7 +1085,7 @@ fn rust_macro_invocations_keep_original_top_level_ranges_and_unknown_state() {
         let restored =
             SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
                 .expect("captured module attributes restore");
-        assert_eq!(&restored, document.facts());
+        assert_restored_semantic_facts(&restored, document.facts());
     }
 }
 
@@ -1157,7 +1157,7 @@ fn rust_macro_direct_tokens_keep_original_ranges_unknown_empty_and_charge() {
     assert_eq!(invocations[1].2.as_deref(), Some([].as_slice()));
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
         .expect("original complete ranges restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
     let mut unknown = captured;
     let rows = unknown.macro_invocations.as_mut().expect("captured rows");
     let owned = rows[0].2.take().expect("owned direct ranges");
@@ -1251,10 +1251,10 @@ fn rust_macro_direct_tokens_distinguish_literals_comments_and_invalid_groups() {
                 .is_some(),
             "complete original body: {body}"
         );
-        assert_eq!(
-            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured)
+        assert_restored_semantic_facts(
+            &SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured)
                 .expect("original literal ranges restore"),
-            *document.facts()
+            document.facts(),
         );
     }
     let document = parsed(
@@ -1296,7 +1296,7 @@ fn rust_scope_preserves_original_root_and_module_children() {
     let restored =
         SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
             .expect("complete original scopes restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
 }
 
 #[test]
@@ -1599,7 +1599,7 @@ fn rust_root_expression_macro_invocations_keep_original_parent_and_restore_charg
     }
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured.clone())
         .expect("original root forms restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
     let mut unknown = captured.clone();
     let charge = get_size2::GetSize::get_heap_size(&unknown.macro_invocations);
     unknown.macro_invocations = None;
@@ -1649,10 +1649,10 @@ fn rust_macro_doc_comments_keep_original_line_endings_and_refuse_hidden_code() {
                 ..usize::try_from(range.end).expect("end")],
             format!("/// original comment{ending}")
         );
-        assert_eq!(
-            SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured.clone())
+        assert_restored_semantic_facts(
+            &SyntaxFacts::from_parts(&source, SyntaxLimits::default(), captured.clone())
                 .expect("exact comment restores"),
-            *document.facts()
+            document.facts(),
         );
         let children = captured
             .macro_invocations
@@ -1697,7 +1697,7 @@ fn documentation_cfg_module_paths_restore_original_source_and_unknown_effects() 
         let restored =
             SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
                 .expect("original documentation attachment facts");
-        assert_eq!(&restored, document.facts());
+        assert_restored_semantic_facts(&restored, document.facts());
         assert_eq!(
             restored.symbols()[0].item_range,
             document.symbols()[0].item_range
@@ -1725,7 +1725,7 @@ fn rust_macro_multiline_lifetimes_keep_original_direct_children() {
         == "a"));
     let restored = SyntaxFacts::from_parts(source, SyntaxLimits::default(), captured)
         .expect("original lifetime ranges restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
 }
 
 #[test]
@@ -1836,7 +1836,7 @@ fn literal_macro_functions_keep_original_header_body_and_restore() {
     let restored =
         SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
             .expect("original function facts restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
 }
 
 #[test]
@@ -1889,7 +1889,7 @@ fn literal_macro_functions_exclude_nested_body_functions_and_keep_duplicate_name
     let restored =
         SyntaxFacts::from_parts(source, SyntaxLimits::default(), parts(document.facts()))
             .expect("normalization and original duplicate ranges restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
 }
 
 #[test]
@@ -1923,7 +1923,7 @@ fn literal_macro_functions_keep_name_bounds_and_reject_corrupt_body_ranges() {
     let restored =
         SyntaxFacts::from_parts(&source, SyntaxLimits::default(), parts(document.facts()))
             .expect("provider-bound original facts restore");
-    assert_eq!(&restored, document.facts());
+    assert_restored_semantic_facts(&restored, document.facts());
     assert!(
         document
             .facts()
@@ -2030,4 +2030,28 @@ fn literal_function_headers_refuse_bounds_malformed_and_truncated_tokens() {
             "{source}"
         );
     }
+}
+
+fn assert_restored_semantic_facts(
+    restored: &rift_syntax::SyntaxFacts,
+    original: &rift_syntax::SyntaxFacts,
+) {
+    assert_eq!(restored.origin(), original.origin());
+    assert_eq!(restored.language(), original.language());
+    assert_eq!(restored.symbols(), original.symbols());
+    assert_eq!(restored.left_out_symbols(), original.left_out_symbols());
+    assert_eq!(restored.export_bindings(), original.export_bindings());
+    assert_eq!(restored.macro_invocations(), original.macro_invocations());
+    assert_eq!(restored.scope(), original.scope());
+    assert_eq!(restored.has_errors(), original.has_errors());
+    assert_eq!(
+        restored.left_out_declaration_count(),
+        original.left_out_declaration_count()
+    );
+    assert_eq!(restored.markdown_facts(), original.markdown_facts());
+    assert_eq!(restored.source_digest(), original.source_digest());
+    assert_eq!(restored.syntax_limits(), original.syntax_limits());
+    assert!(original.nodes().is_some());
+    assert!(restored.nodes().is_none());
+    assert_ne!(restored, original);
 }

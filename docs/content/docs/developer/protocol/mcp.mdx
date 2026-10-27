@@ -79,634 +79,221 @@ A read of `rift://map` returns one `application/json` content under either
 
 <McpTool name="search" />
 
-`search` takes a lexical `query` or a regex [`pattern`](#search-pattern), narrowed or extended by
-a `paths` selector. `paths.include` and `paths.exclude` glob the project-relative path - the same
-glob engine backs the workspace's [`[source]`](/docs/developer/configuration#source) policy -
-narrowing the indexed candidates before scoring.
-
-`paths.force_include` reaches past both: a file `[source]` or `.gitignore` excluded from the
-index is parsed on demand and searched alongside the indexed hits, up to 256 matched files per
-request - the bound counts the files the request reaches outside the index, so a glob whose
-matches the index already holds adds none. A request whose `paths.force_include` matches more
-than that refuses with `limit_exceeded` rather than searching a silently truncated set; the
-`limit` evidence names `paths.force_include`, the bound, and the match count.
-
-The top-level `include` field is a separate selector: it requests extra payload per hit instead
-of narrowing which files are searched. `source` attaches the excerpt around the hit; `score`
-attaches the fused ranking value used to order the page, comparable only within this one answer.
-
-This request narrows the search to the tests tree, then reaches one file the workspace's
-`[source]` policy excludes from the index:
+`search` accepts `query: string` and optional `language: "sparql"`. `language` defaults to
+`sparql`; unknown languages and former top-level selectors fail request validation. The
+query uses the library's SPARQL parser, algebra, and evaluator over immutable selected facts.
 
 ```json
-{
-  "query": "test_fit",
-  "paths": {
-    "include": ["tests/**"],
-    "force_include": ["tests/legacy/test_solver.py"]
-  }
-}
+{ "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } ORDER BY ?name LIMIT 20", "language": "sparql" }
 ```
+
+### Vocabulary and terms
+
+The default empty prefix is `urn:rift:vocabulary:`. The `r:` prefix names the same vocabulary;
+`rdf:`, `rdfs:`, and `xsd:` name their standard namespaces. Explicit prefix declarations are
+supported. The vocabulary follows existing fact fields, including `:name`, `:kind`,
+`:language`, `:declarations`, `:source`, `:unit`, `:range`, `:start`, and `:end`.
+
+Symbols with established identities use canonical `SymbolId` IRIs. Source units retain their
+`SourceUnitId` IRIs. A physical occurrence or nested record uses a blank node, whose identity
+is retained across pages of its execution. A symbol without an established canonical identity
+also remains a blank node. Evaluation does not fabricate a canonical identity from its name.
+
+Available nested records preserve existing fields, ordered array entries through `:index` and
+`:value`, defaults, and opaque extensions as `rdf:JSON`. A bare `:name` query can match nested
+records such as parameters. Use `a :Symbol` when the question requires symbols alone.
+
+### Query forms
+
+- `SELECT` returns `answer.result: "bindings"`, ordered `variables`, and `bindings` rows.
+- `ASK` returns `answer.result: "boolean"` and `value`.
+- `CONSTRUCT` and `DESCRIBE` return `answer.result: "graph"` and `triples`.
+
+Each binding or triple term carries its kind: `iri`, `blank_node`, `literal` with `datatype`, or
+`language_literal` with `language`. Unbound variables are omitted from the row. Duplicate
+bindings and projected variable order follow SPARQL. Graph answers use RDF set semantics.
+
+`DESCRIBE` uses the library's description behavior over all authoritative captured and published records in its selected dataset. It does not implicitly request every language-engine facet. Facts explicitly required by its `WHERE` pattern retain the same strict acquisition and missing-facts rules as other query forms; bounds still refuse incomplete admission.
 
 ### Full-text search [#search-fulltext]
 
-`query` matches declaration names, qualified names, signatures, and attached documentation,
-and the contents of every indexed file, through a full-text index, and the identifiers it
-carries against the indexed names. A multi-word query is answered first by the documents
-carrying every term; only when that leaves the answer short do documents carrying some of
-them join, behind every exact one. Double quotes keep a phrase together in both passes.
+The local `SERVICE :search` reuses identifier, lexical, and available vector ranking. Its
+constant input triples select the producer request, while its graph pattern projects and
+filters the acquired records:
 
-An identifier written inside a question reaches its declaration without being quoted:
-`where does encode_path get its escape set` ranks `encode_path` through the identifier
-matching, while the prose around it ranks through the full-text index.
-
-The index ranks at most 1,000 units for one request. When more units match, the answer
-carries a `lexical_ranking_truncated` warning naming that bound, and hits past it never reach
-a page: `paths` selects among the ranked units, so only a narrower `query` brings the rest
-inside the bound.
-
-The read has its own bound of 1,000, applied to the candidates it ranks and again to the hits
-it orders and pages: a read that reached it warns `results_truncated`.
-
-A symbol whose only match sits in its documentation, not in its name, still returns as a
-`symbol` hit. `matched_by` names every field that carried a term, so this one is tagged
-`["documentation"]`. A hit tagged `["ranked"]` is one the vector ranking placed, where no
-indexed field carries the query's literal bytes at all.
-
-**Request:**
-
-```json
-{ "query": "loads workspace configuration", "target": "symbol" }
-```
-
-<ReadExample name="documentation-search" />
-
-The index holds a file's text once, in the file's own rows, and a declaration's row carries its
-names, signature, and documentation alone. A term only a declaration's body holds therefore
-ranks the file.
-
-The server reads the first 20 file rows of the ranked list, finds the declarations holding the
-query's terms in them, and answers those declarations in place of the first of those rows, best
-first. Each is tagged `matched_by: ["content"]`, and a declaration its own row placed ahead of
-that file row keeps its place and its tags.
-
-Every visible bounded UTF-8 file without a NUL byte joins the same index when its effective
-language entry or [`[search.text].include`](/docs/developer/configuration#search) selects it. A hit on one
-of those files returns as a `file` hit, tagged `matched_by: ["content"]` the same way:
-
-**Request:**
-
-```json
-{ "query": "install checksum", "target": "file" }
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`search` result holding this hit, compact text:**
-
-```text
-1 result
-	README.md:35 · content
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "file",
-    "size": 3546
-  },
-  "matched_by": ["content"],
-  "range": { "start": 820, "end": 920 },
-  "line": 35,
-  "path": "README.md"
+```sparql
+SELECT ?symbol ?name ?source ?score {
+  SERVICE :search {
+    ?hit :query "loads workspace configuration"; :target "symbol";
+         :symbol ?symbol; :source ?source; :score ?score .
+    ?symbol :name ?name
+  }
 }
+ORDER BY DESC(?score)
+LIMIT 5
 ```
 
-</Tab>
+`:query`, `:pattern`, `:scope`, `:target`, `:order`, `:rev`, `:paths`, `:packages`, `:include`,
+`:change`, and `:view` retain their producer meanings inside the service. Structured inputs
+use `rdf:JSON` literals. Conflicting constant inputs refuse. Requesting `:source` and `:score`
+projects the corresponding producer payload. Service input triples select records rather than
+require those input values as stored facts on every result.
 
-</ExampleTabs>
-
-A path carrying no extension - `justfile`, `Dockerfile` - is selected by the same patterns and
-returns the same way, because the selection reads the whole project-relative path. A file hit
-carries `languages` only where a syntax provider claims the path; the full-text index also
-reaches a file no provider claims, as this one does.
-
-The hit above carries no `source`: a request pays that lookup only when `include` names it.
-`include: ["source"]` attaches the excerpt as `source` on every hit; an omitted `include` returns
-the hit's symbol or file, `path`, `range`, and `line` alone, as both hits above do.
-
-A hit's `score` follows the same rule: absent unless `include` names it. `include: ["score"]`
-attaches the fused ranking value that ordered the page, comparable only within this one
-answer.
+Producer transport pages are acquired before evaluating the SPARQL result. Outer `LIMIT` and
+`OFFSET` select query rows; a service batch size cannot silently narrow the domain of a count,
+join, negation, or filter. Existing ranking and result bounds still apply. A required producer
+warning indicating missing or truncated coverage makes the complete query unavailable.
 
 ### Pattern [#search-pattern]
 
-`pattern` answers every match of a regular expression in the text of the indexed files, in place
-of `query`. The syntax is the Rust [`regex`](https://docs.rs/regex) crate's, the dialect ripgrep
-reads, so a pattern written for `rg` or Claude Code's `Grep` carries over unchanged. Matching
-runs line by line, as ripgrep's does:
+`:pattern` in `SERVICE :search` uses the existing Rust regex matcher and trigram candidate
+index. It preserves every file match, including several matches in one declaration:
 
-- `^` and `$` match at line boundaries
-- a `\r` before a line feed belongs to its line
-- no class matches a line feed, so only a literal `\n` crosses a line
-- `(?i)` makes the match case-insensitive; the request carries no case field
+```sparql
+SELECT ?path ?start ?end ?source {
+  SERVICE :search {
+    ?hit :pattern "tokio::[A-Za-z_]+"; :target "file";
+         :path ?path; :start ?start; :end ?end; :source ?source
+  }
+}
+ORDER BY ?path ?start
+```
 
-The server selects the files to read through a trigram index over the stored text, then verifies
-each one with the pattern, so the answer equals a scan of every indexed file. A pattern whose
-literals hold no run of three characters, such as `[0-9a-f]{40}`, verifies every file `paths`
-selects.
+Matching runs line by line. `(?i)` selects case-insensitive matching. Existing pattern length,
+compiled size, candidate rows, verified text size, and matches-per-file bounds remain in
+effect. Invalid patterns refuse with the registered field error. Incomplete pattern coverage
+cannot be evaluated as a complete graph, boolean, aggregate, or binding result.
 
-The server fills the trigram index in the background after each write to the stored text, and no
-search waits for it. Until the index catches up, the server verifies the rows it lacks beside the
-rows it selects, while both fit the `pattern_candidate_rows` and `pattern_verified_size` bounds
-below. Past either, the answer covers the rows the index holds and carries a
-`pattern_index_preparing` warning.
+### References and calls [#search-traversal]
 
-With `target: "file"`, every match is one hit: `range` holds the match's bytes, `line` its line,
-and `source`, when `include` names it, the matched line. With `target: "symbol"`, every
-declaration holding a match is one hit at its first match, and `range` holds the declaration's
-bytes; `all` answers both. Each hit is tagged `matched_by: ["content"]` and carries no score, so
-`relevance` orders the hits by path, then offset, while `path` and `identity` order as they do in
-every other search answer.
+Graph predicates replace the former `traversal` selector:
 
-**Request:**
-
-```json
-{
-  "pattern": "tokio::\\w+",
-  "paths": { "include": ["src/**"] },
-  "target": "file",
-  "include": ["source"]
+```sparql
+SELECT ?usage ?unit ?start ?end {
+  <symbol-id> :usages ?usage .
+  ?usage :unit ?unit; :start ?start; :end ?end
 }
 ```
 
-<ExampleTabs items={["text", "json"]}>
+`:usages` exposes raw physical occurrences. Each occurrence retains target, enclosing symbol
+when established, source unit, byte range, and supplied facets. Repeated locations in one
+caller, recursive uses, and file-level uses remain distinct. The same physical occurrence
+supplied under two facets has one occurrence identity with both facets.
 
-<Tab value="text">
+Symbol adjacency remains separate:
 
-**Response, compact text:**
-
-```text
-2 results
-	[1] src/main.rs:9 · content
-		#[tokio::main]
-	[2] src/main.rs:11 · content
-		    let config = tokio::task::spawn_blocking(|| {
+```sparql
+SELECT ?caller { ?caller :references <symbol-id> }
+SELECT ?callee { <symbol-id> :calls/:calls/:calls ?callee }
+SELECT ?caller { <symbol-id> ^:references+ ?caller }
 ```
 
-</Tab>
-
-<Tab value="json">
-
-**Response, JSON:**
-
-```json
-{
-  "results": [
-    {
-      "hit": { "target": "file", "size": 344, "languages": ["rust"] },
-      "matched_by": ["content"],
-      "source": "#[tokio::main]",
-      "range": { "start": 98, "end": 109 },
-      "line": 9,
-      "path": "src/main.rs"
-    },
-    {
-      "hit": { "target": "file", "size": 344, "languages": ["rust"] },
-      "matched_by": ["content"],
-      "source": "    let config = tokio::task::spawn_blocking(|| {",
-      "range": { "start": 173, "end": 184 },
-      "line": 11,
-      "path": "src/main.rs"
-    }
-  ],
-  "pagination": { "page_index": 0, "total_pages": 1 }
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-A `pattern` search is bounded at every step it takes. The pattern holds at most 1,024
-characters, the schema's `maxLength`, and the
-[`[search]`](/docs/developer/configuration#search) keys bound the rest:
-
-- `pattern_compiled_size` - the bytes the pattern's matcher compiles to
-- `pattern_candidate_rows` - the trigram index rows one search reads to select its files
-- `pattern_verified_size` - the file text one search verifies
-- `pattern_matches_per_file` - the matches one file contributes
-
-A search past the length or one of the first three keys refuses `invalid_request` naming the
-field `pattern` and the key, as in
-`` more than 10000 candidate rows, the [search] pattern_candidate_rows bound; narrow `pattern` or `paths` ``.
-
-A file past `pattern_matches_per_file` is cut there, and the answer carries a
-`pattern_matches_truncated` warning naming it, while every other file answers in full.
-`results_truncated` still reports the result bound alone.
-
-The server refuses `pattern` beside `query`, `traversal`, `change`, or `rev` with
-`invalid_request`: the trigram index holds the current tree alone, and the other fields select
-another result set or tree. A `scope` past `local` reaches the package files through the global
-index, as [package scope](#search-scope) describes. `target: "documentation"` refuses
-`capability_unavailable`, since a documentation block carries no file text.
-
-### Traversal [#search-traversal]
-
-`traversal` walks the references or calls a configured
-[language engine](/docs/developer/configuration#languages-and-lsp) resolves: a bounded search
-from one `seed`, following `direction` and narrowed to `facets`, up to `depth` hops. `seed` and
-the optional `to` are declaration [`SymbolId`](/docs/developer/protocol/reference)
-values, the same identity a `get_symbol` or `search` hit already carries.
-
-`traversal` stands alone as a pure graph walk or rides beside `query`; a symbol both lanes
-reach keeps its lexical `score` and gains the walk's `traversal_path`, and its `matched_by`
-carries both entries.
-
-`direction` names the edges the walk follows from each visited symbol:
-
-- `incoming`, the default - the engine answers which declarations reference the symbol, and each
-  hop carries the `references` facet.
-- `outgoing` -
-  the engine's call hierarchy answers which declarations the symbol calls, and each hop carries the
-  `calls` facet.
-
-These shapes cover most questions:
-
-- **Impact** - `seed` alone, `depth` at its default: what would change if this symbol did.
-- **Callees** - `direction: "outgoing"`: what this symbol relies on, and at `depth: 2` what
-  those declarations rely on in turn. A callee in an installed package or a standard library is
-  a hit carrying the global index's identity for it, and the walk stops there.
-- **Path** - `to` set: whether, and by which shortest route, the walk reaches one named symbol.
-
-Each reached symbol becomes a hit tagged `matched_by: ["relationship"]`, carrying `distance` -
-the path length - and `traversal_path`, the [`GraphHop`](/docs/developer/protocol/reference) list
-from `seed` to the hit. Every `GraphHop` carries the
-[`Relationship`](/docs/developer/protocol/reference) it followed and the direction it
-followed it in; `seed` itself is never a hit.
-
-The example project uses the canonical identity returned by search. Without a language engine
-that serves this seed, both directions refuse explicitly:
-
-<ReadExample name="incoming-traversal" />
-
-<ReadExample name="outgoing-traversal" />
-
-With a configured engine, each caller's `traversal_path` carries a relationship from that caller
-to the seed, with `facets: ["references"]` and `derivation: "resolution"`, followed in the
-`incoming` direction. An outgoing hop carries `facets: ["calls"]` and follows the relationship
-from the seed to its callee. A callee in an installed package or runtime can carry the global
-index's exact identity. Its physical `unit` names its defining source; a source-less builtin can
-have no declaration binding. The walk stops at a global object.
-
-`facets` narrows the walk to [`RelationshipFacet`](/docs/developer/protocol/reference)
-values; an empty or omitted list follows every facet a lane populates, which is `references` on
-an incoming walk and `calls` on an outgoing one. `target: "file"` never carries a walked hit,
-since a traversal only reaches symbols.
-
-A `traversal` names the declaration its walk starts at, so a request carrying no `seed`
-refuses `invalid_request` naming the field.
-
-A walk whose seed no engine answers for refuses `capability_unavailable` naming
-`relationship traversal (no language engine serves the seed)`: nothing this workspace holds
-resolves a reference to that declaration, and a resend changes nothing. A `facets` list naming
-no facet a lane populates draws the same refusal, such as `references` alone on an outgoing walk.
-An engine session serves the current tree, so `traversal` combines with neither `rev` nor
-`change`, and refuses `capability_unavailable` for each, whatever its `direction`.
-
-An outgoing walk from a seed the ready engine prepares no call hierarchy item at refuses
-`capability_unavailable` naming the seed's kind, such as a `struct` under rust-analyzer. The
-engine answers that only once it reads ready, so a resend changes nothing.
-
-A `seed` that resolves to no declaration refuses `resource_not_found`; one the engine answers
-for with no callers or callees returns an empty result set, since an isolated declaration is a
-legitimate answer.
-
-A walk the server stops at its node bound attaches a `traversal_truncated` entry to
-`warnings`, naming how many symbols it visited: hits reachable beyond the bound are missing,
-and a tighter `facets` list, a smaller `depth`, or a less-connected `seed` fits the walk under it.
-
-A walk asking for coverage no lane populates attaches a `relationship_coverage_missing` entry
-to `warnings`. Its `facets` names the requested facets no lane populates, such as `implements`
-beside the `references` the engine lane resolves. An empty answer carrying it means the walk
-could not run; an empty answer without it means the walk ran and the seed has no neighbor
-under the request.
-
-An outgoing walk attaches a `callees_dropped` entry to `warnings` when the engine names callees
-no declaration answers for: a file outside the project and every installed package, or a
-position where the global index holds no declaration. With `[global] enabled = false`, or when
-the global API does not answer, every callee in a package or a standard library drops, and the
-answer also carries the global warning naming why, such as `global_access_disabled`. The walk
-carries no edge to a dropped callee; `callees` counts the edges it dropped over every depth.
+The library evaluates property paths, unions, filters, subqueries, aggregates, and negation.
+Acquisition may restrict a proven anchored shape to its required frontier; otherwise it
+acquires the complete required domain. A valid generic query cannot be rejected solely for
+not matching an acquisition optimization. Requested depth counts edges rather than shortest
+paths. Cycles and duplicate intermediate bindings follow SPARQL semantics.
 
 ### Language-engine references [#search-engine-references]
 
-A current-tree symbol traversal consults the configured
-[language engine](/docs/developer/configuration#languages-and-lsp) when `facets` is empty or
-names the engine facet of its `direction`: `references` for `incoming`, `calls` for `outgoing`.
-The engine's answer is what the walk follows, under the same traversal depth and result bounds.
+Local required facts absent from the selected publication are acquired through the existing
+configured engine. References retain physical locations before mapping optional enclosing
+symbols. Call hierarchy retains all established edges and actual ranges. Acquisition and
+evaluation share cancellation and request bounds.
 
-The server maps each reference location, and each callee's name in a project file, to the
-smallest indexed declaration containing it. Locations outside the workspace or without an
-indexed declaration contribute no hit. When no engine is configured, or the engine lacks
-reference support, the walk refuses `capability_unavailable`. A configured engine that fails to
-start returns its failure through [`ErrorData`](/docs/developer/protocol/reference).
-
-A callee outside the project maps to the package whose files hold it, at an exact version:
-
-- an installed package the workspace's dependencies name, under its `node_modules` folder, its
-  Cargo registry folder, or its import folder in the Python environment, at the version the
-  lockfile pins
-- the Rust standard library below `rustc --print sysroot`, at the toolchain's version
-- a crate the Rust standard library vendors, such as `library/vendor/hashbrown-0.17.1/` below
-  the sysroot, as that Cargo package at the version the standard library's `Cargo.lock` pins
-- the TypeScript built-ins in the `lib.*.d.ts` files of the `typescript` package the engine
-  runs, at that package's version
-- Python's standard library, in the typeshed stubs the embedded engine ships, at the release the
-  global API resolves for the workspace's Python
-
-A package folder inside the workspace, such as `node_modules` or `.venv`, maps as its package.
-The server then asks the global API which declaration holds each such callee's position, in one
-request per walk, and the walk does not continue from a package callee.
-
-Each dependency hit carries its own immutable `view` for subsequent `get_symbol` and
-`get_source` reads. The caller **MUST** use that hit's view rather than the top-level search
-view, which retains the project graph and paging selection. Each hit's view expires no later
-than either the project or cloud selection. The proxy retains the originating project and
-global endpoint for those reads and refuses a changed context instead of selecting another
-publication.
-
-The server captures source and configuration before and after the engine request. If either
-changes, the server captures the current publication, refreshes the search ranking, and repeats
-the reference request, with at most three attempts. The publication wait, the search ranking,
-reference resolution, and these retries share one `[server] readiness_timeout` deadline, taken
-once where the request enters. Exhausted attempts or an expired deadline return
-`temporarily_unavailable` with `retry: "same_request"`.
-
-A stale publication uses indexed relationships and carries `stale_index`. Each engine request
-also uses the configured engine retry and restart bounds.
-
-A walk takes an engine's answer once the engine reads ready: the work it announced has ended and
-stayed quiet for its `settle_delay`. The walk waits for that until a tenth of the
-`[server] readiness_timeout` budget before the request's deadline, so the answer and its warning
-still fit in the budget.
-
-When that wait is spent, when the engine answers about bytes the served tree does not hold, or
-when it answers more than the node bound holds, the walk drops the engine's contribution and
-attaches an `engine_analysis_unavailable` entry to `warnings`, naming the seed's `language`. A
-spent wait keeps the engine's session, so the engine goes on loading and a later read carries its
-edges.
-
-An engine that announced no work since it started, or since the server last sent it changed
-files, gives no evidence that it settled. The walk takes its answer once the engine stayed quiet
-for its `settle_delay`, and attaches an `engine_readiness_unconfirmed` entry naming the engine's
-process key in `processes`.
+Dependency continuation uses admitted source ownership and exact selected context. Supported
+complete-empty facts establish an empty answer. Unsupported facets, an incomplete publication,
+missing source authority, or a bound reached before completeness returns explicit
+unavailability. Global query serving reads existing collected facts; it does not collect,
+ingest, or backfill global language-engine facts. Local request facts do not enter collection.
 
 ### Change [#search-change]
 
-`change` answers the declarations two sides hold differently. `base` names the committed revision
-compared from, spelled the way a [revision read](#revision-reads) spells `rev`, such as `main` or
-`HEAD~1`. `head` names the side
-compared to: a revision spelled the same way, or the working tree, spelled
-`{"kind": "working_tree"}`. An omitted `head` is `HEAD`.
+`:change` selects the existing revision-comparison producer inside `SERVICE :search`:
 
-The server lists the paths the two sides hold differently, reads and parses those paths alone on
-each side, and matches declarations within one path by the provider's qualified name and kind. A declaration both revisions hold whose bytes are equal produces no hit; one whose
-bytes differ is classified the way a [symbol timeline](#tool-get_symbol) classifies two adjacent
-revisions, into `signature_changed`, `body_changed`, or `decorators_changed`. A declaration only
-`head` holds is `introduced`, and one only `base` holds is `removed`.
-
-A deletion and an addition in two different paths whose declarations match one to one - same
-qualified name, same kind, same bytes - are one declaration that `moved`. Anything ambiguous
-stays an addition beside a removal: two same-named declarations removed against one added leave
-three hits, because no evidence says which removal the addition answers.
-
-Each hit is tagged `matched_by: ["change"]` and carries a
-[`SymbolChange`](/docs/developer/protocol/reference) as `change`, naming the `kind`
-above and the `base_path` and `head_path` the declaration lives at on each side. The hit's
-`symbol`, `path`, `range`, `line`, and `source` read the head revision:
-
-This fixture changes the body of `load_config` from `42` to `43` and removes `old_loader`.
-The comparison retains the changed declaration's head source and the removed declaration's
-base source, each under its canonical identity:
-
-<ReadExample name="change" />
-
-A removed declaration is the exception: the head revision no longer holds it, so its hit keeps
-its base-side identity, path, range, and source, and its `change` carries `base_path` alone.
-
-Against the working tree, the head side is the current publication, so staged and unstaged edits,
-files git does not track, and deleted files all take part, and the answer carries `stale_index`
-while that publication lags the filesystem, as any current-tree read does. The base side reads
-each changed file in the form the working tree holds it, so a checkout under
-`core.autocrlf=true` compares CRLF bytes on both sides. A changed path whose attributes name a
-`filter` driver, such as Git LFS, or a UTF-16 `working-tree-encoding` answers no declarations: the
-server runs no driver during a comparison, and the answer carries a `source_unavailable` warning
-naming the path and the driver or encoding.
-
-**Request:**
-
-```json
-{ "change": { "base": "HEAD", "head": { "kind": "working_tree" } }, "target": "symbol" }
-```
-
-A comparison ranks nothing, so no hit carries a `score` even when `include` names one. Ordering
-is deterministic for identical inputs: `relevance` has no score to rank by here and orders
-changed declarations by path, then by name, while `path` and `identity` order as they do in
-every other search answer. `paths` narrows which changed paths are compared, through the same
-glob engine every other selector uses. `target: "file"` never carries a change hit, since the
-comparison reaches declarations alone.
-
-A comparison the server stops at its changed-path bound attaches a `change_truncated` entry to
-`warnings` naming that bound: declarations in the changed paths past it are absent from the
-answer, and `paths` narrows a further comparison onto them. The result set keeps its own bound
-and its `results_truncated` warning. A changed file either revision cannot read - bytes past the
-per-file byte bound, bytes that are not UTF-8, or a syntax tree the provider refuses -
-contributes no declaration, and the changed paths beside it still answer.
-
-The server refuses `change` beside `rev` with `invalid_request`, since `change` names its own
-revisions, and beside `query` with `invalid_request`, since the two select different result
-sets. A `traversal` beside it refuses `capability_unavailable`, since no lane serves the walk from
-a comparison's changed declarations. A `scope` past `local`
-refuses with `invalid_request`, because package facts are served for the current tree alone.
-[`[providers.history]`](/docs/developer/configuration#providers) owns the capability the way it owns
-[revision-addressed reads](#revision-reads): `enabled = false` refuses a comparison, a workspace
-with no git repository refuses `capability_unavailable`, and a revision neither side resolves
-refuses `resource_not_found`.
-
-### Commit search [#search-commits]
-
-`target: "commit"` matches `query` against the messages of the commits the
-[history store](/docs/developer/architecture#history) holds. The server parses the query the way a
-[full-text search](#search-fulltext) does, then answers the commits whose message carries every
-term before the ones carrying some, each group newest first by committer time, whatever `order`
-names.
-
-Under `[providers.history] strategy = "selective"` the store holds the selected releases alone, so
-a commit search answers those.
-
-While the store fills, a commit it has not analyzed yet answers nothing, and the answer carries a
-`history_store_filling` entry in `warnings`: `analyzed` counts the commits the store holds of the
-`total` its latest fill selects. The same warning appears when the store has not yet analyzed the
-commit `HEAD` names, such as right after a new commit, and the read asks the fill to catch up:
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`search` result carrying only this warning, compact text:**
-
-```text
-0 results
-1 warning
-	history_store_filling · analyzed 40 · total 100: the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Warning:**
-
-```json
-{
-  "code": "history_store_filling",
-  "analyzed": 40,
-  "total": 100,
-  "detail": "the history store holds 40 of the 100 commits its latest fill selects, so a commit it has not reached answers nothing; the fill runs in the background, and a later search answers the rest"
-}
-```
-
-</Tab>
-
-</ExampleTabs>
-
-Each hit carries a [`CommitHit`](/docs/developer/protocol/reference) as `commit`: the commit's
-`revision`, its `message`, its `author`, the committer `timestamp`, and the `paths` it changed
-against the commit it was compared with. The message is cut at 4,096 bytes on a character boundary,
-and `message_truncated` says so; `paths` lists at most 32 paths in path order, and
-`paths_truncated` says when the commit changed more. A commit hit carries no `path`, `unit`,
-`range`, `score`, or `matched_by`:
-
-**Request:**
-
-```json
-{ "target": "commit", "query": "change path bound", "limit": 10 }
-```
-
-<ExampleTabs items={["text", "json"]}>
-
-<Tab value="text">
-
-**`search` result holding this hit, compact text:**
-
-```text
-1 result
-	9c1d4e7a · Alice <alice@example.com> · 2026-09-22 14:03 +02:00
-	Bound comparisons at 512 changed paths
-
-	A comparison that reaches the bound answers from the paths that fit and warns change_truncated.
-
-	2 paths:
-		crates/rift-protocol/src/search.rs
-		crates/rift-server/src/change.rs
-```
-
-</Tab>
-
-<Tab value="json">
-
-**Search hit:**
-
-```json
-{
-  "hit": {
-    "target": "commit",
-    "commit": {
-      "revision": "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4",
-      "message": "Bound comparisons at 512 changed paths\n\nA comparison that reaches the bound answers from the paths that fit and warns change_truncated.\n",
-      "message_truncated": false,
-      "author": { "name": "Alice", "email": "alice@example.com" },
-      "timestamp": "2026-09-22T14:03:11+02:00",
-      "paths": ["crates/rift-protocol/src/search.rs", "crates/rift-server/src/change.rs"],
-      "paths_truncated": false
-    }
+```sparql
+SELECT ?symbol ?kind ?base_path ?head_path {
+  SERVICE :search {
+    ?hit :change '{"base":"main","head":"HEAD"}'^^rdf:JSON;
+         :symbol ?symbol; :change ?change .
+    ?change :kind ?kind .
+    OPTIONAL { ?change :base_path ?base_path }
+    OPTIONAL { ?change :head_path ?head_path }
   }
 }
 ```
 
-</Tab>
+The producer keeps existing classifications, base and head identities, source selection, and
+history bounds. A working-tree head uses `{"kind":"working_tree"}`. Unsupported combinations
+and invalid revisions keep their registered errors. An incomplete comparison refuses before
+SPARQL evaluates the selected records.
 
-</ExampleTabs>
+### Commit search [#search-commits]
 
-The server refuses `target: "commit"` beside `pattern`, `traversal`, `change`, `rev`, `packages`,
-and `paths`, and with a `scope` past `local`, each with `invalid_request` naming the field: each of
-them selects declarations, file text, or another tree, and the global index holds no project
-history. A missing or empty `query` refuses `invalid_request` naming `query`.
-[`[providers.history]`](/docs/developer/configuration#providers) `enabled = false` refuses
-`capability_unavailable`, and so does a workspace whose server opened no history store, such as
-one with no git repository.
+`:target "commit"` selects the existing commit-message producer:
+
+```sparql
+SELECT ?message ?revision {
+  SERVICE :search {
+    ?hit :target "commit"; :query "change path bound"; :hit ?record .
+    ?record :commit ?commit .
+    ?commit :message ?message; :revision ?revision
+  }
+}
+```
+
+Commit records preserve message, truncation fields, author, timestamp, revision, and ordered
+paths. A filling or bounded history store cannot establish an answer requiring facts it has
+not supplied. Existing history selection and commit-search refusals remain typed.
 
 ### Package scope [#search-scope]
 
-`scope` selects where `query` and `pattern` run. `local`, the default, selects the primary
-project. `local#name` selects one profile defined in the root `rift.toml`. `local@name`
-selects one extra project accepted by the connection. `global` selects collected package and
-runtime facts named by the dependency context. Explicit `packages` replaces versions of named
-packages or adds packages the context lacks. `all` merges the primary project, profiles,
-accepted extra projects, and global facts. Search returns each
-logical owner in the canonical identity, preserving physical declaration locations separately:
+`:scope "local"` selects the primary project; accepted `local@name` and `local#name` contexts
+select an extra project or profile. `:scope "global"` selects dependency facts and `:scope "all"`
+combines accepted contexts. `:packages` carries requested package selections as `rdf:JSON`.
+Existing dependency resolution, exact package versions, unavailable-package warnings, and
+explicit package constraints remain producer-owned.
 
-<ReadExample name="all-search" />
+`FROM`, `FROM NAMED`, and `GRAPH` select accepted datasets. Unknown, unaccepted, unavailable,
+or incompatible selections refuse before evaluation. They cannot look like an empty dataset.
+All required contexts are selected before evaluation; callbacks do not perform remote I/O.
+Remote acquisition uses bounded batches and original selected-publication identity.
 
-The caller **MUST** use `query` to combine profile and registered project results under `all`.
-The server returns one combined page; each hit retains its captured view for exact reads.
+### Captured answers and pages
 
-Local search runs the indexed declarations and lines, `paths.force_include`, ranked tier,
-and traversal. Global search runs the global query and pattern lanes. Under `order: "path"`,
-project paths precede released source units.
+A successful answer carries `answer`, optional `view`, `pagination`, and optional `warnings`.
+`pagination.page_index` and `total_pages` describe transport pages. When another page exists,
+`pagination.next_query` contains its complete SPARQL request. Send it unchanged as `query`.
+The server decodes that stored page rather than evaluating the original statement again.
 
-A package hit is addressed by `unit` in place of `path` - the
-[`SourceUnitId`](/docs/developer/protocol/reference) of the package file - with `range` and
-`line` inside that unit, and `source` when `include` names it. Its `matched_by` names the fields
-the global index matched, such as `name` for its name and `content` for a term inside its body.
-A package contributes no file to `query`, so `target: "file"` answers nothing from it.
+The service IRI `urn:rift:result:<view-id>` exposes the whole retained binding or graph answer
+to a new query. Binding duplicates, blank nodes, original rows, and graph triples are retained.
+A new query can aggregate, filter, project, or join those facts. The result retains selected
+source context and cannot extend the original expiry.
 
-A `pattern` reaches the package files too. The global index answers each match as a `file` hit
-addressed by `unit`, with the file's `size`, and each declaration holding a match as a `symbol`
-hit at its first match, both tagged `matched_by: ["content"]`. `global` answers released source
-matches; `all` includes project matches too, retaining each matched owner.
+A retained query combined with local facts uses its captured publication. Incompatible
+publications refuse. Expiry, missing captured material, or a changed owner does not select the
+current publication as a replacement. Carry the returned view with exact symbol and source
+reads. Transport pages remain separate from SPARQL `LIMIT` and `OFFSET`.
 
-The server refuses `rev` together with a scope beyond `local` as `invalid_request`, since
-package facts are served for the current tree alone, and refuses `traversal` together with
-`global` the same way, since a walk runs over the project alone; `all` still walks the
-project graph. Package warnings under [Reads](#reads) ride a `search` answer whose
-`scope` reaches packages. Exact reads report the selection and projection facts they retain.
+### Bounds and missing facts
 
-The resolvers read at most 256 manifests per workspace, taken in path order, so a `global` or
-`all` search over a workspace reaches packages those manifests declare. Exact [`get_symbol`](#get_symbol-scope) reads use the returned canonical identity.
+`[search.query]` bounds statement bytes, algebra nodes, acquisition requests, fact records and
+bytes, result records and bytes, and each transport page. Admission checks run before
+unbounded work. Cancellation applies during acquisition and lazy evaluation.
 
-The server asks the global API for one page per query phase, at most 1,000 declarations or the
-smaller page the API advertises, and for one page of matches per `pattern`. A declaration page the
-global API stopped at its response bound, or a `pattern` page it stopped at its limit, its file
-bound, or its verified-text bound, answers what it holds and carries a `global_page_warning` with
-`warning_code: "result_truncated"`; the server does not ask for the rest.
+A query requiring missing facts returns typed unavailability and warnings before evaluation.
+This applies to `ASK`, counts, negation, bindings, and graphs. Available-empty facts differ
+from unavailable facts. A query needing only published symbol names does not require
+unavailable nodes, history, or engine facts. Supplied node facts are preserved; query evaluation
+does not reparse source to manufacture a complete node family.
 
-This search requests `demo` 1.1.0. The fixture serves collected release 1.0.0, reports
-`package_substituted`, and returns that served owner in the symbol and source addresses:
+### Migration
 
-<ReadExample name="requested-served" />
-
-`packages` names package versions this search reaches beside the snapshot context; see
-[requested packages](#requested-packages).
+Former top-level `target`, `scope`, `paths`, `include`, `limit`, `page_index`, `traversal`,
+`change`, and `rev` are rejected. Express field projection, joins, paths, order, and slicing in
+SPARQL. Use `SERVICE :search` for existing ranking, regex, revision comparison, and commit
+producers. Follow `pagination.next_query` for transport pages.
 
 ## Symbol retrieval
 
@@ -778,8 +365,9 @@ A `local@name` owner selects an extra project accepted by the connection:
 <ReadExample name="named-symbol" />
 
 A package or runtime identity selects its exact served version. Search's `scope` and
-`packages` discover these identities. Requested package substitutions are reported by search;
-the returned identity names the served owner. Exact reads never silently replace that version.
+`packages` discover these identities. For the recorded substitution request, search returns
+`outcome: "unavailable"` with a `package_substituted` warning naming the requested entry and
+served package. Exact reads never silently replace a version.
 The declaration's `unit` keeps the physical defining owner even when the logical owner differs.
 
 <ReadExample name="global-search" />
@@ -796,45 +384,65 @@ selection failures. A malformed identity is refused before lookup:
 
 ## Source retrieval
 
-<McpTool name="get_source" />
+`SERVICE :source` acquires one exact source result before SPARQL evaluation. Its constant
+`:unit` input **MUST** be a canonical source-unit IRI. Omitted `:range` requests the whole
+unit; a range uses half-open UTF-8 byte offsets encoded as `rdf:JSON`:
 
-`unit` selects one physical source unit. Omitted `range` requests the whole unit; a supplied
-range is half-open UTF-8 byte offsets. Documentation does not require a symbol declaration:
+```sparql
+SELECT ?outcome ?text ?complete {
+  SERVICE :source {
+    ?read :unit <rift://source/project/README.md>;
+          :range '{"start":0,"end":4}'^^rdf:JSON; :outcome ?outcome .
+    OPTIONAL { ?read :source [ :text ?text ]; :source_complete ?complete }
+  }
+}
+```
+
+A declaration is not required. `:view` selects the original captured view; `:rev` selects local
+Git source and is refused beside `:view` or for released sources. Recorded package and runtime
+owners remain part of the source-unit address.
+
+`found` projects the existing `source.span`, `source.text`, `source_complete`, and original
+source view fields. `missing` requires complete captured coverage and leaves optional source
+fields unbound. The server **MUST** reject unavailable or incomplete source material before
+evaluation, including for `SERVICE SILENT`. Repeated identical requests share one authoritative
+result; different units, ranges or views remain separate requests.
+
+The projected source view retains the source selection's expiry. The enclosing query result
+has its own view and expiry for paging.
 
 <ReadExample name="project-source" />
 
 <ReadExample name="project-section" />
 
-The `view` returned by the preceding named-project symbol read selects that project's
-documentation. The project unit keeps its repository-relative path:
-
 <ReadExample name="named-project-source" />
 
 <ReadExample name="named-project-section" />
 
-A released source read uses its physical owner address:
-
 <ReadExample name="global-source" />
-
-`found` returns `source.span`, `source.text`, `source_complete`, and an immutable `view`.
-`missing` requires complete captured coverage; `unavailable` states why presence or absence
-could not be established. A package or runtime source address retains its defining owner.
-`view` retains a preceding selection; `rev` is refused beside `view` and for released sources.
 
 ## Nodes
 
 <McpTool name="nodes" />
 
-A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
-`capability_unavailable`, naming the extension, or stating that the path carries none.
+`nodes` accepts the same `query` and optional `language` as `search`. Currently, only SPARQL is
+supported. Both tools use the same parser, vocabulary, evaluation, bounds and result forms.
 
-During local preparation, the server **MAY** prepare the requested path within the remaining
-[`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
-the published prepared files carries [`local_index_preparing`](#reads), including when syntax
-is returned; this read does not advance published progress. Exhausted preparation returns empty
-nodes with that warning.
+A `:Node` record carries its original `:id`, `:unit`, `:kind`, `:language`, `:range`, parent and
+named regions. Optional `:symbol` retains the semantic association established by the original
+provider. Query projection preserves absent fields instead of inventing a symbol identity.
 
-This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
+```sparql
+SELECT ?node ?kind ?start ?end {
+  ?node a :Node; :unit <rift://source/project/src/config.rs>; :kind ?kind;
+        :range [ :start ?start; :end ?end ] .
+}
+ORDER BY ?start DESC(?end)
+```
+
+The server **MUST** refuse required syntax facts absent from the selected capture. Evaluation
+reads captured syntax records and source bytes without parsing current files or starting
+language-engine collection.
 
 <ReadExample name="local-nodes" />
 
@@ -845,17 +453,18 @@ Callers read code through these tools:
 | Tool | Result |
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
-| [`get_source`](#tool-get_source) | one physical source unit or byte range |
-| [`search`](#tool-search) | ranked files and symbols across the workspace tree |
-| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
+| [`search`](#tool-search) | SPARQL bindings, a boolean, or a graph over captured facts |
+| [`nodes`](#tool-nodes) | SPARQL bindings, a boolean, or a graph over captured syntax facts |
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
 The index never follows or indexes a symlink, so no read returns one; the file a link points
 at answers under its own path.
 
-`search` pages by `page_index` under `limit`, at most 10,000. Its `pagination` carries
-the served page and true page count, including an empty page past the last page.
+`search` and `nodes` return the first bounded page of their captured answer. The returned `pagination` carries
+the served page, true page count, and `next_query` when another page remains. Submit that
+query unchanged to read the next page. SPARQL `LIMIT` and `OFFSET` select rows before
+transport paging.
 `get_symbol` bounds declaration bindings with `declaration_limit` and continues with
 `declaration_cursor`. Search and exact reads return an immutable `view` with an expiry;
 later reads can retain that selection. Expiry never selects latest implicitly.
@@ -1002,188 +611,66 @@ answers for. The global warning naming why the global API did not answer rides b
 outside that bound. The `source_unavailable` bound above is separate, so an answer can carry
 eight of each.
 
-Every read carries an optional `rev`, and reads the workspace tree when it is absent.
+`get_symbol` accepts optional `rev`. Query-based reads select revisions through the
+`:rev` input of `SERVICE :source` or `SERVICE :search`. Project reads without a revision
+or captured view use the current workspace publication.
 
 ### Result content [#result-content]
 
-A completed tool result carries `content` with one text block of compact text. When the proxy selection is `all`, the result also carries `structuredContent` with the canonical result, and the tool listing carries `outputSchema`. The text block and `structuredContent` are rendered from the same answer.
+A completed tool result carries one compact text block in `content`. With `rift mcp --output all`,
+it also carries canonical `structuredContent`, and the tool listing carries `outputSchema`.
+Both representations come from the same answer.
 
-A caller selects the representations when it starts the proxy with `rift mcp --output`:
+- `all` forwards text, structured content, output schemas, and every resource representation.
+- `text`, the default, omits structured tool content and output schemas. For a resource with both
+  text and JSON, it omits JSON and retains text.
 
-- `all` - The proxy forwards `content` and `structuredContent`, lists `outputSchema`, and forwards every content of a resource read.
-- `text` - the default. The proxy **MUST** omit `structuredContent` from each completed tool result and `outputSchema` from every tool on every `tools/list` page. The proxy **MUST** also omit the `application/json` contents of a completed resource read that holds another content, so the compact text of the [resource](#resource-contents) remains.
+The proxy keeps that selection for its lifetime. Direct HTTP access to `rift server` returns
+both tool representations. The workspace resource carries both representations over direct
+HTTP; the map carries JSON.
 
-The proxy **MUST** keep its selection for its lifetime. A tool list that changes between pages or
-requests would break the caller's cache of the advertised tools.
+For `search`, text retains the query's result form:
 
-Direct HTTP access to `rift server` returns both tool representations, because only the proxy
-applies the selection. The workspace resource carries both contents over direct HTTP; the map
-carries one JSON content.
+- A binding answer starts with `N results · page P/T`, then selected variable names in order,
+  then one JSON object per binding row.
+- A graph answer starts with `N triples · page P/T`, then one JSON triple per line.
+- A boolean answer is `true` or `false`.
 
-The compact text of search and nodes lists items. Exact symbol and source reads state their
-selected object or outcome and serving view. The text lists what an agent reads to choose its next call and leaves the normal state of each field out, and the facts of one line are separated by ` · `. Under the `all` selection, `structuredContent` carries every field of the result, including each field the layout leaves implicit.
+Rows and triples are indented by one tab. Their JSON preserves term kinds, datatype and language
+values, full IRIs, blank node identifiers, and escaped literal bytes. An unbound variable is absent
+from its row. Query text does not turn a relationship answer into a shortest-path tree or
+replace projected facts with declaration summaries. A retained answer states its view and
+expiry. The next-page query is written as `next_query ` followed by its JSON string at column zero; decode that string and send it unchanged as `query`.
 
-The text is a sequence of sections. A section is a title line at column 0, then its entries, each indented by at least one level. A title is `N` and a noun, with the noun in the singular when N is 1, so a line at column 0 is always a title.
-
-The server **MUST** indent with tabs, one tab per level, and **MUST NOT** indent with spaces. A caller then counts the levels of a line by its leading tabs, and the whitespace of copied text never reads as an indent. Copied text keeps its own whitespace after the indent.
-
-The server **MUST NOT** write a blank line between a title and its first entry, between two items, or between two sections. A blank line inside an item stays, and the server writes it empty. The tree of a relationship walk, described below, is the one exception: a blank line separates its parts.
-
-The server **MUST** write the items section first: `N results`, or `1 result`, for `search`, and `N nodes`, or `1 node`, for `nodes`. The title is written also when the result holds no item.
-
-For `search`, the server **MUST** append ` · page P/T` to the title of the items section when `total_pages` is greater than 1 or the requested `page_index` lies past the last page, where P is `page_index` plus 1 and T is `total_pages`. The title is the only place the text carries pagination, so a caller requests the next page with a `page_index` equal to P.
-
-When compact text carries warnings, the server **MUST** write the warnings section after the
-items section: the title `N warnings`, or `1 warning`, counting the displayed groups and
-other distinct warning lines. A result without displayed warnings has no warnings section.
-The line of a warning has these parts:
-
-- the `code` of the warning
-- each payload field except `detail`, as ` · name value`, in the order the warning declares them; a list joins its items with `, `, a package identity is `name@version (manager)`, and a package context entry is `name@version` or `name requirement` followed by `(manager)`, with the availability added after the manager unless it is `canonical`; a value holding ` · ` or `: ` is quoted
-- `: ` and the `detail`, when the warning carries one, quoted when it holds ` · ` or `: `
-
-The server **MUST** group `framework_context_unresolved` warnings with equal `framework`
-and `detail`. Each group omits `unit` from its heading and lists sorted, distinct file
-identities below `files:`; other equal warning lines appear once. The structured `warnings`
-array retains its original entries.
-
-For canonical `get_symbol`, a proxy suppresses repeated framework warning text when the
-distinct details and files remain unchanged for the same originating project, symbol owner,
-and framework on that MCP connection. Changed facts or an intervening answer without that
-framework make its text visible again. The proxy retains at most 256 observations, evicts
-the oldest when full, and starts empty on a new MCP connection.
-
-When the result holds more than one item, the server **MUST** start each item with `[n] ` at one level, counting from 1 in result order, and write every further line of the item at two levels. A result with one item carries no marker and writes every line at one level.
-
-A `nodes` result numbers its nodes the same way.
-
-The server writes the lines of a hit in the order below and omits a line whose fact is absent. A location is `path:line`, or `unit:line` for a hit in a package source unit.
-
-A symbol hit of `search` has these lines:
-
-- the declaration: the display of the first signature, behind its visibility when the display does not start with it
-- the location and the `matched_by` field names joined by `, `, followed by the exceptional facts below, all separated by ` · `
-- the symbol identity, or the byte range as `START..END` when the symbol has no identity
-- the first non-empty line of the first documentation text
-- the change line, when the hit comes from a comparison
-- a blank line, then the source
-
-The change line is the `kind` alone, with its underscores written as spaces. When the change has a `base_path` and a `head_path` that differ, the line adds ` · ` and the two paths joined by ` → `. When it has only one of them and that path differs from the location, the line adds that path.
-
-A symbol hit of `search` whose `traversal_path` holds at least one hop is a **walk hit**. The server **MUST NOT** write walk hits as items. It writes them as a tree: the **root** is the symbol the walk starts from, and each hop of a `traversal_path` is one **branch** under the symbol the hop starts from.
-
-The server **MUST** write the hits outside the walk first, as items, and the marker rule counts only those hits. The server **MUST** then write one tree per root, in the order the first walk hit of each tree has in the result.
-
-The server builds a tree from the `traversal_path` of each walk hit:
-
-- the root is the symbol the first hop starts from: the `from` of its relationship when the `direction` of the hop is `outgoing`, the `to` when it is `incoming`
-- each hop adds one level, and its branch is the symbol the hop reaches: the `to` of an `outgoing` hop, the `from` of an `incoming` hop
-- paths that share their first hops share those branches, and the branches under one symbol keep the order their hits have in the result
-- the hit sits on the branch of its last hop
-
-The root writes every line at one level. A branch `d` levels under the root writes its head line at level `1 + d` and every further line at level `2 + d`.
-
-The server **MUST** write a blank line before the root and before every branch, except before a root that is the first entry of the section. The further lines of a branch and the head line of a branch under it share a level, so the blank line marks where one ends.
-
-The head line of a branch is `↳ ` and the relationship of its hop. The relationship is the `facets` of the hop's relationship, joined by `, `:
-
-- an `outgoing` hop writes each facet as its wire name with underscores as spaces, such as `calls` or `depends on`
-- an `incoming` hop writes each facet read from the other end, as in the table below
-- a relationship whose `derivation` is `heuristic` writes `probably ` before its first facet
-
-| Facet | `incoming` hop | Facet | `incoming` hop |
-| --- | --- | --- | --- |
-| `contains` | `contained by` | `aliases` | `aliased by` |
-| `declares` | `declared by` | `generates` | `generated by` |
-| `augments` | `augmented by` | `depends_on` | `dependency of` |
-| `references` | `referenced by` | `annotated_by` | `annotates` |
-| `calls` | `called by` | `throws` | `thrown by` |
-| `constructs` | `constructed by` | `catches` | `caught by` |
-| `reads` | `read by` | `bounded_by` | `bounds` |
-| `writes` | `written by` | `instantiates` | `instantiated by` |
-| `imports` | `imported by` | `specializes` | `specialized by` |
-| `exports` | `exported by` | `overloads` | `overloaded by` |
-| `extends` | `extended by` | `mixes_in` | `mixed in by` |
-| `implements` | `implemented by` | `embeds` | `embedded by` |
-| `has_type` | `type of` | `tests` | `tested by` |
-| `overrides` | `overridden by` | `configures` | `configured by` |
-| | | `binds` | `bound by` |
-
-A root whose symbol is a hit of the result writes the lines of that symbol hit at level 1, with the declaration as its first line and no word before it. Its location line starts with `in `, unless the hit has no location, and its symbol identity line starts with `at `. The further lines follow unchanged. Its location line leaves `relationship` out of the `matched_by` names, because the tree states it.
-
-A branch whose symbol is a hit of the result writes its head line, then the lines of that symbol hit, all at level `2 + d`, with these words before some of them:
-
-- `by ` before the declaration, when every facet phrase of the hop ends in ` by`, such as `referenced by` or `called by`. The head line then leaves ` by` out of each phrase, as in `↳ referenced, called`, so that `by` heads the declaration line. When a phrase does not end in ` by`, such as `type of`, the head line keeps the whole phrases and the declaration line has no word before it.
-- `in ` before the location line, which starts with the location. A hit without a location writes that line without `in `.
-- `at ` before the symbol identity line. A symbol with no identity writes its byte range without `at `.
-
-The further lines of the symbol hit follow unchanged: the first documentation line, the change line, a blank line, and the source. The branch writes the location line without `relationship` in the `matched_by` names, as the root does.
-
-A root whose symbol is no hit of the result writes one line: `at ` and the symbol identity. A branch whose symbol is no hit writes its head line and the `at` line, and no other line. A branch is no hit when its own hit lies on another page. The root is no hit because a walk does not return the symbol it starts from. When a hit outside the walk is the root symbol, as a `query` beside the `traversal` can return it, the server **MUST** write that hit as the root and not as an item.
-
-A file hit has the location and the `matched_by` field names on its first line, then the source directly below. A node hit adds the node identity between those two lines. A documentation hit starts with the heading path joined by ` > `, or `documentation` without headings, then the location of the block and the `matched_by` field names, the identity of the symbol the block documents, and the source.
-
-A commit hit has these lines:
-
-- the revision, the author as `name <email>`, and the date, hour, minute, and offset of the timestamp as `2026-09-22 14:03 +02:00`, separated by ` · `; a requested `score` ends the line
-- the first line of the message
-- a blank line, then the rest of the message
-- `message truncated`, when `message_truncated` is `true`
-- a blank line, then `N paths:` and one changed path per line, one level below `N paths:`; when `paths_truncated` is `true`, the label is `N+ paths · truncated` and a last line of `...` follows
-
-A found `get_symbol` result writes the declaration, exact identity, exceptional facts,
+For `get_symbol`, a found result writes the declaration, exact identity, exceptional facts,
 then documentation and requested documentation context or history. A `declarations:` section
 retains each physical location, byte range, available node identity, and requested source.
-A returned `declaration_cursor` names remaining bindings. There is no hit count or hit paging.
-A missing result writes `error: symbol_not_found`, the requested identity and bounded
-alternatives below `closest matches:` when alternatives exist;
-an unavailable result writes its typed reason and requested identity. A captured selection ends
-with `view ID · expires TIMESTAMP`, followed by warnings when present.
+A returned `declaration_cursor` names remaining bindings. Exact reads have no hit count or hit
+paging. A missing result writes `error: symbol_not_found`, the requested identity, and bounded
+alternatives below `closest matches:` when available. An unavailable result writes its typed
+reason and requested identity. A captured selection states `view ID · expires TIMESTAMP`.
 
-A `nodes` result lists the nodes from the outermost to the innermost. Each node has these lines:
+`nodes` uses the same query result text as `search`: projected bindings, a boolean or triples.
+The statement selects node fields, source bytes and ordering explicitly.
 
-- the `kind`, then ` · N lines` when its excerpt holds more than one line, then `generated` and `test` when the node has those facets
-- the node identity
-- the symbol identity, when the node has one
-- the regions as `role START..END`, joined by ` · `, when the node has regions
+Exact symbol reads use tabs for layout, preserving copied source whitespace after
+the layout indent. Remove that indent to recover source bytes. A fact whose normal state is
+implicit in this layout remains available in structured content. Exceptional origin, package,
+source kind, deprecated and test facets, document-local identity, and incomplete history remain
+visible in text. Query literals instead use their JSON encoding and preserve every projected
+value regardless of its normal state.
 
-After the last node, the server writes a blank line and the excerpt of the innermost node, indented like the further lines of an item, last in the items section. Each outer excerpt contains the inner ones, so `structuredContent` carries the excerpt of every node in `source`.
+Warnings follow the answer and its serving view. The warning title counts displayed groups and
+distinct lines. Each line states its code, declared payload fields, and available detail.
+Equal `framework_context_unresolved` entries with the same framework and detail are grouped;
+the group lists sorted distinct source identities. Structured warnings retain their entries.
+A canonical-symbol proxy suppresses repeated unchanged framework warning text for the same
+originating project, owner, and framework on its connection. Changed facts or an intervening
+answer without that framework make it visible again. The observation cache remains bounded.
 
-The server **MUST NOT** write a fact in its normal state. The absence of a fact therefore states the normal state, such as a project declaration that is authored, current, not deprecated, and not a test. The exceptional facts are:
-
-- `score` and its value, when the request asked for `score`
-- the origin as its location and `name@version`, when the declaration is not a project declaration without a package; the location is `dependency`, `stdlib`, or `external`
-- `generated` or `synthetic`, when `source_kind` is not `authored`
-- `deprecated` and `test`, when the symbol has those facets
-- `document local`, when `document_local` is `true`
-- a truncation or an incomplete history, in the lines above
-
-The layout leaves these fields to `structuredContent`:
-
-- the language, container, modifiers, types, and extensions of a symbol, every signature beyond the first, and every documentation line beyond the first of a `search` hit
-- the byte range of a symbol that has an identity
-- the `distance` of a walk hit, which the level of its branch shows, and the `relationship` entry of its `matched_by`, which the tree shows
-- the size and languages of a file hit
-- the unit, language, other facets, parent, and byte range of a node
-- the `node` of a `get_symbol` hit, the `reference` of a referenced block, the `source` and `documentation_revision` of a documentation hit and of a referenced block, and the `documentation_revision` of a documentation context
-
-The server **MUST** write a value that is lowercase hex of at least 8 characters as its first 8 characters: the revision of a commit hit or a history entry, and each digest in a warning line or a resource text. The server resolves a request revision with git revision parsing, which accepts a commit id prefix, so a caller **MAY** send the cut value wherever a request takes a revision. `structuredContent` carries the full revision.
-
-The server **MUST** write source, documentation text, and excerpts line by line,
-with their bytes unchanged apart from the indent. A caller then recovers the text by
-removing the leading tabs of the indent, with no unescaping. A documentation text that holds
-only whitespace writes nothing. The subject of a commit message is one fact; the lines after
-the blank line that follows the subject are written line by line, without the blank lines at
-their start and the whitespace at the end of the message. The server writes every other fact on one line, without the spaces at its end, with
-`\n`, `\r`, `\t`, and `\u{HEX}` for the control characters it holds. A value among the facts of a line that holds ` · ` or `: ` is written between double quotes, with each `"` and `\` inside written after a `\`; a value without either stays bare, and so does a value written alone on its line, such as a declaration, an identity, or a commit subject.
-
-A caller that requests `score`, `source`,
-`documentation`, or `history` finds it in the compact text. The server enforces a byte limit on one
-answer's text and refuses an answer that crosses it.
-
-The tabs below show the compact text of `search`, `get_symbol`, and `nodes` results, and of the warnings of an answer:
-
-These examples retain compact text and canonical JSON from the same answers:
+Registered errors and typed unavailable outcomes remain distinct from complete empty query
+answers. A missing family of facts is never rendered as `false`, zero, or an empty graph.
+Every tool's text remains subject to its accepted byte bound.
 
 <ReadExample name="local-search" />
 
@@ -1191,15 +678,10 @@ These examples retain compact text and canonical JSON from the same answers:
 
 <ReadExample name="local-nodes" />
 
-<ReadExample name="requested-served" />
-
-<ReadExample name="incoming-traversal" />
-
-
-
 ### Revision-addressed reads [#revision-reads]
 
-Every read also accepts `rev` - a branch, tag, or commit id, spelled the way git spells it:
+`get_symbol` accepts `rev`. `SERVICE :source` and `SERVICE :search` accept `:rev` as a service
+input. It names a branch, tag, or commit id, spelled the way git spells it:
 `main`, `v0.0.6`, `dd0a482`. The server resolves the revision in place from the workspace's
 git objects, with no checkout, and indexes that commit's tree under the same
 [`[source]`](/docs/developer/configuration#source) policy and bounds as the working-tree scan. A revision
@@ -1266,7 +748,7 @@ refuses every revision read.
 
 ### Requested packages [#requested-packages]
 
-`packages` names package versions a `search` reaches beside the ones the
+The `:packages` input of `SERVICE :search` names package versions it reaches beside the ones the
 workspace's manifests and lockfiles name, at most 64 entries. Each entry is a
 [`RequestedPackage`](/docs/developer/protocol/reference) carrying `manager`, `name`, and an
 optional exact `version`. The server applies the list to this read's dependency context alone:
@@ -1285,19 +767,24 @@ collected release answers `package_absent`, or `package_requirement_absent` for 
 This search reads Tokio 1.47.1 beside the project, in place of the version the workspace's
 `Cargo.lock` pins:
 
-**Request:**
+Pass this SPARQL as `query`:
 
-```json
-{
-  "query": "spawn_blocking",
-  "scope": "all",
-  "target": "symbol",
-  "limit": 10,
-  "packages": [{ "manager": "cargo", "name": "tokio", "version": "1.47.1" }]
-}
+```sparql
+PREFIX : <urn:rift:vocabulary:>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?symbol ?name {
+  SERVICE :search {
+    ?hit :query "spawn_blocking";
+         :scope "all";
+         :target "symbol";
+         :packages '[{"manager":"cargo","name":"tokio","version":"1.47.1"}]'^^rdf:JSON;
+         :symbol ?symbol;
+         :name ?name.
+  }
+} LIMIT 10
 ```
 
-The server refuses `packages` as `invalid_request` naming the field beside the `local` scope, the
+The server refuses `:packages` as `invalid_request` naming the field beside the `local` scope, the
 default, since a project read consults no package, and beside `rev`, since package facts are
 served for the current tree alone. A list past 64 entries, and an entry whose `manager`, `name`,
 or `version` is empty or longer than its schema allows, refuse the same way before anything

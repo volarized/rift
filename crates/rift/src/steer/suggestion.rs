@@ -1,7 +1,7 @@
 //! Maps one qualifying call to the `search` arguments answering the same question.
 //!
 //! A `Grep` call, and the `grep` or `rg` command [`super::bash`] reads as one, maps to a
-//! `search` call carrying `pattern`. A `Glob` call, and a `find` command, list files by
+//! SPARQL service carrying `:pattern`. A `Glob` call, and a `find` command, list files by
 //! name, so they map to a `search` call whose `pattern` matches once in every file, over the
 //! `paths.include` globs selecting the same names. A call holding a field `search` has no
 //! form for maps to nothing, so the steer lets it through without a deny. Sans-I/O: every
@@ -190,6 +190,11 @@ impl GrepRequest {
         }
         let include = included(&self.selected_globs()?, paths)?;
         let (limit, page_index) = paging(self.head_limit, self.offset)?;
+        let limit = if self.head_limit.is_none() {
+            Some(GREP_HEAD_LIMIT_DEFAULT)
+        } else {
+            limit
+        };
         let suggestion = SearchSuggestion {
             pattern,
             paths: (!include.is_empty()).then_some(SuggestedPaths { include }),
@@ -197,7 +202,9 @@ impl GrepRequest {
             limit,
             page_index,
         };
-        let rendered = serde_json::to_string(&suggestion).ok()?;
+        let producer = serde_json::from_value(serde_json::to_value(&suggestion).ok()?).ok()?;
+        let query = rift_search::sparql::retrieval_query(&producer).ok()?;
+        let rendered = serde_json::to_string(&query).ok()?;
         (rendered.len() <= SUGGESTION_BYTES_MAX).then_some(rendered)
     }
 
@@ -262,7 +269,7 @@ fn paging(head_limit: Option<u64>, offset: Option<u64>) -> Option<(Option<u64>, 
     }
 }
 
-/// The `search` arguments one `Grep` call maps to, in the `search` schema's field order.
+/// Internal retrieval inputs carried by one generated SPARQL service request.
 #[derive(Debug, Serialize)]
 struct SearchSuggestion {
     pattern: String,
@@ -333,7 +340,6 @@ fn count(value: &Value) -> Option<u64> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use rift_protocol::read::SearchParams;
     use serde_json::{Value, json};
 
     use super::{
@@ -341,29 +347,71 @@ pub(super) mod tests {
         SUGGESTION_BYTES_MAX, grep_globs,
     };
 
-    /// Proves one suggestion is a `search` call the server takes: it deserializes into
-    /// `SearchParams`, which refuses an unknown field, and validates against the served
-    /// `search` input schema. Returns the arguments as JSON.
+    /// Proves actual public query arguments against the schema and library parser.
+    /// Returns parsed producer selection for the mapping assertions below.
     pub(in crate::steer) fn served_search_call(suggestion: &str) -> Value {
         let arguments: Value = serde_json::from_str(suggestion).expect("a suggestion is JSON");
-        serde_json::from_value::<SearchParams>(arguments.clone())
-            .unwrap_or_else(|error| panic!("{suggestion} must be SearchParams: {error}"));
+        let request: rift_protocol::query::QueryParams = serde_json::from_value(arguments.clone())
+            .unwrap_or_else(|error| panic!("{suggestion} must be QueryParams: {error}"));
         let tools = rift_mcp::schema::tool_listing();
         let search = tools
             .iter()
             .find(|tool| tool.name.as_ref() == "search")
-            .expect("the served surface carries search");
+            .expect("served search");
         let schema = Value::Object(search.input_schema.as_ref().clone());
-        let validator = jsonschema::validator_for(&schema).expect("the served schema compiles");
-        let errors: Vec<String> = validator
-            .iter_errors(&arguments)
-            .map(|error| error.to_string())
-            .collect();
+        let validator = jsonschema::validator_for(&schema).expect("served schema compiles");
         assert!(
-            errors.is_empty(),
-            "{suggestion} must validate against the served search schema: {errors:?}"
+            validator.is_valid(&arguments),
+            "{suggestion} must validate against public schema"
         );
-        arguments
+        let limits = rift_search::query::QueryLimits {
+            query_bytes_max: 16_384,
+            algebra_nodes_max: 4096,
+            quads_max: 1,
+            rdf_bytes_max: 1,
+            result_items_max: 1,
+            result_bytes_max: 1,
+            input_bytes_max: None,
+            output_bytes_max: None,
+            material_bytes_max: None,
+            heap_bytes_max: None,
+            diagnostic_bytes_max: None,
+        };
+        let prepared = rift_search::sparql::PreparedQuery::parse(&request.query, limits)
+            .expect("suggestion parses");
+        assert_eq!(prepared.retrievals().len(), 1);
+        let producer = &prepared.retrievals()[0];
+        let parsed = spargebra::SparqlParser::new()
+            .parse_query(&request.query)
+            .expect("standalone query parses");
+        let (offset, length) = match parsed {
+            spargebra::Query::Select(spargebra::query::SelectQuery {
+                expression: spargebra::algebra::QueryExpression::Slice { offset, limit, .. },
+                ..
+            }) => (offset, limit),
+            spargebra::Query::Select(_) => (0, None),
+            _ => panic!("steering must select bindings"),
+        };
+        let mut options = json!({"pattern": producer.pattern});
+        if let Some(paths) = &producer.paths {
+            options["paths"] = serde_json::to_value(paths).expect("paths serialize");
+            options["paths"]
+                .as_object_mut()
+                .expect("paths is an object")
+                .retain(|_, value| value.as_array().is_none_or(|items| !items.is_empty()));
+        }
+        if producer.target != rift_protocol::read::SearchParamsTarget::All {
+            options["target"] = serde_json::to_value(producer.target).expect("target serializes");
+        }
+        if let Some(limit) = length {
+            if limit != super::GREP_HEAD_LIMIT_DEFAULT || offset != 0 {
+                options["limit"] = json!(limit);
+            }
+            if offset != 0 {
+                options["page_index"] = json!(offset / limit);
+            }
+        }
+        options
     }
 
     /// The `search` arguments one `Grep` input maps to at `path`, proven a served call, or
@@ -606,11 +654,17 @@ pub(super) mod tests {
             globs: globs(INCLUDE_GLOBS_MAX),
             ..GrepRequest::lines("x".to_owned())
         };
-        assert!(at_bound.suggestion(&[GrepPath::Root]).is_some());
+        assert_eq!(
+            super::included(&at_bound.globs, &[GrepPath::Root])
+                .expect("glob count is within its independent bound")
+                .len(),
+            INCLUDE_GLOBS_MAX
+        );
         let past_bound = GrepRequest {
             globs: globs(INCLUDE_GLOBS_MAX + 1),
             ..at_bound
         };
+        assert!(super::included(&past_bound.globs, &[GrepPath::Root]).is_none());
         assert_eq!(past_bound.suggestion(&[GrepPath::Root]), None);
     }
 

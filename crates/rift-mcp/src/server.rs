@@ -1,4 +1,6 @@
 pub(crate) mod candidates;
+mod query;
+pub(crate) use query::{QueryFactRequest, QueryFactResult, QueryFactSelection};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -23,8 +25,8 @@ use rift_protocol::configuration::{
 use rift_protocol::error as wire;
 use rift_protocol::lock::ProductIdentity;
 use rift_protocol::read::{
-    Digest, GetSymbolResult, Language, NodesParams, NodesResult, Pagination, ProjectPath,
-    ReadWarning, SearchParams, SearchResult, SearchScope, TraversalDirection,
+    Digest, GetSymbolResult, Language, Pagination, ProjectPath, ReadWarning, SearchParams,
+    SearchResult, SearchScope, TraversalDirection,
 };
 use rift_protocol::workspace::{
     WORKSPACE_SOURCE_UNITS_MAX, WorkspaceLanguageSummary, WorkspaceLspSummary,
@@ -112,6 +114,21 @@ const MODEL_RETRY_DELAY_LIMIT: Duration = Duration::from_secs(30);
 
 /// The lock a blocking operation's worker permit is recorded under, waits and holds alike.
 pub(crate) const WORKER_PERMIT_LOCK: &str = "worker.permit";
+
+pub(crate) fn captured_views(
+    server: &ServerConfiguration,
+) -> Result<rift_server::LocalSymbolViews, RiftError> {
+    let material_bytes_max = usize::try_from(server.retained_size.bytes())
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    let views_max = usize::try_from(server.retained_views)
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    rift_server::LocalSymbolViews::bounded(
+        material_bytes_max,
+        crate::http::token_entropy("captured view key")?,
+        views_max,
+        Duration::from_millis(server.view_lifetime.milliseconds()),
+    )
+}
 
 /// One admitted blocking operation's worker permit, recorded as [`WORKER_PERMIT_LOCK`].
 type WorkerPermit = rift_tracing::Held<tokio::sync::OwnedSemaphorePermit>;
@@ -887,31 +904,6 @@ impl ResolvedWorkspace {
     }
 }
 
-fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> NodesResult {
-    NodesResult {
-        view: None,
-        nodes: Vec::new(),
-        source: Vec::new(),
-        warnings: nodes_preparing_warnings(resolved),
-    }
-}
-
-fn nodes_preparing_warnings(resolved: &ResolvedWorkspace) -> Vec<ReadWarning> {
-    let mut warnings = Vec::new();
-    if let Some(stale) = resolved.stale.clone() {
-        warnings.push(stale);
-    }
-    if let Some(warning) = resolved
-        .published
-        .preparation
-        .as_ref()
-        .and_then(crate::validation::LocalIndexPreparation::warning)
-    {
-        warnings.push(warning);
-    }
-    warnings
-}
-
 /// A read result's warnings, so the one gate every current-tree read passes can add the
 /// `stale_index` warning without knowing the result's shape.
 pub(crate) trait ReadAnswer {
@@ -926,12 +918,6 @@ impl ReadAnswer for GetSymbolResult {
 }
 
 impl ReadAnswer for SearchResult {
-    fn warnings_mut(&mut self) -> &mut Vec<ReadWarning> {
-        &mut self.warnings
-    }
-}
-
-impl ReadAnswer for NodesResult {
     fn warnings_mut(&mut self) -> &mut Vec<ReadWarning> {
         &mut self.warnings
     }
@@ -1795,6 +1781,7 @@ pub struct RiftMcp {
     tool_router: ToolRouter<Self>,
     local_views: Arc<std::sync::OnceLock<rift_server::LocalSymbolViews>>,
     candidate_responses: Arc<candidates::CandidateResponses>,
+    query_program: Option<Arc<PathBuf>>,
 }
 
 /// The search tier one server opens at startup: the index, the lanes over it, and the
@@ -1844,6 +1831,14 @@ impl AssembledServer {
 
 #[tool_router(router = declared_tool_router, vis = "pub(crate)")]
 impl RiftMcp {
+    /// Selects the compatible Rift executable used for bounded query child processes.
+    /// In-process embedders supply this executable explicitly.
+    #[must_use]
+    pub fn with_query_program(mut self, program: PathBuf) -> Self {
+        self.query_program = Some(Arc::new(program));
+        self
+    }
+
     /// Starts a server with an empty workspace publication, applying the
     /// accepted `rift.toml`'s `[source]` policy to background preparation and its
     /// `[server]` table to the blocking pool. While `rift.toml` is invalid,
@@ -2104,12 +2099,9 @@ impl RiftMcp {
         let (definitions, bindings) = startup_configuration.lsp_runtime_configuration();
         let engines = Arc::new(EngineHold::new(root.clone(), definitions, bindings));
         validation.feed_engines(Arc::clone(&engines));
-        let material_bytes_max = usize::try_from(8_u64 * 1024 * 1024 * 1024)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let local_views = std::sync::OnceLock::from(rift_server::LocalSymbolViews::new(
-            material_bytes_max,
-            crate::http::token_entropy("captured view key")?,
-        ));
+        let local_views = std::sync::OnceLock::from(captured_views(
+            &startup_configuration.server_configuration(),
+        )?);
         let server = Self {
             root: root.clone(),
             identity,
@@ -2131,7 +2123,14 @@ impl RiftMcp {
             forced_capture: ForcedCapture::default(),
             tool_router: Self::tool_router(),
             local_views: Arc::new(local_views),
-            candidate_responses: Arc::default(),
+            candidate_responses: Arc::new(candidates::CandidateResponses::for_configuration(
+                &startup_configuration.server_configuration(),
+            )),
+            #[cfg(test)]
+            query_program: std::env::var_os("CARGO_BIN_EXE_rift")
+                .map(|program| Arc::new(PathBuf::from(program))),
+            #[cfg(not(test))]
+            query_program: None,
         };
         Ok(AssembledServer {
             server,
@@ -2319,74 +2318,24 @@ impl RiftMcp {
         result
     }
 
-    /// Reads a canonical source unit or a half-open UTF-8 byte range. A preceding `view`
-    /// retains its immutable selection and original expiry; `rev` selects a local Git revision.
-    /// The result returns source bytes, definite absence or typed selection unavailability.
-    #[tool]
-    async fn get_source(
-        &self,
-        Parameters(params): Parameters<rift_protocol::source_read::GetSourceParams>,
-        extensions: rmcp::model::Extensions,
-    ) -> Result<Json<rift_protocol::source_read::GetSourceResult>, ToolFailure> {
-        let captured = extensions.get::<std::sync::Arc<
-            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
-        >>();
-        let result = self
-            .exact_source_with_context(params, captured.map(std::sync::Arc::as_ref))
-            .await;
-        if let Err(ToolFailure::Registered(failure, _)) = &result
-            && let Some(operation) = extensions.get::<rift_tracing::Span>()
-        {
-            operation.record("error.type", failure.registered().slug().as_str());
-        }
-        result
-    }
-
-    /// Searches indexed declarations and source lines by lexical `query`, merged with
-    /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
-    /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
-    /// regex against the text of every indexed file, line by line as ripgrep reads it, and
-    /// answers each match and each declaration holding one, in place of `query` and
-    /// `traversal`. `change` answers the declarations a committed revision and another
-    /// revision, or the working tree, hold differently, in place of `query` and `traversal`.
-    /// `rev` searches a version-control revision instead of the current tree, and never
-    /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
-    /// tree: `global` answers collected package and runtime facts selected by the project's
-    /// dependency context. Explicit `packages` replaces versions of named packages or adds
-    /// packages the context lacks. `local@name` selects an accepted extra project; `local#name` selects a root-defined profile.
-    /// `all` merges the primary project, profiles, accepted extra projects, and global results. `target: "commit"` matches
-    /// `query` alone against the messages of the commits the history store holds.
-    /// Use `get_symbol` with an exact canonical identity returned by search.
+    /// Evaluates SPARQL Query over selected workspace facts.
     ///
-    /// For a current-tree search, the published workspace is resolved exactly once and
-    /// threaded through both the search index's revision check and the executed
-    /// `ReadService::search` call: a concurrent rebuild between two separate resolutions
-    /// could otherwise validate ranked units against one snapshot and merge them into
-    /// results computed from another.
+    /// The server supplies `:` and `r:` vocabulary prefixes and standard RDF prefixes.
+    /// `SELECT`, `ASK`, `CONSTRUCT`, and `DESCRIBE` preserve RDF terms and projected fields.
+    /// For example, `SELECT ?symbol { ?symbol :name "ReadService" }` finds declarations.
+    /// `SELECT ?usage { <rift://symbol/local/rust/rift_server/read/ReadService> :usages ?usage }`
+    /// selects every reference occurrence. Required unavailable facts prevent evaluation.
     #[tool]
     async fn search(
         &self,
-        Parameters(params): Parameters<SearchParams>,
+        Parameters(params): Parameters<rift_protocol::query::QueryParams>,
         extensions: rmcp::model::Extensions,
-    ) -> Result<Json<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
-        if params.traversal.is_some() {
-            let context = extensions.get::<std::sync::Arc<
-                std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
-            >>();
-            return self
-                .captured_traversal(&params, context.map(std::sync::Arc::as_ref))
-                .await
-                .map(Json);
-        }
-        if let Some(captured) = self.captured_query(&params).await? {
-            return Ok(Json(captured));
-        }
-        self.search_result(params).await.map(|Json(answer)| {
-            Json(rift_protocol::search_read::SearchReadResult::Results(
-                Box::new(answer),
-            ))
-        })
+    ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
+        let context = extensions.get::<std::sync::Arc<
+            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >>();
+        self.graph_query_with_context(params, context.map(std::sync::Arc::as_ref))
+            .await
     }
 
     async fn search_result(&self, params: SearchParams) -> Result<Json<SearchResult>, ToolFailure> {
@@ -2514,8 +2463,15 @@ impl RiftMcp {
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let (resolved, answer, warnings, references, deadline) =
             self.current_search_inputs(&params).await?;
-        self.route_current_tree_search(resolved, params, answer, warnings, references, deadline)
-            .await
+        self.route_current_tree_search(
+            resolved,
+            params,
+            answer,
+            warnings,
+            references,
+            (deadline, None),
+        )
+        .await
     }
 
     async fn current_search_inputs(
@@ -2602,19 +2558,23 @@ impl RiftMcp {
         answer: StoreAnswer,
         warnings: Vec<ReadWarning>,
         references: EngineReferences,
-        deadline: RequestDeadline,
+        (deadline, capture): (RequestDeadline, Option<crate::global::CapturedGlobalViews>),
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let references = Arc::new(references);
-        if params.pattern.is_some()
-            && !matches!(
-                params.scope,
-                SearchScope::Local
-                    | SearchScope::NamedLocal { .. }
-                    | SearchScope::ProfileLocal { .. }
-            )
-        {
+        let local_scope = matches!(
+            params.scope,
+            SearchScope::Local | SearchScope::NamedLocal { .. } | SearchScope::ProfileLocal { .. }
+        );
+        if params.pattern.is_some() && !local_scope {
             return self
-                .route_pattern_search(resolved, params, answer, warnings, references, deadline)
+                .route_pattern_search(
+                    resolved,
+                    params,
+                    answer,
+                    warnings,
+                    references,
+                    (deadline, capture),
+                )
                 .await;
         }
         let parsed = params
@@ -2624,15 +2584,7 @@ impl RiftMcp {
         let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
             .then_some(parsed)
             .flatten();
-        let (Some(parsed), false) = (
-            remote_query,
-            matches!(
-                params.scope,
-                SearchScope::Local
-                    | SearchScope::NamedLocal { .. }
-                    | SearchScope::ProfileLocal { .. }
-            ),
-        ) else {
+        let (Some(parsed), false) = (remote_query, local_scope) else {
             let mut answer = self
                 .current_tree_search_selected(&resolved, params, answer, references)
                 .await?;
@@ -2661,18 +2613,40 @@ impl RiftMcp {
         let configuration = resolved.published.configuration.global_configuration();
         let requested = &params;
         let parsed = &parsed;
+        let captured = capture.is_some();
         let (route, mut remote) = self
             .global_read(
                 deadline,
                 &configuration,
                 &read_context,
                 |client, packages| async move {
-                    package_search(&client, requested, parsed, &packages).await
+                    if captured {
+                        crate::global::captured_package_search(
+                            &client, requested, parsed, &packages,
+                        )
+                        .await
+                    } else {
+                        package_search(&client, requested, parsed, &packages)
+                            .await
+                            .map(|candidates| crate::global::CapturedGlobalSearchCandidates {
+                                view: None,
+                                candidates,
+                            })
+                    }
                 },
             )
             .await;
-        let remote_warnings = std::mem::take(&mut remote.warnings);
-        let mut answer = merge_search(&params, limit, local, remote)
+        if let Some(capture) = capture
+            && route.client.is_some()
+            && !route.remote_packages.is_empty()
+        {
+            capture
+                .include_view(remote.view.as_ref())
+                .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
+        }
+        remote.attach_view();
+        let remote_warnings = std::mem::take(&mut remote.candidates.warnings);
+        let mut answer = merge_search(&params, limit, local, remote.candidates)
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
         answer.warnings.extend(remote_warnings);
         answer.warnings.extend(route.warnings());
@@ -2691,7 +2665,7 @@ impl RiftMcp {
         answer: StoreAnswer,
         warnings: Vec<ReadWarning>,
         references: Arc<EngineReferences>,
-        deadline: RequestDeadline,
+        (deadline, capture): (RequestDeadline, Option<crate::global::CapturedGlobalViews>),
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let limit = rift_server::search_page_limit(&params)
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
@@ -2717,6 +2691,14 @@ impl RiftMcp {
                 package_patterns(&client, requested, &packages).await
             })
             .await;
+        if let Some(capture) = capture
+            && route.client.is_some()
+            && !route.remote_packages.is_empty()
+        {
+            capture
+                .include_view(remote.view.as_ref())
+                .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
+        }
         let mut answer = merge_patterns(&params, limit, local, remote);
         answer.warnings.extend(route.warnings());
         Ok(Json(answer))
@@ -2918,18 +2900,36 @@ impl RiftMcp {
         references: &mut EngineReferences,
         deadline: RequestDeadline,
     ) -> Vec<ReadWarning> {
-        if references.package_callees().is_empty() {
-            return Vec::new();
+        let (named, warnings) = self
+            .package_callee_names(resolved, references.package_callees(), deadline)
+            .await;
+        match named {
+            Some(named) => references.name_package_callees(|callee| named.declaration(callee)),
+            None => references.drop_package_callees(),
+        }
+        warnings
+    }
+
+    async fn package_callee_names(
+        &self,
+        resolved: &ResolvedWorkspace,
+        callees: &[rift_server::PackageCallee],
+        deadline: RequestDeadline,
+    ) -> (Option<crate::global::CalleeDeclarations>, Vec<ReadWarning>) {
+        if callees.is_empty() {
+            return (
+                Some(crate::global::CalleeDeclarations::default()),
+                Vec::new(),
+            );
         }
         let read_context = ReadContext::snapshot(&resolved.published.reads);
         let configuration = resolved.published.configuration.global_configuration();
         let mut route = match tokio::time::timeout_at(
             deadline.at(),
-            Box::pin(self.global.callee_route(
-                &configuration,
-                &read_context,
-                references.package_callees(),
-            )),
+            Box::pin(
+                self.global
+                    .callee_route(&configuration, &read_context, callees),
+            ),
         )
         .await
         {
@@ -2937,19 +2937,14 @@ impl RiftMcp {
             Err(source) => self.global.deadline_exceeded(&read_context, source),
         };
         let Some(client) = route.client.clone() else {
-            references.drop_package_callees();
-            return route.service_warnings();
+            return (None, route.service_warnings());
         };
-        let asked = callee_declarations(
-            &client,
-            references.package_callees(),
-            &route.remote_packages,
-        );
-        match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
-            Ok(Ok(named)) => references.name_package_callees(|callee| named.declaration(callee)),
+        let asked = callee_declarations(&client, callees, &route.remote_packages);
+        let named = match tokio::time::timeout_at(deadline.at(), Box::pin(asked)).await {
+            Ok(Ok(named)) => Some(named),
             Ok(Err(error)) => {
                 route.discard_remote(&error);
-                references.drop_package_callees();
+                None
             }
             Err(source) => {
                 route.discard_remote(
@@ -2959,10 +2954,10 @@ impl RiftMcp {
                         .source(source)
                         .error(),
                 );
-                references.drop_package_callees();
+                None
             }
-        }
-        route.service_warnings()
+        };
+        (named, route.service_warnings())
     }
 
     /// Whether the captured source and configuration still match the publication.
@@ -3258,61 +3253,21 @@ impl RiftMcp {
         u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
     }
 
-    /// Lists the syntax nodes covering one UTF-8 byte position in one file,
-    /// outermost first. Each identity carries a witness, so an address taken
-    /// from this listing refuses cleanly once the file's bytes drift. `rev`
-    /// lists the nodes as of a version-control revision instead of the
-    /// current tree. If discovery is incomplete or a targeted read spends the
-    /// request's remaining time, the result has empty `nodes` and `source` and
-    /// carries `local_index_preparing`. A selected source path can answer
-    /// within that remaining time, with the same warning until the publication
-    /// records the path: workspace byte and declaration bounds remain unchecked.
-    /// Per-file refusals keep their typed errors. A visible path no syntax
-    /// provider parses refuses `capability_unavailable`, naming the extension.
+    /// Evaluates SPARQL Query over selected syntax facts.
+    ///
+    /// The server supplies `:` and `r:` vocabulary prefixes and standard RDF prefixes.
+    /// `SELECT`, `ASK`, `CONSTRUCT`, and `DESCRIBE` preserve RDF terms and projected fields.
+    /// Required unavailable facts prevent evaluation.
     #[tool]
     async fn nodes(
         &self,
-        Parameters(params): Parameters<NodesParams>,
-    ) -> Result<Json<NodesResult>, ToolFailure> {
-        if let Some(view) = &params.view {
-            return self.captured_nodes(&params, view).map(Json);
-        }
-        let rev = params.rev.clone();
-        if rev.is_some() {
-            return self.read_at(rev, move |reads| reads.nodes(params)).await;
-        }
-        let deadline = self.request_deadline().await;
-        let resolved = self
-            .published_workspace(wire::ErrorPhase::Read, deadline)
-            .await?;
-        let preparation = resolved.published.preparation.as_ref();
-        let path = rift_core::ProjectPath::new(params.path.0.clone()).map_err(|error| {
-            errors::server::read_invalid()
-                .field("path")
-                .violation(error.detail())
-                .cause(error)
-                .mcp()
-                .tool_failure(wire::ErrorPhase::Read)
-        })?;
-        if preparation.is_some_and(|preparation| preparation.total.is_none()) {
-            return Ok(Json(nodes_preparing_answer(&resolved)));
-        }
-        // A complete batch clears `preparation`; retained selected paths therefore carry
-        // the warning used by a deadline answer.
-        let selected_source = preparation.is_some_and(|preparation| {
-            preparation
-                .map_source_paths
-                .iter()
-                .any(|(path, _)| path.as_str() == params.path.0)
-        });
-        if selected_source && resolved.published.reads.file_record(&path).is_none() {
-            return self
-                .targeted_nodes_read(&resolved, deadline, move |reads| {
-                    reads.nodes_for_preparation(params)
-                })
-                .await;
-        }
-        self.current_tree_read(&resolved, false, move |reads| reads.nodes(params))
+        Parameters(params): Parameters<rift_protocol::query::QueryParams>,
+        extensions: rmcp::model::Extensions,
+    ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
+        let context = extensions.get::<std::sync::Arc<
+            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
+        >>();
+        self.graph_query_with_context(params, context.map(std::sync::Arc::as_ref))
             .await
     }
 
@@ -3338,6 +3293,25 @@ impl RiftMcp {
         let Some(rev) = rev else {
             return self.current_tree_read(&resolved, true, operation).await;
         };
+        let capture = self.revision_read_factory(&resolved.published, rev)?;
+        self.blocking
+            .run("revision workspace read", move || {
+                let reads = capture()?;
+                operation(&reads)
+            })
+            .await
+            .map(Json)
+            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
+    }
+
+    fn revision_read_factory(
+        &self,
+        published: &PublishedWorkspace,
+        rev: rift_protocol::read::RevisionId,
+    ) -> Result<
+        impl FnOnce() -> Result<Arc<ReadService>, RiftError> + Send + 'static + use<>,
+        ToolFailure,
+    > {
         let RevisionRead {
             root,
             limits,
@@ -3345,27 +3319,24 @@ impl RiftMcp {
             text_inclusion,
             languages,
             history,
-        } = self.revision_read(&resolved.published)?;
+        } = self.revision_read(published)?;
+        let owner = published.reads.owner().clone();
         let stored = self.history.as_ref().map(|lane| lane.stored().clone());
-        self.blocking
-            .run("revision workspace read", move || {
-                let reads = ReadService::at_revision_with_languages(
-                    &root,
-                    &rev,
-                    limits,
-                    &visibility,
-                    &text_inclusion,
-                    &languages,
-                    history,
-                )?;
-                if let Some(stored) = &stored {
-                    reads.attach_history_store(stored);
-                }
-                operation(&reads)
-            })
-            .await
-            .map(Json)
-            .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))
+        Ok(move || {
+            let reads = Arc::new(ReadService::at_revision_with_owner(
+                (&root, owner),
+                &rev,
+                limits,
+                &visibility,
+                &text_inclusion,
+                &languages,
+                history,
+            )?);
+            if let Some(stored) = &stored {
+                reads.attach_history_store(stored);
+            }
+            Ok(reads)
+        })
     }
 
     /// The workspace policy one read of committed source applies, derived once from the
@@ -3427,9 +3398,18 @@ impl RiftMcp {
             .run("current workspace read", move || operation(&reads))
             .await
             .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
-        if let Some(stale) = resolved.stale.clone() {
-            answer.warnings_mut().push(stale);
-        }
+        answer.warnings_mut().extend(Self::current_tree_warnings(
+            resolved,
+            include_local_preparation,
+        ));
+        Ok(Json(answer))
+    }
+
+    fn current_tree_warnings(
+        resolved: &ResolvedWorkspace,
+        include_local_preparation: bool,
+    ) -> Vec<ReadWarning> {
+        let mut warnings = resolved.stale.clone().into_iter().collect::<Vec<_>>();
         if include_local_preparation
             && let Some(warning) = resolved
                 .published
@@ -3437,47 +3417,9 @@ impl RiftMcp {
                 .as_ref()
                 .and_then(super::validation::LocalIndexPreparation::warning)
         {
-            answer.warnings_mut().push(warning);
+            warnings.push(warning);
         }
-        Ok(Json(answer))
-    }
-
-    /// Reads one selected source path while the rest of its workspace is still preparing.
-    /// Worker admission and parsing spend the same deadline as publication validation.
-    async fn targeted_nodes_read(
-        &self,
-        resolved: &ResolvedWorkspace,
-        deadline: RequestDeadline,
-        operation: impl FnOnce(&ReadService) -> Result<NodesResult, RiftError> + Send + 'static,
-    ) -> Result<Json<NodesResult>, ToolFailure> {
-        resolved
-            .published
-            .configuration
-            .accepted_for_tool(wire::ErrorPhase::Read)?;
-        let reads = Arc::clone(&resolved.published.reads);
-        let cancellation = self.validation.cancellation.child_token();
-        let timed_cancellation = cancellation.clone();
-        let work = self.blocking.run_with_cancellation(
-            "targeted node read",
-            cancellation,
-            move |cancellation| {
-                if cancellation.is_cancelled() {
-                    return errors::server::read_cancelled().fail();
-                }
-                operation(&reads)
-            },
-        );
-        match tokio::time::timeout_at(deadline.at(), work).await {
-            Ok(Ok(mut answer)) => {
-                answer.warnings.extend(nodes_preparing_warnings(resolved));
-                Ok(Json(answer))
-            }
-            Ok(Err(error)) => error.mcp().tool_failure(wire::ErrorPhase::Read).fail(),
-            Err(_) => {
-                timed_cancellation.cancel();
-                Ok(Json(nodes_preparing_answer(resolved)))
-            }
-        }
+        warnings
     }
 
     /// Returns one atomically published index and configuration policy.
@@ -4217,11 +4159,8 @@ impl ServerHandler for RiftMcp {
                     .into_call_tool_result();
             }
         };
-        let captured = matches!(
-            request.name.as_ref(),
-            "get_symbol" | "get_source" | "search"
-        )
-        .then(|| std::sync::Arc::new(std::sync::Mutex::new(expected)));
+        let captured = matches!(request.name.as_ref(), "get_symbol" | "nodes" | "search")
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(expected)));
         if let Some(captured) = &captured {
             let _ = context.extensions.insert(std::sync::Arc::clone(captured));
         }
@@ -4244,53 +4183,54 @@ impl ServerHandler for RiftMcp {
         let _ = context.extensions.insert(operation.clone());
         let answered;
         let elapsed = rift_tracing::measure_elapsed!("tools/call", {
-            answered = span
-                .instrument(async {
-                    rift_tracing::debug!("tool request started");
-                    if request.name == "get_symbol" {
-                        let (published, _) = read_published(&self.published).await.snapshot();
-                        let limit = 2.min(self.limits.results_max());
-                        let examples = match published.reads.canonical_examples(limit) {
-                            Ok(examples) => examples,
-                            Err(error) => {
-                                operation.record("error.type", error.slug().as_str());
-                                return error
-                                    .mcp()
-                                    .tool_failure(wire::ErrorPhase::Read)
-                                    .into_call_tool_result();
-                            }
-                        };
-                        let _ = context.extensions.insert(SymbolExamples(examples));
-                    }
-                    let mut result = if request.name == "search_candidates" {
-                        self.search_candidates_call(request, &operation).await
-                    } else {
-                        let routed = ToolCallContext::new(self, request, context);
-                        match self.tool_router.call(routed).await {
-                            Err(error) => {
-                                let failure = parameter_failure.take().map_or_else(
-                                    || ToolFailure::from(error),
-                                    |failure| {
-                                        ToolFailure::Registered(failure, wire::ErrorPhase::Read)
-                                    },
-                                );
-                                if let ToolFailure::Registered(failure, _) = &failure {
-                                    operation
-                                        .record("error.type", failure.registered().slug().as_str());
-                                }
-                                failure.into_call_tool_result()
-                            }
-                            Ok(response) => Ok(response),
+            answered = Box::pin(span.instrument(async {
+                rift_tracing::debug!("tool request started");
+                if request.name == "get_symbol" {
+                    let (published, _) = read_published(&self.published).await.snapshot();
+                    let limit = 2.min(self.limits.results_max());
+                    let examples = match published.reads.canonical_examples(limit) {
+                        Ok(examples) => examples,
+                        Err(error) => {
+                            operation.record("error.type", error.slug().as_str());
+                            return error
+                                .mcp()
+                                .tool_failure(wire::ErrorPhase::Read)
+                                .into_call_tool_result();
                         }
                     };
-                    candidates::write_captured_context(&mut result, captured.as_deref());
-                    rift_tracing::debug!(
-                        is_error = Ending::of_tool_call(&result) != Ending::Answered,
-                        "tool request completed"
-                    );
-                    result
-                })
-                .await;
+                    let _ = context.extensions.insert(SymbolExamples(examples));
+                }
+                let mut result = if request.name == "search_candidates" {
+                    self.search_candidates_call(request, &operation).await
+                } else if request.name == "query_candidates" {
+                    Self::query_candidates_call(request)
+                } else if request.name == "query_facts" {
+                    self.query_facts_call(request).await
+                } else {
+                    let routed = ToolCallContext::new(self, request, context);
+                    match self.tool_router.call(routed).await {
+                        Err(error) => {
+                            let failure = parameter_failure.take().map_or_else(
+                                || ToolFailure::from(error),
+                                |failure| ToolFailure::Registered(failure, wire::ErrorPhase::Read),
+                            );
+                            if let ToolFailure::Registered(failure, _) = &failure {
+                                operation
+                                    .record("error.type", failure.registered().slug().as_str());
+                            }
+                            failure.into_call_tool_result()
+                        }
+                        Ok(response) => Ok(response),
+                    }
+                };
+                candidates::write_captured_context(&mut result, captured.as_deref());
+                rift_tracing::debug!(
+                    is_error = Ending::of_tool_call(&result) != Ending::Answered,
+                    "tool request completed"
+                );
+                result
+            }))
+            .await;
         })
         .ok()
         .map(|((), measurement)| measurement.elapsed());
@@ -4443,7 +4383,7 @@ impl ServerHandler for RiftMcp {
         .with_server_info(Implementation::new("rift", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "Read the current workspace: get_symbol and search find \
-             declarations, nodes lists syntax nodes at a byte position. \
+             declarations, nodes evaluates SPARQL Query over syntax facts. \
              The rift://workspace resource reads effective configuration \
              and source files. `rift server logs` reads the server's recorded diagnostics, \
              including while a tool refuses.",
@@ -5019,9 +4959,7 @@ done
         VectorSearchConfiguration,
     };
     use rift_protocol::lock::ProductIdentity;
-    use rift_protocol::read::{
-        Digest, NodesParams, NodesResult, ReadWarning, SearchParams, SearchResult,
-    };
+    use rift_protocol::read::{ReadWarning, SearchParams, SearchResult};
     use rift_ranking::{RankingInputKind, RankingWeights};
     use rift_search::{ModelSource, RevisionScoped, VectorReadiness};
     use rift_server::{LspProcessKey, StoreAnswer};
@@ -5133,37 +5071,12 @@ done
         }
     }
 
-    async fn served_nodes(
-        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-        path: &str,
-    ) -> TestResult<NodesResult> {
-        let request = CallToolRequestParams::new("nodes")
-            .with_arguments(arguments(&json!({"path": path, "position": 8}))?);
-        let answer = client.call_tool(request).await?;
-        Ok(serde_json::from_value(
-            answer.structured_content.ok_or("structured node answer")?,
-        )?)
-    }
-
-    fn cold_nodes(
-        root: &std::path::Path,
-        configuration: &crate::validation::ConfigurationState,
-        params: NodesParams,
-    ) -> TestResult<NodesResult> {
-        let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
-        let visibility = configuration.source_visibility();
-        let text_inclusion = configuration.text_inclusion();
-        let languages = configuration.language_file_selections();
-        let reads = rift_server::ReadService::build_with_languages(
-            root,
-            limits,
-            &visibility,
-            &text_inclusion,
-            &languages,
-            configuration.history_configuration(),
-            configuration.dependencies_configuration(),
-        )?;
-        Ok(reads.nodes(params)?)
+    fn nodes_query_request() -> TestResult<CallToolRequestParams> {
+        Ok(
+            CallToolRequestParams::new("nodes").with_arguments(arguments(&json!({
+                "query":"SELECT ?node { ?node a :Node; :unit <rift://source/project/src/lib.rs> }"
+            }))?),
+        )
     }
 
     async fn assert_answers_before_discovery(
@@ -5171,59 +5084,45 @@ done
         request: &CallToolRequestParams,
     ) -> TestResult {
         let answer = client.call_tool(request.clone()).await?;
-        let empty: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured symbol answer")?,
-        )?;
-        assert!(empty.results.is_empty());
-        assert!(empty.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: None,
-                ready_in: None,
-                ..
-            }
-        )));
+        assert_query_preparing(&answer)?;
         for uri in ["rift://map", "rift://workspace"] {
             let value = preparation_resource(client, uri).await?;
             assert_eq!(value["warnings"][0]["code"], "local_index_preparing");
             assert_eq!(value["warnings"][0]["prepared"], 0);
             assert!(value["warnings"][0].get("total").is_none());
         }
-        let before_discovery = served_nodes(client, "src/lib.rs").await?;
-        assert!(before_discovery.nodes.is_empty());
-        assert!(before_discovery.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: None,
-                ..
-            }
-        )));
+        let before_discovery = client.call_tool(nodes_query_request()?).await?;
+        assert_query_preparing(&before_discovery)?;
         let invalid = client
             .call_tool(
                 CallToolRequestParams::new("nodes")
-                    .with_arguments(arguments(&json!({"path": "../outside.rs", "position": 8}))?),
+                    .with_arguments(arguments(&json!({"query":42}))?),
             )
             .await?;
         let text = assert_error_result(&invalid, "invalid_request")?;
         assert!(
-            text.contains("the request does not match the documented form: field path"),
+            text.contains("tool arguments do not match the served schema:"),
             "{text}"
         );
-        assert!(
-            text.lines().any(|line| {
-                line.starts_with("\t\t") && line.contains("project path contains a dot segment")
-            }),
-            "{text}"
-        );
+        assert!(text.contains("field query, tool nodes"), "{text}");
+        assert!(text.contains("rift.mcp.parameter_invalid"), "{text}");
+        Ok(())
+    }
+
+    fn assert_query_preparing(answer: &rmcp::model::CallToolResult) -> TestResult {
+        let structured = answer
+            .structured_content
+            .as_ref()
+            .ok_or("structured query refusal")?;
+        assert_eq!(structured["outcome"], "unavailable", "{structured}");
+        assert_eq!(structured["reason"], "index_preparing", "{structured}");
+        assert!(structured.get("answer").is_none(), "{structured}");
         Ok(())
     }
 
     #[tokio::test]
-    async fn preparation_serves_empty_answers_before_discovery_then_complete_facts() -> TestResult {
+    async fn preparation_refuses_queries_before_discovery_then_serves_complete_facts() -> TestResult
+    {
         let (_directory, assembled) = starting_fixture().await?;
         let server = assembled.server.clone();
         let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
@@ -5236,7 +5135,7 @@ done
         });
         let client = ().serve(client_transport).await?;
         let request = CallToolRequestParams::new("search").with_arguments(arguments(
-            &json!({"pattern": "beacon", "target": "symbol", "scope": "local"}),
+            &json!({"query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name . FILTER(?name = \"beacon\") }"}),
         )?);
         assert_answers_before_discovery(&client, &request).await?;
         let initial = crate::validation::discover_initial_workspace(&assembled.context)
@@ -5252,23 +5151,18 @@ done
         assert_eq!(map["modules"][0]["files"], 1);
         assert_eq!(map["modules"][0]["symbols"], 0);
 
-        let nodes = served_nodes(&client, "src/lib.rs").await?;
-        assert!(!nodes.nodes.is_empty());
-        assert!(nodes.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: Some(2),
-                ..
-            }
-        )));
+        let nodes = client.call_tool(nodes_query_request()?).await?;
+        assert_query_preparing(&nodes)?;
 
         let answer = client.call_tool(request.clone()).await?;
-        let partial: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured partial symbol answer")?,
-        )?;
+        assert_query_preparing(&answer)?;
+        let partial = assembled
+            .server
+            .search_result(serde_json::from_value(
+                json!({"pattern": "beacon", "target": "symbol", "scope": "local"}),
+            )?)
+            .await?
+            .0;
         assert!(partial.results.is_empty());
         assert!(partial.warnings.iter().any(|warning| matches!(
             warning,
@@ -5280,17 +5174,28 @@ done
         )));
 
         crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
-        let complete_nodes = served_nodes(&client, "src/lib.rs").await?;
-        assert_eq!(nodes.nodes, complete_nodes.nodes);
-        assert_eq!(nodes.source, complete_nodes.source);
+        let complete_nodes = client.call_tool(nodes_query_request()?).await?;
+        let complete_nodes: rift_protocol::query::QueryResult = serde_json::from_value(
+            complete_nodes
+                .structured_content
+                .ok_or("structured node query answer")?,
+        )?;
+        let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } = complete_nodes.answer
+        else {
+            return Err("complete node query must return bindings".into());
+        };
+        assert!(!bindings.is_empty());
         assert!(complete_nodes.warnings.is_empty());
         let answer = client.call_tool(request).await?;
-        let complete: SearchResult = serde_json::from_value(
+        let complete: rift_protocol::query::QueryResult = serde_json::from_value(
             answer
                 .structured_content
                 .ok_or("structured symbol answer")?,
         )?;
-        assert_eq!(complete.results.len(), 1);
+        let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } = complete.answer else {
+            return Err("complete query must return bindings".into());
+        };
+        assert_eq!(bindings.len(), 1);
         assert!(
             !complete
                 .warnings
@@ -5359,34 +5264,7 @@ done
         Ok(())
     }
 
-    #[tokio::test]
-    async fn partial_name_hit_warns_until_another_matching_file_is_prepared() -> TestResult {
-        let (directory, assembled) = starting_fixture().await?;
-        fs::write(directory.path().join("src/more.rs"), "pub fn beacon() {}\n")?;
-        crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("initial discovery was cancelled")?;
-        // Issue #491: TOML configuration is a selected source before either Rust file.
-        publish_first_matching_source_for_preparation(&assembled.context).await?;
-        let server = assembled.server.clone();
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let serving = tokio::spawn(async move {
-            let service = server
-                .serve(server_transport)
-                .await
-                .expect("server initializes");
-            service.waiting().await.expect("server stops")
-        });
-        let client = ().serve(client_transport).await?;
-        let request = CallToolRequestParams::new("search").with_arguments(arguments(&json!({
-            "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
-        }))?);
-        let answer = client.call_tool(request.clone()).await?;
-        let partial: SearchResult = serde_json::from_value(
-            answer
-                .structured_content
-                .ok_or("structured partial symbol answer")?,
-        )?;
+    fn assert_partial_name_preparation(partial: &SearchResult) {
         assert_eq!(partial.results.len(), 1);
         assert_eq!(
             partial.results[0].path.as_ref().map(|path| path.0.as_str()),
@@ -5413,6 +5291,37 @@ done
             1,
             "an existing name hit does not finish the selected local scope"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_name_hit_warns_until_another_matching_file_is_prepared() -> TestResult {
+        let (directory, assembled) = starting_fixture().await?;
+        fs::write(directory.path().join("src/more.rs"), "pub fn beacon() {}\n")?;
+        crate::validation::discover_initial_workspace(&assembled.context)
+            .await?
+            .ok_or("initial discovery was cancelled")?;
+        // Issue #491: TOML configuration is a selected source before either Rust file.
+        publish_first_matching_source_for_preparation(&assembled.context).await?;
+        let server = assembled.server.clone();
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let serving = tokio::spawn(async move {
+            let service = server
+                .serve(server_transport)
+                .await
+                .expect("server initializes");
+            service.waiting().await.expect("server stops")
+        });
+        let client = ().serve(client_transport).await?;
+        let parameters: SearchParams = serde_json::from_value(json!({
+            "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
+        }))?;
+        let request = CallToolRequestParams::new("search").with_arguments(arguments(&json!({
+            "query": "SELECT ?symbol ?name ?path ?source { ?symbol a :Symbol; :name ?name; :declarations ?declaration . ?declaration :path ?path; :source ?source . FILTER(?name = \"beacon\") } ORDER BY ?path"
+        }))?);
+        let answer = client.call_tool(request.clone()).await?;
+        assert_query_preparing(&answer)?;
+        let partial = assembled.server.search_result(parameters.clone()).await?.0;
+        assert_partial_name_preparation(&partial);
         assembled.context.validation.observe_whole_workspace()?;
         let pending = assembled.context.validation.take_pending();
         assert_eq!(
@@ -5420,11 +5329,16 @@ done
             RebuildOutcome::Published
         );
         let answer = client.call_tool(request).await?;
-        let complete: SearchResult = serde_json::from_value(
+        let projected: rift_protocol::query::QueryResult = serde_json::from_value(
             answer
                 .structured_content
                 .ok_or("structured complete symbol answer")?,
         )?;
+        let rift_protocol::query::QueryAnswer::Bindings { bindings, .. } = projected.answer else {
+            return Err("complete query must return bindings".into());
+        };
+        assert_eq!(bindings.len(), 2);
+        let complete = assembled.server.search_result(parameters).await?.0;
         let mut paths: Vec<_> = complete
             .results
             .iter()
@@ -5457,267 +5371,6 @@ done
         );
         client.cancel().await?;
         serving.await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn targeted_nodes_warn_until_workspace_declaration_acceptance_finishes() -> TestResult {
-        use std::fmt::Write as _;
-
-        let directory = tempfile::tempdir()?;
-        let mut source = String::new();
-        for number in 0..6_000 {
-            writeln!(source, "pub fn function_{number}() {{}}")?;
-        }
-        fs::write(directory.path().join("a.rs"), &source)?;
-        fs::write(directory.path().join("b.rs"), &source)?;
-        super::hermetic_workspace(directory.path(), "[source]\ndeclarations = 10000\n")?;
-        let assembled = RiftMcp::assemble(
-            super::absolute_root(directory.path())?,
-            WorkspaceIndexLimits::default(),
-            None,
-            crate::identity::BuildCheckout::Unversioned,
-            unwatched,
-            LexicalLane::spawn,
-            None,
-        )
-        .await?;
-        let initial = crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("discovery was cancelled")?;
-        let params: NodesParams = serde_json::from_value(json!({"path": "b.rs", "position": 8}))?;
-        let answer = assembled.server.nodes(Parameters(params.clone())).await?.0;
-        assert!(!answer.nodes.is_empty());
-        assert_eq!(answer.nodes.len(), answer.source.len());
-        assert!(answer.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: 0,
-                total: Some(3),
-                ..
-            }
-        )));
-        crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
-        let error = assembled
-            .server
-            .nodes(Parameters(params))
-            .await
-            .err()
-            .ok_or("the complete index must refuse a path beyond its declaration bound")?;
-        assert_eq!(
-            rmcp::ErrorData::from(error).data.ok_or("typed refusal")?["code"],
-            "content_unavailable"
-        );
-        let published = Arc::clone(&assembled.server.published.read().await.current);
-        assert!(published.preparation.is_none());
-        assert!(matches!(
-            published.reads.file_warning(&CoreProjectPath::new("b.rs")?),
-            Some(rift_index::WorkspaceIndexWarning::DeclarationsBeyondBound(
-                _
-            ))
-        ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn nodes_deadline_cancels_queued_targeted_parse_and_answers_preparing() -> TestResult {
-        let directory = tempfile::tempdir()?;
-        fs::create_dir(directory.path().join("src"))?;
-        fs::write(directory.path().join("src/lib.rs"), "pub fn beacon() {}\n")?;
-        super::hermetic_workspace(
-            directory.path(),
-            "[server]\nreadiness_timeout = \"1s\"\nworker_queue_timeout = \"2s\"\n",
-        )?;
-        let assembled = RiftMcp::assemble(
-            super::absolute_root(directory.path())?,
-            WorkspaceIndexLimits::default(),
-            None,
-            crate::identity::BuildCheckout::Unversioned,
-            unwatched,
-            LexicalLane::spawn,
-            None,
-        )
-        .await?;
-        let server = assembled.server.clone();
-        crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("initial discovery was cancelled")?;
-        let published = Arc::clone(&server.published.read().await.current);
-        let configuration = published.configuration.clone();
-        let params: NodesParams =
-            serde_json::from_value(json!({"path": "src/lib.rs", "position": 8}))?;
-        let expected = cold_nodes(directory.path(), &configuration, params.clone())?;
-        server.force_capture(|current| {
-            Ok((
-                current.reads.workspace_digests(),
-                current.configuration.fingerprint,
-            ))
-        });
-        let permits_max = u32::try_from(server.blocking.operations.available_permits())?;
-        assert!(permits_max > 0, "worker pool has an admission permit");
-        let held = Arc::clone(&server.blocking.operations)
-            .acquire_many_owned(permits_max)
-            .await?;
-
-        assert_queued_nodes_timeout(server, params, expected, permits_max, held).await
-    }
-
-    async fn assert_queued_nodes_timeout(
-        server: RiftMcp,
-        params: NodesParams,
-        expected: NodesResult,
-        permits_max: u32,
-        held: tokio::sync::OwnedSemaphorePermit,
-    ) -> TestResult {
-        let published = Arc::clone(&server.published.read().await.current);
-        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
-        let serving_server = server.clone();
-        let serving = tokio::spawn(async move {
-            let service = serving_server
-                .serve(server_transport)
-                .await
-                .expect("server initializes");
-            service.waiting().await.expect("server stops")
-        });
-        let client = ().serve(client_transport).await?;
-        let response = tokio::time::timeout(
-            Duration::from_millis(1_500),
-            served_nodes(&client, "src/lib.rs"),
-        )
-        .await;
-        if response.is_err() {
-            drop(held);
-            let _ = tokio::time::timeout(Duration::from_secs(3), client.cancel()).await;
-            let _ = tokio::time::timeout(Duration::from_secs(3), serving).await;
-            return Err("queued nodes request must spend its 1s deadline".into());
-        }
-        let nodes = response??;
-        assert_empty_preparing_nodes(&nodes, 0, Some(2));
-        assert_stale_nodes_timeout_warning(&server, &published, params.clone()).await?;
-        drop(held);
-        let after_timeout = Arc::clone(&server.published.read().await.current);
-        assert!(Arc::ptr_eq(&published, &after_timeout));
-        let permits =
-            Arc::clone(&server.blocking.operations).try_acquire_many_owned(permits_max)?;
-        drop(permits);
-        let retried =
-            tokio::time::timeout(Duration::from_secs(3), served_nodes(&client, "src/lib.rs"))
-                .await??;
-        let mut expected = expected;
-        expected.warnings.extend(super::nodes_preparing_warnings(
-            &super::ResolvedWorkspace::current(published, Duration::ZERO),
-        ));
-        assert_eq!(retried, expected);
-        tokio::time::timeout(Duration::from_secs(3), client.cancel()).await??;
-        tokio::time::timeout(Duration::from_secs(3), serving).await??;
-        Ok(())
-    }
-
-    async fn assert_stale_nodes_timeout_warning(
-        server: &RiftMcp,
-        published: &Arc<PublishedWorkspace>,
-        params: NodesParams,
-    ) -> TestResult {
-        let stale_warning = ReadWarning::StaleIndex {
-            index_tree_revision: Digest("11111111".to_owned()),
-            captured_tree_revision: Digest("22222222".to_owned()),
-            detail: "captured source moved".to_owned(),
-        };
-        let stale = super::ResolvedWorkspace {
-            published: Arc::clone(published),
-            stale: Some(stale_warning.clone()),
-            capture_elapsed: Duration::ZERO,
-        };
-        let stale_answer = server
-            .targeted_nodes_read(
-                &stale,
-                RequestDeadline::starting(Duration::from_millis(20)),
-                {
-                    let params = params.clone();
-                    move |reads| reads.nodes_for_preparation(params)
-                },
-            )
-            .await?
-            .0;
-        assert!(stale_answer.warnings.contains(&stale_warning));
-        assert_empty_preparing_nodes(&stale_answer, 0, Some(2));
-        Ok(())
-    }
-
-    fn assert_empty_preparing_nodes(answer: &NodesResult, prepared: u64, total: Option<u64>) {
-        assert!(answer.nodes.is_empty());
-        assert!(answer.source.is_empty());
-        assert!(answer.warnings.iter().any(|warning| matches!(
-            warning,
-            ReadWarning::LocalIndexPreparing {
-                prepared: actual_prepared,
-                total: actual_total,
-                ..
-            } if *actual_prepared == prepared && *actual_total == total
-        )));
-    }
-
-    #[tokio::test]
-    async fn nodes_deadline_keeps_an_admitted_parse_owned_until_it_finishes() -> TestResult {
-        let (_directory, assembled) = starting_fixture().await?;
-        crate::validation::discover_initial_workspace(&assembled.context)
-            .await?
-            .ok_or("initial discovery was cancelled")?;
-        let server = assembled.server.clone();
-        let published = Arc::clone(&server.published.read().await.current);
-        let resolved = super::ResolvedWorkspace::current(Arc::clone(&published), Duration::ZERO);
-        let params: NodesParams =
-            serde_json::from_value(json!({"path": "src/lib.rs", "position": 8}))?;
-        let permits_max = u32::try_from(server.blocking.operations.available_permits())?;
-        assert!(permits_max > 0, "worker pool has an admission permit");
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
-        let deadline = RequestDeadline::starting(Duration::from_secs(1));
-        let worker_server = server.clone();
-        let read = tokio::spawn(async move {
-            worker_server
-                .targeted_nodes_read(&resolved, deadline, move |reads| {
-                    started_tx.send(()).expect("test waits for admitted work");
-                    release_rx
-                        .recv_timeout(Duration::from_secs(5))
-                        .expect("test releases admitted work");
-                    reads.nodes_for_preparation(params)
-                })
-                .await
-        });
-        tokio::task::spawn_blocking(move || started_rx.recv_timeout(Duration::from_secs(2)))
-            .await??;
-        let joined = tokio::time::timeout(Duration::from_secs(2), read).await??;
-        let answer = joined?.0;
-        assert_empty_preparing_nodes(&answer, 0, Some(2));
-        assert_eq!(
-            u32::try_from(server.blocking.operations.available_permits())?,
-            permits_max - 1,
-        );
-        assert!(Arc::ptr_eq(
-            &published,
-            &server.published.read().await.current
-        ));
-
-        release_tx
-            .send(())
-            .expect("admitted work still waits at gate");
-        let permits = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Ok(permit) =
-                    Arc::clone(&server.blocking.operations).try_acquire_many_owned(permits_max)
-                {
-                    break permit;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await?;
-        drop(permits);
-        assert!(Arc::ptr_eq(
-            &published,
-            &server.published.read().await.current
-        ));
         Ok(())
     }
 
@@ -6041,43 +5694,24 @@ done
         Ok((directory, server, id))
     }
 
-    /// Reads physical declarations through the public pattern search without requiring identity.
+    /// Reads physical declarations through pattern search without requiring identity.
     async fn search_symbols(server: &RiftMcp, name: &str) -> Result<SearchResult, rmcp::ErrorData> {
         let params = serde_json::from_value(json!({
             "pattern": name, "target": "symbol", "scope": "local", "include": ["source"]
         }))
         .expect("test search parameters must deserialize");
         server
-            .answered_search(Parameters(params))
+            .search_result(params)
             .await
             .map(|result| result.0)
             .map_err(rmcp::ErrorData::from)
-    }
-
-    impl RiftMcp {
-        async fn answered_search(
-            &self,
-            params: Parameters<SearchParams>,
-        ) -> Result<super::Json<SearchResult>, super::ToolFailure> {
-            let super::Json(answer) = self
-                .search(params, rmcp::model::Extensions::default())
-                .await?;
-            match answer {
-                rift_protocol::search_read::SearchReadResult::Results(answer) => {
-                    Ok(super::Json(*answer))
-                }
-                rift_protocol::search_read::SearchReadResult::Unavailable(answer) => {
-                    panic!("this search must return results: {answer:?}")
-                }
-            }
-        }
     }
 
     async fn run_search(server: &RiftMcp, query: &str) -> Result<SearchResult, rmcp::ErrorData> {
         let params: SearchParams = serde_json::from_value(json!({"query": query}))
             .expect("test search parameters must deserialize");
         server
-            .answered_search(Parameters(params))
+            .search_result(params)
             .await
             .map(|result| result.0)
             .map_err(rmcp::ErrorData::from)
@@ -7172,7 +6806,7 @@ done
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["get_source", "get_symbol", "nodes", "search"]
+            ["get_symbol", "nodes", "search"]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 
@@ -7198,62 +6832,91 @@ done
         assert!(structured["view"]["id"].as_str().is_some());
 
         let unit = project_declaration_unit(&declarations[0])?;
-        let source = client
-            .call_tool(
-                CallToolRequestParams::new("get_source").with_arguments(arguments(&json!({
-                    "unit": unit,
-                    "view": structured["view"]["id"]
-                }))?),
-            )
-            .await?;
-        let source_response = format!("{source:?}");
-        let source = source
-            .structured_content
-            .ok_or_else(|| format!("get_source returns structured content: {source_response}"))?;
-        assert_eq!(source["outcome"], "found");
-        assert_eq!(source["source"]["text"], "pub fn beacon() {}\n");
-        assert_eq!(source["view"], structured["view"]);
+        assert_surface_source(&client, &structured, &unit).await?;
 
         let search = client
             .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "beacon"}))?),
+                CallToolRequestParams::new("search").with_arguments(arguments(
+                    &json!({"query": "SELECT ?symbol { ?symbol a :Symbol; :name \"beacon\" }"}),
+                )?),
             )
             .await?;
         assert!(
             !search
                 .structured_content
-                .ok_or("search must return structured content")?["results"]
+                .ok_or("search must return structured content")?["answer"]["bindings"]
                 .as_array()
-                .ok_or("search results must be an array")?
+                .ok_or("SELECT bindings must be an array")?
                 .is_empty()
         );
 
+        let nodes_query = format!(
+            "SELECT ?node ?id {{ ?node a :Node; :unit <{unit}>; :symbol <{}>; :id ?id; :range [ :start 0; :end 18 ] }}",
+            id.as_str()
+        );
         let nodes = client
             .call_tool(
                 CallToolRequestParams::new("nodes")
-                    .with_arguments(arguments(&json!({"path": "lib.rs", "position": 8}))?),
+                    .with_arguments(arguments(&json!({"query": nodes_query}))?),
             )
             .await?;
         let structured = nodes
             .structured_content
             .ok_or("nodes must return structured content")?;
-        let listed = structured["nodes"]
+        assert_eq!(structured["answer"]["result"], "bindings");
+        let listed = structured["answer"]["bindings"]
             .as_array()
-            .ok_or("nodes must be an array")?;
-        assert!(
-            !listed.is_empty(),
-            "position 8 sits inside `pub fn beacon`, so at least one node covers it"
+            .ok_or("node bindings must be an array")?;
+        assert_eq!(
+            listed.len(),
+            1,
+            "original function node retains its semantic association"
         );
-        let witness_suffix = has_witness_fragment(listed[0]["id"].as_str().unwrap_or_default());
+        let node_id = listed[0]["id"]["value"]
+            .as_str()
+            .ok_or("node identity literal")?;
         assert!(
-            witness_suffix,
-            "every listed node id must end in an eight-hex-character witness: {}",
-            listed[0]["id"]
+            has_witness_fragment(node_id),
+            "every listed node id must end in an eight-hex-character witness: {node_id}"
         );
 
         client.cancel().await?;
         server_task.await?;
+        Ok(())
+    }
+
+    async fn assert_surface_source(
+        client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+        structured: &serde_json::Value,
+        unit: &str,
+    ) -> TestResult {
+        let original_view = structured["view"]["id"].as_str().ok_or("symbol view id")?;
+        let selected_view = oxigraph::model::Literal::from(original_view);
+        let source_query = format!(
+            "SELECT ?outcome ?text ?source_view ?expires {{ SERVICE :source {{ ?read :unit <{unit}>; :view {selected_view}; :outcome ?outcome; :view [ :id ?source_view; :expires_at ?expires ] . OPTIONAL {{ ?read :source [ :text ?text ] }} }} }}"
+        );
+        let source = client
+            .call_tool(
+                CallToolRequestParams::new("search")
+                    .with_arguments(arguments(&json!({"query": source_query}))?),
+            )
+            .await?;
+        let source_response = format!("{source:?}");
+        let source = source
+            .structured_content
+            .ok_or_else(|| format!("source query returns structured content: {source_response}"))?;
+        assert_eq!(source["answer"]["result"], "bindings");
+        let rows = source["answer"]["bindings"]
+            .as_array()
+            .ok_or("source bindings")?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["outcome"]["value"], "found");
+        assert_eq!(rows[0]["text"]["value"], "pub fn beacon() {}\n");
+        assert_eq!(rows[0]["source_view"]["value"], original_view);
+        assert_eq!(
+            rows[0]["expires"]["value"],
+            structured["view"]["expires_at"]
+        );
         Ok(())
     }
 
@@ -7348,7 +7011,7 @@ done
         // returned before the tier could answer. Poll for the file hit under a bound: the
         // same pass carries the symbol hit asserted below.
         let structured = search_until_hit(client.peer(), "replace all units", "guide.txt").await?;
-        let results = structured["results"]
+        let results = structured["answer"]["bindings"]
             .as_array()
             .ok_or("results must be an array")?;
 
@@ -7357,10 +7020,17 @@ done
         let file_hit = results
             .iter()
             .find(|hit| {
-                hit["hit"]["target"] == "documentation" && hit["path"] == json!("guide.txt")
+                hit["target"]["value"] == "documentation" && hit["path"]["value"] == "guide.txt"
             })
             .ok_or_else(|| format!("guide.txt documentation hit missing: {structured:#}"))?;
-        assert_eq!(file_hit["matched_by"], json!(["content"]));
+        assert_eq!(file_hit["matched_by"]["value"], "content");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|row| row["path"]["value"] == "guide.txt")
+                .count(),
+            1
+        );
 
         // "units" appears in `scale_value`'s doc comment and in no name of its own, so the
         // documentation column is what carried the query into this declaration. Its source
@@ -7368,24 +7038,27 @@ done
         // declaration already placed, so `content` does not ride along.
         let symbol_hit = results
             .iter()
-            .find(|hit| {
-                hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
-            })
+            .find(|hit| hit["target"]["value"] == "symbol" && hit["name"]["value"] == "scale_value")
             .ok_or_else(|| format!("scale_value doc-comment hit missing: {structured:#}"))?;
-        assert_eq!(symbol_hit["matched_by"], json!(["documentation"]));
+        assert_eq!(symbol_hit["matched_by"]["value"], "documentation");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|row| row["name"]["value"] == "scale_value")
+                .count(),
+            1
+        );
 
         // The declaration's own name places the same declaration under a name hit.
         let named = search_until_hit(client.peer(), "scale_value", "lib.rs").await?;
-        let name_hit = named["results"]
+        let name_hit = named["answer"]["bindings"]
             .as_array()
             .ok_or("results must be an array")?
             .iter()
-            .find(|hit| {
-                hit["hit"]["target"] == "symbol" && hit["hit"]["symbol"]["name"] == "scale_value"
-            })
+            .find(|hit| hit["target"]["value"] == "symbol" && hit["name"]["value"] == "scale_value")
             .ok_or_else(|| format!("scale_value name hit missing: {named:#}"))?;
         assert_eq!(
-            name_hit["matched_by"][0],
+            name_hit["matched_by"]["value"],
             json!("name"),
             "the declaration's own name places it first among the matched columns: \
              {name_hit:#}"
@@ -7608,7 +7281,8 @@ done
             text,
             "1 error\n\tinvalid_request · retry never\n\
              \t\tthe request does not match the documented form: field query, \
-             violation query is empty: subject query; \
+             violation Syntax error at line 1 column 1: found end of input \
+             expected BASE, PREFIX, SELECT, CONSTRUCT, DESCRIBE, or ASK; \
              correct the reported field and resend the request\n\
              \t\trift.server.read_invalid\n"
         );
@@ -7637,7 +7311,7 @@ done
         assert_eq!(
             text,
             "1 error\n\tinvalid_request · retry never\n\
-             \t\tthe request does not match the documented form: field limit, \
+             \t\tthe request does not match the documented form: field declaration_limit, \
              violation zero; \
              correct the reported field and resend the request\n\
              \t\trift.server.read_invalid\n"
@@ -7648,23 +7322,20 @@ done
     /// A member sent in the wrong shape is refused by the member's own name,
     /// with an example of the value it takes.
     ///
-    /// The refusal never names a Rust type: `PathSelector` is a name only this
-    /// repository holds, and a caller reading it has nothing to look up. The
-    /// example comes from the same schema the caller lists, so it can be sent
-    /// back verbatim.
+    /// The refusal names the query field and shows the same example the caller lists.
     #[tokio::test]
     async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
         let result = failing_call(
-            &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
+            &json!({"query": ["SELECT ?symbol { ?symbol a :Symbol }"]}),
             "search",
         )
         .await?;
         let text = assert_error_result(&result, "invalid_request")?;
         assert!(
             text.contains(
-                "tool arguments do not match the served schema: accepted exclude, force_include, \
-                 include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
-                 field paths, tool search; \
+                "tool arguments do not match the served schema: \
+                 example {\"query\":\"SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } LIMIT 20\"}, \
+                 field query, tool search; \
                  correct the reported field and resend the request"
             ),
             "{text}"
@@ -7684,7 +7355,7 @@ done
             "{text}"
         );
         assert!(text.contains("tool search"), "{text}");
-        assert!(text.contains("paths"), "{text}");
+        assert!(text.contains("accepted language, query"), "{text}");
         assert!(text.contains("example {"), "{text}");
         assert!(
             !text.contains("unknown field") && !text.contains("struct"),
@@ -7696,13 +7367,10 @@ done
     /// A closed set's member is refused by listing the values it takes.
     #[tokio::test]
     async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
-        let result = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let result = failing_call(&json!({"query": "ASK {}", "language": "sql"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(
-            text.contains("accepted all, commit, documentation, file, symbol"),
-            "{text}"
-        );
-        assert!(text.contains("field target"), "{text}");
+        assert!(text.contains("accepted sparql"), "{text}");
+        assert!(text.contains("field language"), "{text}");
         assert!(text.contains("tool search"), "{text}");
         assert!(
             !text.contains("unknown variant"),
@@ -8026,7 +7694,7 @@ done
         let root = directory.path().to_path_buf();
         server.force_capture_after(CAPTURE, move |current| captured_tree(&root, current));
         let answer = server
-            .answered_search(Parameters(params))
+            .search_result(params)
             .await
             .map_err(|refusal| format!("the walk must answer inside the budget: {refusal:?}"))?
             .0;
@@ -8413,13 +8081,10 @@ done
 
         let lagging = beacon_history(&server).await?;
         let search: SearchParams = serde_json::from_value(json!({"query": "beacon"}))?;
-        let searched = tokio::time::timeout(
-            UNWAITED_READ_MAX,
-            server.answered_search(Parameters(search)),
-        )
-        .await
-        .map_err(|_| "a search waits on no fill")??
-        .0;
+        let searched = tokio::time::timeout(UNWAITED_READ_MAX, server.search_result(search))
+            .await
+            .map_err(|_| "a search waits on no fill")??
+            .0;
 
         assert!(
             !lagging.complete,
@@ -8446,25 +8111,15 @@ done
         Ok(())
     }
 
-    /// One commit search for `beacon`, validated against the output schema the router serves
-    /// for `search`.
+    /// One commit retrieval for `beacon`, validated against its internal result schema.
     async fn beacon_commits(server: &RiftMcp) -> TestResult<SearchResult> {
         let params = serde_json::from_value(json!({"target": "commit", "query": "beacon"}))?;
-        let answer = tokio::time::timeout(
-            UNWAITED_READ_MAX,
-            server.answered_search(Parameters(params)),
-        )
-        .await
-        .map_err(|_| "a commit search waits on no fill")??
-        .0;
-        let output_schema = RiftMcp::tool_router()
-            .list_all()
-            .into_iter()
-            .find(|tool| tool.name == "search")
-            .and_then(|tool| tool.output_schema)
-            .ok_or("search serves an output schema")?;
-        let validator =
-            jsonschema::validator_for(&serde_json::Value::Object(output_schema.as_ref().clone()))?;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search_result(params))
+            .await
+            .map_err(|_| "a commit search waits on no fill")??
+            .0;
+        let schema = serde_json::to_value(schemars::schema_for!(SearchResult))?;
+        let validator = jsonschema::validator_for(&schema)?;
         let wire = serde_json::to_value(&answer)?;
         let errors: Vec<String> = validator
             .iter_errors(&wire)
@@ -8540,13 +8195,10 @@ done
 
         let request = json!({"change": {"base": "HEAD", "head": {"kind": "working_tree"}}});
         let working_tree: SearchParams = serde_json::from_value(request)?;
-        let answer = tokio::time::timeout(
-            UNWAITED_READ_MAX,
-            server.answered_search(Parameters(working_tree)),
-        )
-        .await
-        .map_err(|_| "a comparison under a recorded failure must not wait")??
-        .0;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search_result(working_tree))
+            .await
+            .map_err(|_| "a comparison under a recorded failure must not wait")??
+            .0;
 
         assert!(
             answer.results.is_empty(),
@@ -8560,7 +8212,7 @@ done
         assert!(detail.contains("injected failure"), "{detail}");
 
         let committed: SearchParams = serde_json::from_value(json!({"change": {"base": "HEAD"}}))?;
-        let answer = server.answered_search(Parameters(committed)).await?.0;
+        let answer = server.search_result(committed).await?.0;
         assert!(
             stale_index_of(&answer.warnings).is_err(),
             "a committed head reads no publication: {answer:#?}"
@@ -8823,12 +8475,22 @@ done
     async fn a_node_listing_whose_tree_keeps_moving_answers_stale() -> TestResult {
         let (directory, server) = fixture().await?;
         capture_a_tree_that_keeps_moving(&server, directory.path());
-        let params = serde_json::from_value(json!({"path": "lib.rs", "position": 8}))?;
+        let params = serde_json::from_value(json!({
+            "query": "SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> }"
+        }))?;
 
-        let answer = tokio::time::timeout(RECONCILED_READ_MAX, server.nodes(Parameters(params)))
-            .await
-            .map_err(|_| "a node listing whose tree keeps moving must answer within the bound")??
-            .0;
+        let answer = tokio::time::timeout(
+            RECONCILED_READ_MAX,
+            server.nodes(Parameters(params), rmcp::model::Extensions::default()),
+        )
+        .await
+        .map_err(|_| "a node listing whose tree keeps moving must answer within the bound")??
+        .0;
+        let rift_protocol::query::QueryReadResult::Results(answer) = answer else {
+            return Err(
+                "a node listing whose tree keeps moving must return its captured answer".into(),
+            );
+        };
 
         let (_index, _captured, detail) = stale_index_of(&answer.warnings)?;
         assert!(
@@ -9621,16 +9283,13 @@ done
             serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
         let held = database.hold_connection().await?;
 
-        let answer = tokio::time::timeout(
-            UNWAITED_READ_MAX,
-            server.answered_search(Parameters(params)),
-        )
-        .await
-        .map_err(|_elapsed| "the pattern search waited past its bound for the held connection")?
-        .map_err(|refusal| {
-            format!("the pattern search must answer without the store: {refusal:?}")
-        })?
-        .0;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search_result(params))
+            .await
+            .map_err(|_elapsed| "the pattern search waited past its bound for the held connection")?
+            .map_err(|refusal| {
+                format!("the pattern search must answer without the store: {refusal:?}")
+            })?
+            .0;
         drop(held);
 
         assert_eq!(
@@ -9659,7 +9318,7 @@ done
         assert!(server.search_index.is_none());
         let params: SearchParams =
             serde_json::from_value(json!({"pattern": r"fn bea\w+\(", "target": "file"}))?;
-        let answer = server.answered_search(Parameters(params)).await?.0;
+        let answer = server.search_result(params).await?.0;
         assert_eq!(
             pattern_hits(&answer),
             vec![(Some("lib.rs".to_owned()), Some((4, 14)))]
@@ -9675,7 +9334,7 @@ done
         assert!(server.search_index.is_some());
         let params: SearchParams =
             serde_json::from_value(json!({"pattern": "fn", "target": "file"}))?;
-        let answer = server.answered_search(Parameters(params)).await?.0;
+        let answer = server.search_result(params).await?.0;
         assert_eq!(
             pattern_hits(&answer),
             vec![(Some("lib.rs".to_owned()), Some((4, 6)))]
@@ -9727,7 +9386,7 @@ done
         };
         let expected = [(Some("lib.rs".to_owned()), Some(1), Some((4, 14)))];
 
-        let before = server.answered_search(Parameters(params.clone())).await?.0;
+        let before = server.search_result(params.clone()).await?.0;
         assert_eq!(located(&before), expected);
         assert!(before.warnings.is_empty(), "{:?}", before.warnings);
 
@@ -9739,7 +9398,7 @@ done
             1,
             "lib.rs alone holds `fn bea`"
         );
-        let after = server.answered_search(Parameters(params)).await?.0;
+        let after = server.search_result(params).await?.0;
         assert_eq!(located(&after), expected);
         Ok(())
     }
@@ -9848,13 +9507,10 @@ done
         let (server, _double) = server_with_trigrams_held(directory.path(), "").await?;
         let params: SearchParams =
             serde_json::from_value(json!({"pattern": r"harbor note 1\d\b", "target": "file"}))?;
-        let answer = tokio::time::timeout(
-            UNWAITED_READ_MAX,
-            server.answered_search(Parameters(params.clone())),
-        )
-        .await
-        .map_err(|_| "a pattern search never waits for the trigram index")??
-        .0;
+        let answer = tokio::time::timeout(UNWAITED_READ_MAX, server.search_result(params.clone()))
+            .await
+            .map_err(|_| "a pattern search never waits for the trigram index")??
+            .0;
         assert!(answer.warnings.is_empty(), "{:?}", answer.warnings);
         assert_eq!(pattern_hits(&answer).len(), 10, "notes 10 to 19");
         assert_eq!(
@@ -9893,13 +9549,10 @@ done
                 .await?;
         let params: SearchParams =
             serde_json::from_value(json!({"pattern": r"harbor note 1\d\b", "target": "file"}))?;
-        let held = tokio::time::timeout(
-            UNWAITED_READ_MAX,
-            server.answered_search(Parameters(params.clone())),
-        )
-        .await
-        .map_err(|_| "a pattern search never waits for the trigram index")??
-        .0;
+        let held = tokio::time::timeout(UNWAITED_READ_MAX, server.search_result(params.clone()))
+            .await
+            .map_err(|_| "a pattern search never waits for the trigram index")??
+            .0;
         let preparing: Vec<(u64, u64)> = held
             .warnings
             .iter()
@@ -9920,18 +9573,7 @@ done
             "the index holds no row to verify: {:?}",
             held.results
         );
-        let tools = RiftMcp::tool_router().list_all();
-        let search = tools
-            .iter()
-            .find(|tool| tool.name == "search")
-            .ok_or("search is served")?;
-        let schema = serde_json::Value::Object(
-            search
-                .output_schema
-                .as_deref()
-                .ok_or("search declares an output schema")?
-                .clone(),
-        );
+        let schema = serde_json::to_value(schemars::schema_for!(SearchResult))?;
         let validator = jsonschema::validator_for(&schema)?;
         let instance = serde_json::to_value(&held)?;
         let failures: Vec<String> = validator
@@ -9941,13 +9583,13 @@ done
         assert!(failures.is_empty(), "{failures:#?}\n{instance:#}");
 
         double.release_trigrams();
-        let mut settled = server.answered_search(Parameters(params.clone())).await?.0;
+        let mut settled = server.search_result(params.clone()).await?.0;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             if settled.warnings.is_empty() {
                 break;
             }
             tokio::time::sleep(SEARCH_TIER_POLL).await;
-            settled = server.answered_search(Parameters(params.clone())).await?.0;
+            settled = server.search_result(params.clone()).await?.0;
         }
         assert!(settled.warnings.is_empty(), "{:?}", settled.warnings);
         assert_eq!(pattern_hits(&settled).len(), 10, "notes 10 to 19");
@@ -10668,7 +10310,7 @@ done
         );
         let params: SearchParams =
             serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
-        let answer = server.answered_search(Parameters(params)).await?.0;
+        let answer = server.search_result(params).await?.0;
         assert_eq!(answered_paths(&answer), ["src/blob.rs", "src/huge.rs"]);
         let unparsed = answer
             .warnings
@@ -10724,7 +10366,7 @@ done
 
         let params: SearchParams =
             serde_json::from_value(json!({"pattern": "harbor \\w+", "target": "file"}))?;
-        let answer = server.answered_search(Parameters(params)).await?.0;
+        let answer = server.search_result(params).await?.0;
         assert!(answer.results.is_empty(), "{answer:?}");
         assert!(
             answer
@@ -11701,7 +11343,7 @@ done
         );
         let params: SearchParams =
             serde_json::from_value(json!({"query": "beacon", "rev": "main"}))?;
-        let answer = server.answered_search(Parameters(params)).await?.0;
+        let answer = server.search_result(params).await?.0;
         assert!(
             !answer.results.is_empty(),
             "a revision search must still answer: {answer:#?}"
@@ -11768,13 +11410,13 @@ done
     ) -> TestResult<SearchResult> {
         let params: SearchParams = serde_json::from_value(json!({"query": query, "limit": limit}))
             .expect("test search parameters must deserialize");
-        let mut answer = server.answered_search(Parameters(params.clone())).await?.0;
+        let mut answer = server.search_result(params.clone()).await?.0;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             if store_ranked(&answer) {
                 return Ok(answer);
             }
             tokio::time::sleep(SEARCH_TIER_POLL).await;
-            answer = server.answered_search(Parameters(params.clone())).await?.0;
+            answer = server.search_result(params.clone()).await?.0;
         }
         Err(format!(
             "the population lane never stamped the served tree for query {query} at limit \
@@ -11961,21 +11603,52 @@ done
         query: &str,
         path: &str,
     ) -> TestResult<serde_json::Value> {
+        let stage = match (query, path) {
+            ("replace all units", "guide.txt") => Some("matched_by first"),
+            ("scale_value", "lib.rs") => Some("matched_by named"),
+            _ => None,
+        };
+        let literal = oxigraph::model::Literal::from(query);
+        let statement = format!(
+            "SELECT ?hit ?path ?target ?symbol ?name ?matched_by ?matched_index {{ SERVICE :search {{ ?hit :query {literal}; :index ?index; :path ?path; :hit/:target ?target; :matched_by ?match . ?match :value ?matched_by; :index ?matched_index . OPTIONAL {{ ?hit :symbol ?symbol . ?symbol :name ?name }} }} }} ORDER BY ?index ?matched_index LIMIT 100"
+        );
         let mut last_answer = json!(null);
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             let answer = peer
                 .call_tool(
                     CallToolRequestParams::new("search")
-                        .with_arguments(arguments(&json!({"query": query}))?),
+                        .with_arguments(arguments(&json!({"query": statement}))?),
                 )
                 .await?;
-            let structured = answer
-                .structured_content
-                .ok_or("search must return structured content")?;
-            let results = structured["results"]
+            let structured = answer.structured_content.ok_or_else(|| match stage {
+                Some(stage) => {
+                    format!("{stage}: search must return structured content; structured=false")
+                }
+                None => "search must return structured content".to_owned(),
+            })?;
+            if structured["outcome"] == "unavailable" && structured["reason"] == "index_preparing" {
+                last_answer = structured;
+                tokio::time::sleep(SEARCH_TIER_POLL).await;
+                continue;
+            }
+            let results = structured["answer"]["bindings"]
                 .as_array()
-                .ok_or("results must be an array")?;
-            if results.iter().any(|hit| hit["path"] == json!(path)) {
+                .ok_or_else(|| {
+                    let Some(stage) = stage else {
+                        return "results must be an array".to_owned();
+                    };
+                    let warnings = structured["warnings"].as_array();
+                    let codes: Vec<_> = warnings.into_iter().flatten().take(8)
+                        .filter_map(|warning| warning.get("code").and_then(serde_json::Value::as_str))
+                        .collect();
+                    format!(
+                        "{stage}: results must be an array; structured=true; outcome={:?}; reason={:?}; warning_count={:?}; warning_codes={codes:?}",
+                        structured.get("outcome").and_then(serde_json::Value::as_str),
+                        structured.get("reason").and_then(serde_json::Value::as_str),
+                        warnings.map(Vec::len),
+                    )
+                })?;
+            if results.iter().any(|hit| hit["path"]["value"] == path) {
                 return Ok(structured);
             }
             last_answer = structured;

@@ -26,6 +26,7 @@ percent-encoding.workspace = true
 globset.workspace = true
 rapidfuzz.workspace = true
 rift-core.workspace = true
+rift-analysis = { workspace = true, features = ["collector"] }
 rift-error.workspace = true
 rift-dependency.workspace = true
 rift-history.workspace = true

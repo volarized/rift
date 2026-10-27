@@ -260,7 +260,7 @@ mod tests {
     }
 
     fn namespaced(key: &str, data: serde_json::Value) -> Extensions {
-        Extensions(BTreeMap::from([(
+        Extensions::from(BTreeMap::from([(
             ExtensionKey(key.to_owned()),
             ExtensionValue { version: 1, data },
         )]))
@@ -396,7 +396,6 @@ mod tests {
         );
         let generated = contribution
             .namespaced()
-            .0
             .get(&ExtensionKey("org.rift.generated_source".to_owned()))
             .expect("generated fact");
         assert_eq!(generated.data["generator"], "build-script");

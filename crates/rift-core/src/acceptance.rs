@@ -445,11 +445,134 @@ mod tests {
             .map(super::AcceptedConfiguration::into_parts)
     }
 
+    #[test]
+    fn global_relationship_counts_accept_document_and_environment_overrides() {
+        let (defaults, _) = accept(None, &[]).expect("default global policy");
+        assert_eq!(defaults.global.max_symbols, 10_000);
+        assert_eq!(defaults.global.max_sources, 10_000);
+        assert_eq!(defaults.global.max_seeds, 64);
+        assert_eq!(defaults.global.max_facets, 16);
+        assert_eq!(defaults.global.max_relationships, 1_000);
+        assert_eq!(defaults.global.max_occurrences, 1_000);
+        let document = "[global]\nmax_symbols=1\nmax_sources=2\nmax_seeds=3\nmax_facets=4\nmax_relationships=5\nmax_occurrences=6\n";
+        let (configured, _) = accept(Some(document), &[]).expect("document global policy");
+        assert_eq!(configured.global.max_symbols, 1);
+        assert_eq!(configured.global.max_sources, 2);
+        let (overridden, variables) = accept(
+            Some(document),
+            &[
+                ("RIFT_GLOBAL_MAX_SYMBOLS", "7"),
+                ("RIFT_GLOBAL_MAX_SOURCES", "8"),
+                ("RIFT_GLOBAL_MAX_SEEDS", "9"),
+                ("RIFT_GLOBAL_MAX_FACETS", "10"),
+                ("RIFT_GLOBAL_MAX_RELATIONSHIPS", "11"),
+                ("RIFT_GLOBAL_MAX_OCCURRENCES", "12"),
+            ],
+        )
+        .expect("environment overrides document counts");
+        assert_eq!(overridden.global.max_symbols, 7);
+        assert_eq!(overridden.global.max_sources, 8);
+        assert_eq!(overridden.global.max_seeds, 9);
+        assert_eq!(overridden.global.max_facets, 10);
+        assert_eq!(overridden.global.max_relationships, 11);
+        assert_eq!(overridden.global.max_occurrences, 12);
+        assert_eq!(variables.len(), 6);
+        for (key, variable) in [
+            ("max_symbols", "RIFT_GLOBAL_MAX_SYMBOLS"),
+            ("max_sources", "RIFT_GLOBAL_MAX_SOURCES"),
+            ("max_seeds", "RIFT_GLOBAL_MAX_SEEDS"),
+            ("max_facets", "RIFT_GLOBAL_MAX_FACETS"),
+            ("max_relationships", "RIFT_GLOBAL_MAX_RELATIONSHIPS"),
+            ("max_occurrences", "RIFT_GLOBAL_MAX_OCCURRENCES"),
+        ] {
+            let expected = format!("global.{key}");
+            for (document, variables) in [
+                (Some(format!("[global]\n{key}=0\n")), Vec::new()),
+                (None, vec![(variable, "0")]),
+            ] {
+                let (configuration, _) =
+                    accept(document.as_deref(), &variables).expect("numeric shape");
+                let violation = configuration
+                    .validate()
+                    .expect_err("zero global count must fail validation");
+                assert!(
+                    matches!(violation, rift_protocol::configuration::ConfigurationViolation::LimitOutOfRange { field, value: 0, min: 1, .. } if field == expected),
+                    "{key}: {violation:?}"
+                );
+            }
+        }
+        assert!(accept(None, &[("RIFT_GLOBAL_MAX_SYMBOLS", "invalid")]).is_err());
+        assert!(
+            accept(
+                None,
+                &[("RIFT_GLOBAL_MAX_SOURCES", "184467440737095516160")]
+            )
+            .is_err()
+        );
+    }
+
     fn context_value(error: &RiftError, name: &str) -> Option<String> {
         error
             .context()
             .find(|(key, _)| *key == name)
             .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn test_query_process_sizes_accept_document_and_environment_overrides() {
+        let document = "[search.query]\ninput_size = '1kb'\noutput_size = '2kb'\nmaterial_size = '3kb'\nheap_size = '4kb'\ndiagnostic_size = '5kb'\n";
+        let (configuration, _) = accept(Some(document), &[]).expect("query process sizes");
+        let query = configuration.search.query;
+        assert_eq!(query.input_size, Some(ByteSize::from_bytes(1024)));
+        assert_eq!(query.output_size, Some(ByteSize::from_bytes(2048)));
+        assert_eq!(query.material_size, Some(ByteSize::from_bytes(3072)));
+        assert_eq!(query.heap_size, Some(ByteSize::from_bytes(4096)));
+        assert_eq!(query.diagnostic_size, Some(ByteSize::from_bytes(5120)));
+        let (configuration, variables) = accept(
+            Some(document),
+            &[
+                ("RIFT_SEARCH_QUERY_INPUT_SIZE", "6kb"),
+                ("RIFT_SEARCH_QUERY_OUTPUT_SIZE", "7kb"),
+                ("RIFT_SEARCH_QUERY_MATERIAL_SIZE", "8kb"),
+                ("RIFT_SEARCH_QUERY_HEAP_SIZE", "9kb"),
+                ("RIFT_SEARCH_QUERY_DIAGNOSTIC_SIZE", "1b"),
+            ],
+        )
+        .expect("environment overrides query process sizes");
+        let query = configuration.search.query;
+        assert_eq!(query.input_size, Some(ByteSize::from_bytes(6144)));
+        assert_eq!(query.output_size, Some(ByteSize::from_bytes(7168)));
+        assert_eq!(query.material_size, Some(ByteSize::from_bytes(8192)));
+        assert_eq!(query.heap_size, Some(ByteSize::from_bytes(9216)));
+        assert_eq!(query.diagnostic_size, Some(ByteSize::from_bytes(1)));
+        assert_eq!(variables.len(), 5);
+        assert!(accept(None, &[("RIFT_SEARCH_QUERY_INPUT_SIZE", "many")]).is_err());
+    }
+
+    #[test]
+    fn test_retention_policy_accepts_document_and_environment_without_fallback() {
+        let document =
+            "[server]\nretained_size = '1mb'\nretained_views = 2\nview_lifetime = '1s'\n";
+        let (configuration, _) = accept(Some(document), &[]).expect("retention document");
+        assert_eq!(configuration.server.retained_size.bytes(), 1 << 20);
+        assert_eq!(configuration.server.retained_views, 2);
+        assert_eq!(configuration.server.view_lifetime.milliseconds(), 1000);
+        let (configuration, _) = accept(
+            Some(document),
+            &[
+                ("RIFT_SERVER_RETAINED_SIZE", "2mb"),
+                ("RIFT_SERVER_RETAINED_VIEWS", "3"),
+                ("RIFT_SERVER_VIEW_LIFETIME", "2s"),
+            ],
+        )
+        .expect("retention environment");
+        assert_eq!(configuration.server.retained_size.bytes(), 2 << 20);
+        assert_eq!(configuration.server.retained_views, 3);
+        assert_eq!(configuration.server.view_lifetime.milliseconds(), 2000);
+        let (configuration, _) =
+            accept(None, &[("RIFT_SERVER_RETAINED_VIEWS", "0")]).expect("numeric shape");
+        assert!(configuration.validate().is_err());
+        assert!(accept(None, &[("RIFT_SERVER_RETAINED_VIEWS", "many")]).is_err());
     }
 
     #[test]

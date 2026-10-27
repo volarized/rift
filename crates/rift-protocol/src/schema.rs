@@ -85,6 +85,7 @@ mod keyword {
     pub(super) const PATTERN: &str = "pattern";
     pub(super) const PROPERTY_NAMES: &str = "propertyNames";
     pub(super) const TYPE: &str = "type";
+    pub(super) const OBJECT: &str = "object";
     pub(super) const DEFAULT: &str = "default";
 
     pub(super) const DEFS: &str = "$defs";
@@ -97,6 +98,14 @@ mod keyword {
     pub(super) const NULL: &str = "null";
     pub(super) const STRING: &str = "string";
     pub(super) const ADDITIONAL_PROPERTIES: &str = "additionalProperties";
+}
+
+/// Declares the object root shared by every complete or unavailable query result.
+pub fn require_query_result_object(schema: &mut Schema) {
+    schema.insert(
+        keyword::TYPE.to_owned(),
+        Value::String(keyword::OBJECT.to_owned()),
+    );
 }
 
 /// References and unions one schema walk follows before it answers with what
@@ -472,6 +481,8 @@ fn accepted_members(node: &Value) -> Vec<String> {
             properties.keys().cloned().collect()
         } else if let Some(values) = node.get(keyword::ENUM).and_then(Value::as_array) {
             string_values(values.iter())
+        } else if let Some(value) = node.get(keyword::CONST) {
+            string_values(std::iter::once(value))
         } else {
             string_values(
                 value_branches(node)
@@ -1007,12 +1018,24 @@ pub fn declare_history_ranges(schema: &mut Schema) {
 /// enforces the bound at load and the schema carries it for readers.
 pub fn declare_server_ranges(schema: &mut Schema) {
     use crate::configuration::{
-        Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
+        ByteSize, Duration, SERVER_IDLE_TIMEOUT_MS_MAX, SERVER_IDLE_TIMEOUT_MS_MIN,
         SERVER_QUEUE_TIMEOUT_MS_MAX, SERVER_READINESS_TIMEOUT_MS_MAX,
         SERVER_READINESS_TIMEOUT_MS_MIN, SERVER_VALIDATION_INTERVAL_MS_MAX,
         SERVER_VALIDATION_INTERVAL_MS_MIN, SERVER_VERSION_CONTROL_TIMEOUT_MS_MAX,
         ServerConfiguration,
     };
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, retained_size),
+        RIFT_RANGE,
+        range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(u64::MAX)),
+    );
+    annotate_property(
+        schema,
+        property!(ServerConfiguration, view_lifetime),
+        RIFT_RANGE,
+        range(&Duration::from_millis(1), &Duration::from_millis(u64::MAX)),
+    );
     annotate_property(
         schema,
         property!(ServerConfiguration, worker_queue_timeout),
@@ -1068,6 +1091,31 @@ pub fn declare_server_ranges(schema: &mut Schema) {
             ])),
         ),
     );
+}
+
+/// Declares the positive byte ranges accepted by query configuration.
+pub fn declare_query_ranges(schema: &mut Schema) {
+    use crate::configuration::ByteSize;
+    use crate::query::QueryConfiguration;
+
+    for name in [
+        property!(QueryConfiguration, statement_size),
+        property!(QueryConfiguration, fact_size),
+        property!(QueryConfiguration, result_size),
+        property!(QueryConfiguration, page_limit),
+        property!(QueryConfiguration, input_size),
+        property!(QueryConfiguration, output_size),
+        property!(QueryConfiguration, material_size),
+        property!(QueryConfiguration, heap_size),
+        property!(QueryConfiguration, diagnostic_size),
+    ] {
+        annotate_property(
+            schema,
+            name,
+            RIFT_RANGE,
+            range(&ByteSize::from_bytes(1), &ByteSize::from_bytes(u64::MAX)),
+        );
+    }
 }
 
 /// A [`SearchConfiguration`](crate::configuration::SearchConfiguration) states its
@@ -2323,6 +2371,17 @@ mod tests {
         assert_eq!(by_const.accepted(), ["file", "symbol"]);
         let by_enum = expected_shape(&addressed_schema(), &[DocumentStep::Member("order")]);
         assert_eq!(by_enum.accepted(), ["path", "relevance"]);
+        for schema in [
+            json!({"const":"sparql"}),
+            json!({"oneOf":[{"const":"sparql"}]}),
+        ] {
+            assert_eq!(expected_shape(&schema, &[]).accepted(), ["sparql"]);
+        }
+        assert!(
+            expected_shape(&json!({"const":0}), &[])
+                .accepted()
+                .is_empty()
+        );
     }
 
     /// A step the schema does not declare stops the walk, and `followed`

@@ -181,13 +181,14 @@ pub type MacroInvocation = (ByteRange, Vec<ByteRange>, Option<Vec<ByteRange>>);
 /// Original Rust scope range and optional complete direct child ranges.
 pub type Scope = (ByteRange, Option<Vec<ByteRange>>);
 
-/// Immutable syntax facts shared by documents at different paths, without complete node rows.
+/// Immutable syntax facts and complete named nodes shared by documents at different paths.
 ///
 /// `Eq` is not derived: [`SyntaxSymbol`] is not `Eq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxFacts {
     origin: SyntaxOrigin,
     language: Language,
+    nodes: Option<Arc<[SyntaxNode]>>,
     symbols: Vec<SyntaxSymbol>,
     left_out_symbols: Vec<SyntaxSymbol>,
     export_bindings: Option<Vec<SyntaxExportBinding>>,
@@ -207,7 +208,6 @@ pub struct SyntaxFacts {
 pub struct SyntaxDocument {
     path: ProjectPath,
     facts: Arc<SyntaxFacts>,
-    nodes: Arc<Vec<SyntaxNode>>,
 }
 
 /// Suffixes every repeated qualified name apart, in source order.
@@ -300,7 +300,9 @@ impl SyntaxDocument {
     /// extraction remains the documentation adapter's responsibility.
     #[must_use]
     pub fn empty(language: Language, path: ProjectPath) -> Self {
-        Self::new(language, path, Vec::new(), Vec::new(), false)
+        let mut document = Self::new(language, path, Vec::new(), Vec::new(), false);
+        Arc::make_mut(&mut document.facts).nodes = None;
+        document
     }
 
     /// Assembles one document from a provider's extracted facts, suffixing
@@ -359,7 +361,11 @@ impl SyntaxDocument {
         );
         let facts = Arc::make_mut(&mut document.facts);
         facts.source_digest = Some(FileDigest::of(source.text.as_bytes()));
-        facts.scope = rust_macros::capture_scope(source.text, &document.nodes, has_errors);
+        facts.scope = rust_macros::capture_scope(
+            source.text,
+            facts.nodes.as_deref().unwrap_or(&[]),
+            has_errors,
+        );
         facts.syntax_limits = Some(limits);
         document
     }
@@ -407,11 +413,13 @@ impl SyntaxDocument {
         let macro_invocations = captured.or_else(|| Self::invocations(&language, &nodes));
         let left_out_symbols = leave_out_refused_names(&mut symbols);
         let left_out_declarations = left_out_symbols.len();
+        let nodes = Arc::from(nodes);
         Self {
             path,
             facts: Arc::new(SyntaxFacts {
                 origin: SyntaxOrigin::Provider,
                 language,
+                nodes: Some(nodes),
                 symbols,
                 left_out_symbols,
                 export_bindings: None,
@@ -423,7 +431,6 @@ impl SyntaxDocument {
                 source_digest: None,
                 syntax_limits: None,
             }),
-            nodes: Arc::new(nodes),
         }
     }
 
@@ -436,7 +443,6 @@ impl SyntaxDocument {
         Self {
             path,
             facts: Arc::clone(&self.facts),
-            nodes: Arc::clone(&self.nodes),
         }
     }
 
@@ -482,10 +488,19 @@ impl SyntaxDocument {
         let facts = Arc::make_mut(&mut self.facts);
         facts.source_digest = Some(FileDigest::of(source.as_bytes()));
         if facts.language.name == "rust" && facts.language.dialect.is_none() {
-            facts.scope = rust_macros::capture_scope(source, &self.nodes, facts.has_errors);
+            facts.scope = rust_macros::capture_scope(
+                source,
+                facts.nodes.as_deref().unwrap_or(&[]),
+                facts.has_errors,
+            );
         }
         if let Some(invocations) = &mut facts.macro_invocations {
-            rust_macros::capture(source, &self.nodes, invocations, None);
+            rust_macros::capture(
+                source,
+                facts.nodes.as_deref().unwrap_or(&[]),
+                invocations,
+                None,
+            );
         }
         self
     }
@@ -493,7 +508,7 @@ impl SyntaxDocument {
     /// Returns every named syntax node in pre-order.
     #[must_use]
     pub fn nodes(&self) -> &[SyntaxNode] {
-        self.nodes.as_slice()
+        self.facts.nodes.as_deref().unwrap_or(&[])
     }
 
     /// Returns extracted declarations in source order.
@@ -526,7 +541,7 @@ impl SyntaxDocument {
     /// Returns nodes covering byte position, outermost first.
     #[must_use]
     pub fn nodes_at(&self, position: u64) -> Vec<&SyntaxNode> {
-        self.nodes
+        self.nodes()
             .iter()
             .filter(|node| node.range.contains(position))
             .collect()
@@ -538,7 +553,7 @@ impl SyntaxDocument {
         Arc::clone(&self.facts)
     }
 
-    /// Returns shared path-independent facts without the complete node table.
+    /// Returns shared path-independent facts and their recorded complete node table.
     #[must_use]
     pub fn into_facts(self) -> Arc<SyntaxFacts> {
         self.facts
@@ -546,6 +561,12 @@ impl SyntaxDocument {
 }
 
 impl SyntaxFacts {
+    /// Returns the complete original named tree, or `None` when no tree was captured.
+    #[must_use]
+    pub fn nodes(&self) -> Option<&[SyntaxNode]> {
+        self.nodes.as_deref()
+    }
+
     /// Returns recorded export bindings, or `None` for unrecorded facts.
     #[must_use]
     pub fn export_bindings(&self) -> Option<&[SyntaxExportBinding]> {
@@ -662,6 +683,7 @@ impl SyntaxFacts {
         Self {
             origin: parts.origin,
             language: parts.language,
+            nodes: None,
             symbols: parts.symbols,
             left_out_symbols: parts.left_out_symbols,
             export_bindings: parts.export_bindings,
@@ -757,6 +779,7 @@ mod tests {
         assert_eq!(document.language(), &language);
         assert_eq!(document.path(), &path);
         assert!(document.nodes().is_empty());
+        assert!(document.facts().nodes().is_none());
         assert!(document.symbols().is_empty());
         assert!(!document.has_errors());
     }
@@ -838,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_facts_release_node_table_and_keep_first_declaration_match() {
+    fn indexed_facts_retain_complete_nodes_and_keep_first_declaration_match() {
         let range = ByteRange { start: 7, end: 8 };
         let document = SyntaxDocument::new(
             language(),
@@ -860,7 +883,13 @@ mod tests {
             vec![symbol("entry", range.start)],
             false,
         );
-        let node_table = Arc::downgrade(&document.nodes);
+        let node_table = Arc::downgrade(
+            document
+                .facts
+                .nodes
+                .as_ref()
+                .expect("provider captured named nodes"),
+        );
         assert_eq!(
             document
                 .nodes()
@@ -871,8 +900,47 @@ mod tests {
         );
 
         let facts = document.into_facts();
-        assert!(node_table.upgrade().is_none());
+        let rows = node_table
+            .upgrade()
+            .expect("indexed facts retain their named tree");
+        assert_eq!(facts.nodes(), Some(rows.as_ref()));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].parent, Some(0));
+        assert!(rows[1].has_error);
         assert_eq!(facts.symbols()[0].node_kind, Some("first_kind"));
+        drop(rows);
+        drop(facts);
+        assert!(node_table.upgrade().is_none());
+    }
+
+    #[test]
+    fn restored_semantic_facts_do_not_claim_a_complete_named_tree() {
+        let path = ProjectPath::new("src/lib.rs").expect("valid source path");
+        let source = "pub fn beacon() {}\n";
+        let parsed = rust_document(&path, source);
+        let facts = parsed.facts();
+        assert!(facts.nodes().is_some());
+        let restored = SyntaxFacts::from_parts(
+            source,
+            SyntaxLimits::default(),
+            crate::SyntaxFactsParts {
+                origin: facts.origin(),
+                language: facts.language().clone(),
+                symbols: facts.symbols().to_vec(),
+                left_out_symbols: facts.left_out_symbols().to_vec(),
+                export_bindings: facts.export_bindings().map(<[_]>::to_vec),
+                macro_invocations: facts.macro_invocations().map(<[_]>::to_vec),
+                scope: facts.scope().map(<[_]>::to_vec),
+                has_errors: facts.has_errors(),
+                left_out_declarations: facts.left_out_declaration_count(),
+                markdown_facts: None,
+                source_digest: *facts.source_digest().expect("parsed source digest"),
+            },
+        )
+        .expect("original normalized facts restore");
+        assert_eq!(restored.symbols(), facts.symbols());
+        assert_eq!(restored.source_digest(), facts.source_digest());
+        assert!(restored.nodes().is_none());
     }
 
     fn qualified_names(document: &SyntaxDocument) -> Vec<&str> {

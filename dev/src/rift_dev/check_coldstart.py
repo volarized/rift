@@ -23,6 +23,7 @@ from mcp.client.stdio import stdio_client
 from rift_dev.check_artifact import incoming_references, symbol_hit, symbol_id
 from rift_dev.commands import DockerCommand, owned_environment
 from rift_dev.log_records import parse_line
+from rift_dev.query import literal
 from rift_dev.rift_test_client import (
     LOG_BYTES_MAX,
     LOG_FILTER,
@@ -148,7 +149,7 @@ async def check_first_use(client: Client, name: str) -> None:
     container_command(name, ["sh", "-c", 'printf %s "$1" > lib.rs', "sh", SOURCE])
     hit = await symbol_hit(client, "beacon_cold")
     require(
-        hit.get("source") == SOURCE.rstrip("\n"), f"late file was not indexed: {hit}"
+        literal(hit, "source") == SOURCE.rstrip("\n"), f"late file was not indexed: {hit}"
     )
     logs = await container_logs(
         name, ["/rift", "server", "logs", "--tail", str(RECORD_TAIL)]
@@ -199,7 +200,7 @@ async def check_missing_executable(client: Client, name: str) -> None:
     else:
         raise AssertionError("missing configured engine answered references")
     require(
-        (await symbol_hit(client, "beacon_cold")).get("source") == SOURCE.rstrip("\n"),
+        literal(await symbol_hit(client, "beacon_cold"), "source") == SOURCE.rstrip("\n"),
         "engine failure removed syntax reads",
     )
     logs = await container_logs(

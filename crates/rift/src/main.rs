@@ -1,14 +1,11 @@
 //! Rift CLI.
 
-/// Use one allocator for Rust and C allocations across Linux index rebuilds.
-#[cfg(target_os = "linux")]
-#[global_allocator]
-static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
+mod allocator;
 mod config;
 mod install;
 mod mcp;
 mod progress;
+mod query_child;
 mod server;
 mod steer;
 mod update;
@@ -75,6 +72,15 @@ enum CliCommand {
     },
     /// Answer one Claude Code `PreToolUse` hook call from stdin.
     Steer,
+    /// Run one bounded query request in this executable.
+    #[command(name = "__query", hide = true)]
+    __Query {
+        request: PathBuf,
+        response: PathBuf,
+        input_bytes_max: usize,
+        output_bytes_max: usize,
+        heap_bytes_max: usize,
+    },
     /// Delete the backup binary left behind by a Windows self-update.
     ///
     /// Windows cannot delete a running executable, so after replacement the
@@ -144,9 +150,29 @@ const SERVED_EXIT_STATUS: i32 = 0;
 /// The process status a foreground server leaves with when its serving failed.
 const FAILED_EXIT_STATUS: i32 = 1;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(CliCommand::__Query {
+        request,
+        response,
+        input_bytes_max,
+        output_bytes_max,
+        heap_bytes_max,
+    }) = &cli.command
+    {
+        return query_child::run(
+            request,
+            response,
+            *input_bytes_max,
+            *output_bytes_max,
+            *heap_bytes_max,
+        );
+    }
+    run_async(cli)
+}
+
+#[tokio::main]
+async fn run_async(cli: Cli) -> ExitCode {
     let serves = cli.records_logs();
     let logs = serves.then(|| rift_mcp::logs_configuration(&logs_root(&cli, Path::new("."))));
     let tracing_builder = tracing_builder(serves, logs.as_ref());
@@ -393,9 +419,19 @@ async fn run(
                 .map_err(CliError::Config)
         }
         Some(CliCommand::Mcp { output, extra }) => {
+            let query_program = std::env::current_exe().map_err(|source| {
+                CliError::Mcp(
+                    rift_error::errors::mcp::election_storage_failed()
+                        .operation("read query executable")
+                        .path(Path::new("."))
+                        .source(source)
+                        .error()
+                        .mcp(),
+                )
+            })?;
             rift_mcp::serve_proxy(
                 Path::new("."),
-                BUILD_CHECKOUT,
+                rift_mcp::ServeOptions::from(BUILD_CHECKOUT).with_query_program(query_program),
                 output.into(),
                 &extra,
                 std::env::home_dir().as_deref(),
@@ -424,6 +460,12 @@ async fn run(
             .map(Some)
             .map_err(CliError::Install),
         Some(CliCommand::Steer) => Ok(Some(CliOutcome::Steer(steer::run()))),
+        Some(CliCommand::__Query { .. }) => Err(CliError::Server(
+            rift_error::errors::server::read_unavailable()
+                .operation("query child")
+                .detail("query child requires synchronous startup")
+                .error(),
+        )),
         #[cfg(windows)]
         Some(CliCommand::__CleanupUpdate { parent_pid }) => {
             let _ = parent_pid;

@@ -24,7 +24,7 @@ mod uv;
 mod fixture;
 
 pub use bun::BunResolver;
-pub use cargo::CargoResolver;
+pub use cargo::{CargoMetadataError, CargoResolver};
 pub use context::{
     ContextAnswer, Degradation, Degraded, DependencyContext, EnvironmentObservation, InstallFolder,
     InstallLocation, resolve_context,

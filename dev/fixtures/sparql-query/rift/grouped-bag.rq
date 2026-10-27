@@ -1,0 +1,1 @@
+SELECT ?value (COUNT(*) AS ?count) WHERE { VALUES ?value { 2 1 2 } } GROUP BY ?value ORDER BY ?value

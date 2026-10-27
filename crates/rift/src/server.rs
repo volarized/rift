@@ -1025,6 +1025,9 @@ async fn serve_foreground(
     install_panic_hook();
     let shutdown = CancellationToken::new();
     let selection = foreground_selection(root, repository)?;
+    let query_program = query_executable(root)?;
+    let serving_options =
+        rift_mcp::ServeOptions::from(crate::BUILD_CHECKOUT).with_query_program(query_program);
     let (storage, guard) = if repository {
         (None, None)
     } else {
@@ -1051,7 +1054,7 @@ async fn serve_foreground(
             shutdown.clone(),
             rift_index::WorkspaceIndexLimits::default(),
             check,
-            crate::BUILD_CHECKOUT,
+            serving_options,
         )
         .await
     } else {
@@ -1075,7 +1078,7 @@ async fn serve_foreground(
             shutdown.clone(),
             storage,
             check,
-            crate::BUILD_CHECKOUT,
+            serving_options,
         )
         .await
     };
@@ -1119,6 +1122,16 @@ async fn serve_foreground(
     let _ = stop_export(&export, deadline).await;
     retire_before_exit(guard);
     stopped.and(search).and(logs)
+}
+
+fn query_executable(root: &Path) -> Result<std::path::PathBuf, RiftError> {
+    std::env::current_exe().map_err(|source| {
+        errors::mcp::election_storage_failed()
+            .operation("read query executable")
+            .path(root)
+            .source(source)
+            .error()
+    })
 }
 
 /// Starts the log drain of a foreground server: writing into the metrics database of the

@@ -10,7 +10,8 @@
 //! The served surface is the subset the server itself asks engines for:
 //! `initialize`, document open and close, `textDocument/references`, call
 //! hierarchy (`textDocument/prepareCallHierarchy` and
-//! `callHierarchy/outgoingCalls`), and the `textDocument/diagnostic` pull.
+//! `callHierarchy/incomingCalls` and `callHierarchy/outgoingCalls`), and the
+//! `textDocument/diagnostic` pull.
 //! Ranges cross the wire in UTF-8 positions, the encoding the answer
 //! advertises.
 //!
@@ -245,6 +246,9 @@ fn handle_message(message: &Value, root: &Path, documents: &DocumentStore) -> Ha
         ),
         ("callHierarchy/outgoingCalls", Some(id)) => {
             answered(&id, root, documents, &params, ITEM_URI, outgoing_calls)
+        }
+        ("callHierarchy/incomingCalls", Some(id)) => {
+            answered(&id, root, documents, &params, ITEM_URI, incoming_calls)
         }
         ("textDocument/diagnostic", Some(id)) => answered(
             &id,
@@ -648,6 +652,13 @@ fn offset_at(text: &str, position: &Value) -> Result<TextSize, AnswerRefusal> {
 /// The LSP range one byte range spells in `text`, in UTF-8 positions.
 fn range_at(text: &str, range: TextRange) -> Result<Value, AnswerRefusal> {
     let index = rift_lsp::LineIndex::new(text);
+    indexed_range_at(&index, range)
+}
+
+fn indexed_range_at(
+    index: &rift_lsp::LineIndex<'_>,
+    range: TextRange,
+) -> Result<Value, AnswerRefusal> {
     let start = index
         .position(PositionEncoding::Utf8, usize::from(range.start()))
         .map_err(|error| {
@@ -685,28 +696,38 @@ fn references(
     else {
         return Ok(json!([]));
     };
-    let mut locations = Vec::new();
+    let mut texts = HashMap::new();
     for target in &targets {
-        if let Some((uri, range)) =
-            target_location(database, exchange, target.file(), target.range())?
-        {
+        texts
+            .entry(target.file())
+            .or_insert_with(|| source_text(database, target.file()));
+    }
+    let mut conversions = HashMap::with_capacity(texts.len());
+    for (file, text) in &texts {
+        if let Some(uri) = target_uri(database, exchange, *file)? {
+            conversions.insert(*file, (uri, rift_lsp::LineIndex::new(text.as_str())));
+        }
+    }
+    let mut locations = Vec::with_capacity(targets.len());
+    for target in &targets {
+        if let Some((uri, index)) = conversions.get(&target.file()) {
+            let range = indexed_range_at(index, target.range())?;
             locations.push(json!({ "uri": uri, "range": range }));
         }
     }
     Ok(Value::Array(locations))
 }
 
-/// One reference target as a `file://` URI and UTF-8 range; `None` for a
+/// One reference target as a `file://` URI; `None` for a
 /// target outside the filesystem, such as a vendored stub. The canonical
 /// workspace prefix swaps back to the root spelling the session addressed,
 /// so an answer echoes the caller's own paths, symlinked temp roots
 /// included.
-fn target_location(
+fn target_uri(
     database: &ProjectDatabase,
     exchange: &Exchange<'_>,
     file: File,
-    range: TextRange,
-) -> Result<Option<(String, Value)>, AnswerRefusal> {
+) -> Result<Option<String>, AnswerRefusal> {
     let Some(system_path) = file.path(database).as_system_path() else {
         return Ok(None);
     };
@@ -717,10 +738,7 @@ fn target_location(
             |_| system_path.as_std_path().to_path_buf(),
             |relative| exchange.spelled_root.join(relative),
         );
-    let uri = path_to_uri(&spelled)?;
-    let text = source_text(database, file);
-    let range = range_at(text.as_str(), range)?;
-    Ok(Some((uri, range)))
+    path_to_uri(&spelled).map(Some)
 }
 
 /// Answers `textDocument/prepareCallHierarchy`: one item per callable
@@ -788,6 +806,50 @@ fn outgoing_calls(
     Ok(Value::Array(calls))
 }
 
+/// Answers incoming calls with every range in its original caller file.
+fn incoming_calls(
+    database: &mut ProjectDatabase,
+    exchange: &Exchange<'_>,
+    params: &Value,
+) -> Result<Value, AnswerRefusal> {
+    let file = file_at(database, params.pointer(ITEM_URI).unwrap_or(&Value::Null))?;
+    database.project().open_file(database, file);
+    let program_file = database.program_file(file);
+    let text = source_text(database, file);
+    let offset = offset_at(
+        exchange.conversion_text(text.as_str()),
+        params
+            .pointer("/item/selectionRange/start")
+            .unwrap_or(&Value::Null),
+    )?;
+    let incoming = ty_ide::incoming_calls(database, program_file, offset);
+    let mut texts = HashMap::new();
+    for call in &incoming {
+        texts
+            .entry(call.from.file)
+            .or_insert_with(|| source_text(database, call.from.file));
+    }
+    let indices = texts
+        .iter()
+        .map(|(file, text)| (*file, rift_lsp::LineIndex::new(text.as_str())))
+        .collect::<HashMap<_, _>>();
+    let mut calls = Vec::with_capacity(incoming.len());
+    for call in &incoming {
+        let Some(uri) = hierarchy_uri(database, exchange, call.from.file)? else {
+            continue;
+        };
+        let index = &indices[&call.from.file];
+        let from = indexed_hierarchy_item(&call.from, &uri, index)?;
+        let ranges = call
+            .from_ranges
+            .iter()
+            .map(|range| indexed_range_at(index, *range))
+            .collect::<Result<Vec<_>, _>>()?;
+        calls.push(json!({ "from": from, "fromRanges": ranges }));
+    }
+    Ok(Value::Array(calls))
+}
+
 /// One `ty_ide` call hierarchy item in its LSP spelling; `None` for a file
 /// that is neither on the filesystem nor a vendored stub.
 ///
@@ -799,24 +861,37 @@ fn hierarchy_item(
     item: &ty_ide::CallHierarchyItem,
 ) -> Result<Option<Value>, AnswerRefusal> {
     let text = source_text(database, item.file);
-    let (uri, range) = match item.file.path(database).as_vendored_path() {
-        Some(vendored) => (
-            vendored_uri(vendored),
-            range_at(text.as_str(), item.full_range)?,
-        ),
-        None => match target_location(database, exchange, item.file, item.full_range)? {
-            Some(location) => location,
-            None => return Ok(None),
-        },
+    let Some(uri) = hierarchy_uri(database, exchange, item.file)? else {
+        return Ok(None);
     };
-    Ok(Some(json!({
+    let index = rift_lsp::LineIndex::new(text.as_str());
+    indexed_hierarchy_item(item, &uri, &index).map(Some)
+}
+
+fn hierarchy_uri(
+    database: &ProjectDatabase,
+    exchange: &Exchange<'_>,
+    file: File,
+) -> Result<Option<String>, AnswerRefusal> {
+    match file.path(database).as_vendored_path() {
+        Some(vendored) => Ok(Some(vendored_uri(vendored))),
+        None => target_uri(database, exchange, file),
+    }
+}
+
+fn indexed_hierarchy_item(
+    item: &ty_ide::CallHierarchyItem,
+    uri: &str,
+    index: &rift_lsp::LineIndex<'_>,
+) -> Result<Value, AnswerRefusal> {
+    Ok(json!({
         "name": item.name.as_str(),
         "kind": symbol_kind(item.kind),
         "detail": item.detail,
         "uri": uri,
-        "range": range,
-        "selectionRange": range_at(text.as_str(), item.selection_range)?,
-    })))
+        "range": indexed_range_at(index, item.full_range)?,
+        "selectionRange": indexed_range_at(index, item.selection_range)?,
+    }))
 }
 
 /// A vendored stub's URI, its path segments joined with `/`.
@@ -1463,6 +1538,74 @@ mod tests {
             reply["result"],
             serde_json::json!([]),
             "a position resolving no symbol answers the empty list"
+        );
+    }
+
+    #[test]
+    fn reference_conversion_keeps_each_file_and_observes_changed_source_next_response() {
+        let directory = tempfile::tempdir().expect("reference workspace");
+        let definition = "def helper():\r\n    return 1\r\n";
+        let first = "from a import helper\r\n'😀'; helper(); helper()\r\n";
+        let second = "from a import helper\nhelper()\n";
+        for (name, source) in [("a.py", definition), ("b.py", first), ("c.py", second)] {
+            std::fs::write(directory.path().join(name), source).expect("original source");
+        }
+        let documents = empty_documents();
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "textDocument/references",
+            "params": {
+                "textDocument": { "uri": uri_of(&directory.path().join("a.py")) },
+                "position": { "line": 0, "character": 4 },
+                "context": { "includeDeclaration": false },
+            },
+        });
+        let Handled::Reply(reply) = handle_message(&request, directory.path(), &documents) else {
+            panic!("reference response");
+        };
+        let locations = reply["result"].as_array().expect("complete references");
+        let expected = |name: &str, line, character| {
+            json!({
+                "uri": uri_of(&directory.path().join(name)),
+                "range": {
+                    "start": { "line": line, "character": character },
+                    "end": { "line": line, "character": character + 6 },
+                },
+            })
+        };
+        assert!(locations.contains(&expected("b.py", 1, 8)), "{reply}");
+        assert!(locations.contains(&expected("b.py", 1, 18)), "{reply}");
+        assert!(locations.contains(&expected("c.py", 1, 0)), "{reply}");
+        let original_second = locations
+            .iter()
+            .filter(|location| location["uri"] == uri_of(&directory.path().join("c.py")))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let changed = "from a import helper\r\n\r\nhelper()\r\n";
+        let changed_uri = uri_of(&directory.path().join("b.py"));
+        std::fs::write(directory.path().join("b.py"), changed).expect("changed source");
+        let open = json!({
+            "jsonrpc": "2.0", "method": "textDocument/didOpen",
+            "params": { "textDocument": { "uri": changed_uri, "text": changed } },
+        });
+        assert!(matches!(
+            handle_message(&open, directory.path(), &documents),
+            Handled::Silent
+        ));
+        let Handled::Reply(reply) = handle_message(&request, directory.path(), &documents) else {
+            panic!("changed reference response");
+        };
+        let locations = reply["result"].as_array().expect("changed references");
+        assert!(locations.contains(&expected("b.py", 2, 0)), "{reply}");
+        assert!(!locations.contains(&expected("b.py", 1, 8)), "{reply}");
+        assert!(!locations.contains(&expected("b.py", 1, 18)), "{reply}");
+        assert_eq!(
+            locations
+                .iter()
+                .filter(|location| location["uri"] == uri_of(&directory.path().join("c.py")))
+                .cloned()
+                .collect::<Vec<_>>(),
+            original_second
         );
     }
 

@@ -46,18 +46,35 @@ impl LocalSymbolMaterial {
         request: &GetSourceParams,
         view: &CapturedView,
     ) -> Result<GetSourceResult, RiftError> {
-        if !request.unit.is_project() {
-            return Ok(source_unavailable(
-                request,
-                Some(view.clone()),
-                SymbolUnavailableReason::ViewContext,
-            ));
-        }
         let (_, path) = rift_protocol::identity::parse_source_unit_identity(request.unit.as_str())?;
         let path = rift_core::ProjectPath::new(path)?;
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
-        let Some(text) = self.index.source(&path) else {
+        let text = if request.unit.is_project() {
+            self.source(&path)
+        } else {
+            match self
+                .package_source(&request.unit)
+                .map(|source| source.text.as_deref())
+            {
+                Some(Some(text)) => Some(text),
+                Some(None) => {
+                    return Ok(source_unavailable(
+                        request,
+                        Some(view.clone()),
+                        SymbolUnavailableReason::InsufficientCoverage,
+                    ));
+                }
+                None => {
+                    return Ok(source_unavailable(
+                        request,
+                        Some(view.clone()),
+                        SymbolUnavailableReason::ViewContext,
+                    ));
+                }
+            }
+        };
+        let Some(text) = text else {
             return Ok(GetSourceResult::Missing {
                 unit: request.unit.clone(),
                 view: view.clone(),

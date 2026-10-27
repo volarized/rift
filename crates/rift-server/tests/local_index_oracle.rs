@@ -21,7 +21,11 @@ use rift_protocol::{
         SYMBOL_ALTERNATIVES_MAX, SearchScope, SyntaxFramework,
     },
 };
-use rift_server::ReadService;
+use rift_search::query::{
+    FactRequirement, FactRequirements, QueryFacts, QueryLimits, QueryProviderSelection,
+};
+use rift_search::sparql::{PreparedQuery, QueryCancellation};
+use rift_server::{QueryFactBudget, ReadService};
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -458,6 +462,149 @@ fn assert_matches_cold(
         "incremental semantic relationship edges must equal a cold build"
     );
     Ok(())
+}
+
+const UNCHANGED_QUERY_SOURCE: &str = "/// Stable.\npub fn unchanged_query_source() {}\n";
+
+fn original_query_snapshot(
+    service: &ReadService,
+    limits: QueryLimits,
+) -> TestResult<(QueryProviderSelection, Vec<usize>, QueryFacts)> {
+    let input = service.local_search_view_input(true)?;
+    let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
+    let selection = input.provider_selection(&configuration)?;
+    let requirements = FactRequirements {
+        required: [
+            FactRequirement::Domain,
+            FactRequirement::CompleteDomain,
+            FactRequirement::Description,
+            FactRequirement::Source,
+        ]
+        .into(),
+        ..FactRequirements::default()
+    };
+    let mut budget = QueryFactBudget::new(limits, &|| false)?;
+    let (facts, subjects) =
+        input.query_facts_with_subjects(&requirements, limits, &mut budget, &selection)?;
+    Ok((selection, subjects, facts))
+}
+
+fn assert_query_snapshot_matches_cold(
+    incremental: &ReadService,
+    root: &Path,
+    phase: &str,
+    present: &[&str],
+    absent: &[&str],
+) -> TestResult {
+    let limits = QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())?;
+    let current = original_query_snapshot(incremental, limits)?;
+    let cold = original_query_snapshot(&build(root)?, limits)?;
+    assert_eq!(current.0, cold.0, "{phase}: original provider selection");
+    assert_eq!(
+        serde_json::to_value(&current)?,
+        serde_json::to_value(&cold)?,
+        "{phase}: every original payload, selector and association must equal a cold build"
+    );
+    let facts = &current.2;
+    assert!(
+        !facts.providers.is_empty(),
+        "{phase}: actual normalized provider records"
+    );
+    assert!(
+        !facts.documentation_references.is_empty(),
+        "{phase}: actual documentation facts"
+    );
+    assert_eq!(
+        facts
+            .sources
+            .iter()
+            .filter(|source| source.text.as_deref() == Some(UNCHANGED_QUERY_SOURCE))
+            .count(),
+        1,
+        "{phase}: unchanged source payload occurs exactly once"
+    );
+    for name in present {
+        assert!(
+            facts
+                .symbols
+                .iter()
+                .any(|record| record.symbol.name == *name),
+            "{phase}: missing {name}"
+        );
+    }
+    for name in absent {
+        assert!(
+            !facts
+                .symbols
+                .iter()
+                .any(|record| record.symbol.name == *name),
+            "{phase}: stale {name}"
+        );
+    }
+    for statement in [
+        "SELECT ?node { ?node a :Node }",
+        "SELECT ?history { ?history a :SymbolHistory }",
+    ] {
+        let required = PreparedQuery::parse(statement, limits)?;
+        assert!(
+            required.requirements().validate_facts(facts).is_err(),
+            "{phase}: uncaptured family must stay unavailable"
+        );
+    }
+    let prepared = PreparedQuery::parse(
+        "SELECT ?name ?kind ?language ?path ?unit ?start ?end ?source WHERE { ?symbol a :Symbol; :name ?name; :kind ?kind; :language ?language . OPTIONAL { ?symbol :declarations ?declaration . OPTIONAL { ?declaration :path ?path } OPTIONAL { ?declaration :unit ?unit } OPTIONAL { ?declaration :range ?range . ?range :start ?start; :end ?end } OPTIONAL { ?declaration :source ?source } } } ORDER BY ?name ?kind ?language ?path ?unit ?start ?end ?source",
+        limits,
+    )?;
+    assert_eq!(
+        prepared.evaluate(current.2, limits, QueryCancellation::default())?,
+        prepared.evaluate(cold.2, limits, QueryCancellation::default())?,
+        "{phase}: supported symbol/source RDF rows, duplicates and unbound fields"
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_query_facts_match_cold_after_add_edit_delete_and_move() -> TestResult {
+    let directory = TempDir::new()?;
+    let root = directory.path();
+    write_tree_a(root)?;
+    fs::write(root.join("src/unchanged.rs"), UNCHANGED_QUERY_SOURCE)?;
+    let mut service = build(root)?;
+    assert_query_snapshot_matches_cold(
+        &service,
+        root,
+        "initial",
+        &["old", "Removed"],
+        &["Added", "new"],
+    )?;
+
+    fs::write(root.join("src/added.rs"), "pub struct Added;\n")?;
+    service = updated(&service, root)?;
+    assert_query_snapshot_matches_cold(&service, root, "add", &["Added", "old"], &["new"])?;
+
+    fs::write(root.join("src/lib.rs"), SOURCE_B)?;
+    service = updated(&service, root)?;
+    assert_query_snapshot_matches_cold(&service, root, "edit", &["Added", "new"], &["old"])?;
+
+    fs::remove_file(root.join("src/added.rs"))?;
+    service = updated(&service, root)?;
+    assert_query_snapshot_matches_cold(
+        &service,
+        root,
+        "delete",
+        &["new", "Removed"],
+        &["Added", "old"],
+    )?;
+
+    fs::rename(root.join("src/removed.rs"), root.join("src/moved.rs"))?;
+    service = updated(&service, root)?;
+    assert_query_snapshot_matches_cold(
+        &service,
+        root,
+        "move",
+        &["new", "Removed"],
+        &["Added", "old"],
+    )
 }
 
 #[test]

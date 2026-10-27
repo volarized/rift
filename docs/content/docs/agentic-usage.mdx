@@ -67,14 +67,16 @@ its situation:
 
 - [`search`](/docs/mcp#tool-search) answers when the target is unknown.
 - [`get_symbol`](/docs/mcp#tool-get_symbol) reads one exact symbol identity returned by search.
-- [`nodes`](/docs/mcp#tool-nodes) answers when the syntax structure at one position is
-  needed.
-- `search` with a `traversal` block answers a symbol's neighbors, its impact (who breaks when it
+- [`nodes`](/docs/mcp#tool-nodes) evaluates SPARQL over captured syntax facts.
+- `search` with `SERVICE :source` reads an observed source unit or byte range.
+- `search` with SPARQL property paths answers a symbol's neighbors, its impact (who breaks when it
   changes), or a path between two symbols.
 
 The skill also points the agent at [`rift://map`](/docs/mcp#resource-map) as the first
 read in an unfamiliar repository, and at [`rift server logs`](/docs/developer/implementation#server-logs)
 when a refusal alone doesn't say why.
+
+The skill includes name, usage, location, caller, callee, fixed-depth, substring, regex, count, and source recipes. Ranking and regex use `SERVICE :search`; projected fields and query limits remain SPARQL. Retained pages use the returned `pagination.next_query`.
 
 ## Steering
 
@@ -115,17 +117,23 @@ and [`rift://map`](/docs/mcp#resource-map) for orientation.
 
 The suggested call carries the agent's own search:
 
-- a `Grep` call becomes a [`pattern`](/docs/mcp#search-pattern) search with the same regex. Its
+- a `Grep` call becomes a SPARQL `SERVICE :search` request with the same regex as `:pattern`. Its
   `path`, `glob`, and `type` become `paths.include`, `-i` a `(?i)` prefix, and `head_limit` and
-  `offset` the page
-- a `Glob` call becomes a `pattern` search for `\A`, which matches once at the start of every
-  file, with `target: "file"`: the answer lists the indexed files its pattern selects
+  `offset` outer `LIMIT` and `OFFSET`
+- a `Glob` call becomes a service request with `:pattern "\\A"`, which matches once at the start of every
+  file, with `:target "file"`: the answer lists the indexed files its pattern selects
 - a `Bash` call running one plain `grep`, `rg`, or `find` command is read as the `Grep` or
   `Glob` call it equals. grep's basic and extended syntax is translated into the regex syntax
   `pattern` reads, so `grep -rn "cfg(test)" src/` from the workspace root suggests:
 
-```json
-{ "pattern": "cfg\\(test\\)", "paths": { "include": ["src/**"] } }
+```sparql
+SELECT ?path ?start ?end {
+  SERVICE :search {
+    ?hit :pattern "cfg\\(test\\)";
+         :paths '{"include":["src/**"]}'^^rdf:JSON;
+         :path ?path; :start ?start; :end ?end
+  }
+}
 ```
 
 A call with a part `search` has no form for passes without a deny: context lines, `multiline`,

@@ -717,11 +717,32 @@
             "min": "1s"
           }
         },
+        "max_facets": {
+          "default": 16,
+          "description": "Most selected facets in one global relationship request.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "max_in_flight": {
           "default": 4,
           "description": "Global API requests running at once, 1 to 32.",
           "format": "uint64",
           "maximum": 32,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_occurrences": {
+          "default": 1000,
+          "description": "Most occurrence projections in one global relationship group.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_relationships": {
+          "default": 1000,
+          "description": "Most relationship projections in one global relationship group.",
+          "format": "uint64",
           "minimum": 1,
           "type": "integer"
         },
@@ -743,6 +764,13 @@
             "min": "1b"
           }
         },
+        "max_seeds": {
+          "default": 64,
+          "description": "Most subjects in one global relationship request.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "max_source": {
           "$ref": "#/$defs/ByteSize",
           "default": "1mb",
@@ -751,6 +779,20 @@
             "max": "64mb",
             "min": "1b"
           }
+        },
+        "max_sources": {
+          "default": 10000,
+          "description": "Most original source units in one global relationship page.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "max_symbols": {
+          "default": 10000,
+          "description": "Most original symbol records in one global relationship page.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
         },
         "request_timeout": {
           "$ref": "#/$defs/Duration",
@@ -1576,6 +1618,164 @@
       },
       "type": "object"
     },
+    "QueryConfiguration": {
+      "additionalProperties": false,
+      "description": "The `[search.query]` bounds for acquisition, evaluation and retained answers.",
+      "properties": {
+        "algebra_nodes": {
+          "default": 8192,
+          "description": "Most parsed algebra nodes. Must be positive.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "diagnostic_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Most diagnostic bytes retained from one query child's standard error.\nOmitted retains 8192 bytes; protocol acknowledgment bytes are counted separately.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "fact_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "256mb",
+          "description": "Most projected RDF term bytes. Must be positive.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "heap_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Most live Rust allocation bytes in one query child. Omitted derives twice\n`statement_size + fact_size + result_size`, plus 33554432 bytes for initial allocations.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "input_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Most encoded request bytes sent to one query child. Omitted derives four times\n`statement_size + fact_size + result_size`, plus 33554432 bytes for framing and metadata.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "material_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Most acquired record material retained by one query. Omitted uses the same\nderivation as `input_size`, independently of either exchange override.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "output_size": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ByteSize"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Most encoded response bytes read from one query child. Omitted uses the same\nderivation as `input_size`, independently of an explicit `input_size`.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "page_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Most encoded answer bytes in one transport page. Must be positive.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "page_size": {
+          "default": 1000,
+          "description": "Most rows or triples served in one transport page. Must be positive.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "requests": {
+          "default": 20000,
+          "description": "Most provider requests during one acquisition. Must be positive.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "result_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "128mb",
+          "description": "Most serialized bytes retained for one answer. Must be positive.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "results": {
+          "default": 1000000,
+          "description": "Most evaluated rows or triples retained. Must be positive.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "statement_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "64kb",
+          "description": "Most query text bytes admitted before parsing. Must be positive.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "statements": {
+          "default": 2000000,
+          "description": "Most projected RDF statements. Must be positive.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "RankingConfiguration": {
       "additionalProperties": false,
       "description": "The `[search.ranking]` table: what each ranking input contributes to a\nfused score, and how sharply a top rank counts.\n\nThe three weights need not sum to 1. The executor normalizes the weights\nof the inputs that answered, so an unavailable vector ranking does not\nrescale what identifier matching and the lexical ranking returned.",
@@ -1749,6 +1949,26 @@
           "minimum": 1,
           "type": "integer"
         },
+        "query": {
+          "$ref": "#/$defs/QueryConfiguration",
+          "default": {
+            "algebra_nodes": 8192,
+            "diagnostic_size": null,
+            "fact_size": "256mb",
+            "heap_size": null,
+            "input_size": null,
+            "material_size": null,
+            "output_size": null,
+            "page_limit": "4mb",
+            "page_size": 1000,
+            "requests": 20000,
+            "result_size": "128mb",
+            "results": 1000000,
+            "statement_size": "64kb",
+            "statements": 2000000
+          },
+          "description": "Admission, evaluation, and retained-result bounds for query search."
+        },
         "ranking": {
           "$ref": "#/$defs/RankingConfiguration",
           "default": {
@@ -1893,6 +2113,22 @@
             "min": "1s"
           }
         },
+        "retained_size": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "8gb",
+          "description": "Most measured material bytes retained for exact reads and query continuations.",
+          "rift:range": {
+            "max": "18446744073709551615b",
+            "min": "1b"
+          }
+        },
+        "retained_views": {
+          "default": 256,
+          "description": "Most immutable views retained by one serving owner.",
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
         "validation_interval": {
           "$ref": "#/$defs/Duration",
           "default": "30s",
@@ -1908,6 +2144,15 @@
           "description": "Maximum span publication waits for the worktree's Git index lock,\n1ms to 30s. A lock retained past this bound is logged and passed.",
           "rift:range": {
             "max": "30s",
+            "min": "1ms"
+          }
+        },
+        "view_lifetime": {
+          "$ref": "#/$defs/Duration",
+          "default": "15m",
+          "description": "Longest lifetime of a newly captured view. An upstream expiry can shorten it.",
+          "rift:range": {
+            "max": "18446744073709551615ms",
             "min": "1ms"
           }
         },
@@ -2279,10 +2524,16 @@
         "enabled": true,
         "endpoint": "https://api.volar.sh/rift/rest",
         "failure_ttl": "30s",
+        "max_facets": 16,
         "max_in_flight": 4,
+        "max_occurrences": 1000,
+        "max_relationships": 1000,
         "max_request": "4mb",
         "max_response": "32mb",
+        "max_seeds": 64,
         "max_source": "1mb",
+        "max_sources": 10000,
+        "max_symbols": 10000,
         "request_timeout": "15s",
         "resolution_ttl": "15m",
         "token_env": "RIFT_API_TOKEN"
@@ -2417,6 +2668,22 @@
         "pattern_matches_per_file": 1000,
         "pattern_verified_size": "128mb",
         "pool_slots": 4,
+        "query": {
+          "algebra_nodes": 8192,
+          "diagnostic_size": null,
+          "fact_size": "256mb",
+          "heap_size": null,
+          "input_size": null,
+          "material_size": null,
+          "output_size": null,
+          "page_limit": "4mb",
+          "page_size": 1000,
+          "requests": 20000,
+          "result_size": "128mb",
+          "results": 1000000,
+          "statement_size": "64kb",
+          "statements": 2000000
+        },
         "ranking": {
           "fusion_k": 60,
           "identifier_weight": 0.35,
@@ -2472,8 +2739,11 @@
         "port": null,
         "port_range": null,
         "readiness_timeout": "30s",
+        "retained_size": "8gb",
+        "retained_views": 256,
         "validation_interval": "30s",
         "version_control_timeout": "3s",
+        "view_lifetime": "15m",
         "worker_queue_timeout": "30s",
         "workspaces": 16
       },

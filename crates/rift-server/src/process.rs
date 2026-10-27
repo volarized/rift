@@ -110,6 +110,17 @@ pub(crate) fn run_bounded(
     capture_bytes: usize,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> std::io::Result<BoundedRun> {
+    run_bounded_streams(command, timeout, capture_bytes, capture_bytes, cancelled)
+}
+
+/// Uses the same process and pipe ownership with independent retained stream prefixes.
+pub(crate) fn run_bounded_streams(
+    command: &mut Command,
+    timeout: Duration,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    cancelled: &(dyn Fn() -> bool + Sync),
+) -> std::io::Result<BoundedRun> {
     let [stdout_slot, stderr_slot] = reserve_readers(&STREAM_READERS)?;
     command
         .stdin(Stdio::null())
@@ -127,8 +138,8 @@ pub(crate) fn run_bounded(
         "child spawned"
     );
     let mut readers = [
-        StreamReader::start(child.stdout.take(), capture_bytes, stdout_slot),
-        StreamReader::start(child.stderr.take(), capture_bytes, stderr_slot),
+        StreamReader::start(child.stdout.take(), stdout_bytes, stdout_slot),
+        StreamReader::start(child.stderr.take(), stderr_bytes, stderr_slot),
     ];
     let (exit, mut ending) = rift_tracing::traced!(
         component = "process",

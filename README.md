@@ -42,6 +42,11 @@ Run `rift mcp` from a codebase. Rift exposes structured reads through `search`, 
 `get_source`, and `nodes` over stdio MCP. Later reads include filesystem changes made by a formatter or
 another process.
 
+`search` accepts required SPARQL `query` and optional `language`, defaulting to `sparql`.
+Queries project names, usages, locations, calls, and counts; `SERVICE :search` exposes the
+existing ranking and regex producers. Follow returned `pagination.next_query` for transport
+pages and carry the answer's `view` with exact symbol and source reads.
+
 This repository's `.mcp.json` runs the local build through Cargo. An installed client configuration
 uses `rift` as command and `["mcp"]` as arguments.
 

@@ -439,7 +439,7 @@ pub struct Held<Guard> {
 /// it drops.
 struct Hold {
     /// Held open, never read: the span closes when the hold drops.
-    _span: tracing::Span,
+    span: Option<tracing::Span>,
     lock: Lock,
     acquired: Duration,
 }
@@ -485,7 +485,7 @@ impl<Guard> Held<Guard> {
         Self {
             guard,
             hold: Hold {
-                _span: span,
+                span: Some(span),
                 lock,
                 acquired: monotonic_now(),
             },
@@ -534,6 +534,11 @@ impl Drop for Hold {
         LOCK_HELD_DURATION
             .labeled([self.lock.name, self.lock.mode.label()])
             .record(held);
+        if let Some(span) = self.span.take()
+            && let Some(dispatcher) = span.with_subscriber(|(_, dispatcher)| dispatcher.clone())
+        {
+            tracing::dispatcher::with_default(&dispatcher, || drop(span));
+        }
     }
 }
 

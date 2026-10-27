@@ -80,7 +80,7 @@ impl LocalSymbolMaterial {
                     range: super::super::text_range(node.range),
                     regions: Vec::new(),
                     parent: None,
-                    extensions: Extensions(BTreeMap::new()),
+                    extensions: Extensions::from(BTreeMap::new()),
                 }
             })
             .collect();

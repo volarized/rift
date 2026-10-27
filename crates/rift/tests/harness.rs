@@ -1822,7 +1822,7 @@ async fn proxied_result_within(
     }
     Err(format!(
         "the server kept refusing {name} through {ACCEPTANCE_ATTEMPTS_MAX} attempts; \
-         the last refusal: {}",
+         the last refusal: {}; request {call_arguments}",
         refused.unwrap_or_default()
     )
     .into())

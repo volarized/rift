@@ -680,3 +680,127 @@ fn fill_progress_counts_what_the_latest_plan_still_owes() {
         "a plan never owes more than it selects"
     );
 }
+
+#[test]
+fn captured_commit_pages_keep_original_rows_after_trim_without_new_fill() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let (store, service, fills) = partly_filled(directory.path(), folder.path(), 3)?;
+    let reads = Arc::new(service);
+    let mut params = commit_search("the")?;
+    let expected = reads.search_commits(&params)?;
+    assert_eq!(expected.results.len(), 3);
+    assert!(expected.warnings.is_empty());
+    let limits = rift_search::query::QueryLimits::try_from(
+        &rift_protocol::query::QueryConfiguration::default(),
+    )?;
+    let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+    params.limit = Some(1);
+    let snapshot = Arc::clone(&reads).capture_search(
+        params,
+        Arc::new(crate::StoreAnswer::identifier_only()),
+        Arc::new(crate::EngineReferences::default()),
+        &mut budget,
+    )?;
+    let original = snapshot.view_input(true)?;
+    assert_eq!(original.root(), reads.index().root());
+    assert_eq!(original.owner(), reads.owner());
+    assert_eq!(fills.load(Ordering::SeqCst), 0);
+    let mut filler = store.filler()?.ok_or("original history filler")?;
+    assert_eq!(filler.trim(&std::collections::BTreeSet::new())?, 3);
+    write(directory.path(), "src/lib.rs", "pub fn replacement() {}\n")?;
+    for (page_index, hit) in expected.results.iter().enumerate() {
+        let (page, keys) = snapshot.page(u64::try_from(page_index)?, &mut budget)?;
+        assert_eq!(page.pagination.page_index, u64::try_from(page_index)?);
+        assert_eq!(page.pagination.total_pages, 3);
+        assert_eq!(page.results.as_slice(), std::slice::from_ref(hit));
+        assert_eq!(page.warnings, expected.warnings);
+        assert_eq!(keys, vec![Vec::<rift_core::ContributionKey>::new()]);
+    }
+    let (past, keys) = snapshot.page(3, &mut budget)?;
+    assert!(past.results.is_empty());
+    assert!(keys.is_empty());
+    assert_eq!(past.pagination.total_pages, 3);
+    assert_eq!(fills.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[test]
+fn captured_commit_rows_refuse_exhausted_material_before_retention() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let reads = Arc::new(searchable(directory.path(), folder.path())?);
+    let mut configuration = rift_protocol::query::QueryConfiguration::default();
+    configuration.material_size = Some(rift_protocol::configuration::ByteSize::from_bytes(1));
+    let limits = rift_search::query::QueryLimits::try_from(&configuration)?;
+    let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+    assert!(
+        Arc::clone(&reads)
+            .capture_search(
+                commit_search("the")?,
+                Arc::new(crate::StoreAnswer::identifier_only()),
+                Arc::new(crate::EngineReferences::default()),
+                &mut budget,
+            )
+            .is_err()
+    );
+    let mut budget = crate::QueryFactBudget::new(limits, &|| true)?;
+    assert!(
+        Arc::clone(&reads)
+            .capture_search(
+                commit_search("the")?,
+                Arc::new(crate::StoreAnswer::identifier_only()),
+                Arc::new(crate::EngineReferences::default()),
+                &mut budget,
+            )
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn captured_commit_pages_do_not_repeat_initial_missing_head_notification() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let (store, service, fills) = partly_filled(directory.path(), folder.path(), 3)?;
+    write(directory.path(), "NOTES.md", "# Notes\n\nMore.\n")?;
+    commit_all_at(
+        directory.path(),
+        "Extend the release notes\n",
+        "2026-01-01T00:04:00 +0000",
+    );
+    let reads = Arc::new(service);
+    let mut params = commit_search("the")?;
+    params.limit = Some(1);
+    let limits = rift_search::query::QueryLimits::try_from(
+        &rift_protocol::query::QueryConfiguration::default(),
+    )?;
+    let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
+    let snapshot = Arc::clone(&reads).capture_search(
+        params,
+        Arc::new(crate::StoreAnswer::identifier_only()),
+        Arc::new(crate::EngineReferences::default()),
+        &mut budget,
+    )?;
+    assert_eq!(
+        fills.load(Ordering::SeqCst),
+        1,
+        "initial capture preserves the ordinary lag notification"
+    );
+    let (first, _) = snapshot.page(0, &mut budget)?;
+    assert_eq!(filling_counts(&first), [(3, 3)]);
+    assert!(first.warnings.iter().any(|warning| matches!(warning, ReadWarning::HistoryStoreFilling { detail, .. } if detail.contains("HEAD"))));
+    let mut filler = store.filler()?.ok_or("original history filler")?;
+    assert_eq!(filler.trim(&std::collections::BTreeSet::new())?, 3);
+    for page in 0..3 {
+        let (held, _) = snapshot.page(page, &mut budget)?;
+        assert_eq!(held.results.len(), 1);
+        assert_eq!(held.warnings, first.warnings);
+        assert_eq!(
+            fills.load(Ordering::SeqCst),
+            1,
+            "held pages never request another fill"
+        );
+    }
+    Ok(())
+}

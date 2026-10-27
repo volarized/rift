@@ -13,6 +13,7 @@ from pathlib import Path
 from urllib.parse import unquote
 
 from rift_dev.log_records import Line, closes_span, lines, parse_line
+from rift_dev.query import bindings, iri, literal
 from rift_dev.rift_test_client import (
     Json,
     JsonObject,
@@ -118,22 +119,14 @@ def symbol_pool(candidates: list[JsonObject]) -> dict[str, JsonObject]:
     require(len(candidates) <= SYMBOL_POOL_MAX, "symbol pool exceeded 4000 hits")
     identities: dict[str, JsonObject] = {}
     for candidate in candidates:
-        symbol = object_value(
-            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
-        )
-        language = string_value(symbol.get("language"), "symbol language")
-        if symbol.get("id") is None:
+        language = literal(candidate, "language")
+        symbol = object_value(candidate.get("symbol"), "symbol term")
+        if symbol.get("type") == "blank_node":
             continue
-        identity = string_value(symbol.get("id"), "symbol identity")
+        identity = iri(candidate, "symbol")
         if identity in identities:
-            previous = object_value(
-                object_value(identities[identity].get("hit"), "search hit").get(
-                    "symbol"
-                ),
-                "symbol",
-            )
             require(
-                previous.get("language") == language,
+                literal(identities[identity], "language") == language,
                 f"one identity named two languages: {identity}",
             )
         else:
@@ -148,23 +141,22 @@ def declaration_pool(
     require(len(candidates) <= SYMBOL_POOL_MAX, "symbol pool exceeded 4000 hits")
     declarations: dict[tuple[str, str, int, int], JsonObject] = {}
     for candidate in candidates:
-        symbol = object_value(
-            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
-        )
-        language = string_value(symbol.get("language"), "symbol language")
-        string_value(symbol.get("name"), "symbol name")
-        path = string_value(candidate.get("path"), "symbol path")
-        span = object_value(candidate.get("range"), "symbol range")
-        start = number(span.get("start"), "range start")
-        end = number(span.get("end"), "range end")
+        language = literal(candidate, "language")
+        literal(candidate, "name")
+        path = literal(candidate, "path")
+        start = int(literal(candidate, "start"))
+        end = int(literal(candidate, "end"))
         require(start < end, "symbol range must be nonempty")
         key = (language, path, start, end)
         if key in declarations:
-            previous = object_value(
-                object_value(declarations[key].get("hit"), "search hit").get("symbol"),
-                "symbol",
+            previous = declarations[key]
+            require(
+                all(
+                    previous.get(field) == candidate.get(field)
+                    for field in ("name", "kind", "language")
+                ),
+                f"one declaration named two symbols: {key}",
             )
-            require(previous == symbol, f"one declaration named two symbols: {key}")
         else:
             declarations[key] = candidate
     return declarations
@@ -173,10 +165,7 @@ def declaration_pool(
 def language_counts(candidates: list[JsonObject]) -> JsonObject:
     counts: dict[str, int] = {}
     for candidate in declaration_pool(candidates).values():
-        symbol = object_value(
-            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
-        )
-        language = string_value(symbol.get("language"), "symbol language")
+        language = literal(candidate, "language")
         counts[language] = counts.get(language, 0) + 1
     return {language: count for language, count in sorted(counts.items())}
 
@@ -193,10 +182,7 @@ def sample_symbols(
     groups: dict[str, list[JsonObject]] = {}
     for identity in sorted(pool):
         candidate = pool[identity]
-        symbol = object_value(
-            object_value(candidate.get("hit"), "search hit").get("symbol"), "symbol"
-        )
-        language = string_value(symbol.get("language"), "symbol language")
+        language = literal(candidate, "language")
         groups.setdefault(language, []).append(candidate)
     require(
         required.issubset(groups),
@@ -304,17 +290,19 @@ def chunked_answer(answer: JsonObject, path: str, size: int, offset: int) -> lis
     Under the default `large_files = "split"` no file is left out of the text index, so no
     warning may count one as skipped. Returns the codes of the warnings naming `path`.
     """
-    hits = array_value(answer.get("results"), "pattern hits")
+    hits = bindings(answer)
     require(bool(hits), f"{path}: no pattern hit at byte {offset}: {answer}")
     first = object_value(hits[0], "pattern hit")
-    target = object_value(first.get("hit"), "pattern hit target")
-    span = object_value(first.get("range"), "pattern hit range")
-    observed = (first.get("path"), target.get("target"), target.get("size"))
+    observed = (
+        literal(first, "path"),
+        literal(first, "target"),
+        int(literal(first, "size")),
+    )
     require(
         observed == (path, "file", size),
         f"expected a file hit on {path} holding {size} bytes, received {observed}",
     )
-    start = number(span.get("start"), "pattern hit start")
+    start = int(literal(first, "start"))
     require(start == offset, f"{path}: first hit at byte {start}, expected {offset}")
     named: list[str] = []
     for warning in warnings(answer):
@@ -592,17 +580,15 @@ def churn_answer(
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
     if tool == "nodes":
-        nodes = array_value(answer.get("nodes"), "probe nodes")
-        excerpts = array_value(answer.get("source"), "probe node sources")
-        require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
-        matches = [
-            (object_value(node, "probe node"), excerpt)
-            for node, excerpt in zip(nodes, excerpts, strict=True)
-            if object_value(node, "probe node").get("symbol") == identity
-        ]
-        require(len(matches) == 1, "nodes lost probe declaration")
-        hit, excerpt = matches[0]
-        found = string_value(hit.get("symbol"), "probe identity")
+        rows = bindings(answer)
+        require(len(rows) == 1, "nodes lost probe declaration")
+        hit = rows[0]
+        found = iri(hit, "node_symbol")
+        encoded = literal(hit, "text").encode()
+        start = int(literal(hit, "node_start"))
+        end = int(literal(hit, "node_end"))
+        require(0 <= start <= end <= len(encoded), "node range exceeds source")
+        excerpt = encoded[start:end].decode()
     elif tool == "get_symbol":
         require(answer.get("outcome") == "found", "get_symbol lost probe declaration")
         symbol = object_value(answer.get("symbol"), "probe symbol")
@@ -613,24 +599,32 @@ def churn_answer(
         require(hit.get("path") == probe_path, "get_symbol returned another probe path")
         excerpt = hit.get("source")
     else:
-        rows = array_value(answer.get("results"), "probe hits")
+        rows = bindings(answer)
         require(len(rows) == 1, f"{tool} lost probe declaration")
         hit = object_value(rows[0], "probe hit")
-        symbol = object_value(
-            object_value(hit.get("hit"), "search hit").get("symbol"), "probe symbol"
+        found = iri(hit, "symbol")
+        require(
+            literal(hit, "path") == probe_path, f"{tool} returned another probe path"
         )
-        found = string_value(symbol.get("id"), "probe identity")
-        require(hit.get("path") == probe_path, f"{tool} returned another probe path")
-        excerpt = hit.get("source")
+        excerpt = literal(hit, "source")
     require(identity is None or found == identity, f"{tool} changed probe identity")
     source = string_value(excerpt, "probe source")
     require(
         source in sources,
         f"{tool} returned source outside the expected revisions: {source}",
     )
-    span = object_value(hit.get("range"), "probe range")
+    if tool == "search":
+        start, end = int(literal(hit, "start")), int(literal(hit, "end"))
+    elif tool == "nodes":
+        start, end = int(literal(hit, "node_start")), int(literal(hit, "node_end"))
+    else:
+        span = object_value(hit.get("range"), "probe range")
+        start, end = (
+            number(span.get("start"), "probe start"),
+            number(span.get("end"), "probe end"),
+        )
     require(
-        span.get("start") == 0 and span.get("end") == len(source.encode()),
+        start == 0 and end == len(source.encode()),
         f"{tool} probe range disagrees with source",
     )
     return found, source

@@ -6,7 +6,10 @@ import asyncio
 from pathlib import Path
 from typing import cast
 
+from dulwich.repo import Repo
+
 from rift_dev.check_artifact import (
+    CONFIGURATION,
     check_external_change,
     check_reads,
     incoming_references,
@@ -16,9 +19,18 @@ from rift_dev.check_artifact import (
 )
 from rift_dev.log_records import parse_line
 from rift_dev.nextest_run import retained_collector
+from rift_dev.query import (
+    bindings,
+    declaration_nodes_request,
+    declaration_request,
+    iri,
+    literal,
+    quoted,
+)
 from rift_dev.rift_test_client import (
     Client,
     Server,
+    ToolFailure,
     array_value,
     collector_line,
     gate_deadline,
@@ -29,7 +41,7 @@ from rift_dev.rift_test_client import (
     string_value,
     verify_version,
 )
-from rift_dev.trace import TEST_CASE_KEY, resource_attribute
+from rift_dev.trace import TEST_CASE_KEY, Collector, resource_attribute
 
 AGENT_SECONDS = 300.0
 READ_TOOLS = {"search", "get_symbol", "nodes"}
@@ -53,40 +65,114 @@ retry = { attempts = 12, delay = "250ms", delay_limit = "2s" }
 
 
 async def check_embedded_references(client: Client, root: Path) -> None:
-    """Require the embedded engine to resolve a caller through a read request."""
-    seed = symbol_id(await symbol_hit(client, "serve", "python"))
-    caller = symbol_id(await symbol_hit(client, "caller", "python"))
-    answer = await incoming_references(client, seed)
-    resolved = []
-    for value in array_value(answer.get("results"), "search.results"):
-        hit = object_value(value, "search hit")
-        symbol = object_value(
-            object_value(hit.get("hit"), "hit").get("symbol"), "symbol"
-        )
-        if symbol.get("id") == caller:
-            resolved.append(hit)
+    """Require Python references with original RDF endpoints and declaration spans."""
+    target_name = quoted("serve")
+    caller_name = quoted("caller")
+    language = quoted("python")
+    path = quoted("service.py")
+    target_lookup = string_value(declaration_request("serve").get("query"), "query")
+    caller_lookup = string_value(declaration_request("caller").get("query"), "query")
+    answer = await client.call(
+        "search",
+        {
+            "query": f"SELECT ?caller ?target ?derivation ?facet ?caller_source ?caller_start ?caller_end ?caller_unit ?target_source ?target_start ?target_end ?target_unit ?target_count ?caller_count {{ {{ SELECT (COUNT(*) AS ?target_count) {{ {{ {target_lookup} }} FILTER(?language = {language}) }} }} {{ SELECT (COUNT(*) AS ?caller_count) {{ {{ {caller_lookup} }} FILTER(?language = {language}) }} }} ?target a :Symbol; :name {target_name}; :language {language}; :declarations ?target_declaration . ?target_declaration :path {path}; :source ?target_source; :unit ?target_unit; :range ?target_range . ?target_range :start ?target_start; :end ?target_end . ?caller a :Symbol; :name {caller_name}; :language {language}; :declarations ?caller_declaration; :references ?target . ?caller_declaration :path {path}; :source ?caller_source; :unit ?caller_unit; :range ?caller_range . ?caller_range :start ?caller_start; :end ?caller_end . ?relationship a :Relationship; :from ?caller; :to ?target; :derivation ?derivation; :facets :references . BIND(:references AS ?facet) }} ORDER BY ?caller"
+        },
+    )
+    resolved = bindings(answer)
     require(len(resolved) == 1, f"engine references omitted caller: {answer}")
-    hops = array_value(resolved[0].get("traversal_path"), "traversal_path")
-    require(len(hops) == 1, f"expected one reference step: {hops}")
-    hop = object_value(hops[0], "hop")
-    relationship = object_value(hop.get("relationship"), "relationship")
+    relationship = resolved[0]
     require(
-        relationship.get("from") == caller and relationship.get("to") == seed,
-        f"reference endpoints differ: {relationship}",
+        literal(relationship, "target_count") == "1"
+        and literal(relationship, "caller_count") == "1",
+        f"expected one serve and one caller declaration: {answer}",
+    )
+    endpoints = {
+        field: object_value(relationship.get(field), field)
+        for field in ("caller", "target")
+    }
+    for field, endpoint in endpoints.items():
+        require(
+            endpoint.get("type") in {"iri", "blank_node"}
+            and bool(string_value(endpoint.get("value"), field)),
+            f"reference endpoint is not an RDF resource: {relationship}",
+        )
+    require(
+        endpoints["caller"] != endpoints["target"],
+        f"reference endpoints are the same: {relationship}",
     )
     require(
-        relationship.get("derivation") == "resolution",
+        iri(relationship, "derivation") == "urn:rift:vocabulary:resolution",
         f"reference was not resolved by the engine: {relationship}",
     )
     require(
-        relationship.get("facets") == ["references"],
+        iri(relationship, "facet") == "urn:rift:vocabulary:references",
         f"reference facets differ: {relationship}",
     )
-    require(hop.get("direction") == "incoming", f"reference direction differs: {hop}")
+    original = PYTHON_SOURCE.encode()
+    target_source, caller_source = PYTHON_SOURCE.removesuffix("\n").split("\n\n\n")
+    for field, text in (("caller", caller_source), ("target", target_source)):
+        expected = text.encode()
+        start = original.index(expected)
+        require(
+            literal(relationship, f"{field}_source") == text
+            and literal(relationship, f"{field}_start") == str(start)
+            and literal(relationship, f"{field}_end") == str(start + len(expected))
+            and iri(relationship, f"{field}_unit")
+            == "rift://source/project/service.py",
+            f"reference declaration changed its original source or range: {relationship}",
+        )
     require(
-        (root / "service.py").read_bytes() == PYTHON_SOURCE.encode(),
+        (root / "service.py").read_bytes() == original,
         "reference read changed source bytes",
     )
+
+
+async def check_mixed_references_unavailable(client: Client) -> None:
+    """Require complete relationship acquisition to refuse an unserved language."""
+    seed = symbol_id(await symbol_hit(client, "serve", "python"))
+    try:
+        answer = await incoming_references(client, seed)
+    except ToolFailure as failure:
+        require(
+            failure.code == "capability_unavailable"
+            and failure.retry == "operator_action",
+            f"mixed relationship acquisition returned a different refusal: {failure}",
+        )
+    else:
+        raise AssertionError(
+            f"unserved Rust relationships returned a complete answer: {answer}"
+        )
+
+
+async def check_python_references(
+    binary: Path, base: Path, telemetry: Collector
+) -> None:
+    """Read relationship metadata from a complete served Python workspace."""
+    root = base / "python"
+    root.mkdir()
+    with Repo.init(root):
+        pass
+    (root / "rift.toml").write_text(
+        CONFIGURATION + "[source]\ninclude=['service.py']\n" + PYTHON_CONFIGURATION,
+        encoding="utf-8",
+        newline="",
+    )
+    (root / "service.py").write_text(PYTHON_SOURCE, encoding="utf-8", newline="")
+    (root / "pyproject.toml").write_text(PYTHON_METADATA, encoding="utf-8", newline="")
+    with Server(
+        binary,
+        root,
+        base / "python-server.log",
+        env={"OTEL_RESOURCE_ATTRIBUTES": resource_attribute(TEST_CASE_KEY, "agent")},
+        collector=telemetry,
+    ) as server:
+        try:
+            async with server.connect() as client:
+                await check_embedded_references(client, root)
+        except BaseException as error:
+            for note in server.evidence():
+                error.add_note(note)
+            raise
 
 
 async def check_resources(client: Client) -> None:
@@ -121,23 +207,16 @@ async def declaration_node(client: Client, name: str) -> str:
     """Prove nodes retains the captured declaration and original source."""
     search = await client.call(
         "search",
-        {"query": name, "target": "symbol", "include": ["source"], "limit": 1000},
+        declaration_request(name),
     )
-    matches = []
-    for value in array_value(search.get("results"), "search.results"):
-        row = object_value(value, "hit")
-        target = object_value(row.get("hit"), "hit")
-        if target.get("target") != "symbol":
-            continue
-        symbol = object_value(target.get("symbol"), "symbol")
-        if symbol.get("name") == name and symbol.get("language") == "rust":
-            matches.append(row)
+    matches = [
+        row
+        for row in bindings(search)
+        if literal(row, "name") == name and literal(row, "language") == "rust"
+    ]
     require(len(matches) == 1, f"expected one {name} declaration: {search}")
     hit = matches[0]
-    selected_view = hit.get("view")
-    if selected_view is None:
-        selected_view = search.get("view")
-    captured = object_value(selected_view, "search.view")
+    captured = object_value(search.get("view"), "search.view")
     identity = symbol_id(hit)
     answer = await client.call(
         "get_symbol",
@@ -155,11 +234,16 @@ async def declaration_node(client: Client, name: str) -> str:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path", "range", "source"):
+    for field in ("path", "source"):
         require(
-            declaration.get(field) == hit.get(field),
+            declaration.get(field) == literal(hit, field),
             f"symbol declaration changed {field}: {answer}",
         )
+    require(
+        declaration.get("range")
+        == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
+        f"symbol declaration changed range: {answer}",
+    )
     span = object_value(declaration.get("range"), "declaration.range")
     start, end = span.get("start"), span.get("end")
     require(
@@ -170,26 +254,27 @@ async def declaration_node(client: Client, name: str) -> str:
     require(view == captured, f"symbol changed captured view: {answer}")
     listing = await client.call(
         "nodes",
-        {
-            "path": string_value(declaration.get("path"), "declaration.path"),
-            "position": cast(int, end) - 1,
-            "view": string_value(view.get("id"), "view.id"),
-        },
+        declaration_nodes_request(identity, string_value(view.get("id"), "view.id")),
     )
-    require(listing.get("view") == view, f"nodes changed captured view: {listing}")
-    nodes = array_value(listing.get("nodes"), "nodes.nodes")
-    sources = array_value(listing.get("source"), "nodes.source")
-    require(len(nodes) == len(sources), f"nodes lost source excerpts: {listing}")
+    query_view = object_value(listing.get("view"), "nodes.view")
+    require(
+        bool(string_value(query_view.get("id"), "nodes.view.id"))
+        and bool(string_value(query_view.get("expires_at"), "nodes.view.expires_at")),
+        f"nodes has no retained query view: {listing}",
+    )
     matches = [
-        (object_value(entry, "node"), excerpt)
-        for entry, excerpt in zip(nodes, sources, strict=True)
-        if object_value(entry, "node").get("symbol") == identity
-        and object_value(entry, "node").get("range") == span
+        row
+        for row in bindings(listing)
+        if int(literal(row, "node_start")) == start
+        and int(literal(row, "node_end")) == end
     ]
     require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
-    node, excerpt = matches[0]
+    node = matches[0]
+    string_value(iri(node, "node_unit"), "original node source unit")
+    source = literal(node, "text").encode()
+    excerpt = source[cast(int, start) : cast(int, end)].decode()
     require(excerpt == declaration.get("source"), f"nodes changed source: {listing}")
-    return string_value(node.get("id"), "node.id")
+    return literal(node, "node_id")
 
 
 async def check_agent(binary: Path, version: str | None = None) -> None:
@@ -231,7 +316,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     await check_reads(client)
                     await check_resources(client)
                     await check_external_change(client, root)
-                    await check_embedded_references(client, root)
+                    await check_mixed_references_unavailable(client)
                     await declaration_node(client, "beacon_one")
                     client.require_complete(READ_TOOLS)
                 server.stop()
@@ -240,6 +325,7 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                     any(parse_line(line) is not None for line in logs.splitlines()),
                     "startup recorded no logs",
                 )
+                await check_python_references(binary, base, telemetry)
             except BaseException as error:
                 for note in server.evidence():
                     error.add_note(note)

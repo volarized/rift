@@ -81,12 +81,32 @@ fn tailwind_static_classes_variants_and_dynamic_expressions_across_templates() {
             scope: enriched.facts().scope().map(<[_]>::to_vec),
             source_digest: *enriched.source_digest().expect("digest"),
         };
-        assert_eq!(
-            SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts)
-                .expect("restored context"),
-            *enriched.facts()
-        );
+        assert!(document.facts().nodes().is_some());
+        assert_eq!(enriched.facts().nodes(), document.facts().nodes());
+        let restored = SyntaxFacts::from_parts(text, SyntaxLimits::default(), parts)
+            .expect("restored context");
+        assert_restored_tailwind_facts(&restored, enriched.facts());
     }
+}
+
+/// Semantic restoration preserves every recorded fact without claiming an original named tree.
+fn assert_restored_tailwind_facts(restored: &SyntaxFacts, original: &SyntaxFacts) {
+    assert!(restored.nodes().is_none());
+    assert_eq!(restored.origin(), original.origin());
+    assert_eq!(restored.language(), original.language());
+    assert_eq!(restored.symbols(), original.symbols());
+    assert_eq!(restored.left_out_symbols(), original.left_out_symbols());
+    assert_eq!(restored.export_bindings(), original.export_bindings());
+    assert_eq!(restored.macro_invocations(), original.macro_invocations());
+    assert_eq!(restored.scope(), original.scope());
+    assert_eq!(restored.has_errors(), original.has_errors());
+    assert_eq!(
+        restored.left_out_declaration_count(),
+        original.left_out_declaration_count()
+    );
+    assert_eq!(restored.markdown_facts(), original.markdown_facts());
+    assert_eq!(restored.source_digest(), original.source_digest());
+    assert_eq!(restored.syntax_limits(), original.syntax_limits());
 }
 
 #[test]
