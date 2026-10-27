@@ -1239,6 +1239,40 @@ async fn validated_proxy_rows(
     Ok((body, sources))
 }
 
+/// Checks the one generated blank node alongside every fixed term in the fixture.
+fn assert_term_kind_text(text: &str) -> TestResult {
+    use rift_protocol::query::RdfTerm;
+    use std::collections::BTreeMap;
+
+    let row = text.lines().nth(2).ok_or("term-kind row missing")?;
+    let binding: BTreeMap<String, RdfTerm> = serde_json::from_str(
+        row.strip_prefix('\t')
+            .ok_or("term-kind row is not indented")?,
+    )?;
+    let Some(RdfTerm::BlankNode { value }) = binding.get("blank") else {
+        return Err("term-kind blank node missing".into());
+    };
+    assert!(
+        !value.is_empty(),
+        "the execution retains a blank-node identity"
+    );
+    let expected: BTreeMap<String, RdfTerm> = serde_json::from_value(json!({
+        "blank":{"type":"blank_node","value":value},
+        "iri":{"type":"iri","value":"urn:fixture:term"},
+        "language":{"type":"language_literal","value":"hello","language":"en"},
+        "number":{"type":"literal","value":"1","datatype":"http://www.w3.org/2001/XMLSchema#integer"}
+    }))?;
+    assert_eq!(binding, expected);
+    assert_eq!(
+        text,
+        format!(
+            "1 results · page 1/1\n\tblank iri number language\n\t{}\n",
+            serde_json::to_string(&expected)?
+        )
+    );
+    Ok(())
+}
+
 fn validate_query_without_continuation(
     request: &serde_json::Value,
     reference: &serde_json::Value,
@@ -1606,6 +1640,66 @@ async fn await_surface_population(
     Ok(())
 }
 
+fn is_paged_index_request(name: &str, request: &serde_json::Value) -> bool {
+    name == "search"
+        && request["query"]
+            .as_str()
+            .is_some_and(|query| query.starts_with("SELECT ?index { VALUES ?index { "))
+        && surface_corpus::corpus()
+            .last()
+            .is_some_and(|(tool, expected)| *tool == name && expected == request)
+}
+
+fn assert_paged_index_text(
+    result: &CallToolResult,
+    body: &str,
+    answer: &rift_protocol::query::QueryAnswer,
+) -> TestResult {
+    use rift_protocol::query::{QueryAnswer, QueryReadResult, RdfTerm};
+
+    let QueryAnswer::Bindings {
+        variables,
+        bindings,
+    } = answer
+    else {
+        return Err("paged index query returns bindings".into());
+    };
+    assert_eq!(variables, &vec!["index".to_owned()]);
+    assert_eq!(bindings.len(), 1000);
+    let (_, view) = proxy_text_view(text_of(result)?)?;
+    let view = view.ok_or("paged index query retains its own view")?;
+    let next = rift_search::sparql::continuation_query(answer, &view.id, 1)?;
+    let mut expected = String::from("1000 results · page 1/2\n\tindex\n");
+    for (index, row) in bindings.iter().enumerate() {
+        assert_eq!(row.len(), 1);
+        assert_eq!(
+            row.get("index"),
+            Some(&RdfTerm::Literal {
+                value: index.to_string(),
+                datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
+            })
+        );
+        expected.push('\t');
+        expected.push_str(&serde_json::to_string(row)?);
+        expected.push('\n');
+    }
+    expected.push_str("next_query ");
+    expected.push_str(&serde_json::to_string(&next)?);
+    expected.push('\n');
+    assert_eq!(body, expected);
+    if let Some(structured) = &result.structured_content {
+        let QueryReadResult::Results(own) = serde_json::from_value(structured.clone())? else {
+            return Err("paged index query returns structured bindings".into());
+        };
+        assert_eq!(&own.answer, answer);
+        assert_eq!(own.view.as_ref(), Some(&view));
+        assert_eq!(own.pagination.page.page_index, 0);
+        assert_eq!(own.pagination.page.total_pages, 2);
+        assert_eq!(own.pagination.next_query.as_deref(), Some(next.as_str()));
+    }
+    Ok(())
+}
+
 async fn assert_proxy_texts(
     all: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     text: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
@@ -1638,7 +1732,23 @@ async fn assert_proxy_texts(
             validated_proxy_text(all, name, request, all_result, reference),
             validated_proxy_text(text, name, request, text_result, reference),
         );
-        assert_eq!(all_body?, text_body?, "{name}: texts differ");
+        let (all_body, text_body) = (all_body?, text_body?);
+        if name == "search"
+            && request["query"]
+                == "SELECT (BNODE() AS ?blank) (<urn:fixture:term> AS ?iri) (1 AS ?number) ('hello'@en AS ?language) WHERE {}"
+        {
+            assert_term_kind_text(&all_body.0)?;
+            assert_term_kind_text(&text_body.0)?;
+            assert_eq!(all_body.1, text_body.1, "{name}: source bytes differ");
+        } else if is_paged_index_request(name, request) {
+            let answer: rift_protocol::query::QueryAnswer =
+                serde_json::from_value(reference["answer"].clone())?;
+            assert_paged_index_text(all_result, &all_body.0, &answer)?;
+            assert_paged_index_text(text_result, &text_body.0, &answer)?;
+            assert_eq!(all_body.1, text_body.1, "{name}: source bytes differ");
+        } else {
+            assert_eq!(all_body, text_body, "{name}: texts differ");
+        }
     }
     Ok(())
 }
