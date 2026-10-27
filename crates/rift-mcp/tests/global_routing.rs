@@ -1402,22 +1402,76 @@ async fn a_package_scoped_pattern_answers_package_matches_from_one_request() -> 
     Ok(())
 }
 
+fn mixed_local_source_error(error: &dyn std::error::Error, mixed: &Value) -> String {
+    let rows = mixed["answer"]["bindings"].as_array();
+    let locators: Vec<_> = rows
+        .into_iter()
+        .flatten()
+        .take(4)
+        .map(|row| json!({"path": row.get("path"), "unit": row.get("unit")}))
+        .collect();
+    format!(
+        "local Source read: {error}; mixed_view={}; row_count={:?}; locators={locators:?}",
+        mixed["view"],
+        rows.map(Vec::len)
+    )
+}
+
+fn mixed_source_query(args: Value) -> TestResult<rift_protocol::query::QueryParams> {
+    let parameters: rift_protocol::read::SearchParams = serde_json::from_value(args)?;
+    let limit = parameters
+        .limit
+        .unwrap_or(u64::try_from(rift_core::constants::SEARCH_RESULTS_DEFAULT)?);
+    let limit = oxigraph::model::Literal::from(limit);
+    let mut query = workspace_client::query::projected_retrieval(
+        &parameters,
+        "",
+        &format!("?hit :limit {limit} ."),
+    )?;
+    query.query = format!(
+        "SELECT * {{ {{ {} }} OPTIONAL {{ ?local_unit a :SourceUnitId; :path ?catalog_path . FILTER(BOUND(?path) && ?catalog_path = ?path) }} }} ORDER BY ?index",
+        query.query
+    );
+    Ok(query)
+}
+
+fn mixed_local_unit(mixed: &Value) -> TestResult<&str> {
+    let mut selected = None;
+    for row in workspace_client::query::rows(mixed)? {
+        if row["path"]["value"] == "src/lib.rs" {
+            let unit = workspace_client::query::iri(row, "local_unit")?;
+            if let Some(previous) = selected {
+                assert_eq!(unit, previous, "one original local source unit: {mixed:#}");
+            }
+            selected = Some(unit);
+        } else {
+            assert!(
+                row.get("local_unit").is_none(),
+                "remote hits do not bind the local source catalog: {mixed:#}"
+            );
+        }
+    }
+    selected.ok_or_else(|| "the original mixed query must expose its local source unit".into())
+}
+
 async fn assert_mixed_source_readback(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     fixture: &GlobalFixture,
     mixed: &Value,
 ) -> TestResult {
     let before = fixture.requests().await.len();
+    let local_unit = mixed_local_unit(mixed)?;
     let local = call_tool(
         client,
         "search",
         serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
             json!({
-                "unit":"rift://source/project/src/lib.rs", "view":mixed["view"]["id"]
+                "unit":local_unit, "view":mixed["view"]["id"]
             }),
         )?)?)?,
     )
-    .await?;
+    .await
+    .map_err(|error| mixed_local_source_error(error.as_ref(), mixed))?;
     let [local_row] = workspace_client::query::rows(&local)? else {
         return Err(format!("source query must return one original result: {local:#}").into());
     };
@@ -1425,10 +1479,7 @@ async fn assert_mixed_source_readback(
         workspace_client::query::literal(local_row, "outcome")?,
         "found"
     );
-    assert_eq!(
-        workspace_client::query::iri(local_row, "unit")?,
-        "rift://source/project/src/lib.rs"
-    );
+    assert_eq!(workspace_client::query::iri(local_row, "unit")?, local_unit);
     assert_eq!(
         workspace_client::query::literal(local_row, "complete")?,
         "true"
@@ -1550,22 +1601,23 @@ async fn global_pattern_empty_and_mixed_results_keep_original_views_and_source_o
             "{selector}"
         );
     }
-    let mixed = search_symbols(
+    let mixed = call_tool(
         &client,
-        json!({
+        "search",
+        serde_json::to_value(mixed_source_query(json!({
             "pattern":r"fn \w*beacon", "scope":"all", "target":"file",
             "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
-        }),
+        }))?)?,
     )
     .await?;
     assert_eq!(workspace_client::query::rows(&mixed)?.len(), 4, "{mixed:#}");
     assert_eq!(view_expiry(&mixed["view"])?, view_expiry(&original_view)?);
-    let ranked = ranked_search_symbols(
+    let ranked = workspace_client::search_after_population(
         &client,
-        json!({
+        &mixed_source_query(json!({
             "query":"beacon", "scope":"all", "include":["source"],
             "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
-        }),
+        }))?,
     )
     .await?;
     let requests = fixture.requests().await;
