@@ -250,9 +250,13 @@ impl RiftMcp {
 
 fn same_view(actual: &CapturedView, selected: &CapturedView) -> bool {
     actual.id == selected.id
-        && crate::proxy::captured_expiry(actual)
+        && crate::proxy::captured_expiry(actual).is_ok()
+        && crate::proxy::captured_expiry(selected).is_ok()
+        && actual
+            .expires_at
+            .parse::<jiff::Timestamp>()
             .ok()
-            .zip(crate::proxy::captured_expiry(selected).ok())
+            .zip(selected.expires_at.parse::<jiff::Timestamp>().ok())
             .is_some_and(|(actual, selected)| actual == selected)
 }
 
