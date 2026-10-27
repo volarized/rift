@@ -101,3 +101,54 @@ fn captured_node_projection_is_deterministic_and_refuses_missing_or_invalid_sour
         serde_json::from_value(serde_json::json!({"unit":"rift://source/project/lib.rs"}));
     assert!(malformed.is_err());
 }
+
+#[test]
+fn supplied_node_symbol_joins_original_declaration_and_source() {
+    let mut facts = facts();
+    let symbol: rift_protocol::read::Symbol = serde_json::from_value(serde_json::json!({
+        "id": "rift://symbol/local/rust/fixture/one", "name": "one",
+        "kind": "function", "language": "rust"
+    }))
+    .expect("original semantic symbol");
+    let declaration = serde_json::from_value(serde_json::json!({
+        "origin": serde_json::to_value(&symbol.origin).expect("original source origin"),
+        "unit": "rift://source/project/lib.rs", "range": {"start": 0, "end": 11},
+        "line": 1, "source": "fn one() {}", "source_complete": true,
+        "signature_indices": [], "type_indices": [], "documentation_indices": []
+    }))
+    .expect("original physical declaration");
+    let selected = crate::query::QuerySymbol {
+        symbol,
+        declarations: vec![declaration],
+    };
+    facts.nodes[0].nodes[1].node.symbol = selected.symbol.id.clone();
+    facts.symbols.push(selected);
+    let statement = r#"ASK {
+        ?node a :Node; :kind "function_item";
+            :symbol <rift://symbol/local/rust/fixture/one>;
+            :unit <rift://source/project/lib.rs>;
+            :range [ :start 0; :end 11 ]; :regions ?region.
+        ?region a :NodeRegion; :role "name"; :range [ :start 3; :end 6 ].
+        <rift://symbol/local/rust/fixture/one> a :Symbol; :name "one";
+            :declarations ?declaration.
+        ?declaration a :SymbolDeclaration; :unit <rift://source/project/lib.rs>;
+            :range [ :start 0; :end 11 ]; :line 1;
+            :source "fn one() {}"; :source_complete true.
+        <rift://source/project/lib.rs> a :SourceUnitId; :path "lib.rs";
+            :source "fn one() {}".
+    }"#;
+    let prepared = PreparedQuery::parse(statement, limits()).expect("ordinary node join");
+    assert_eq!(
+        prepared
+            .evaluate(facts.clone(), limits(), QueryCancellation::default())
+            .expect("supplied node joins its original semantic and physical facts"),
+        rift_protocol::query::QueryAnswer::Boolean { value: true }
+    );
+    facts.nodes[0].nodes[1].node.symbol = None;
+    assert_eq!(
+        prepared
+            .evaluate(facts, limits(), QueryCancellation::default())
+            .expect("node without semantic identity does not gain a symbol link"),
+        rift_protocol::query::QueryAnswer::Boolean { value: false }
+    );
+}
