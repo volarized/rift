@@ -26,6 +26,7 @@ from rift_dev.corpus_assertions import (
     chunked_answer,
     churn_answer,
     database_bytes,
+    declaration_pool,
     exact_degradation,
     language_counts,
     last_line_pattern,
@@ -33,6 +34,7 @@ from rift_dev.corpus_assertions import (
     lexical_content,
     map_paths,
     no_failed_builds,
+    number,
     open_history_batch,
     probe_units,
     records,
@@ -156,6 +158,30 @@ REQUIRED_LANGUAGES = {
     "nextjs": {"typescript"},
     "fastapi": {"python"},
 }
+
+
+def catalog_paths(workspace: JsonObject) -> dict[str, list[str]]:
+    """Select catalog paths that are literal under the existing glob selector.
+
+    This is a source sample, not a complete listing of the workspace. Paths with
+    glob syntax remain covered by the independent path and declaration gates.
+
+    >>> catalog_paths({"source": [{"path": "src/test.rs", "digest": "0123abcd", "language": "rust"}, {"path": "app/[slug]/page.tsx", "digest": "0123abcd", "language": "typescript:tsx"}]})
+    {'rust': ['src/test.rs']}
+    >>> catalog_paths({"source": [{"path": "README.md", "digest": "0123abcd"}]})
+    {}
+    """
+    paths: dict[str, list[str]] = {}
+    for source in objects(workspace, "source"):
+        path = string_value(source.get("path"), "catalog source path")
+        string_value(source.get("digest"), "catalog source digest")
+        language = source.get("language")
+        if language is None:
+            continue
+        language = string_value(language, "catalog source language")
+        if path.isascii() and all(c.isalnum() or c in "/_.-" for c in path):
+            paths.setdefault(language, []).append(path)
+    return paths
 
 
 def corpus_request(parameters: JsonObject) -> JsonObject:
@@ -485,28 +511,210 @@ class Corpus:
             CONFIGURATION + extra, encoding="utf-8"
         )
 
+    async def source_catalog(
+        self, client: Client
+    ) -> tuple[JsonObject, dict[str, list[str]]]:
+        """Read typed source paths through the existing resource page contract."""
+        first = await client.resource("rift://workspace")
+        revision = string_value(
+            first.get("configuration_revision"), "configuration revision"
+        )
+        pagination = object_value(first.get("pagination"), "catalog pagination")
+        pages = number(pagination.get("total_pages"), "catalog total pages")
+        groups: dict[str, list[str]] = {}
+        previous = ""
+        for index in range(pages):
+            page = (
+                first
+                if index == 0
+                else await client.resource(f"rift://workspace?page_index={index}")
+            )
+            require(
+                page.get("configuration_revision") == revision,
+                "catalog configuration changed",
+            )
+            require(
+                page.get("languages") == first.get("languages"),
+                "catalog languages changed",
+            )
+            position = object_value(page.get("pagination"), "catalog pagination")
+            require(
+                position.get("page_index") == index
+                and position.get("total_pages") == pages,
+                "catalog page changed",
+            )
+            require(not warnings(page), "source catalog is still preparing")
+            for source in objects(page, "source"):
+                path = string_value(source.get("path"), "catalog source path")
+                require(path > previous, "catalog paths must be unique and sorted")
+                previous = path
+            for language, paths in catalog_paths(page).items():
+                groups.setdefault(language, []).extend(paths)
+        return first, groups
+
+    async def symbol_candidates(
+        self, client: Client, *, minimum: int = SYMBOL_COUNT
+    ) -> list[JsonObject]:
+        """Collect complete exact-path results for the existing physical sample.
+
+        The callback boundary covers a first catalog page with no sampled language
+        and final exhaustion of an optional language. These typed callback rows
+        test control flow; the owning corpus run checks actual declarations.
+
+        >>> from types import SimpleNamespace
+        >>> from typing import cast
+        >>> from unittest.mock import AsyncMock
+        >>> def term(value, datatype="string"):
+        ...     return {"type": "literal", "value": str(value), "datatype": "http://www.w3.org/2001/XMLSchema#" + datatype}
+        >>> rows = [{**{key: term(value) for key, value in {"name": f"entry{index}", "kind": "function", "language": "typescript", "path": "src/test.ts"}.items()}, "start": term(index * 2, "integer"), "end": term(index * 2 + 1, "integer"), "symbol": {"type": "iri", "value": f"urn:fixture:sample:{index}"}} for index in range(SYMBOL_COUNT)]
+        >>> def answer(bindings):
+        ...     return {"answer": {"result": "bindings", "variables": list(rows[0]), "bindings": bindings}}
+        >>> languages = [{"language": language, "enabled": True, "syntax": True, "include": ["**"]} for language in ("rust", "typescript", "typescript:tsx", "markdown")]
+        >>> common = {"configuration_revision": "0123abcd", "languages": languages}
+        >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
+        >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer([]), answer(rows), answer([])]))
+        >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
+        >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
+        >>> len(selected), client.call.await_count, client.resource.await_count
+        (200, 3, 2)
+        >>> all(literal(row, "path") == "src/test.ts" for row in selected)
+        True
+        >>> "rift.toml" in client.call.await_args_list[0].args[1]["query"]
+        True
+        """
+        languages = SAMPLE_LANGUAGES[self.pin.name]
+
+        async def read(path: str, query: str = "test") -> list[JsonObject]:
+            answer = await settled_local(
+                client,
+                "search",
+                corpus_request(
+                    {
+                        "query": query,
+                        "target": "symbol",
+                        "paths": {"include": [path]},
+                        "limit": 1000,
+                        "order": "identity",
+                    }
+                ),
+            )
+            warnings(answer)
+            found = bindings(answer)
+            require(
+                all(literal(hit, "path") == path for hit in found),
+                "literal sample path matched another file",
+            )
+            return found
+
+        # configure() writes this exact fixture-owned path before the server starts.
+        # This read waits for startup without depending on a catalog page's languages.
+        pool = await read("rift.toml")
+        represented: set[str] = set()
+        workspace, groups = await self.source_catalog(client)
+        configured = objects(workspace, "languages")
+        for language in languages:
+            matching = [row for row in configured if row.get("language") == language]
+            require(len(matching) == 1, f"workspace lost language {language}")
+            row = matching[0]
+            require(
+                row.get("enabled") is True and row.get("syntax") is True,
+                f"workspace does not serve syntax for {language}",
+            )
+            require(
+                bool(array_value(row.get("include"), "language include patterns")),
+                f"workspace lost include patterns for {language}",
+            )
+        anchor = (
+            {
+                "bun": "rift://symbol/local/rust/bun_bundler/defines/TEST",
+                "fastapi": "rift://symbol/local/python/fastapi/routing/APIRouter",
+            }.get(self.pin.name)
+            if minimum == SYMBOL_COUNT
+            else None
+        )
+        if anchor is not None:
+            detail = await client.call("get_symbol", {"id": anchor})
+            require(
+                detail.get("outcome") == "found"
+                and object_value(detail.get("symbol"), "anchor symbol").get("id")
+                == anchor,
+                "canonical sample anchor was not found",
+            )
+            paths = {
+                path for language in languages for path in groups.get(language, [])
+            }
+            for declaration in objects(detail, "declarations"):
+                path = string_value(declaration.get("path"), "anchor declaration path")
+                require(
+                    path in paths, "anchor declaration is outside literal catalog paths"
+                )
+                added = await read(path, anchor.rsplit("/", 1)[1])
+                pool.extend(added)
+                if added:
+                    represented.update(
+                        language
+                        for language in languages
+                        if path in groups.get(language, [])
+                    )
+            require(
+                anchor in symbol_pool(pool),
+                "scoped search lost the canonical sample anchor",
+            )
+        pending = {
+            language: iter(
+                sorted(
+                    groups.get(language, []),
+                    key=lambda path: ("test" not in path.lower(), path),
+                )
+            )
+            for language in languages
+        }
+        exhausted: set[str] = set()
+        seen: set[str] = set()
+        while True:
+            counts = language_counts(pool)
+            enough = len(declaration_pool(pool)) >= minimum
+            if minimum == SYMBOL_COUNT:
+                enough = (
+                    enough
+                    and REQUIRED_LANGUAGES[self.pin.name].issubset(counts)
+                    and bool(symbol_pool(pool))
+                    and set(languages).issubset(represented | exhausted)
+                )
+            if enough:
+                return pool
+            progress = False
+            for language in languages:
+                if language in exhausted:
+                    continue
+                path = next(pending[language], None)
+                if path is None:
+                    exhausted.add(language)
+                    progress = True
+                    continue
+                progress = True
+                if path in seen:
+                    continue
+                seen.add(path)
+                added = await read(path)
+                pool.extend(added)
+                if added:
+                    represented.add(language)
+            require(
+                progress,
+                f"source catalog has fewer than {minimum} sampled declarations",
+            )
+
     async def baseline(self) -> None:
         with self.server() as server:
             async with server.connect() as client:
-                answer = await settled_local(
-                    client,
-                    "search",
-                    corpus_request(
-                        {
-                            "query": "test",
-                            "target": "symbol",
-                            "limit": 1000,
-                            "order": "identity",
-                        }
-                    ),
-                )
-                candidates = bindings(answer)
+                candidates = await self.symbol_candidates(client)
                 require(
                     len(candidates) >= SYMBOL_COUNT,
                     f"{self.pin.name}: fewer than {SYMBOL_COUNT} symbols",
                 )
                 self.record("publication", symbols=len(candidates))
-                warnings(answer)
                 await client.resource("rift://workspace")
                 workspace_map = await client.resource("rift://map")
                 found = await observed(
@@ -705,50 +913,6 @@ class Corpus:
         """Check 200 physical declarations and every sampled established identity."""
         initial = language_counts(candidates)
         pool = list(candidates)
-        workspace = await client.resource("rift://workspace")
-        configured = objects(workspace, "languages")
-        for language in SAMPLE_LANGUAGES[self.pin.name]:
-            matching = [row for row in configured if row.get("language") == language]
-            require(len(matching) == 1, f"workspace lost language {language}")
-            row = matching[0]
-            require(
-                row.get("enabled") is True and row.get("syntax") is True,
-                f"workspace does not serve syntax for {language}",
-            )
-            included = array_value(row.get("include"), "language include patterns")
-            require(bool(included), f"workspace lost include patterns for {language}")
-            paths: JsonObject = {"include": included, "exclude": row.get("exclude", [])}
-            answer = await client.call(
-                "search",
-                corpus_request(
-                    {
-                        "query": "test",
-                        "target": "symbol",
-                        "paths": paths,
-                        "limit": 1000,
-                        "order": "identity",
-                    }
-                ),
-            )
-            warnings(answer)
-            added = bindings(answer)
-            pool.extend(added)
-        if self.pin.name == "fastapi":
-            answer = await client.call(
-                "search",
-                corpus_request(
-                    {
-                        "query": "APIRouter",
-                        "target": "symbol",
-                        "paths": {"include": ["fastapi/**"]},
-                        "limit": 1000,
-                        "order": "identity",
-                    }
-                ),
-            )
-            warnings(answer)
-            added = bindings(answer)
-            pool.extend(added)
         selected = sample_symbols(
             pool, SYMBOL_COUNT, SEED, REQUIRED_LANGUAGES[self.pin.name]
         )
@@ -1183,13 +1347,8 @@ class Corpus:
         link.symlink_to(self.root, target_is_directory=True)
         with self.server(link) as server:
             async with server.connect() as client:
-                answer = await settled_local(
-                    client, "search", corpus_request({"query": "test", "limit": 1})
-                )
-                require(
-                    bool(bindings(answer)),
-                    "symlink root has no search results",
-                )
+                candidates = await self.symbol_candidates(client, minimum=1)
+                require(bool(candidates), "symlink root has no search results")
                 no_failed_builds(await logged(server, "index"))
             self.stop(server)
         self.record("symlink_root", reads=True)
