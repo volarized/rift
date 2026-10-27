@@ -3,10 +3,46 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Literal
 
 from rift_dev.corpus_assertions import warnings
 from rift_dev.rift_test_client import Client, JsonObject, ToolFailure, gate_deadline
+
+
+def _committing_lexical(warning: JsonObject) -> bool:
+    """Match the active commit detail, never the shared terminal warning code.
+
+    >>> detail = "the lexical index is still committing tree revision b0431b62, so the answer was ranked by identifier matching alone; resend the request once the commit lands"
+    >>> warning = {"code": "lexical_ranking_unavailable", "detail": detail}
+    >>> _committing_lexical(warning)
+    True
+    >>> for invalid in (detail + " trailing", "prefix " + detail, detail.replace("b0431b62", "b0431b6"), detail.replace("b0431b62", "B0431B62"), detail.replace("b0431b62", "g0431b62"), None):
+    ...     assert not _committing_lexical({**warning, "detail": invalid})
+    >>> terminal = [
+    ...     "the lexical index missed a commit and compares every file with the digests it recorded under the next publication, so the answer for tree revision b0431b62 was ranked by identifier matching alone: write refused",
+    ...     "the lexical index holds no indexed tree and no commit is under way for tree revision b0431b62, so the answer was ranked by identifier matching alone; rift server logs names what the lexical lane did, and a restart retries it",
+    ...     "the workspace search database could not be opened, so the answer was ranked by identifier matching alone; the server log names the open failure, and a restart retries it",
+    ...     "the workspace search database handed this request no connection: every one of its `[search] pool_slots` stayed in use past `[search] busy_timeout`, so the answer was ranked by identifier matching alone; a resent request reads the store again",
+    ...     "local files are still being prepared, so the answer was ranked by identifier matching alone",
+    ... ]
+    >>> all(not _committing_lexical({**warning, "detail": value}) for value in terminal)
+    True
+    >>> _committing_lexical({**warning, "code": "source_unavailable"})
+    False
+    """
+    detail = warning.get("detail")
+    return (
+        warning.get("code") == "lexical_ranking_unavailable"
+        and isinstance(detail, str)
+        and re.fullmatch(
+            r"the lexical index is still committing tree revision [0-9a-f]{8}, "
+            r"so the answer was ranked by identifier matching alone; "
+            r"resend the request once the commit lands",
+            detail,
+        )
+        is not None
+    )
 
 
 def preparing_local(
@@ -27,7 +63,7 @@ def preparing_local(
     >>> preparing_local({"outcome": "unavailable", "reason": "index_preparing"})
     False
     >>> pending = {"outcome": "unavailable", "reason": "insufficient_coverage", "warnings": [{"code": "local_index_preparing"}]}
-    >>> for code in ("source_unavailable", "framework_context_unresolved"):
+    >>> for code in ("source_unavailable", "framework_context_unresolved", "large_file_unparsed"):
     ...     mixed = {**pending, "warnings": [*pending["warnings"], {"code": code, "unit": "rift://source/project/lib.rs"}]}
     ...     assert preparing_local(mixed, selection="current")
     ...     assert not preparing_local(mixed)
@@ -44,6 +80,7 @@ def preparing_local(
         "lexical_ranking_unavailable",
         "source_unavailable",
         "framework_context_unresolved",
+        "large_file_unparsed",
     )
     if any(warning.get("code") not in accepted for warning in observed):
         return False
@@ -52,7 +89,10 @@ def preparing_local(
             return True
         if answer.get("reason") != "insufficient_coverage":
             return False
-    return any(warning.get("code") == "local_index_preparing" for warning in observed)
+    return any(
+        warning.get("code") == "local_index_preparing" or _committing_lexical(warning)
+        for warning in observed
+    )
 
 
 def retry_local_failure(failure: ToolFailure) -> bool:
@@ -109,6 +149,22 @@ async def settled_local(
     >>> answer, count = asyncio.run(read([pending, ready], selection="current"))
     >>> bindings(answer)[0]["symbol"]["type"], count
     ('blank_node', 2)
+    >>> committing = {"outcome": "unavailable", "reason": "insufficient_coverage", "warnings": [{"code": "lexical_ranking_unavailable", "detail": "the lexical index is still committing tree revision b0431b62, so the answer was ranked by identifier matching alone; resend the request once the commit lands"}]}
+    >>> answer, count = asyncio.run(read([committing, ready], selection="current"))
+    >>> bindings(answer)[0]["symbol"]["type"], count
+    ('blank_node', 2)
+    >>> answer, count = asyncio.run(read([committing], selection="captured"))
+    >>> answer is committing, count
+    (True, 1)
+    >>> answer, count = asyncio.run(read([committing], selection="current", request={"view": "0" * 64}))
+    >>> answer is committing, count
+    (True, 1)
+    >>> for code in ("results_truncated", "global_response_invalid", "relationship_coverage_missing", "unknown"):
+    ...     assert not preparing_local({**committing, "warnings": [*committing["warnings"], {"code": code}]}, selection="current")
+    >>> terminal = {**committing, "warnings": [{"code": "lexical_ranking_unavailable", "detail": "the workspace search database could not be opened, so the answer was ranked by identifier matching alone; the server log names the open failure, and a restart retries it"}]}
+    >>> answer, count = asyncio.run(read([terminal], selection="current"))
+    >>> answer is terminal, count
+    (True, 1)
     >>> answer, count = asyncio.run(read([pending], selection="captured"))
     >>> answer is pending, count
     (True, 1)
