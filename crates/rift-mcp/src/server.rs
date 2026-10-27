@@ -11603,6 +11603,11 @@ done
         query: &str,
         path: &str,
     ) -> TestResult<serde_json::Value> {
+        let stage = match (query, path) {
+            ("replace all units", "guide.txt") => Some("matched_by first"),
+            ("scale_value", "lib.rs") => Some("matched_by named"),
+            _ => None,
+        };
         let literal = oxigraph::model::Literal::from(query);
         let statement = format!(
             "SELECT ?hit ?path ?target ?symbol ?name ?matched_by ?matched_index {{ SERVICE :search {{ ?hit :query {literal}; :index ?index; :path ?path; :hit/:target ?target; :matched_by ?match . ?match :value ?matched_by; :index ?matched_index . OPTIONAL {{ ?hit :symbol ?symbol . ?symbol :name ?name }} }} }} ORDER BY ?index ?matched_index LIMIT 100"
@@ -11615,9 +11620,12 @@ done
                         .with_arguments(arguments(&json!({"query": statement}))?),
                 )
                 .await?;
-            let structured = answer
-                .structured_content
-                .ok_or("search must return structured content")?;
+            let structured = answer.structured_content.ok_or_else(|| match stage {
+                Some(stage) => {
+                    format!("{stage}: search must return structured content; structured=false")
+                }
+                None => "search must return structured content".to_owned(),
+            })?;
             if structured["outcome"] == "unavailable" && structured["reason"] == "index_preparing" {
                 last_answer = structured;
                 tokio::time::sleep(SEARCH_TIER_POLL).await;
@@ -11625,7 +11633,21 @@ done
             }
             let results = structured["answer"]["bindings"]
                 .as_array()
-                .ok_or("results must be an array")?;
+                .ok_or_else(|| {
+                    let Some(stage) = stage else {
+                        return "results must be an array".to_owned();
+                    };
+                    let warnings = structured["warnings"].as_array();
+                    let codes: Vec<_> = warnings.into_iter().flatten().take(8)
+                        .filter_map(|warning| warning.get("code").and_then(serde_json::Value::as_str))
+                        .collect();
+                    format!(
+                        "{stage}: results must be an array; structured=true; outcome={:?}; reason={:?}; warning_count={:?}; warning_codes={codes:?}",
+                        structured.get("outcome").and_then(serde_json::Value::as_str),
+                        structured.get("reason").and_then(serde_json::Value::as_str),
+                        warnings.map(Vec::len),
+                    )
+                })?;
             if results.iter().any(|hit| hit["path"]["value"] == path) {
                 return Ok(structured);
             }
