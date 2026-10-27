@@ -1230,7 +1230,7 @@ async fn assert_captured_typescript_call(
     )?)?;
     assert!(
         matches!(owner, rift_protocol::identity::SymbolOwner::Package { manager, registry, name, version }
-            if manager == "npm" && registry == "registry.npmjs.org" && name == "typescript"
+            if manager == "npm" && registry == "npmjs.org" && name == "typescript"
                 && manifest["version"].as_str() == Some(version.as_str())),
         "the physical declaration retains its installed package owner: {row}"
     );
