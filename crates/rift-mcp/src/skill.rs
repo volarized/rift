@@ -282,14 +282,14 @@ fn skill_markdown(form: SkillForm) -> String {
          ORDER BY ?name ?path LIMIT 20\n\
          ```\n\n\
          ### Source reads\n\n\
-         Read a complete source unit or a half-open UTF-8 byte range. Replace `<source-unit>` \
+         Read a complete source unit or a half-open UTF-8 byte range. Replace `<rift://source/project/crates/rift/src/main.rs>` \
          with an observed source-unit IRI. Whole-file reads omit `:range`; captured reads \
          add `:view` with the original captured view ID.\n\n\
          ```sparql\n\
          SELECT ?outcome ?text ?start ?end ?complete\n\
          WHERE {\n\
            SERVICE :source {\n\
-             ?read :unit <source-unit>; :range '{\"start\":0,\"end\":4}'^^rdf:JSON;\n\
+             ?read :unit <rift://source/project/crates/rift/src/main.rs>; :range '{\"start\":0,\"end\":4}'^^rdf:JSON;\n\
                    :outcome ?outcome .\n\
              OPTIONAL {\n\
                ?read :source [ :text ?text; :span [ :range [ :start ?start; :end ?end ] ] ];\n\
@@ -906,6 +906,51 @@ mod tests {
         Ok(())
     }
 
+    fn evaluate_source_example(
+        query: &rift_search::sparql::PreparedQuery,
+        limits: rift_search::query::QueryLimits,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(query.requirements().source_reads.len(), 1);
+        let request = query.requirements().source_reads[0].clone();
+        let found: rift_protocol::source_read::GetSourceResult =
+            serde_json::from_value(serde_json::json!({
+                "outcome": "found",
+                "source": {
+                    "span": { "unit": request.unit, "range": request.range },
+                    "text": "main"
+                },
+                "source_complete": true,
+                "view": {
+                    "id": "a".repeat(64),
+                    "expires_at": "2099-01-01T00:00:00Z"
+                }
+            }))?;
+        let rows = example_bindings(query.evaluate_with_services(
+            rift_search::query::QueryFacts::default(),
+            limits,
+            rift_search::sparql::QueryCancellation::default(),
+            rift_search::sparql::QueryServices {
+                sources: vec![(request, found)],
+                ..rift_search::sparql::QueryServices::default()
+            },
+        )?);
+        assert_eq!(rows.len(), 1);
+        for (key, expected) in [
+            ("outcome", "found"),
+            ("text", "main"),
+            ("start", "0"),
+            ("end", "4"),
+            ("complete", "true"),
+        ] {
+            let Some(rift_protocol::query::RdfTerm::Literal { value, .. }) = rows[0].get(key)
+            else {
+                return Err(format!("Source example has no {key}").into());
+            };
+            assert_eq!(value, expected);
+        }
+        Ok(())
+    }
+
     #[test]
     fn rendered_sparql_examples_evaluate_original_rows_and_two_call_edges()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -914,10 +959,11 @@ mod tests {
         )?;
         for form in [SkillForm::Installed, SkillForm::Plugin] {
             let queries = prepared_examples(form, limits)?;
-            assert_eq!(queries.len(), 3);
+            assert_eq!(queries.len(), 4);
             evaluate_text_example(&queries[0], limits)?;
             evaluate_pattern_example(&queries[1], limits)?;
             evaluate_traversal_example(&queries[2], limits)?;
+            evaluate_source_example(&queries[3], limits)?;
         }
         Ok(())
     }
@@ -940,7 +986,7 @@ mod tests {
                     rift_search::sparql::PreparedQuery::parse(statement, limits)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            assert_eq!(queries.len(), 3);
+            assert_eq!(queries.len(), 4);
             assert_eq!(queries[0].retrievals().len(), 1);
             assert!(queries[0].retrievals()[0].query.is_some());
             assert!(queries[0].retrievals()[0].pattern.is_none());
@@ -948,6 +994,18 @@ mod tests {
             assert!(queries[1].retrievals()[0].pattern.is_some());
             assert!(queries[1].retrievals()[0].paths.is_some());
             assert!(queries[2].retrievals().is_empty());
+            assert!(queries[3].retrievals().is_empty());
+            assert_eq!(
+                queries[3].requirements().source_reads,
+                vec![rift_protocol::source_read::GetSourceParams {
+                    unit: rift_protocol::read::SourceUnitId::parse(
+                        "rift://source/project/crates/rift/src/main.rs"
+                    )?,
+                    range: Some(rift_protocol::read::TextRange { start: 0, end: 4 }),
+                    view: None,
+                    rev: None,
+                }]
+            );
             assert!(
                 queries[2]
                     .requirements()

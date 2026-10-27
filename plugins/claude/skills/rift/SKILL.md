@@ -91,13 +91,13 @@ ORDER BY ?name ?path LIMIT 20
 
 ### Source reads
 
-Read a complete source unit or a half-open UTF-8 byte range. Replace `<source-unit>` with an observed source-unit IRI. Whole-file reads omit `:range`; captured reads add `:view` with the original captured view ID.
+Read a complete source unit or a half-open UTF-8 byte range. Replace `<rift://source/project/crates/rift/src/main.rs>` with an observed source-unit IRI. Whole-file reads omit `:range`; captured reads add `:view` with the original captured view ID.
 
 ```sparql
 SELECT ?outcome ?text ?start ?end ?complete
 WHERE {
 SERVICE :source {
-?read :unit <source-unit>; :range '{"start":0,"end":4}'^^rdf:JSON;
+?read :unit <rift://source/project/crates/rift/src/main.rs>; :range '{"start":0,"end":4}'^^rdf:JSON;
 :outcome ?outcome .
 OPTIONAL {
 ?read :source [ :text ?text; :span [ :range [ :start ?start; :end ?end ] ] ];
