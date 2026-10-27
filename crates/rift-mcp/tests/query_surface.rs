@@ -207,7 +207,7 @@ async fn assert_query_fact_refusals(
         .await?;
     assert_eq!(invalid.is_error, Some(true), "{invalid:?}");
     assert!(serde_json::to_string(&invalid)?.contains("invalid_request"));
-    for version in [0, 8] {
+    for version in [0, 8, 9] {
         let mut incompatible = request.clone();
         incompatible["version"] = json!(version);
         let incompatible = client

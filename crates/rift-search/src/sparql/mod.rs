@@ -38,6 +38,8 @@ macro_rules! vocabulary_iri {
 pub const VOCABULARY: &str = vocabulary_iri!("");
 /// Local retrieval service reusing Rift's existing search producers.
 pub const SEARCH_SERVICE: &str = vocabulary_iri!("search");
+/// Exact source results acquired before evaluation.
+pub const SOURCE_SERVICE: &str = vocabulary_iri!("source");
 /// Namespace of retained query executions selected through `SERVICE`.
 pub const RESULT_SERVICE_PREFIX: &str = "urn:rift:result:";
 /// Namespace of accepted extra-project dataset names.
@@ -158,7 +160,7 @@ impl PreparedQuery {
         cancellation: QueryCancellation,
         mut services: QueryServices,
     ) -> Result<QueryAnswer, QueryError> {
-        services.validate(&self.requirements)?;
+        services.validate(&self.requirements, &cancellation)?;
         self.requirements.validate_facts(&facts)?;
         for selected in &services.datasets {
             self.requirements.validate_facts(&selected.facts)?;

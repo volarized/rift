@@ -53,6 +53,7 @@ fn service(query: &PreparedQuery, hits: Vec<SearchHit>) -> QueryServices {
             targets: vec![None; result.results.len()],
             result,
         }],
+        sources: Vec::new(),
         bindings: Vec::new(),
         datasets: Vec::new(),
     }
@@ -277,6 +278,7 @@ fn test_retained_table_preserves_duplicates_blank_nodes_and_inner_filter() -> Te
     };
     let services = QueryServices {
         retrievals: Vec::new(),
+        sources: Vec::new(),
         bindings: vec![retained],
         datasets: Vec::new(),
     };
@@ -310,6 +312,7 @@ fn test_retained_graph_uses_rdf_graph_matching() -> TestResult {
     };
     let services = QueryServices {
         retrievals: Vec::new(),
+        sources: Vec::new(),
         datasets: Vec::new(),
         bindings: vec![RetainedResult {
             service: "urn:rift:result:12345678".to_owned(),
@@ -338,6 +341,7 @@ fn test_retained_graph_uses_rdf_graph_matching() -> TestResult {
 fn test_retained_boolean_uses_one_typed_value() -> TestResult {
     let services = QueryServices {
         retrievals: Vec::new(),
+        sources: Vec::new(),
         datasets: Vec::new(),
         bindings: vec![RetainedResult {
             service: "urn:rift:result:12345678".to_owned(),

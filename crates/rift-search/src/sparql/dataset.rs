@@ -124,6 +124,12 @@ pub(super) struct VirtualDataset {
     cancellation: CancellationToken,
     retrieval: Option<Arc<super::services::QueryServiceData>>,
     retrieval_owner: Option<Arc<Self>>,
+    source_read: Option<
+        Arc<(
+            rift_protocol::source_read::GetSourceParams,
+            rift_protocol::source_read::GetSourceResult,
+        )>,
+    >,
     retained_graph: Option<Arc<Vec<rift_protocol::query::RdfTriple>>>,
     datasets: Arc<Vec<(Option<Term>, Self)>>,
     identities: Arc<identity::IdentityMap>,
@@ -245,6 +251,7 @@ impl VirtualDataset {
             cancellation,
             retrieval: None,
             retrieval_owner: None,
+            source_read: None,
             retained_graph: None,
             datasets: Arc::new(Vec::new()),
             identities: Arc::new(identity::IdentityMap::default()),
@@ -301,6 +308,7 @@ impl VirtualDataset {
         self.sources(output)?;
         self.other_records(output)?;
         self.retrieval(output)?;
+        self.source_read(output)?;
         self.retained_graph(output)
     }
 
@@ -366,6 +374,32 @@ impl VirtualDataset {
         self.retrieval = Some(retrieval);
         self.retrieval_owner = Some(owner);
         self
+    }
+
+    pub(super) fn with_source_read(
+        mut self,
+        source: Arc<(
+            rift_protocol::source_read::GetSourceParams,
+            rift_protocol::source_read::GetSourceResult,
+        )>,
+    ) -> Self {
+        self.source_read = Some(source);
+        self
+    }
+
+    fn source_read(&self, output: &mut Projection) -> Result<(), QueryError> {
+        let Some(source) = &self.source_read else {
+            return Ok(());
+        };
+        let view = match &source.1 {
+            rift_protocol::source_read::GetSourceResult::Found { view, .. }
+            | rift_protocol::source_read::GetSourceResult::Missing { view, .. } => view,
+            rift_protocol::source_read::GetSourceResult::Unavailable { .. } => {
+                return Err(failure::invalid("required source result is unavailable"));
+            }
+        };
+        let subject = blank(&serde_json::to_vec(&(&source.0, view)).map_err(invalid)?)?;
+        output.fields(subject, &source.1)
     }
 
     pub(super) fn with_retained_graph(

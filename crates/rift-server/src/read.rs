@@ -1602,7 +1602,6 @@ fn wire_node_facts(
     range: ByteRange,
     kind: &'static str,
 ) -> Result<Node, RiftError> {
-    let language = file.syntax().language();
     let symbol = index
         .file(file.path())
         .filter(|captured| captured.digest() == file.digest())
@@ -1610,7 +1609,57 @@ fn wire_node_facts(
         .map(|symbol| symbol_id(index, crate::search::declared(file, symbol)))
         .transpose()?
         .flatten();
-    Ok(Node {
+    Ok(wire_node_with_symbol(file, range, kind, symbol))
+}
+
+/// Reserves variable node output and bounded address/classification scratch before copying.
+///
+/// The admitted source unit already carries the existing path encoding. Its length bounds
+/// each retained address path and one temporary path encoding. The same three quantities
+/// cover the original language, its address segment and the temporary segment. One Node
+/// allocation also reserves the fixed facet classifier rows; these contain no strings.
+pub(crate) fn wire_node_material_bytes(
+    file: &IndexedFile,
+    unit: &SourceUnitId,
+    kind: &str,
+    symbol: Option<&str>,
+    parent: Option<&NodeId>,
+) -> Option<usize> {
+    let path = unit.as_str().len();
+    let language = file.syntax().language();
+    let dialect = language
+        .dialect
+        .as_ref()
+        .map_or(Some(0), |dialect| dialect.len().checked_add(1))?;
+    let language = language.name.len().checked_add(dialect)?;
+    let digits = usize::try_from(u64::MAX.ilog10() + 1).ok()?;
+    let fixed = size_of::<Node>()
+        .checked_add("rift://node/".len())?
+        .checked_add("rift://file/".len())?
+        .checked_add("/@-#".len())?
+        .checked_add(digits.checked_mul(2)?)?
+        .checked_add(DIGEST_WIRE_CHARS)?
+        .checked_add(size_of::<sha2::digest::Output<Sha256>>().checked_mul(2)?)?;
+    [
+        path.checked_mul(3)?,
+        language.checked_mul(3)?,
+        kind.len(),
+        symbol.map_or(0, str::len),
+        parent.map_or(0, |parent| parent.0.len()),
+    ]
+    .into_iter()
+    .try_fold(fixed, usize::checked_add)
+}
+
+/// Projects one original syntax row with its captured declaration association.
+pub(crate) fn wire_node_with_symbol(
+    file: &IndexedFile,
+    range: ByteRange,
+    kind: &'static str,
+    symbol: Option<SymbolId>,
+) -> Node {
+    let language = file.syntax().language();
+    Node {
         id: node_id(file, range),
         symbol,
         unit: file_id(file.path()),
@@ -1621,7 +1670,7 @@ fn wire_node_facts(
         regions: Vec::new(),
         parent: None,
         extensions: Extensions::from(BTreeMap::new()),
-    })
+    }
 }
 
 /// Builds one hit's wire symbol, and the `symbol_disagreement` warning its retained

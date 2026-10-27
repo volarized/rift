@@ -12,6 +12,7 @@ use rift_search::query::{
 
 mod history;
 mod local_provider;
+mod nodes;
 
 /// Combines admitted facts while preserving their original source and provider associations.
 ///
@@ -460,10 +461,23 @@ fn project_sources(
     budget: &mut QueryFactBudget<'_>,
 ) -> Result<(), RiftError> {
     let mut source_bytes = 0usize;
+    let mut node_count = 0usize;
+    let mut nodes_complete = true;
     for (path, source) in view.sources() {
         budget.check()?;
-        if requirements.symbol_name.is_some() || requirements.symbol_ids.is_some() {
+        if (requirements.symbol_name.is_some() || requirements.symbol_ids.is_some())
+            && !requirements.requires(FactRequirement::Nodes)
+            && requirements.source_units.is_none()
+        {
             break;
+        }
+        let unit = SourceUnitId(rift_syntax::source_unit_for_path(path)?.to_string());
+        if requirements
+            .source_units
+            .as_ref()
+            .is_some_and(|units| !units.contains(&unit))
+        {
+            continue;
         }
         if facts.sources.len() >= limits.quads_max {
             return query_bound("search.query.statements");
@@ -480,7 +494,7 @@ fn project_sources(
             budget.charge(&source)?;
         }
         let mut record = QuerySource {
-            unit: SourceUnitId(rift_syntax::source_unit_for_path(path)?.to_string()),
+            unit,
             digest: Some(rift_protocol::identity::SourceDigest::parse(
                 &data_encoding::HEXLOWER
                     .encode(rift_core::FileDigest::of(source.as_bytes()).as_bytes()),
@@ -488,10 +502,35 @@ fn project_sources(
             text: None,
         };
         budget.charge(&record)?;
+        if requirements.requires(FactRequirement::Nodes) {
+            if let Some(file) = view.file(path) {
+                node_count = node_count
+                    .checked_add(file.syntax().nodes().map_or(0, <[_]>::len))
+                    .ok_or_else(|| query_bound_error("search.query.statements"))?;
+                if node_count > limits.quads_max {
+                    return query_bound("search.query.statements");
+                }
+                nodes_complete &= nodes::project(view, file, &record.unit, facts, budget)?;
+            } else if requirements.source_units.is_some() {
+                nodes_complete = false;
+            }
+        }
         record.text = requirements
             .requires(FactRequirement::Source)
             .then(|| source.to_owned());
         facts.sources.push(record);
+    }
+    if requirements.requires(FactRequirement::Nodes)
+        && nodes_complete
+        && requirements.source_units.as_ref().is_none_or(|units| {
+            units
+                .iter()
+                .all(|unit| facts.nodes.iter().any(|source| &source.unit == unit))
+        })
+    {
+        facts
+            .unavailable_families
+            .retain(|family| *family != QueryFactFamily::Nodes);
     }
     Ok(())
 }
@@ -599,19 +638,8 @@ mod tests {
     #[test]
     fn captured_query_facts_preserve_selected_source_and_narrow_names()
     -> Result<(), Box<dyn std::error::Error>> {
-        let root = tempfile::tempdir()?;
-        std::fs::write(
-            root.path().join("Cargo.toml"),
-            "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
-        )?;
         let original = "/// Original.\npub fn kept() {}\npub fn other() {}\n";
-        std::fs::write(root.path().join("lib.rs"), original)?;
-        let index = WorkspaceIndex::build(
-            root.path(),
-            WorkspaceIndexLimits::default(),
-            &SourceVisibility::default(),
-            &TextFileInclusion::default(),
-        )?;
+        let (root, index) = query_fixture(original)?;
         let view = index.symbol_view()?;
         let prepared = PreparedQuery::parse(
             "SELECT ?symbol { ?symbol a :Symbol; :name \"kept\" }",
@@ -656,6 +684,170 @@ mod tests {
             )?,
             QueryAnswer::Boolean { value: true }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn captured_nodes_keep_original_tree_declaration_and_source_after_edit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = "pub fn kept() {}";
+        let (root, index) = query_fixture(original)?;
+        let view = index.symbol_view()?;
+        let path = rift_core::ProjectPath::new("lib.rs")?;
+        let file = view.file(&path).ok_or("captured file")?;
+        let rows = file.syntax().nodes().ok_or("complete captured rows")?;
+        let count = rows.len();
+        let same_span = rows
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, node)| {
+                (node.kind == "function_item" && node.range == rows[0].range).then_some(ordinal)
+            })
+            .ok_or("same-span root and function")?;
+        drop(index);
+        std::fs::write(root.path().join("lib.rs"), "pub fn changed() {}")?;
+        let mut requirements = FactRequirements {
+            required: [
+                FactRequirement::Domain,
+                FactRequirement::Nodes,
+                FactRequirement::Source,
+            ]
+            .into(),
+            source_units: Some(vec![SourceUnitId::parse("rift://source/project/lib.rs")?]),
+            ..FactRequirements::default()
+        };
+        let facts = project_query_facts(&view, &requirements, limits())?;
+        assert!(!facts.unavailable_families.contains(&QueryFactFamily::Nodes));
+        assert_eq!(facts.nodes.len(), 1);
+        let source = &facts.nodes[0];
+        assert_eq!(source.nodes.len(), count);
+        assert_eq!(source.bytes, u64::try_from(original.len())?);
+        assert_eq!(source.nodes[0].node.id, source.nodes[same_span].node.id);
+        assert_ne!(source.nodes[0].ordinal, source.nodes[same_span].ordinal);
+        assert!(source.nodes[0].node.symbol.is_none());
+        assert!(source.nodes[same_span].node.symbol.is_some());
+        assert_eq!(source.nodes[same_span].parent, Some(0));
+        assert_eq!(facts.sources[0].text.as_deref(), Some(original));
+        for (statement, expected) in [
+            (
+                "ASK { ?node a :Node; :kind 'function_item'; :symbol ?symbol . ?symbol a :Symbol; :name 'kept' }",
+                true,
+            ),
+            (
+                "ASK { ?node a :Node; :kind 'source_file'; :symbol ?symbol }",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                PreparedQuery::parse(statement, limits())?.evaluate(
+                    facts.clone(),
+                    limits(),
+                    QueryCancellation::default()
+                )?,
+                QueryAnswer::Boolean { value: expected },
+                "{statement}"
+            );
+        }
+        requirements.source_units = Some(vec![SourceUnitId::parse(
+            "rift://source/project/missing.rs",
+        )?]);
+        let missing = project_query_facts(&view, &requirements, limits())?;
+        assert!(missing.nodes.is_empty());
+        assert!(
+            missing
+                .unavailable_families
+                .contains(&QueryFactFamily::Nodes)
+        );
+        let mut bound = limits();
+        bound.quads_max = count - 1;
+        requirements.source_units =
+            Some(vec![SourceUnitId::parse("rift://source/project/lib.rs")?]);
+        assert!(project_query_facts(&view, &requirements, bound).is_err());
+        Ok(())
+    }
+
+    fn query_fixture(
+        source: &str,
+    ) -> Result<(tempfile::TempDir, WorkspaceIndex), Box<dyn std::error::Error>> {
+        let root = tempfile::tempdir()?;
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname='beacon'\nversion='1.0.0'\n[lib]\npath='lib.rs'\n",
+        )?;
+        std::fs::write(root.path().join("lib.rs"), source)?;
+        let index = WorkspaceIndex::build(
+            root.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+        )?;
+        Ok((root, index))
+    }
+
+    fn answer_bag(answer: QueryAnswer) -> Result<serde_json::Value, serde_json::Error> {
+        let mut value = serde_json::to_value(answer)?;
+        if let Some(serde_json::Value::Array(rows)) = value.get_mut("bindings") {
+            rows.sort_by_cached_key(serde_json::Value::to_string);
+        }
+        Ok(value)
+    }
+
+    #[test]
+    fn selected_query_facts_match_complete_domain_for_general_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_root, index) = query_fixture("pub fn kept() {}\npub fn other(kept: bool) {}\n")?;
+        let view = index.symbol_view()?;
+        let statements = [
+            "SELECT ?name { ?s a :Symbol; :name 'kept'; :name ?name }",
+            "SELECT ?name ?missing { ?s a :Symbol; :name 'kept'; :name ?name OPTIONAL { ?s :absent ?missing } }",
+            "SELECT ?name { { ?s a :Symbol; :name 'kept' } UNION { ?s a :Symbol; :name 'other' } ?s :name ?name }",
+            "SELECT ?name { ?s a :Symbol; :kind 'function'; :name ?name FILTER EXISTS { ?s :language 'rust' } }",
+            "SELECT ?name { { SELECT ?s { ?s a :Symbol; :name 'kept' } } ?s :name ?name }",
+            "SELECT (COUNT(?s) AS ?count) { ?s a :Symbol; :kind 'function'; :name ?name }",
+            "SELECT ?name { VALUES ?wanted { 'kept' 'kept' } ?s a :Symbol; :name ?wanted; :name ?name }",
+            "SELECT ?name { ?s a :Symbol; :kind 'function'; :name ?name MINUS { ?s :name 'other' } }",
+            "ASK { ?s a :Symbol; :name 'kept' FILTER NOT EXISTS { ?s :name 'absent' } }",
+            "SELECT ?source { ?s a :Symbol; :name 'kept'; :declarations ?declaration . ?declaration :source ?source }",
+        ];
+        for statement in statements {
+            let prepared = PreparedQuery::parse(statement, limits())?;
+            let selected = project_query_facts(&view, prepared.requirements(), limits())?;
+            let mut complete_requirements = prepared.requirements().clone();
+            complete_requirements.symbol_name = None;
+            complete_requirements.symbol_ids = None;
+            complete_requirements.adjacency.clear();
+            let complete = project_query_facts(&view, &complete_requirements, limits())?;
+            assert!(
+                complete.symbols.len() >= selected.symbols.len(),
+                "{statement}"
+            );
+            let selected = prepared.evaluate(selected, limits(), QueryCancellation::default())?;
+            let complete = prepared.evaluate(complete, limits(), QueryCancellation::default())?;
+            assert_eq!(answer_bag(selected)?, answer_bag(complete)?, "{statement}");
+        }
+        let guarded = PreparedQuery::parse("SELECT ?s { ?s a :Symbol; :name 'kept' }", limits())?;
+        assert_eq!(guarded.requirements().symbol_name.as_deref(), Some("kept"));
+        let selected = project_query_facts(&view, guarded.requirements(), limits())?;
+        let complete = project_query_facts(&view, &FactRequirements::default(), limits())?;
+        assert!(selected.symbols.len() < complete.symbols.len());
+        let variable = PreparedQuery::parse(
+            "SELECT ?predicate ?value { ?s ?predicate ?value }",
+            limits(),
+        )?;
+        assert!(
+            variable
+                .requirements()
+                .requires(FactRequirement::CompleteDomain)
+        );
+        assert!(variable.requirements().requires(FactRequirement::Nodes));
+        for requirements in [variable.requirements(), &FactRequirements::default()] {
+            let facts = project_query_facts(&view, requirements, limits())?;
+            assert!(
+                variable
+                    .evaluate(facts, limits(), QueryCancellation::default())
+                    .is_err()
+            );
+        }
         Ok(())
     }
 

@@ -213,6 +213,9 @@ pub struct FactRequirements {
     pub symbol_name: Option<String>,
     /// Exact symbol restriction proved for a physical usage-only pattern.
     pub symbol_ids: Option<Vec<SymbolId>>,
+    /// Exact physical source units proved for every required source and node pattern.
+    /// `None` selects the complete source domain when source or node facts are required.
+    pub source_units: Option<Vec<rift_protocol::read::SourceUnitId>>,
     /// Anchored target identities whose physical usages must be acquired.
     pub occurrences: Vec<SymbolId>,
     /// Required anchored relationship acquisitions.
@@ -227,6 +230,8 @@ pub struct FactRequirements {
     pub services: Vec<String>,
     /// Existing retrieval requests executed before language evaluation.
     pub retrievals: Vec<rift_protocol::read::SearchParams>,
+    /// Exact source requests executed before language evaluation.
+    pub source_reads: Vec<rift_protocol::source_read::GetSourceParams>,
 }
 
 impl FactRequirements {
@@ -238,6 +243,18 @@ impl FactRequirements {
     /// # Errors
     /// Returns an invalid request when a required family has no domain selection.
     pub fn validate_selection(&self) -> Result<(), rift_error::RiftError> {
+        if self.source_reads.iter().any(|request| !request.is_valid()) {
+            return Err(rift_error::errors::server::read_invalid()
+                .field("requirements.source_reads")
+                .violation("source selectors or byte range are invalid")
+                .error());
+        }
+        if self.source_units.as_ref().is_some_and(Vec::is_empty) {
+            return Err(rift_error::errors::server::read_invalid()
+                .field("requirements.source_units")
+                .violation("selected source units must not be empty")
+                .error());
+        }
         if !self.requires(FactRequirement::Domain) && !self.required.is_empty() {
             return Err(rift_error::errors::server::read_invalid()
                 .field("requirements")
@@ -267,6 +284,11 @@ mod tests {
     #[test]
     fn fact_selection_refuses_families_without_domain() {
         assert!(FactRequirements::default().validate_selection().is_ok());
+        let empty_sources = FactRequirements {
+            source_units: Some(Vec::new()),
+            ..FactRequirements::default()
+        };
+        assert!(empty_sources.validate_selection().is_err());
         for requirement in [
             FactRequirement::Description,
             FactRequirement::CompleteDomain,
@@ -304,6 +326,9 @@ mod tests {
                 FactRequirement::AllOccurrences,
             ]
             .into(),
+            source_units: Some(vec![rift_protocol::read::SourceUnitId::parse(
+                "rift://source/project/src/lib.rs",
+            )?]),
             ..FactRequirements::default()
         };
         let decoded =

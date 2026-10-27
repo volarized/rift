@@ -9,6 +9,7 @@ use oxiri::Iri;
 use oxstr::OxString;
 use rift_protocol::query::{QueryAnswer, RdfTerm};
 use rift_protocol::read::{SearchParams, SearchResult};
+use rift_protocol::source_read::{GetSourceParams, GetSourceResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use spargebra::Query;
@@ -17,7 +18,8 @@ use spargebra::term::{NamedNodePattern, TermPattern};
 
 use super::dataset::VirtualDataset;
 use super::{
-    QueryCancellation, QueryError, QueryFacts, QueryLimits, SEARCH_SERVICE, VOCABULARY, failure,
+    QueryCancellation, QueryError, QueryFacts, QueryLimits, SEARCH_SERVICE, SOURCE_SERVICE,
+    VOCABULARY, failure,
 };
 
 /// One complete result produced by the existing retrieval owner.
@@ -48,6 +50,8 @@ pub struct RetainedResult {
 pub struct QueryServices {
     /// Complete results from existing ranked, regex, revision and change producers.
     pub retrievals: Vec<QueryServiceData>,
+    /// Exact source requests paired with their original complete results.
+    pub sources: Vec<(GetSourceParams, GetSourceResult)>,
     /// Previously retained binding tables.
     pub bindings: Vec<RetainedResult>,
     /// Complete facts for additional accepted named graphs.
@@ -150,6 +154,16 @@ impl QueryServices {
                 },
             );
         }
+        if !self.sources.is_empty() {
+            evaluator = evaluator.with_service_handler(
+                NamedNode::new(SOURCE_SERVICE).map_err(failure::invalid)?,
+                SourceHandler {
+                    records: self.sources.into_iter().map(Arc::new).collect(),
+                    limits,
+                    cancellation: cancellation.clone(),
+                },
+            );
+        }
         let mut names = BTreeSet::new();
         for table in self.bindings {
             if !names.insert(table.service.clone()) {
@@ -167,12 +181,15 @@ impl QueryServices {
     }
 
     pub(super) fn validate(
-        &self,
+        &mut self,
         requirements: &crate::query::FactRequirements,
+        cancellation: &QueryCancellation,
     ) -> Result<(), QueryError> {
         for service in &requirements.services {
             let available = if service == SEARCH_SERVICE {
                 !self.retrievals.is_empty()
+            } else if service == SOURCE_SERVICE {
+                !self.sources.is_empty()
             } else {
                 self.bindings.iter().any(|table| table.service == *service)
             };
@@ -193,7 +210,137 @@ impl QueryServices {
                 ));
             }
         }
+        if cancellation.is_cancelled() {
+            return Err(failure::cancelled());
+        }
+        if self.sources.len() != requirements.source_reads.len() {
+            return Err(failure::evaluation(
+                "required source results do not match source requests",
+            ));
+        }
+        for (request, result) in &self.sources {
+            if cancellation.is_cancelled() {
+                return Err(failure::cancelled());
+            }
+            if !result.is_valid_for(request)
+                || matches!(
+                    result,
+                    GetSourceResult::Unavailable { .. }
+                        | GetSourceResult::Found {
+                            source_complete: false,
+                            ..
+                        }
+                )
+            {
+                return Err(failure::evaluation("required source result is unavailable"));
+            }
+        }
+        self.sources.sort_unstable_by(|left, right| {
+            source_request_key(&left.0).cmp(&source_request_key(&right.0))
+        });
+        if cancellation.is_cancelled() {
+            return Err(failure::cancelled());
+        }
+        if self
+            .sources
+            .windows(2)
+            .any(|pair| source_request_key(&pair[0].0) == source_request_key(&pair[1].0))
+        {
+            return Err(failure::evaluation("source requests must be distinct"));
+        }
+        for request in &requirements.source_reads {
+            if cancellation.is_cancelled() {
+                return Err(failure::cancelled());
+            }
+            if self
+                .sources
+                .binary_search_by(|record| {
+                    source_request_key(&record.0).cmp(&source_request_key(request))
+                })
+                .is_err()
+            {
+                return Err(failure::evaluation("required source result is unavailable"));
+            }
+        }
         Ok(())
+    }
+}
+
+type SourceRequestKey<'a> = (
+    &'a str,
+    Option<(u64, u64)>,
+    Option<&'a str>,
+    Option<&'a rift_protocol::read::RevisionId>,
+);
+
+fn source_request_key(request: &GetSourceParams) -> SourceRequestKey<'_> {
+    (
+        request.unit.as_str(),
+        request.range.as_ref().map(|range| (range.start, range.end)),
+        request
+            .view
+            .as_ref()
+            .map(rift_protocol::symbol_read::CapturedViewId::as_str),
+        request.rev.as_ref(),
+    )
+}
+
+struct SourceHandler {
+    records: Vec<Arc<(GetSourceParams, GetSourceResult)>>,
+    limits: QueryLimits,
+    cancellation: QueryCancellation,
+}
+
+impl ServiceHandler for SourceHandler {
+    type Error = QueryError;
+
+    fn handle(
+        &self,
+        pattern: &QueryExpression,
+        base_iri: Option<&Iri<OxString>>,
+    ) -> Result<QuerySolutionIter<'static>, QueryError> {
+        let request = source_request(pattern, self.limits.algebra_nodes_max)?;
+        let index = self
+            .records
+            .binary_search_by(|record| {
+                source_request_key(&record.0).cmp(&source_request_key(&request))
+            })
+            .map_err(|_| failure::evaluation("required source result is unavailable"))?;
+        let record = &self.records[index];
+        let outcome = match &record.1 {
+            GetSourceResult::Found { .. } => "found",
+            GetSourceResult::Missing { .. } => "missing",
+            GetSourceResult::Unavailable { .. } => {
+                return Err(failure::evaluation("required source result is unavailable"));
+            }
+        };
+        let dataset = VirtualDataset::new(
+            QueryFacts::default(),
+            self.limits,
+            self.cancellation.0.clone(),
+        )?
+        .with_source_read(Arc::clone(record));
+        let query = Query::Select(spargebra::query::SelectQuery {
+            dataset: None,
+            expression: execution_pattern_for(
+                pattern,
+                self.limits.algebra_nodes_max,
+                SOURCE_INPUT_FIELDS,
+                &NamedNodePattern::NamedNode(
+                    NamedNode::new(format!("{VOCABULARY}outcome")).map_err(failure::invalid)?,
+                ),
+                &TermPattern::Literal(Literal::from(outcome)),
+            )?,
+            base_iri: base_iri.cloned(),
+        });
+        solutions(
+            SparqlEvaluator::new()
+                .with_cancellation_token(self.cancellation.0.clone())
+                .for_query(query)
+                .on_queryable_dataset(dataset)
+                .execute()
+                .map_err(super::result::evaluation_error)?,
+        )
     }
 }
 
@@ -414,6 +561,19 @@ pub(super) fn request(
     request_for(pattern, nodes_max, INPUT_FIELDS, &["score", "source"])
 }
 
+pub(super) fn source_request(
+    pattern: &QueryExpression,
+    nodes_max: usize,
+) -> Result<GetSourceParams, QueryError> {
+    let request: GetSourceParams = request_for(pattern, nodes_max, SOURCE_INPUT_FIELDS, &[])?;
+    if !request.is_valid() {
+        return Err(failure::parse("source selectors or byte range are invalid"));
+    }
+    Ok(request)
+}
+
+const SOURCE_INPUT_FIELDS: &[&str] = &["unit", "range", "view", "rev"];
+
 fn request_for<T: serde::de::DeserializeOwned>(
     pattern: &QueryExpression,
     nodes_max: usize,
@@ -503,6 +663,16 @@ fn input(
     key: &str,
     object: &TermPattern,
 ) -> Result<(), QueryError> {
+    if key == "unit" && !matches!(object, TermPattern::NamedNode(_) | TermPattern::Variable(_)) {
+        return Err(failure::parse("source input unit must be a canonical IRI"));
+    }
+    if key == "range"
+        && !matches!(object, TermPattern::Variable(_))
+        && !matches!(object, TermPattern::Literal(value)
+            if value.datatype().as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON")
+    {
+        return Err(failure::parse("source input range must use RDF JSON"));
+    }
     if ["query", "pattern"].contains(&key)
         && match object {
             TermPattern::Literal(value) => {
@@ -708,6 +878,290 @@ mod dataset_owner_tests {
             .ok_or("selected owner")?
             .remove("graph");
         assert!(serde_json::from_value::<QueryDataset>(encoded).is_err());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::sparql::PreparedQuery;
+
+    fn limits() -> Result<QueryLimits, QueryError> {
+        QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())
+    }
+
+    #[test]
+    fn source_request_is_exact_and_silent_cannot_hide_missing_material()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = limits()?;
+        let query = PreparedQuery::parse(
+            r#"ASK { SERVICE SILENT :source {
+                ?read :unit <rift://source/project/notes.txt>;
+                    :range "{\"start\":1,\"end\":3}"^^rdf:JSON;
+                    :outcome 'found' .
+            } }"#,
+            limits,
+        )?;
+        assert!(query.requirements().required.is_empty());
+        assert_eq!(
+            query.requirements().source_reads,
+            vec![GetSourceParams {
+                unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/notes.txt")?,
+                range: Some(rift_protocol::read::TextRange { start: 1, end: 3 }),
+                view: None,
+                rev: None,
+            }]
+        );
+        assert!(
+            query
+                .evaluate(QueryFacts::default(), limits, QueryCancellation::default())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    fn ready_source_query(
+        unit: &rift_protocol::read::SourceUnitId,
+        input: &str,
+        limits: QueryLimits,
+    ) -> Result<PreparedQuery, QueryError> {
+        PreparedQuery::parse(
+            &format!(
+                r"SELECT ?outcome ?text ?unit ?start ?end ?complete ?view ?expires {{
+                    SERVICE :source {{
+                        ?read :unit <{unit}> {input}; :outcome ?outcome;
+                            :view [ :id ?view; :expires_at ?expires ] .
+                        OPTIONAL {{
+                            ?read :source [ :text ?text; :span [ :unit ?unit;
+                                :range [ :start ?start; :end ?end ] ] ];
+                                :source_complete ?complete .
+                        }}
+                    }}
+                }}",
+                unit = unit.as_str(),
+            ),
+            limits,
+        )
+    }
+
+    #[test]
+    fn ready_source_graph_preserves_original_range_context_and_definite_absence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = limits()?;
+        let unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/notes.txt")?;
+        let view = rift_protocol::symbol_read::CapturedView {
+            id: rift_protocol::symbol_read::CapturedViewId::parse(&"a".repeat(64))?,
+            expires_at: "2099-01-01T00:00:00Z".to_owned(),
+        };
+        let range = rift_protocol::read::TextRange { start: 1, end: 3 };
+        let found: GetSourceResult = serde_json::from_value(serde_json::json!({
+            "outcome": "found",
+            "source": {"span": {"unit": unit, "range": range}, "text": "λ"},
+            "source_complete": true,
+            "view": view,
+        }))?;
+        let missing = GetSourceResult::Missing {
+            unit: unit.clone(),
+            view: view.clone(),
+            warnings: Vec::new(),
+        };
+        for (result, outcome, input) in [
+            (
+                found,
+                "found",
+                r#"; :range "{\"start\":1,\"end\":3}"^^rdf:JSON"#,
+            ),
+            (missing, "missing", ""),
+        ] {
+            let query = ready_source_query(&unit, input, limits)?;
+            let request = query.requirements().source_reads[0].clone();
+            let services = QueryServices {
+                sources: vec![(request, result)],
+                ..QueryServices::default()
+            };
+            if outcome == "found" {
+                let mut duplicate = services.clone();
+                let (request, mut conflicting) = duplicate.sources[0].clone();
+                let GetSourceResult::Found { source, view, .. } = &mut conflicting else {
+                    return Err("original source must be found".into());
+                };
+                source.text = "zz".to_owned();
+                view.id = rift_protocol::symbol_read::CapturedViewId::parse(&"b".repeat(64))?;
+                assert!(conflicting.is_valid_for(&request));
+                duplicate.sources.push((request, conflicting));
+                assert!(
+                    query
+                        .evaluate_with_services(
+                            QueryFacts::default(),
+                            limits,
+                            QueryCancellation::default(),
+                            duplicate,
+                        )
+                        .is_err()
+                );
+            }
+            let QueryAnswer::Bindings { bindings, .. } = query.evaluate_with_services(
+                QueryFacts::default(),
+                limits,
+                QueryCancellation::default(),
+                services,
+            )?
+            else {
+                return Err("source service must return bindings".into());
+            };
+            let [row] = bindings.as_slice() else {
+                return Err("source service must return one original result".into());
+            };
+            for (key, expected) in [
+                ("outcome", outcome),
+                ("view", view.id.as_str()),
+                ("expires", view.expires_at.as_str()),
+            ] {
+                let Some(RdfTerm::Literal { value, .. }) = row.get(key) else {
+                    return Err(format!("source result has no {key}").into());
+                };
+                assert_eq!(value, expected);
+            }
+            if outcome == "found" {
+                assert_eq!(
+                    row.get("unit"),
+                    Some(&RdfTerm::Iri {
+                        value: unit.as_str().to_owned()
+                    })
+                );
+                for (key, expected) in [
+                    ("text", "λ"),
+                    ("start", "1"),
+                    ("end", "3"),
+                    ("complete", "true"),
+                ] {
+                    let Some(RdfTerm::Literal { value, .. }) = row.get(key) else {
+                        return Err(format!("source result has no {key}").into());
+                    };
+                    assert_eq!(value, expected);
+                }
+            } else {
+                for key in ["text", "unit", "start", "end", "complete"] {
+                    assert!(!row.contains_key(key), "missing source must not bind {key}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_source_requests_stay_separate_and_repeated_calls_share_one_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = limits()?;
+        let first_view = "a".repeat(64);
+        let second_view = "b".repeat(64);
+        let first = format!(
+            r#":unit <rift://source/project/notes.txt>;
+            :range "{{\"start\":1,\"end\":3}}"^^rdf:JSON; :view "{first_view}""#
+        );
+        let second = format!(
+            r#":unit <rift://source/project/other.txt>;
+            :range "{{\"start\":0,\"end\":2}}"^^rdf:JSON; :view "{second_view}""#
+        );
+        let query = PreparedQuery::parse(
+            &format!(
+                r"SELECT ?first ?second ?again {{
+                SERVICE :source {{ ?first_read {first}; :source [ :text ?first ] }}
+                SERVICE :source {{ ?second_read {second}; :source [ :text ?second ] }}
+                SERVICE :source {{ ?again_read {first}; :source [ :text ?again ] }}
+            }}"
+            ),
+            limits,
+        )?;
+        assert_eq!(query.requirements().source_reads.len(), 2);
+        let mut services = QueryServices::default();
+        for request in &query.requirements().source_reads {
+            let text = if request.unit.as_str() == "rift://source/project/notes.txt" {
+                "λ"
+            } else {
+                "ox"
+            };
+            let result: GetSourceResult = serde_json::from_value(serde_json::json!({
+                "outcome": "found",
+                "source": {"span": {"unit": &request.unit, "range": &request.range}, "text": text},
+                "source_complete": true,
+                "view": {"id": request.view.as_ref().ok_or("source request view")?,
+                    "expires_at": "2099-01-01T00:00:00Z"},
+            }))?;
+            services.sources.push((request.clone(), result));
+        }
+        let mut duplicate = services.clone();
+        duplicate.sources[1] = duplicate.sources[0].clone();
+        assert!(
+            duplicate
+                .sources
+                .iter()
+                .all(|(request, result)| result.is_valid_for(request))
+        );
+        assert!(
+            query
+                .evaluate_with_services(
+                    QueryFacts::default(),
+                    limits,
+                    QueryCancellation::default(),
+                    duplicate,
+                )
+                .is_err()
+        );
+        let mut extra = services.clone();
+        let (mut request, mut result) = extra.sources[0].clone();
+        request.unit =
+            rift_protocol::read::SourceUnitId::parse("rift://source/project/unrequested.txt")?;
+        let GetSourceResult::Found { source, .. } = &mut result else {
+            return Err("original source must be found".into());
+        };
+        source.span.unit = request.unit.clone();
+        assert!(result.is_valid_for(&request));
+        extra.sources.push((request, result));
+        assert!(
+            query
+                .evaluate_with_services(
+                    QueryFacts::default(),
+                    limits,
+                    QueryCancellation::default(),
+                    extra,
+                )
+                .is_err()
+        );
+        let QueryAnswer::Bindings { bindings, .. } = query.evaluate_with_services(
+            QueryFacts::default(),
+            limits,
+            QueryCancellation::default(),
+            services,
+        )?
+        else {
+            return Err("source service must return bindings".into());
+        };
+        let [row] = bindings.as_slice() else {
+            return Err("exact source calls must retain one joined result".into());
+        };
+        for (key, expected) in [("first", "λ"), ("second", "ox"), ("again", "λ")] {
+            let Some(RdfTerm::Literal { value, .. }) = row.get(key) else {
+                return Err(format!("source result has no {key}").into());
+            };
+            assert_eq!(value, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn source_request_refuses_variable_or_literal_unit_and_untyped_range()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = limits()?;
+        for pattern in [
+            "?read :unit ?unit",
+            "?read :unit 'rift://source/project/notes.txt'",
+            "?read :unit <rift://source/project/notes.txt>; :range '{\"start\":0,\"end\":1}'",
+        ] {
+            let query = format!("ASK {{ SERVICE :source {{ {pattern} }} }}");
+            assert!(PreparedQuery::parse(&query, limits).is_err(), "{query}");
+        }
         Ok(())
     }
 }

@@ -722,6 +722,7 @@ mod tests {
                     warnings: Vec::new(),
                 },
             }],
+            sources: Vec::new(),
             bindings: Vec::new(),
             datasets: Vec::new(),
         }

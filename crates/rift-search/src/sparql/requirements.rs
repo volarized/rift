@@ -426,13 +426,21 @@ impl FactRequirements {
         inner: &QueryExpression,
         nodes_max: usize,
     ) -> Result<(), QueryError> {
+        if matches!(name, NamedNodePattern::Variable(_)) {
+            return Err(failure::parse("local service names must be constant IRIs"));
+        }
         self.selection(name, true);
-        if let NamedNodePattern::NamedNode(name) = name
-            && name.as_str() == super::SEARCH_SERVICE
-        {
-            let request = super::services::request(inner, nodes_max)?;
-            if !self.retrievals.contains(&request) {
-                self.retrievals.push(request);
+        if let NamedNodePattern::NamedNode(name) = name {
+            if name.as_str() == super::SEARCH_SERVICE {
+                let request = super::services::request(inner, nodes_max)?;
+                if !self.retrievals.contains(&request) {
+                    self.retrievals.push(request);
+                }
+            } else if name.as_str() == super::SOURCE_SERVICE {
+                let request = super::services::source_request(inner, nodes_max)?;
+                if !self.source_reads.contains(&request) {
+                    self.source_reads.push(request);
+                }
             }
         }
         Ok(())
@@ -837,4 +845,26 @@ fn single_usage_pattern(mut pattern: &QueryExpression) -> Option<Vec<SymbolId>> 
 
 fn facet(value: &str) -> Option<RelationshipFacet> {
     serde_json::from_value(serde_json::Value::String(value.to_owned())).ok()
+}
+
+#[cfg(test)]
+mod service_name_tests {
+    use crate::sparql::{PreparedQuery, QueryLimits};
+
+    #[test]
+    fn variable_service_names_require_proven_acquisition_before_silent_evaluation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let limits = QueryLimits::try_from(&rift_protocol::query::QueryConfiguration::default())?;
+        for silent in ["", "SILENT "] {
+            let query = format!(
+                "ASK {{ VALUES ?service {{ :source }} SERVICE {silent}?service {{ \
+                    ?read :unit <rift://source/project/notes.txt>; :outcome ?outcome \
+                }} }}"
+            );
+            let error = PreparedQuery::parse(&query, limits)
+                .expect_err("variable service acquisition is not established");
+            assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
+        }
+        Ok(())
+    }
 }
