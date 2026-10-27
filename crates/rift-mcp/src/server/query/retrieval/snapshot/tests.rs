@@ -105,6 +105,7 @@ fn revision_fixture(
     revision: bool,
 ) -> Result<Option<rift_protocol::read::RevisionId>, Box<dyn std::error::Error>> {
     Ok(if revision {
+        std::fs::write(root.join(".gitignore"), ".rift/\n")?;
         rift_history::fixture::init(root);
         rift_history::fixture::commit_all(root, "introduce shared functions");
         let resolved = rift_history::Repository::open(root)?
