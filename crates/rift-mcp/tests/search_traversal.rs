@@ -1016,7 +1016,21 @@ async fn live_rust_analyzer_walks_answer_a_rename_in_an_unopened_file() -> TestR
     let larger = live_seed(&client, "larger", "rust").await?;
     let beacon = live_seed(&client, "beacon", "rust").await?;
     let request = path_arguments(&larger, "outgoing")?;
-    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+    let failure = failed_call(client.call_tool(tool_request("search", &request)).await)?;
+    assert_eq!(
+        failure.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{failure:?}"
+    );
+    assert_eq!(failure.retry, RetryDirective::SameRequest, "{failure:?}");
+    assert!(
+        failure.message.starts_with(
+            "workspace index is unavailable during query relationships: detail the outgoing target has no admitted source owner: uri file://"
+        ) && failure.message.contains("/library/core/src/cmp.rs, served root ")
+            && failure.message.ends_with("; resend the same request after a short delay"),
+        "the unadmitted sysroot target refuses the complete query: {failure:?}"
+    );
+    assert!(failure.text.contains("rift.server.read_unavailable"));
     let local = live_seed(&client, "local", "rust").await?;
     let (cold, _) = live_walk(&client, "outgoing before", &local, "outgoing", &["beacon"]).await?;
     assert_eq!(cold, 1);
