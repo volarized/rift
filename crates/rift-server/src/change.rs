@@ -1134,6 +1134,11 @@ mod tests {
         let older = "pub fn removed() {}\npub fn changed() -> u8 { 1 }\n";
         let newer = "pub fn added() {}\npub fn changed() -> u8 { 2 }\n";
         let fixture = Fixture::revisions(&[("lib.rs", older)], &[("lib.rs", newer)], &[])?;
+        // Persist the fixture's LF policy before the independent repository reader opens it.
+        git(
+            fixture.directory.path(),
+            &["config", "core.autocrlf", "false"],
+        );
         let configuration = rift_protocol::configuration::WorkspaceConfiguration::default();
         let limits = QueryLimits::try_from(&configuration.search.query)?;
         let mut budget = crate::QueryFactBudget::new(limits, &|| false)?;
