@@ -560,18 +560,22 @@ fn search_request_with_timeout(
     query: &str,
     timeout: Option<Duration>,
 ) -> TestResult<String> {
-    let selected = serde_json::from_value(serde_json::json!({"query": query}))?;
-    let request = query::projected_retrieval(
-        &selected,
-        "?matched_by ?target",
-        "?hit :matched_by/:value ?matched_by; :hit/:target ?target .",
-    )?;
+    let request = lexical_query(query)?;
     tool_request_with_timeout(
         port,
         token,
         "search",
         &serde_json::to_value(request)?,
         timeout,
+    )
+}
+
+fn lexical_query(query: &str) -> TestResult<rift_protocol::query::QueryParams> {
+    let selected = serde_json::from_value(serde_json::json!({"query": query}))?;
+    query::projected_retrieval(
+        &selected,
+        "?matched_by ?target",
+        "?hit :matched_by/:value ?matched_by; :hit/:target ?target .",
     )
 }
 
@@ -686,9 +690,15 @@ fn wait_for_lexical_content_hit(
 ) -> TestResult<(serde_json::Value, rift_protocol::symbol_read::CapturedView)> {
     let deadline =
         std::time::Instant::now() + POLL_INTERVAL.saturating_mul(START_POLL_ATTEMPT_COUNT);
+    let mut request = lexical_query(query)?;
+    request.query = format!(
+        "SELECT * {{ {{ {} }} OPTIONAL {{ ?local_unit a :SourceUnitId; :path ?catalog_path . FILTER(BOUND(?path) && ?catalog_path = ?path) }} }} ORDER BY ?index",
+        request.query
+    );
+    let arguments = serde_json::to_value(request)?;
     let mut last_response = String::from("no response received");
     for _ in 0..START_POLL_ATTEMPT_COUNT {
-        match search_request_with_timeout(port, token, query, Some(CONNECT_TIMEOUT)) {
+        match tool_request_with_timeout(port, token, "search", &arguments, Some(CONNECT_TIMEOUT)) {
             Ok(answer) => match lexical_content_hit(&answer, path) {
                 Ok(hit) => return Ok(hit),
                 Err(error) => last_response = error.to_string(),
@@ -1005,7 +1015,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let first = lexical_hit_with_validated_view(serving.port, &serving.token, first)?;
+    let first = lexical_hit_with_validated_view("first", serving.port, &serving.token, first)?;
 
     stop_foreground_server(root, &mut child, &stderr)?;
     wait_until_port_refuses(serving.port)?;
@@ -1018,7 +1028,8 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let second = lexical_hit_with_validated_view(reopened.port, &reopened.token, second)?;
+    let second =
+        lexical_hit_with_validated_view("reopened", reopened.port, &reopened.token, second)?;
     assert_eq!(second, first, "reopen must preserve the lexical search hit");
 
     stop_foreground_server(root, &mut child, &stderr)?;
@@ -1027,13 +1038,44 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
     Ok(())
 }
 
+fn source_read_failure_context(phase: &str, response: &serde_json::Value) -> String {
+    let text = response["result"]["content"][0]["text"].as_str();
+    let head = text.and_then(|text| text.lines().nth(1));
+    let code = [
+        "temporarily_unavailable",
+        "capability_unavailable",
+        "invalid_request",
+    ]
+    .into_iter()
+    .find(|code| head.is_some_and(|head| head.contains(code)));
+    let retry = ["same_request", "never"]
+        .into_iter()
+        .find(|retry| head.is_some_and(|head| head.ends_with(retry)));
+    let slug = [
+        "rift.server.read_unavailable",
+        "rift.server.read_unsupported",
+        "rift.server.search_view_expired",
+    ]
+    .into_iter()
+    .find(|slug| text.is_some_and(|text| text.contains(slug)));
+    format!(
+        "restart Source phase={phase}; result_present={}; error_present={}; structured_present={}; is_error={:?}; json_rpc_code={:?}; code={code:?}; retry={retry:?}; slug={slug:?}",
+        response.get("result").is_some(),
+        response.get("error").is_some(),
+        response["result"].get("structuredContent").is_some(),
+        response["result"]["isError"].as_bool(),
+        response["error"]["code"].as_i64(),
+    )
+}
+
 fn lexical_hit_with_validated_view(
+    phase: &str,
     port: u16,
     token: &str,
     hit: (serde_json::Value, rift_protocol::symbol_read::CapturedView),
 ) -> TestResult<rift_protocol::read::SourceUnitSpan> {
     let (row, view) = hit;
-    let unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/notes.md")?;
+    let unit = rift_protocol::read::SourceUnitId::parse(query::iri(&row, "local_unit")?)?;
     let answer = tool_request_with_timeout(
         port,
         token,
@@ -1048,6 +1090,9 @@ fn lexical_hit_with_validated_view(
         .ok_or("the MCP response must contain an HTTP body")?
         .1;
     let response: serde_json::Value = serde_json::from_str(body)?;
+    if response["result"]["structuredContent"]["answer"]["result"] != "bindings" {
+        eprintln!("{}", source_read_failure_context(phase, &response));
+    }
     let [source] = query::rows(&response["result"]["structuredContent"])? else {
         return Err(format!("one captured project source: {response}").into());
     };
