@@ -193,14 +193,14 @@ impl RiftProxy {
         &self,
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<rmcp::model::CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        if request.name != "search" {
+        if !matches!(request.name.as_ref(), "nodes" | "search") {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
         let _: rift_protocol::query::QueryParams = serde_json::from_value(arguments.into())
             .map_err(|source| {
                 errors::mcp::parameter_invalid()
-                    .tool("search")
+                    .tool(request.name.as_ref())
                     .field("arguments")
                     .accepted(source.to_string())
                     .error()

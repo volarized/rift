@@ -172,7 +172,8 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
         .iter()
         .map(|tool| tool.name.as_ref())
         .collect();
-    for expected in ["get_source", "get_symbol", "nodes", "search"] {
+    assert_eq!(names.len(), 3, "the surface contains exactly three tools");
+    for expected in ["get_symbol", "nodes", "search"] {
         assert!(
             names.contains(&expected),
             "{expected} missing from {names:?}"

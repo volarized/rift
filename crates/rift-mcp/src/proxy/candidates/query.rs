@@ -77,17 +77,18 @@ impl RiftProxy {
             let Some((view, _)) = replay::result_service(service)? else {
                 continue;
             };
-            if let Some(views) = self.query_views.get() {
-                let root = self
-                    .accepted_root
-                    .as_deref()
-                    .ok_or_else(retained::unavailable)?;
-                match views.query_view(&view, root, &self.owner) {
-                    Ok(_) => retained_owner = true,
-                    Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext) => {}
-                    Err(_) => return Err(retained::unavailable()),
-                }
-            }
+            retained_owner |= self.owns_query_view(&view)?;
+        }
+        for source in &plan.requirements().source_reads {
+            let Some(view) = &source.view else {
+                continue;
+            };
+            retained_owner |= self.owns_query_view(view)?
+                || matches!(
+                    self.candidate_views
+                        .backend(view, std::time::SystemTime::now())?,
+                    Ok(Some(_)) | Err(_)
+                );
         }
         let mut federated = retained_owner
             || plan
@@ -113,6 +114,24 @@ impl RiftProxy {
         Ok(owned(
             self.evaluate_owned_query(plan, limits, deadline).await?,
         ))
+    }
+
+    fn owns_query_view(
+        &self,
+        view: &rift_protocol::symbol_read::CapturedViewId,
+    ) -> Result<bool, RiftError> {
+        let Some(views) = self.query_views.get() else {
+            return Ok(false);
+        };
+        let root = self
+            .accepted_root
+            .as_deref()
+            .ok_or_else(retained::unavailable)?;
+        match views.query_view(view, root, &self.owner) {
+            Ok(_) => Ok(true),
+            Err(rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext) => Ok(false),
+            Err(_) => Err(retained::unavailable()),
+        }
     }
 
     fn query_backend(&self, name: &str) -> Result<&Self, RiftError> {

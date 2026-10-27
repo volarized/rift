@@ -129,15 +129,34 @@ impl RiftMcp {
                 .await?;
             (SearchReadResult::Results(result), contributions)
         } else {
-            let mut extensions = rmcp::model::Extensions::default();
-            extensions.insert(captured.clone());
             let associations =
                 super::super::candidates::CapturedSearchContributions::new(budget.clone());
-            extensions.insert(associations.clone());
-            let result = self
-                .discovery_search(crate::parameters::Parameters(paging.clone()), extensions)
+            let result = if let Some(result) = self
+                .captured_query(paging, Some(&associations), Some(captured))
                 .await?
-                .0;
+            {
+                result
+            } else if paging.rev.is_none()
+                && paging.change.is_none()
+                && paging.target != rift_protocol::read::SearchParamsTarget::Commit
+            {
+                let (resolved, answer, warnings, references, search_deadline) =
+                    self.current_search_inputs(paging).await?;
+                let result = self
+                    .route_current_tree_search(
+                        resolved,
+                        paging.clone(),
+                        answer,
+                        warnings,
+                        references,
+                        (search_deadline, Some(captured.clone())),
+                    )
+                    .await?
+                    .0;
+                SearchReadResult::Results(Box::new(result))
+            } else {
+                SearchReadResult::Results(Box::new(self.search_result(paging.clone()).await?.0))
+            };
             let contributions = if let Some(rows) = associations.take()? {
                 rows
             } else {

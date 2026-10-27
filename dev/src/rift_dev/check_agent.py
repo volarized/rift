@@ -19,7 +19,14 @@ from rift_dev.check_artifact import (
 )
 from rift_dev.log_records import parse_line
 from rift_dev.nextest_run import retained_collector
-from rift_dev.query import bindings, declaration_request, iri, literal, quoted
+from rift_dev.query import (
+    bindings,
+    declaration_nodes_request,
+    declaration_request,
+    iri,
+    literal,
+    quoted,
+)
 from rift_dev.rift_test_client import (
     Client,
     Server,
@@ -247,26 +254,27 @@ async def declaration_node(client: Client, name: str) -> str:
     require(view == captured, f"symbol changed captured view: {answer}")
     listing = await client.call(
         "nodes",
-        {
-            "path": string_value(declaration.get("path"), "declaration.path"),
-            "position": cast(int, end) - 1,
-            "view": string_value(view.get("id"), "view.id"),
-        },
+        declaration_nodes_request(identity, string_value(view.get("id"), "view.id")),
     )
-    require(listing.get("view") == view, f"nodes changed captured view: {listing}")
-    nodes = array_value(listing.get("nodes"), "nodes.nodes")
-    sources = array_value(listing.get("source"), "nodes.source")
-    require(len(nodes) == len(sources), f"nodes lost source excerpts: {listing}")
+    query_view = object_value(listing.get("view"), "nodes.view")
+    require(
+        bool(string_value(query_view.get("id"), "nodes.view.id"))
+        and bool(string_value(query_view.get("expires_at"), "nodes.view.expires_at")),
+        f"nodes has no retained query view: {listing}",
+    )
     matches = [
-        (object_value(entry, "node"), excerpt)
-        for entry, excerpt in zip(nodes, sources, strict=True)
-        if object_value(entry, "node").get("symbol") == identity
-        and object_value(entry, "node").get("range") == span
+        row
+        for row in bindings(listing)
+        if int(literal(row, "node_start")) == start
+        and int(literal(row, "node_end")) == end
     ]
     require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
-    node, excerpt = matches[0]
+    node = matches[0]
+    string_value(iri(node, "node_unit"), "original node source unit")
+    source = literal(node, "text").encode()
+    excerpt = source[cast(int, start) : cast(int, end)].decode()
     require(excerpt == declaration.get("source"), f"nodes changed source: {listing}")
-    return string_value(node.get("id"), "node.id")
+    return literal(node, "node_id")
 
 
 async def check_agent(binary: Path, version: str | None = None) -> None:

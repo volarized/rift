@@ -48,7 +48,7 @@ fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
 /// The result rows a paginated answer pages: search hits or symbol hits. None for a tool
 /// whose result carries no pagination.
 fn paged_rows<'result>(name: &str, structured: &'result Value) -> Option<&'result [Value]> {
-    if name != "search" {
+    if !matches!(name, "search" | "nodes") {
         return None;
     }
     match structured["answer"]["result"].as_str() {
@@ -77,9 +77,9 @@ fn assert_validates(validator: &Validator, instance: &Value, context: &str) {
 /// that every `search` hit names exactly one location, and that a read result
 /// warns only what it is entitled to.
 ///
-/// `get_symbol` and `nodes` carry empty `warnings`: the live server resolves one published
-/// workspace per request, so no request can observe a lagging index, and neither tool
-/// consults the search index at all.
+/// `get_symbol` carries empty `warnings`: the live server resolves one published workspace
+/// per request, so the request cannot observe a lagging index. Query-based `nodes` and
+/// `search` preserve warnings from their actual requested families and services.
 ///
 /// `search` does consult it, and the search tier is prepared behind the answers, so this
 /// fixture's default `[search.vector]` table legitimately produces
@@ -105,7 +105,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     if reaches_dependencies {
         assert_dependency_warnings_only(structured);
     }
-    if matches!(name, "get_symbol" | "nodes") && !reaches_dependencies {
+    if name == "get_symbol" && !reaches_dependencies {
         assert!(
             structured.get("warnings").is_none(),
             "a live {name} result must omit warnings when there is nothing to warn about: \
@@ -138,7 +138,7 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
             }
         }
     }
-    if name == "search"
+    if matches!(name, "search" | "nodes")
         && let Some(warnings) = structured["warnings"].as_array()
     {
         for warning in warnings {
@@ -194,7 +194,7 @@ fn request_reaches_dependencies(name: &str, request: &Value) -> Option<bool> {
             SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
         ));
     }
-    if name != "search" {
+    if !matches!(name, "search" | "nodes") {
         return Some(false);
     }
     let configuration = rift_protocol::query::QueryConfiguration::default();
@@ -259,7 +259,10 @@ fn exact_request_owner_controls_source_resolvers_and_refuses_malformed_identity(
         Some(true)
     );
     assert_eq!(
-        request_reaches_dependencies("nodes", &json!({})),
+        request_reaches_dependencies(
+            "nodes",
+            &json!({"query":"SELECT ?node { ?node a :Node; :unit <rift://source/project/lib.rs> }"})
+        ),
         Some(false)
     );
     Ok(())
@@ -375,7 +378,7 @@ async fn served_fixture_with_setup(
     tokio::task::JoinHandle<()>,
 )> {
     let fixture = if complete_selection {
-        let fixture = surface_corpus::SurfaceFixture::start().await?;
+        let fixture = surface_corpus::SurfaceFixture::start_with_configuration(Ok).await?;
         // Positive remote queries select only the collected release. The default fixture
         // keeps its unavailable path dependency and unserved standard-library requirements.
         let manifest_path = fixture.root().join("Cargo.toml");
@@ -403,7 +406,7 @@ async fn served_fixture_with_setup(
         rift_history::fixture::commit_all(fixture.root(), "declare the original change module");
         fixture
     } else {
-        surface_corpus::SurfaceFixture::start().await?
+        surface_corpus::SurfaceFixture::start_with_configuration(Ok).await?
     };
     if let Some(search) = search {
         let path = fixture.root().join("rift.toml");
@@ -1639,25 +1642,25 @@ fn tools_call_request(name: &'static str, value: &Value) -> TestResult<CallToolR
     Ok(CallToolRequestParams::new(name).with_arguments(arguments(value)?))
 }
 
-/// A visible path no syntax provider parses refuses `capability_unavailable`, naming
-/// the extension - `nodes` can never serve it whatever tree it is pointed at.
+/// A query cannot obtain Nodes facts from a captured unit without a syntax tree.
 #[tokio::test]
-async fn nodes_on_an_unparsed_visible_path_names_the_extension() -> TestResult {
+async fn nodes_query_refuses_a_unit_without_captured_syntax() -> TestResult {
     let (_directory, client, server_task) = served_fixture().await?;
 
     let failure = workspace_client::failed_call(
         client
             .call_tool(
-                CallToolRequestParams::new("nodes")
-                    .with_arguments(arguments(&json!({ "path": "justfile", "position": 0 }))?),
+                CallToolRequestParams::new("nodes").with_arguments(arguments(&json!({
+                    "query": "SELECT ?node { ?node a :Node; :unit <rift://source/project/justfile> }",
+                    "language": "sparql"
+                }))?),
             )
             .await,
     )?;
-    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
-    let message = &failure.message;
+    assert_eq!(failure.code, ErrorCode::TemporarilyUnavailable);
     assert!(
-        message.contains("files with no extension"),
-        "the refusal must name what governs the missing provider: {message}"
+        failure.message.contains("required Nodes facts"),
+        "the query refuses missing captured syntax: {failure:?}"
     );
 
     client.cancel().await?;

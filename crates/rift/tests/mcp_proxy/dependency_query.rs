@@ -1,5 +1,6 @@
 //! Dependency call paths and captured package reads through the real stdio proxy.
 
+use crate::workspace_client::query;
 use serde_json::{Value, json};
 
 use super::global_api::{FixtureOptions, GlobalFixture};
@@ -100,12 +101,29 @@ async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestRe
     std::fs::write(root.join(SOURCE_PATH), SOURCE.replace("_inner", "_changed"))?;
     let held = proxied_call(
         &client,
-        "get_source",
-        &json!({"unit":unit,"view":selected["id"]}),
+        "search",
+        &serde_json::to_value(query::source(&serde_json::from_value(
+            json!({"unit":unit,"view":selected["id"]}),
+        )?)?)?,
     )
     .await?;
-    assert_eq!(held["source"]["text"], SOURCE);
-    assert_eq!(held["view"], *selected);
+    let [source_row] = query::rows(&held)? else {
+        return Err(format!("one original package source: {held}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
+    assert_eq!(query::literal(source_row, "complete")?, "true");
+    assert_eq!(query::iri(source_row, "unit")?, unit);
+    assert_eq!(query::literal(source_row, "text")?, SOURCE);
+    assert_eq!(
+        query::literal(source_row, "source_view")?,
+        selected["id"].as_str().ok_or("package source view")?
+    );
+    assert_eq!(
+        query::literal(source_row, "source_expiry")?,
+        selected["expires_at"]
+            .as_str()
+            .ok_or("package source expiry")?
+    );
     let exact_held = proxied_call(
         &client,
         "get_symbol",

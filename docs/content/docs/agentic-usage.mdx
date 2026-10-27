@@ -67,8 +67,8 @@ its situation:
 
 - [`search`](/docs/mcp#tool-search) answers when the target is unknown.
 - [`get_symbol`](/docs/mcp#tool-get_symbol) reads one exact symbol identity returned by search.
-- [`nodes`](/docs/mcp#tool-nodes) answers when the syntax structure at one position is
-  needed.
+- [`nodes`](/docs/mcp#tool-nodes) evaluates SPARQL over captured syntax facts.
+- `search` with `SERVICE :source` reads an observed source unit or byte range.
 - `search` with SPARQL property paths answers a symbol's neighbors, its impact (who breaks when it
   changes), or a path between two symbols.
 
@@ -76,7 +76,7 @@ The skill also points the agent at [`rift://map`](/docs/mcp#resource-map) as the
 read in an unfamiliar repository, and at [`rift server logs`](/docs/developer/implementation#server-logs)
 when a refusal alone doesn't say why.
 
-The skill includes name, usage, location, caller, callee, fixed-depth, substring, regex, and count recipes. Ranking and regex use `SERVICE :search`; projected fields and query limits remain SPARQL. Retained pages use the returned `pagination.next_query`.
+The skill includes name, usage, location, caller, callee, fixed-depth, substring, regex, count, and source recipes. Ranking and regex use `SERVICE :search`; projected fields and query limits remain SPARQL. Retained pages use the returned `pagination.next_query`.
 
 ## Steering
 

@@ -94,9 +94,16 @@ async fn configure_engine(root: &Path, profile: Option<&str>, script: &str) -> T
     } else {
         "languages.rust.lsp.retry"
     };
+    let source = if profile.is_some() {
+        "\n[profiles.docs.source]\ninclude = [\"Cargo.toml\", \"lib.rs\", \"caller.rs\"]\n[profiles.docs.languages.toml]\nenabled = false\n"
+    } else {
+        ""
+    };
     fs::write(
         configuration,
-        format!("{original}\n[{retry}]\nattempts = 3\ndelay = \"250ms\"\ndelay_limit = \"2s\"\n"),
+        format!(
+            "{original}\n[{retry}]\nattempts = 3\ndelay = \"250ms\"\ndelay_limit = \"2s\"\n{source}"
+        ),
     )?;
     Ok(())
 }
@@ -146,6 +153,45 @@ fn hit(answer: &Value) -> TestResult<ProfileSymbol> {
     })
 }
 
+fn declaration_unit(
+    hit: &ProfileSymbol,
+    declaration: &rift_protocol::symbol_read::SymbolDeclaration,
+) -> TestResult<rift_protocol::read::SourceUnitId> {
+    use rift_protocol::identity::SourceDigest;
+    use rift_protocol::read::SourceUnitId;
+
+    assert_ne!(declaration.path.is_some(), declaration.unit.is_some());
+    let original = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("project")?,
+        rift_core::SourcePath::new("lib.rs")?,
+    )?;
+    let original = SourceUnitId::parse(&original.to_string())?;
+    match SymbolIdentity::parse(hit.id.as_str())?.owner() {
+        SymbolOwner::Local => {
+            assert_eq!(
+                declaration.path.as_ref().map(|path| path.0.as_str()),
+                Some("lib.rs")
+            );
+            assert!(declaration.unit.is_none());
+            Ok(original)
+        }
+        SymbolOwner::ProfileLocal { name } => {
+            assert_eq!(name, "docs");
+            assert!(declaration.path.is_none());
+            let unit = declaration.unit.as_ref().ok_or("qualified source unit")?;
+            let (_, key) = rift_protocol::identity::parse_source_unit_identity(unit.as_str())?;
+            let (selection, _) = key.split_once('/').ok_or("qualified source selection")?;
+            let selection = SourceDigest::parse(selection)?;
+            assert_eq!(
+                unit,
+                &rift_search::query::qualify_source_unit(&original, Some(&selection))?
+            );
+            Ok(unit.clone())
+        }
+        _ => Err("unexpected profile fixture symbol owner".into()),
+    }
+}
+
 async fn symbol_read(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     hit: &ProfileSymbol,
@@ -176,39 +222,45 @@ async fn symbol_read(
         Some(hit.source.as_str()),
         "{answer}"
     );
-    assert!(declarations[0].path.is_none(), "{answer}");
-    let unit = declarations[0]
-        .unit
-        .as_ref()
-        .ok_or("qualified source unit")?;
-    if let Some((expected_unit, expected_source)) = expected_source {
+    let unit = declaration_unit(hit, &declarations[0])?;
+    let original_docs_source = format!("{DOCS_SOURCE}mod caller;\n");
+    let expected_source = if let Some((expected_unit, expected_source)) = expected_source {
         let expected_unit: rift_protocol::read::SourceUnitId =
             serde_json::from_value(json!(expected_unit))?;
-        assert_eq!(unit, &expected_unit, "{answer}");
-        let source_answer =
-            proxied_call(client, "get_source", &json!({"unit":unit, "view":view.id})).await?;
-        let result: rift_protocol::source_read::GetSourceResult =
-            serde_json::from_value(source_answer.clone())?;
-        let rift_protocol::source_read::GetSourceResult::Found {
-            source,
-            source_complete,
-            view: source_view,
-            ..
-        } = result
-        else {
-            return Err(format!("original source not found: {source_answer}").into());
-        };
-        assert_eq!(&source_view, view, "{source_answer}");
-        assert_eq!(&source.span.unit, unit, "{source_answer}");
-        assert_eq!(source.span.range.start, 0, "{source_answer}");
-        assert_eq!(
-            source.span.range.end,
-            u64::try_from(expected_source.len())?,
-            "{source_answer}"
-        );
-        assert_eq!(source.text, expected_source, "{source_answer}");
-        assert!(source_complete, "{source_answer}");
-    }
+        assert_eq!(&unit, &expected_unit, "{answer}");
+        expected_source
+    } else {
+        assert!(matches!(
+            SymbolIdentity::parse(hit.id.as_str())?.owner(),
+            SymbolOwner::ProfileLocal { name } if name == "docs"
+        ));
+        original_docs_source.as_str()
+    };
+    let source_answer = proxied_call(
+        client,
+        "search",
+        &serde_json::to_value(query::source(&serde_json::from_value(
+            json!({"unit":&unit,"view":view.id}),
+        )?)?)?,
+    )
+    .await?;
+    let [source_row] = query::rows(&source_answer)? else {
+        return Err(format!("one original profile source: {source_answer}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
+    assert_eq!(query::literal(source_row, "source_view")?, view.id.as_str());
+    assert_eq!(
+        query::literal(source_row, "source_expiry")?,
+        view.expires_at.as_str()
+    );
+    assert_eq!(query::iri(source_row, "unit")?, unit.as_str());
+    assert_eq!(query::literal(source_row, "start")?.parse::<u64>()?, 0);
+    assert_eq!(
+        query::literal(source_row, "end")?.parse::<u64>()?,
+        u64::try_from(expected_source.len())?
+    );
+    assert_eq!(query::literal(source_row, "text")?, expected_source);
+    assert_eq!(query::literal(source_row, "complete")?, "true");
     Ok(answer)
 }
 
@@ -342,6 +394,23 @@ async fn require_engine_root(logs: &Path, name: &str, root: &Path) -> TestResult
     Ok(())
 }
 
+async fn require_profile_source_scope(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+) -> TestResult {
+    let arguments = serde_json::to_value(QueryParams {
+        query:
+            "PREFIX : <urn:rift:vocabulary:> SELECT ?symbol { ?symbol a :Symbol; :language 'toml' }"
+                .to_owned(),
+        language: QueryLanguage::Sparql,
+    })?;
+    let answer = proxied_call(client, "search", &arguments).await?;
+    assert!(
+        query::rows(&answer)?.is_empty(),
+        "profile source includes only the configured Rust files: {answer}"
+    );
+    Ok(())
+}
+
 async fn require_profile_scope(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult {
@@ -454,7 +523,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
             ("docs/lib.rs", &docs_source),
             ("docs/caller.rs", CALLER_SOURCE),
         ],
-        "[source]\ninclude = [\"lib.rs\", \"caller.rs\", \"docs/lib.rs\", \"docs/caller.rs\"]\n[search.query]\npage_size = 1\n[global]\nenabled = false\n",
+        "[source]\ninclude = [\"Cargo.toml\", \"lib.rs\", \"caller.rs\", \"docs/lib.rs\", \"docs/caller.rs\"]\n[search.text]\ninclude = [\"Cargo.toml\"]\n[languages.toml]\nenabled = false\n[search.query]\npage_size = 1\n[global]\nenabled = false\n",
     )?;
     let root = directory.path();
     let docs = root.join("docs");
@@ -476,6 +545,7 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     await_workspace_ready(&client).await?;
     let docs_client = proxy_client(&docs).await?;
     await_workspace_ready(&docs_client).await?;
+    require_profile_source_scope(&docs_client).await?;
     docs_client.cancel().await?;
     require_profile_scope(&client).await?;
     let first = proxied_call(&client, "search", &search()?).await?;

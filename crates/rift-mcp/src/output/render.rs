@@ -29,14 +29,13 @@
 //! at one level and indent their further lines by two. Text an answer copies, such as source,
 //! keeps its own whitespace after the indent. No blank line separates two items or two sections.
 //! The hits a relationship walk reached are written as a tree; see the `walk` module.
-//! `nodes` answers, failures, and workspace pages follow the same principles; see the
-//! `nodes`, `error`, and `workspace` modules.
+//! Query answers, failures, and workspace pages follow the same principles; see the
+//! `query`, `error`, and `workspace` modules.
 
 mod error;
 mod facts;
 mod inline;
 mod layout;
-mod nodes;
 mod query;
 mod search;
 mod symbol;
@@ -45,7 +44,7 @@ mod warning;
 mod workspace;
 
 use rift_protocol::error::ErrorData;
-use rift_protocol::read::{GetSymbolResult, NodesResult};
+use rift_protocol::read::GetSymbolResult;
 use rift_protocol::search::SearchResult;
 use rift_protocol::workspace::WorkspaceResourcePage;
 
@@ -146,12 +145,6 @@ impl Render for GetSymbolResult {
     }
 }
 
-impl Render for NodesResult {
-    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        nodes::answer(out, self)
-    }
-}
-
 impl Render for ErrorData {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         error::answer(out, self)
@@ -185,54 +178,5 @@ impl Render for rift_protocol::symbol_read::GetSymbolResult {
 
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         symbol::canonical(out, self)
-    }
-}
-
-impl Render for rift_protocol::source_read::GetSourceResult {
-    fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
-        let (view, warnings) = match self {
-            Self::Found {
-                source,
-                source_complete,
-                view,
-                warnings,
-            } => {
-                out.raw_line(0, source.span.unit.as_str())?;
-                out.raw_line(
-                    0,
-                    &format!("{}..{}", source.span.range.start, source.span.range.end),
-                )?;
-                if !source_complete {
-                    out.raw_line(0, "source (incomplete):")?;
-                }
-                out.raw_lines(1, &source.text)?;
-                (Some(view), warnings)
-            }
-            Self::Missing {
-                unit,
-                view,
-                warnings,
-            } => {
-                out.raw_line(0, &format!("missing · {}", unit.as_str()))?;
-                (Some(view), warnings)
-            }
-            Self::Unavailable {
-                unit,
-                view,
-                reason,
-                warnings,
-            } => {
-                out.raw_line(0, &format!("unavailable · {reason:?}"))?;
-                out.raw_line(0, unit.as_str())?;
-                (view.as_ref(), warnings)
-            }
-        };
-        if let Some(view) = view {
-            out.raw_line(
-                0,
-                &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
-            )?;
-        }
-        warning::section(out, warnings)
     }
 }

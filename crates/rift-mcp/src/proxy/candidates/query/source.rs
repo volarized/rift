@@ -61,7 +61,7 @@ impl RiftProxy {
         &self,
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        if !matches!(request.name.as_ref(), "get_source" | "get_symbol") {
+        if request.name != "get_symbol" {
             return Ok(None);
         }
         let arguments = request.arguments.clone().unwrap_or_default();
@@ -95,43 +95,35 @@ impl RiftProxy {
                 select_read(request, &captured, &saved, budget)
             })
             .await?;
-        match selected {
-            SelectedRead::Captured(value) => {
-                Ok(Some(crate::output::Json(value).into_call_tool_result()))
+        let SelectedRead {
+            backend,
+            request,
+            view,
+            source_units,
+            original_view,
+        } = selected;
+        let response = self
+            .query_backend(&backend)?
+            .forward_read((*request).clone())
+            .await?;
+        self.query_work(&budget, deadline, move |budget| {
+            if let Ok(CallToolResponse::Complete(response)) = &response {
+                budget.charge(response)?;
             }
-            SelectedRead::Forward {
-                backend,
-                request,
+            let response = qualify_response(
+                response,
+                &request,
+                &backend,
                 view,
-                public_unit,
-                source_units,
-                original_view,
-            } => {
-                let response = self
-                    .query_backend(&backend)?
-                    .forward_read((*request).clone())
-                    .await?;
-                self.query_work(&budget, deadline, move |budget| {
-                    if let Ok(CallToolResponse::Complete(response)) = &response {
-                        budget.charge(response)?;
-                    }
-                    let response = qualify_response(
-                        response,
-                        &request,
-                        &backend,
-                        view,
-                        public_unit,
-                        &source_units,
-                        &original_view,
-                    )?;
-                    if let Ok(CallToolResponse::Complete(response)) = &response {
-                        budget.charge(response)?;
-                    }
-                    Ok(Some(response))
-                })
-                .await
+                &source_units,
+                &original_view,
+            )?;
+            if let Ok(CallToolResponse::Complete(response)) = &response {
+                budget.charge(response)?;
             }
-        }
+            Ok(Some(response))
+        })
+        .await
     }
 
     pub(in crate::proxy) fn query_roots(&self) -> std::collections::BTreeMap<String, String> {
@@ -168,19 +160,15 @@ fn encoding_failure(source: serde_json::Error) -> RiftError {
     errors::mcp::forward_failed().source(source).error()
 }
 
-enum SelectedRead {
-    Captured(GetSourceResult),
-    Forward {
-        backend: String,
-        request: Box<CallToolRequestParams>,
-        view: CapturedView,
-        public_unit: Option<rift_protocol::read::SourceUnitId>,
-        source_units: Vec<(
-            rift_protocol::read::SourceUnitId,
-            rift_protocol::read::SourceUnitId,
-        )>,
-        original_view: CapturedView,
-    },
+struct SelectedRead {
+    backend: String,
+    request: Box<CallToolRequestParams>,
+    view: CapturedView,
+    source_units: Vec<(
+        rift_protocol::read::SourceUnitId,
+        rift_protocol::read::SourceUnitId,
+    )>,
+    original_view: CapturedView,
 }
 
 fn select_read(
@@ -190,43 +178,15 @@ fn select_read(
     budget: &mut rift_server::QueryFactBudget<'_>,
 ) -> Result<SelectedRead, RiftError> {
     let mut arguments = request.arguments.unwrap_or_default();
-    let (provider, public_unit) = if request.name == "get_symbol" {
-        let id = arguments
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(retained::unavailable)?;
-        let (provider, original) = selected_symbol(saved, id)?;
-        arguments.insert(
-            "id".to_owned(),
-            serde_json::to_value(original).map_err(encoding_failure)?,
-        );
-        (provider, None)
-    } else {
-        let params: GetSourceParams =
-            serde_json::from_value(arguments.clone().into()).map_err(encoding_failure)?;
-        if !params.is_valid() {
-            return Err(retained::unavailable());
-        }
-        let source = selected_source(saved, &params.unit)?;
-        if let Some(bytes) = &source.bytes {
-            let response = captured_source(
-                params,
-                captured
-                    .material()
-                    .sources()
-                    .get(bytes.clone())
-                    .ok_or_else(retained::unavailable)?,
-                captured.view(),
-                budget,
-            )?;
-            return Ok(SelectedRead::Captured(response));
-        }
-        arguments.insert(
-            "unit".to_owned(),
-            serde_json::to_value(&source.original).map_err(encoding_failure)?,
-        );
-        (source.provider, Some(params.unit))
-    };
+    let id = arguments
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(retained::unavailable)?;
+    let (provider, original) = selected_symbol(saved, id)?;
+    arguments.insert(
+        "id".to_owned(),
+        serde_json::to_value(original).map_err(encoding_failure)?,
+    );
     let provider_index = provider;
     let provider = saved
         .providers
@@ -244,11 +204,10 @@ fn select_read(
         "view".to_owned(),
         serde_json::to_value(&provider.view.id).map_err(encoding_failure)?,
     );
-    Ok(SelectedRead::Forward {
+    Ok(SelectedRead {
         backend: provider.backend.clone(),
         request: Box::new(CallToolRequestParams::new(request.name).with_arguments(arguments)),
         view: captured.view().clone(),
-        public_unit,
         source_units,
         original_view,
     })
@@ -329,7 +288,6 @@ fn qualify_response(
     request: &CallToolRequestParams,
     backend: &str,
     view: CapturedView,
-    public_unit: Option<rift_protocol::read::SourceUnitId>,
     source_units: &[(
         rift_protocol::read::SourceUnitId,
         rift_protocol::read::SourceUnitId,
@@ -339,34 +297,21 @@ fn qualify_response(
     let Ok(CallToolResponse::Complete(mut result)) = response else {
         return Ok(response);
     };
-    if result.is_error == Some(true)
-        && (request.name != "get_symbol"
-            || !crate::proxy::candidates::read::canonical_symbol_response(&result))
-    {
+    if !crate::proxy::candidates::read::canonical_symbol_response(&result) {
         return Ok(Ok(result.into()));
     }
     let value = result
         .structured_content
         .take()
         .ok_or_else(retained::unavailable)?;
-    if request.name == "get_source" {
-        let params: GetSourceParams =
-            serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
-                .map_err(encoding_failure)?;
-        let mut source: GetSourceResult =
-            serde_json::from_value(value).map_err(encoding_failure)?;
-        source = qualify_source(source, &params, backend, view, public_unit)?;
-        Ok(crate::output::Json(source).into_call_tool_result())
-    } else {
-        let mut symbol: rift_protocol::symbol_read::GetSymbolResult =
-            serde_json::from_value(value).map_err(encoding_failure)?;
-        let original: rift_protocol::symbol_read::GetSymbolParams =
-            serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
-                .map_err(encoding_failure)?;
-        crate::proxy::candidates::read::validate_symbol(&original, &symbol, Some(original_view))?;
-        symbol = qualify_symbol(symbol, &original, backend, view, source_units)?;
-        Ok(crate::output::Json(symbol).into_call_tool_result())
-    }
+    let mut symbol: rift_protocol::symbol_read::GetSymbolResult =
+        serde_json::from_value(value).map_err(encoding_failure)?;
+    let original: rift_protocol::symbol_read::GetSymbolParams =
+        serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
+            .map_err(encoding_failure)?;
+    crate::proxy::candidates::read::validate_symbol(&original, &symbol, Some(original_view))?;
+    symbol = qualify_symbol(symbol, &original, backend, view, source_units)?;
+    Ok(crate::output::Json(symbol).into_call_tool_result())
 }
 
 pub(crate) fn qualify_source(

@@ -1037,8 +1037,10 @@ fn lexical_hit_with_validated_view(
     let answer = tool_request_with_timeout(
         port,
         token,
-        "get_source",
-        &serde_json::json!({"unit": unit, "view": view.id}),
+        "search",
+        &serde_json::to_value(query::source(&serde_json::from_value(
+            serde_json::json!({"unit": unit,"view":view.id}),
+        )?)?)?,
         Some(CONNECT_TIMEOUT),
     )?;
     let body = answer
@@ -1046,41 +1048,47 @@ fn lexical_hit_with_validated_view(
         .ok_or("the MCP response must contain an HTTP body")?
         .1;
     let response: serde_json::Value = serde_json::from_str(body)?;
-    let result: rift_protocol::source_read::GetSourceResult =
-        serde_json::from_value(response["result"]["structuredContent"].clone())?;
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source,
-        source_complete,
-        view: returned_view,
-        ..
-    } = result
-    else {
-        return Err(format!("the captured project source must remain readable: {response}").into());
+    let [source] = query::rows(&response["result"]["structuredContent"])? else {
+        return Err(format!("one captured project source: {response}").into());
     };
+    assert_eq!(query::literal(source, "outcome")?, "found");
     assert_eq!(
-        returned_view, view,
-        "held reads retain the original view and expiry"
+        query::literal(source, "source_view")?,
+        view.id.as_str(),
+        "held reads retain the original view"
     );
-    assert_eq!(source.span.unit, unit);
     assert_eq!(
-        source.text,
+        query::literal(source, "source_expiry")?,
+        view.expires_at.as_str(),
+        "held reads retain the original expiry"
+    );
+    assert_eq!(query::iri(source, "unit")?, unit.as_str());
+    assert_eq!(
+        query::literal(source, "text")?,
         "amber canoe velvet: persistent lexical content\n"
     );
-    assert!(source_complete);
+    assert_eq!(query::literal(source, "complete")?, "true");
+    let span = rift_protocol::read::SourceUnitSpan {
+        unit,
+        range: rift_protocol::read::TextRange {
+            start: query::literal(source, "start")?.parse()?,
+            end: query::literal(source, "end")?.parse()?,
+        },
+    };
     assert_eq!(query::literal(&row, "path")?, "notes.md");
     assert_eq!(query::literal(&row, "target")?, "documentation");
     assert_eq!(query::literal(&row, "matched_by")?, "content");
     if row.get("unit").is_some() {
-        assert_eq!(query::iri(&row, "unit")?, unit.as_str());
+        assert_eq!(query::iri(&row, "unit")?, span.unit.as_str());
     }
     assert_eq!(
-        serde_json::to_value(&source.span.range)?,
+        serde_json::to_value(&span.range)?,
         serde_json::json!({
             "start": query::literal(&row, "start")?.parse::<u64>()?,
             "end": query::literal(&row, "end")?.parse::<u64>()?,
         })
     );
-    Ok(source.span)
+    Ok(span)
 }
 
 #[test]

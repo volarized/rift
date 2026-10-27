@@ -35,7 +35,7 @@ pub enum QueryLanguage {
 pub struct QueryParams {
     /// Query text.
     pub query: String,
-    /// Currently only SPARQL is supported.
+    /// Currently, only SPARQL is supported.
     #[serde(default)]
     pub language: QueryLanguage,
 }

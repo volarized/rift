@@ -142,16 +142,39 @@ async fn assert_pattern_view_readback(
         .ok_or("captured pattern view")?;
     let source = call_tool(
         client,
-        "get_source",
-        json!({"unit":COLLECTED_UNIT,"view":view}),
+        "search",
+        serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
+            json!({"unit":COLLECTED_UNIT,"view":view}),
+        )?)?)?,
     )
     .await?;
-    assert_eq!(source["outcome"], "found", "{source:#}");
-    assert_eq!(source["view"], answer["view"]);
-    assert!(
-        source["source"]["text"]
+    let [source_row] = workspace_client::query::rows(&source)? else {
+        return Err(format!("source query must return one original result: {source:#}").into());
+    };
+    assert_eq!(
+        workspace_client::query::literal(source_row, "outcome")?,
+        "found"
+    );
+    assert_eq!(
+        workspace_client::query::iri(source_row, "unit")?,
+        COLLECTED_UNIT
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "complete")?,
+        "true"
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "source_view")?,
+        view
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "source_expiry")?,
+        answer["view"]["expires_at"]
             .as_str()
-            .is_some_and(|source| source.contains("pub fn helper_beacon() {}"))
+            .ok_or("pattern expiry")?
+    );
+    assert!(
+        workspace_client::query::literal(source_row, "text")?.contains("pub fn helper_beacon() {}")
     );
     let symbol = global_api::collected_identity(SymbolFixture::Valid, "helper_beacon");
     let exact = call_tool(
@@ -526,21 +549,63 @@ async fn assert_admitted_outgoing_source(
             })
         );
     }
-    let source = call_tool(
-        client,
-        "get_source",
-        json!({"unit":unit,"view":answer["view"]["id"]}),
-    )
-    .await?;
-    assert_eq!(source["outcome"], "found", "{source:#}");
-    assert_eq!(source["source"]["text"], original_source);
-    assert_eq!(source["view"], answer["view"]);
+    assert_admitted_source_read(client, &answer, unit, &original_source).await?;
     let requests = fixture.requests().await;
     assert!(
         requests
             .iter()
             .all(|request| request.uri.ends_with("/capabilities")),
         "admitted source facts require no global naming request: {requests:#?}"
+    );
+    Ok(())
+}
+
+async fn assert_admitted_source_read(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    answer: &Value,
+    unit: &str,
+    original_source: &str,
+) -> TestResult {
+    let source = call_tool(
+        client,
+        "search",
+        serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
+            json!({"unit":unit,"view":answer["view"]["id"]}),
+        )?)?)?,
+    )
+    .await?;
+    let [source_row] = workspace_client::query::rows(&source)? else {
+        return Err(format!("source query must return one original result: {source:#}").into());
+    };
+    assert_eq!(
+        workspace_client::query::literal(source_row, "outcome")?,
+        "found"
+    );
+    assert_eq!(workspace_client::query::iri(source_row, "unit")?, unit);
+    assert_eq!(
+        workspace_client::query::literal(source_row, "text")?,
+        original_source
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "complete")?,
+        "true"
+    );
+    assert_eq!(workspace_client::query::literal(source_row, "start")?, "0");
+    assert_eq!(
+        workspace_client::query::literal(source_row, "end")?.parse::<usize>()?,
+        original_source.len()
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "source_view")?,
+        answer["view"]["id"]
+            .as_str()
+            .ok_or("original outgoing view")?
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "source_expiry")?,
+        answer["view"]["expires_at"]
+            .as_str()
+            .ok_or("original outgoing expiry")?
     );
     Ok(())
 }
@@ -1345,18 +1410,41 @@ async fn assert_mixed_source_readback(
     let before = fixture.requests().await.len();
     let local = call_tool(
         client,
-        "get_source",
-        json!({
-            "unit":"rift://source/project/src/lib.rs", "view":mixed["view"]["id"]
-        }),
+        "search",
+        serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
+            json!({
+                "unit":"rift://source/project/src/lib.rs", "view":mixed["view"]["id"]
+            }),
+        )?)?)?,
     )
     .await?;
-    assert_eq!(local["outcome"], "found", "{local:#}");
-    assert_eq!(local["view"], mixed["view"]);
-    assert!(
-        local["source"]["text"]
+    let [local_row] = workspace_client::query::rows(&local)? else {
+        return Err(format!("source query must return one original result: {local:#}").into());
+    };
+    assert_eq!(
+        workspace_client::query::literal(local_row, "outcome")?,
+        "found"
+    );
+    assert_eq!(
+        workspace_client::query::iri(local_row, "unit")?,
+        "rift://source/project/src/lib.rs"
+    );
+    assert_eq!(
+        workspace_client::query::literal(local_row, "complete")?,
+        "true"
+    );
+    assert_eq!(
+        workspace_client::query::literal(local_row, "source_view")?,
+        mixed["view"]["id"].as_str().ok_or("original mixed view")?
+    );
+    assert_eq!(
+        workspace_client::query::literal(local_row, "source_expiry")?,
+        mixed["view"]["expires_at"]
             .as_str()
-            .is_some_and(|source| source.contains("pub fn local_beacon() {}"))
+            .ok_or("original mixed expiry")?
+    );
+    assert!(
+        workspace_client::query::literal(local_row, "text")?.contains("pub fn local_beacon() {}")
     );
     assert_eq!(
         fixture.requests().await.len(),
@@ -1365,18 +1453,41 @@ async fn assert_mixed_source_readback(
     );
     let remote = call_tool(
         client,
-        "get_source",
-        json!({
-            "unit":COLLECTED_UNIT, "view":mixed["view"]["id"]
-        }),
+        "search",
+        serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
+            json!({
+                "unit":COLLECTED_UNIT, "view":mixed["view"]["id"]
+            }),
+        )?)?)?,
     )
     .await?;
-    assert_eq!(remote["outcome"], "found", "{remote:#}");
-    assert_eq!(remote["view"], mixed["view"]);
-    assert!(
-        remote["source"]["text"]
+    let [remote_row] = workspace_client::query::rows(&remote)? else {
+        return Err(format!("source query must return one original result: {remote:#}").into());
+    };
+    assert_eq!(
+        workspace_client::query::literal(remote_row, "outcome")?,
+        "found"
+    );
+    assert_eq!(
+        workspace_client::query::iri(remote_row, "unit")?,
+        COLLECTED_UNIT
+    );
+    assert_eq!(
+        workspace_client::query::literal(remote_row, "complete")?,
+        "true"
+    );
+    assert_eq!(
+        workspace_client::query::literal(remote_row, "source_view")?,
+        mixed["view"]["id"].as_str().ok_or("original mixed view")?
+    );
+    assert_eq!(
+        workspace_client::query::literal(remote_row, "source_expiry")?,
+        mixed["view"]["expires_at"]
             .as_str()
-            .is_some_and(|source| source.contains("pub fn helper_beacon() {}"))
+            .ok_or("original mixed expiry")?
+    );
+    assert!(
+        workspace_client::query::literal(remote_row, "text")?.contains("pub fn helper_beacon() {}")
     );
     Ok(())
 }
@@ -2839,19 +2950,7 @@ async fn global_service_query_view_retains_exact_provider_reads_and_refuses_chan
     .await?;
     assert_eq!(exact["outcome"], "found", "{exact}");
     assert_eq!(exact["view"], answer["view"]);
-    let source = call_tool(
-        &client,
-        "get_source",
-        json!({"unit":COLLECTED_UNIT,"view":view}),
-    )
-    .await?;
-    assert_eq!(source["outcome"], "found", "{source}");
-    assert_eq!(source["view"], answer["view"]);
-    assert!(
-        source["source"]["text"]
-            .as_str()
-            .is_some_and(|text| text.contains("pub fn beacon()"))
-    );
+    assert_global_query_source(&client, &answer, &view).await?;
     for request in first
         .requests()
         .await
@@ -2883,8 +2982,10 @@ async fn global_service_query_view_retains_exact_provider_reads_and_refuses_chan
     .await?;
     let refused = call_tool(
         &client,
-        "get_source",
-        json!({"unit":COLLECTED_UNIT,"view":view}),
+        "search",
+        serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
+            json!({"unit":COLLECTED_UNIT,"view":view}),
+        )?)?)?,
     )
     .await?;
     assert_eq!(refused["outcome"], "unavailable", "{refused}");
@@ -2898,6 +2999,48 @@ async fn global_service_query_view_retains_exact_provider_reads_and_refuses_chan
     );
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+async fn assert_global_query_source(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    answer: &Value,
+    view: &str,
+) -> TestResult {
+    let source = call_tool(
+        client,
+        "search",
+        serde_json::to_value(workspace_client::query::source(&serde_json::from_value(
+            json!({"unit":COLLECTED_UNIT,"view":view}),
+        )?)?)?,
+    )
+    .await?;
+    let [source_row] = workspace_client::query::rows(&source)? else {
+        return Err(format!("source query must return one original result: {source:#}").into());
+    };
+    assert_eq!(
+        workspace_client::query::literal(source_row, "outcome")?,
+        "found"
+    );
+    assert_eq!(
+        workspace_client::query::iri(source_row, "unit")?,
+        COLLECTED_UNIT
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "complete")?,
+        "true"
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "source_view")?,
+        view
+    );
+    assert_eq!(
+        workspace_client::query::literal(source_row, "source_expiry")?,
+        answer["view"]["expires_at"]
+            .as_str()
+            .ok_or("original global expiry")?
+    );
+    assert!(workspace_client::query::literal(source_row, "text")?.contains("pub fn beacon()"));
     Ok(())
 }
 
@@ -3143,5 +3286,107 @@ async fn test_served_package_reads_apply_workspace_request_opt_out() -> TestResu
     );
     client.cancel().await?;
     server_task.await?;
+    Ok(())
+}
+
+/// The recorded package examples use complete answers from the served MCP router.
+#[tokio::test]
+async fn recorded_global_query_examples_keep_source_and_substitution_contracts() -> TestResult {
+    let fixture = complete_fixture(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled=true\nendpoint={:?}\nattempts=1\n{DEMO_PACKAGE}\n[languages.rust]\nstdlib=false\n",
+        fixture.endpoint,
+    );
+    let (directory, client, server_task) = served_probe_workspace(configuration).await?;
+    let parameters = serde_json::from_value(json!({
+        "query":"beacon", "scope":"global", "target":"symbol", "include":["source"],
+        "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}]
+    }))?;
+    let search = workspace_client::query::retrieval(&parameters)?;
+    workspace_client::search_after_population(&client, &search).await?;
+    let mut captured_view = Value::Null;
+    for example in ["global-search", "global-source", "requested-served"] {
+        let arguments = match example {
+            "global-search" => serde_json::to_value(&search)?,
+            "global-source" => serde_json::to_value(workspace_client::query::source(
+                &serde_json::from_value(json!({"unit":COLLECTED_UNIT,"view":captured_view["id"]}))?,
+            )?)?,
+            _ => serde_json::to_value(workspace_client::query::retrieval(
+                &serde_json::from_value(json!({
+                    "query":"beacon", "scope":"global", "target":"symbol", "include":["source"],
+                    "packages":[{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.1.0"}]
+                }))?,
+            )?)?,
+        };
+        let result = client.call_tool(tool_request("search", &arguments)).await?;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let answer = result
+            .structured_content
+            .as_ref()
+            .ok_or("recorded query returns structured content")?;
+        match example {
+            "global-search" => {
+                let rows = workspace_client::query::rows(answer)?;
+                let identity = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+                assert!(
+                    rows.iter().any(|row| {
+                        workspace_client::query::iri(row, "symbol")
+                            .is_ok_and(|symbol| symbol == identity.as_str())
+                            && workspace_client::query::iri(row, "unit")
+                                .is_ok_and(|unit| unit == COLLECTED_UNIT)
+                            && workspace_client::query::literal(row, "source")
+                                .is_ok_and(|source| source == "pub fn beacon() {}")
+                    }),
+                    "{answer:#}"
+                );
+                captured_view = answer["view"].clone();
+                assert!(captured_view["id"].as_str().is_some());
+            }
+            "global-source" => assert_recorded_global_source(answer, &captured_view)?,
+            _ => {
+                assert_unavailable(answer);
+                assert_eq!(substituted_versions(answer), [&json!("1.1.0")]);
+                assert!(answer["warnings"].as_array().ok_or("query warnings")?.iter().any(|warning| {
+                    warning["code"] == "package_substituted"
+                        && warning["package"] == json!({"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"})
+                }), "{answer:#}");
+            }
+        }
+        println!(
+            "RIFT_READ_EXAMPLE {}",
+            serde_json::to_string(&json!({
+                "id":example, "tool":"search", "arguments":arguments, "response":result
+            }))?
+        );
+    }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+fn assert_recorded_global_source(answer: &Value, captured: &Value) -> TestResult {
+    let [row] = workspace_client::query::rows(answer)? else {
+        return Err("recorded source query returns one result".into());
+    };
+    let text = "pub fn helper_beacon() {}\npub fn beacon() {}\n";
+    assert_eq!(workspace_client::query::literal(row, "outcome")?, "found");
+    assert_eq!(workspace_client::query::iri(row, "unit")?, COLLECTED_UNIT);
+    assert_eq!(workspace_client::query::literal(row, "text")?, text);
+    assert_eq!(workspace_client::query::literal(row, "start")?, "0");
+    assert_eq!(
+        workspace_client::query::literal(row, "end")?,
+        text.len().to_string()
+    );
+    assert_eq!(workspace_client::query::literal(row, "complete")?, "true");
+    assert_eq!(
+        workspace_client::query::literal(row, "source_view")?,
+        captured["id"].as_str().ok_or("original query view")?
+    );
+    assert_eq!(
+        workspace_client::query::literal(row, "source_expiry")?.parse::<jiff::Timestamp>()?,
+        view_expiry(captured)?
+    );
+    assert!(view_expiry(&answer["view"])? <= view_expiry(captured)?);
     Ok(())
 }

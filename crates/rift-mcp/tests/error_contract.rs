@@ -49,17 +49,14 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
             json!({ "query": "beacon", "paths": { "include": ["[unclosed"] } }),
         ),
         ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
-        ("nodes", json!({ "path": "missing.rs", "position": 0 })),
+        ("nodes", json!({ "query": 42 })),
         (
             "get_symbol",
             json!({ "name": "beacon", "include": ["history"] }),
         ),
         ("get_symbol", json!({ "name": "beacon", "rev": "main" })),
         ("search", json!({ "query": "beacon", "rev": "main" })),
-        (
-            "nodes",
-            json!({ "path": "lib.rs", "position": 0, "rev": "HEAD~1" }),
-        ),
+        ("nodes", json!({ "query": "ASK {", "language": "sparql" })),
     ];
     for (tool, producer) in failing_requests {
         let request = if tool == "search" && producer["query"] != "" {

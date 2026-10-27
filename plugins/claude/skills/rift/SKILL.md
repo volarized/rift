@@ -20,14 +20,15 @@ Read `rift://map` first for served languages, workspace layout, and language ser
 | The exact symbol identity is known. | `get_symbol` |
 | A package or runtime declaration is needed. | `search` (with `:scope "global"` or `"all"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`) |
 | A package version the project does not use, or a package it lacks, is needed. | `search` (with `:packages` and `:scope "global"` or `"all"` in `SERVICE :search`; read the returned symbol IRI with `get_symbol`) |
-| The syntax structure at one position is needed. | `nodes` |
+| The syntax structure is needed. | `nodes` (with SPARQL Query) |
+| A source unit or byte range is needed. | `search` (with `:unit` and optional `:range` in `SERVICE :source`) |
 | The declarations that reference a symbol, its impact (what changes when it does), or a path between two symbols is needed. | `search` (with SPARQL property paths) |
 | The declarations two revisions, or a revision and the working tree, hold differently are needed. | `search` (with `:change` in `SERVICE :search`) |
 | The commit that made a change, found by its message, is needed. | `search` (with `:target "commit"` in `SERVICE :search`) |
 
 ## Query recipes
 
-`search` takes required SPARQL `query` and optional `language`, default `sparql`. Prefixes `:`, `r:`, `rdf:`, `rdfs:`, and `xsd:` are supplied. Replace `<symbol-id>` below with an observed canonical symbol IRI.
+`search` and `nodes` take required `query` text and optional `language`, default `sparql`. Prefixes `:`, `r:`, `rdf:`, `rdfs:`, and `xsd:` are supplied. Replace `<symbol-id>` below with an observed canonical symbol IRI.
 
 - Names: `SELECT ?symbol {?symbol a :Symbol; :name "load_config"}`
 - Usage identities: `SELECT ?usage {<symbol-id> :usages ?usage}`
@@ -86,6 +87,24 @@ OPTIONAL { ?callee :name ?name }
 OPTIONAL { ?callee :path ?path }
 }
 ORDER BY ?name ?path LIMIT 20
+```
+
+### Source reads
+
+Read a complete source unit or a half-open UTF-8 byte range. Replace `<source-unit>` with an observed source-unit IRI. Whole-file reads omit `:range`; captured reads add `:view` with the original captured view ID.
+
+```sparql
+SELECT ?outcome ?text ?start ?end ?complete
+WHERE {
+SERVICE :source {
+?read :unit <source-unit>; :range '{"start":0,"end":4}'^^rdf:JSON;
+:outcome ?outcome .
+OPTIONAL {
+?read :source [ :text ?text; :span [ :range [ :start ?start; :end ?end ] ] ];
+:source_complete ?complete .
+}
+}
+}
 ```
 
 Set `OFFSET 20` to select the next query window. Follow returned `pagination.next_query` unchanged for transport pages. Carry the returned `view` with exact symbol and source reads. Missing required facts return unavailability, never a false boolean or empty complete answer.

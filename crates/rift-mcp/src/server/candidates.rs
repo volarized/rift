@@ -665,33 +665,6 @@ impl RiftMcp {
         self.candidate_responses.save_bytes(id, expires, encoded)
     }
 
-    pub(super) fn captured_nodes(
-        &self,
-        params: &rift_protocol::read::NodesParams,
-        view: &rift_protocol::symbol_read::CapturedViewId,
-    ) -> Result<rift_protocol::read::NodesResult, ToolFailure> {
-        let context = self.captured_context(view, "nodes")?;
-        let owner = context.owner;
-        let root = std::path::Path::new(&context.root);
-        let views = self.local_views.get().ok_or_else(|| {
-            captured_node_refusal(
-                view,
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewExpired,
-            )
-        })?;
-        let (nodes, selected) = views
-            .nodes(params, view, root, &owner)
-            .map_err(read_failure)?
-            .map_err(|reason| captured_node_refusal(view, reason))?;
-        if nodes.view.as_ref() != Some(&selected) || selected.id != *view {
-            return Err(captured_node_refusal(
-                view,
-                rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-            ));
-        }
-        Ok(nodes)
-    }
-
     fn saved_candidates(
         &self,
         params: &SearchParams,
@@ -764,16 +737,9 @@ fn captured_read_refusal(
     read_failure(error)
 }
 
-fn captured_node_refusal(
-    view: &rift_protocol::symbol_read::CapturedViewId,
-    reason: rift_protocol::symbol_read::SymbolUnavailableReason,
-) -> ToolFailure {
-    captured_read_refusal("nodes", view, reason)
-}
-
 #[cfg(test)]
 mod captured_node_error_tests {
-    use super::captured_node_refusal;
+    use super::captured_read_refusal;
     use super::wire;
     use crate::{failure::WireFailure, output::ToolFailure};
     use rift_protocol::symbol_read::{CapturedViewId, SymbolUnavailableReason};
@@ -793,7 +759,9 @@ mod captured_node_error_tests {
                 "matching workspace",
             ),
         ] {
-            let ToolFailure::Registered(error, phase) = captured_node_refusal(&view, reason) else {
+            let ToolFailure::Registered(error, phase) =
+                captured_read_refusal("nodes", &view, reason)
+            else {
                 panic!("captured refusal must retain its registered error");
             };
             assert_eq!(error.registered().slug().as_str(), slug);
@@ -818,6 +786,7 @@ mod captured_search_startup_tests {
     #[tokio::test]
     async fn direct_search_keeps_original_capture_after_source_changes()
     -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use rift_protocol::query::{QueryAnswer, QueryReadResult, RdfTerm};
         let directory = tempfile::tempdir()?;
         super::super::hermetic_workspace(directory.path(), "")?;
         std::fs::write(
@@ -828,70 +797,102 @@ mod captured_search_startup_tests {
         let root = directory.path().canonicalize()?;
         let server =
             RiftMcp::build_settled(&root, super::super::WorkspaceIndexLimits::default()).await?;
-        let mut params: SearchParams = serde_json::from_value(serde_json::json!({
-            "query": "beacon", "scope": "local", "include": ["source"]
-        }))?;
         let initial = server
-            .discovery_search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
-            )
+            .graph_query_with_context(serde_json::from_value(serde_json::json!({
+                "query": "SELECT ?symbol ?name ?source { ?symbol a :Symbol; :name 'beacon', ?name; :declarations [ :source ?source ] }"
+            }))?, None)
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
-        let rift_protocol::search_read::SearchReadResult::Results(initial) = initial else {
-            return Err("initial search must return captured results".into());
+        let QueryReadResult::Results(initial) = initial else {
+            return Err("initial query must return captured results".into());
         };
-        assert!(!initial.results.is_empty());
+        let QueryAnswer::Bindings { bindings, .. } = &initial.answer else {
+            return Err("initial query must return bindings".into());
+        };
+        assert!(!bindings.is_empty());
+        assert!(bindings.iter().all(|row| {
+            matches!(row.get("symbol"), Some(RdfTerm::Iri { .. }))
+                && matches!(row.get("name"), Some(RdfTerm::Literal { value, .. }) if value == "beacon")
+                && matches!(row.get("source"), Some(RdfTerm::Literal { value, .. }) if value == "pub fn beacon() {}")
+        }));
         let view = initial
             .view
             .clone()
-            .ok_or("initial search must issue a view")?;
-        assert!(
-            initial
-                .results
-                .iter()
-                .all(|hit| hit.view.as_ref() == Some(&view))
-        );
+            .ok_or("initial query must issue a view")?;
         std::fs::write(directory.path().join("lib.rs"), "pub fn replacement() {}\n")?;
-        params.view = Some(view.id.clone());
+        let query = rift_search::sparql::continuation_query(&initial.answer, &view.id, 0)?;
         let later = server
-            .discovery_search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({"query":query}))?,
+                None,
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
-        let rift_protocol::search_read::SearchReadResult::Results(later) = later else {
-            return Err("held search must return original results".into());
+        let QueryReadResult::Results(later) = later else {
+            return Err("held query must return original results".into());
         };
         assert_eq!(later, initial);
-        params.page_index = 1;
+        let query = rift_search::sparql::continuation_query(&initial.answer, &view.id, 1)?;
         let page = server
-            .discovery_search(
-                super::super::Parameters(params.clone()),
-                rmcp::model::Extensions::default(),
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({"query":query}))?,
+                None,
             )
             .await
             .map_err(|failure| format!("{failure:?}"))?
             .0;
-        let rift_protocol::search_read::SearchReadResult::Results(page) = page else {
+        let QueryReadResult::Results(page) = page else {
             return Err("empty later page must keep capture".into());
         };
-        assert!(page.results.is_empty());
+        let QueryAnswer::Bindings { bindings, .. } = &page.answer else {
+            return Err("empty later page must return bindings".into());
+        };
+        assert!(bindings.is_empty());
         assert_eq!(page.view.as_ref(), Some(&view));
-        params.query = Some("replacement".to_owned());
+        let fresh = server
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({
+                    "query":"SELECT ?symbol { ?symbol a :Symbol; :name 'replacement' }"
+                }))?,
+                None,
+            )
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(fresh) = fresh else {
+            return Err("fresh query must capture the replacement".into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = &fresh.answer else {
+            return Err("fresh query must return bindings".into());
+        };
+        assert!(!bindings.is_empty());
+        let fresh_view = fresh.view.ok_or("fresh query view")?;
+        refuse_mixed_query_views(&server, view.id.as_str(), fresh_view.id.as_str()).await?;
+        Ok(())
+    }
+
+    async fn refuse_mixed_query_views(
+        server: &RiftMcp,
+        original_view: &str,
+        fresh_view: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let prefix = rift_search::sparql::RESULT_SERVICE_PREFIX;
+        let query = format!(
+            "SELECT ?symbol {{ SERVICE <{prefix}{original_view}> {{}} SERVICE <{prefix}{fresh_view}> {{}} }}"
+        );
+        let refused = server
+            .graph_query_with_context(
+                serde_json::from_value(serde_json::json!({"query":query}))?,
+                None,
+            )
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
         assert!(matches!(
-            server
-                .discovery_search(
-                    super::super::Parameters(params),
-                    rmcp::model::Extensions::default()
-                )
-                .await
-                .map_err(|failure| format!("{failure:?}"))?
-                .0,
-            rift_protocol::search_read::SearchReadResult::Unavailable(
+            refused,
+            rift_protocol::query::QueryReadResult::Unavailable(
                 rift_protocol::search_read::SearchUnavailable::Unavailable {
                     reason: rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
                     ..
@@ -1178,15 +1179,10 @@ mod tests {
     async fn preparing_query_refuses_unterminated_quote_without_retaining_candidates() -> TestResult
     {
         let (_directory, assembled) = super::super::tests::starting_fixture().await?;
-        let params = serde_json::from_value(serde_json::json!({
-            "query": "\"beacon", "scope": "local", "target": "symbol"
-        }))?;
+        let params = serde_json::from_value(serde_json::json!({"query":"\"beacon"}))?;
         let failure = assembled
             .server
-            .discovery_search(
-                super::super::Parameters(params),
-                rmcp::model::Extensions::default(),
-            )
+            .graph_query_with_context(params, None)
             .await
             .err()
             .expect("preparing publication must refuse the malformed query");
@@ -1238,18 +1234,25 @@ mod tests {
             );
             if attempt == 0 {
                 let params = serde_json::from_value(serde_json::json!({
-                    "query": "beacon", "scope": "local", "target": "symbol"
+                    "query":"SELECT ?symbol { ?symbol a :Symbol; :name 'beacon' }"
                 }))?;
                 let direct = assembled
                     .server
-                    .discovery_search(
-                        super::super::Parameters(params),
-                        rmcp::model::Extensions::default(),
-                    )
+                    .graph_query_with_context(params, None)
                     .await
                     .map_err(|failure| format!("{failure:?}"))?
                     .0;
-                assert_eq!(serde_json::to_value(direct)?, value);
+                assert!(matches!(
+                    direct,
+                    rift_protocol::query::QueryReadResult::Unavailable(
+                        rift_protocol::search_read::SearchUnavailable::Unavailable {
+                            reason:
+                                rift_protocol::symbol_read::SymbolUnavailableReason::IndexPreparing,
+                            view: None,
+                            ..
+                        }
+                    )
+                ));
             }
             assert!(
                 assembled

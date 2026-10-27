@@ -81,13 +81,6 @@ impl RiftMcp {
         })
     }
 
-    pub(super) async fn graph_query(
-        &self,
-        params: QueryParams,
-    ) -> Result<Json<QueryReadResult>, ToolFailure> {
-        self.graph_query_with_context(params, None).await
-    }
-
     pub(super) async fn graph_query_with_context(
         &self,
         params: QueryParams,

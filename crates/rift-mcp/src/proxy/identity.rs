@@ -140,16 +140,6 @@ pub(super) fn qualify_hit(hit: &mut SearchHit, backend: &str) -> Result<(), Rift
     Ok(())
 }
 
-pub(super) fn qualify_nodes(
-    result: &mut rift_protocol::read::NodesResult,
-    backend: &str,
-) -> Result<(), RiftError> {
-    for node in &mut result.nodes {
-        qualify_optional(&mut node.symbol, backend)?;
-    }
-    qualify_warnings(&mut result.warnings, backend)
-}
-
 pub(super) fn qualify_source(
     result: &mut rift_protocol::source_read::GetSourceResult,
     backend: &str,
@@ -161,24 +151,6 @@ pub(super) fn qualify_source(
         | GetSourceResult::Unavailable { warnings, .. } => warnings,
     };
     qualify_warnings(warnings, backend)
-}
-
-pub(super) fn qualify_search(
-    result: &mut rift_protocol::search_read::SearchReadResult,
-    backend: &str,
-) -> Result<(), RiftError> {
-    use rift_protocol::search_read::{SearchReadResult, SearchUnavailable};
-    match result {
-        SearchReadResult::Results(result) => {
-            for hit in &mut result.results {
-                qualify_hit(hit, backend)?;
-            }
-            qualify_warnings(&mut result.warnings, backend)
-        }
-        SearchReadResult::Unavailable(SearchUnavailable::Unavailable { warnings, .. }) => {
-            qualify_warnings(warnings, backend)
-        }
-    }
 }
 
 pub(super) fn qualify_symbol_result(

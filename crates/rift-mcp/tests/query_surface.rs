@@ -1305,7 +1305,8 @@ async fn assert_original_query_nodes(statement: &str, observe_unit: bool) -> Tes
         call_retrying_acceptance(&client, tool_request("search", &json!({"query":statement})))
             .await?;
     assert_eq!(
-        query::rows(&held)?,
+        query::rows(&held)
+            .map_err(|error| format!("held Node read unit={unit} view={view}: {error}"))?,
         original_rows,
         "original node identity, unit, range and bytes survive source and index removal"
     );
@@ -1326,7 +1327,9 @@ async fn assert_original_query_nodes(statement: &str, observe_unit: bool) -> Tes
         tool_request("search", &serde_json::to_value(source_query)?),
     )
     .await?;
-    let [source_row] = query::rows(&held_source)? else {
+    let [source_row] = query::rows(&held_source)
+        .map_err(|error| format!("held Source read unit={unit} view={view}: {error}"))?
+    else {
         return Err(format!("one captured source: {held_source}").into());
     };
     assert_eq!(query::literal(source_row, "outcome")?, "found");
@@ -1371,7 +1374,9 @@ async fn original_query_node_rows(
     selected: &Value,
     observe_unit: bool,
 ) -> TestResult<(String, String, Value)> {
-    let [row] = query::rows(selected)? else {
+    let [row] =
+        query::rows(selected).map_err(|error| format!("initial query selection: {error}"))?
+    else {
         return Err(format!("one original declaration: {selected}").into());
     };
     let identity = query::iri(row, "symbol")?;
@@ -1395,7 +1400,9 @@ async fn original_query_node_rows(
         let observed_nodes =
             call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
                 .await?;
-        let [node] = query::rows(&observed_nodes)? else {
+        let [node] = query::rows(&observed_nodes)
+            .map_err(|error| format!("Node unit observation view={view}: {error}"))?
+        else {
             return Err(format!("one original semantic node unit: {observed_nodes}").into());
         };
         query::iri(node, "unit")?.to_owned()
@@ -1419,7 +1426,8 @@ async fn original_query_node_rows(
     let original =
         call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
             .await?;
-    let original_rows = query::rows(&original)?;
+    let original_rows = query::rows(&original)
+        .map_err(|error| format!("original Node read unit={unit} view={view}: {error}"))?;
     let [node] = original_rows else {
         return Err(format!("one original semantic declaration node: {original}").into());
     };

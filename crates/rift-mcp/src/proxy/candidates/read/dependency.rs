@@ -1,104 +1,4 @@
-use super::{
-    CANDIDATE_BYTES_MAX, CallToolRequestParams, CapturedView, CapturedViewId, GetSymbolResult,
-    RiftError, RiftProxy, SavedCandidateBackend, SearchReadResult, SymbolIdentity, SymbolOwner,
-    SystemTime, errors, global_backend, invalid, view_refusal,
-};
-use sha2::{Digest, Sha256};
-
-impl RiftProxy {
-    pub(super) fn dependency_views(
-        &self,
-        result: &rmcp::model::CallToolResult,
-        value: serde_json::Value,
-        project: &str,
-        root: &str,
-    ) -> Result<serde_json::Value, RiftError> {
-        let mut decoded: SearchReadResult = serde_json::from_value(value)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        if let SearchReadResult::Results(answer) = &mut decoded {
-            let top = answer
-                .view
-                .as_ref()
-                .ok_or_else(|| invalid("view", "captured response has no selected view"))?;
-            for hit in &mut answer.results {
-                let view = hit
-                    .view
-                    .as_ref()
-                    .ok_or_else(|| invalid("view", "captured response has no selected view"))?;
-                let owner = match &hit.hit {
-                    rift_protocol::search::SearchHitTarget::Symbol { symbol } => symbol
-                        .id
-                        .as_ref()
-                        .map(|id| {
-                            SymbolIdentity::parse(id.as_str())
-                                .map(|identity| identity.owner().clone())
-                        })
-                        .transpose()?,
-                    _ => None,
-                };
-                let owner = owner.filter(|owner| {
-                    matches!(
-                        owner,
-                        SymbolOwner::Package { .. } | SymbolOwner::Runtime { .. }
-                    )
-                });
-                let Some(owner) = owner else {
-                    if view == top {
-                        continue;
-                    }
-                    return Err(invalid("view", "captured backend context does not match"));
-                };
-                let meta = result
-                    .meta
-                    .as_ref()
-                    .ok_or_else(|| invalid("view", "captured backend mapping is unavailable"))?;
-                let upstream = global_backend(meta, view)?;
-                let selected = dependency_backend(top, project, root, &owner, upstream)?;
-                let retained = self
-                    .candidate_views
-                    .backend(&selected.view.id, SystemTime::now())?
-                    .map_err(|reason| view_refusal(&selected.view.id, reason))?;
-                if let Some(held) = retained {
-                    if held != selected {
-                        return Err(invalid("view", "captured backend context does not match"));
-                    }
-                } else {
-                    let mut pending = self
-                        .candidate_views
-                        .reserve_captured(&selected, SystemTime::now())?;
-                    pending.finalize(&selected, SystemTime::now())?;
-                }
-                hit.view = Some(selected.view);
-            }
-        }
-        serde_json::to_value(decoded)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())
-    }
-}
-
-fn dependency_backend(
-    top: &CapturedView,
-    project: &str,
-    root: &str,
-    owner: &SymbolOwner,
-    mut upstream: SavedCandidateBackend,
-) -> Result<SavedCandidateBackend, RiftError> {
-    let key = (top, project, root, owner, &upstream);
-    let encoded = super::super::super::encode_bounded(&key, CANDIDATE_BYTES_MAX)
-        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-    let id = CapturedViewId::parse(&data_encoding::HEXLOWER.encode(&Sha256::digest(encoded)))?;
-    let expires_at =
-        if super::super::captured_expiry(top)? <= super::super::captured_expiry(&upstream.view)? {
-            top.expires_at.clone()
-        } else {
-            upstream.view.expires_at.clone()
-        };
-    upstream.upstream_view = Some(upstream.view.clone());
-    upstream.view = CapturedView { id, expires_at };
-    upstream.owner = Some(owner.clone());
-    upstream.project = Some(project.to_owned());
-    Ok(upstream)
-}
+use super::{CallToolRequestParams, GetSymbolResult, RiftError, SavedCandidateBackend, invalid};
 
 pub(in crate::proxy) fn upstream_backend(
     selected: &SavedCandidateBackend,
@@ -170,69 +70,48 @@ pub(super) fn public_symbol_view(result: &mut GetSymbolResult, selected: &SavedC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
+    use serde_json::json;
 
     #[test]
-    fn dependency_views_bind_project_owner_and_original_selection() {
-        let top = CapturedView {
-            id: CapturedViewId::parse("claims.local").expect("view"),
-            expires_at: "2030-01-01T00:10:00Z".to_owned(),
+    fn recorded_backend_context_preserves_the_original_global_view()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let remote = CapturedView {
+            id: CapturedViewId::parse("claims.remote")?,
+            expires_at: "2030-01-01T00:00:00Z".to_owned(),
         };
-        let remote = SavedCandidateBackend {
+        let selected = SavedCandidateBackend {
             backend: "global".to_owned(),
             root: "https://rift.test".to_owned(),
-            owner: None,
+            owner: Some(rift_protocol::identity::SymbolOwner::Local),
             view: CapturedView {
-                id: CapturedViewId::parse("claims.remote").expect("view"),
-                expires_at: "2030-01-01T00:15:00Z".to_owned(),
+                id: CapturedViewId::parse("claims.public")?,
+                expires_at: "2030-01-01T00:00:00Z".to_owned(),
             },
-            project: None,
-            upstream_view: None,
+            project: Some("local".to_owned()),
+            upstream_view: Some(remote.clone()),
         };
-        let owner = SymbolIdentity::parse(
-            "rift://symbol/pypi/pypi.org/greeting@1.0.0/python/greeting/core/greet",
-        )
-        .expect("identity")
-        .owner()
-        .clone();
-        let main =
-            dependency_backend(&top, "local", "/main", &owner, remote.clone()).expect("main");
-        let docs =
-            dependency_backend(&top, "docs", "/main/docs", &owner, remote.clone()).expect("docs");
-        assert_ne!(main.view.id, docs.view.id);
-        assert_eq!(main.view.expires_at, top.expires_at);
-        assert_eq!(upstream_backend(&main), remote);
-        assert_eq!(
-            dependency_backend(&top, "local", "/main", &owner, upstream_backend(&main))
-                .expect("held"),
-            main
+        let normalized = upstream_backend(&selected);
+        assert_eq!(normalized.view, remote);
+        assert!(normalized.owner.is_none());
+        assert!(normalized.project.is_none());
+        assert!(normalized.upstream_view.is_none());
+        let request = CallToolRequestParams::new("get_symbol").with_arguments(
+            serde_json::from_value(json!({
+                "id":"rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+                "view":selected.view.id,
+            }))?,
         );
-        let mut earlier = remote;
-        earlier.view.expires_at = "2030-01-01T00:05:00Z".to_owned();
-        let selected = dependency_backend(&top, "local", "/main", &owner, earlier.clone())
-            .expect("earlier cloud expiry");
-        assert_eq!(selected.view.expires_at, earlier.view.expires_at);
-        assert_eq!(selected.upstream_view.as_ref(), Some(&earlier.view));
-        for view in [Some(earlier.view.clone()), None] {
-            let mut response: GetSymbolResult = serde_json::from_value(serde_json::json!({
-                "outcome":"unavailable",
-                "id":"rift://symbol/pypi/pypi.org/greeting@1.0.0/python/greeting/core/greet",
-                "view":view, "reason":"insufficient_coverage"
-            }))
-            .expect("unavailable symbol reply");
-            public_symbol_view(&mut response, &selected);
-            let GetSymbolResult::Unavailable {
-                view: returned,
-                reason,
-                ..
-            } = response
-            else {
-                panic!("unavailable reply remains unavailable");
-            };
-            assert_eq!(returned, view.map(|_| selected.view.clone()));
-            assert_eq!(
-                reason,
-                rift_protocol::symbol_read::SymbolUnavailableReason::InsufficientCoverage
-            );
-        }
+        let request = upstream_request(request, &selected)?;
+        assert_eq!(
+            request.arguments.as_ref().ok_or("arguments")?["view"],
+            remote.id.as_str()
+        );
+        let meta = request.meta.ok_or("recorded backend context")?;
+        assert_eq!(meta.0["backend"], "global");
+        assert_eq!(meta.0["root"], "https://rift.test");
+        assert!(meta.0["owner"].is_null());
+        assert_eq!(meta.0["view"], serde_json::to_value(remote)?);
+        Ok(())
     }
 }

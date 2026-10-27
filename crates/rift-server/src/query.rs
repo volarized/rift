@@ -855,6 +855,7 @@ mod tests {
             }
         );
         assert!(node.node.id.0.contains('#'));
+        assert_optional_node_fields(&view, original, bounded)?;
         let answer = PreparedQuery::parse("SELECT ?symbol { ?node a :Node; :unit <rift://source/project/lib.rs>; :symbol ?symbol }", bounded)?.evaluate(facts, bounded, QueryCancellation::default())?;
         let value = serde_json::to_value(answer)?;
         let rows = value["bindings"].as_array().ok_or("Node symbol bindings")?;
@@ -866,6 +867,122 @@ mod tests {
             "the unchanged generic Symbol projection still accounts for unrelated source"
         );
         Ok(())
+    }
+
+    type OptionalNodeRow = (String, u64, u64, Option<String>, Option<String>);
+
+    fn assert_optional_node_fields(
+        view: &WorkspaceSymbolView,
+        original: &str,
+        bounded: QueryLimits,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let statement = format!(
+            "SELECT ?id ?node_symbol ?facet ?start ?end ?text {{ ?node a :Node; :unit <rift://source/project/lib.rs>; :id ?id; :range [ :start ?start; :end ?end ] . OPTIONAL {{ ?node :symbol ?node_symbol }} OPTIONAL {{ ?node :facets ?facet }} FILTER(?start <= 0 && 0 < ?end && (?end = {} || ?facet = :declaration)) <rift://source/project/lib.rs> :source ?text }} ORDER BY ?start ?end ?id",
+            original.len()
+        );
+        let selected = PreparedQuery::parse(&statement, bounded)?;
+        assert!(selected.requirements().selects_node_sources());
+        let selected_facts = project_query_facts(view, selected.requirements(), bounded)?;
+        let mut expected = optional_node_rows(&selected_facts, u64::try_from(original.len())?)?;
+        assert!(expected.iter().any(|(_, _, _, symbol, _)| symbol.is_some()));
+        assert!(
+            expected.iter().any(|(_, _, _, symbol, _)| symbol.is_none()),
+            "anonymous nodes remain in the same range result"
+        );
+        let answer = selected.evaluate(selected_facts, bounded, QueryCancellation::default())?;
+        let value = serde_json::to_value(answer)?;
+        let rows = value["bindings"]
+            .as_array()
+            .ok_or("optional Node field bindings")?;
+        let mut actual = Vec::new();
+        for row in rows {
+            assert_eq!(row["text"]["value"], original);
+            let symbol = if let Some(symbol) = row.get("node_symbol") {
+                assert_eq!(symbol["type"], "iri");
+                Some(
+                    symbol["value"]
+                        .as_str()
+                        .ok_or("canonical Node symbol IRI")?
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            let facet = if let Some(facet) = row.get("facet") {
+                assert_eq!(facet["type"], "iri");
+                Some(facet["value"].as_str().ok_or("Node facet IRI")?.to_owned())
+            } else {
+                None
+            };
+            actual.push((
+                row["id"]["value"]
+                    .as_str()
+                    .ok_or("original Node id")?
+                    .to_owned(),
+                row["start"]["value"]
+                    .as_str()
+                    .ok_or("Node range start")?
+                    .parse::<u64>()?,
+                row["end"]["value"]
+                    .as_str()
+                    .ok_or("Node range end")?
+                    .parse::<u64>()?,
+                symbol,
+                facet,
+            ));
+        }
+        expected.sort();
+        actual.sort();
+        assert_eq!(
+            actual, expected,
+            "optional fields preserve exact rows and facet multiplicity"
+        );
+        Ok(())
+    }
+
+    fn optional_node_rows(
+        facts: &QueryFacts,
+        source_end: u64,
+    ) -> Result<Vec<OptionalNodeRow>, Box<dyn std::error::Error>> {
+        let mut expected = Vec::new();
+        for row in &facts.nodes[0].nodes {
+            if row.node.range.start != 0 || row.node.range.end == 0 {
+                continue;
+            }
+            let node_facets: Vec<_> = if row.node.facets.is_empty() {
+                vec![None]
+            } else {
+                row.node.facets.iter().map(Some).collect()
+            };
+            for facet in node_facets {
+                if row.node.range.end != source_end
+                    && facet != Some(&rift_protocol::read::NodeFacet::Declaration)
+                {
+                    continue;
+                }
+                let facet = if let Some(facet) = facet {
+                    let value = serde_json::to_value(facet)?;
+                    Some(format!(
+                        "{}{}",
+                        rift_search::sparql::VOCABULARY,
+                        value.as_str().ok_or("serialized Node facet")?
+                    ))
+                } else {
+                    None
+                };
+                expected.push((
+                    row.node.id.0.clone(),
+                    row.node.range.start,
+                    row.node.range.end,
+                    row.node
+                        .symbol
+                        .as_ref()
+                        .map(|symbol| symbol.as_str().to_owned()),
+                    facet,
+                ));
+            }
+        }
+        Ok(expected)
     }
 
     fn query_fixture(

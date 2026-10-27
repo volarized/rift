@@ -580,17 +580,15 @@ def churn_answer(
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
     if tool == "nodes":
-        nodes = array_value(answer.get("nodes"), "probe nodes")
-        excerpts = array_value(answer.get("source"), "probe node sources")
-        require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
-        matches = [
-            (object_value(node, "probe node"), excerpt)
-            for node, excerpt in zip(nodes, excerpts, strict=True)
-            if object_value(node, "probe node").get("symbol") == identity
-        ]
-        require(len(matches) == 1, "nodes lost probe declaration")
-        hit, excerpt = matches[0]
-        found = string_value(hit.get("symbol"), "probe identity")
+        rows = bindings(answer)
+        require(len(rows) == 1, "nodes lost probe declaration")
+        hit = rows[0]
+        found = iri(hit, "node_symbol")
+        encoded = literal(hit, "text").encode()
+        start = int(literal(hit, "node_start"))
+        end = int(literal(hit, "node_end"))
+        require(0 <= start <= end <= len(encoded), "node range exceeds source")
+        excerpt = encoded[start:end].decode()
     elif tool == "get_symbol":
         require(answer.get("outcome") == "found", "get_symbol lost probe declaration")
         symbol = object_value(answer.get("symbol"), "probe symbol")
@@ -617,6 +615,8 @@ def churn_answer(
     )
     if tool == "search":
         start, end = int(literal(hit, "start")), int(literal(hit, "end"))
+    elif tool == "nodes":
+        start, end = int(literal(hit, "node_start")), int(literal(hit, "node_end"))
     else:
         span = object_value(hit.get("range"), "probe range")
         start, end = (

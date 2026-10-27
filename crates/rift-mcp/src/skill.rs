@@ -118,9 +118,14 @@ const DECISION_TABLE: &[DecisionRow] = &[
         ),
     },
     DecisionRow {
-        situation: "The syntax structure at one position is needed.",
+        situation: "The syntax structure is needed.",
         tools: &["nodes"],
-        note: None,
+        note: Some("with SPARQL Query"),
+    },
+    DecisionRow {
+        situation: "A source unit or byte range is needed.",
+        tools: &["search"],
+        note: Some("with `:unit` and optional `:range` in `SERVICE :source`"),
     },
     DecisionRow {
         situation: "The declarations that reference a symbol, its impact (what changes when \
@@ -221,7 +226,7 @@ fn skill_markdown(form: SkillForm) -> String {
     rendered.push('\n');
     rendered.push_str(
         "## Query recipes\n\n\
-         `search` takes required SPARQL `query` and optional `language`, default `sparql`. \
+         `search` and `nodes` take required `query` text and optional `language`, default `sparql`. \
          Prefixes `:`, `r:`, `rdf:`, `rdfs:`, and `xsd:` are supplied. Replace `<symbol-id>` \
          below with an observed canonical symbol IRI.\n\n\
          - Names: `SELECT ?symbol {?symbol a :Symbol; :name \"load_config\"}`\n\
@@ -275,6 +280,23 @@ fn skill_markdown(form: SkillForm) -> String {
            OPTIONAL { ?callee :path ?path }\n\
          }\n\
          ORDER BY ?name ?path LIMIT 20\n\
+         ```\n\n\
+         ### Source reads\n\n\
+         Read a complete source unit or a half-open UTF-8 byte range. Replace `<source-unit>` \
+         with an observed source-unit IRI. Whole-file reads omit `:range`; captured reads \
+         add `:view` with the original captured view ID.\n\n\
+         ```sparql\n\
+         SELECT ?outcome ?text ?start ?end ?complete\n\
+         WHERE {\n\
+           SERVICE :source {\n\
+             ?read :unit <source-unit>; :range '{\"start\":0,\"end\":4}'^^rdf:JSON;\n\
+                   :outcome ?outcome .\n\
+             OPTIONAL {\n\
+               ?read :source [ :text ?text; :span [ :range [ :start ?start; :end ?end ] ] ];\n\
+                     :source_complete ?complete .\n\
+             }\n\
+           }\n\
+         }\n\
          ```\n\n\
          Set `OFFSET 20` to select the next query window. Follow returned \
          `pagination.next_query` unchanged for transport pages. Carry the returned `view` \

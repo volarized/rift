@@ -107,22 +107,42 @@ async fn physical_calls_keep_the_admitted_runtime_source() -> TestResult {
         Some(rift_protocol::identity::SymbolOwner::Runtime { .. })
     ));
     let params = json!({"unit":unit,"view":answer["view"]["id"]});
-    let original = call_retrying_acceptance(&client, tool_request("get_source", &params)).await?;
-    assert_eq!(original["outcome"], "found", "{original}");
-    assert_eq!(original["view"], answer["view"]);
-    assert!(
-        original["source"]["text"]
-            .as_str()
-            .ok_or("runtime source")?
-            .contains("def len(")
+    let original = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(params.clone())?)?)?,
+        ),
+    )
+    .await?;
+    let [original_source] = query::rows(&original)? else {
+        return Err(format!("one original runtime source: {original}").into());
+    };
+    assert_eq!(query::literal(original_source, "outcome")?, "found");
+    assert_eq!(
+        query::literal(original_source, "source_view")?,
+        answer["view"]["id"].as_str().ok_or("runtime source view")?
     );
+    assert_eq!(
+        query::literal(original_source, "source_expiry")?,
+        answer["view"]["expires_at"]
+            .as_str()
+            .ok_or("runtime source expiry")?
+    );
+    assert!(query::literal(original_source, "text")?.contains("def len("));
     std::fs::write(
         directory.path().join("graph.py"),
         "# changed after capture\n",
     )?;
-    let held = call_retrying_acceptance(&client, tool_request("get_source", &params)).await?;
-    assert_eq!(held["source"], original["source"]);
-    assert_eq!(held["view"], original["view"]);
+    let held = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(params.clone())?)?)?,
+        ),
+    )
+    .await?;
+    assert_eq!(query::rows(&held)?, query::rows(&original)?);
     client.cancel().await?;
     Ok(())
 }
@@ -201,12 +221,17 @@ async fn search_query_local_physical_calls_keep_held_source() -> TestResult {
     let held = call_retrying_acceptance(
         &client,
         tool_request(
-            "get_source",
-            &json!({"unit":unit,"range":{"start":start,"end":end},"view":view}),
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(
+                json!({"unit":unit,"range":{"start":start,"end":end},"view":view}),
+            )?)?)?,
         ),
     )
     .await?;
-    assert_eq!(held["source"]["text"], expected);
+    let [source_row] = query::rows(&held)? else {
+        return Err(format!("one original source result: {held}").into());
+    };
+    assert_eq!(query::literal(source_row, "text")?, expected);
     let replay = format!(
         "SELECT ?symbol ?name ?unit ?start ?end ?derivation {{ SERVICE <{}{view}> {{}} }}",
         rift_search::sparql::RESULT_SERVICE_PREFIX,
@@ -472,12 +497,17 @@ async fn search_query_inverse_calls_preserves_recursive_and_module_call_sites() 
     let held = call_retrying_acceptance(
         &client,
         tool_request(
-            "get_source",
-            &json!({"unit":"rift://source/project/graph.py","view":view}),
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(
+                json!({"unit":"rift://source/project/graph.py","view":view}),
+            )?)?)?,
         ),
     )
     .await?;
-    assert_eq!(held["source"]["text"], source);
+    let [source_row] = query::rows(&held)? else {
+        return Err(format!("one original source result: {held}").into());
+    };
+    assert_eq!(query::literal(source_row, "text")?, source);
     client.cancel().await?;
     Ok(())
 }
@@ -1104,9 +1134,9 @@ fn install_captured_typescript_engine(root: &std::path::Path) {
 
 /// typescript-language-server answers both walk directions through `search`, each on its
 /// first walk, since the walk waits out the project load. The outgoing walk from `larger`
-/// reaches `beacon`, and addresses `Math.max` in the `typescript` package the workspace
-/// installs, whose lib declares it: with the global API off it drops, and the answer names
-/// why. The incoming walk to `beacon` reaches `larger`, `total`, and the TSX `Banner`.
+/// reaches `beacon` and the physically admitted `Math.max` declaration in the installed
+/// `typescript` package. Its original source remains readable without global naming.
+/// The incoming walk to `beacon` reaches `larger`, `total`, and the TSX `Banner`.
 #[cfg(unix)]
 #[tokio::test]
 async fn live_typescript_language_server_walks_both_directions() -> TestResult {
@@ -1116,7 +1146,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     let started = std::time::Instant::now();
     let mut files = typescript_install::typescript_package_files().to_vec();
     files.extend_from_slice(LIVE_TYPESCRIPT_FILES);
-    let (_directory, client, _server_task) = workspace_client::served_prepared_workspace(
+    let (directory, client, _server_task) = workspace_client::served_prepared_workspace(
         &files,
         Some(live_typescript_engine()),
         install_captured_typescript_engine,
@@ -1125,8 +1155,7 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
     call_retrying_acceptance(&client, tool_request("search", &name_arguments("beacon"))).await?;
     let larger = live_seed(&client, "larger", "typescript").await?;
     let beacon = live_seed(&client, "beacon", "typescript").await?;
-    let request = path_arguments(&larger, "outgoing")?;
-    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+
     let total = live_seed(&client, "total", "typescript").await?;
     let (outgoing, _) = live_walk(
         &client,
@@ -1151,8 +1180,92 @@ async fn live_typescript_language_server_walks_both_directions() -> TestResult {
         (1, 1),
         "both walks answer on the first request"
     );
+    assert_captured_typescript_call(&client, directory.path(), &larger).await?;
 
     client.cancel().await?;
+    Ok(())
+}
+
+/// Reads a physical package callee from one query response and its original captured source.
+#[cfg(unix)]
+async fn assert_captured_typescript_call(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    root: &std::path::Path,
+    seed: &str,
+) -> TestResult {
+    let seed = oxigraph::model::NamedNodeRef::new(seed)?;
+    let statement = format!(
+        "SELECT ?symbol ?name ?unit ?source ?start ?end ?full_source {{ \
+         {seed} :calls ?symbol . ?symbol :name ?name; :declarations ?declaration . \
+         ?declaration :unit ?unit; :source ?source; :range ?range . \
+         ?range :start ?start; :end ?end . ?unit :source ?full_source }} ORDER BY ?name"
+    );
+    let answer =
+        call_retrying_acceptance(client, tool_request("search", &json!({"query":statement})))
+            .await?;
+    assert_eq!(projected_names(&answer)?, ["beacon", "max"]);
+    let row = callee_hit(&answer, "max")?;
+    assert!(
+        matches!(row["symbol"]["type"].as_str(), Some("iri" | "blank_node")),
+        "the original physical endpoint remains an RDF resource: {row}"
+    );
+    let unit = query::iri(&row, "unit")?;
+    let (owner, path) = rift_protocol::identity::parse_released_source_identity(unit)?;
+    let manifest: Value = serde_json::from_str(&std::fs::read_to_string(
+        root.join("node_modules/typescript/package.json"),
+    )?)?;
+    assert!(
+        matches!(owner, rift_protocol::identity::SymbolOwner::Package { manager, registry, name, version }
+            if manager == "npm" && registry == "registry.npmjs.org" && name == "typescript"
+                && manifest["version"].as_str() == Some(version.as_str())),
+        "the physical declaration retains its installed package owner: {row}"
+    );
+    let source_path = root.join("node_modules/typescript").join(&path);
+    let original = std::fs::read_to_string(&source_path)?;
+    assert_eq!(query::literal(&row, "full_source")?, original);
+    let start: usize = query::literal(&row, "start")?.parse()?;
+    let end: usize = query::literal(&row, "end")?.parse()?;
+    assert_eq!(
+        query::literal(&row, "source")?,
+        original
+            .get(start..end)
+            .ok_or("original package declaration range")?
+    );
+    std::fs::write(source_path, "// changed after the captured query\n")?;
+    let held = call_retrying_acceptance(
+        client,
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(
+                json!({"unit":unit,"view":answer["view"]["id"]}),
+            )?)?)?,
+        ),
+    )
+    .await?;
+    let [source_row] = query::rows(&held)? else {
+        return Err(format!("one original physical source: {held}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
+    assert_eq!(query::literal(source_row, "complete")?, "true");
+    assert_eq!(query::iri(source_row, "unit")?, unit);
+    assert_eq!(query::literal(source_row, "start")?.parse::<u64>()?, 0);
+    assert_eq!(
+        query::literal(source_row, "end")?.parse::<usize>()?,
+        original.len()
+    );
+    assert_eq!(query::literal(source_row, "text")?, original);
+    assert_eq!(
+        query::literal(source_row, "source_view")?,
+        answer["view"]["id"]
+            .as_str()
+            .ok_or("physical source view")?
+    );
+    assert_eq!(
+        query::literal(source_row, "source_expiry")?,
+        answer["view"]["expires_at"]
+            .as_str()
+            .ok_or("physical source expiry")?
+    );
     Ok(())
 }
 
@@ -1280,7 +1393,21 @@ async fn search_traversal_outgoing_drops_a_standard_library_callee_and_walks_a_c
         served_workspace(OUTGOING_FILES, Some(OUTGOING_ENGINE.to_owned())).await?;
     let seed = captured_seed(&client, "counted", "extra.py").await?;
     let request = serde_json::to_value(query::path(&seed, ":calls")?)?;
-    required_facts_unavailable(&client, &request, ErrorCode::CapabilityUnavailable).await?;
+    let failure = failed_call(client.call_tool(tool_request("search", &request)).await)?;
+    assert_eq!(
+        failure.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{failure:?}"
+    );
+    assert_eq!(failure.retry, RetryDirective::SameRequest, "{failure:?}");
+    assert!(
+        failure.message.contains("dependency query source")
+            && failure
+                .message
+                .contains("the selected runtime source has no admitted owner"),
+        "the missing captured runtime owner refuses the complete query: {failure:?}"
+    );
+    assert!(failure.text.contains("rift.server.read_unavailable"));
     let seed = captured_seed(&client, "Holder", "extra.py").await?;
     let answer = graph(&client, &seed, ":calls").await?;
     assert_eq!(projected_names(&answer)?, ["counted"]);
@@ -1794,15 +1921,31 @@ async fn read_dependency_hit(
         .ok_or("dependency declaration source unit")?;
     let source = call_retrying_acceptance(
         client,
-        tool_request("get_source", &json!({"unit":unit,"view":selected["id"]})),
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(
+                json!({"unit":unit,"view":selected["id"]}),
+            )?)?)?,
+        ),
     )
     .await?;
-    assert_eq!(source["outcome"], "found", "{source}");
-    assert_eq!(source["view"], *selected, "{source}");
+    let [source_row] = query::rows(&source)? else {
+        return Err(format!("one original dependency source: {source}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
     assert_eq!(
-        source["source"]["text"],
-        global_api::GREETING_SOURCE,
-        "{source}"
+        query::literal(source_row, "source_view")?,
+        selected["id"].as_str().ok_or("dependency source view")?
+    );
+    assert_eq!(
+        query::literal(source_row, "source_expiry")?,
+        selected["expires_at"]
+            .as_str()
+            .ok_or("dependency source expiry")?
+    );
+    assert_eq!(
+        query::literal(source_row, "text")?,
+        global_api::GREETING_SOURCE
     );
     Ok(symbol)
 }
@@ -2016,10 +2159,18 @@ async fn search_query_continues_three_calls_through_an_installed_dependency() ->
     std::fs::write(&path, source.replace("_inner", "_changed"))?;
     let retained = call_retrying_acceptance(
         &client,
-        tool_request("get_source", &json!({"unit":unit,"view":view})),
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(
+                json!({"unit":unit,"view":view}),
+            )?)?)?,
+        ),
     )
     .await?;
-    assert_eq!(retained["source"]["text"], source);
+    let [source_row] = query::rows(&retained)? else {
+        return Err(format!("one original source result: {retained}").into());
+    };
+    assert_eq!(query::literal(source_row, "text")?, source);
     let changed = graph(&client, &seed, ":calls/:calls/:calls").await?;
     assert_eq!(projected_names(&changed)?, ["_changed"]);
     assert!(declaration_requests(&fixture).await.is_empty());
@@ -2182,9 +2333,9 @@ async fn search_traversal_outgoing_names_a_callee_installed_after_the_first_walk
     Ok(())
 }
 
-/// An unavailable global API refuses the required dependency contribution.
+/// An unavailable global API does not discard an independently admitted physical runtime source.
 #[tokio::test]
-async fn search_query_refuses_an_unavailable_required_global_api() -> TestResult {
+async fn search_query_uses_admitted_runtime_when_global_api_is_unavailable() -> TestResult {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     drop(listener);
@@ -2203,9 +2354,111 @@ async fn search_query_refuses_an_unavailable_required_global_api() -> TestResult
         &captured_seed(&client, "counted", "extra.py").await?,
         "outgoing",
     )?;
-    required_facts_unavailable(&client, &request, ErrorCode::TemporarilyUnavailable).await?;
+    let answer = call_retrying_acceptance(&client, tool_request("search", &request)).await?;
+    assert_eq!(projected_names(&answer)?, ["leaf", "len"]);
+    let row = callee_hit(&answer, "len")?;
+    let id = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
+    assert_eq!(query::iri(&row, "symbol")?, id);
+    let exact = call_retrying_acceptance(
+        &client,
+        tool_request(
+            "get_symbol",
+            &json!({"id":id,"view":answer["view"]["id"],"include":["source"]}),
+        ),
+    )
+    .await?;
+    assert_eq!(exact["outcome"], "found");
+    assert_eq!(exact["symbol"]["id"], id);
+    assert_eq!(exact["declarations"].as_array().map(Vec::len), Some(1));
+    assert_eq!(exact["declarations"][0]["source_complete"], true);
+    assert!(exact["declarations"][0]["path"].is_null());
+    assert_eq!(exact["symbol"]["name"], "len");
+    assert_eq!(
+        exact["symbol"]["origin"],
+        json!({
+            "location":"stdlib","source_kind":"authored",
+            "runtime":{"runtime":"cpython","version":global_api::python_runtime::VERSION}
+        })
+    );
+    let declaration = &exact["declarations"][0];
+    assert_eq!(
+        declaration["unit"],
+        global_api::named_unit(&global_api::NAMED_POSITIONS[0])
+    );
+    let start = usize::try_from(
+        declaration["range"]["start"]
+            .as_u64()
+            .ok_or("runtime range start")?,
+    )?;
+    let end = usize::try_from(
+        declaration["range"]["end"]
+            .as_u64()
+            .ok_or("runtime range end")?,
+    )?;
+    let original = global_api::python_runtime::builtins();
+    assert!(
+        declaration["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("def len("))
+    );
+    assert_eq!(
+        declaration["source"].as_str(),
+        Some(
+            original
+                .get(start..end)
+                .ok_or("original runtime declaration range")?
+        )
+    );
+    assert_eq!(exact["view"], answer["view"]);
+    assert_admitted_runtime_source(&client, &answer, declaration, &original).await?;
 
     client.cancel().await?;
+    Ok(())
+}
+
+async fn assert_admitted_runtime_source(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    answer: &Value,
+    declaration: &Value,
+    original: &str,
+) -> TestResult {
+    let source = call_retrying_acceptance(
+        client,
+        tool_request(
+            "search",
+            &serde_json::to_value(query::source(&serde_json::from_value(
+                json!({"unit":declaration["unit"],"view":answer["view"]["id"]}),
+            )?)?)?,
+        ),
+    )
+    .await?;
+    let [source_row] = query::rows(&source)? else {
+        return Err(format!("one original physical source: {source}").into());
+    };
+    assert_eq!(query::literal(source_row, "outcome")?, "found");
+    assert_eq!(query::literal(source_row, "complete")?, "true");
+    assert_eq!(
+        query::iri(source_row, "unit")?,
+        declaration["unit"].as_str().ok_or("runtime source unit")?
+    );
+    assert_eq!(query::literal(source_row, "start")?.parse::<u64>()?, 0);
+    assert_eq!(
+        query::literal(source_row, "end")?.parse::<usize>()?,
+        original.len()
+    );
+    assert_eq!(query::literal(source_row, "text")?, original);
+    assert_eq!(
+        query::literal(source_row, "source_view")?,
+        answer["view"]["id"]
+            .as_str()
+            .ok_or("physical source view")?
+    );
+    assert_eq!(
+        query::literal(source_row, "source_expiry")?,
+        answer["view"]["expires_at"]
+            .as_str()
+            .ok_or("physical source expiry")?
+    );
     Ok(())
 }
 

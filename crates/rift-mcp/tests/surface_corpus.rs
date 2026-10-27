@@ -66,20 +66,14 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
                 "paths": { "force_include": ["hidden.rs"] }
             }),
         ),
-        (
-            "get_source",
-            json!({ "unit": "rift://source/project/lib.rs" }),
-        ),
-        ("nodes", json!({ "path": "lib.rs", "position": 0 })),
-        ("nodes", json!({ "path": "lib.rs", "position": 8 })),
+        ("search", source_request("lib.rs", None)),
+        ("nodes", nodes_request("lib.rs", false)),
+        ("nodes", nodes_request("lib.rs", true)),
         (
             "nodes",
-            json!({ "path": "packages/@scope/name/package.json", "position": 4 }),
+            nodes_request("packages/@scope/name/package.json", true),
         ),
-        (
-            "nodes",
-            json!({ "path": "notes for café.json", "position": 4 }),
-        ),
+        ("nodes", nodes_request("notes for café.json", true)),
     ];
     requests.extend(dependency_scope_search_corpus());
     requests.extend(package_argument_corpus());
@@ -111,6 +105,47 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
             )
         })
         .collect()
+}
+
+/// Queries the captured syntax fields from one exact source unit.
+fn nodes_request(path: &str, fields: bool) -> Value {
+    let unit = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("project").expect("project resolver"),
+        rift_core::SourcePath::new(path).expect("static source path"),
+    )
+    .expect("static source unit")
+    .to_string();
+    let unit = oxigraph::model::NamedNode::new(unit).expect("source unit IRI");
+    let query = if fields {
+        format!(
+            "SELECT ?node ?id ?kind ?language ?start ?end ?text {{ ?node a :Node; :unit {unit}; :id ?id; :kind ?kind; :language ?language; :range [ :start ?start; :end ?end ] . {unit} :source ?text }} ORDER BY ?start ?end"
+        )
+    } else {
+        format!("SELECT ?node {{ ?node a :Node; :unit {unit} }}")
+    };
+    json!({ "query": query, "language": "sparql" })
+}
+
+/// Reads the original bytes through the same Source SERVICE contract as other callers.
+fn source_request(path: &str, revision: Option<&str>) -> Value {
+    let unit = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("project").expect("project resolver"),
+        rift_core::SourcePath::new(path).expect("static source path"),
+    )
+    .expect("static source unit")
+    .to_string();
+    let parameters = rift_protocol::source_read::GetSourceParams {
+        unit: rift_protocol::read::SourceUnitId::parse(unit.as_str())
+            .expect("source unit protocol identity"),
+        range: None,
+        view: None,
+        rev: revision
+            .map(|value| serde_json::from_value(json!(value)).expect("static source revision")),
+    };
+    serde_json::to_value(
+        crate::workspace_client::query::source(&parameters).expect("static Source SERVICE query"),
+    )
+    .expect("query parameters serialize")
 }
 
 /// Builds exact requests from local discovery and the original collected fixture declarations.
@@ -382,10 +417,7 @@ fn revision_read_corpus() -> Vec<(&'static str, Value)> {
             json!({ "name": "beacon_one", "rev": "HEAD^" }),
         ),
         ("search", json!({ "query": "beacon", "rev": "main" })),
-        (
-            "nodes",
-            json!({ "path": "lib.rs", "position": 0, "rev": "main" }),
-        ),
+        ("search", source_request("lib.rs", Some("main"))),
     ]
 }
 
@@ -443,8 +475,10 @@ pub(crate) struct SurfaceFixture {
 }
 
 impl SurfaceFixture {
-    /// Builds fixture files, Git history, and global API for each corpus request.
-    pub(crate) async fn start() -> Result<Self, Box<dyn std::error::Error>> {
+    /// Builds the fixture with one configuration edit before recording Git history.
+    pub(crate) async fn start_with_configuration(
+        edit: impl FnOnce(String) -> Result<String, Box<dyn std::error::Error>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let global = GlobalFixture::start_with(crate::global_api::FixtureOptions {
             query_narrowed: false,
             ..crate::global_api::FixtureOptions::default()
@@ -527,7 +561,7 @@ impl SurfaceFixture {
             hermetic_search::HERMETIC_TABLES,
             global.endpoint
         );
-        fs::write(directory.path().join("rift.toml"), configuration)?;
+        fs::write(directory.path().join("rift.toml"), edit(configuration)?)?;
         rift_history::fixture::init(directory.path());
         rift_history::fixture::commit_all(directory.path(), "fixture baseline");
         // A second commit, tagged apart from it, so a `change` request compares two

@@ -12,7 +12,6 @@ import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
 
 from rift_dev.corpus_assertions import (
     CONTEXT_DEGRADED,
@@ -34,7 +33,6 @@ from rift_dev.corpus_assertions import (
     lexical_content,
     map_paths,
     no_failed_builds,
-    number,
     open_history_batch,
     probe_units,
     records,
@@ -62,7 +60,9 @@ from rift_dev.query import (
     iri,
     literal,
     name_request,
+    node_request,
     optional_iri,
+    project_source_unit,
     retrieval_request,
 )
 from rift_dev.rift_test_client import (
@@ -179,7 +179,7 @@ CHURN_SEARCH_INPUTS: JsonObject = {
 CHURN_REQUESTS: dict[str, JsonObject] = {
     "search": corpus_request(CHURN_SEARCH_INPUTS),
     "get_symbol": {"include": ["source"]},
-    "nodes": {"path": PROBE_PATH, "position": 0},
+    "nodes": node_request(project_source_unit(PROBE_PATH), position=0),
 }
 # The convergence loop resends every churn tool until the newest source lands, so it
 # stands outside the reads it repeats: one whole read budget for each of them.
@@ -731,7 +731,8 @@ class Corpus:
                 ),
             )
             warnings(answer)
-            pool.extend(bindings(answer))
+            added = bindings(answer)
+            pool.extend(added)
         if self.pin.name == "fastapi":
             answer = await client.call(
                 "search",
@@ -746,7 +747,8 @@ class Corpus:
                 ),
             )
             warnings(answer)
-            pool.extend(bindings(answer))
+            added = bindings(answer)
+            pool.extend(added)
         selected = sample_symbols(
             pool, SYMBOL_COUNT, SEED, REQUIRED_LANGUAGES[self.pin.name]
         )
@@ -810,49 +812,60 @@ class Corpus:
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
-            # Declarations can start with attached comments or attributes. Extraction
-            # keeps their end equal to the item end, so its final byte is in the item.
-            answer = await client.call(
-                "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
+            # Declarations can start with attached comments or attributes. Their
+            # final byte remains inside the original declaration node.
+            # This existing corpus check reads the current default local workspace.
+            # Held or named selections must use an observed public unit instead.
+            unit = project_source_unit(literal(hit, "path"))
+            answer = await client.call("nodes", node_request(unit, position=end - 1))
+            rows = bindings(answer)
+            require(bool(rows), f"nodes omitted captured syntax for {path}")
+            current_view = object_value(answer.get("view"), "node query view")
+            require(
+                bool(string_value(current_view.get("id"), "node query view id"))
+                and instant(
+                    string_value(current_view.get("expires_at"), "node query expiry")
+                )
+                is not None,
+                "node query has an invalid captured view",
             )
-            nodes = objects(answer, "nodes")
-            excerpts = array_value(answer.get("source"), "node sources")
-            require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
-            for node, excerpt in zip(nodes, excerpts, strict=True):
-                node_span = object_value(node.get("range"), "node range")
-                node_start = number(node_span.get("start"), "node start")
-                node_end = number(node_span.get("end"), "node end")
+            for node in rows:
+                node_start = int(literal(node, "node_start"))
+                node_end = int(literal(node, "node_end"))
                 require(
-                    0 <= node_start <= node_end <= len(content),
-                    "node range exceeds source",
+                    0 <= node_start <= end - 1 < node_end <= len(content),
+                    "node range exceeds original source or misses requested byte",
+                )
+                require(iri(node, "node_unit") == unit, "nodes changed captured unit")
+                require(
+                    literal(node, "node_language") == literal(hit, "language"),
+                    "nodes changed original language",
+                )
+                string_value(literal(node, "node_id"), "original Node id")
+                captured = literal(node, "text").encode()
+                require(
+                    captured == content,
+                    f"node source disagrees with captured bytes at {path}",
                 )
                 require(
-                    isinstance(excerpt, str)
-                    and excerpt.encode() == content[node_start:node_end],
-                    f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
+                    captured[node_start:node_end] == content[node_start:node_end],
+                    f"node source span changed at {path}:{node_start}-{node_end}",
                 )
             if identity is not None:
                 require(
-                    any(node.get("symbol") == identity for node in nodes),
-                    f"nodes omitted sampled declaration: {identity} at {end - 1}; "
-                    f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
+                    any(optional_iri(node, "node_symbol") == identity for node in rows),
+                    f"nodes omitted sampled declaration: {identity} at {end - 1}; {rows}",
                 )
             else:
                 matching = [
                     node
-                    for node in nodes
-                    if number(
-                        object_value(node.get("range"), "node range").get("end"),
-                        "node end",
-                    )
-                    >= end
-                    and number(
-                        cast(JsonObject, node["range"]).get("start"), "node start"
-                    )
-                    <= end - 1
+                    for node in rows
+                    if int(literal(node, "node_end")) >= end
+                    and int(literal(node, "node_start")) <= end - 1
                     and (
-                        cast(JsonObject, node["range"]).get("end") == end
-                        or "declaration" in node.get("facets", [])
+                        int(literal(node, "node_end")) == end
+                        or optional_iri(node, "facet")
+                        == "urn:rift:vocabulary:declaration"
                     )
                 ]
                 require(
@@ -860,7 +873,7 @@ class Corpus:
                     f"nodes omitted raw declaration at {path}:{start}-{end}",
                 )
                 require(
-                    all(node.get("symbol") is None for node in matching),
+                    all(node.get("node_symbol") is None for node in matching),
                     f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
                 )
             require(path.read_bytes() == content, f"read changed {path}")
@@ -966,10 +979,13 @@ class Corpus:
     ) -> None:
         require((self.root / path).is_symlink(), f"{path}: pinned symlink is absent")
         try:
-            await client.call("nodes", {"path": path, "position": 0})
+            await client.call(
+                "nodes", node_request(project_source_unit(path), position=0)
+            )
         except ToolFailure as error:
             require(
-                error.code == "resource_not_found",
+                error.code == "temporarily_unavailable"
+                and "required Nodes facts" in str(error),
                 f"symlink nodes wrong refusal: {error}",
             )
         else:
@@ -1016,7 +1032,7 @@ class Corpus:
         """Read complete source revisions while external writes continue every two seconds."""
         path = self.root / probe_path
         requests = {name: dict(request) for name, request in CHURN_REQUESTS.items()}
-        requests["nodes"]["path"] = probe_path
+        requests["nodes"] = node_request(project_source_unit(probe_path), position=0)
         requests["search"] = corpus_request(
             {**CHURN_SEARCH_INPUTS, "paths": {"include": [probe_path]}}
         )
@@ -1097,6 +1113,9 @@ class Corpus:
         try:
             identity, _revision = await read("search", None)
             requests["get_symbol"]["id"] = identity
+            requests["nodes"] = node_request(
+                project_source_unit(probe_path), position=0, symbol=identity
+            )
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)
