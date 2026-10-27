@@ -355,17 +355,28 @@ async fn repository_workspace_reads(
             .any(|hit| hit["name"]["value"] == name),
         "{search}"
     );
-    let nodes = proxied_call(client, "nodes", &json!({"path": "lib.rs", "position": 8}))
-        .await
-        .map_err(|error| format!("nodes: {error:?}"))?;
-    assert!(
-        nodes["source"]
-            .as_array()
-            .ok_or("nodes carries source")?
-            .iter()
-            .any(|source| source.as_str().is_some_and(|source| source.contains(name))),
-        "{nodes}"
-    );
+    let unit = rift_core::SourceUnitId::new(
+        rift_core::SourceResolverId::new("project")?,
+        rift_core::SourcePath::new("lib.rs")?,
+    )?;
+    let nodes = proxied_call(
+        client,
+        "nodes",
+        &json!({
+            "query": format!("SELECT ?node ?start ?end ?text {{ ?node a :Node; :unit <{unit}>; :range [ :start ?start; :end ?end ] . <{unit}> :source ?text . FILTER(?start <= 8 && 8 < ?end) }}"),
+            "language": "sparql"
+        }),
+    )
+    .await
+    .map_err(|error| format!("nodes: {error:?}"))?;
+    let rows = workspace_client::query::rows(&nodes)?;
+    assert!(!rows.is_empty(), "position 8 has captured nodes: {nodes}");
+    for row in rows {
+        assert!(
+            workspace_client::query::literal(row, "text")?.contains(name),
+            "{nodes}"
+        );
+    }
     Ok(revision)
 }
 

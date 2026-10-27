@@ -431,7 +431,13 @@ async fn http_tools_list_preserves_object_output_unions() -> TestResult {
     let client = connected_client(&server).await?;
     let listing = client.list_tools(None).await?;
     let exported = schema::tool_listing();
-    assert_eq!(listing.tools.len(), 4);
+    let mut names = listing
+        .tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["get_symbol", "nodes", "search"]);
     for tool in &listing.tools {
         let output = tool
             .output_schema

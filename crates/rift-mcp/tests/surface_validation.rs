@@ -888,7 +888,8 @@ fn warning_count(structured: &Value, code: &str) -> usize {
 
 /// Every node identity one answer carries, whatever tool produced it.
 ///
-/// A `nodes` answer lists them under `id`; a search hit carries one under `node`.
+/// A Node query projects a literal `id` beside its `node` resource; a symbol declaration
+/// carries a raw identity under `node`. Both retain the protocol's `NodeId` constraints.
 fn node_identities(structured: &Value) -> Vec<String> {
     let mut found = Vec::new();
     let mut pending = vec![structured];
@@ -903,12 +904,30 @@ fn node_identities(structured: &Value) -> Vec<String> {
                         {
                             found.push(identity.clone());
                         }
+                        Value::Object(_) if key == "id" && members.get("node").is_some() => {
+                            let identity = workspace_client::query::literal(value, "id")
+                                .expect("projected Node.id is a literal");
+                            assert_eq!(
+                                member["datatype"], "http://www.w3.org/2001/XMLSchema#string",
+                                "Node.id retains its string datatype: {member}"
+                            );
+                            assert!(identity.starts_with("rift://node/"), "{identity}");
+                            found.push(identity.to_owned());
+                        }
                         _ => pending.push(member),
                     }
                 }
             }
             Value::Array(entries) => pending.extend(entries),
             _ => {}
+        }
+    }
+    if !found.is_empty() {
+        let schema = serde_json::to_value(schemars::schema_for!(rift_protocol::read::NodeId))
+            .expect("node identity schema");
+        let validator = jsonschema::validator_for(&schema).expect("node identity schema compiles");
+        for identity in &found {
+            assert_validates(&validator, &json!(identity), "projected Node identity");
         }
     }
     found
