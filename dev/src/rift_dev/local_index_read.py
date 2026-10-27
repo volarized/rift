@@ -26,11 +26,25 @@ def preparing_local(
     False
     >>> preparing_local({"outcome": "unavailable", "reason": "index_preparing"})
     False
+    >>> pending = {"outcome": "unavailable", "reason": "insufficient_coverage", "warnings": [{"code": "local_index_preparing"}]}
+    >>> for code in ("source_unavailable", "framework_context_unresolved"):
+    ...     mixed = {**pending, "warnings": [*pending["warnings"], {"code": code, "unit": "rift://source/project/lib.rs"}]}
+    ...     assert preparing_local(mixed, selection="current")
+    ...     assert not preparing_local(mixed)
+    ...     assert not preparing_local({"warnings": [{"code": code, "unit": "rift://source/project/lib.rs"}]}, selection="current")
+    >>> for code in ("results_truncated", "global_response_invalid", "relationship_coverage_missing"):
+    ...     mixed = {**pending, "warnings": [*pending["warnings"], {"code": code, "unit": "rift://source/project/lib.rs"}]}
+    ...     assert not preparing_local(mixed, selection="current")
     """
     if selection != "current":
         return False
     observed = warnings(answer)
-    accepted = ("local_index_preparing", "lexical_ranking_unavailable")
+    accepted = (
+        "local_index_preparing",
+        "lexical_ranking_unavailable",
+        "source_unavailable",
+        "framework_context_unresolved",
+    )
     if any(warning.get("code") not in accepted for warning in observed):
         return False
     if answer.get("outcome") == "unavailable":
@@ -75,7 +89,7 @@ async def settled_local(
     Callers name the original selection; the helper does not parse query text.
     A top-level captured view always keeps captured behavior. Current preparation
     may use `index_preparing`, or `insufficient_coverage` with the local preparation
-    warning and its lexical preparation warning. Other coverage failures return
+    warning, including unrelated source or framework warnings. Other coverage failures return
     unchanged. One inherited deadline bounds every call and poll together.
 
     The actual callback sequence retains typed refusals until current preparation
