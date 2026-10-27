@@ -573,15 +573,18 @@ class Corpus:
         >>> common = {"configuration_revision": "0123abcd", "languages": languages}
         >>> first = {**common, "pagination": {"page_index": 0, "total_pages": 2}, "source": [{"path": f"docs/a{index:04}.md", "digest": "0123abcd", "language": "markdown"} for index in range(1000)]}
         >>> second = {**common, "pagination": {"page_index": 1, "total_pages": 2}, "source": [{"path": path, "digest": "0123abcd", "language": language} for path, language in [("src/test.ts", "typescript"), ("src/ztest.tsx", "typescript:tsx")]]}
-        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[answer([]), answer(rows), answer([])]))
+        >>> admission = {"answer": {"result": "bindings", "variables": ["symbol"], "bindings": [{"symbol": {"type": "iri", "value": "urn:fixture:startup"}}]}}
+        >>> client = SimpleNamespace(resource=AsyncMock(side_effect=[first, second]), call=AsyncMock(side_effect=[admission, answer(rows), answer([])]))
         >>> sample = Corpus(cast(Pin, SimpleNamespace(name="nextjs")), Path("rift"), Path("report"))
         >>> selected = asyncio.run(sample.symbol_candidates(cast(Client, client)))
         >>> len(selected), client.call.await_count, client.resource.await_count
         (200, 3, 2)
         >>> all(literal(row, "path") == "src/test.ts" for row in selected)
         True
-        >>> "rift.toml" in client.call.await_args_list[0].args[1]["query"]
+        >>> client.call.await_args_list[0].args[1] == name_request("corpus_probe")
         True
+        >>> "SERVICE" in client.call.await_args_list[0].args[1]["query"]
+        False
         """
         languages = SAMPLE_LANGUAGES[self.pin.name]
 
@@ -607,9 +610,10 @@ class Corpus:
             )
             return found
 
-        # configure() writes this exact fixture-owned path before the server starts.
-        # This read waits for startup without depending on a catalog page's languages.
-        pool = await read("rift.toml")
+        # The Domain query waits for index preparation without lexical ranking.
+        # Its identity rows are admission evidence, not declarations in the sample.
+        bindings(await settled_local(client, "search", name_request("corpus_probe")))
+        pool: list[JsonObject] = []
         represented: set[str] = set()
         workspace, groups = await self.source_catalog(client)
         configured = objects(workspace, "languages")
@@ -1182,7 +1186,11 @@ class Corpus:
                 async with server.connect() as client:
                     # Listener readiness precedes file preparation. Observe the existing
                     # startup budget before measuring reads against external writes.
-                    await settled_local(client, "search", CHURN_REQUESTS["search"])
+                    bindings(
+                        await settled_local(
+                            client, "search", name_request("corpus_probe")
+                        )
+                    )
                     await self.churn(client, probe.relative_to(self.root).as_posix())
                     no_failed_builds(await logged(server, "index"))
                 self.stop(server)
