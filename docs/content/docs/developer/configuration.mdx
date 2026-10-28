@@ -848,15 +848,20 @@ Symbols carry the same owner as the scope that serves them, for example
 connection did not register, such as `local@web:api`, fails with `parameter_invalid` listing the
 accepted scopes.
 
-`rift mcp` reads each extra project's `rift.toml` when it starts. An extra configuration that
-fails validation stops the connection from starting, with the refusal that project's own server
-would report. A profile whose root is already registered, as the primary project or another
-extra project, fails with `configuration_invalid`.
+`rift mcp` reads each extra project's `rift.toml` when it starts. When that file can't be read or
+fails validation, the connection still starts and `local@name` stays registered; its server
+reports the refusal when a request reaches it. That project serves no profiles: `all` leaves them
+out, and a scope such as `local@web:docs` fails with the same refusal.
+
+A profile whose root is already registered, as the primary project or another extra project,
+stops the connection from starting with `configuration_invalid`. So does a primary project profile
+whose folder holds, or lies inside, an extra project or one of its profiles.
 
 A saved registration whose folder lies below the primary project root leaves that folder out of
 the primary project's index, so its files are served once, under `local@name`. `rift server`
-reads only the saved `rift.toml`, so a registration given through `--extra` alone leaves the
-primary project's index unchanged.
+reads only the saved `rift.toml`, so `rift mcp` refuses a `--extra` registration below the
+primary project root, and one that replaces a saved registration below it, with
+`configuration_invalid`. Save such a registration in `[mcp.extra]` instead.
 
 ### Language engines
 
