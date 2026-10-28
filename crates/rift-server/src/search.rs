@@ -1001,10 +1001,7 @@ fn validate_change(change: &SearchChange, params: &SearchParams) -> Result<(), R
             .violation("query and change select different result sets")
             .fail();
     }
-    if !matches!(
-        params.scope,
-        SearchScope::Local | SearchScope::NamedLocal { .. } | SearchScope::ProfileLocal { .. }
-    ) {
+    if !params.scope.is_project() {
         return errors::server::read_invalid()
             .field("scope")
             .violation(CURRENT_TREE_ALONE)

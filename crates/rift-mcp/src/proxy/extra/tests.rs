@@ -208,7 +208,7 @@ fn profile_and_extra_with_same_name_select_distinct_roots() -> TestResult {
     let accepted = Registrations::accept(&primary, &configuration.mcp, &[], None)?
         .with_profiles(&primary, &configuration)?;
     assert_eq!(
-        accepted.root("#docs"),
+        accepted.root(":docs"),
         Some(profile.canonicalize()?.as_path())
     );
     assert_eq!(accepted.root("docs"), Some(extra.canonicalize()?.as_path()));
@@ -221,5 +221,95 @@ fn profile_and_extra_with_same_name_select_distinct_roots() -> TestResult {
         .with_profiles(&primary, &configuration)
         .expect_err("one root cannot select both models");
     assert_eq!(refused.slug().as_str(), "rift.core.configuration_invalid");
+    Ok(())
+}
+
+#[test]
+fn extra_projects_register_their_own_profiles_without_following_their_extras() -> TestResult {
+    use rift_protocol::configuration::WorkspaceConfiguration;
+    let directory = tempfile::tempdir()?;
+    let primary = directory.path().join("primary");
+    let cloud = directory.path().join("cloud");
+    let other = directory.path().join("other");
+    for path in [
+        &primary,
+        &cloud.join(".git"),
+        &cloud.join("docs"),
+        &cloud.join("dev"),
+        &other,
+    ] {
+        std::fs::create_dir_all(path)?;
+    }
+    std::fs::write(
+        cloud.join("rift.toml"),
+        "[mcp.extra]\nother = '../other'\n[profiles.docs]\nroot = 'docs'\n[profiles.dev]\nroot = 'dev'\n",
+    )?;
+    let mut configuration = WorkspaceConfiguration::default();
+    configuration
+        .mcp
+        .extra
+        .insert("cloud".to_owned(), "../cloud".to_owned());
+    let accepted = Registrations::accept(&primary, &configuration.mcp, &[], None)?
+        .with_profiles(&primary, &configuration)?;
+    assert_eq!(
+        accepted.names().collect::<Vec<_>>(),
+        ["cloud", "cloud:dev", "cloud:docs"]
+    );
+    assert_eq!(
+        accepted.root("cloud:docs"),
+        Some(cloud.join("docs").canonicalize()?.as_path())
+    );
+    assert_eq!(accepted.root(":docs"), None);
+    assert_eq!(accepted.root("other"), None);
+    let refusal = accepted.refusal("cloud:api", "search", "scope");
+    assert_eq!(refusal.slug().as_str(), "rift.mcp.parameter_invalid");
+    assert!(
+        refusal
+            .to_string()
+            .contains("local@cloud, local@cloud:dev, local@cloud:docs"),
+        "{refusal}"
+    );
+    Ok(())
+}
+
+#[test]
+fn extra_profile_naming_a_registered_root_or_invalid_extra_configuration_is_refused() -> TestResult
+{
+    use rift_protocol::configuration::WorkspaceConfiguration;
+    let directory = tempfile::tempdir()?;
+    let primary = directory.path().join("primary");
+    let cloud = directory.path().join("cloud");
+    for path in [&primary, &cloud.join(".git"), &cloud.join("docs")] {
+        std::fs::create_dir_all(path)?;
+    }
+    std::fs::write(cloud.join("rift.toml"), "[profiles.docs]\nroot = 'docs'\n")?;
+    let mut configuration = WorkspaceConfiguration::default();
+    configuration.mcp.extra.extend([
+        ("cloud".to_owned(), "../cloud".to_owned()),
+        ("docs".to_owned(), "../cloud/docs".to_owned()),
+    ]);
+    let refused = Registrations::accept(&primary, &configuration.mcp, &[], None)?
+        .with_profiles(&primary, &configuration)
+        .expect_err("one root cannot be both an extra project and an extra profile");
+    assert_eq!(refused.slug().as_str(), "rift.core.configuration_invalid");
+    assert!(
+        refused.to_string().contains("same canonical root"),
+        "{refused}"
+    );
+    configuration.mcp.extra.remove("docs");
+    std::fs::write(
+        cloud.join("rift.toml"),
+        "[profiles.docs]\nroot = '../outside'\n",
+    )?;
+    let refused = Registrations::accept(&primary, &configuration.mcp, &[], None)?
+        .with_profiles(&primary, &configuration)
+        .expect_err("an extra project's refused configuration refuses its registration");
+    assert!(
+        refused
+            .slug()
+            .as_str()
+            .starts_with("rift.core.configuration"),
+        "{refused}"
+    );
     Ok(())
 }

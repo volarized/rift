@@ -1,30 +1,58 @@
 use rift_error::{RiftError, errors};
-use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
+use rift_protocol::identity::{PROFILE_SEPARATOR, SymbolIdentity, SymbolOwner};
 use rift_protocol::read::{ReadWarning, SearchHit, SearchHitTarget, Symbol, SymbolId, TypeBinding};
 use rift_protocol::symbol_read::GetSymbolResult;
 
 pub(super) fn public_owner(owner: &SymbolOwner, backend: &str) -> Result<SymbolOwner, RiftError> {
     let owner = match owner {
-        SymbolOwner::Local if backend.starts_with('#') => SymbolOwner::ProfileLocal {
-            name: backend[1..].to_owned(),
-        },
-        SymbolOwner::Local if backend != "local" && backend != "global" => {
-            SymbolOwner::NamedLocal {
-                name: backend.to_owned(),
-            }
-        }
+        SymbolOwner::Local => backend_owner(backend).unwrap_or(SymbolOwner::Local),
         _ => owner.clone(),
     };
     owner.validate()?;
     Ok(owner)
 }
 
+/// The owner a backend key names: `cloud`, `:docs`, or `cloud:docs`.
+fn backend_owner(backend: &str) -> Option<SymbolOwner> {
+    if ["local", "global"].contains(&backend) {
+        return None;
+    }
+    Some(match backend.split_once(PROFILE_SEPARATOR) {
+        Some(("", name)) => SymbolOwner::ProfileLocal {
+            name: name.to_owned(),
+        },
+        Some((project, name)) => SymbolOwner::NamedProfileLocal {
+            project: project.to_owned(),
+            name: name.to_owned(),
+        },
+        None => SymbolOwner::NamedLocal {
+            name: backend.to_owned(),
+        },
+    })
+}
+
 pub(super) fn backend_key(owner: &SymbolOwner) -> Option<String> {
     match owner {
         SymbolOwner::NamedLocal { name } => Some(name.clone()),
-        SymbolOwner::ProfileLocal { name } => Some(format!("#{name}")),
+        SymbolOwner::ProfileLocal { name } => Some(profile_key(name)),
+        SymbolOwner::NamedProfileLocal { project, name } => Some(extra_profile_key(project, name)),
         _ => None,
     }
+}
+
+/// The backend key a project scope selects, absent for `local`, `global`, and `all`.
+pub(super) fn scope_key(scope: &rift_protocol::read::SearchScope) -> Option<String> {
+    scope.project_owner().as_ref().and_then(backend_key)
+}
+
+/// The backend key of a registered profile defined by the extra project `project`.
+pub(super) fn extra_profile_key(project: &str, name: &str) -> String {
+    format!("{project}{PROFILE_SEPARATOR}{name}")
+}
+
+/// The backend key of a profile defined by the primary project's configuration.
+pub(super) fn profile_key(name: &str) -> String {
+    format!("{PROFILE_SEPARATOR}{name}")
 }
 
 fn with_owner(identity: &SymbolIdentity, owner: SymbolOwner) -> Result<SymbolId, RiftError> {
@@ -41,20 +69,13 @@ fn with_owner(identity: &SymbolIdentity, owner: SymbolOwner) -> Result<SymbolId,
 
 pub(super) fn dispatch_id(id: &SymbolId, backend: &str) -> Result<SymbolId, RiftError> {
     let identity = SymbolIdentity::parse(id.as_str())?;
-    match identity.owner() {
-        SymbolOwner::NamedLocal { name } if name == backend => {
-            with_owner(&identity, SymbolOwner::Local)
-        }
-        SymbolOwner::ProfileLocal { name } if backend.strip_prefix('#') == Some(name.as_str()) => {
-            with_owner(&identity, SymbolOwner::Local)
-        }
-        SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. } => {
-            errors::server::read_invalid()
-                .field("id")
-                .violation("symbol owner does not match the accepted project")
-                .fail()
-        }
-        _ => Ok(id.clone()),
+    match backend_key(identity.owner()) {
+        Some(key) if key == backend => with_owner(&identity, SymbolOwner::Local),
+        Some(_) => errors::server::read_invalid()
+            .field("id")
+            .violation("symbol owner does not match the accepted project")
+            .fail(),
+        None => Ok(id.clone()),
     }
 }
 
@@ -226,7 +247,10 @@ pub(super) fn qualify_symbol_result(
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_id, qualify_hit, qualify_id, qualify_symbol_result};
+    use super::{
+        SymbolOwner, backend_key, backend_owner, dispatch_id, qualify_hit, qualify_id,
+        qualify_symbol_result, scope_key,
+    };
     use rift_protocol::read::{SearchHit, SymbolId};
     use rift_protocol::symbol_read::GetSymbolResult;
 
@@ -254,16 +278,49 @@ mod tests {
         ))?;
         let mut profile = original.clone();
         let mut extra = original.clone();
-        qualify_id(&mut profile, "#docs")?;
+        qualify_id(&mut profile, ":docs")?;
         qualify_id(&mut extra, "docs")?;
-        assert!(profile.as_str().starts_with("rift://symbol/local%23docs/"));
+        assert!(profile.as_str().starts_with("rift://symbol/local:docs/"));
         assert!(extra.as_str().starts_with("rift://symbol/local@docs/"));
         assert_ne!(profile, extra);
-        assert_eq!(dispatch_id(&profile, "#docs")?, original);
+        assert_eq!(dispatch_id(&profile, ":docs")?, original);
         assert_eq!(dispatch_id(&extra, "docs")?, original);
         assert!(dispatch_id(&profile, "docs").is_err());
-        assert!(dispatch_id(&extra, "#docs").is_err());
-        assert!(dispatch_id(&profile, "#other").is_err());
+        assert!(dispatch_id(&extra, ":docs").is_err());
+        assert!(dispatch_id(&profile, ":other").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn extra_profile_identity_roundtrip_keeps_extra_and_root_profile_distinct()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let original = SymbolId::parse("rift://symbol/local/rust/app/beacon")?;
+        let mut extra_profile = original.clone();
+        qualify_id(&mut extra_profile, "cloud:docs")?;
+        assert_eq!(
+            extra_profile.as_str(),
+            "rift://symbol/local@cloud:docs/rust/app/beacon"
+        );
+        assert_eq!(dispatch_id(&extra_profile, "cloud:docs")?, original);
+        for backend in ["cloud", ":docs", "cloud:api", "other:docs"] {
+            assert!(dispatch_id(&extra_profile, backend).is_err(), "{backend}");
+        }
+        let owner = SymbolOwner::NamedProfileLocal {
+            project: "cloud".to_owned(),
+            name: "docs".to_owned(),
+        };
+        assert_eq!(backend_key(&owner).as_deref(), Some("cloud:docs"));
+        assert_eq!(backend_owner("cloud:docs"), Some(owner));
+        assert_eq!(backend_owner("global"), None);
+        assert_eq!(
+            scope_key(&rift_protocol::read::SearchScope::NamedProfileLocal {
+                project: "cloud".to_owned(),
+                name: "docs".to_owned(),
+            })
+            .as_deref(),
+            Some("cloud:docs")
+        );
+        assert_eq!(scope_key(&rift_protocol::read::SearchScope::All), None);
         Ok(())
     }
 

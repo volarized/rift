@@ -18,7 +18,7 @@ pub const PROFILE_COUNT_MAX: usize = 64;
 /// Folder components a profile root may hold, at most.
 pub const PROFILE_ROOT_DEPTH_MAX: usize = 63;
 
-/// One project folder served as `local#name` from the root `rift.toml`.
+/// One project folder served as `local:name` from the root `rift.toml`.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = declare_profile_contract)]
@@ -62,9 +62,22 @@ fn declare_profile_contract(schema: &mut schemars::Schema) {
 impl WorkspaceConfiguration {
     /// Excludes profile folders from the primary project's source selection.
     #[must_use]
-    pub fn with_profile_exclusions(mut self) -> Self {
-        for profile in self.profiles.values() {
-            let pattern = subtree_pattern(&profile.root);
+    pub fn with_profile_exclusions(self) -> Self {
+        let roots: Vec<String> = self
+            .profiles
+            .values()
+            .map(|profile| profile.root.clone())
+            .collect();
+        self.with_folder_exclusions(&roots)
+    }
+
+    /// Excludes folders another registration serves from the primary project's source selection.
+    ///
+    /// Each folder is relative to the primary root with `/` separators.
+    #[must_use]
+    pub fn with_folder_exclusions(mut self, folders: &[String]) -> Self {
+        for folder in folders {
+            let pattern = subtree_pattern(folder);
             if !self
                 .source
                 .exclude
@@ -134,7 +147,7 @@ pub(super) fn violation(configuration: &WorkspaceConfiguration) -> Option<Config
     let mut roots = Vec::<&str>::new();
     for (name, profile) in &configuration.profiles {
         let detail = if !valid_registration_name(name)
-            || name.len() > crate::identity::SYMBOL_ID_BYTES_MAX - "local#".len()
+            || name.len() > crate::identity::SYMBOL_ID_BYTES_MAX - "local:".len()
         {
             Some("profile name is not canonical")
         } else if !valid_root(&profile.root) {

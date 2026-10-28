@@ -284,31 +284,24 @@ fn captured_view(captured: &CapturedCandidates) -> Result<(CapturedView, SystemT
 }
 
 impl RiftProxy {
-    fn candidate_backends<'a>(
+    pub(super) fn candidate_backends<'a>(
         &'a self,
         params: &'a SearchParams,
     ) -> Result<Vec<(&'a str, &'a Self)>, RiftError> {
-        match &params.scope {
-            SearchScope::NamedLocal { name } => self
+        match (&params.scope, super::identity::scope_key(&params.scope)) {
+            (_, Some(key)) => self
                 .backends
-                .get(name)
-                .map(|backend| vec![(name.as_str(), backend)])
-                .ok_or_else(|| self.extra.refusal(name, "search", "scope")),
-            SearchScope::ProfileLocal { name } => {
-                let key = format!("#{name}");
-                self.backends
-                    .get_key_value(&key)
-                    .map(|(name, backend)| vec![(name.as_str(), backend)])
-                    .ok_or_else(|| self.extra.refusal(&key, "search", "scope"))
-            }
-            SearchScope::All => Ok(std::iter::once(("local", self))
+                .get_key_value(&key)
+                .map(|(name, backend)| vec![(name.as_str(), backend)])
+                .ok_or_else(|| self.extra.refusal(&key, "search", "scope")),
+            (SearchScope::All, None) => Ok(std::iter::once(("local", self))
                 .chain(
                     self.backends
                         .iter()
                         .map(|(name, backend)| (name.as_str(), backend)),
                 )
                 .collect()),
-            SearchScope::Local | SearchScope::Global => Ok(vec![("local", self)]),
+            (_, None) => Ok(vec![("local", self)]),
         }
     }
 
@@ -393,13 +386,8 @@ impl RiftProxy {
         params: &SearchParams,
         previous: &[SearchCandidatePool],
     ) -> Result<bool, RiftError> {
-        if let SearchScope::NamedLocal { name } = &params.scope
-            && !self.backends.contains_key(name)
-        {
-            return Ok(false);
-        }
-        if let SearchScope::ProfileLocal { name } = &params.scope
-            && !self.backends.contains_key(&format!("#{name}"))
+        if let Some(key) = super::identity::scope_key(&params.scope)
+            && !self.backends.contains_key(&key)
         {
             return Ok(false);
         }

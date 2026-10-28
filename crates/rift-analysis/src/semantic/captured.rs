@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rift_error::{RiftError, errors};
-use rift_protocol::identity::SymbolOwner;
 use rift_provider::NormalizedGraph;
 use rift_syntax::DocumentPlacement;
 
@@ -40,10 +39,7 @@ impl WorkspaceSemantics {
         declarations_max: usize,
         revision: u64,
     ) -> Result<PreparedSemantics, RiftError> {
-        if !matches!(
-            input.owner(),
-            SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. }
-        ) {
+        if !input.owner().is_local() {
             return errors::analysis::package_input_identity_invalid().fail();
         }
         let captured = input

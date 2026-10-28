@@ -12,7 +12,9 @@ use crate::identity::{SYMBOL_ID_BYTES_MAX, parse_local_scope};
 pub struct McpConfiguration {
     /// Registration names and paths. Relative paths start at the primary project root.
     /// CLI entries replace saved entries with the same name. Each project keeps its own
-    /// configuration; extra registrations are not imported recursively.
+    /// configuration, and its profiles are served as `local@name:profile`; extra
+    /// registrations are not imported recursively. A saved project below the primary root
+    /// is left out of the primary project's source.
     pub extra: BTreeMap<String, String>,
 }
 

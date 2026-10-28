@@ -8,7 +8,10 @@ use rift_protocol::configuration::McpConfiguration;
 #[cfg(test)]
 mod tests;
 
-/// Canonical roots retained without reading extra project configurations.
+/// Canonical roots retained for one connection, keyed by backend name.
+///
+/// An extra project's own profiles are registered beside it; their own extra
+/// registrations are not followed.
 #[derive(Debug, Default)]
 pub(super) struct Registrations {
     roots: BTreeMap<String, PathBuf>,
@@ -49,20 +52,41 @@ impl Registrations {
         })
     }
 
+    /// Registers the primary project's profiles and each extra project's own profiles.
+    ///
+    /// An extra project's profiles come from the configuration its own server accepts at
+    /// its root, so each profile is served with that profile's root and settings.
+    ///
+    /// # Errors
+    /// Returns a configuration refusal for an unreadable extra configuration, an invalid
+    /// profile root, or a profile that names an already registered root.
     pub(super) fn with_profiles(
         mut self,
         root: &Path,
         configuration: &rift_protocol::configuration::WorkspaceConfiguration,
     ) -> Result<Self, RiftError> {
+        let mut profiles = Vec::new();
         for (name, path) in rift_server::profile_roots(root, configuration)? {
-            if self.roots.values().any(|extra| extra == &path) {
+            profiles.push((super::identity::profile_key(&name), name, path));
+        }
+        for (project, project_root) in &self.roots {
+            let extra = rift_server::load_configuration(project_root)?;
+            for (name, path) in rift_server::profile_roots(project_root, &extra)? {
+                let key = super::identity::extra_profile_key(project, &name);
+                profiles.push((key, name, path));
+            }
+        }
+        for (key, name, path) in profiles {
+            let registered = self.primary.as_ref() == Some(&path)
+                || self.roots.values().any(|other| other == &path);
+            if registered {
                 return errors::core::configuration_invalid()
                     .field("profiles")
                     .name(name)
                     .detail("profile and extra workspace name the same canonical root")
                     .fail();
             }
-            self.roots.insert(format!("#{name}"), path);
+            self.roots.insert(key, path);
         }
         Ok(self)
     }
@@ -93,7 +117,7 @@ impl Registrations {
                 .accepted(
                     self.names()
                         .map(|name| {
-                            if name.starts_with('#') {
+                            if name.starts_with(rift_protocol::identity::PROFILE_SEPARATOR) {
                                 format!("local{name}")
                             } else {
                                 format!("local@{name}")

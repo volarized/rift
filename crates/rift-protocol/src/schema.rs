@@ -893,7 +893,7 @@ pub fn declare_workspace_contract(schema: &mut Schema) {
         schema,
         property!(WorkspaceConfiguration, profiles),
         keyword::PROPERTY_NAMES,
-        json!({"pattern": "^[a-z][a-z0-9_-]*$", "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX - "local#".len(), "not": {"enum": ["local", "global", "all"]}}),
+        json!({"pattern": "^[a-z][a-z0-9_-]*$", "maxLength": crate::identity::SYMBOL_ID_BYTES_MAX - "local:".len(), "not": {"enum": ["local", "global", "all"]}}),
     );
 }
 

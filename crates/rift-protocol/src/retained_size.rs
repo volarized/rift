@@ -16,6 +16,11 @@ impl GetSize for crate::identity::SymbolOwner {
             Self::NamedLocal { name } | Self::ProfileLocal { name } => {
                 name.get_heap_size_with_tracker(tracker)
             }
+            Self::NamedProfileLocal { project, name } => {
+                let (project, tracker) = project.get_heap_size_with_tracker(tracker);
+                let (name, tracker) = name.get_heap_size_with_tracker(tracker);
+                (project.saturating_add(name), tracker)
+            }
             Self::Package {
                 manager,
                 registry,
@@ -538,6 +543,18 @@ mod tests {
                 std::mem::size_of_val(&owner) + capacity
             );
         }
+    }
+
+    #[test]
+    fn extra_profile_owner_material_counts_both_name_capacities() {
+        let mut project = String::with_capacity(256);
+        project.push_str("cloud");
+        let mut name = String::with_capacity(512);
+        name.push_str("docs");
+        let capacity = project.capacity() + name.capacity();
+        let owner = crate::identity::SymbolOwner::NamedProfileLocal { project, name };
+        assert_eq!(owner.get_heap_size(), capacity);
+        assert_eq!(owner.get_size(), std::mem::size_of_val(&owner) + capacity);
     }
 
     #[test]

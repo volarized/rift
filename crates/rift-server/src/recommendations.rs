@@ -9,6 +9,7 @@ use rift_index::WorkspaceSourcePolicy;
 use rift_protocol::configuration::{
     CONFIGURATION_FILE_BYTES_MAX, LspPackageManager, WorkspaceConfiguration,
 };
+use rift_protocol::identity::PROFILE_SEPARATOR;
 use rift_protocol::map::{
     MAP_RECOMMENDATION_COMMAND_CHARS_MAX, MAP_RECOMMENDATION_ROOT_CHARS_MAX,
     MAP_RECOMMENDATIONS_MAX,
@@ -257,7 +258,7 @@ fn registration_roots(
                 "profiles and extra projects must name distinct folders",
             ));
         }
-        roots.insert(format!("#{name}"), project);
+        roots.insert(format!("{PROFILE_SEPARATOR}{name}"), project);
     }
     Ok(roots)
 }
@@ -375,7 +376,7 @@ fn decisions(
     let mut registrations = registered
         .iter()
         .filter_map(|(name, project)| {
-            name.strip_prefix('#')
+            name.strip_prefix(PROFILE_SEPARATOR)
                 .map(|name| (name.to_owned(), project_name(root, project)))
         })
         .collect();
@@ -417,7 +418,7 @@ fn decisions(
         {
             let extra = registered
                 .iter()
-                .find(|(name, path)| !name.starts_with('#') && **path == project);
+                .find(|(name, path)| !name.starts_with(PROFILE_SEPARATOR) && **path == project);
             let scope = if relative == "." {
                 SearchScope::Local
             } else if let Some((name, _)) = extra {
@@ -647,7 +648,7 @@ mod tests {
             .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
         let inputs = LspRecommendationInputs::new(root.path(), configuration.clone())?;
         assert_eq!(
-            inputs.registered_projects().get("#docs"),
+            inputs.registered_projects().get(":docs"),
             Some(&profile_root)
         );
         assert_eq!(inputs.registered_projects().get("docs"), Some(&extra_root));

@@ -154,7 +154,7 @@ async fn map_profile_advice_requires_reconnect_before_named_project_reads() -> T
     assert_eq!(configuration.profiles["docs"].root, "docs");
     wait_until_configured(&client).await?;
     let query = json!({
-        "query":"beacon", "target":"symbol", "scope":"local#docs",
+        "query":"beacon", "target":"symbol", "scope":"local:docs",
         "paths":{"include":["page.ts"]},
     });
     let refused = proxied_call(&client, "search", &query)

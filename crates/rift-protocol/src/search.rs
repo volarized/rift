@@ -581,10 +581,11 @@ pub struct SearchParams {
     #[schemars(length(min = 1, max = SEARCH_PATTERN_CHARS_MAX))]
     pub pattern: Option<String>,
     /// Which corpus is selected. Omitted, `local`, the primary project. `local@name`
-    /// selects an extra project accepted by the connection. `local#name` selects a profile
-    /// defined in the root configuration. `global` reaches collected package and runtime
-    /// facts selected by the dependency context; `all` merges the primary project, profiles,
-    /// accepted extra projects, and global results. Explicit `packages` replaces
+    /// selects an extra project accepted by the connection. `local:name` selects a profile
+    /// defined in the root configuration. `local@name:profile` selects a profile defined in
+    /// the root configuration of that extra project. `global` reaches collected package and
+    /// runtime facts selected by the dependency context; `all` merges the primary project,
+    /// profiles, accepted extra projects with their profiles, and global results. Explicit `packages` replaces
     /// versions of named packages or adds packages the context lacks.
     /// The server refuses a scope beyond `local` together with `rev`, and `global`
     /// together with `traversal`, since a walk runs over local declarations.

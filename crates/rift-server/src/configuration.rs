@@ -41,7 +41,10 @@ pub fn load_configuration(root: &Path) -> Result<WorkspaceConfiguration, RiftErr
     )?;
     if configuration_root == root {
         validate_profile_roots(root, &configuration)?;
-        let configuration = configuration.with_profile_exclusions();
+        let nested = nested_extra_folders(root, &configuration);
+        let configuration = configuration
+            .with_profile_exclusions()
+            .with_folder_exclusions(&nested);
         configuration
             .validate()
             .map_err(|violation| rift_core::configuration_violation_error(&violation))?;
@@ -132,6 +135,35 @@ pub fn profile_roots(
         roots.insert(name.clone(), path);
     }
     Ok(roots)
+}
+
+/// Folders of saved `[mcp.extra]` registrations that lie below the primary root.
+///
+/// The primary project leaves these folders to their registrations, so each source
+/// file is served once. A registration whose path does not resolve holds no folder
+/// below the root; the proxy refuses it when it registers the connection.
+fn nested_extra_folders(root: &Path, configuration: &WorkspaceConfiguration) -> Vec<String> {
+    configuration
+        .mcp
+        .extra
+        .values()
+        .filter_map(|saved| {
+            let selected = match saved.strip_prefix('~') {
+                Some(relative) if relative.is_empty() || relative.starts_with('/') => {
+                    std::env::home_dir()?.join(relative.trim_start_matches('/'))
+                }
+                _ => root.join(saved),
+            };
+            let canonical = std::fs::canonicalize(selected).ok()?;
+            let relative = canonical.strip_prefix(root).ok()?;
+            let folder = relative
+                .components()
+                .map(|component| component.as_os_str().to_str())
+                .collect::<Option<Vec<_>>>()?
+                .join("/");
+            (!folder.is_empty()).then_some(folder)
+        })
+        .collect()
 }
 
 fn validate_profile_roots(
@@ -656,6 +688,35 @@ mod profile_tests {
             Some("source.exclude")
         );
         assert_eq!(context.get("value").map(String::as_str), Some("513"));
+        Ok(())
+    }
+
+    #[test]
+    fn primary_leaves_nested_extra_folders_to_their_registrations()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("primary");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join("vendor/app"))?;
+        std::fs::create_dir_all(directory.path().join("outside"))?;
+        let absolute = root.join("vendor/app").canonicalize()?;
+        std::fs::write(
+            root.join("rift.toml"),
+            format!(
+                "[mcp.extra]\nnested = 'vendor/app'\nsame = '{}'\noutside = '../outside'\nmissing = 'gone'\n",
+                absolute.display()
+            ),
+        )?;
+        let primary = load_configuration(&root)?;
+        let excluded: Vec<&str> = primary
+            .source
+            .exclude
+            .iter()
+            .map(|pattern| pattern.0.as_str())
+            .collect();
+        assert_eq!(excluded, ["vendor/app/**"]);
+        let nested = load_configuration(&root.join("vendor/app"))?;
+        assert!(nested.source.exclude.is_empty());
         Ok(())
     }
 

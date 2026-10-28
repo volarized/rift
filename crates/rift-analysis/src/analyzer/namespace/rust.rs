@@ -156,9 +156,10 @@ fn selected_libraries(
     match input.owner() {
         SymbolOwner::Package { .. } => library(input).into_iter().collect(),
         SymbolOwner::Runtime { runtime, .. } if runtime == "rust" => libraries(input, inventory),
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. } => {
-            libraries(input, inventory)
-        }
+        SymbolOwner::Local
+        | SymbolOwner::NamedLocal { .. }
+        | SymbolOwner::ProfileLocal { .. }
+        | SymbolOwner::NamedProfileLocal { .. } => libraries(input, inventory),
         SymbolOwner::Runtime { .. } => Vec::new(),
     }
 }

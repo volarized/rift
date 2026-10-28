@@ -13,7 +13,19 @@ use crate::read::Language;
 pub const SYMBOL_ID_BYTES_MAX: usize = 8_192;
 
 /// Structural local scope pattern. The codec also refuses reserved registration names.
-pub const LOCAL_SCOPE_PATTERN: &str = r"^local(?:[@#][a-z][a-z0-9_-]*)?$";
+pub const LOCAL_SCOPE_PATTERN: &str = r"^local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?$";
+
+/// Local scope names reserved for the corpora a scope selects by keyword.
+pub const LOCAL_SCOPE_RESERVED_PATTERN: &str = r"[@:](?:local|global|all)(?::|$)";
+
+/// Separator between a project and one of its profiles in a local scope and a symbol owner.
+pub const PROFILE_SEPARATOR: char = ':';
+
+/// Leading word of every local scope and local symbol owner.
+const LOCAL_SCOPE_PREFIX: &str = "local";
+
+/// Separator between `local` and an extra project's registration name.
+const REGISTRATION_SEPARATOR: char = '@';
 
 /// The canonical owner and logical path format this codec accepts.
 pub const SYMBOL_IDENTITY_FORMAT_REVISION: u32 = 1;
@@ -23,7 +35,7 @@ pub const SYMBOL_URI_PREFIX: &str = "rift://symbol/";
 
 /// Structural wire pattern. The codec also validates exact versions and canonical spelling.
 pub const SYMBOL_ID_PATTERN: &str = concat!(
-    r"^rift://symbol/(?:local(?:(?:@|%23)[a-z][a-z0-9_-]*)?/",
+    r"^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/",
     r"|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/",
     r"|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)",
     r"[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/",
@@ -102,6 +114,13 @@ pub enum SymbolOwner {
     /// One profile defined in the root workspace configuration.
     ProfileLocal {
         /// Accepted profile name.
+        name: String,
+    },
+    /// One profile defined in the root configuration of an extra project.
+    NamedProfileLocal {
+        /// Accepted registration name of the extra project.
+        project: String,
+        /// Profile name defined in that project's root configuration.
         name: String,
     },
     /// One exact release from its defining registry.
@@ -236,7 +255,7 @@ impl schemars::JsonSchema for SymbolIdentity {
             "maxLength": SYMBOL_ID_BYTES_MAX,
             "pattern": SYMBOL_ID_PATTERN,
             "not": {"pattern": "/\\.{1,2}(?:/|~|$)"},
-            "description": "Canonical logical symbol identity with local, profile, registered local, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://symbol/local/rust/app/parser/parse",
                 "rift://symbol/local@cloud/rust/app/load",
@@ -446,6 +465,7 @@ impl SymbolOwner {
         match self {
             Self::Local => 0,
             Self::NamedLocal { name } | Self::ProfileLocal { name } => name.len(),
+            Self::NamedProfileLocal { project, name } => project.len().saturating_add(name.len()),
             Self::Package {
                 manager,
                 registry,
@@ -470,6 +490,9 @@ impl SymbolOwner {
             Self::Local => true,
             Self::NamedLocal { name } | Self::ProfileLocal { name } => {
                 valid_registration_name(name)
+            }
+            Self::NamedProfileLocal { project, name } => {
+                valid_registration_name(project) && valid_registration_name(name)
             }
             Self::Package {
                 manager,
@@ -506,28 +529,41 @@ impl SymbolOwner {
     /// # Errors
     /// Returns the existing owner or length refusal for an invalid local scope.
     pub fn local_scope(&self) -> Result<String, RiftError> {
-        if !matches!(
-            self,
-            Self::Local | Self::NamedLocal { .. } | Self::ProfileLocal { .. }
-        ) {
+        if !self.is_local() {
             return Err(SymbolIdentityViolation::Owner.into());
         }
         self.validate()?;
-        let scope = match self {
-            Self::ProfileLocal { name } => format!("local#{name}"),
-            _ => self.wire_owner(),
-        };
+        let scope = self.wire_owner();
         if scope.len() > SYMBOL_ID_BYTES_MAX {
             return Err(SymbolIdentityViolation::Length.into());
         }
         Ok(scope)
     }
 
+    /// Whether this owner selects a project tree rather than a released package or runtime.
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        matches!(
+            self,
+            Self::Local
+                | Self::NamedLocal { .. }
+                | Self::ProfileLocal { .. }
+                | Self::NamedProfileLocal { .. }
+        )
+    }
+
     fn wire_owner(&self) -> String {
         match self {
-            Self::Local => "local".to_owned(),
-            Self::NamedLocal { name } => format!("local@{name}"),
-            Self::ProfileLocal { name } => format!("local%23{name}"),
+            Self::Local => LOCAL_SCOPE_PREFIX.to_owned(),
+            Self::NamedLocal { name } => {
+                format!("{LOCAL_SCOPE_PREFIX}{REGISTRATION_SEPARATOR}{name}")
+            }
+            Self::ProfileLocal { name } => {
+                format!("{LOCAL_SCOPE_PREFIX}{PROFILE_SEPARATOR}{name}")
+            }
+            Self::NamedProfileLocal { project, name } => format!(
+                "{LOCAL_SCOPE_PREFIX}{REGISTRATION_SEPARATOR}{project}{PROFILE_SEPARATOR}{name}"
+            ),
             Self::Package {
                 manager,
                 registry,
@@ -585,20 +621,44 @@ fn parse_owner<'a>(
     scope: &str,
     segments: &mut impl Iterator<Item = &'a str>,
 ) -> Result<SymbolOwner, RiftError> {
+    if let Some(owner) = local_owner(scope) {
+        return Ok(owner);
+    }
     match scope {
-        "local" => Ok(SymbolOwner::Local),
         "stdlib" => {
             let (runtime, version) = parse_release(next_segment(segments)?)?;
             Ok(SymbolOwner::Runtime { runtime, version })
         }
-        value if value.starts_with("local@") => Ok(SymbolOwner::NamedLocal {
-            name: value["local@".len()..].to_owned(),
-        }),
-        value if value.starts_with("local%23") => Ok(SymbolOwner::ProfileLocal {
-            name: value["local%23".len()..].to_owned(),
-        }),
         manager => parse_package_owner(manager, segments),
     }
+}
+
+/// Splits `local`, `local:profile`, `local@name`, or `local@name:profile` into its owner.
+///
+/// Absent when the value does not start with a local scope; names stay unvalidated.
+fn local_owner(value: &str) -> Option<SymbolOwner> {
+    let selection = value.strip_prefix(LOCAL_SCOPE_PREFIX)?;
+    let (registration, profile) = match selection.split_once(PROFILE_SEPARATOR) {
+        Some((registration, profile)) => (registration, Some(profile)),
+        None => (selection, None),
+    };
+    let project = match registration {
+        "" => None,
+        registration => Some(registration.strip_prefix(REGISTRATION_SEPARATOR)?),
+    };
+    Some(match (project, profile) {
+        (None, None) => SymbolOwner::Local,
+        (Some(name), None) => SymbolOwner::NamedLocal {
+            name: name.to_owned(),
+        },
+        (None, Some(name)) => SymbolOwner::ProfileLocal {
+            name: name.to_owned(),
+        },
+        (Some(project), Some(name)) => SymbolOwner::NamedProfileLocal {
+            project: project.to_owned(),
+            name: name.to_owned(),
+        },
+    })
 }
 
 fn parse_package_owner<'a>(
@@ -681,19 +741,7 @@ pub fn parse_local_scope(value: &str) -> Result<SymbolOwner, RiftError> {
     if value.len() > SYMBOL_ID_BYTES_MAX {
         return Err(SymbolIdentityViolation::Length.into());
     }
-    let owner = if let Some(name) = value.strip_prefix("local#") {
-        SymbolOwner::ProfileLocal {
-            name: name.to_owned(),
-        }
-    } else {
-        parse_owner(value, &mut std::iter::empty())?
-    };
-    if !matches!(
-        &owner,
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. }
-    ) {
-        return Err(SymbolIdentityViolation::Owner.into());
-    }
+    let owner = local_owner(value).ok_or(SymbolIdentityViolation::Owner)?;
     owner.validate()?;
     if owner.local_scope()? != value {
         return Err(SymbolIdentityViolation::Noncanonical.into());
