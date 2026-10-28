@@ -658,11 +658,12 @@ one with no git repository.
 ### Package scope [#search-scope]
 
 `scope` selects where `query` and `pattern` run. `local`, the default, selects the primary
-project. `local#name` selects one profile defined in the root `rift.toml`. `local@name`
-selects one extra project accepted by the connection. `global` selects collected package and
+project. `local:name` selects one profile defined in the root `rift.toml`. `local@name`
+selects one extra project accepted by the connection, and `local@name:profile` selects one
+profile defined in that extra project's own `rift.toml`. `global` selects collected package and
 runtime facts named by the dependency context. Explicit `packages` replaces versions of named
 packages or adds packages the context lacks. `all` merges the primary project, profiles,
-accepted extra projects, and global facts. Search returns each
+accepted extra projects with their profiles, and global facts. Search returns each
 logical owner in the canonical identity, preserving physical declaration locations separately:
 
 <ReadExample name="all-search" />
@@ -769,9 +770,14 @@ open, the server walks Git per request instead.
 
 ### Symbol ownership [#get_symbol-scope]
 
-A `local%23name` owner in a symbol identity selects a profile defined in the root configuration.
-For example, `rift://symbol/local%23docs/typescript/page/beacon` selects the `docs` profile.
-The scope uses `local#docs`; the symbol URI encodes `#` as `%23`.
+A `local:name` owner in a symbol identity selects a profile defined in the root configuration.
+For example, `rift://symbol/local:docs/typescript/page/beacon` selects the `docs` profile.
+A `local@name:profile` owner selects a profile defined in an extra project's own configuration,
+such as `rift://symbol/local@cloud:docs/typescript/page/beacon`. Scopes and symbol URIs spell the
+owner identically.
+
+Releases before v0.0.72 spelled the profile owner `local#docs` in scopes and `local%23docs` in
+symbol URIs. The server refuses both spellings.
 
 A `local@name` owner selects an extra project accepted by the connection:
 
