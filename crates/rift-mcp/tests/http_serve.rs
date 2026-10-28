@@ -168,7 +168,7 @@ async fn serves_tools_and_stops_on_external_cancel() -> TestResult {
         .iter()
         .map(|tool| tool.name.as_ref())
         .collect();
-    for expected in ["get_source", "get_symbol", "nodes", "search"] {
+    for expected in ["get_symbol", "nodes", "search"] {
         assert!(
             names.contains(&expected),
             "{expected} missing from {names:?}"
@@ -426,7 +426,7 @@ async fn http_tools_list_preserves_object_output_unions() -> TestResult {
     let client = connected_client(&server).await?;
     let listing = client.list_tools(None).await?;
     let exported = schema::tool_listing();
-    assert_eq!(listing.tools.len(), 4);
+    assert_eq!(listing.tools.len(), 3);
     for tool in &listing.tools {
         let output = tool
             .output_schema

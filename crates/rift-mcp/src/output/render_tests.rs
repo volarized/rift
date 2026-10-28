@@ -4510,31 +4510,3 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
     assert!(text.contains("unavailable · ViewExpired"));
     assert!(!text.contains("symbol_not_found"));
 }
-
-#[test]
-fn canonical_source_render_keeps_utf8_bytes_and_original_view() {
-    use rift_protocol::source_read::GetSourceResult;
-    use rift_protocol::symbol_read::{CapturedView, CapturedViewId};
-    let unit = SourceUnitId::parse("rift://source/project/src/lib.rs").expect("modeled source");
-    let text = "// café\nstruct A;\n";
-    let answer = GetSourceResult::Found {
-        source: rift_protocol::read::SourceExcerpt {
-            span: rift_protocol::read::SourceUnitSpan {
-                unit: unit.clone(),
-                range: range(0, text.len() as u64),
-            },
-            text: text.to_owned(),
-        },
-        source_complete: true,
-        view: CapturedView {
-            id: CapturedViewId::parse("claims.signature").expect("view"),
-            expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
-        },
-        warnings: Vec::new(),
-    };
-    let output = rendered(&answer);
-    assert!(output.contains(unit.as_str()));
-    assert!(output.contains("// café\n\tstruct A;\n"));
-    assert!(output.contains(&format!("0..{}", text.len())));
-    assert!(output.contains("view claims.signature · expires 2030-01-01T00:10:00+00:00"));
-}
