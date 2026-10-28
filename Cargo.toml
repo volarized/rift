@@ -193,7 +193,10 @@ zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2
 
 # Embedded ty: git dependencies pinned to the ruff submodule sha of ty release
 # 0.0.84. ty_project and ty_ide are unpublished, so git is the only route.
-ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
+# ty_project's default `zstd` feature compresses the bundled typeshed archive with zstd,
+# the only path that enables zip's zstd backend. `deflate` builds that archive with the
+# zlib-rs backend Rift's own zip dependency already selects, as Ruff's ty_wasm does.
+ty_project = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a", default-features = false, features = ["deflate"] }
 ty_ide = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
 ruff_db = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a", features = ["os"] }
 ruff_notebook = { git = "https://github.com/astral-sh/ruff", rev = "11aaa39f84c0c44bdfb4c9cc21e4038c6f74c00a" }
