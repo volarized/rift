@@ -253,10 +253,8 @@ impl RiftProxy {
         if params.rev.is_some() {
             return Ok(None);
         }
-        let name = match &params.scope {
-            rift_protocol::read::SearchScope::NamedLocal { name } => name.clone(),
-            rift_protocol::read::SearchScope::ProfileLocal { name } => format!("#{name}"),
-            _ => return Ok(None),
+        let Some(name) = super::super::identity::scope_key(&params.scope) else {
+            return Ok(None);
         };
         let backend = self.call_backend(request)?;
         let upstream = dispatch_read_request(request, &name)?;
@@ -481,12 +479,7 @@ fn dispatch_read_request(
             *target = super::super::identity::dispatch_id(target, backend)?;
         }
     }
-    let project = match &params.scope {
-        rift_protocol::read::SearchScope::NamedLocal { name } => Some(name.clone()),
-        rift_protocol::read::SearchScope::ProfileLocal { name } => Some(format!("#{name}")),
-        _ => None,
-    };
-    if let Some(name) = project {
+    if let Some(name) = super::super::identity::scope_key(&params.scope) {
         if name != backend {
             return Err(invalid("scope", "captured backend context does not match"));
         }
@@ -809,8 +802,8 @@ mod tests {
     fn selected_search_dispatch_preserves_pattern_change_and_scope_boundary()
     -> Result<(), Box<dyn std::error::Error>> {
         for (scope, backend, foreign) in [
-            ("local@docs", "docs", "#docs"),
-            ("local#docs", "#docs", "docs"),
+            ("local@docs", "docs", ":docs"),
+            ("local:docs", ":docs", "docs"),
         ] {
             for selector in [
                 serde_json::json!({"pattern":"beacon", "target":"symbol"}),

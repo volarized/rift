@@ -35,10 +35,7 @@ pub(crate) fn validated_root(root: &Path, owner: &SymbolOwner) -> Result<PathBuf
             io::Error::new(io::ErrorKind::InvalidInput, format!("{error:?}")),
         )
     })?;
-    if !matches!(
-        owner,
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. }
-    ) {
+    if !owner.is_local() {
         return Err(invalid(
             root,
             io::Error::new(io::ErrorKind::InvalidInput, "owner is not local"),

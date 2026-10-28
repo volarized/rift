@@ -29,6 +29,8 @@
 //! sharing, and re-election, and add the few helpers only they use.
 
 mod engine_fixture;
+#[path = "mcp_proxy/extra_profiles.rs"]
+mod extra_profiles;
 #[path = "../../rift-mcp/tests/global_api.rs"]
 #[allow(
     dead_code,

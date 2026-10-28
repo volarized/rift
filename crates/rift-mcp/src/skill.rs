@@ -210,8 +210,9 @@ fn skill_markdown(form: SkillForm) -> String {
         "Read `rift://map` first for served languages, workspace layout, and language server \
          recommendations. When configuring language servers, run listed `rift config set` \
          commands from the workspace root. After creating a named profile, reconnect MCP to \
-         use its `local#name` scope. Profiles are defined in the root `rift.toml`; \
-         `local@name` selects an extra workspace registered through `[mcp.extra]`.\n\n",
+         use its `local:name` scope. Profiles are defined in the root `rift.toml`; \
+         `local@name` selects an extra workspace registered through `[mcp.extra]`, and \
+         `local@name:profile` selects a profile defined in that workspace's own `rift.toml`.\n\n",
     );
     rendered.push_str("## Which tool\n\n");
     rendered.push_str("| Situation | Tool |\n");

@@ -9,7 +9,7 @@ Rift indexes this workspace's source and serves it over MCP: structured search, 
 
 Rift writes no source: apply a change with your own edit tools.
 
-Read `rift://map` first for served languages, workspace layout, and language server recommendations. When configuring language servers, run listed `rift config set` commands from the workspace root. After creating a named profile, reconnect MCP to use its `local#name` scope. Profiles are defined in the root `rift.toml`; `local@name` selects an extra workspace registered through `[mcp.extra]`.
+Read `rift://map` first for served languages, workspace layout, and language server recommendations. When configuring language servers, run listed `rift config set` commands from the workspace root. After creating a named profile, reconnect MCP to use its `local:name` scope. Profiles are defined in the root `rift.toml`; `local@name` selects an extra workspace registered through `[mcp.extra]`, and `local@name:profile` selects a profile defined in that workspace's own `rift.toml`.
 
 ## Which tool
 

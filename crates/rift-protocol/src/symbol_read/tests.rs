@@ -260,6 +260,8 @@ fn exact_request_schema_advertises_codec_owners_and_declaration_bounds() {
     for id in [
         ID,
         "rift://symbol/local@cloud/rust/app/load",
+        "rift://symbol/local:docs/typescript/page/beacon",
+        "rift://symbol/local@cloud:docs/typescript/page/beacon",
         "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
         "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
         "rift://symbol/cargo/packages.example%2Freleases/demo@1.2.3/rust/demo/run",

@@ -91,7 +91,7 @@ fn render(root: &Path, recommendations: Vec<LspRecommendation>) -> Result<String
                     rift_protocol::read::SearchScope::ProfileLocal { name } => {
                         let _ = writeln!(
                             output,
-                            "  scope: local#{name}\n  primary source excludes this project folder"
+                            "  scope: local:{name}\n  primary source excludes this project folder"
                         );
                     }
                     rift_protocol::read::SearchScope::NamedLocal { name } => {
@@ -196,8 +196,8 @@ mod tests {
             output.contains("executable: .venv/bin/pyright-langserver"),
             "{output}"
         );
-        assert!(output.contains("scope: local#docs"), "{output}");
-        assert!(output.contains("scope: local#project-1"), "{output}");
+        assert!(output.contains("scope: local:docs"), "{output}");
+        assert!(output.contains("scope: local:project-1"), "{output}");
         assert!(output.contains("'--profile-root=docs space'"), "{output}");
         let commands: Vec<_> = output
             .lines()
@@ -384,7 +384,7 @@ mod tests {
         std::fs::write(&primary_path, &original)?;
         let output = recommend(root.path())?;
         assert!(output.contains("scope: local@docs"), "{output}");
-        assert!(output.contains("scope: local#docs"), "{output}");
+        assert!(output.contains("scope: local:docs"), "{output}");
         let command = output
             .lines()
             .map(str::trim)

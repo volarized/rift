@@ -346,8 +346,11 @@ The request's `scope` selects its corpus:
 
 - `local`, the default, searches the primary project
 - `local@name` searches one extra project accepted by the connection
+- <VersionBadge version="v0.0.72" inline /> `local:name` searches one profile defined in the root
+  `rift.toml`, and `local@name:profile` one profile defined in an extra project's own `rift.toml`
 - `global` searches collected package and runtime facts selected by the dependency context
-- `all` searches the primary project, accepted extra projects, and global facts and merges the ranked results
+- `all` searches the primary project, profiles, accepted extra projects with their profiles, and
+  global facts and merges the ranked results
 
 <VersionBadge version="v0.0.46" />
 

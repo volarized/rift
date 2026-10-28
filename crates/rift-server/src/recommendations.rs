@@ -165,7 +165,7 @@ impl LspRecommendationInputs {
 /// # Errors
 ///
 /// Returns an error when the home directory is unavailable or the folder cannot be read.
-fn registered_project_root(root: &Path, saved: &str) -> Result<PathBuf, RiftError> {
+pub(crate) fn registered_project_root(root: &Path, saved: &str) -> Result<PathBuf, RiftError> {
     let path = root.join("rift.toml");
     let selected = if saved == "~" || saved.starts_with("~/") {
         let home = std::env::home_dir().ok_or_else(|| {

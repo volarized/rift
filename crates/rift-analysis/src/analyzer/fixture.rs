@@ -56,7 +56,14 @@ fn unavailable_syntax_keeps_local_profile_and_extra_error_labels_distinct() {
             SymbolOwner::ProfileLocal {
                 name: "docs".to_owned(),
             },
-            "local#docs",
+            "local:docs",
+        ),
+        (
+            SymbolOwner::NamedProfileLocal {
+                project: "docs".to_owned(),
+                name: "docs".to_owned(),
+            },
+            "local@docs:docs",
         ),
         (
             SymbolOwner::Runtime {

@@ -281,7 +281,7 @@ async fn require_profile_scope(
         client,
         "search",
         &json!({
-            "query":"beacon", "target":"symbol", "scope":"local#docs",
+            "query":"beacon", "target":"symbol", "scope":"local:docs",
             "paths":{"include":["lib.rs"]}, "include":["source"],
         }),
     )
@@ -294,8 +294,8 @@ async fn require_profile_scope(
     assert!(
         symbol_id(&scoped.results[0])?
             .as_str()
-            .starts_with("rift://symbol/local%23docs/"),
-        "profile identities escape the scope separator"
+            .starts_with("rift://symbol/local:docs/"),
+        "profile identities carry the scope owner"
     );
     require_profile_pattern(client).await?;
     let extra = within(
@@ -323,7 +323,7 @@ async fn require_profile_pattern(
         client,
         "search",
         &json!({
-            "pattern":"pub fn beacon", "target":"symbol", "scope":"local#docs",
+            "pattern":"pub fn beacon", "target":"symbol", "scope":"local:docs",
             "paths":{"include":["lib.rs"]}, "include":["source"],
         }),
     )

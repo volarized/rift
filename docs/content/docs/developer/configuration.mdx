@@ -781,10 +781,13 @@ installation. Profile source paths and language `include` and `exclude` patterns
 to `docs/`. The primary project leaves the profile directory to that profile, so `all` returns
 each source once.
 
-Search selects the profile with `scope: "local#docs"`. Its symbol identities carry the
-`local%23docs` owner, for example `rift://symbol/local%23docs/typescript/page/beacon`.
+<VersionBadge version="v0.0.72" />
+
+Search selects the profile with `scope: "local:docs"`. Its symbol identities carry the
+`local:docs` owner, for example `rift://symbol/local:docs/typescript/page/beacon`.
 The primary project's symbols keep the `local` owner. A `query` search with `scope: "all"`
-includes the primary project, profiles, registered extra projects, and global facts.
+includes the primary project, profiles, registered [extra projects](#extra-projects) with their
+profiles, and global facts.
 
 After creating a named profile, reconnect the MCP client before searching its scope or
 including it in `all` results. Existing profiles accept language selections on later requests.
@@ -793,20 +796,72 @@ Profile roots stay below the root project and cannot overlap another profile roo
 selects its own languages and can refer to shared top-level `lsp` definitions. Rift reads the
 profile from the root configuration when serving that directory. A profile can override
 dependency and execution settings. Profile roots hold at most 63 path segments and cannot cross
-a Git repository boundary; register a separate repository through `[mcp.extra]`.
+a Git repository boundary; register a separate repository through
+[`[mcp.extra]`](#extra-projects).
 
 Profiles inherit shared server and provider settings. Profile servers use the default port
 range; the root's `server.port` and `server.port_range` apply to the primary project.
 
-`[mcp.extra]` registers additional workspaces, each with its own root configuration:
+### Extra projects
+
+`[mcp.extra]` registers additional workspaces, each with its own root configuration. A relative
+path starts at the primary project root. `rift mcp --extra name=path` adds a registration for one
+connection and replaces a saved one with the same name.
+
+<VersionBadge version="v0.0.72" />
+
+Each extra project also serves the profiles its own `rift.toml` defines. Rift serves each such
+profile from its folder with that project's profile settings, as the extra project's own server
+would. Rift does not follow the extra project's own `[mcp.extra]` registrations.
+
+Consider a primary project that registers two repositories next to it:
 
 ```toml
 [mcp.extra]
-cloud = "../rift-cloud"
+api = "../api"
+web = "../web"
 ```
 
-Search selects that workspace with `scope: "local@cloud"`; its symbols carry `local@cloud`.
-Extra registrations do not define profiles. Rift imports direct extra registrations only.
+The `web` repository keeps a documentation site in `docs/` and defines a profile for it in its own
+`rift.toml`:
+
+```toml
+[profiles.docs]
+root = "docs"
+
+[profiles.docs.languages.typescript.lsp]
+package_manager = "bun"
+```
+
+The connection then accepts these scopes:
+
+| Scope | Searches |
+| --- | --- |
+| `local` | The primary project |
+| `local@api` | `../api` |
+| `local@web` | `../web`, without its `docs/` folder |
+| `local@web:docs` | `../web/docs`, with the `docs` profile's settings |
+| `all` | Every scope above and global facts |
+
+Symbols carry the same owner as the scope that serves them, for example
+`rift://symbol/local@web:docs/typescript/page/beacon`. A scope naming a project or profile the
+connection did not register, such as `local@web:api`, fails with `parameter_invalid` listing the
+accepted scopes.
+
+`rift mcp` reads each extra project's `rift.toml` when it starts. When that file can't be read or
+fails validation, the connection still starts and `local@name` stays registered; its server
+reports the refusal when a request reaches it. That project serves no profiles: `all` leaves them
+out, and a scope such as `local@web:docs` fails with the same refusal.
+
+A profile whose root is already registered, as the primary project or another extra project,
+stops the connection from starting with `configuration_invalid`. So does a primary project profile
+whose folder holds, or lies inside, an extra project or one of its profiles.
+
+A saved registration whose folder lies below the primary project root leaves that folder out of
+the primary project's index, so its files are served once, under `local@name`. `rift server`
+reads only the saved `rift.toml`, so `rift mcp` refuses a `--extra` registration below the
+primary project root, and one that replaces a saved registration below it, with
+`configuration_invalid`. Save such a registration in `[mcp.extra]` instead.
 
 ### Language engines
 

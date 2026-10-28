@@ -1927,7 +1927,9 @@ const ANCESTRY_MARKERS: [u8; 2] = *b"~^";
 /// Which corpus a read searches. The names identify logical corpora, not storage
 /// locations: `global` reaches collected package and runtime facts selected by the dependency context.
 /// A `local@name` scope selects an extra project accepted by the current connection.
-/// A `local#name` scope selects a profile defined in the root configuration.
+/// A `local:name` scope selects a profile defined in the root configuration.
+/// A `local@name:profile` scope selects a profile defined in the root configuration of
+/// that extra project.
 #[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum SearchScope {
     /// The project tree the server serves.
@@ -1935,7 +1937,8 @@ pub enum SearchScope {
     Local,
     /// Collected package and runtime facts selected by the dependency context.
     Global,
-    /// The primary project, configured profiles, accepted extra projects, and global facts, merged by rank.
+    /// The primary project, configured profiles, accepted extra projects with their profiles,
+    /// and global facts, merged by rank.
     All,
     /// One extra project accepted by the current connection.
     NamedLocal {
@@ -1947,31 +1950,58 @@ pub enum SearchScope {
         /// Accepted profile name.
         name: String,
     },
+    /// One profile defined in the root configuration of an extra project.
+    NamedProfileLocal {
+        /// Accepted registration name of the extra project.
+        project: String,
+        /// Profile name defined in that project's root configuration.
+        name: String,
+    },
+}
+
+impl SearchScope {
+    /// The project owner this scope selects, absent for the primary project, `global`, and `all`.
+    #[must_use]
+    pub fn project_owner(&self) -> Option<crate::identity::SymbolOwner> {
+        match self {
+            Self::NamedLocal { name } => {
+                Some(crate::identity::SymbolOwner::NamedLocal { name: name.clone() })
+            }
+            Self::ProfileLocal { name } => {
+                Some(crate::identity::SymbolOwner::ProfileLocal { name: name.clone() })
+            }
+            Self::NamedProfileLocal { project, name } => {
+                Some(crate::identity::SymbolOwner::NamedProfileLocal {
+                    project: project.clone(),
+                    name: name.clone(),
+                })
+            }
+            Self::Local | Self::Global | Self::All => None,
+        }
+    }
+
+    /// Whether this scope searches one project tree alone.
+    #[must_use]
+    pub const fn is_project(&self) -> bool {
+        matches!(
+            self,
+            Self::Local
+                | Self::NamedLocal { .. }
+                | Self::ProfileLocal { .. }
+                | Self::NamedProfileLocal { .. }
+        )
+    }
 }
 
 impl Serialize for SearchScope {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            Self::Local => serializer.serialize_str("local"),
-            Self::Global => serializer.serialize_str("global"),
-            Self::All => serializer.serialize_str("all"),
-            Self::NamedLocal { name } | Self::ProfileLocal { name } => {
-                if name.len() > crate::identity::SYMBOL_ID_BYTES_MAX {
-                    let error = rift_error::errors::core::symbol_identity_invalid()
-                        .violation("Length")
-                        .error();
-                    return Err(serde::ser::Error::custom(error));
-                }
-                let owner = match self {
-                    Self::ProfileLocal { .. } => {
-                        crate::identity::SymbolOwner::ProfileLocal { name: name.clone() }
-                    }
-                    _ => crate::identity::SymbolOwner::NamedLocal { name: name.clone() },
-                };
-                let scope = owner.local_scope().map_err(serde::ser::Error::custom)?;
-                serializer.serialize_str(&scope)
-            }
-        }
+        let scope = match (self, self.project_owner()) {
+            (_, Some(owner)) => owner.local_scope().map_err(serde::ser::Error::custom)?,
+            (Self::Global, None) => "global".to_owned(),
+            (Self::All, None) => "all".to_owned(),
+            (_, None) => "local".to_owned(),
+        };
+        serializer.serialize_str(&scope)
     }
 }
 
@@ -1988,6 +2018,9 @@ impl<'de> Deserialize<'de> for SearchScope {
                     crate::identity::SymbolOwner::NamedLocal { name } => Self::NamedLocal { name },
                     crate::identity::SymbolOwner::ProfileLocal { name } => {
                         Self::ProfileLocal { name }
+                    }
+                    crate::identity::SymbolOwner::NamedProfileLocal { project, name } => {
+                        Self::NamedProfileLocal { project, name }
                     }
                     _ => Self::Local,
                 })
@@ -2009,10 +2042,10 @@ impl JsonSchema for SearchScope {
                 {"enum": ["local", "global", "all"]},
                 {
                     "pattern": crate::identity::LOCAL_SCOPE_PATTERN,
-                    "not": {"enum": ["local@local", "local@global", "local@all", "local#local", "local#global", "local#all"]}
+                    "not": {"pattern": crate::identity::LOCAL_SCOPE_RESERVED_PATTERN}
                 }
             ],
-            "description": "Which corpus a read searches. local@name selects an accepted extra project; local#name selects a root-defined profile."
+            "description": "Which corpus a read searches. local@name selects an accepted extra project; local:name selects a root-defined profile; local@name:profile selects a profile defined by that extra project."
         })
     }
 }
@@ -2792,9 +2825,16 @@ mod tests {
                 },
             ),
             (
-                "local#cloud",
+                "local:cloud",
                 SearchScope::ProfileLocal {
                     name: "cloud".to_owned(),
+                },
+            ),
+            (
+                "local@cloud:docs",
+                SearchScope::NamedProfileLocal {
+                    project: "cloud".to_owned(),
+                    name: "docs".to_owned(),
                 },
             ),
         ] {
@@ -2816,14 +2856,22 @@ mod tests {
             "local@Cloud",
             "local@cloud/path",
             "local@cloud%2D",
-            "local#",
-            "local#local",
-            "local#global",
-            "local#all",
-            "local#Cloud",
-            "local#cloud/path",
-            "local#cloud%2D",
+            "local:",
+            "local:local",
+            "local:global",
+            "local:all",
+            "local:Cloud",
+            "local:cloud/path",
+            "local:cloud%2D",
+            "local#cloud",
             "local%23cloud",
+            "local@cloud:",
+            "local@cloud:all",
+            "local@all:docs",
+            "local@cloud:Docs",
+            "local@cloud#docs",
+            "local:docs@cloud",
+            "local@cloud:docs:api",
             "npm/npmjs.org/beacon@1.0.0",
         ] {
             assert!(!validator.is_valid(&json!(wire)));
@@ -2836,6 +2884,20 @@ mod tests {
             "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX + 1),
         ] {
             assert!(serde_json::to_value(SearchScope::NamedLocal { name: name.clone() }).is_err());
+            assert!(
+                serde_json::to_value(SearchScope::NamedProfileLocal {
+                    project: "cloud".to_owned(),
+                    name: name.clone(),
+                })
+                .is_err()
+            );
+            assert!(
+                serde_json::to_value(SearchScope::NamedProfileLocal {
+                    project: name.clone(),
+                    name: "docs".to_owned(),
+                })
+                .is_err()
+            );
             assert!(serde_json::to_value(SearchScope::ProfileLocal { name }).is_err());
         }
     }
@@ -2863,13 +2925,81 @@ mod tests {
     }
 
     #[test]
+    fn reserved_scope_words_agree_between_codec_and_schema_in_every_position() {
+        let schema = serde_json::to_value(schema_for!(SearchScope)).expect("scope schema");
+        let validator = jsonschema::validator_for(&schema).expect("scope schema compiles");
+        let positions: [fn(&str) -> String; 4] = [
+            |word| format!("local@{word}"),
+            |word| format!("local:{word}"),
+            |word| format!("local@{word}:docs"),
+            |word| format!("local@cloud:{word}"),
+        ];
+        for (word, reserved) in [
+            ("local", true),
+            ("global", true),
+            ("all", true),
+            ("locals", false),
+            ("global-api", false),
+            ("all_docs", false),
+            ("allx", false),
+        ] {
+            assert_eq!(
+                crate::identity::valid_registration_name(word),
+                !reserved,
+                "{word}"
+            );
+            for position in positions {
+                let scope = position(word);
+                let codec = serde_json::from_value::<SearchScope>(json!(scope)).is_ok();
+                assert_eq!(codec, !reserved, "codec: {scope}");
+                assert_eq!(
+                    validator.is_valid(&json!(scope)),
+                    !reserved,
+                    "schema: {scope}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_extra_profile_scope_bound_matches_the_shared_codec_and_schema() {
+        let name = "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX - "local@cloud:".len());
+        let scope = SearchScope::NamedProfileLocal {
+            project: "cloud".to_owned(),
+            name: name.clone(),
+        };
+        let wire = serde_json::to_value(&scope).expect("exact extra profile bound serializes");
+        assert_eq!(
+            serde_json::from_value::<SearchScope>(wire.clone())
+                .expect("exact extra profile bound parses"),
+            scope
+        );
+        let schema = serde_json::to_value(schema_for!(SearchScope)).expect("scope schema");
+        let validator = jsonschema::validator_for(&schema).expect("scope schema compiles");
+        assert!(validator.is_valid(&wire));
+        let overbound = json!(format!("local@cloud:{name}x"));
+        assert!(!validator.is_valid(&overbound));
+        assert!(serde_json::from_value::<SearchScope>(overbound).is_err());
+        assert_eq!(
+            scope.project_owner(),
+            Some(crate::identity::SymbolOwner::NamedProfileLocal {
+                project: "cloud".to_owned(),
+                name,
+            })
+        );
+        assert!(scope.is_project());
+        assert!(!SearchScope::All.is_project());
+        assert_eq!(SearchScope::Global.project_owner(), None);
+    }
+
+    #[test]
     fn search_profile_scope_bound_and_default_preserve_primary_project() {
         assert_eq!(SearchScope::default(), SearchScope::Local);
         assert_ne!(
-            serde_json::from_value::<SearchScope>(json!("local#docs")).expect("profile scope"),
+            serde_json::from_value::<SearchScope>(json!("local:docs")).expect("profile scope"),
             serde_json::from_value::<SearchScope>(json!("local@docs")).expect("extra scope"),
         );
-        let name = "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX - "local#".len());
+        let name = "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX - "local:".len());
         let scope = SearchScope::ProfileLocal { name: name.clone() };
         let wire = serde_json::to_value(&scope).expect("exact profile bound serializes");
         assert_eq!(
@@ -2880,7 +3010,7 @@ mod tests {
         let schema = serde_json::to_value(schema_for!(SearchScope)).expect("scope schema");
         let validator = jsonschema::validator_for(&schema).expect("scope schema compiles");
         assert!(validator.is_valid(&wire));
-        let overbound = json!(format!("local#{name}x"));
+        let overbound = json!(format!("local:{name}x"));
         assert!(!validator.is_valid(&overbound));
         assert!(serde_json::from_value::<SearchScope>(overbound).is_err());
         assert!(

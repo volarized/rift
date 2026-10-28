@@ -286,9 +286,10 @@ fn captured_metadata(input: &NamespaceInput<'_>) -> Option<PackageMetadata> {
             version,
             ..
         } => manager == "npm" && metadata.name == *name && metadata.version == *version,
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. } => {
-            !metadata.name.is_empty()
-        }
+        SymbolOwner::Local
+        | SymbolOwner::NamedLocal { .. }
+        | SymbolOwner::ProfileLocal { .. }
+        | SymbolOwner::NamedProfileLocal { .. } => !metadata.name.is_empty(),
         SymbolOwner::Runtime { .. } => false,
     };
     accepted.then_some(metadata)

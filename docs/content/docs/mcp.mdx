@@ -198,9 +198,10 @@ in the project's dependencies by changing `scope`:
 | --- | --- |
 | `local` | Primary project code, the default |
 | `local@name` | One extra project accepted by the connection |
-| `local#name` | One profile defined in the root `rift.toml` |
+| `local:name` | One profile defined in the root `rift.toml` |
+| `local@name:profile` | One profile defined in the extra project's own `rift.toml` |
 | `global` | Collected package and runtime facts selected by the dependency context |
-| `all` | Primary project, accepted extra projects, and global facts |
+| `all` | Primary project, profiles, accepted extra projects with their profiles, and global facts |
 
 An `all` search retains identities from the primary project, a named local project, and a
 served package in one answer:

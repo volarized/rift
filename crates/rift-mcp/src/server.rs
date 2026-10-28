@@ -2354,8 +2354,9 @@ impl RiftMcp {
     /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
     /// tree: `global` answers collected package and runtime facts selected by the project's
     /// dependency context. Explicit `packages` replaces versions of named packages or adds
-    /// packages the context lacks. `local@name` selects an accepted extra project; `local#name` selects a root-defined profile.
-    /// `all` merges the primary project, profiles, accepted extra projects, and global results. `target: "commit"` matches
+    /// packages the context lacks. `local@name` selects an accepted extra project; `local:name` selects a root-defined profile;
+    /// `local@name:profile` selects a profile defined in that extra project's own `rift.toml`.
+    /// `all` merges the primary project, profiles, accepted extra projects with their profiles, and global results. `target: "commit"` matches
     /// `query` alone against the messages of the commits the history store holds.
     /// Use `get_symbol` with an exact canonical identity returned by search.
     ///
@@ -2605,14 +2606,7 @@ impl RiftMcp {
         deadline: RequestDeadline,
     ) -> Result<Json<SearchResult>, ToolFailure> {
         let references = Arc::new(references);
-        if params.pattern.is_some()
-            && !matches!(
-                params.scope,
-                SearchScope::Local
-                    | SearchScope::NamedLocal { .. }
-                    | SearchScope::ProfileLocal { .. }
-            )
-        {
+        if params.pattern.is_some() && !params.scope.is_project() {
             return self
                 .route_pattern_search(resolved, params, answer, warnings, references, deadline)
                 .await;
@@ -2624,15 +2618,7 @@ impl RiftMcp {
         let remote_query = (params.target != rift_protocol::read::SearchParamsTarget::File)
             .then_some(parsed)
             .flatten();
-        let (Some(parsed), false) = (
-            remote_query,
-            matches!(
-                params.scope,
-                SearchScope::Local
-                    | SearchScope::NamedLocal { .. }
-                    | SearchScope::ProfileLocal { .. }
-            ),
-        ) else {
+        let (Some(parsed), false) = (remote_query, params.scope.is_project()) else {
             let mut answer = self
                 .current_tree_search_selected(&resolved, params, answer, references)
                 .await?;

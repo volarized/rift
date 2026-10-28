@@ -472,12 +472,7 @@ impl RiftMcp {
         ToolFailure,
     > {
         if params.target == rift_protocol::read::SearchParamsTarget::File
-            || matches!(
-                params.scope,
-                rift_protocol::read::SearchScope::Local
-                    | rift_protocol::read::SearchScope::NamedLocal { .. }
-                    | rift_protocol::read::SearchScope::ProfileLocal { .. }
-            )
+            || params.scope.is_project()
         {
             return Ok((None, Vec::new()));
         }

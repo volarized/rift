@@ -135,3 +135,28 @@ fn accepted_registration_names_fit_the_canonical_local_scope() {
         }
     }
 }
+
+#[test]
+fn registration_names_refuse_a_profile_separator_in_codec_and_schema() {
+    let schema = serde_json::to_value(schemars::schema_for!(McpConfiguration)).expect("schema");
+    let validator = jsonschema::validator_for(&schema).expect("registration schema");
+    for name in ["a:b", "cloud:docs", ":docs", "cloud:"] {
+        let value = json!({"extra": {name: "."}});
+        let configuration: McpConfiguration =
+            serde_json::from_value(value.clone()).expect("registration shape");
+        assert!(!validator.is_valid(&value), "{name}");
+        let error = configuration
+            .validate()
+            .expect_err("a profile separator cannot name a registration");
+        assert_eq!(
+            error.context().collect::<Vec<_>>(),
+            ConfigurationViolation::McpRegistrationInvalid {
+                field: "mcp.extra",
+                name: name.to_owned(),
+                detail: "registration name is not canonical",
+            }
+            .evidence(),
+            "{name}"
+        );
+    }
+}

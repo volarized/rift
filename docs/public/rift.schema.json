@@ -1462,7 +1462,7 @@
     },
     "ProfileConfiguration": {
       "additionalProperties": false,
-      "description": "One project folder served as `local#name` from the root `rift.toml`.",
+      "description": "One project folder served as `local:name` from the root `rift.toml`.",
       "properties": {
         "dependencies": {
           "anyOf": [

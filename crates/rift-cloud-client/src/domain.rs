@@ -300,7 +300,10 @@ fn canonical_candidate(
             }
             None
         }
-        SymbolOwner::Local | SymbolOwner::NamedLocal { .. } | SymbolOwner::ProfileLocal { .. } => {
+        SymbolOwner::Local
+        | SymbolOwner::NamedLocal { .. }
+        | SymbolOwner::ProfileLocal { .. }
+        | SymbolOwner::NamedProfileLocal { .. } => {
             return Err(invalid("symbol.id"));
         }
     };
