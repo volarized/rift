@@ -4688,6 +4688,7 @@ dependencies = [
  "unicode-normalization",
  "url",
  "zip 9.1.2",
+ "zstd",
 ]
 
 [[package]]

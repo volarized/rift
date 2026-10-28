@@ -190,6 +190,7 @@ unicode-normalization = "0.1.24"
 unicode-ident = "1.0.24"
 unicode-width = "0.2.2"
 zip = { version = "=9.1.2", default-features = false, features = ["deflate-flate2-zlib-rs", "zstd"] }
+zstd = { version = "=0.14.3", default-features = false }
 
 # Embedded ty: git dependencies pinned to the ruff submodule sha of ty release
 # 0.0.84. ty_project and ty_ide are unpublished, so git is the only route.
