@@ -2925,6 +2925,43 @@ mod tests {
     }
 
     #[test]
+    fn reserved_scope_words_agree_between_codec_and_schema_in_every_position() {
+        let schema = serde_json::to_value(schema_for!(SearchScope)).expect("scope schema");
+        let validator = jsonschema::validator_for(&schema).expect("scope schema compiles");
+        let positions: [fn(&str) -> String; 4] = [
+            |word| format!("local@{word}"),
+            |word| format!("local:{word}"),
+            |word| format!("local@{word}:docs"),
+            |word| format!("local@cloud:{word}"),
+        ];
+        for (word, reserved) in [
+            ("local", true),
+            ("global", true),
+            ("all", true),
+            ("locals", false),
+            ("global-api", false),
+            ("all_docs", false),
+            ("allx", false),
+        ] {
+            assert_eq!(
+                crate::identity::valid_registration_name(word),
+                !reserved,
+                "{word}"
+            );
+            for position in positions {
+                let scope = position(word);
+                let codec = serde_json::from_value::<SearchScope>(json!(scope)).is_ok();
+                assert_eq!(codec, !reserved, "codec: {scope}");
+                assert_eq!(
+                    validator.is_valid(&json!(scope)),
+                    !reserved,
+                    "schema: {scope}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn search_extra_profile_scope_bound_matches_the_shared_codec_and_schema() {
         let name = "x".repeat(crate::identity::SYMBOL_ID_BYTES_MAX - "local@cloud:".len());
         let scope = SearchScope::NamedProfileLocal {

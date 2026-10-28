@@ -50,6 +50,41 @@ async fn beacons(
     Ok(hits)
 }
 
+/// Asserts that `scope` is refused with the accepted scopes of the connection.
+async fn require_unregistered_scope(
+    client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+    scope: &str,
+) -> TestResult {
+    let refused = within(
+        "unregistered profile scope",
+        client.call_tool(
+            rmcp::model::CallToolRequestParams::new("search").with_arguments(
+                serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                    "query":"beacon", "target":"symbol", "scope":scope,
+                }))?,
+            ),
+        ),
+    )
+    .await?
+    .expect_err("a scope naming no registered profile is refused");
+    let rmcp::ServiceError::McpError(data) = refused else {
+        return Err(format!("expected a protocol-level refusal, got {refused:?}").into());
+    };
+    assert!(
+        data.message
+            .starts_with("tool arguments do not match the served schema"),
+        "{scope}: {}",
+        data.message
+    );
+    assert!(
+        data.message
+            .contains("accepted local@other, local@other:docs"),
+        "{scope}: {}",
+        data.message
+    );
+    Ok(())
+}
+
 /// One extra project registration serves its primary tree and each of its own profiles.
 #[tokio::test]
 async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -> TestResult {
@@ -138,18 +173,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     assert_eq!(declarations[0].source.as_deref(), Some(PROFILE_SOURCE));
 
     for scope in ["local@other:api", "local:docs"] {
-        let refused = within(
-            "unregistered profile scope",
-            client.call_tool(
-                rmcp::model::CallToolRequestParams::new("search").with_arguments(
-                    serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-                        "query":"beacon", "target":"symbol", "scope":scope,
-                    }))?,
-                ),
-            ),
-        )
-        .await?;
-        assert!(refused.is_err(), "{scope} names no registered profile");
+        require_unregistered_scope(&client, scope).await?;
     }
     client.cancel().await?;
     Ok(())

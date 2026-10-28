@@ -148,13 +148,7 @@ fn nested_extra_folders(root: &Path, configuration: &WorkspaceConfiguration) -> 
         .extra
         .values()
         .filter_map(|saved| {
-            let selected = match saved.strip_prefix('~') {
-                Some(relative) if relative.is_empty() || relative.starts_with('/') => {
-                    std::env::home_dir()?.join(relative.trim_start_matches('/'))
-                }
-                _ => root.join(saved),
-            };
-            let canonical = std::fs::canonicalize(selected).ok()?;
+            let canonical = crate::recommendations::registered_project_root(root, saved).ok()?;
             let relative = canonical.strip_prefix(root).ok()?;
             let folder = relative
                 .components()

@@ -4820,7 +4820,7 @@ fn captured_semantic_revision(
             hasher.update(name.as_bytes());
         }
         SymbolOwner::ProfileLocal { name } => {
-            hasher.update(b"local:");
+            hasher.update(b"local#");
             hasher.update(name.as_bytes());
         }
         SymbolOwner::NamedProfileLocal { project, name } => {
@@ -13611,9 +13611,21 @@ mod tests {
             },
         )
         .expect("profile context");
+        let named_profile = captured_semantic_revision(
+            &fingerprint,
+            root.path(),
+            &SymbolOwner::NamedProfileLocal {
+                project: "cloud".to_owned(),
+                name: "cloud".to_owned(),
+            },
+        )
+        .expect("named profile context");
         assert_ne!(primary, named);
         assert_ne!(primary, profile);
         assert_ne!(named, profile);
+        for other in [primary, named, profile] {
+            assert_ne!(named_profile, other);
+        }
         assert_ne!(
             primary,
             captured_semantic_revision(

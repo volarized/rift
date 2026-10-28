@@ -1930,6 +1930,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
@@ -2188,6 +2190,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
@@ -5157,6 +5161,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
@@ -5173,6 +5179,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
@@ -7806,6 +7814,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
@@ -8455,6 +8465,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],
@@ -12076,6 +12088,8 @@
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
+              "rift://symbol/local:docs/typescript/page/beacon",
+              "rift://symbol/local@cloud:docs/typescript/page/beacon",
               "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
               "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
             ],

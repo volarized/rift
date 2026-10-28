@@ -4,7 +4,7 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 use super::{CONFIGURATION_FILE_BYTES_MAX, ConfigurationViolation};
-use crate::identity::{SYMBOL_ID_BYTES_MAX, parse_local_scope};
+use crate::identity::{SYMBOL_ID_BYTES_MAX, SymbolOwner, parse_local_scope};
 
 /// The `[mcp]` table: explicit local projects registered for one connection.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -42,7 +42,8 @@ impl McpConfiguration {
             return Some(violation);
         }
         self.extra.iter().find_map(|(name, path)| {
-            let detail = if parse_local_scope(&format!("local@{name}")).is_err() {
+            let registration = parse_local_scope(&format!("local@{name}"));
+            let detail = if !matches!(registration, Ok(SymbolOwner::NamedLocal { .. })) {
                 "registration name is not canonical"
             } else if path.is_empty()
                 || path.chars().any(char::is_control)
