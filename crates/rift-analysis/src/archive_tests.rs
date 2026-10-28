@@ -146,7 +146,7 @@ fn unicode_name_zip(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         extra.extend_from_slice(&0_u32.to_le_bytes());
         extra.extend_from_slice(name.as_bytes());
         let mut options = zip::write::FullFileOptions::default();
-        options.add_extra_data(0x7075, extra, true)?;
+        options.add_extra_field(0x7075, extra, true)?;
         archive.start_file(path, options)?;
         archive.write_all(b"text")?;
     }
