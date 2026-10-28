@@ -394,6 +394,32 @@ fn refused_extra_configuration_keeps_the_extra_and_answers_its_profiles_with_the
 }
 
 #[test]
+fn registered_scope_without_backend_answers_read_unavailable() -> TestResult {
+    let (_directory, primary, _cloud) = extra_fixture("[profiles.docs]\nroot = 'docs'\n")?;
+    let configuration = saved(&[("cloud", "../cloud")]);
+    let accepted = Registrations::accept(&primary, &configuration.mcp, &[], None)?
+        .with_profiles(&primary, &configuration)?;
+    for scope in ["cloud", "cloud:docs"] {
+        let refusal = accepted.refusal(scope, "search", "scope");
+        assert_eq!(
+            refusal.slug().as_str(),
+            "rift.server.read_unavailable",
+            "{refusal}"
+        );
+        let evidence = evidence(&refusal);
+        assert_eq!(
+            evidence.get("detail").map(String::as_str),
+            Some(format!("registered project {scope} has no available backend").as_str())
+        );
+        assert_eq!(
+            evidence.get("operation").map(String::as_str),
+            Some("search")
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn profile_key_already_registered_is_refused_instead_of_replaced() -> TestResult {
     let (directory, primary, cloud) = extra_fixture("[profiles.docs]\nroot = 'docs'\n")?;
     let registrations = Registrations {
