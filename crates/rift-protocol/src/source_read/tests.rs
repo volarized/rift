@@ -1,5 +1,4 @@
 use super::*;
-use crate::read::SourceUnitSpan;
 use serde_json::json;
 
 const PROJECT: &str = "rift://source/project/src/lib.rs";
@@ -16,10 +15,10 @@ fn view(value: &str) -> CapturedView {
     }
 }
 
-fn request() -> GetSourceParams {
-    GetSourceParams {
-        unit: unit(PROJECT),
-        range: None,
+fn request() -> FindDeclarationsParams {
+    FindDeclarationsParams {
+        position_encoding: PositionEncoding::Utf8,
+        positions: vec![position(PROJECT)],
         view: None,
         rev: None,
     }
@@ -34,7 +33,7 @@ fn position(value: &str) -> SourcePosition {
 }
 
 #[test]
-fn source_selectors_require_project_history_and_refuse_legacy_owners() {
+fn position_selectors_require_project_history_and_refuse_legacy_owners() {
     let mut request = request();
     request.rev = Some(RevisionId("main~1".to_owned()));
     assert!(request.is_valid());
@@ -45,131 +44,30 @@ fn source_selectors_require_project_history_and_refuse_legacy_owners() {
         "rift://source/cargo2/src/lib.rs",
         "rift://source/npm/npmjs.org/@scope/demo@1.0.0/index.ts",
     ] {
-        request.unit = unit(value);
+        request.positions = vec![position(value)];
         assert!(
             !request.is_valid(),
             "released and custom sources do not imply Git history"
         );
     }
-    request.unit = unit(PROJECT);
+    request.positions = vec![position(PROJECT)];
     request.view = Some(view("payload.signature").id);
     assert!(!request.is_valid());
     request.view = None;
     request.rev = Some(RevisionId("main@{1}".to_owned()));
     assert!(!request.is_valid());
     assert!(
-        serde_json::from_value::<GetSourceParams>(
-            json!({"unit":"rift://source/stdlib/python/3.12.9/pathlib.py"})
+        serde_json::from_value::<SourcePosition>(
+            json!({"unit":"rift://source/stdlib/python/3.12.9/pathlib.py","line":0,"character":0})
         )
         .is_err()
     );
     assert!(
-        serde_json::from_value::<GetSourceParams>(json!({"unit":PROJECT,"name":"beacon"})).is_err()
+        serde_json::from_value::<SourcePosition>(
+            json!({"unit":PROJECT,"line":0,"character":0,"name":"beacon"})
+        )
+        .is_err()
     );
-}
-
-#[test]
-fn empty_source_is_found_and_utf8_bytes_must_match_range() {
-    let request = request();
-    let mut found = GetSourceResult::Found {
-        source: SourceExcerpt {
-            span: SourceUnitSpan {
-                unit: request.unit.clone(),
-                range: TextRange { start: 0, end: 0 },
-            },
-            text: String::new(),
-        },
-        source_complete: true,
-        view: view("payload.signature"),
-        warnings: Vec::new(),
-    };
-    assert!(found.is_valid_for(&request));
-    let GetSourceResult::Found { source, .. } = &mut found else {
-        panic!("found fixture")
-    };
-    source.text = "é".to_owned();
-    source.span.range.end = 1;
-    assert!(!found.is_valid_for(&request));
-    let GetSourceResult::Found { source, .. } = &mut found else {
-        panic!("found fixture")
-    };
-    source.span.range.end = 2;
-    assert!(found.is_valid_for(&request));
-}
-
-#[test]
-fn source_cuts_and_complete_ranges_retain_unit_and_view() {
-    let mut request = request();
-    request.range = Some(TextRange { start: 10, end: 20 });
-    request.view = Some(view("payload.signature").id);
-    let mut found = GetSourceResult::Found {
-        source: SourceExcerpt {
-            span: SourceUnitSpan {
-                unit: request.unit.clone(),
-                range: TextRange { start: 10, end: 13 },
-            },
-            text: "abc".to_owned(),
-        },
-        source_complete: false,
-        view: view("payload.signature"),
-        warnings: Vec::new(),
-    };
-    assert!(found.is_valid_for(&request));
-    let GetSourceResult::Found {
-        source_complete, ..
-    } = &mut found
-    else {
-        panic!("found fixture")
-    };
-    *source_complete = true;
-    assert!(!found.is_valid_for(&request));
-    let GetSourceResult::Found {
-        source_complete,
-        view: selected,
-        ..
-    } = &mut found
-    else {
-        panic!("found fixture")
-    };
-    *source_complete = false;
-    *selected = view("foreign.signature");
-    assert!(!found.is_valid_for(&request));
-    request.range = Some(TextRange { start: 20, end: 10 });
-    assert!(!request.is_valid());
-    request.range = Some(TextRange {
-        start: 0,
-        end: 9_007_199_254_740_992,
-    });
-    assert!(!request.is_valid());
-}
-
-#[test]
-fn missing_and_unavailable_preserve_requested_source() {
-    let request = request();
-    let missing = GetSourceResult::Missing {
-        unit: request.unit.clone(),
-        view: view("payload.signature"),
-        warnings: Vec::new(),
-    };
-    let unavailable = GetSourceResult::Unavailable {
-        unit: request.unit.clone(),
-        view: None,
-        reason: SymbolUnavailableReason::InsufficientCoverage,
-        warnings: Vec::new(),
-    };
-    for result in [missing, unavailable] {
-        assert!(result.is_valid_for(&request));
-        let encoded = serde_json::to_value(&result).expect("serialize source outcome");
-        assert_eq!(
-            serde_json::from_value::<GetSourceResult>(encoded).expect("source outcome"),
-            result
-        );
-        let foreign = GetSourceParams {
-            unit: unit(RUNTIME),
-            ..request.clone()
-        };
-        assert!(!result.is_valid_for(&foreign));
-    }
 }
 
 #[test]

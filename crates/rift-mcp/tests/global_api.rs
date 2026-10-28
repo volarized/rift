@@ -375,12 +375,6 @@ async fn global_handler(
         state.hold_read().await;
         return state.response(symbols(options.symbol, &body));
     }
-    if path.ends_with("/source") {
-        return source(options.symbol, &body, &state.view).map_or_else(
-            || StatusCode::BAD_REQUEST.into_response(),
-            |answer| state.response(answer),
-        );
-    }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
@@ -645,6 +639,9 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         .copied()
         .find(|name| collected_identity(fixture, name) == id);
     let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
+    if id == named_identity(&NAMED_POSITIONS[0]) {
+        return runtime_symbol(request, &view);
+    }
     if id == named_identity(&NAMED_POSITIONS[1]) {
         return greeting_symbol(request, &view);
     }
@@ -657,6 +654,40 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         binding["source"] = source.clone();
     }
     json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
+}
+
+/// The runtime `len` declaration, carrying the embedded standard library stub's own bytes
+/// at its range.
+fn runtime_symbol(request: &Value, view: &Value) -> Value {
+    let builtins = python_runtime::builtins();
+    let start = builtins
+        .find("def len(")
+        .expect("embedded stub declares len");
+    let end = builtins[start..]
+        .find('\n')
+        .map_or(builtins.len(), |offset| start + offset);
+    let line = builtins[..start].matches('\n').count() + 1;
+    let origin = json!({
+        "location":"stdlib", "source_kind":"authored",
+        "runtime":{"runtime":PYTHON_STANDARD_LIBRARY.1, "version":PYTHON_STANDARD_LIBRARY.2}
+    });
+    let mut declaration = json!({
+        "origin":origin, "unit":named_unit(&NAMED_POSITIONS[0]),
+        "range":{"start":start,"end":end}, "line":line,
+        "source_complete":includes_source(request),
+        "signature_indices":[], "type_indices":[], "documentation_indices":[]
+    });
+    if includes_source(request) {
+        declaration["source"] = json!(&builtins[start..end]);
+    }
+    json!({
+        "outcome":"found", "view":view,
+        "symbol":{
+            "id":named_identity(&NAMED_POSITIONS[0]), "language":"python",
+            "name":"len", "kind":"function", "origin":origin
+        },
+        "declarations":[declaration]
+    })
 }
 
 fn greeting_symbol(request: &Value, view: &Value) -> Value {
@@ -685,54 +716,6 @@ fn greeting_symbol(request: &Value, view: &Value) -> Value {
         },
         "declarations":[declaration]
     })
-}
-
-/// Reads the original collected source under its exact unit, range, and captured view.
-fn source(fixture: SymbolFixture, body: &Value, view: &Value) -> Option<Value> {
-    let request: rift_protocol::source_read::GetSourceParams =
-        serde_json::from_value(body.clone()).ok()?;
-    if !request.is_valid() {
-        return None;
-    }
-    if request
-        .view
-        .as_ref()
-        .is_some_and(|selected| Some(selected.as_str()) != view["id"].as_str())
-    {
-        return Some(json!({
-            "outcome": "unavailable", "unit": request.unit, "reason": "view_context"
-        }));
-    }
-    let runtime_unit = named_unit(&NAMED_POSITIONS[0]);
-    let greeting_unit = named_unit(&NAMED_POSITIONS[1]);
-    if request.unit.as_str() != COLLECTED_UNIT
-        && request.unit.as_str() != runtime_unit
-        && request.unit.as_str() != greeting_unit
-    {
-        return Some(json!({"outcome": "missing", "unit": request.unit, "view": view}));
-    }
-    let runtime_source = (request.unit.as_str() == runtime_unit).then(python_runtime::builtins);
-    let text = if request.unit.as_str() == greeting_unit {
-        GREETING_SOURCE
-    } else {
-        runtime_source.as_deref().unwrap_or(match fixture {
-            SymbolFixture::CasePairs => CASE_SOURCE,
-            SymbolFixture::Valid | SymbolFixture::InvalidIdentity => COLLECTED_SOURCE,
-        })
-    };
-    let range = request.range.unwrap_or(rift_protocol::read::TextRange {
-        start: 0,
-        end: u64::try_from(text.len()).ok()?,
-    });
-    let start = usize::try_from(range.start).ok()?;
-    let end = usize::try_from(range.end).ok()?;
-    let selected = text.get(start..end)?;
-    Some(json!({
-        "outcome": "found",
-        "source": {"span": {"unit": request.unit, "range": range}, "text": selected},
-        "source_complete": true,
-        "view": view
-    }))
 }
 
 /// The search page for `request`: in the precise phase, each collected declaration one of
