@@ -2,7 +2,6 @@ use super::{CANDIDATE_BYTES_MAX, CapturedViewId, RiftProxy, SavedCandidateBacken
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::search_read::SearchReadResult;
-use rift_protocol::source_read::GetSourceResult;
 use rift_protocol::symbol_read::{CapturedView, GetSymbolParams, GetSymbolResult};
 use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::model::{
@@ -20,7 +19,6 @@ impl RiftProxy {
         let arguments = request.arguments.clone().unwrap_or_default();
         match request.name.as_ref() {
             "get_symbol" => self.captured_symbol(request).await,
-            "get_source" if !arguments.contains_key("view") => self.captured_source(request).await,
             "search" if arguments.contains_key("traversal") && !arguments.contains_key("view") => {
                 self.captured_traversal(request).await
             }
@@ -120,78 +118,6 @@ impl RiftProxy {
             super::super::identity::qualify_symbol_result(&mut decoded, name)?;
             validate_symbol(&params, &decoded, None)?;
             response = symbol_response(decoded, result)?;
-        }
-        Ok(Some(response))
-    }
-
-    async fn captured_source(
-        &self,
-        request: &CallToolRequestParams,
-    ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
-        let arguments = request.arguments.clone().unwrap_or_default();
-        super::super::encode_bounded(&arguments, CANDIDATE_BYTES_MAX)
-            .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-        let params: rift_protocol::source_read::GetSourceParams =
-            serde_json::from_value(arguments.clone().into()).map_err(|source| {
-                errors::mcp::parameter_invalid()
-                    .tool("get_source")
-                    .field("arguments")
-                    .accepted(source.to_string())
-                    .error()
-            })?;
-        if !params.is_valid() {
-            return Err(invalid(
-                "source",
-                "source selectors or byte range are invalid",
-            ));
-        }
-        let (owner, _) = rift_protocol::identity::parse_source_unit_identity(params.unit.as_str())?;
-        let owner = owner.unwrap_or(SymbolOwner::Local);
-        let backend = self;
-        let root = accepted_root(backend)?;
-        let mut reservation =
-            self.candidate_views
-                .reserve_symbol("local", root, &owner, SystemTime::now())?;
-        let response = backend.forward_read(request.clone()).await?;
-        if let Ok(CallToolResponse::Complete(result)) = &response
-            && result.is_error != Some(true)
-        {
-            super::super::encode_bounded(result, CANDIDATE_BYTES_MAX)
-                .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            let value = result.structured_content.as_ref().ok_or_else(|| {
-                invalid(
-                    "structuredContent",
-                    "captured response has no structured result",
-                )
-            })?;
-            if let Some(view) = returned_view(request, value.clone())? {
-                let accepted = symbol_backend(result, &view, "local", root, &owner)?;
-                let retained = self
-                    .candidate_views
-                    .backend(&view.id, SystemTime::now())?
-                    .map_err(|reason| view_refusal(&view.id, reason))?;
-                if retained.is_some() {
-                    let (selected_backend, selected) =
-                        self.selected_read_backend(&view.id, Some(&owner))?;
-                    if !std::ptr::eq(selected_backend, backend) || selected != accepted {
-                        return Err(view_refusal(
-                            &view.id,
-                            rift_protocol::symbol_read::SymbolUnavailableReason::ViewContext,
-                        ));
-                    }
-                } else if accepted.backend == "global" {
-                    drop(reservation);
-                    let mut pending = self.candidate_views.reserve_backend(
-                        &accepted.backend,
-                        &accepted.root,
-                        accepted.owner.as_ref(),
-                        SystemTime::now(),
-                    )?;
-                    pending.finalize(&accepted, SystemTime::now())?;
-                } else {
-                    reservation.finalize(&accepted, SystemTime::now())?;
-                }
-            }
         }
         Ok(Some(response))
     }
@@ -331,7 +257,7 @@ impl RiftProxy {
         request: &CallToolRequestParams,
     ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
         let arguments = request.arguments.clone().unwrap_or_default();
-        if !matches!(request.name.as_ref(), "get_source" | "nodes" | "search") {
+        if !matches!(request.name.as_ref(), "nodes" | "search") {
             return Ok(None);
         }
         if request.name == "search" && !arguments.contains_key("traversal") {
@@ -380,9 +306,6 @@ impl RiftProxy {
             let expected = dependency::upstream_backend(&selected);
             if returned.as_ref().is_some_and(|view| view != &expected.view) {
                 return Err(invalid("view", "captured backend context does not match"));
-            }
-            if request.name == "get_source" {
-                validate_global_backend(result, &selected, returned.as_ref())?;
             }
             let mut value = value.clone();
             if selected.upstream_view.is_some() && returned.is_some() {
@@ -515,13 +438,6 @@ fn qualified_read_response(
                 serde_json::from_value(value)
                     .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
             super::super::identity::qualify_search(&mut result, backend)?;
-            bounded_response(crate::output::Json(result).into_call_tool_result())
-        }
-        "get_source" => {
-            let mut result: rift_protocol::source_read::GetSourceResult =
-                serde_json::from_value(value)
-                    .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            super::super::identity::qualify_source(&mut result, backend)?;
             bounded_response(crate::output::Json(result).into_call_tool_result())
         }
         _ => Err(invalid("view", "captured backend mapping is unavailable")),
@@ -725,22 +641,6 @@ fn returned_view(
     value: serde_json::Value,
 ) -> Result<Option<CapturedView>, RiftError> {
     match request.name.as_ref() {
-        "get_source" => {
-            let params: rift_protocol::source_read::GetSourceParams =
-                serde_json::from_value(request.arguments.clone().unwrap_or_default().into())
-                    .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            let result: rift_protocol::source_read::GetSourceResult = serde_json::from_value(value)
-                .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
-            if !result.is_valid_for(&params) {
-                return Err(invalid("view", "captured backend context does not match"));
-            }
-            Ok(match result {
-                GetSourceResult::Found { view, .. } | GetSourceResult::Missing { view, .. } => {
-                    Some(view)
-                }
-                GetSourceResult::Unavailable { view, .. } => view,
-            })
-        }
         "nodes" => {
             let result: rift_protocol::read::NodesResult = serde_json::from_value(value)
                 .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
@@ -896,34 +796,6 @@ mod tests {
         let mut missing = response.clone();
         missing.meta = None;
         assert!(validate_global_backend(&missing, &selected, Some(&view)).is_err());
-    }
-
-    #[test]
-    fn source_backend_retains_global_context_and_refuses_changed_endpoint() {
-        let params: rift_protocol::source_read::GetSourceParams = serde_json::from_value(
-            serde_json::json!({"unit":"rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"}),
-        )
-        .expect("source request");
-        assert!(params.is_valid());
-        assert!(params.view.is_none());
-        let (owner, _) = rift_protocol::identity::parse_source_unit_identity(params.unit.as_str())
-            .expect("source owner");
-        let owner = owner.expect("released owner");
-        let view = view();
-        let response = response(&view);
-        let selected = symbol_backend(&response, &view, "local", "/fixture/main", &owner)
-            .expect("fresh global source context");
-        assert_eq!(selected.backend, "global");
-        assert_eq!(selected.owner, None);
-        assert_eq!(selected.root, "/fixture/global");
-        assert_eq!(selected.view, view);
-        let mut changed = response.clone();
-        changed
-            .meta
-            .as_mut()
-            .expect("metadata")
-            .insert("root".to_owned(), serde_json::json!("/fixture/foreign"));
-        assert!(validate_global_backend(&changed, &selected, Some(&view)).is_err());
     }
 
     #[test]
