@@ -482,60 +482,6 @@
     "text": "1 error\n\tinvalid_request \u00b7 retry never\n\t\ttool arguments do not match the served schema: accepted rift://symbol/<owner>/<language>/<qualified_path>; an occurrence uses ~2?rev=<revision>, example {\"id\":\"rift://symbol/local/rust/example_project/config/Config\"}, {\"id\":\"rift://symbol/local/rust/example_project/config/load_config\"}, field id, tool get_symbol; correct the reported field and resend the request\n\t\trift.mcp.parameter_invalid\n",
     "json": null
   },
-  "project-source": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/project/README.md"
-    },
-    "text": "rift://source/project/README.md\n0..398\n\t# Example project\n\n\tA Rust project that reads workspace configuration from `rift.toml`.\n\n\t- `src/main.rs` starts the application.\n\t- `src/config.rs` loads the workspace configuration.\n\t- `src/error.rs` defines the error type returned by the loader.\n\n\tRift reads the project structure, source, and documentation to help\n\tan agent find the code relevant to its task.\n\n\t## Configuration\n\n\tCall `load_config`.\n\nview 815047e7e6f2f275e58e2b16ada429efb25cb8fc6bd70e4ad5153b6ed8540aae \u00b7 expires 2026-10-12T15:50:28.799521+00:00\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 0,
-            "end": 398
-          }
-        },
-        "text": "# Example project\n\nA Rust project that reads workspace configuration from `rift.toml`.\n\n- `src/main.rs` starts the application.\n- `src/config.rs` loads the workspace configuration.\n- `src/error.rs` defines the error type returned by the loader.\n\nRift reads the project structure, source, and documentation to help\nan agent find the code relevant to its task.\n\n## Configuration\n\nCall `load_config`.\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "815047e7e6f2f275e58e2b16ada429efb25cb8fc6bd70e4ad5153b6ed8540aae",
-        "expires_at": "2026-10-12T15:50:28.799521+00:00"
-      }
-    }
-  },
-  "project-section": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/project/README.md",
-      "range": {
-        "start": 360,
-        "end": 398
-      }
-    },
-    "text": "rift://source/project/README.md\n360..398\n\t## Configuration\n\n\tCall `load_config`.\n\nview 4c04e9840ee7a9d270a923cd35c010c840baef4da46fc29c64f921b2e76e4bc4 \u00b7 expires 2026-10-12T15:50:28.847106+00:00\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 360,
-            "end": 398
-          }
-        },
-        "text": "## Configuration\n\nCall `load_config`.\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "4c04e9840ee7a9d270a923cd35c010c840baef4da46fc29c64f921b2e76e4bc4",
-        "expires_at": "2026-10-12T15:50:28.847106+00:00"
-      }
-    }
-  },
   "pattern-search": {
     "tool": "search",
     "arguments": {
@@ -1522,31 +1468,6 @@
       }
     }
   },
-  "global-source": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
-    },
-    "text": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs\n0..45\n\tpub fn helper_beacon() {}\n\tpub fn beacon() {}\n\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
-          "range": {
-            "start": 0,
-            "end": 45
-          }
-        },
-        "text": "pub fn helper_beacon() {}\npub fn beacon() {}\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "expires_at": "2099-10-10T10:05:00Z"
-      }
-    }
-  },
   "source-less-runtime": {
     "tool": "get_symbol",
     "arguments": {
@@ -2038,62 +1959,6 @@
       "pagination": {
         "page_index": 0,
         "total_pages": 1
-      }
-    }
-  },
-  "named-project-source": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/project/README.md",
-      "view": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd"
-    },
-    "text": "rift://source/project/README.md\n0..81\n\t# Example project\n\n\tProject documentation.\n\n\t## Configuration\n\n\tCall `load_config`.\n\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 0,
-            "end": 81
-          }
-        },
-        "text": "# Example project\n\nProject documentation.\n\n## Configuration\n\nCall `load_config`.\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-        "expires_at": "2026-10-12T16:17:02.916991+00:00"
-      }
-    }
-  },
-  "named-project-section": {
-    "tool": "get_source",
-    "arguments": {
-      "unit": "rift://source/project/README.md",
-      "view": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-      "range": {
-        "start": 43,
-        "end": 81
-      }
-    },
-    "text": "rift://source/project/README.md\n43..81\n\t## Configuration\n\n\tCall `load_config`.\n\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
-    "json": {
-      "outcome": "found",
-      "source": {
-        "span": {
-          "unit": "rift://source/project/README.md",
-          "range": {
-            "start": 43,
-            "end": 81
-          }
-        },
-        "text": "## Configuration\n\nCall `load_config`.\n"
-      },
-      "source_complete": true,
-      "view": {
-        "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
-        "expires_at": "2026-10-12T16:17:02.916991+00:00"
       }
     }
   }
