@@ -66,7 +66,7 @@ jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-sy
 lsp-types = "0.97.0"
 mimalloc = { version = "=0.1.52", features = ["v2", "override"] }
 nix = { version = "0.31.3", features = ["signal"] }
-notify = "=8.2.0"
+notify = "=8.2.1"
 oas3-gen-support = "=0.28.0"
 oas3 = "=0.22.0"
 # The OTLP export stack rift-tracing owns. tracing-opentelemetry pins the opentelemetry minor it
@@ -80,7 +80,7 @@ oas3 = "=0.22.0"
 # `logs`. The SDK aggregates and its async-runtime periodic reader exports over the same
 # Tokio-driven `reqwest` client the span batches and the log record batches use.
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["logs", "metrics"] }
-opentelemetry-otlp = { version = "=0.33.0", default-features = false, features = [
+opentelemetry-otlp = { version = "=0.33.1", default-features = false, features = [
     "http-proto",
     "logs",
     "metrics",
@@ -127,7 +127,7 @@ rig-reqwest = { version = "=0.45.0", default-features = false }
 # The version toasty-driver-sqlite 0.11.0 already builds, so the history store links no
 # second SQLite.
 rusqlite = { version = "=0.40.2", features = ["bundled"] }
-rmcp = { version = "=3.6.0", default-features = false, features = ["macros", "server", "transport-io"] }
+rmcp = { version = "=3.7.0", default-features = false, features = ["macros", "server", "transport-io"] }
 same-file = "1.0.6"
 schemars = { version = "=1.2.3", default-features = false, features = ["derive", "std"] }
 semver = "1.0.28"
@@ -155,7 +155,7 @@ syn = { version = "2.0.119", features = ["full"] }
 # lock already holds.
 sysinfo = { version = "=0.39.6", default-features = false, features = ["system"] }
 thiserror = "2.0.21"
-tokio = { version = "=1.53.3", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "=1.54.1", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "=0.7.20", features = ["rt"] }
 tracing = "0.1.44"
 tracing-opentelemetry = { version = "=0.34.0", default-features = false }
@@ -178,7 +178,7 @@ tree-sitter-svelte-ng = "=1.0.2"
 tree-sitter-vue-next = "=0.1.0"
 tree-sitter-javascript = "=0.25.0"
 tree-sitter-json = "=0.24.8"
-tree-sitter-md = { version = "=0.5.3", default-features = false }
+tree-sitter-md = { version = "=0.5.4", default-features = false }
 tree-sitter-python = "=0.25.0"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-toml-ng = "=0.7.0"
