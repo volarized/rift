@@ -381,10 +381,14 @@ impl<'current> ComparedRevisions<'current> {
                 unpaired.added.push(added);
                 continue;
             };
-            let older =
-                SymbolState::Present(SymbolShape::from_source(base_file.source(), base_symbol));
-            let newer =
-                SymbolState::Present(SymbolShape::from_source(head_file.source(), head_symbol));
+            let older = SymbolState::Present(vec![SymbolShape::from_source(
+                base_file.source(),
+                base_symbol,
+            )]);
+            let newer = SymbolState::Present(vec![SymbolShape::from_source(
+                head_file.source(),
+                head_symbol,
+            )]);
             let Some(kind) = classify(&older, &newer) else {
                 continue;
             };

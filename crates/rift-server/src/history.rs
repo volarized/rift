@@ -10,8 +10,8 @@
 //! [`SymbolVersionKind`]. The caller runs either on its blocking lane; the
 //! classifier itself is sans-I/O.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -326,6 +326,48 @@ impl SymbolTimelines {
         })
     }
 
+    /// Composes one symbol's timeline over every file its declarations live in, newest
+    /// first: one timeline per distinct path and qualified name among `bindings`, merged
+    /// by commit time, versions of one time keeping their binding order. The timeline is
+    /// complete when every merged one is.
+    ///
+    /// Work is one timeline per distinct path, each under the `max_revisions` bound;
+    /// `bindings` is the index's bounded page of the symbol's declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the repository or the store cannot be read.
+    pub(crate) fn symbol_timeline(
+        &mut self,
+        bindings: &[SymbolMatch<'_>],
+        identity: SymbolId,
+    ) -> Result<SymbolHistory, RiftError> {
+        let mut composed = BTreeSet::new();
+        let mut versions = Vec::new();
+        let mut complete = true;
+        for matched in bindings {
+            let key = (
+                matched.file.path().as_str(),
+                matched.symbol.qualified_name.as_str(),
+            );
+            if !composed.insert(key) {
+                continue;
+            }
+            let provider = crate::read::language_provider(matched.file.syntax().language());
+            let timeline = self.timeline(provider, *matched, identity.clone())?;
+            complete &= timeline.complete;
+            versions.extend(timeline.versions);
+        }
+        versions.sort_by_cached_key(|version| {
+            std::cmp::Reverse(
+                chrono::DateTime::parse_from_rfc3339(&version.timestamp)
+                    .ok()
+                    .map(|time| time.timestamp()),
+            )
+        });
+        Ok(timeline_answer(identity, versions, complete))
+    }
+
     /// Composes one hit's timeline, newest first.
     ///
     /// # Errors
@@ -553,9 +595,9 @@ impl WalkedTimelines {
     }
 }
 
-/// The declaration's state at one touching commit: parsed from the
-/// committed blob, absent when the commit removed the file or the parse
-/// lacks the symbol, unknown when the blob cannot be analyzed.
+/// The symbol's state at one touching commit: every declaration of
+/// `qualified_name` the committed blob holds, absent when the commit removed
+/// the file or the parse holds none, unknown when the blob cannot be analyzed.
 fn revision_state(
     repository: &Repository,
     parses: &mut HashMap<ParseKey, Option<ParsedRevision>>,
@@ -576,14 +618,15 @@ fn revision_state(
         }
     };
     Ok(match cached {
-        Some(analysis) => analysis
-            .document
-            .symbols()
-            .iter()
-            .find(|symbol| symbol.qualified_name == qualified_name)
-            .map_or(SymbolState::Absent, |symbol| {
-                SymbolState::Present(SymbolShape::from_source(&analysis.text, symbol))
-            }),
+        Some(analysis) => SymbolState::of_declarations(
+            analysis
+                .document
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.qualified_name == qualified_name)
+                .map(|symbol| SymbolShape::from_source(&analysis.text, symbol))
+                .collect(),
+        ),
         None => SymbolState::Unknown,
     })
 }
@@ -621,17 +664,30 @@ fn parse_blob(
     Ok(document.map(|document| ParsedRevision { text, document }))
 }
 
-/// One declaration's state at one revision, as the classifier sees it.
+/// One symbol's state in one file at one revision, as the classifier sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SymbolState {
-    /// The declaration is in the parsed source, holding these bytes.
-    Present(SymbolShape),
-    /// The source parsed without the declaration, or the commit removed the
-    /// file.
+    /// The symbol's declarations are in the parsed source, holding these bytes in
+    /// source order; never empty.
+    Present(Vec<SymbolShape>),
+    /// The source parsed without any declaration of the symbol, or the commit
+    /// removed the file.
     Absent,
     /// Nothing provable: the blob did not parse, or the revision lies past
     /// the walk's examination bound.
     Unknown,
+}
+
+impl SymbolState {
+    /// The state a parse holding `shapes`, one per declaration in source order,
+    /// answers: absent when it holds none.
+    pub(crate) fn of_declarations(shapes: Vec<SymbolShape>) -> Self {
+        if shapes.is_empty() {
+            Self::Absent
+        } else {
+            Self::Present(shapes)
+        }
+    }
 }
 
 /// The byte regions the classifier compares between two adjacent states of
@@ -695,7 +751,7 @@ fn clipped(source: &str, start: u64, end: u64) -> &str {
 }
 
 /// Classifies the transition between two adjacent states of one
-/// declaration; `None` when the pair proves no change worth a version.
+/// symbol; `None` when the pair proves no change worth a version.
 pub(crate) fn classify(older: &SymbolState, newer: &SymbolState) -> Option<SymbolVersionKind> {
     match (older, newer) {
         (SymbolState::Unknown, _)
@@ -703,8 +759,36 @@ pub(crate) fn classify(older: &SymbolState, newer: &SymbolState) -> Option<Symbo
         | (SymbolState::Absent, SymbolState::Absent) => None,
         (SymbolState::Absent, SymbolState::Present(_)) => Some(SymbolVersionKind::Introduced),
         (SymbolState::Present(_), SymbolState::Absent) => Some(SymbolVersionKind::Removed),
-        (SymbolState::Present(older), SymbolState::Present(newer)) => item_change(older, newer),
+        (SymbolState::Present(older), SymbolState::Present(newer)) => {
+            declarations_change(older, newer)
+        }
     }
+}
+
+/// The declaration changes one symbol version can name, strongest first.
+const DECLARATION_CHANGE_PRECEDENCE: [SymbolVersionKind; 3] = [
+    SymbolVersionKind::SignatureChanged,
+    SymbolVersionKind::BodyChanged,
+    SymbolVersionKind::DecoratorsChanged,
+];
+
+/// Which part of a symbol's declarations changed between two revisions.
+///
+/// A declaration added or removed changes the symbol's declared interface,
+/// `SignatureChanged`. Otherwise the declarations pair in source order, and the
+/// strongest pair change wins: a signature over a body over decorators.
+fn declarations_change(older: &[SymbolShape], newer: &[SymbolShape]) -> Option<SymbolVersionKind> {
+    if older.len() != newer.len() {
+        return Some(SymbolVersionKind::SignatureChanged);
+    }
+    let changes = older
+        .iter()
+        .zip(newer)
+        .filter_map(|(older, newer)| item_change(older, newer))
+        .collect::<Vec<_>>();
+    DECLARATION_CHANGE_PRECEDENCE
+        .into_iter()
+        .find(|kind| changes.contains(kind))
 }
 
 /// Which part of a present declaration changed between two revisions.
@@ -814,7 +898,7 @@ mod tests {
     }
 
     fn present(shape: SymbolShape) -> SymbolState {
-        SymbolState::Present(shape)
+        SymbolState::Present(vec![shape])
     }
 
     #[test]
@@ -872,6 +956,32 @@ mod tests {
         assert_eq!(
             classify(&older, &newer),
             Some(SymbolVersionKind::SignatureChanged)
+        );
+    }
+
+    /// Every declaration of one symbol takes part in its state: a declaration added or
+    /// removed changes the signature, and otherwise the strongest pair change wins.
+    #[test]
+    fn classify_compares_every_declaration_of_the_symbol() {
+        let one = function_shape("", "fn beacon() ", " 1 ");
+        let two = function_shape("", "fn beacon() ", " 2 ");
+        let attributed = function_shape("#[inline] ", "fn beacon() ", " 1 ");
+        let state = |shapes: &[&SymbolShape]| {
+            SymbolState::of_declarations(shapes.iter().map(|shape| (*shape).clone()).collect())
+        };
+        assert_eq!(state(&[]), SymbolState::Absent);
+        assert_eq!(classify(&state(&[&one, &one]), &state(&[&one, &one])), None);
+        assert_eq!(
+            classify(&state(&[&one]), &state(&[&one, &one])),
+            Some(SymbolVersionKind::SignatureChanged)
+        );
+        assert_eq!(
+            classify(&state(&[&one, &one]), &state(&[&attributed, &two])),
+            Some(SymbolVersionKind::BodyChanged)
+        );
+        assert_eq!(
+            classify(&state(&[&one, &one]), &state(&[&one, &attributed])),
+            Some(SymbolVersionKind::DecoratorsChanged)
         );
     }
 
