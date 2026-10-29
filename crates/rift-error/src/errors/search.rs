@@ -153,9 +153,31 @@ __rift_error_definition!(
     query_feature_refused,
     slug = "rift.search.query_feature_refused",
     message = "SPARQL query uses {feature}, which the read-only graph does not serve",
-    action = "send a SELECT or ASK query without {feature} and resend the request",
+    action = "remove {feature} from the query and resend the request",
     fields = {
         feature: required(string),
+    },
+);
+
+__rift_error_definition!(
+    query_nesting_limit,
+    slug = "rift.search.query_nesting_limit",
+    message = "SPARQL query nests brackets {depth} deep, exceeding accepted limit {limit}",
+    action = "flatten the query below {limit} nested brackets and resend the request",
+    fields = {
+        depth: required(unsigned),
+        limit: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
+    query_operator_limit,
+    slug = "rift.search.query_operator_limit",
+    message = "SPARQL query writes {count} operator characters, exceeding accepted limit {limit}",
+    action = "split the expression below {limit} operators and resend the request",
+    fields = {
+        count: required(unsigned),
+        limit: required(unsigned),
     },
 );
 

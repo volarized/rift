@@ -36,10 +36,13 @@
 //! # Ok::<(), rift_error::RiftError>(())
 //! ```
 
+mod admission;
 mod dataset;
 mod evaluation;
+mod expression;
 mod limits;
 mod query;
+mod query_thread;
 mod vocabulary;
 
 #[cfg(test)]
@@ -53,8 +56,9 @@ pub use dataset::{
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
 pub use limits::{
-    ANSWER_BYTES_MAX, EVALUATION_TIMEOUT, GraphLimits, GraphLimitsBuilder, LITERAL_BYTES_MAX,
-    QUERY_BYTES_MAX, SOLUTIONS_MAX, TRIPLES_MAX,
+    ANSWER_BYTES_MAX, EVALUATION_TIMEOUT, EXPRESSION_BYTES_MAX, GraphLimits, GraphLimitsBuilder,
+    LITERAL_BYTES_MAX, NESTING_DEPTH_MAX, OPERATORS_MAX, QUERY_BYTES_MAX, SOLUTIONS_MAX,
+    TRIPLES_MAX,
 };
 pub use query::GraphQuery;
 pub use vocabulary::{

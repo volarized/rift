@@ -1,0 +1,284 @@
+//! Admission of a parsed query: the forms, clauses and joins the graph does not serve.
+
+use std::collections::HashSet;
+
+use oxrdf::NamedNode;
+use rift_error::{RiftError, errors};
+use spargebra::Query;
+use spargebra::algebra::{AggregateExpression, Expression, OrderExpression, QueryExpression};
+use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use spargebra::vocab::sparql;
+
+use super::expression::GROUP_CONCAT_PREFIX;
+use super::query::refused;
+
+/// The feature a join of patterns sharing no variable is refused as.
+const CARTESIAN_PRODUCT: &str = "a cartesian product of patterns sharing no variable";
+
+/// One algebra element still to inspect.
+enum Visit<'a> {
+    Pattern(&'a mut QueryExpression),
+    Expression(&'a mut Expression),
+}
+
+/// Refuses what the graph does not serve, renames each `GROUP_CONCAT` to its bounded form,
+/// and returns the separators those forms take, by index.
+///
+/// spareval's hash join checks no cancellation between the rows it joins in memory, so rows
+/// written inline would join past the deadline: the product of every `VALUES` table's row count
+/// is refused past `inline_rows_max`. Rows read from the dataset reach the token at every read.
+///
+/// The walk keeps an explicit stack, so algebra depth never deepens the call stack. Its work
+/// is one step per algebra element, bounded by the query byte bound the parser ran under,
+/// plus one in-scope variable scan of both sides of every join.
+pub(super) fn admit(query: &mut Query, inline_rows_max: usize) -> Result<Vec<String>, RiftError> {
+    let root = match query {
+        Query::Select(select) if select.dataset.is_none() => &mut select.expression,
+        Query::Ask(ask) if ask.dataset.is_none() => &mut ask.expression,
+        Query::Select(_) | Query::Ask(_) => return refused("a FROM or FROM NAMED clause"),
+        Query::Construct(_) => return refused("CONSTRUCT"),
+        Query::Describe(_) => return refused("DESCRIBE"),
+    };
+    let mut separators = Vec::new();
+    let mut inline_rows = 1_usize;
+    let mut pending = vec![Visit::Pattern(root)];
+    while let Some(visit) = pending.pop() {
+        match visit {
+            Visit::Pattern(QueryExpression::Values { bindings, .. }) => {
+                inline_rows = inline_rows.saturating_mul(bindings.len().max(1));
+            }
+            Visit::Pattern(pattern) => admit_pattern(pattern, &mut separators, &mut pending)?,
+            Visit::Expression(expression) => push_expression_children(expression, &mut pending),
+        }
+    }
+    if inline_rows > inline_rows_max {
+        return errors::search::query_answer_limit()
+            .bound("joined VALUES rows")
+            .limit(inline_rows_max)
+            .fail();
+    }
+    Ok(separators)
+}
+
+/// Refuses one pattern the graph does not serve, then pushes what it holds.
+fn admit_pattern<'a>(
+    pattern: &'a mut QueryExpression,
+    separators: &mut Vec<String>,
+    pending: &mut Vec<Visit<'a>>,
+) -> Result<(), RiftError> {
+    match pattern {
+        QueryExpression::Service { name, .. } => return refused(&format!("SERVICE {name}")),
+        QueryExpression::Bgp { patterns } if is_disconnected(patterns) => {
+            return refused(CARTESIAN_PRODUCT);
+        }
+        QueryExpression::Join { left, right } | QueryExpression::LeftJoin { left, right, .. }
+            if is_product(left, right) =>
+        {
+            return refused(CARTESIAN_PRODUCT);
+        }
+        QueryExpression::Group { aggregates, .. } => {
+            for (_, aggregate) in aggregates {
+                bound_group_concat(aggregate, separators);
+            }
+        }
+        _ => {}
+    }
+    push_pattern_children(pattern, pending);
+    Ok(())
+}
+
+/// Renames a `GROUP_CONCAT` to the bounded aggregate taking its separator.
+fn bound_group_concat(aggregate: &mut AggregateExpression, separators: &mut Vec<String>) {
+    if let AggregateExpression::FunctionCall {
+        name, scalarvals, ..
+    } = aggregate
+        && *name == sparql::AGG_GROUP_CONCAT
+    {
+        let separator = scalarvals
+            .iter()
+            .find(|(key, _)| key.as_str() == "separator")
+            .map_or(" ", |(_, value)| value.as_str());
+        *name = NamedNode::new_unchecked(format!("{GROUP_CONCAT_PREFIX}{}", separators.len()));
+        separators.push(separator.to_owned());
+    }
+}
+
+/// Whether two joined patterns form a cartesian product: both bind variables, they share
+/// none, and neither yields at most one row.
+fn is_product(left: &QueryExpression, right: &QueryExpression) -> bool {
+    let (left_variables, right_variables) = (in_scope(left), in_scope(right));
+    let unconstrained = !left_variables.is_empty()
+        && !right_variables.is_empty()
+        && left_variables.is_disjoint(&right_variables);
+    unconstrained && !at_most_one_row(left) && !at_most_one_row(right)
+}
+
+fn in_scope(pattern: &QueryExpression) -> HashSet<&str> {
+    let mut variables = HashSet::new();
+    pattern.on_in_scope_variable(|variable| {
+        variables.insert(variable.as_str());
+    });
+    variables
+}
+
+/// Whether `pattern` yields at most one solution whatever the data holds.
+fn at_most_one_row(mut pattern: &QueryExpression) -> bool {
+    loop {
+        pattern = match pattern {
+            QueryExpression::Bgp { patterns } => return patterns.is_empty(),
+            QueryExpression::Values { bindings, .. } => return bindings.len() <= 1,
+            QueryExpression::Group { variables, .. } => return variables.is_empty(),
+            QueryExpression::Slice {
+                limit: Some(limit), ..
+            } if *limit <= 1 => return true,
+            QueryExpression::Extend { inner, .. }
+            | QueryExpression::Filter { inner, .. }
+            | QueryExpression::OrderBy { inner, .. }
+            | QueryExpression::Project { inner, .. }
+            | QueryExpression::Distinct { inner }
+            | QueryExpression::Reduced { inner }
+            | QueryExpression::Slice { inner, .. } => inner,
+            _ => return false,
+        };
+    }
+}
+
+/// Whether the triple patterns of one basic graph pattern fall into two or more groups that
+/// share no variable; the parser already turned blank nodes into variables. The scan
+/// compares every pair once per reached pattern.
+fn is_disconnected(patterns: &[TriplePattern]) -> bool {
+    let terms: Vec<Vec<String>> = patterns.iter().map(pattern_terms).collect();
+    let bound: Vec<usize> = (0..terms.len())
+        .filter(|index| !terms[*index].is_empty())
+        .collect();
+    let Some(&first) = bound.first() else {
+        return false;
+    };
+    let mut reached = vec![false; terms.len()];
+    reached[first] = true;
+    let mut frontier = vec![first];
+    while let Some(index) = frontier.pop() {
+        reach_neighbors(&terms, &bound, index, &mut reached, &mut frontier);
+    }
+    bound.iter().any(|index| !reached[*index])
+}
+
+/// Marks every bound pattern sharing a term with pattern `index` reached.
+fn reach_neighbors(
+    terms: &[Vec<String>],
+    bound: &[usize],
+    index: usize,
+    reached: &mut [bool],
+    frontier: &mut Vec<usize>,
+) {
+    let neighbors = bound.iter().filter(|other| {
+        !reached[**other]
+            && terms[**other]
+                .iter()
+                .any(|term| terms[index].contains(term))
+    });
+    let neighbors: Vec<usize> = neighbors.copied().collect();
+    for other in neighbors {
+        reached[other] = true;
+        frontier.push(other);
+    }
+}
+
+/// The variables one triple pattern binds.
+fn pattern_terms(pattern: &TriplePattern) -> Vec<String> {
+    let term = |term: &TermPattern| match term {
+        TermPattern::Variable(variable) => Some(variable.as_str().to_owned()),
+        TermPattern::NamedNode(_) | TermPattern::Literal(_) => None,
+    };
+    let predicate = match &pattern.predicate {
+        NamedNodePattern::Variable(variable) => Some(variable.as_str().to_owned()),
+        NamedNodePattern::NamedNode(_) => None,
+    };
+    [term(&pattern.subject), predicate, term(&pattern.object)]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Pushes the patterns and expressions one pattern holds.
+fn push_pattern_children<'a>(pattern: &'a mut QueryExpression, pending: &mut Vec<Visit<'a>>) {
+    match pattern {
+        QueryExpression::Bgp { .. }
+        | QueryExpression::Path { .. }
+        | QueryExpression::Values { .. }
+        | QueryExpression::Service { .. } => {}
+        QueryExpression::Join { left, right }
+        | QueryExpression::Union { left, right }
+        | QueryExpression::Minus { left, right } => {
+            pending.extend([Visit::Pattern(left), Visit::Pattern(right)]);
+        }
+        QueryExpression::LeftJoin {
+            left,
+            right,
+            expression,
+        } => {
+            pending.extend([Visit::Pattern(left), Visit::Pattern(right)]);
+            pending.extend(expression.iter_mut().map(Visit::Expression));
+        }
+        QueryExpression::Filter { expr, inner } => {
+            pending.extend([Visit::Expression(expr), Visit::Pattern(inner)]);
+        }
+        QueryExpression::Extend {
+            inner, expression, ..
+        } => pending.extend([Visit::Expression(expression), Visit::Pattern(inner)]),
+        QueryExpression::OrderBy { inner, expression } => {
+            pending.push(Visit::Pattern(inner));
+            pending.extend(expression.iter_mut().map(|order| match order {
+                OrderExpression::Asc(expression) | OrderExpression::Desc(expression) => {
+                    Visit::Expression(expression)
+                }
+            }));
+        }
+        QueryExpression::Group {
+            inner, aggregates, ..
+        } => {
+            pending.push(Visit::Pattern(inner));
+            pending.extend(
+                aggregates
+                    .iter_mut()
+                    .filter_map(|(_, aggregate)| match aggregate {
+                        AggregateExpression::CountSolutions { .. } => None,
+                        AggregateExpression::FunctionCall { expr, .. } => {
+                            Some(Visit::Expression(expr))
+                        }
+                    }),
+            );
+        }
+        QueryExpression::Graph { inner, .. }
+        | QueryExpression::Project { inner, .. }
+        | QueryExpression::Distinct { inner }
+        | QueryExpression::Reduced { inner }
+        | QueryExpression::Slice { inner, .. } => pending.push(Visit::Pattern(inner)),
+    }
+}
+
+/// Pushes the subexpressions and `EXISTS` patterns one expression holds.
+fn push_expression_children<'a>(expression: &'a mut Expression, pending: &mut Vec<Visit<'a>>) {
+    match expression {
+        Expression::NamedNode(_)
+        | Expression::Literal(_)
+        | Expression::Variable(_)
+        | Expression::Bound(_) => {}
+        Expression::Or(left, right) | Expression::And(left, right) => {
+            pending.extend([Visit::Expression(left), Visit::Expression(right)]);
+        }
+        Expression::In(needle, haystack) => {
+            pending.push(Visit::Expression(needle));
+            pending.extend(haystack.iter_mut().map(Visit::Expression));
+        }
+        Expression::Exists(pattern) => pending.push(Visit::Pattern(pattern)),
+        Expression::If(condition, then, otherwise) => pending.extend([
+            Visit::Expression(condition),
+            Visit::Expression(then),
+            Visit::Expression(otherwise),
+        ]),
+        Expression::Coalesce(arguments) | Expression::FunctionCall(_, arguments) => {
+            pending.extend(arguments.iter_mut().map(Visit::Expression));
+        }
+    }
+}

@@ -38,7 +38,6 @@ bind	bind03	bind03.rq	data.ttl	bind03.srx
 bind	bind04	bind04.rq	data.ttl	bind04.srx
 bind	bind05	bind05.rq	data.ttl	bind05.srx
 bind	bind06	bind06.rq	data.ttl	bind06.srx
-bind	bind07	bind07.rq	data.ttl	bind07.srx
 bind	bind08	bind08.rq	data.ttl	bind08.srx
 bind	bind10	bind10.rq	data.ttl	bind10.srx
 bind	bind11	bind11.rq	data.ttl	bind11.srx
@@ -54,7 +53,6 @@ bindings	inline1	inline01.rq	data01.ttl	inline01.srx
 bindings	inline2	inline02.rq	data02.ttl	inline02.srx
 bindings	values-order-by	values-order-by.rq	data-modifiers.ttl	values-order-by.srx
 bindings	values-offset-limit	values-offset-limit.rq	data-modifiers.ttl	values-offset-limit.srx
-bindings	values-distinct	values-distinct.rq	data-modifiers.ttl	values-distinct.srx
 bindings	values-group-order-by	values-group-order-by.rq	data-modifiers.ttl	values-group-order-by.srx
 bindings	values-select-star	values-select-star.rq	data-modifiers.ttl	values-select-star.srx
 bindings	values-no-vars-no-rows	values-no-vars-no-rows.rq	data-modifiers.ttl	values-no-vars-no-rows.srx
@@ -69,11 +67,6 @@ exists	exists02	exists02.rq	exists01.ttl	exists02.srx
 exists	exists05	exists05.rq	exists01.ttl	exists05.srx
 negation	subset-by-exclusion-nex-1	subsetByExcl01.rq	subsetByExcl.ttl	subsetByExcl01.srx
 negation	subset-by-exclusion-minus-1	subsetByExcl02.rq	subsetByExcl.ttl	subsetByExcl02.srx
-negation	temporal-proximity-by-exclusion-nex-1	temporalProximity01.rq	temporalProximity01.ttl	temporalProximity01.srx
-negation	subset-01	subset-01.rq	set-data.ttl	subset-01.srx
-negation	subset-02	subset-02.rq	set-data.ttl	subset-02.srx
-negation	set-equals-1	set-equals-1.rq	set-data.ttl	set-equals-1.srx
-negation	subset-03	subset-03.rq	set-data.ttl	subset-03.srx
 negation	exists-01	exists-01.rq	set-data.ttl	exists-01.srx
 negation	exists-02	exists-02.rq	set-data.ttl	exists-02.srx
 negation	full-minuend	full-minuend.rq	full-minuend.ttl	full-minuend.srx
@@ -129,8 +122,6 @@ functions	abs01	abs01.rq	data.ttl	abs01.srx
 functions	ceil01	ceil01.rq	data.ttl	ceil01.srx
 functions	floor01	floor01.rq	data.ttl	floor01.srx
 functions	round01	round01.rq	data.ttl	round01.srx
-functions	concat01	concat01.rq	data.ttl	concat01.srx
-functions	concat02	concat02.rq	data2.ttl	concat02.srx
 functions	concat-empty	concat-empty.rq	data.ttl	concat-empty.srx
 functions	concat-single	concat-single.rq	data.ttl	concat-single.srx
 functions	substring01	substring01.rq	data.ttl	substring01.srx

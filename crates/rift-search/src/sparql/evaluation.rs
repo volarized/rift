@@ -1,23 +1,23 @@
 //! Evaluation of one admitted query over one dataset, within its answer and time bounds.
 
-use std::cell::Cell;
-use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use oxrdf::{Dataset, Term};
+use oxrdf::Term;
 use rift_error::{RiftError, errors};
 use spareval::{
-    CancellationToken, InternalQuad, QueryEvaluationError, QueryEvaluator, QueryResults,
-    QuerySolutionIter, QueryableDataset,
+    CancellationToken, QueryEvaluationError, QueryEvaluator, QueryResults, QuerySolutionIter,
 };
 
 use super::dataset::GraphDataset;
+use super::expression::ExpressionBudget;
 use super::limits::GraphLimits;
 use super::query::GraphQuery;
+use super::query_thread::{self, Watch};
 
-/// Cancellation one evaluation observes. Cancelling it ends the evaluation at its next dataset
-/// read or solution with `query_cancelled`; the evaluation deadline cancels it too, so one
-/// token serves one evaluation.
+/// Cancellation one evaluation observes. Cancelling it ends the evaluation at spareval's next
+/// check with `query_cancelled`; the evaluation deadline and the expression byte bound cancel
+/// it too, so one token serves one evaluation.
 #[derive(Clone, Default)]
 pub struct QueryCancellation(CancellationToken);
 
@@ -88,56 +88,116 @@ pub enum GraphAnswer {
 impl GraphDataset {
     /// Evaluates `query` within this dataset's bounds.
     ///
-    /// The deadline starts at the call and is checked at every dataset read and every
-    /// solution: crossing it cancels `cancellation`, which stops spareval's joins at their next
-    /// check as well. Evaluation is synchronous CPU work; an async caller runs it on its bounded
-    /// blocking pool and may cancel the token from a timer of its own.
+    /// Evaluation runs on the query thread while the calling thread holds the deadline: at the
+    /// evaluation timeout it cancels `cancellation`, which spareval checks at every dataset read
+    /// and inside its join loops, and every solution is checked against the deadline as well.
+    /// The string functions that can outgrow their arguments refuse a value past the expression
+    /// byte bound before computing it. The call blocks; an async caller runs it on its bounded
+    /// blocking pool.
     ///
     /// # Errors
     ///
-    /// - `query_answer_limit` when the answer needs more solutions or term bytes than allowed.
+    /// - `query_answer_limit` when the answer needs more solutions or term bytes than allowed,
+    ///   or one computed string needs more expression bytes.
     /// - `query_deadline_exceeded` when evaluation outlasts the evaluation timeout.
     /// - `query_cancelled` when `cancellation` was cancelled by its holder.
     /// - `query_evaluation_failed` for every other evaluation failure, such as an unknown
-    ///   function.
+    ///   function, and when the query thread cannot start.
     pub fn evaluate(
         &self,
         query: &GraphQuery,
         cancellation: &QueryCancellation,
     ) -> Result<GraphAnswer, RiftError> {
-        let expired = Cell::new(false);
-        let watched = DeadlineDataset {
-            dataset: self.triples(),
-            deadline: Deadline::after(self.limits()),
-            cancellation: cancellation.0.clone(),
+        let limits = self.limits();
+        let expired = AtomicBool::new(false);
+        let budget = ExpressionBudget::new(limits.expression_bytes_max(), cancellation.0.clone());
+        let watch = Watch {
+            timeout: limits.evaluation_timeout(),
+            token: &cancellation.0,
             expired: &expired,
         };
+        let deadline = Deadline::after(limits);
+        let outcome = query_thread::run(Some(watch), || {
+            self.evaluate_here(query, cancellation, &budget, deadline, &expired)
+        })?;
+        match outcome {
+            Ok(answer) => Ok(answer),
+            Err(Failure::Refused(error)) => Err(error),
+            Err(Failure::Evaluation(error)) => {
+                Err(evaluation_failure(error, &budget, &expired, limits))
+            }
+        }
+    }
+
+    /// Evaluates `query` on the calling thread, leaving cancellation causes to the caller.
+    fn evaluate_here(
+        &self,
+        query: &GraphQuery,
+        cancellation: &QueryCancellation,
+        budget: &ExpressionBudget,
+        deadline: Deadline,
+        expired: &AtomicBool,
+    ) -> Result<GraphAnswer, Failure> {
         let evaluator = QueryEvaluator::new().with_cancellation_token(cancellation.0.clone());
-        let failure = |error| evaluation_failure(error, &expired, self.limits());
+        let evaluator = budget.bound(evaluator, query.separators());
         let results = evaluator
             .prepare(query.query())
-            .execute(watched.clone())
-            .map_err(failure)?;
-        match results {
-            QueryResults::Boolean(value) => Ok(GraphAnswer::Boolean(value)),
+            .execute(self.triples())
+            .map_err(Failure::Evaluation)?;
+        let checkpoint = Checkpoint {
+            budget,
+            deadline,
+            expired,
+        };
+        let answer = match results {
+            QueryResults::Boolean(value) => GraphAnswer::Boolean(value),
             QueryResults::Solutions(solutions) => {
-                collect_solutions(solutions, &watched, self.limits(), failure)
-                    .map(GraphAnswer::Solutions)
+                GraphAnswer::Solutions(collect_solutions(solutions, &checkpoint, self.limits())?)
             }
-            QueryResults::Graph(_) => errors::search::query_feature_refused()
-                .feature("CONSTRUCT")
-                .fail(),
-        }
+            QueryResults::Graph(_) => {
+                let refusal = errors::search::query_feature_refused().feature("CONSTRUCT");
+                return Err(Failure::Refused(refusal.error()));
+            }
+        };
+        checkpoint.observe()?;
+        Ok(answer)
     }
 }
 
-/// Collects at most the solution and term byte bounds, checking the deadline per solution.
+/// Why an evaluation stopped before answering.
+enum Failure {
+    /// spareval failed, cancellation included; the cause is decided after the thread joins.
+    Evaluation(QueryEvaluationError),
+    /// A bound refused the answer.
+    Refused(RiftError),
+}
+
+/// The checks one evaluation makes between solutions.
+struct Checkpoint<'a> {
+    budget: &'a ExpressionBudget,
+    deadline: Deadline,
+    expired: &'a AtomicBool,
+}
+
+impl Checkpoint<'_> {
+    /// Fails as cancelled once the deadline passed or a string crossed its bound.
+    fn observe(&self) -> Result<(), Failure> {
+        if self.deadline.has_passed() {
+            self.expired.store(true, Ordering::Relaxed);
+        }
+        if self.expired.load(Ordering::Relaxed) || self.budget.is_crossed() {
+            return Err(Failure::Evaluation(QueryEvaluationError::Cancelled));
+        }
+        Ok(())
+    }
+}
+
+/// Collects at most the solution and term byte bounds, observing the checkpoint per solution.
 fn collect_solutions(
     solutions: QuerySolutionIter<'_>,
-    watched: &DeadlineDataset<'_>,
+    checkpoint: &Checkpoint<'_>,
     limits: &GraphLimits,
-    failure: impl Fn(QueryEvaluationError) -> RiftError,
-) -> Result<SolutionTable, RiftError> {
+) -> Result<SolutionTable, Failure> {
     let variables = solutions
         .variables()
         .iter()
@@ -146,11 +206,8 @@ fn collect_solutions(
     let mut rows = Vec::new();
     let mut answer_bytes = 0_usize;
     for solution in solutions {
-        watched.observe_deadline();
-        if watched.expired.get() {
-            return Err(failure(QueryEvaluationError::Cancelled));
-        }
-        let solution = solution.map_err(&failure)?;
+        checkpoint.observe()?;
+        let solution = solution.map_err(Failure::Evaluation)?;
         let row: Vec<Option<GraphTerm>> = solution
             .values()
             .iter()
@@ -166,10 +223,10 @@ fn collect_solutions(
             .into_iter()
             .find(|(_, required, limit)| required > limit)
         {
-            return errors::search::query_answer_limit()
+            let refusal = errors::search::query_answer_limit()
                 .bound(bound)
-                .limit(limit)
-                .fail();
+                .limit(limit);
+            return Err(Failure::Refused(refusal.error()));
         }
         rows.push(row);
     }
@@ -179,11 +236,18 @@ fn collect_solutions(
 /// The registered refusal one spareval failure maps to.
 fn evaluation_failure(
     error: QueryEvaluationError,
-    expired: &Cell<bool>,
+    budget: &ExpressionBudget,
+    expired: &AtomicBool,
     limits: &GraphLimits,
 ) -> RiftError {
     match error {
-        QueryEvaluationError::Cancelled if expired.get() => {
+        QueryEvaluationError::Cancelled if budget.is_crossed() => {
+            errors::search::query_answer_limit()
+                .bound("expression bytes")
+                .limit(budget.bytes_max())
+                .error()
+        }
+        QueryEvaluationError::Cancelled if expired.load(Ordering::Relaxed) => {
             let timeout_ms =
                 u64::try_from(limits.evaluation_timeout().as_millis()).unwrap_or(u64::MAX);
             errors::search::query_deadline_exceeded()
@@ -209,52 +273,6 @@ impl Deadline {
 
     fn has_passed(self) -> bool {
         self.0.is_some_and(|deadline| Instant::now() >= deadline)
-    }
-}
-
-/// The dataset as spareval reads it, cancelling evaluation once the deadline passes.
-#[derive(Clone)]
-struct DeadlineDataset<'a> {
-    dataset: &'a Dataset,
-    deadline: Deadline,
-    cancellation: CancellationToken,
-    expired: &'a Cell<bool>,
-}
-
-impl DeadlineDataset<'_> {
-    /// Cancels evaluation, once, when the deadline has passed.
-    fn observe_deadline(&self) {
-        if !self.expired.get() && self.deadline.has_passed() {
-            self.expired.set(true);
-            self.cancellation.cancel();
-        }
-    }
-}
-
-impl<'a> QueryableDataset<'a> for DeadlineDataset<'a> {
-    type InternalTerm = Term;
-    type Error = Infallible;
-
-    fn internal_quads_for_pattern(
-        &self,
-        subject: Option<&Term>,
-        predicate: Option<&Term>,
-        object: Option<&Term>,
-        graph_name: Option<Option<&Term>>,
-    ) -> impl Iterator<Item = Result<InternalQuad<Term>, Infallible>> + use<'a> {
-        self.observe_deadline();
-        let watched = self.clone();
-        self.dataset
-            .internal_quads_for_pattern(subject, predicate, object, graph_name)
-            .inspect(move |_| watched.observe_deadline())
-    }
-
-    fn internalize_term(&self, term: Term) -> Result<Term, Infallible> {
-        Ok(term)
-    }
-
-    fn externalize_term(&self, term: Term) -> Result<Term, Infallible> {
-        Ok(term)
     }
 }
 

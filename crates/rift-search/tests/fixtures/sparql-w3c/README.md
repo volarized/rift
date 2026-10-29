@@ -12,4 +12,6 @@ The selection holds every `mf:QueryEvaluationTest` of the groups `aggregates`, `
 
 The selection leaves out the cases whose expected results spell a numeric value in a non-canonical lexical form, such as `"1.0"^^xsd:decimal` for the evaluator's `"1"^^xsd:decimal`, since term equality compares lexical forms: `aggregates/agg-avg-02`, `aggregates/agg-avg-distinct`, `aggregates/agg-err-02`, `aggregates/agg-min-01`, `aggregates/agg-min-02`, `aggregates/agg-min-distinct`, `aggregates/agg-sum-distinct` and `functions/coalesce01`.
 
+The selection also leaves out the cases whose queries join patterns sharing no variable, which `GraphQuery::parse` refuses as a cartesian product: `bind/bind07`, `bindings/values-distinct`, `functions/concat01`, `functions/concat02`, `negation/set-equals-1`, `negation/subset-01`, `negation/subset-02`, `negation/subset-03` and `negation/temporal-proximity-by-exclusion-nex-1`.
+
 The upstream repository uses W3C's dual test-suite licenses, as `LICENSE.md` states. These checks use its 3-clause BSD option, whose terms `w3c-bsd-license.html` retains.

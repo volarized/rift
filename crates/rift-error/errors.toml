@@ -837,6 +837,16 @@ message = "SPARQL query of {observed} bytes exceeds accepted limit {limit}"
 action = "shorten the query below {limit} bytes and resend the request"
 fields = { limit = { type = "unsigned" }, observed = { type = "unsigned" } }
 
+[error.search.query_nesting_limit]
+message = "SPARQL query nests brackets {depth} deep, exceeding accepted limit {limit}"
+action = "flatten the query below {limit} nested brackets and resend the request"
+fields = { depth = { type = "unsigned" }, limit = { type = "unsigned" } }
+
+[error.search.query_operator_limit]
+message = "SPARQL query writes {count} operator characters, exceeding accepted limit {limit}"
+action = "split the expression below {limit} operators and resend the request"
+fields = { count = { type = "unsigned" }, limit = { type = "unsigned" } }
+
 [error.search.query_syntax_invalid]
 message = "SPARQL query does not parse: {detail}"
 action = "correct the SPARQL 1.1 query syntax at the reported position and resend the request"
@@ -844,7 +854,7 @@ fields = { detail = { type = "string" } }
 
 [error.search.query_feature_refused]
 message = "SPARQL query uses {feature}, which the read-only graph does not serve"
-action = "send a SELECT or ASK query without {feature} and resend the request"
+action = "remove {feature} from the query and resend the request"
 fields = { feature = { type = "string" } }
 
 [error.search.query_answer_limit]

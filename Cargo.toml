@@ -76,6 +76,7 @@ oxttl = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d7
 sparesults = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.4.0-dev", default-features = false }
 spareval = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.3.0-dev", default-features = false }
 spargebra = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.5.0-dev", default-features = false }
+sparopt = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.4.0-dev", default-features = false }
 # The OTLP export stack rift-tracing owns. tracing-opentelemetry pins the opentelemetry minor it
 # builds against (0.34.0 requires opentelemetry ^0.33.0), and opentelemetry_sdk /
 # opentelemetry-otlp move in lockstep with opentelemetry itself, so every member is

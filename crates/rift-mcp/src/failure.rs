@@ -470,6 +470,8 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.search.model_download_too_large",
                 "rift.search.query_answer_limit",
                 "rift.search.query_deadline_exceeded",
+                "rift.search.query_nesting_limit",
+                "rift.search.query_operator_limit",
                 "rift.search.query_too_large",
                 "rift.search.text_limit",
                 "rift.syntax.markdown_progress_exceeded",

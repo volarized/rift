@@ -5130,6 +5130,7 @@ dependencies = [
  "sparesults",
  "spareval",
  "spargebra",
+ "sparopt",
  "strum",
  "tempfile",
  "tokenizers 0.23.2",

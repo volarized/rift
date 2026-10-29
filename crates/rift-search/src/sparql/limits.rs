@@ -6,6 +6,13 @@ use rift_error::{RiftError, errors};
 
 /// Default most bytes of query text accepted, 64 KiB.
 pub const QUERY_BYTES_MAX: usize = 64 * 1024;
+/// Default deepest bracket nesting a query may write: parsing recurses once per level.
+pub const NESTING_DEPTH_MAX: usize = 64;
+/// Default most operator characters (`+ - * / & |`) a query may write: the parser recurses once
+/// per operator of a chain such as `1 + 1 + ...`, which no bracket nests.
+pub const OPERATORS_MAX: usize = 256;
+/// Default most bytes one computed string value may hold, 1 MiB.
+pub const EXPRESSION_BYTES_MAX: usize = 1024 * 1024;
 /// Default most triples one dataset materializes. An in-memory dataset indexes each triple
 /// six ways, so 200,000 triples hold tens of MiB.
 pub const TRIPLES_MAX: usize = 200_000;
@@ -23,6 +30,9 @@ pub const EVALUATION_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GraphLimits {
     query_bytes_max: usize,
+    nesting_depth_max: usize,
+    operators_max: usize,
+    expression_bytes_max: usize,
     triples_max: usize,
     literal_bytes_max: usize,
     solutions_max: usize,
@@ -34,6 +44,9 @@ impl Default for GraphLimits {
     fn default() -> Self {
         Self {
             query_bytes_max: QUERY_BYTES_MAX,
+            nesting_depth_max: NESTING_DEPTH_MAX,
+            operators_max: OPERATORS_MAX,
+            expression_bytes_max: EXPRESSION_BYTES_MAX,
             triples_max: TRIPLES_MAX,
             literal_bytes_max: LITERAL_BYTES_MAX,
             solutions_max: SOLUTIONS_MAX,
@@ -55,6 +68,24 @@ impl GraphLimits {
     #[must_use]
     pub const fn query_bytes_max(&self) -> usize {
         self.query_bytes_max
+    }
+
+    /// Deepest bracket nesting of query text.
+    #[must_use]
+    pub const fn nesting_depth_max(&self) -> usize {
+        self.nesting_depth_max
+    }
+
+    /// Most operator characters of query text.
+    #[must_use]
+    pub const fn operators_max(&self) -> usize {
+        self.operators_max
+    }
+
+    /// Most bytes one computed string value holds.
+    #[must_use]
+    pub const fn expression_bytes_max(&self) -> usize {
+        self.expression_bytes_max
     }
 
     /// Most triples one dataset materializes.
@@ -102,6 +133,24 @@ impl GraphLimitsBuilder {
         self
     }
 
+    /// Sets the deepest bracket nesting of query text.
+    pub const fn nesting_depth_max(mut self, value: usize) -> Self {
+        self.limits.nesting_depth_max = value;
+        self
+    }
+
+    /// Sets the most operator characters of query text.
+    pub const fn operators_max(mut self, value: usize) -> Self {
+        self.limits.operators_max = value;
+        self
+    }
+
+    /// Sets the most bytes one computed string value holds.
+    pub const fn expression_bytes_max(mut self, value: usize) -> Self {
+        self.limits.expression_bytes_max = value;
+        self
+    }
+
     /// Sets the most triples one dataset materializes.
     pub const fn triples_max(mut self, value: usize) -> Self {
         self.limits.triples_max = value;
@@ -142,6 +191,9 @@ impl GraphLimitsBuilder {
         let limits = self.limits;
         let counts = [
             ("query_bytes_max", limits.query_bytes_max),
+            ("nesting_depth_max", limits.nesting_depth_max),
+            ("operators_max", limits.operators_max),
+            ("expression_bytes_max", limits.expression_bytes_max),
             ("triples_max", limits.triples_max),
             ("literal_bytes_max", limits.literal_bytes_max),
             ("solutions_max", limits.solutions_max),
@@ -163,6 +215,9 @@ mod tests {
     fn test_graph_limits_builder_sets_every_bound() {
         let limits = GraphLimits::builder()
             .query_bytes_max(1)
+            .nesting_depth_max(7)
+            .operators_max(9)
+            .expression_bytes_max(8)
             .triples_max(2)
             .literal_bytes_max(3)
             .solutions_max(4)
@@ -173,13 +228,16 @@ mod tests {
         assert_eq!(
             (
                 limits.query_bytes_max(),
+                limits.nesting_depth_max(),
+                limits.operators_max(),
+                limits.expression_bytes_max(),
                 limits.triples_max(),
                 limits.literal_bytes_max(),
                 limits.solutions_max(),
                 limits.answer_bytes_max(),
                 limits.evaluation_timeout(),
             ),
-            (1, 2, 3, 4, 5, Duration::from_millis(6))
+            (1, 7, 9, 8, 2, 3, 4, 5, Duration::from_millis(6))
         );
         assert_eq!(
             GraphLimits::builder().build().ok(),

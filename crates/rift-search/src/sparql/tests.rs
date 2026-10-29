@@ -340,22 +340,17 @@ fn test_graph_dataset_refuses_identity_outside_its_form() {
 
 #[test]
 fn test_graph_dataset_evaluate_refuses_answer_past_solution_and_byte_bounds() {
-    let base = GraphDataset::builder(
-        GraphLimits::builder()
-            .solutions_max(2)
-            .build()
-            .expect("nonzero"),
-    );
-    let dataset = base.build();
-    let three = "SELECT ?x { VALUES ?x { 1 2 3 } }";
-    let error = answer(&dataset, three).expect_err("three solutions pass two");
+    let narrow = GraphLimits::builder()
+        .solutions_max(2)
+        .build()
+        .expect("nonzero");
+    let dataset = model(narrow).expect("model builds");
+    let three = "SELECT ?s { ?s a :Symbol }";
+    let error = answer(&dataset, three).expect_err("three symbols pass two solutions");
     assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
     assert!(error.to_string().contains("solutions"), "{error}");
-    assert_eq!(
-        rows(&dataset, "SELECT ?x { VALUES ?x { 1 2 } }").len(),
-        2,
-        "two solutions fit"
-    );
+    let limited = "SELECT ?s { ?s a :Symbol } LIMIT 2";
+    assert_eq!(rows(&dataset, limited).len(), 2, "two solutions fit");
 
     let narrow = GraphDataset::builder(
         GraphLimits::builder()
@@ -406,4 +401,137 @@ fn test_graph_dataset_evaluate_reports_evaluation_failure() {
         refusal(answer(&dataset, unknown)),
         errors::search::query_evaluation_failed::SLUG
     );
+}
+
+/// A dataset of `callers` symbols that all call one target.
+fn fan_in(callers: usize, limits: GraphLimits) -> GraphDataset {
+    let target = symbol(PARSE);
+    let mut graph = GraphDataset::builder(limits);
+    for caller in 0..callers {
+        let source = symbol(&format!("{MAIN}{caller}"));
+        let fact = GraphFact::Relation {
+            source: &source,
+            relation: SymbolRelation::Calls,
+            target: &target,
+        };
+        graph.insert(fact).expect("the fan-in fits");
+    }
+    graph.build()
+}
+
+#[test]
+fn test_graph_dataset_evaluate_timer_stops_join_between_reads() {
+    let timeout = Duration::from_millis(50);
+    let limits = GraphLimits::builder()
+        .evaluation_timeout(timeout)
+        .build()
+        .expect("nonzero");
+    let dataset = fan_in(60, limits);
+    let joined =
+        "SELECT (COUNT(*) AS ?n) { ?a :calls ?t . ?b :calls ?t . ?c :calls ?t . ?d :calls ?t }";
+    let started = std::time::Instant::now();
+    let error = answer(&dataset, joined).expect_err("13 million joined rows outlast 50 ms");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        error.slug(),
+        errors::search::query_deadline_exceeded::SLUG,
+        "{error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the timer cancels the join: elapsed={elapsed:?}"
+    );
+}
+
+#[test]
+fn test_graph_dataset_evaluate_refuses_string_past_expression_bound() {
+    let limits = GraphLimits::builder()
+        .expression_bytes_max(64)
+        .build()
+        .expect("nonzero");
+    let dataset = GraphDataset::builder(limits).build();
+    let doubling = "SELECT ?d { BIND(\"0123456789abcdef\" AS ?a) BIND(CONCAT(?a, ?a) AS ?b) BIND(CONCAT(?b, ?b) AS ?c) BIND(CONCAT(?c, ?c) AS ?d) }";
+    let replace = "SELECT ?x { BIND(REPLACE(\"aaaa\", \"a\", \"bbbbbbbbbbbbbbbbbbbb\") AS ?x) }";
+    let ucase = "SELECT ?x { BIND(UCASE(\"aaaaaaaaaaaaaaaaaaaaaaa\") AS ?x) }";
+    let grouped = "SELECT (GROUP_CONCAT(?v) AS ?x) { VALUES ?v { \"0123456789\" \"0123456789\" \"0123456789\" \"0123456789\" \"0123456789\" \"0123456789\" } }";
+    for text in [doubling, replace, ucase, grouped] {
+        let error = answer(&dataset, text).expect_err("the computed string passes 64 bytes");
+        assert_eq!(
+            error.slug(),
+            errors::search::query_answer_limit::SLUG,
+            "{text}"
+        );
+        assert!(error.to_string().contains("expression bytes"), "{error}");
+    }
+    let fits = "SELECT ?x ?y { BIND(CONCAT(\"ab\", \"cd\") AS ?x) { SELECT (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?y) { VALUES ?v { \"\" \"b\" \"\" } } } }";
+    assert_eq!(
+        rows(&dataset, fits),
+        vec![vec!["abcd".to_owned(), "|b".to_owned()]]
+    );
+}
+
+#[test]
+fn test_graph_query_parse_refuses_nesting_past_bound_and_survives_it() {
+    let limits = GraphLimits::default();
+    let nested = |depth: usize| {
+        let (open, close) = ("(".repeat(depth - 2), ")".repeat(depth - 2));
+        format!("SELECT ?x {{ BIND({open}1{close} AS ?x) }}")
+    };
+    let deepest = nested(limits.nesting_depth_max());
+    let dataset = GraphDataset::builder(limits).build();
+    assert_eq!(rows(&dataset, &deepest), vec![vec!["1".to_owned()]]);
+    let error = GraphQuery::parse(&nested(limits.nesting_depth_max() + 1), &limits)
+        .expect_err("one level too deep");
+    assert_eq!(error.slug(), errors::search::query_nesting_limit::SLUG);
+    let shallow = GraphLimits::builder()
+        .nesting_depth_max(2)
+        .build()
+        .expect("nonzero");
+    let quoted =
+        "ASK { FILTER(\"((\" != '''[[''' && <urn:a(b)> != <urn:c> && 1 < 2 && 2 > 1) } # (((";
+    assert!(
+        GraphQuery::parse(quoted, &shallow).is_ok(),
+        "brackets in literals, IRIs and comments count nothing"
+    );
+}
+
+#[test]
+fn test_graph_query_parse_survives_nesting_and_operators_at_their_bounds() {
+    let limits = GraphLimits::default();
+    let open = "(".repeat(limits.nesting_depth_max() - 2);
+    let close = ")".repeat(limits.nesting_depth_max() - 2);
+    let chain = "+1".repeat(limits.operators_max());
+    let text = format!("SELECT ?x {{ BIND({open}1{chain}{close} AS ?x) }}");
+    let dataset = GraphDataset::builder(limits).build();
+    let expected = (limits.operators_max() + 1).to_string();
+    assert_eq!(rows(&dataset, &text), vec![vec![expected]]);
+    let past = format!("SELECT ?x {{ BIND(1{chain}+1 AS ?x) }}");
+    let error = GraphQuery::parse(&past, &limits).expect_err("one operator too many");
+    assert_eq!(error.slug(), errors::search::query_operator_limit::SLUG);
+}
+
+#[test]
+fn test_graph_query_parse_refuses_inline_rows_joining_past_solution_bound() {
+    let limits = GraphLimits::builder()
+        .solutions_max(100)
+        .build()
+        .expect("nonzero");
+    let block = |name: &str| {
+        format!(
+            "VALUES (?{name} ?t) {{ {} }}",
+            (0..11)
+                .map(|row| format!("({row} 0)"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let fits = format!("SELECT * {{ {} }}", block("a"));
+    assert!(
+        GraphQuery::parse(&fits, &limits).is_ok(),
+        "eleven inline rows fit"
+    );
+    let joined = format!("SELECT * {{ {} {} }}", block("a"), block("b"));
+    let error = GraphQuery::parse(&joined, &limits).expect_err("121 joined inline rows pass 100");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(error.to_string().contains("joined VALUES rows"), "{error}");
 }
