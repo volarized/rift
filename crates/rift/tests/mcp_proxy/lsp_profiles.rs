@@ -143,7 +143,8 @@ async fn symbol_read(
     );
     let nodes = proxied_call(client, "nodes", &json!({"symbol":id, "view":view.id})).await?;
     let item = &nodes["nodes"][0];
-    assert_eq!(item["of"].as_str(), Some(id.as_str()), "{nodes}");
+    assert_eq!(nodes["symbol"].as_str(), Some(id.as_str()), "{nodes}");
+    assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
     assert_eq!(item["source"].as_str(), hit.source.as_deref(), "{nodes}");
     Ok(answer)
 }
@@ -357,7 +358,8 @@ async fn require_profile_pattern(
     assert_eq!(declarations.len(), 1);
     let nodes = proxied_call(client, "nodes", &json!({"symbol":id})).await?;
     let item = &nodes["nodes"][0];
-    assert_eq!(item["of"].as_str(), Some(id.as_str()), "{nodes}");
+    assert_eq!(nodes["symbol"].as_str(), Some(id.as_str()), "{nodes}");
+    assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
     assert_eq!(
         item["source"].as_str(),
         patterned.results[0].source.as_deref(),

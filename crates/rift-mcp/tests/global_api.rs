@@ -716,25 +716,26 @@ fn symbol_nodes(request: &Value) -> Option<Value> {
         ("parameters", "pub fn ".len() + name.len(), "()"),
         ("block", item.len() - "{}".len(), "{}"),
     ];
-    let language = rift_protocol::read::Language::from_identity_segment("rust").ok()?;
     let nodes = parts
         .into_iter()
-        .map(|(kind, offset, source)| {
+        .enumerate()
+        .map(|(index, (kind, offset, source))| {
             let node_start = start + offset;
-            let id = rift_protocol::read::NodeId::for_content(&language, kind, source.as_bytes());
             let mut node = json!({
-                "id": id.0, "unit": COLLECTED_UNIT, "language": "rust", "kind": kind,
+                "declaration": 0, "index": index, "unit": COLLECTED_UNIT, "language": "rust",
+                "kind": kind,
                 "range": {"start": node_start, "end": node_start + source.len()},
                 "source": source,
             });
-            if kind == "function_item" {
-                node["of"] = json!(collected_identity(SymbolFixture::Valid, name));
+            if index == 0 {
                 node["facets"] = json!(["declaration", "definition"]);
+            } else {
+                node["parent"] = json!(0);
             }
             node
         })
         .collect::<Vec<_>>();
-    let mut answer = json!({"nodes": nodes, "revision": release_revision(id)});
+    let mut answer = json!({"symbol": id, "nodes": nodes, "revision": release_revision(id)});
     if request.get("view").is_some() {
         answer["view"] = Value::Null;
     }
@@ -759,15 +760,8 @@ fn runtime_nodes(request: &Value) -> Value {
     let builtins = python_runtime::builtins();
     let (start, end) = runtime_declaration();
     let source = &builtins[start..end];
-    let language = rift_protocol::read::Language::from_identity_segment("python")
-        .expect("python identity segment");
-    let id = rift_protocol::read::NodeId::for_content(
-        &language,
-        "function_definition",
-        source.as_bytes(),
-    );
-    let mut answer = json!({"nodes": [{
-        "id": id.0, "of": named_identity(&NAMED_POSITIONS[0]),
+    let mut answer = json!({"symbol": named_identity(&NAMED_POSITIONS[0]), "nodes": [{
+        "declaration": 0, "index": 0,
         "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
         "kind": "function_definition", "facets": ["declaration", "definition"],
         "range": {"start": start, "end": end}, "source": source,

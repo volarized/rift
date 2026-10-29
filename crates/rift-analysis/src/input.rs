@@ -400,6 +400,7 @@ impl<'source> PackageSource<'source> {
 #[derive(Debug, Clone, Copy)]
 pub struct ExactPackageInput<'input> {
     owner: &'input SymbolOwner,
+    release_version: &'input str,
     language: &'input Language,
     origin: &'input ContributionOrigin,
     files: &'input [PackageSource<'input>],
@@ -441,10 +442,11 @@ impl<'input> ExactPackageInput<'input> {
         limits: ExactPackageLimits,
     ) -> Result<Self, RiftError> {
         validate_owner(owner)?;
-        validate_origin(owner, origin)?;
+        let release_version = validate_origin(owner, origin)?;
         validate_sources(files, limits, |file| released_source_unit(owner, file))?;
         Ok(Self {
             owner,
+            release_version,
             language,
             origin,
             files,
@@ -474,12 +476,17 @@ impl<'input> ExactPackageInput<'input> {
     /// names.
     ///
     /// # Errors
-    /// Returns the existing origin refusal when the origin names no release of the owner.
+    /// Returns the refusal [`Revision::release`](rift_protocol::revision::Revision::release)
+    /// names for a version its ecosystem does not spell; origin validation already refused
+    /// one.
     pub fn release(self) -> Result<rift_protocol::revision::Revision, RiftError> {
-        let version = origin_version(self.origin)
-            .ok_or_else(|| errors::analysis::package_input_origin_invalid().error())?;
-        rift_protocol::revision::Revision::release(self.owner, version)
-            .map_err(|_| errors::analysis::package_input_origin_invalid().error())
+        rift_protocol::revision::Revision::release(self.owner, self.release_version)
+    }
+
+    /// The version of the release this input analyzes, as its origin names it.
+    #[must_use]
+    pub const fn release_version(self) -> &'input str {
+        self.release_version
     }
 
     /// Borrows the admitted source and metadata context for namespace placement.
@@ -683,39 +690,43 @@ impl<'input> ExactPackageInput<'input> {
     }
 }
 
-/// The version a package or runtime origin names.
-fn origin_version(origin: &ContributionOrigin) -> Option<&str> {
-    match origin.location() {
-        Some(SourceLocation::Dependency { package }) => Some(&package.version),
-        Some(SourceLocation::Stdlib {
-            runtime: Some(runtime),
-        }) => Some(&runtime.version),
-        _ => None,
-    }
-}
-
-fn validate_origin(owner: &SymbolOwner, origin: &ContributionOrigin) -> Result<(), RiftError> {
+/// Validates an authored release origin of `owner` and answers the version it names.
+fn validate_origin<'origin>(
+    owner: &SymbolOwner,
+    origin: &'origin ContributionOrigin,
+) -> Result<&'origin str, RiftError> {
     if origin.source_kind() != SourceKind::Authored {
         return errors::analysis::package_input_origin_invalid().fail();
     }
     validate_physical_origin(owner, origin)
 }
 
-fn validate_physical_origin(
+/// Validates that `origin` names a release of `owner` and answers the version it names.
+fn validate_physical_origin<'origin>(
     owner: &SymbolOwner,
-    origin: &ContributionOrigin,
-) -> Result<(), RiftError> {
+    origin: &'origin ContributionOrigin,
+) -> Result<&'origin str, RiftError> {
     let observed = match origin.location() {
-        Some(SourceLocation::Dependency { package }) => package.owner().ok(),
+        Some(SourceLocation::Dependency { package }) => package
+            .owner()
+            .ok()
+            .map(|observed| (observed, package.version.as_str())),
         Some(SourceLocation::Stdlib {
             runtime: Some(runtime),
-        }) => runtime.owner().ok(),
+        }) => runtime
+            .owner()
+            .ok()
+            .map(|observed| (observed, runtime.version.as_str())),
         _ => None,
     };
-    if observed.as_ref() == Some(owner) && origin.source_kind() != SourceKind::Synthetic {
-        return Ok(());
+    match observed {
+        Some((observed, version))
+            if &observed == owner && origin.source_kind() != SourceKind::Synthetic =>
+        {
+            Ok(version)
+        }
+        _ => errors::analysis::package_input_origin_invalid().fail(),
     }
-    errors::analysis::package_input_origin_invalid().fail()
 }
 
 fn validate_source_count(observed: usize, limits: ExactPackageLimits) -> Result<(), RiftError> {
@@ -791,7 +802,9 @@ fn released_source_unit(
     Ok(match file.physical {
         Some((unit, physical_origin)) => {
             match unit.source_owner() {
-                Some(physical_owner) => validate_physical_origin(physical_owner, physical_origin)?,
+                Some(physical_owner) => {
+                    validate_physical_origin(physical_owner, physical_origin)?;
+                }
                 None => validate_captured_origin(unit, physical_origin)?,
             }
             unit.clone()

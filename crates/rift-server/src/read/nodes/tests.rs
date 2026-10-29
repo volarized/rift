@@ -67,7 +67,11 @@ fn a_symbol_read_lists_its_item_node_then_its_own_descendants_with_their_source(
 
     let item = answer.nodes.first().ok_or("the module has nodes")?;
     assert_eq!(item.kind.0, "mod_item");
-    assert_eq!(item.of.as_ref(), Some(&lamp));
+    assert_eq!(answer.symbol.as_ref(), Some(&lamp));
+    assert_eq!(
+        (item.declaration, item.index, item.parent),
+        (Some(0), 0, None)
+    );
     let module_end = RUST_SOURCE.find("}\n\npub fn dim").ok_or("module end")? + 1;
     assert_eq!(item.source, RUST_SOURCE[..module_end]);
     for node in &answer.nodes {
@@ -88,7 +92,18 @@ fn a_symbol_read_lists_its_item_node_then_its_own_descendants_with_their_source(
         "nodes of the nested declarations belong to them, not to the module: {:?}",
         answer.nodes
     );
-    assert!(answer.nodes.iter().skip(1).all(|node| node.of.is_none()));
+    for (offset, node) in answer.nodes.iter().enumerate() {
+        assert_eq!(
+            node.declaration,
+            Some(0),
+            "every node is of the one declaration"
+        );
+        assert_eq!(
+            node.index,
+            u64::try_from(offset)?,
+            "indexes count in pre-order"
+        );
+    }
     assert_eq!(answer.node_cursor, None);
     Ok(())
 }
@@ -135,9 +150,18 @@ fn a_symbol_with_several_declarations_lists_each_outermost_first() -> TestResult
     let items = answer
         .nodes
         .iter()
-        .filter(|node| node.of.as_ref() == Some(&open))
+        .filter(|node| node.index == 0)
         .collect::<Vec<_>>();
     assert_eq!(items.len(), 3, "one item node per declaration");
+    assert_eq!(answer.symbol.as_ref(), Some(&open));
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.declaration)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1), Some(2)],
+        "each declaration is numbered in binding order"
+    );
     for (item, binding) in items.iter().zip(&bindings) {
         assert_eq!(
             item.unit,
@@ -190,9 +214,18 @@ fn repeated_definitions_of_one_path_read_as_one_symbol_with_every_declaration() 
     let items = answer
         .nodes
         .iter()
-        .filter(|node| node.of.as_ref() == Some(&tick) && node.kind.0 == "function_item")
+        .filter(|node| node.index == 0 && node.kind.0 == "function_item")
         .collect::<Vec<_>>();
     assert_eq!(items.len(), 2, "one item node per declaration: {items:?}");
+    assert_eq!(answer.symbol.as_ref(), Some(&tick));
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.declaration)
+            .collect::<Vec<_>>(),
+        [Some(0), Some(1)],
+        "the declarations of one path are numbered in binding order"
+    );
     for (item, binding) in items.iter().zip(&bindings) {
         assert_eq!(item.range.start, binding.symbol.item_range.start);
     }
@@ -211,7 +244,6 @@ fn pages_of_a_symbol_read_resume_through_the_cursor_until_the_last_node() -> Tes
         "the fixture function has several nodes"
     );
     let key = rift_core::SymbolId::new(dim.as_str())?;
-    let (declarations, _) = service.index().symbols_by_identity_page(&key, 0, 10)?;
     let revision = "tree";
     let bounds = PageBounds {
         nodes_max: 2,
@@ -221,19 +253,14 @@ fn pages_of_a_symbol_read_resume_through_the_cursor_until_the_last_node() -> Tes
     let mut listed = Vec::new();
     let mut offset = 0;
     loop {
-        let page = symbol_page(
-            &declarations,
-            |path| super::declared_syntax(path, service.index().syntax(path)),
-            (&dim, revision),
-            offset,
-            bounds,
-        )?;
+        let page = symbol_page(service.index(), (&dim, &key), (offset, revision), bounds)?
+            .ok_or("the symbol has a declaration")?;
         assert!(page.nodes.len() <= 2);
         listed.extend(page.nodes);
         let Some(cursor) = page.node_cursor else {
             break;
         };
-        offset = super::cursor_offset(&cursor, &dim, revision)?;
+        offset = super::cursor_offset(&cursor, dim.as_str(), revision)?;
         assert_eq!(offset, listed.len());
     }
 
@@ -246,22 +273,17 @@ fn a_page_past_its_source_bound_still_answers_one_node() -> TestResult {
     let (_directory, service) = rust_service()?;
     let dim = identity(&service, "dim")?;
     let key = rift_core::SymbolId::new(dim.as_str())?;
-    let (declarations, _) = service.index().symbols_by_identity_page(&key, 0, 10)?;
     let bounds = PageBounds {
         nodes_max: 100,
         source_bytes_max: 1,
     };
 
-    let page = symbol_page(
-        &declarations,
-        |path| super::declared_syntax(path, service.index().syntax(path)),
-        (&dim, "tree"),
-        0,
-        bounds,
-    )?;
+    let page = symbol_page(service.index(), (&dim, &key), (0, "tree"), bounds)?
+        .ok_or("the symbol has a declaration")?;
 
     assert_eq!(page.nodes.len(), 1, "the item node alone crosses the bound");
-    assert_eq!(page.nodes[0].of.as_ref(), Some(&dim));
+    assert_eq!(page.symbol.as_ref(), Some(&dim));
+    assert_eq!(page.nodes[0].index, 0);
     assert!(page.node_cursor.is_some());
     Ok(())
 }
@@ -272,7 +294,7 @@ fn a_served_cursor_continues_the_read_and_refuses_another_symbol() -> TestResult
     let dim = identity(&service, "dim")?;
     let lamp = identity(&service, "lamp")?;
     let revision = service.revisions.index_tree_revision.clone();
-    let cursor = super::cursor(1, &dim, &revision);
+    let cursor = super::cursor(1, dim.as_str(), &revision);
 
     let rest = service.nodes(&NodesParams {
         node_cursor: Some(cursor.clone()),
@@ -319,13 +341,6 @@ fn a_request_selects_exactly_one_of_symbol_and_path() -> TestResult {
             },
             "position",
         ),
-        (
-            NodesParams {
-                node_cursor: Some("0.0".to_owned()),
-                ..NodesParams::at(path, 0)
-            },
-            "node_cursor",
-        ),
     ];
     for (params, field) in refusals {
         let error = service
@@ -359,13 +374,66 @@ fn a_symbol_without_a_declaration_refuses_naming_it() -> TestResult {
 }
 
 #[test]
-fn a_declaration_whose_file_the_index_lost_refuses_as_unavailable() -> TestResult {
-    let path = rift_core::ProjectPath::new("src/gone.rs")?;
+fn a_cursor_beside_a_position_continues_the_answer_it_came_with() -> TestResult {
+    let (_directory, service) = rust_service()?;
+    let dim = identity(&service, "dim")?;
+    let path = ProjectPath("src/lib.rs".to_owned());
+    let position = u64::try_from(RUST_SOURCE.find("level / 2").ok_or("body")?)?;
+    let revision = service.revisions.index_tree_revision.clone();
 
-    let error = super::declared_syntax(&path, Ok(None)).expect_err("no parse answers");
+    let rest = service.nodes(&NodesParams {
+        node_cursor: Some(super::cursor(1, dim.as_str(), &revision)),
+        ..NodesParams::at(path.clone(), position)
+    })?;
 
-    assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
-    assert!(error.to_string().contains("src/gone.rs"), "{error}");
+    assert_eq!(rest.symbol.as_ref(), Some(&dim));
+    assert_eq!(rest.nodes, symbol_nodes(&service, &dim)?.nodes[1..]);
+    let foreign = service
+        .nodes(&NodesParams {
+            node_cursor: Some(super::cursor(
+                1,
+                "rift://source/project/src/lib.rs",
+                &revision,
+            )),
+            ..NodesParams::at(path, position)
+        })
+        .expect_err("a cursor minted for the unit refuses inside a declaration");
+    assert_eq!(foreign.slug(), errors::server::read_invalid::SLUG);
+    Ok(())
+}
+
+#[test]
+fn a_position_outside_every_declaration_answers_the_unit_from_its_file_node() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n",
+    )?;
+    fs::create_dir(directory.path().join("src"))?;
+    let source = "use std::fmt;\n\npub fn dim() {}\n";
+    fs::write(directory.path().join("src/lib.rs"), source)?;
+    let service = service(directory.path())?;
+
+    let answer = service.nodes(&NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 4))?;
+
+    assert_eq!(answer.symbol, None);
+    let file = answer.nodes.first().ok_or("the unit holds its file node")?;
+    assert_eq!(
+        (file.kind.0.as_str(), file.index, file.parent),
+        (rift_protocol::read::FILE_NODE_KIND, 0, None)
+    );
+    assert_eq!(file.source, source);
+    assert!(answer.nodes.iter().all(|node| node.declaration.is_none()));
+    assert!(
+        answer
+            .nodes
+            .iter()
+            .all(|node| node.range.start < 15 || node.range.start == 0),
+        "the function's nodes belong to its declaration: {:?}",
+        answer.nodes
+    );
+    let root = answer.nodes.get(1).ok_or("the grammar's root follows")?;
+    assert_eq!((root.index, root.parent), (1, Some(0)));
     Ok(())
 }
 

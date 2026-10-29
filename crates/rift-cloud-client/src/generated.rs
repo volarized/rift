@@ -56,13 +56,6 @@ static REGEX_PACKAGE_SEARCH_REQUEST_VIEW: std::sync::LazyLock<regex::Regex> = st
     regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
         .expect("invalid regex")
 });
-static REGEX_SEARCH_HIT_TARGET_NODE_ID_NODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-{
-    regex::Regex::new(
-            "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-        )
-        .expect("invalid regex")
-});
 static REGEX_SYMBOL_ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
             "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
@@ -665,13 +658,6 @@ pub struct Parameter {
     /// implement.
     pub extensions: Option<serde_json::Value>,
 }
-/// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-/// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-/// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-/// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-/// kind with equal bytes share one identity wherever they are written, so the identity never
-/// locates a node: the `unit` and `range` beside it do.
-pub type NodeId = String;
 /// One type a symbol carries, together with the role it plays for that symbol.
 #[derive(
     Debug,
@@ -2155,8 +2141,8 @@ pub struct PackageDocumentationHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One search hit. Its file, node, symbol, or commit payload carries the canonical identity.
-/// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
+/// One search hit. Its file, symbol, documentation, or commit payload carries the canonical
+/// identity. Dependency and synthetic symbols can have no readable source; file hits cannot.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -2308,8 +2294,6 @@ pub enum SearchHitTarget {
     DocumentationHit(SearchHitTargetDocumentationHit),
     /// A symbol hit: the declaration a provider resolved.
     Symbol(SearchHitTargetSymbol),
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    NodeId(SearchHitTargetNodeId),
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     Object(SearchHitTargetObject),
     /// A commit hit: one commit the history store holds, matched by its message.
@@ -2327,13 +2311,6 @@ impl SearchHitTarget {
     pub fn symbol(symbol: Symbol) -> Self {
         Self::Symbol(SearchHitTargetSymbol {
             symbol,
-            ..Default::default()
-        })
-    }
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    pub fn node_id(node: String) -> Self {
-        Self::NodeId(SearchHitTargetNodeId {
-            node,
             ..Default::default()
         })
     }
@@ -2432,7 +2409,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `relationship` retains source-node evidence and
+/// One auditable step in a search traversal. `relationship` retains its occurrence and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2445,8 +2422,8 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
 )]
 #[serde(deny_unknown_fields)]
 pub struct GraphHop {
-    /// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-    /// its derivation is how much the provider knew when it was read.
+    /// One directed edge between two symbols. Its occurrence is where it was read from, and its
+    /// derivation is how much the provider knew when it was read.
     #[validate(nested)]
     pub relationship: Relationship,
     /// How one path step followed its directed relationship.
@@ -2564,8 +2541,8 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
         }
     }
 }
-/// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-/// its derivation is how much the provider knew when it was read.
+/// One directed edge between two symbols. Its occurrence is where it was read from, and its
+/// derivation is how much the provider knew when it was read.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -2576,7 +2553,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
     validator::Validate,
     oas3_gen_support::Default
 )]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
@@ -2591,10 +2568,6 @@ pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
-    /// Content identities of the nodes this edge was read from, each spanning `occurrence`,
-    /// which is present whenever this list is not empty. Absent when empty.
-    #[default(Some(Default::default()))]
-    pub evidence: Option<Vec<String>>,
     /// One byte range in a source-catalog unit.
     #[validate(nested)]
     pub occurrence: Option<SourceUnitSpan>,
@@ -3731,9 +3704,10 @@ impl<'de> serde::Deserialize<'de> for SyntaxFramework {
         }
     }
 }
-/// Lists syntax nodes with their source, outermost first: every node of one `symbol`, or the
-/// nodes covering one `position` in one file. Each node carries its kind, range, and source
-/// text, including expressions smaller than a declaration.
+/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
+/// innermost declaration holding one `position` in one file, or of that file's unit when no
+/// declaration holds it. Each node carries its kind, range, source text, and place, including
+/// expressions smaller than a declaration.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -3759,14 +3733,16 @@ pub struct NodesParams {
         regex(path = "REGEX_DOCUMENTATION_LICENSE_FILE_PATH")
     )]
     pub path: Option<String>,
-    /// UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes
-    /// themselves carry the spans. A position inside a multi-byte character is valid and
-    /// answers with its enclosing nodes; a position at or past the file's byte length
-    /// refuses.
+    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
+    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
+    /// innermost declaration holding the node at the position, or of the file's unit when no
+    /// declaration holds it. A position inside a multi-byte character is valid; a position at
+    /// or past the file's byte length refuses.
     #[validate(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: Option<u64>,
-    /// Continuation a preceding `symbol` read returned, bound to that symbol and the tree
-    /// revision it read. The server refuses it beside `path` and once the tree has moved.
+    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
+    /// and the tree revision it read. The caller MUST send it with the selector of that read;
+    /// the server refuses it for another symbol or unit and once the tree has moved.
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub node_cursor: Option<String>,
     /// A service-issued key for one immutable view in one serving context.
@@ -3782,15 +3758,18 @@ pub struct NodesParams {
     )]
     pub revision: Option<String>,
 }
-/// The nodes a read selected, each with its source text and identity derived from its bytes.
+/// The nodes a read selected, each with its source text and its place inside its symbol or
+/// unit.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct NodesResult {
-    /// Nodes the read selected, outermost first: per declaration for a `symbol` read, from
-    /// the file node inward for a `position` read.
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
+    pub symbol: Option<String>,
+    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
+    /// lists them, or the unit's nodes from its file node on.
     pub nodes: Vec<Node>,
-    /// Continuation for the rest of a `symbol` read whose nodes crossed the answer's node
-    /// count or source byte bound. Absent when the answer holds the last node.
+    /// Continuation for the rest of an answer whose nodes crossed its node count or source
+    /// byte bound. Absent when the answer holds the last node.
     pub node_cursor: Option<String>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
@@ -3800,20 +3779,23 @@ pub struct NodesResult {
     #[default(Some(Default::default()))]
     pub warnings: Option<Vec<ReadWarning>>,
 }
-/// One node of a source unit's syntax tree, with its source text. It identifies a source
-/// range and provider-local syntax kind. `of` connects the node to the symbol it declares.
+/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
+/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
+/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// after it.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Node {
-    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-    /// kind with equal bytes share one identity wherever they are written, so the identity never
-    /// locates a node: the `unit` and `range` beside it do.
-    pub id: String,
-    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
-    pub of: Option<String>,
+    /// Ordinal of the declaration holding this node among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
+    /// every declaration: the file node, an import, a top-level statement.
+    pub declaration: Option<u64>,
+    /// Pre-order position of this node inside its declaration's item subtree, or inside its
+    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
+    pub index: u64,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
@@ -3835,13 +3817,9 @@ pub struct Node {
     /// The node's named parts, including its function body and documentation. Absent when empty.
     #[default(Some(Default::default()))]
     pub regions: Option<Vec<NodeRegion>>,
-    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-    /// kind with equal bytes share one identity wherever they are written, so the identity never
-    /// locates a node: the `unit` and `range` beside it do.
-    pub parent: Option<String>,
+    /// `index` of the node this one is nested inside, in the same declaration or unit. Absent
+    /// for node 0.
+    pub parent: Option<u64>,
     /// Facts a provider carries that the model has no field for, under a reverse-domain key.
     /// Keys and values use RFC 8785 canonical JSON. Consumers skip entries they do not
     /// implement.
@@ -5335,32 +5313,6 @@ pub struct SearchHitTargetSymbol {
     #[validate(nested)]
     pub symbol: Symbol,
     #[default("symbol".to_string())]
-    pub target: String,
-}
-/// A node hit: one place in a syntax tree, without its enclosing symbol record.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    validator::Validate,
-    oas3_gen_support::Default
-)]
-#[serde(deny_unknown_fields, default)]
-pub struct SearchHitTargetNodeId {
-    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-    /// kind with equal bytes share one identity wherever they are written, so the identity never
-    /// locates a node: the `unit` and `range` beside it do.
-    #[validate(
-        length(min = 78u64, max = 206u64),
-        regex(path = "REGEX_SEARCH_HIT_TARGET_NODE_ID_NODE")
-    )]
-    pub node: String,
-    #[default("node".to_string())]
     pub target: String,
 }
 /// A file hit: one entry of the tree, whether or not any provider reads it.
