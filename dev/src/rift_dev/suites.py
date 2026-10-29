@@ -190,10 +190,11 @@ def unit(archive: Path | None) -> None:
     """Run the unit suite once under one coverage report.
 
     Unit tests use local fixtures and require no language servers or model
-    downloads.
+    downloads. `cargo llvm-cov nextest` cleans before it runs: cargo-llvm-cov 0.8.7
+    removes the measured crates' artifacts and every profraw file unless
+    `--no-clean` is passed, so the suite runs no separate clean.
     """
     coverage_target()
-    CargoCommand("llvm-cov", "clean", "--workspace").run()
     selection = archive_selection(
         archive, ["--workspace", "--all-targets", "--all-features", "--locked"]
     )
