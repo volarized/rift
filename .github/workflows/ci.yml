@@ -275,10 +275,16 @@ jobs:
           rustup toolchain install 1.98 --profile minimal
           --component rustfmt,clippy,llvm-tools-preview,rust-src
 
-      # Test binaries come from this revision's build archive.
+      # Test binaries come from this revision's build archive. Nextest bounds the
+      # run at the `ci` profile's 480 s global timeout; the step adds what runs
+      # outside that bound, measured on six runs (2026-10-28/29) that still ran a
+      # second clean: up to 82 s for that clean, which resolves the registry index
+      # on a fresh runner, 70 s before the first test (cargo-llvm-cov's own clean
+      # and archive extraction) and 38 s of report. 480 s plus 190 s leaves 50 s
+      # in 12 minutes.
       - run: just test target/fast.tar.zst
         id: rust_tests
-        timeout-minutes: 10
+        timeout-minutes: 12
         env:
           NEXTEST_PROFILE: ci
       - name: Measure retained material accounting
