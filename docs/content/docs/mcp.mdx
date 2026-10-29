@@ -477,8 +477,9 @@ See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bou
 ## Nodes [#tool-nodes]
 
 After reading a declaration, the agent may need its source, or only its name, body, or one
-expression. `nodes` lists syntax nodes with their source: every node of one symbol, or the nodes
-around a position in a local file, giving the agent source ranges for a precise edit target.
+expression. `nodes` lists syntax nodes with their source: every node of one symbol, or of the
+declaration around a position in a local file, giving the agent source ranges for a precise edit
+target.
 
 To read the `Config` struct of the sample project, the agent passes its symbol identity:
 
@@ -499,33 +500,22 @@ The position is a UTF-8 byte offset, rather than a line or character number.
 
 </Callout>
 
-In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call:
+In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call. A position read
+answers every node of the declaration holding it, `load_config`:
 
 <ReadExample name="local-nodes" />
 
-The response lists enclosing nodes from outermost to innermost, with their source and byte
-ranges:
+The answer names the symbol once, and each node carries its address inside it:
 
-| Node in this example | What the agent can inspect |
-| --- | --- |
-| File | The whole file |
-| Source file | The tree the grammar parsed |
-| `load_config` function | The complete declaration |
-| Function body | The implementation inside the braces |
-| `parse_config(&text)` call | The expression to change |
-| `parse_config` identifier | The name within that expression |
+- `declaration` is the declaration's ordinal among the symbol's declarations, and `index` is the
+  node's place inside that declaration, from the declaration's own node at 0: `334..353`, the
+  `parse_config(&text)` call, is node 25 of `load_config`.
+- `parent` is the index of the node around it: the call's parent, node 13, is the function body.
+- A node has no identity of its own. Its address names its place in the current code, so the
+  agent reads again after an edit before using it.
 
-In the text response:
-
-- Each node shows its syntax kind and line count, its byte range, then its node identity:
-  `334..353` is the `parse_config(&text)` call.
-- The node identity is a digest of the node's language, kind, and bytes, so it stays the same
-  when the agent edits another part of the file, and two nodes written the same way share one
-  identity. The byte range is what places the node: both `pub` keywords of `Config` above share
-  one identity.
-- A node that declares a symbol also shows the symbol's identity.
-- The source of the innermost node closes a position answer, and the declaration's source closes
-  a symbol answer; the structured output carries the source of every node.
+A byte outside every declaration, such as one in an import, answers the file's own nodes: the
+file node at index 0, then each node no declaration holds.
 
 Every file has a file node spanning all of it, so a file no syntax provider parses, such as a
 `justfile`, answers that one node with the file's text.

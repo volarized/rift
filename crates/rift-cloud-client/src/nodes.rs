@@ -138,8 +138,8 @@ fn is_release_owner(owner: &SymbolOwner) -> bool {
 
 /// Whether `result` answers `request` within `bounds`: every node sits in a source unit of
 /// the symbol's own release and carries the bytes its range spans, the answer reports that
-/// release as its revision, the page stays within its node and source bounds, and the view
-/// and cursor are the ones the request allows.
+/// release as its revision and names no other symbol, the page stays within its node and source
+/// bounds, and the view and cursor are the ones the request allows.
 fn valid_result(
     request: &NodesParams,
     symbol: &RequestedSymbol<'_>,
@@ -164,22 +164,31 @@ fn valid_result(
         !result.nodes.is_empty() && !cursor.is_empty() && cursor.len() <= CURSOR_BYTES_MAX
     });
     let revision_valid = result.revision.answers_for(&symbol.owner);
-    within_page && nodes_valid && within_source && view_valid && cursor_valid && revision_valid
+    let names_symbol = result
+        .symbol
+        .as_ref()
+        .is_none_or(|named| named == symbol.id);
+    within_page
+        && nodes_valid
+        && within_source
+        && view_valid
+        && cursor_valid
+        && revision_valid
+        && names_symbol
 }
 
-/// Whether `node` is a node of `symbol`: written in a source unit of the symbol's release,
-/// naming no other symbol, and carrying exactly as many bytes as its range spans.
+/// Whether `node` is a node of `symbol`: written in a source unit of the symbol's release and
+/// carrying exactly as many bytes as its range spans.
 fn valid_node(node: &Node, symbol: &RequestedSymbol<'_>) -> bool {
     let NodeUnit::Source(unit) = &node.unit else {
         return false;
     };
     let in_release = parse_source_unit_identity(unit.as_str())
         .is_ok_and(|(unit_owner, _)| unit_owner.as_ref() == Some(&symbol.owner));
-    let names_symbol = node.of.as_ref().is_none_or(|of| of == symbol.id);
     let spans_source = node
         .range
         .end
         .checked_sub(node.range.start)
         .is_some_and(|length| u64::try_from(node.source.len()).is_ok_and(|bytes| bytes == length));
-    in_release && names_symbol && spans_source
+    in_release && spans_source
 }
