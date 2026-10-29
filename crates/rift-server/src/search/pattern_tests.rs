@@ -433,7 +433,7 @@ fn refusals_name_the_field_and_the_bound() -> TestResult {
             rift_error::errors::server::read_invalid::SLUG,
         ),
         (
-            json!({"pattern": "TODO", "rev": "main"}),
+            json!({"pattern": "TODO", "revision": "rift://revision/git/main"}),
             "current tree alone",
             rift_error::errors::server::read_invalid::SLUG,
         ),
@@ -509,7 +509,7 @@ fn packages_beside_a_pattern_refuse_only_where_the_argument_cannot_answer() -> T
             "the local scope reads the project alone",
         ),
         (
-            json!({"pattern": "TODO", "scope": "all", "rev": "main", "packages": packages}),
+            json!({"pattern": "TODO", "scope": "all", "revision": "rift://revision/git/main", "packages": packages}),
             "scope",
             "current tree alone",
         ),

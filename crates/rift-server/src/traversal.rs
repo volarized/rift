@@ -1439,7 +1439,7 @@ pub(crate) mod tests {
     fn search_traversal_with_rev_refuses_capability_unavailable() -> TestResult {
         let (_directory, service, references) = live_reference_graph_fixture()?;
         let params: SearchParams = serde_json::from_value(json!({
-            "rev": "HEAD",
+            "revision": "rift://revision/git/HEAD",
             "traversal": {
                 "seed": graph_identity("leaf").as_str()
             }
@@ -1455,7 +1455,7 @@ pub(crate) mod tests {
     #[test]
     fn validate_search_refuses_traversal_with_rev_before_resolving_either() {
         let params: SearchParams = serde_json::from_value(json!({
-            "rev": "main",
+            "revision": "rift://revision/git/main",
             "traversal": {
                 "seed": graph_identity("root").as_str()
             }

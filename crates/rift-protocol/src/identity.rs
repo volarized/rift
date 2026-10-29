@@ -481,6 +481,12 @@ impl SymbolOwner {
         )
     }
 
+    /// A package or runtime owner's release spelling, the form a release revision carries:
+    /// `cargo/crates.io/demo@1.0.0`, `stdlib/cpython@3.12.9`. Absent for a local owner.
+    pub(crate) fn release_spelling(&self) -> Option<String> {
+        (!self.is_local()).then(|| self.wire_owner())
+    }
+
     fn wire_owner(&self) -> String {
         match self {
             Self::Local => LOCAL_SCOPE_PREFIX.to_owned(),
@@ -593,6 +599,22 @@ fn parse_package_owner<'a>(
         name,
         version,
     })
+}
+
+/// Parses one canonical package or runtime release spelling, as
+/// [`SymbolOwner::release_spelling`] renders it.
+pub(crate) fn parse_release_owner(value: &str) -> Result<SymbolOwner, RiftError> {
+    let mut segments = value.split('/');
+    let scope = next_segment(&mut segments)?;
+    let owner = parse_owner(scope, &mut segments)?;
+    if owner.is_local() || segments.next().is_some() {
+        return Err(SymbolIdentityViolation::Structure.into());
+    }
+    owner.validate()?;
+    if owner.wire_owner() != value {
+        return Err(SymbolIdentityViolation::Noncanonical.into());
+    }
+    Ok(owner)
 }
 
 fn parse_release(value: &str) -> Result<(String, String), RiftError> {

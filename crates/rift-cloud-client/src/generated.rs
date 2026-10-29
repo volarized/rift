@@ -37,6 +37,13 @@ static REGEX_DOCUMENTATION_LICENSE_FILE_PATH: std::sync::LazyLock<regex::Regex> 
         )
         .expect("invalid regex")
 });
+static REGEX_GET_SYMBOL_PARAMS_REVISION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+{
+    regex::Regex::new(
+            "^rift://revision/(?:git/[A-Za-z0-9._/-]+(?:~[0-9]*)*|tree/[0-9a-f]{64}|stdlib/[a-z][a-z0-9_-]*@[^/?#]+|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+)$",
+        )
+        .expect("invalid regex")
+});
 static REGEX_PACKAGE_SEARCH_HIT_UNIT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 {
     regex::Regex::new(
@@ -2773,16 +2780,6 @@ pub struct FindDeclarationsParams {
         regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
     )]
     pub view: Option<String>,
-    /// Identity of one revision in the workspace's version-control history, spelled the way the
-    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
-    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
-    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
-    /// their identifiers.
-    #[validate(
-        length(min = 1u64, max = 128u64),
-        regex(path = "REGEX_COMMIT_HIT_REVISION")
-    )]
-    pub rev: Option<String>,
 }
 /// One answer per submitted position, retaining one shared captured selection.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -2845,16 +2842,12 @@ pub struct GetSymbolParams {
     /// Requested projections. Omitted or empty requests none. A declaration's source is read
     /// by `nodes` with `symbol`.
     pub include: Option<Vec<GetSymbolInclude>>,
-    /// Identity of one revision in the workspace's version-control history, spelled the way the
-    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
-    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
-    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
-    /// their identifiers.
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
-        length(min = 1u64, max = 128u64),
-        regex(path = "REGEX_COMMIT_HIT_REVISION")
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_GET_SYMBOL_PARAMS_REVISION")
     )]
-    pub rev: Option<String>,
+    pub revision: Option<String>,
     /// A service-issued key for one immutable view in one serving context.
     #[validate(
         length(min = 3u64, max = 4_096u64),
@@ -3352,6 +3345,8 @@ impl<'de> serde::Deserialize<'de> for RelationshipFacet {
 /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
 /// their identifiers.
 pub type RevisionId = String;
+/// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+pub type Revision = String;
 /// One exact position in a project, package or runtime source unit.
 #[derive(
     Debug,
@@ -3778,16 +3773,12 @@ pub struct NodesParams {
         regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
     )]
     pub view: Option<String>,
-    /// Identity of one revision in the workspace's version-control history, spelled the way the
-    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
-    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
-    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
-    /// their identifiers.
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
-        length(min = 1u64, max = 128u64),
-        regex(path = "REGEX_COMMIT_HIT_REVISION")
+        length(min = 1u64, max = 8_192u64),
+        regex(path = "REGEX_GET_SYMBOL_PARAMS_REVISION")
     )]
-    pub rev: Option<String>,
+    pub revision: Option<String>,
 }
 /// The nodes a read selected, each with its source text and identity derived from its bytes.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
@@ -3799,6 +3790,8 @@ pub struct NodesResult {
     /// Continuation for the rest of a `symbol` read whose nodes crossed the answer's node
     /// count or source byte bound. Absent when the answer holds the last node.
     pub node_cursor: Option<String>,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
@@ -5566,6 +5559,8 @@ pub struct GetSymbolResultObject {
     pub symbol: Symbol,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
     /// Declaration bindings in deterministic source order.
     pub declarations: Vec<SymbolDeclaration>,
     /// Continuation for remaining declarations in this exact view.
@@ -5591,6 +5586,8 @@ pub struct GetSymbolResultObject2 {
     pub symbol_not_found: SymbolNotFound,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: CapturedView,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
     /// Warnings, including incomplete candidate work.
     pub warnings: Option<Vec<ReadWarning>>,
     #[default("missing".to_string())]
@@ -5604,6 +5601,8 @@ pub struct GetSymbolResultObject3 {
     pub id: String,
     /// The immutable serving view and the expiry promised by its owner.
     pub view: Option<CapturedView>,
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: Option<String>,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
     /// Details and available partial-read warnings.

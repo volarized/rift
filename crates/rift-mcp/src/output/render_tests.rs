@@ -198,6 +198,7 @@ fn search_result(
 ) -> SearchResult {
     SearchResult {
         view: None,
+        revision: None,
         results,
         pagination,
         warnings,
@@ -359,6 +360,7 @@ fn nodes_result(mut nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
         view: None,
         nodes,
         node_cursor: None,
+        revision: tree_revision(),
         warnings: Vec::new(),
     }
 }
@@ -723,6 +725,7 @@ fn warnings_follow_the_items_of_the_other_answers() {
             "2 warnings",
             "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
             "\tglobal_access_disabled",
+            REVISION_LINE,
         ],
     );
 }
@@ -3434,6 +3437,7 @@ fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "\t\trift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             "",
             "\t\tc",
+            REVISION_LINE,
         ],
     );
 }
@@ -3707,6 +3711,7 @@ fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
             "\t\trift://node/rust/9b04c3deca33e42e8320a198a92e8228c839f6896f7355d628794a903e7e1e65",
             "",
             "\t\tpub fn beacon() {}",
+            REVISION_LINE,
         ],
     );
 }
@@ -3758,6 +3763,7 @@ fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
             "",
             "\t\tfn a() {}",
             "node_cursor 3.0123456789abcdef",
+            REVISION_LINE,
         ],
     );
 }
@@ -3765,7 +3771,7 @@ fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
 #[test]
 fn an_empty_nodes_answer_writes_only_the_header() {
     let answer = nodes_result(Vec::new(), Vec::new());
-    golden(&answer, &["0 nodes"]);
+    golden(&answer, &["0 nodes", REVISION_LINE]);
 }
 
 #[test]
@@ -3788,6 +3794,7 @@ fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
             "\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "",
             "\tname",
+            REVISION_LINE,
         ],
     );
 }
@@ -3808,6 +3815,7 @@ fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_innermost_e
             "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "",
             "\t\tname",
+            REVISION_LINE,
         ],
     );
     assert!(
@@ -3864,6 +3872,7 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
             "\t\tfn a() {",
             "\t\t    b",
             "\t\t}",
+            REVISION_LINE,
         ],
     );
 }
@@ -3914,6 +3923,7 @@ fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
             "\t\trift://node/rust/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "",
             "\t\tz",
+            REVISION_LINE,
         ],
     );
 }
@@ -3937,7 +3947,8 @@ fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
             "\t0..1",
             "\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "",
-            ""
+            "",
+            REVISION_LINE,
         ])
     );
 }
@@ -3960,6 +3971,7 @@ fn warnings_follow_the_innermost_excerpt_of_the_nodes() {
             "\t\tname",
             "1 warning",
             "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
+            REVISION_LINE,
         ],
     );
 }
@@ -3989,6 +4001,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
             "\t[1] fake",
             "\t\tnested",
             "\t````",
+            REVISION_LINE,
         ],
     );
     let two = nodes_result(
@@ -4010,7 +4023,11 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
     );
     let output = rendered(&two);
     assert_no_trailing_space(&output);
-    let block: Vec<&str> = output.lines().skip(8).collect();
+    let block: Vec<&str> = output
+        .lines()
+        .skip(8)
+        .take_while(|line| !line.starts_with("revision "))
+        .collect();
     assert_eq!(block.len(), 7);
     let recovered: Vec<&str> = block
         .iter()
@@ -4329,6 +4346,7 @@ fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_sourc
             "\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
             "",
             "\t\tparse_config",
+            AUTHORED_REVISION_LINE,
         ],
     );
 }
@@ -4556,6 +4574,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
             id: CapturedViewId::parse("claims.signature").expect("view"),
             expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
         },
+        revision: tree_revision(),
         declarations: Vec::new(),
         declaration_cursor: None,
         history: None,
@@ -4565,6 +4584,7 @@ fn canonical_symbol_render_keeps_source_less_object_without_physical_bindings() 
     let text = rendered(&answer);
     assert!(text.contains(id.as_str()));
     assert!(text.contains("view claims.signature"));
+    assert!(text.contains(&format!("revision {}", tree_revision())));
     assert!(!text.contains("declarations:"));
     assert!(!text.contains("a.rs:1"));
 }
@@ -4592,6 +4612,7 @@ fn canonical_symbol_render_keeps_binding_location_and_declaration_continuation()
             id: CapturedViewId::parse("claims.signature").expect("view"),
             expires_at: "2030-01-01T00:10:00+00:00".to_owned(),
         },
+        revision: tree_revision(),
         declaration_cursor: Some("opaque-continuation".to_owned()),
         history: None,
         documentation: None,
@@ -4620,16 +4641,31 @@ fn canonical_read_render_keeps_missing_and_unavailable_distinct() {
             detail: None,
         },
         view: view.clone(),
+        revision: tree_revision(),
         warnings: Vec::new(),
     };
     let unavailable = GetSymbolResult::Unavailable {
         id,
         view: Some(view),
+        revision: None,
         reason: SymbolUnavailableReason::ViewExpired,
         warnings: Vec::new(),
     };
-    assert!(rendered(&missing).contains("symbol_not_found"));
+    let missing = rendered(&missing);
+    assert!(missing.contains("symbol_not_found"));
+    assert!(missing.contains("revision rift://revision/tree/"));
     let text = rendered(&unavailable);
     assert!(text.contains("unavailable · ViewExpired"));
     assert!(!text.contains("symbol_not_found"));
+    assert!(!text.contains("revision "));
+}
+
+/// The `revision` line of an answer read at [`tree_revision`].
+const REVISION_LINE: &str = "revision rift://revision/tree/0000000000000000000000000000000000000000000000000000000000000000";
+
+/// The `revision` line of the authored `nodes` example.
+const AUTHORED_REVISION_LINE: &str = "revision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11";
+
+fn tree_revision() -> rift_protocol::revision::Revision {
+    rift_protocol::revision::Revision::tree(&"0".repeat(64)).expect("tree revision")
 }

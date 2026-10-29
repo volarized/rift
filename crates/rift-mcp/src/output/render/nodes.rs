@@ -21,6 +21,7 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     let NodesResult {
         nodes,
         node_cursor,
+        revision,
         view,
         warnings,
     } = result;
@@ -35,6 +36,7 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
         out.raw_line(0, &format!("node_cursor {cursor}"))?;
     }
     warning::section(out, warnings)?;
+    layout::revision(out, Some(revision))?;
     if let Some(view) = view {
         out.raw_line(
             0,

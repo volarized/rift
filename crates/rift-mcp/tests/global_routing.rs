@@ -866,7 +866,10 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
     assert!(refused.message.contains(&absent), "{}", refused.text);
     let at_revision = failed_call(
         client
-            .call_tool(tool_request("nodes", &json!({"symbol": id, "rev": "main"})))
+            .call_tool(tool_request(
+                "nodes",
+                &json!({"symbol": id, "revision": "rift://revision/git/main"}),
+            ))
             .await,
     )?;
     assert_eq!(
@@ -1482,7 +1485,7 @@ async fn a_revision_search_with_a_global_scope_refuses_invalid_request() -> Test
         client
             .call_tool(tool_request(
                 "search",
-                &json!({"query": "local_beacon", "scope": "all", "rev": "main"}),
+                &json!({"query": "local_beacon", "scope": "all", "revision": "rift://revision/git/main"}),
             ))
             .await,
     )?;

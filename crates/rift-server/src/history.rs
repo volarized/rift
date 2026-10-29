@@ -1283,7 +1283,7 @@ mod tests {
         let mut request = GetSymbolParams {
             id: timeline_identity(&service, matched)?,
             include: vec![rift_protocol::read::GetSymbolInclude::History],
-            rev: None,
+            revision: None,
             view: None,
             declaration_limit: 1,
             declaration_cursor: None,

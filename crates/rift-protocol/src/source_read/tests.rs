@@ -20,7 +20,6 @@ fn request() -> FindDeclarationsParams {
         position_encoding: PositionEncoding::Utf8,
         positions: vec![position(PROJECT)],
         view: None,
-        rev: None,
     }
 }
 
@@ -33,29 +32,12 @@ fn position(value: &str) -> SourcePosition {
 }
 
 #[test]
-fn position_selectors_require_project_history_and_refuse_legacy_owners() {
+fn position_selectors_accept_canonical_units_and_refuse_legacy_owners() {
     let mut request = request();
-    request.rev = Some(RevisionId("main~1".to_owned()));
     assert!(request.is_valid());
-    for value in [
-        RUNTIME,
-        "rift://source/custom/src/lib.rs",
-        "rift://source/project2/src/lib.rs",
-        "rift://source/cargo2/src/lib.rs",
-        "rift://source/npm/npmjs.org/@scope/demo@1.0.0/index.ts",
-    ] {
-        request.positions = vec![position(value)];
-        assert!(
-            !request.is_valid(),
-            "released and custom sources do not imply Git history"
-        );
-    }
-    request.positions = vec![position(PROJECT)];
+    request.positions = vec![position(RUNTIME)];
     request.view = Some(view("payload.signature").id);
-    assert!(!request.is_valid());
-    request.view = None;
-    request.rev = Some(RevisionId("main@{1}".to_owned()));
-    assert!(!request.is_valid());
+    assert!(request.is_valid());
     assert!(
         serde_json::from_value::<SourcePosition>(
             json!({"unit":"rift://source/stdlib/python/3.12.9/pathlib.py","line":0,"character":0})
@@ -76,7 +58,6 @@ fn position_bounds_match_schema_and_batch_order() {
         position_encoding: PositionEncoding::Utf16,
         positions: vec![position(PROJECT)],
         view: None,
-        rev: None,
     };
     request.positions[0].line = SOURCE_POSITION_MAX;
     request.positions[0].character = SOURCE_POSITION_MAX;
@@ -114,7 +95,6 @@ fn position_results_share_view_without_conflating_physical_and_logical_owner() {
             position(PROJECT),
         ],
         view: None,
-        rev: None,
     };
     let mut result = FindDeclarationsResult {
         results: vec![

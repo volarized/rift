@@ -164,6 +164,7 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
     } else {
         rest
     };
+    let rest = revision_states(rest, structured.get("revision"))?;
     let rest = cursor_states(rest, structured.get("node_cursor"))?;
     warnings_states(rest, structured.get("warnings"))?;
     items_states(tool, &first.entries, items, structured)
@@ -955,6 +956,26 @@ fn regions_states(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String>
 
 /// Checks the `node_cursor CURSOR` line that opens the sections after the items when the answer
 /// carries a cursor, and returns the sections after it.
+/// Checks the `revision` line that ends an answer reporting the revision it was read at,
+/// before any captured view.
+fn revision_states<'text, 'sections>(
+    sections: &'sections [Section<'text>],
+    revision: Option<&Value>,
+) -> Result<&'sections [Section<'text>], String> {
+    let Some(revision) = revision else {
+        return Ok(sections);
+    };
+    let revision = revision.as_str().ok_or("$.revision: must be a string")?;
+    match sections.split_last() {
+        Some((last, preceding))
+            if last.title == format!("revision {revision}") && last.entries.is_empty() =>
+        {
+            Ok(preceding)
+        }
+        _ => Err("$.revision: the text must state the revision the answer was read at".to_owned()),
+    }
+}
+
 fn cursor_states<'text, 'sections>(
     sections: &'sections [Section<'text>],
     cursor: Option<&Value>,

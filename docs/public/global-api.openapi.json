@@ -931,6 +931,7 @@
                 "exact": {
                   "value": {
                     "id": "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+                    "revision": "rift://revision/cargo/crates.io/tokio@1.50.0",
                     "declaration_limit": 5
                   }
                 }
@@ -960,6 +961,7 @@
                         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "expires_at": "2026-10-10T01:00:00Z"
                       },
+                      "revision": "rift://revision/cargo/crates.io/tokio@1.50.0",
                       "declarations": []
                     }
                   }
@@ -1238,7 +1240,8 @@
                       "view": {
                         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "expires_at": "2026-10-10T01:00:00Z"
-                      }
+                      },
+                      "revision": "rift://revision/cargo/crates.io/demo@1.0.0"
                     }
                   }
                 }
@@ -5071,10 +5074,6 @@
           "view": {
             "description": "A preceding immutable selection shared by the whole batch.",
             "$ref": "#/components/schemas/CapturedViewId"
-          },
-          "rev": {
-            "description": "A local Git revision. Refused for released sources and beside `view`.",
-            "$ref": "#/components/schemas/RevisionId"
           }
         },
         "required": [
@@ -5135,9 +5134,9 @@
             },
             "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`."
           },
-          "rev": {
-            "description": "A local Git revision. Refused for a package or runtime owner and beside `view`.",
-            "$ref": "#/components/schemas/RevisionId"
+          "revision": {
+            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision names the release\na package or runtime `id` carries. Omitted reads the served working tree. The\nserver refuses it beside `view` and once the index no longer serves it.",
+            "$ref": "#/components/schemas/Revision"
           },
           "view": {
             "description": "A view returned by a preceding read. Expiry never selects latest implicitly.",
@@ -5186,6 +5185,10 @@
                 "$ref": "#/components/schemas/CapturedView",
                 "description": "The immutable context used for this result and its continuations."
               },
+              "revision": {
+                "$ref": "#/components/schemas/Revision",
+                "description": "The revision this answer was read at: a commit, a release, or a working tree."
+              },
               "declarations": {
                 "type": "array",
                 "items": {
@@ -5224,6 +5227,7 @@
               "outcome",
               "symbol",
               "view",
+              "revision",
               "declarations"
             ],
             "description": "The exact identity was established, even when it has no source declarations."
@@ -5240,6 +5244,10 @@
                 "$ref": "#/components/schemas/CapturedView",
                 "description": "The exact immutable selection searched."
               },
+              "revision": {
+                "$ref": "#/components/schemas/Revision",
+                "description": "The revision this answer was read at: a commit, a release, or a working tree."
+              },
               "warnings": {
                 "type": "array",
                 "items": {
@@ -5255,7 +5263,8 @@
             "required": [
               "outcome",
               "symbol_not_found",
-              "view"
+              "view",
+              "revision"
             ],
             "description": "The valid identity is absent from the completely searched exact selection."
           },
@@ -5270,6 +5279,10 @@
               "view": {
                 "description": "The selected view, when one could be captured.",
                 "$ref": "#/components/schemas/CapturedView"
+              },
+              "revision": {
+                "description": "The revision the read selected, when it established one.",
+                "$ref": "#/components/schemas/Revision"
               },
               "reason": {
                 "$ref": "#/components/schemas/SymbolUnavailableReason",
@@ -6497,6 +6510,21 @@
         "pattern": "^[A-Za-z0-9._/-]+(?:[~^][0-9]*)*$",
         "description": "Identity of one revision in the workspace's version-control history, spelled the way the\nversion-control system spells it: a branch, tag, or commit id, optionally followed by\nancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for\nthe second parent. Rift carries it opaquely and never orders two revisions by comparing\ntheir identifiers."
       },
+      "Revision": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 8192,
+        "pattern": "^rift://revision/(?:git/[A-Za-z0-9._/-]+(?:~[0-9]*)*|tree/[0-9a-f]{64}|stdlib/[a-z][a-z0-9_-]*@[^/?#]+|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+)$",
+        "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
+        "examples": [
+          "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1",
+          "rift://revision/git/main",
+          "rift://revision/cargo/crates.io/serde@1.0.228",
+          "rift://revision/npm/npmjs.org/@types/node@26.6.4",
+          "rift://revision/stdlib/cpython@3.12.9",
+          "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+        ]
+      },
       "SourceExcerpt": {
         "type": "object",
         "additionalProperties": false,
@@ -6912,9 +6940,9 @@
             "description": "Zero-based page of the result set to serve, sized by `limit`. A `page_index` past\nthe last page returns an empty page whose `pagination` carries the requested\n`page_index` and the true `total_pages`.",
             "default": 0
           },
-          "rev": {
-            "description": "The version-control revision to search - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted searches the current tree. The server\nrefuses a revision search when the workspace has no version-control repository.",
-            "$ref": "#/components/schemas/RevisionId"
+          "revision": {
+            "description": "The revision to search: a git revision searches that commit, a tree revision the\nserved working tree. Omitted searches the served working tree. The server refuses a\ngit revision when the workspace has no version-control repository, a tree revision\nonce the index serves another tree, and a release revision, since `packages` names\nthe releases a search reads.",
+            "$ref": "#/components/schemas/Revision"
           },
           "traversal": {
             "description": "A bounded relationship walk from `seed`, standing alone or beside `query`. A symbol\nthe walk reaches becomes a hit tagged `relationship`; one also matched lexically\nkeeps its own score and payload and gains the walk's path. `target: \"file\"` never\ncarries a walked hit, since a traversal only reaches symbols. With no `query`,\n`relevance` orders hits by ascending `distance`, then identity. A configured\nlanguage engine resolves the references the walk follows, and an engine session\nserves the current tree, so the server refuses `traversal` beside `rev` and beside\n`change`.",
@@ -7285,6 +7313,10 @@
             "description": "The captured serving context for this result, including an empty page. Each hit\ncarries the original view of its selected project or released owner.\nAbsent when the caller selected latest facts without retained serving context.",
             "$ref": "#/components/schemas/CapturedView"
           },
+          "revision": {
+            "description": "The revision of the project tree this answer read: a commit or a working tree.\nAbsent when the answer merged several project trees, read packages alone, or\nanswered from a captured view.",
+            "$ref": "#/components/schemas/Revision"
+          },
           "results": {
             "type": "array",
             "items": {
@@ -7552,12 +7584,12 @@
             "maxLength": 4096
           },
           "view": {
-            "description": "Captured view selected by discovery. The server reads nodes from that view and\nrefuses an expired or foreign view. The caller MUST omit `rev` beside `view`.",
+            "description": "Captured view selected by discovery. The server reads nodes from that view and\nrefuses an expired or foreign view. The caller MUST omit `revision` beside `view`.",
             "$ref": "#/components/schemas/CapturedViewId"
           },
-          "rev": {
-            "description": "The version-control revision to read - a branch, tag, or commit id as the\nworkspace's version control spells it. Omitted reads the current tree. The server\nrefuses a revision read when the workspace has no version-control repository.",
-            "$ref": "#/components/schemas/RevisionId"
+          "revision": {
+            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision names the release a package or runtime\n`symbol` carries. Omitted reads the served working tree. The server refuses a git\nrevision when the workspace has no version-control repository, and a tree revision\nonce the index serves another tree.",
+            "$ref": "#/components/schemas/Revision"
           }
         },
         "description": "Lists syntax nodes with their source, outermost first: every node of one `symbol`, or the\nnodes covering one `position` in one file. Each node carries its kind, range, and source\ntext, including expressions smaller than a declaration.",
@@ -7637,6 +7669,10 @@
             "type": "string",
             "description": "Continuation for the rest of a `symbol` read whose nodes crossed the answer's node\ncount or source byte bound. Absent when the answer holds the last node."
           },
+          "revision": {
+            "$ref": "#/components/schemas/Revision",
+            "description": "The revision this answer was read at: a commit, a release, or a working tree."
+          },
           "view": {
             "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view.",
             "$ref": "#/components/schemas/CapturedView"
@@ -7651,7 +7687,8 @@
           }
         },
         "required": [
-          "nodes"
+          "nodes",
+          "revision"
         ],
         "description": "The nodes a read selected, each with its source text and identity derived from its bytes.",
         "examples": [
@@ -7731,7 +7768,8 @@
                 },
                 "source": "parse_config"
               }
-            ]
+            ],
+            "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
           }
         ]
       },

@@ -85,6 +85,7 @@ fn paginated_read_results_deserialize_with_warnings_absent() -> TestResult {
 
     let nodes: NodesResult = serde_json::from_value(json!({
         "nodes": [],
+        "revision": "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1",
     }))?;
     assert!(nodes.warnings.is_empty());
 

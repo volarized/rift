@@ -86,7 +86,7 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
             include: Vec::new(),
             limit: 10,
             page_index: 0,
-            rev: None,
+            revision: None,
         })?;
         let hit = declaration.hits.first().ok_or("Beacon declaration")?;
         assert_eq!(
@@ -245,7 +245,7 @@ fn symbol_pages(
             include: Vec::new(),
             limit: 1,
             page_index,
-            rev: None,
+            revision: None,
         })?;
         let total_pages = result.pagination.total_pages;
         if total_pages > SYMBOL_PAGES_MAX {

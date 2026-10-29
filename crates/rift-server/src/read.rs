@@ -27,6 +27,7 @@ use rift_protocol::read::{
     RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol,
     SymbolId, TextRange,
 };
+use rift_protocol::revision::{Revision, RevisionPoint};
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
 
 use crate::history::{StoredHistory, SymbolTimelines};
@@ -754,7 +755,7 @@ impl ReadService {
         rift_index::validate_project_owner(&owner)?;
         if let Some(violation) = rev.violation() {
             return errors::server::read_invalid()
-                .field("rev")
+                .field("revision")
                 .violation(violation.as_str())
                 .fail();
         }
@@ -901,16 +902,17 @@ impl ReadService {
     /// # Errors
     ///
     /// Returns [`RiftError`] naming `packages` for an argument the read cannot send:
-    /// beside the `local` scope, beside `rev`, past `REQUESTED_PACKAGES_MAX` entries, or
-    /// with an entry outside its advertised lengths.
+    /// beside the `local` scope, beside a git revision, past `REQUESTED_PACKAGES_MAX`
+    /// entries, or with an entry outside its advertised lengths.
     pub fn read_context(
         &self,
         scope: &SearchScope,
-        rev: Option<&RevisionId>,
+        revision: Option<&Revision>,
         packages: &[RequestedPackage],
     ) -> Result<Arc<DependencyContext>, RiftError> {
-        validate_requested_packages(scope, rev.is_some(), packages)?;
-        self.validate_dependency_scope(scope, rev)?;
+        let git = is_git_revision(revision);
+        validate_requested_packages(scope, git, packages)?;
+        self.validate_dependency_scope(scope, git)?;
         if packages.is_empty() {
             return Ok(Arc::clone(&self.context));
         }
@@ -940,6 +942,45 @@ impl ReadService {
     /// current tree.
     pub(crate) const fn revision(&self) -> Option<&RevisionId> {
         self.revision.as_ref()
+    }
+
+    /// The revision this service answers at: the commit it was built at, or the working
+    /// tree it captured.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the captured commit id or tree digest is not complete.
+    pub fn served_revision(&self) -> Result<Revision, RiftError> {
+        match &self.revision {
+            Some(commit) => Revision::commit(&commit.0),
+            None => Revision::tree(&self.revisions.index_tree_revision),
+        }
+    }
+
+    /// Refuses a requested `revision` this service does not serve. A git reference is
+    /// honored by building the service at the commit it resolves to; a commit or a tree
+    /// must equal the one this service captured; a release names no project tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns `read_revision_unserved` naming the requested and the served revision.
+    pub fn accept_revision(&self, requested: Option<&Revision>) -> Result<(), RiftError> {
+        let Some(requested) = requested else {
+            return Ok(());
+        };
+        let served = self.served_revision()?;
+        let accepted = match requested.point() {
+            RevisionPoint::Reference(_) => self.revision.is_some(),
+            RevisionPoint::Commit(_) | RevisionPoint::Tree(_) => requested == &served,
+            RevisionPoint::Release(_) => false,
+        };
+        if accepted {
+            return Ok(());
+        }
+        errors::server::read_revision_unserved()
+            .revision(requested.to_string())
+            .served(served.to_string())
+            .fail()
     }
 
     /// Returns exact visible source identity captured by this service.
@@ -987,7 +1028,7 @@ impl ReadService {
 
     /// Reads syntax nodes with their source: every node of one symbol, or the nodes covering
     /// one UTF-8 byte position. The tree the nodes come from is the one this service holds;
-    /// `params.rev` was already honored by building the service at that revision.
+    /// A git `params.revision` was already honored by building the service at that commit.
     ///
     /// # Errors
     ///
@@ -1001,7 +1042,7 @@ impl ReadService {
                 .view(view.as_str())
                 .fail();
         }
-        validate_common(params.rev.is_some())?;
+        self.accept_revision(params.revision.as_ref())?;
         match nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)? {
             nodes::NodesSelector::Position { path, position } => {
                 self.position_nodes(&path, position)
@@ -1037,7 +1078,12 @@ impl ReadService {
                 })
                 .map(wire_index_warning),
         );
-        nodes_at_file(&self.index, file, &document.nodes_at(position), warnings)
+        nodes_at_file(
+            &self.index,
+            file,
+            &document.nodes_at(position),
+            (self.served_revision()?, warnings),
+        )
     }
 
     /// The file node of a held text file no syntax provider parses. A file a syntax bound
@@ -1054,6 +1100,7 @@ impl ReadService {
         Ok(NodesResult {
             nodes: vec![nodes::text_file_node(path, text.content())],
             node_cursor: None,
+            revision: self.served_revision()?,
             view: None,
             warnings: self.revisions.warnings(),
         })
@@ -1083,6 +1130,7 @@ impl ReadService {
         Ok(NodesResult {
             nodes: page.nodes,
             node_cursor: page.node_cursor,
+            revision: self.served_revision()?,
             view: None,
             warnings: self.revisions.warnings(),
         })
@@ -1104,7 +1152,7 @@ impl ReadService {
                 .fail();
         }
 
-        validate_common(params.rev.is_some())?;
+        self.accept_revision(params.revision.as_ref())?;
         let nodes::NodesSelector::Position { path, position } =
             nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)?
         else {
@@ -1167,7 +1215,12 @@ impl ReadService {
         let mut warnings = self.revisions.warnings();
         warnings.extend(parsed.warnings);
         let covering = parsed.nodes.iter().collect::<Vec<_>>();
-        nodes_at_file(&self.index, &parsed.file, &covering, warnings)
+        nodes_at_file(
+            &self.index,
+            &parsed.file,
+            &covering,
+            (self.served_revision()?, warnings),
+        )
     }
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
@@ -1261,20 +1314,22 @@ impl ReadService {
     /// Finds declarations by name, with each hit's version-control timeline
     /// when the request asks for history. The project index answers `local` and
     /// `all`; package facts come from the global index, so a `global` lookup
-    /// answers no project hit. A scope beyond `local` refuses `rev`, since package
-    /// facts are served for the current tree alone.
+    /// answers no project hit. A scope beyond `local` refuses a git `revision`, since
+    /// package facts are served for the current tree alone.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] for a scope beyond `local` beside `rev`, a `packages`
+    /// Returns [`RiftError`] for a `revision` this service does not serve, a scope beyond
+    /// `local` beside a git `revision`, a `packages`
     /// argument the read cannot send, and symbol history the workspace's version control
     /// cannot serve.
     pub fn get_symbol(&self, params: &GetSymbolParams) -> Result<GetSymbolResult, RiftError> {
-        validate_common(params.rev.is_some())?;
         accepted_symbol_name(&params.name)?;
         let limit = accepted_limit(params.limit)?;
-        validate_requested_packages(&params.scope, params.rev.is_some(), &params.packages)?;
-        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        let git = is_git_revision(params.revision.as_ref());
+        validate_requested_packages(&params.scope, git, &params.packages)?;
+        self.validate_dependency_scope(&params.scope, git)?;
+        self.accept_revision(params.revision.as_ref())?;
         // The whole ranked match set is collected up to the project index's own
         // `results_max` bound, so `pagination.total_pages` counts the full result set the
         // pages divide.
@@ -1376,8 +1431,8 @@ impl ReadService {
         })
     }
 
-    /// Refuses a `scope` that reaches packages on a revision read - one the request's
-    /// `rev` names, or the revision this snapshot already serves - since package facts
+    /// Refuses a `scope` that reaches packages on a revision read - a git `revision` the
+    /// request names, or the commit this snapshot already serves - since package facts
     /// are served for the current tree alone. `get_symbol` and `search` share the rule.
     ///
     /// # Errors
@@ -1387,12 +1442,12 @@ impl ReadService {
     pub(crate) fn validate_dependency_scope(
         &self,
         scope: &SearchScope,
-        rev: Option<&RevisionId>,
+        git: bool,
     ) -> Result<(), RiftError> {
         if scope == &SearchScope::Local {
             return Ok(());
         }
-        if rev.is_some() || self.revision.is_some() {
+        if git || self.revision.is_some() {
             return errors::server::read_invalid()
                 .field("scope")
                 .violation(CURRENT_TREE_ALONE)
@@ -1489,17 +1544,10 @@ pub fn accepted_limit(requested: u64) -> Result<usize, RiftError> {
 
 const _: () = assert!(PAGE_LIMIT_MAX <= usize::MAX as u64);
 
-/// The one checkpoint every read call passes before its own validation. `projection`
-/// left the wire, so `rev` is the only field this still takes; a caller-supplied `rev`
-/// needs no rule beyond what [`ReadService::at_revision`] already enforces when it
-/// resolves that revision. `get_symbol`'s `scope` rule pairs with `rev` and lives there.
-#[expect(
-    clippy::unnecessary_wraps,
-    reason = "kept as Result for symmetry with every other read validation, which every call \
-              site propagates with `?`"
-)]
-pub(crate) fn validate_common(_rev: bool) -> Result<(), RiftError> {
-    Ok(())
+/// Whether a request's `revision` names a git commit or reference: the revisions a read
+/// answers from a committed snapshot, which serves no package fact and no engine.
+pub(crate) fn is_git_revision(revision: Option<&Revision>) -> bool {
+    revision.is_some_and(|revision| revision.git_revision().is_some())
 }
 
 /// Why a read refuses a `scope` past `local`, or a `packages` argument, beside a revision.
@@ -1917,7 +1965,7 @@ fn nodes_at_file(
     index: &WorkspaceIndex,
     file: &IndexedFile,
     matched: &[&SyntaxNode],
-    warnings: Vec<ReadWarning>,
+    (revision, warnings): (Revision, Vec<ReadWarning>),
 ) -> Result<NodesResult, RiftError> {
     let mut nodes = Vec::with_capacity(matched.len().saturating_add(1));
     nodes.push(nodes::file_node(file));
@@ -1927,6 +1975,7 @@ fn nodes_at_file(
     Ok(NodesResult {
         nodes,
         node_cursor: None,
+        revision,
         view: None,
         warnings,
     })
@@ -2903,7 +2952,11 @@ pub fn compute() -> i32 {
         let params = NodesParams::at(ProjectPath("src/kept.rs".to_owned()), 0);
 
         let actual = partial.nodes_for_preparation(&params.clone())?;
-        let expected = settled.nodes(&params)?;
+        // A preparing capture answers at its own partial tree; every other field matches.
+        let expected = NodesResult {
+            revision: actual.revision.clone(),
+            ..settled.nodes(&params)?
+        };
         assert_eq!(actual, expected);
         assert!(actual.warnings.is_empty());
         Ok(())
@@ -4008,8 +4061,9 @@ pub fn compute() -> i32 {
     fn get_symbol_rev_with_a_global_scope_refuses_naming_scope() -> TestResult {
         let (_directory, service) = beacon_fixture()?;
         for scope in ["global", "all"] {
-            let params: GetSymbolParams =
-                serde_json::from_value(json!({"name": "beacon", "scope": scope, "rev": "main"}))?;
+            let params: GetSymbolParams = serde_json::from_value(
+                json!({"name": "beacon", "scope": scope, "revision": "rift://revision/git/main"}),
+            )?;
 
             let error = service
                 .get_symbol(&params)
@@ -4077,7 +4131,7 @@ pub fn compute() -> i32 {
         for scope in ["local", "global", "all"] {
             let request = json!({
                 "scope": scope,
-                "rev": "main",
+                "revision": "rift://revision/git/main",
                 "packages": [{"manager": "cargo", "name": "serde", "version": "1.0.228"}]
             });
             let error = service
@@ -5055,7 +5109,9 @@ pub fn compute() -> i32 {
         let service = revision_service(directory.path(), "main")?;
         let error = service
             .nodes(&NodesParams {
-                rev: Some(RevisionId("main".to_owned())),
+                revision: Some(rift_protocol::revision::Revision::parse(
+                    "rift://revision/git/main",
+                )?),
                 ..NodesParams::at(ProjectPath("Cargo.lock".to_owned()), 0)
             })
             .expect_err("an unparsed extension must be rejected at a revision too");
@@ -5138,8 +5194,9 @@ pub fn compute() -> i32 {
             "commit a source past the syntax depth bound",
         );
         let service = revision_service(directory.path(), "HEAD")?;
-        let params: GetSymbolParams =
-            serde_json::from_value(json!({"name": "beacon", "rev": "HEAD"}))?;
+        let params: GetSymbolParams = serde_json::from_value(
+            json!({"name": "beacon", "revision": "rift://revision/git/HEAD"}),
+        )?;
         let result = service.get_symbol(&params)?;
         assert_eq!(
             result.hits.len(),
@@ -5182,12 +5239,101 @@ pub fn compute() -> i32 {
         Ok(())
     }
 
+    /// Each service answers at the point it captured: a git snapshot at the commit its
+    /// reference resolved to, a working-tree service at its tree digest, and a request
+    /// naming any other point refuses with both revisions named.
+    #[test]
+    fn a_service_accepts_its_own_revision_and_refuses_every_other() -> TestResult {
+        use rift_protocol::revision::{Revision, RevisionPoint};
+        let directory = committed_fixture()?;
+        let at_head = revision_service(directory.path(), "main")?;
+        let working = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let commit = at_head.served_revision()?;
+        let RevisionPoint::Commit(id) = commit.point() else {
+            return Err(format!("a git snapshot answers at a commit: {commit}").into());
+        };
+        assert_eq!(
+            Some(id),
+            at_head.revision().map(|revision| revision.0.as_str())
+        );
+        let tree = working.served_revision()?;
+        assert!(matches!(tree.point(), RevisionPoint::Tree(_)), "{tree}");
+        let reference = Revision::parse("rift://revision/git/main")?;
+        at_head.accept_revision(Some(&reference))?;
+        at_head.accept_revision(Some(&commit))?;
+        working.accept_revision(Some(&tree))?;
+        working.accept_revision(None)?;
+        let release = Revision::parse("rift://revision/cargo/crates.io/demo@1.0.0")?;
+        let moved = Revision::tree(&"0".repeat(64))?;
+        for (service, requested) in [
+            (&working, &reference),
+            (&working, &commit),
+            (&working, &moved),
+            (&working, &release),
+            (&at_head, &tree),
+        ] {
+            let refused = service
+                .accept_revision(Some(requested))
+                .expect_err("a service serves its own revision alone");
+            assert_eq!(refused.slug(), errors::server::read_revision_unserved::SLUG);
+            let served = service.served_revision()?.to_string();
+            let named = |key: &str, expected: &str| {
+                refused
+                    .context()
+                    .any(|(field, value)| field == key && value == expected)
+            };
+            assert!(
+                named("revision", &requested.to_string()) && named("served", &served),
+                "the refusal names both revisions: {refused}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A nodes answer reports the revision it was read at, and a tree revision the
+    /// service no longer serves refuses before any node is read.
+    #[test]
+    fn nodes_report_the_served_revision_and_refuse_a_moved_tree() -> TestResult {
+        let directory = committed_fixture()?;
+        let working = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let request = NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 8);
+        let answer = working.nodes(&request)?;
+        assert_eq!(answer.revision, working.served_revision()?);
+        let pinned = working.nodes(&NodesParams {
+            revision: Some(answer.revision.clone()),
+            ..request.clone()
+        })?;
+        assert_eq!(pinned.nodes, answer.nodes);
+        let moved = working
+            .nodes(&NodesParams {
+                revision: Some(rift_protocol::revision::Revision::tree(&"0".repeat(64))?),
+                ..request
+            })
+            .expect_err("a moved tree is no longer served");
+        assert_eq!(moved.slug(), errors::server::read_revision_unserved::SLUG);
+        Ok(())
+    }
+
     #[test]
     fn revision_nodes_list_committed_syntax() -> TestResult {
         let directory = committed_fixture()?;
         let service = revision_service(directory.path(), "main")?;
         let result = service.nodes(&NodesParams {
-            rev: Some(RevisionId("main".to_owned())),
+            revision: Some(rift_protocol::revision::Revision::parse(
+                "rift://revision/git/main",
+            )?),
             ..NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 8)
         })?;
         let value = serde_json::to_value(result)?;
@@ -5218,8 +5364,8 @@ pub fn compute() -> i32 {
             error.to_string(),
             format!(
                 "workspace has no git repository: {}: \
-                 requires a git repository - run `git init`, or omit `rev` to \
-                 read the current tree; run `git init`, or omit `rev` to read current tree",
+                 requires a git repository - run `git init`, or omit `revision` to \
+                 read the current tree; run `git init`, or omit `revision` to read current tree",
                 canonical.display()
             )
         );
@@ -5269,7 +5415,7 @@ pub fn compute() -> i32 {
             .expect_err("a spelling outside the advertised charset must refuse");
         assert_eq!(
             error.to_string(),
-            "the request does not match the documented form: field rev, \
+            "the request does not match the documented form: field revision, \
              violation charset_forbidden; correct the reported field and \
              resend the request"
         );
@@ -5470,7 +5616,7 @@ pub fn compute() -> i32 {
             json!({"name": "Beacon", "projection": "rift://projection/my-feature-one"}),
             json!({
                 "name": "Beacon",
-                "rev": "main",
+                "revision": "rift://revision/git/main",
                 "projection": "rift://projection/my-feature-one"
             }),
         ];

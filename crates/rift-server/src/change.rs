@@ -83,6 +83,7 @@ pub fn search_change(
     warnings.extend(object_warnings);
     Ok(SearchResult {
         view: None,
+        revision: None,
         results,
         pagination,
         warnings,
@@ -1751,7 +1752,9 @@ mod tests {
         let fixture = Fixture::baseline(&[("src/lib.rs", "pub fn kept() {}\n")])?;
 
         let error = fixture
-            .search(&json!({"change": {"base": "baseline"}, "rev": "main"}))
+            .search(
+                &json!({"change": {"base": "baseline"}, "revision": "rift://revision/git/main"}),
+            )
             .expect_err("change beside rev must refuse");
 
         assert_eq!(error.slug(), errors::server::read_invalid::SLUG);

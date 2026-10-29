@@ -564,7 +564,7 @@ pub struct SearchParams {
     /// releases alone - and answers the commits carrying every term before the ones
     /// carrying some, each group newest first, whatever `order` names. While the store
     /// fills, a commit it has not analyzed yet answers nothing. The server refuses `commit`
-    /// beside `pattern`, `traversal`, `change`, `rev`, `packages`, and `paths`, and with a
+    /// beside `pattern`, `traversal`, `change`, a git `revision`, `packages`, and `paths`, and with a
     /// `scope` past `local`, since each of them selects declarations, text, or another
     /// tree, and the global index holds no project history.
     #[serde(default = "default_search_params_target")]
@@ -596,7 +596,7 @@ pub struct SearchParams {
     /// by path, then offset. With a `scope` past `local`, the global index matches the
     /// pattern over the dependency packages' source too, and those hits carry `unit` in
     /// place of `path`. The server refuses `pattern` beside `query`, `traversal`,
-    /// `change`, and `rev`, and with `target: "documentation"`, and it refuses a pattern
+    /// `change`, and a git `revision`, and with `target: "documentation"`, and it refuses a pattern
     /// whose compiled size, candidate rows, or verified bytes pass the `[search]` bounds,
     /// naming the bound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -609,7 +609,7 @@ pub struct SearchParams {
     /// runtime facts selected by the dependency context; `all` merges the primary project,
     /// profiles, accepted extra projects with their profiles, and global results. Explicit `packages` replaces
     /// versions of named packages or adds packages the context lacks.
-    /// The server refuses a scope beyond `local` together with `rev`, and `global`
+    /// The server refuses a scope beyond `local` together with a git `revision`, and `global`
     /// together with `traversal`, since a walk runs over local declarations.
     #[serde(default)]
     pub scope: SearchScope,
@@ -617,8 +617,8 @@ pub struct SearchParams {
     /// lockfiles name, at most 64. An entry naming a package the workspace depends on replaces that
     /// package's versions for this search, and an entry naming another package adds it.
     /// The server refuses `packages` beside the `local` scope, since a project search
-    /// consults no package, and beside `rev`, since package facts are served for the
-    /// current tree alone.
+    /// consults no package, and beside a git `revision`, since package facts are served for
+    /// the current tree alone.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub packages: Vec<RequestedPackage>,
@@ -641,19 +641,21 @@ pub struct SearchParams {
     /// `page_index` and the true `total_pages`.
     #[serde(default = "default_search_params_page_index")]
     pub page_index: u64,
-    /// The version-control revision to search - a branch, tag, or commit id as the
-    /// workspace's version control spells it. Omitted searches the current tree. The server
-    /// refuses a revision search when the workspace has no version-control repository.
+    /// The revision to search: a git revision searches that commit, a tree revision the
+    /// served working tree. Omitted searches the served working tree. The server refuses a
+    /// git revision when the workspace has no version-control repository, a tree revision
+    /// once the index serves another tree, and a release revision, since `packages` names
+    /// the releases a search reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<RevisionId>,
+    pub revision: Option<crate::revision::Revision>,
     /// A bounded relationship walk from `seed`, standing alone or beside `query`. A symbol
     /// the walk reaches becomes a hit tagged `relationship`; one also matched lexically
     /// keeps its own score and payload and gains the walk's path. `target: "file"` never
     /// carries a walked hit, since a traversal only reaches symbols. With no `query`,
     /// `relevance` orders hits by ascending `distance`, then identity. A configured
     /// language engine resolves the references the walk follows, and an engine session
-    /// serves the current tree, so the server refuses `traversal` beside `rev` and beside
-    /// `change`.
+    /// serves the current tree, so the server refuses `traversal` beside a git `revision`
+    /// and beside `change`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traversal: Option<SearchTraversal>,
     /// A committed revision compared against another revision or the working tree,
@@ -662,7 +664,7 @@ pub struct SearchParams {
     /// declaration lives on each side. `target: "file"` never carries a change hit, since
     /// the comparison reaches declarations alone, and `relevance` orders the hits by path,
     /// then name. `paths` narrows which changed paths are compared. The server refuses
-    /// `change` beside `rev`, since `change` names its own revisions; beside `query`, since
+    /// `change` beside a git `revision`, since `change` names its own revisions; beside `query`, since
     /// the two select different result sets; beside `traversal`, which no comparison
     /// serves; and beside a `scope` past `local`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -851,6 +853,11 @@ pub struct SearchResult {
     /// Absent when the caller selected latest facts without retained serving context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<crate::symbol_read::CapturedView>,
+    /// The revision of the project tree this answer read: a commit or a working tree.
+    /// Absent when the answer merged several project trees, read packages alone, or
+    /// answered from a captured view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<crate::revision::Revision>,
     /// The hits on this page, in the order the request asked for.
     pub results: Vec<SearchHit>,
     /// Where this page sits in the full result set under the request's `limit`.

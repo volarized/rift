@@ -97,7 +97,8 @@ impl GlobalClient {
 }
 
 /// The symbol `request` lists the nodes of, once the request holds the one form the global
-/// API serves: a package or runtime `symbol`, with no `path`, `position`, or `rev`.
+/// API serves: a package or runtime `symbol`, with no `path` or `position`, and no `revision`
+/// other than the release the symbol's identity names.
 fn validate_request(request: &NodesParams) -> Result<RequestedSymbol<'_>, RiftError> {
     let invalid =
         |field| failure::request_invalid("validate_request", field, "field failed validation");
@@ -106,10 +107,14 @@ fn validate_request(request: &NodesParams) -> Result<RequestedSymbol<'_>, RiftEr
     if !is_release_owner(&owner) {
         return Err(invalid("symbol"));
     }
+    let other_revision = request
+        .revision
+        .as_ref()
+        .is_some_and(|revision| !revision.answers_for(&owner));
     let unserved = [
         ("path", request.path.is_some()),
         ("position", request.position.is_some()),
-        ("rev", request.rev.is_some()),
+        ("revision", other_revision),
     ];
     if let Some((field, _)) = unserved.into_iter().find(|(_, present)| *present) {
         return Err(invalid(field));
@@ -132,8 +137,9 @@ fn is_release_owner(owner: &SymbolOwner) -> bool {
 }
 
 /// Whether `result` answers `request` within `bounds`: every node sits in a source unit of
-/// the symbol's own release and carries the bytes its range spans, the page stays within its
-/// node and source bounds, and the view and cursor are the ones the request allows.
+/// the symbol's own release and carries the bytes its range spans, the answer reports that
+/// release as its revision, the page stays within its node and source bounds, and the view
+/// and cursor are the ones the request allows.
 fn valid_result(
     request: &NodesParams,
     symbol: &RequestedSymbol<'_>,
@@ -157,7 +163,8 @@ fn valid_result(
     let cursor_valid = result.node_cursor.as_ref().is_none_or(|cursor| {
         !result.nodes.is_empty() && !cursor.is_empty() && cursor.len() <= CURSOR_BYTES_MAX
     });
-    within_page && nodes_valid && within_source && view_valid && cursor_valid
+    let revision_valid = result.revision.answers_for(&symbol.owner);
+    within_page && nodes_valid && within_source && view_valid && cursor_valid && revision_valid
 }
 
 /// Whether `node` is a node of `symbol`: written in a source unit of the symbol's release,

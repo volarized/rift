@@ -1243,7 +1243,7 @@ fields = { path = { type = "path", format = "display", optional = true }, field 
 
 [error.history.unversioned]
 message = "workspace has no git repository: {workspace}"
-action = "run `git init`, or omit `rev` to read current tree"
+action = "run `git init`, or omit `revision` to read current tree"
 fields = { workspace = { type = "path", format = "display" }, requires = { type = "string" } }
 
 [error.history.revision_unknown]
@@ -1344,6 +1344,11 @@ fields = { field = { type = "string" }, violation = { type = "string" }, cause =
 message = "requested source path does not exist: {path}"
 action = "search or list first, then retry with a path that answer returned"
 fields = { path = { type = "string" } }
+
+[error.server.read_revision_unserved]
+message = "the index does not serve the requested revision {revision}; it serves {served}"
+action = "resend the read without `revision`, or with the revision the latest answer reported"
+fields = { revision = { type = "string" }, served = { type = "string" } }
 
 [error.server.read_symbol_not_found]
 message = "requested symbol has no declaration in the index: {id}"

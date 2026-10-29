@@ -2935,12 +2935,12 @@ mod tests {
             (
                 "GetSymbolParams",
                 serde_json::to_value(schema_for!(crate::read::GetSymbolParams)).expect("schema"),
-                &["rev"],
+                &["revision"],
             ),
             (
                 "NodesParams",
                 serde_json::to_value(schema_for!(crate::read::NodesParams)).expect("schema"),
-                &["rev"],
+                &["revision"],
             ),
             (
                 "ExecutionConfiguration",

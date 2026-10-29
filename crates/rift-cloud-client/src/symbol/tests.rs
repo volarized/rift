@@ -7,6 +7,7 @@ use rift_protocol::{
 use serde_json::{Value, json};
 
 const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+const RELEASE: &str = "rift://revision/cargo/crates.io/tokio@1.50.0";
 const OTHER_ID: &str = "rift://symbol/cargo/crates.io/tokio@1.49.0/rust/tokio/Beacon";
 
 fn error_field<'error>(error: &'error RiftError, key: &str) -> Option<&'error str> {
@@ -26,6 +27,10 @@ fn assert_request_field(error: &RiftError, field: &str) {
     assert_eq!(error_field(error, "field"), Some(field));
 }
 
+fn revision(value: &str) -> rift_protocol::revision::Revision {
+    rift_protocol::revision::Revision::parse(value).expect("revision fixture")
+}
+
 fn request() -> GetSymbolParams {
     serde_json::from_value(json!({"id": ID})).expect("request")
 }
@@ -43,6 +48,7 @@ fn found(declarations: Vec<Value>) -> GetSymbolResult {
             }
         }},
         "view": view(),
+        "revision": RELEASE,
         "declarations": Value::Array(declarations),
     }))
     .expect("result")
@@ -72,7 +78,7 @@ fn source_less_found_and_typed_absence_remain_distinct() {
         serde_json::from_value(intrinsic).expect("synthetic source-less symbol");
     assert!(valid_result(&request, &intrinsic, 100));
     let missing = serde_json::from_value(json!({
-        "outcome": "missing", "view": view(),
+        "outcome": "missing", "view": view(), "revision": RELEASE,
         "symbol_not_found": {"id": ID, "alternatives": [{
             "id": OTHER_ID, "name": "Beacon", "match_context": ["version"]
         }]}
@@ -135,8 +141,18 @@ fn request_rejects_local_owners_revision_and_unbound_continuation() {
         "declaration_limit",
     );
     request.declaration_limit = 5;
-    request.rev = Some(rift_protocol::read::RevisionId("main".to_owned()));
-    assert_request_field(&validate_request(&request).expect_err("revision"), "rev");
+    request.revision = Some(revision("rift://revision/git/main"));
+    assert_request_field(
+        &validate_request(&request).expect_err("revision"),
+        "revision",
+    );
+    request.revision = Some(revision("rift://revision/cargo/crates.io/tokio@1.49.0"));
+    assert_request_field(
+        &validate_request(&request).expect_err("release"),
+        "revision",
+    );
+    request.revision = Some(revision("rift://revision/cargo/crates.io/tokio@1.50.0"));
+    assert!(validate_request(&request).is_ok());
 }
 
 #[test]
@@ -172,7 +188,7 @@ fn exact_response_requires_status_to_match_outcome() {
         (200, serde_json::to_value(found(Vec::new())).expect("found")),
         (
             404,
-            json!({"outcome":"missing","symbol_not_found":{"id":ID,"alternatives":[]},"view":view()}),
+            json!({"outcome":"missing","symbol_not_found":{"id":ID,"alternatives":[]},"view":view(),"revision":RELEASE}),
         ),
         (
             503,
@@ -360,6 +376,7 @@ fn canonical_runtime_documentation_preserves_exact_runtime_source_owner() {
         "runtime": "node", "version": "26.11.1"
     }});
     value["declarations"] = json!([]);
+    value["revision"] = json!("rift://revision/stdlib/node@26.11.1");
     value["documentation"]["references"][0]["reference"]["target"] = json!(id);
     for pointer in [
         "/documentation/references/0/documentation/source/identity/source/unit",

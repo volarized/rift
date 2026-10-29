@@ -183,7 +183,7 @@ impl Repository {
             errors::history::unversioned()
                 .workspace(&root)
                 .requires(
-                    "a git repository - run `git init`, or omit `rev` to read the current tree",
+                    "a git repository - run `git init`, or omit `revision` to read the current tree",
                 )
                 .error()
         };

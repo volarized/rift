@@ -55,7 +55,7 @@ fn request(id: SymbolId, view: CapturedViewId) -> GetSymbolParams {
     GetSymbolParams {
         id,
         include: vec![GetSymbolInclude::Documentation],
-        rev: None,
+        revision: None,
         view: Some(view),
         declaration_limit: 1,
         declaration_cursor: None,
@@ -76,7 +76,7 @@ fn captured_input(reads: &ReadService) -> LocalSymbolViewInput {
                 id: SymbolId::parse("rift://symbol/local/javascript/beacon/open")
                     .expect("fixture identity"),
                 include: Vec::new(),
-                rev: None,
+                revision: None,
                 view: None,
                 declaration_limit: 1,
                 declaration_cursor: None,
@@ -1290,7 +1290,7 @@ fn distinct_text_generations() -> (tempfile::TempDir, Vec<rift_index::WorkspaceI
 
 fn text_generation_input(index: &rift_index::WorkspaceIndex) -> LocalSymbolViewInput {
     let metadata = serde_json::to_vec(&CapturedMetadata {
-        revision: None,
+        revision: rift_protocol::revision::Revision::tree(&"0".repeat(64)).expect("tree revision"),
         warnings: Vec::new(),
     })
     .expect("captured metadata");

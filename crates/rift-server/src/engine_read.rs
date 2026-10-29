@@ -349,7 +349,7 @@ fn reachable_reference_source(
 fn reference_traversal(params: &SearchParams) -> Option<(&SearchTraversal, &SymbolId)> {
     let traversal = params.traversal.as_ref()?;
     let seed = traversal.seed.as_ref()?;
-    let current = params.rev.is_none();
+    let current = !crate::read::is_git_revision(params.revision.as_ref());
     let symbols = matches!(
         params.target,
         SearchParamsTarget::All | SearchParamsTarget::Symbol
@@ -1734,7 +1734,7 @@ mod tests {
         let seed = crate::traversal::tests::graph_identity("beacon");
         for (extra, slug, context_key, context_value) in [
             (
-                json!({"rev": "main"}),
+                json!({"revision": "rift://revision/git/main"}),
                 errors::server::read_unsupported::SLUG,
                 "capability",
                 "traversal at a revision",
