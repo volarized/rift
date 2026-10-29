@@ -5,8 +5,8 @@ use rift_protocol::error::{
 };
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeId,
-    NodeRegion, NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole,
+    Extensions, FileId, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeRegion,
+    NodesResult, PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole,
     RelationshipFacet, RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol,
     SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin, SymbolVersion, SymbolVersionKind,
     TextRange,
@@ -242,10 +242,11 @@ fn stale_index() -> ReadWarning {
     }
 }
 
-fn node(id: &str, kind: &str, start: u64, end: u64) -> Node {
+fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
     Node {
-        id: NodeId(id.to_owned()),
         symbol: None,
+        declaration: None,
+        index,
         unit: FileId("rift://file/src/lib.rs".to_owned()),
         language: rust(),
         kind: ExactKind(kind.to_owned()),
@@ -335,7 +336,6 @@ fn symbol_hit_with_source(source: Option<&str>) -> GetSymbolHit {
         unit: None,
         range: range(0, 9),
         line: 1,
-        node: None,
         source: source.map(str::to_owned),
         history: None,
         documentation: None,
@@ -2552,37 +2552,6 @@ fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
 }
 
 #[test]
-fn a_node_hit_writes_its_place_its_range_its_identity_and_the_source() {
-    let node_id =
-        "rift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e";
-    let placed = SearchHit {
-        matched_by: vec![MatchedField::Content],
-        line: Some(1),
-        range: Some(range(0, 9)),
-        path: Some(project_path("a.rs")),
-        source: Some("fn a() {}".to_owned()),
-        ..search_hit(SearchHitTarget::Node {
-            node: NodeId(node_id.to_owned()),
-        })
-    };
-    let bare = search_hit(SearchHitTarget::Node {
-        node: NodeId(node_id.to_owned()),
-    });
-    golden(
-        &only_page(vec![placed, bare]),
-        &[
-            "2 results",
-            "\t[1] a.rs:1 · content",
-            "\t\t0..9",
-            "\t\trift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e",
-            "\t\tfn a() {}",
-            "\t[2]",
-            "\t\trift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e",
-        ],
-    );
-}
-
-#[test]
 fn a_documentation_hit_is_headed_by_its_heading_path() {
     let documented = SearchHit {
         matched_by: vec![MatchedField::Documentation],
@@ -3427,24 +3396,9 @@ fn a_search_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
 fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let answer = nodes_result(
         vec![
-            node(
-                "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "a · b",
-                0,
-                9,
-            ),
-            node(
-                "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "c: d",
-                1,
-                8,
-            ),
-            node(
-                "rift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                "e:f·g",
-                2,
-                7,
-            ),
+            node(0, "a · b", 0, 9),
+            node(1, "c: d", 1, 8),
+            node(2, "e:f·g", 2, 7),
         ],
         vec!["a", "b", "c"],
     );
@@ -3454,13 +3408,13 @@ fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "3 nodes",
             "\t[1] \"a · b\"",
             "\t\t0..9",
-            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\tindex 0",
             "\t[2] \"c: d\"",
             "\t\t1..8",
-            "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\t\tindex 1",
             "\t[3] e:f·g",
             "\t\t2..7",
-            "\t\trift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "\t\tindex 2",
             "",
             "\t\tc",
         ],
@@ -3696,19 +3650,9 @@ fn control_characters_in_get_symbol_facts_are_escaped_and_source_keeps_its_bytes
 // Nodes answers.
 
 fn outer_and_inner() -> NodesResult {
-    let outer = node(
-        "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "function_item",
-        0,
-        20,
-    );
-    let mut inner = node(
-        "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "identifier",
-        3,
-        9,
-    );
-    inner.parent = Some(outer.id.clone());
+    let outer = node(0, "function_item", 0, 20);
+    let mut inner = node(1, "identifier", 3, 9);
+    inner.parent = Some(outer.index);
     nodes_result(vec![outer, inner], vec!["fn name() {}\n// tail", "name"])
 }
 
@@ -3720,22 +3664,14 @@ fn an_empty_nodes_answer_writes_only_the_header() {
 
 #[test]
 fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
-    let answer = nodes_result(
-        vec![node(
-            "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "identifier",
-            3,
-            9,
-        )],
-        vec!["name"],
-    );
+    let answer = nodes_result(vec![node(1, "identifier", 3, 9)], vec!["name"]);
     golden(
         &answer,
         &[
             "1 node",
             "\tidentifier",
             "\t3..9",
-            "\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\tindex 1",
             "",
             "\tname",
         ],
@@ -3752,10 +3688,10 @@ fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_innermost_e
             "2 nodes",
             "\t[1] function_item · 2 lines",
             "\t\t0..20",
-            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\tindex 0",
             "\t[2] identifier",
             "\t\t3..9",
-            "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\t\tindex 1 · parent 0",
             "",
             "\t\tname",
         ],
@@ -3768,12 +3704,7 @@ fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_innermost_e
 
 #[test]
 fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
-    let mut item = node(
-        "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "function_item",
-        0,
-        20,
-    );
+    let mut item = node(0, "function_item", 0, 20);
     item.symbol = Some(SymbolId(A_ID.to_owned()));
     item.facets = vec![
         NodeFacet::Declaration,
@@ -3791,12 +3722,7 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
             range: range(8, 20),
         },
     ];
-    let mut plain = node(
-        "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "block",
-        9,
-        10,
-    );
+    let mut plain = node(1, "block", 9, 10);
     plain.facets = vec![NodeFacet::Body, NodeFacet::Block];
     golden(
         &nodes_result(vec![item, plain], vec!["fn a() {\n    b\n}", "{"]),
@@ -3804,12 +3730,12 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
             "2 nodes",
             "\t[1] function_item · 3 lines · generated · test",
             "\t\t0..20",
-            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\tindex 0",
             "\t\trift://symbol/local/rust/app/a/A",
             "\t\tname 3..4 · body 8..20",
             "\t[2] block",
             "\t\t9..10",
-            "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\t\tindex 1",
             "",
             "\t\t{",
         ],
@@ -3819,30 +3745,10 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
 #[test]
 fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
     let nodes = vec![
-        node(
-            "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "a",
-            0,
-            1,
-        ),
-        node(
-            "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "b",
-            1,
-            2,
-        ),
-        node(
-            "rift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            "c",
-            2,
-            3,
-        ),
-        node(
-            "rift://node/rust/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-            "d",
-            3,
-            4,
-        ),
+        node(0, "a", 0, 1),
+        node(1, "b", 1, 2),
+        node(2, "c", 2, 3),
+        node(3, "d", 3, 4),
     ];
     golden(
         &nodes_result(nodes, vec!["", "x\n", "x\ny\n", "z"]),
@@ -3850,16 +3756,16 @@ fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
             "4 nodes",
             "\t[1] a",
             "\t\t0..1",
-            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\tindex 0",
             "\t[2] b",
             "\t\t1..2",
-            "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\t\tindex 1",
             "\t[3] c · 2 lines",
             "\t\t2..3",
-            "\t\trift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "\t\tindex 2",
             "\t[4] d",
             "\t\t3..4",
-            "\t\trift://node/rust/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "\t\tindex 3",
             "",
             "\t\tz",
         ],
@@ -3868,25 +3774,10 @@ fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
 
 #[test]
 fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
-    let answer = nodes_result(
-        vec![node(
-            "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "a",
-            0,
-            1,
-        )],
-        vec![""],
-    );
+    let answer = nodes_result(vec![node(0, "a", 0, 1)], vec![""]);
     assert_eq!(
         rendered(&answer),
-        text(&[
-            "1 node",
-            "\ta",
-            "\t0..1",
-            "\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "",
-            ""
-        ])
+        text(&["1 node", "\ta", "\t0..1", "\tindex 0", "", ""])
     );
 }
 
@@ -3900,10 +3791,10 @@ fn warnings_follow_the_innermost_excerpt_of_the_nodes() {
             "2 nodes",
             "\t[1] function_item · 2 lines",
             "\t\t0..20",
-            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\tindex 0",
             "\t[2] identifier",
             "\t\t3..9",
-            "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\t\tindex 1 · parent 0",
             "",
             "\t\tname",
             "1 warning",
@@ -3915,12 +3806,7 @@ fn warnings_follow_the_innermost_excerpt_of_the_nodes() {
 #[test]
 fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
     let excerpt = "````rust\n```\n! stale_index\n2 nodes\n[1] fake\n\tnested\n````";
-    let nodes = vec![node(
-        "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "a",
-        0,
-        9,
-    )];
+    let nodes = vec![node(0, "a", 0, 9)];
     let single = nodes_result(nodes, vec![excerpt]);
     golden(
         &single,
@@ -3928,7 +3814,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
             "1 node",
             "\ta · 7 lines",
             "\t0..9",
-            "\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\tindex 0",
             "",
             "\t````rust",
             "\t```",
@@ -3940,20 +3826,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
         ],
     );
     let two = nodes_result(
-        vec![
-            node(
-                "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "a",
-                0,
-                9,
-            ),
-            node(
-                "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "b",
-                1,
-                9,
-            ),
-        ],
+        vec![node(0, "a", 0, 9), node(1, "b", 1, 9)],
         vec!["x", excerpt],
     );
     let output = rendered(&two);
@@ -3969,14 +3842,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
 
 #[test]
 fn nodes_and_excerpts_that_differ_in_length_are_refused() {
-    let one_node = || {
-        vec![node(
-            "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "a",
-            0,
-            1,
-        )]
-    };
+    let one_node = || vec![node(0, "a", 0, 1)];
     for answer in [
         nodes_result(one_node(), Vec::new()),
         nodes_result(Vec::new(), vec!["extra"]),
@@ -4243,8 +4109,6 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
 #[test]
 fn identities_are_written_whole_and_hashes_are_cut() {
     let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService~2?rev=0000000000000000000000000000000000000000000000000000000000000000";
-    let node_id =
-        "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28";
     let unit = "rift://source/project/packages/@scope/name/package.json";
     let file = "rift://file/src/dir%20name/lib.rs";
     let mut hit = search_hit(symbol_target(Some(symbol_id), "ReadService"));
@@ -4258,16 +4122,19 @@ fn identities_are_written_whole_and_hashes_are_cut() {
     assert!(search.lines().any(|line| line == entry(unit)), "{search}");
     let mut symbols = symbol_hit_with_source(None);
     symbols.symbol.id = Some(SymbolId(symbol_id.to_owned()));
-    symbols.node = Some(NodeId(node_id.to_owned()));
     let get_symbol = rendered(&symbol_result(vec![symbols], pagination(0, 1)));
     assert!(
         get_symbol.lines().any(|line| line == entry(symbol_id)),
         "{get_symbol}"
     );
-    let mut node_item = node(node_id, "function_item", 0, 1);
+    let mut node_item = node(0, "function_item", 0, 1);
     node_item.unit = FileId(file.to_owned());
+    node_item.symbol = Some(SymbolId(symbol_id.to_owned()));
     let nodes = rendered(&nodes_result(vec![node_item], vec!["x"]));
-    assert!(nodes.lines().any(|line| line == entry(node_id)), "{nodes}");
+    assert!(
+        nodes.lines().any(|line| line == entry(symbol_id)),
+        "{nodes}"
+    );
     let mut commit = commit_hit();
     commit.revision = RevisionId("main^2".to_owned());
     let by_branch = rendered(&commit_answer(commit));
@@ -4283,21 +4150,24 @@ fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_sourc
             "5 nodes",
             "\t[1] source_file · 14 lines",
             "\t\t0..356",
-            "\t\trift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
+            "\t\tindex 0",
             "\t[2] function_item · 4 lines",
             "\t\t218..355",
-            "\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
+            "\t\tdeclaration 0 · index 0",
             "\t\trift://symbol/local/rust/app/config/load_config",
             "\t\tname 225..236 · body 281..355",
             "\t[3] block · 4 lines",
             "\t\t281..355",
-            "\t\trift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
+            "\t\tdeclaration 0 · index 13 · parent 0",
+            "\t\trift://symbol/local/rust/app/config/load_config",
             "\t[4] call_expression",
             "\t\t334..353",
-            "\t\trift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
+            "\t\tdeclaration 0 · index 25 · parent 13",
+            "\t\trift://symbol/local/rust/app/config/load_config",
             "\t[5] identifier",
             "\t\t334..346",
-            "\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
+            "\t\tdeclaration 0 · index 26 · parent 25",
+            "\t\trift://symbol/local/rust/app/config/load_config",
             "",
             "\t\tparse_config",
         ],
@@ -4554,7 +4424,6 @@ fn canonical_symbol_render_keeps_binding_bytes_and_declaration_continuation() {
             unit: None,
             range: range(0, source.len() as u64),
             line: 1,
-            node: None,
             source: Some(source.to_owned()),
             source_complete: true,
             signature_indices: Vec::new(),

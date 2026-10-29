@@ -38,11 +38,8 @@ symbol identities remain separate from these physical addresses.
 
 The key is never a digest. A [`Digest`](/docs/developer/protocol/reference#Digest) reaches the
 wire only as a short witness where byte identity matters: the first eight hex characters of a
-SHA-256. The server computes and compares the full digest internally, so it never travels whole.
-
-A [`NodeId`](/docs/developer/protocol/reference#NodeId) carries a whole SHA-256: the digest of a
-syntax node's language, kind, and bytes. Equal bytes of one language and kind share that identity
-wherever they are written, and a short prefix would give unrelated nodes one identity as well.
+SHA-256, the same convention `NodeId`'s witness uses. The server computes and compares the full
+digest internally, so it never travels whole.
 
 [`SourceLocationKind`](/docs/developer/protocol/reference#SourceLocationKind) names where a
 declaration's source belongs: project, dependency, standard library, or external source.

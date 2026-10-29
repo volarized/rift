@@ -653,20 +653,8 @@ fn located_states(
             || format!("no `{name}` on the location line {facts:?}"),
         )?;
     }
-    if target == "node"
-        && let (Some(start), Some(end)) = (
-            hit.pointer("/range/start").and_then(Value::as_u64),
-            hit.pointer("/range/end").and_then(Value::as_u64),
-        )
-    {
-        let range = format!("{start}..{end}");
-        require(item.has_line(&range), &format!("{at}.range"), || {
-            format!("no line equals the node range `{range}`")
-        })?;
-    }
     let identity = match target {
         "symbol" => text_at(hit, "/hit/symbol/id"),
-        "node" => text_at(hit, "/hit/node"),
         "documentation" => text_at(hit, "/hit/documentation/block/symbol"),
         _ => None,
     };
@@ -853,7 +841,7 @@ fn version_states(entry: Option<&str>, version: &Value, at: &str) -> Result<(), 
     Ok(())
 }
 
-/// Checks one `nodes` entry against its lines: head, byte range, identity, symbol, and regions.
+/// Checks one `nodes` entry against its lines: head, byte range, address, symbol, and regions.
 fn node_entry(
     item: &Item<'_>,
     node: &Value,
@@ -861,7 +849,19 @@ fn node_entry(
     index: usize,
     at: &str,
 ) -> Result<(), String> {
-    let id = text_at(node, "/id").ok_or_else(|| format!("{at}.id: must be a string"))?;
+    let place = node
+        .pointer("/index")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{at}.index: must be an integer"))?;
+    let mut address = Vec::new();
+    if let Some(declaration) = node.pointer("/declaration").and_then(Value::as_u64) {
+        address.push(format!("declaration {declaration}"));
+    }
+    address.push(format!("index {place}"));
+    if let Some(parent) = node.pointer("/parent").and_then(Value::as_u64) {
+        address.push(format!("parent {parent}"));
+    }
+    let address = address.join(" · ");
     let excerpt = structured
         .pointer(&format!("/source/{index}"))
         .and_then(Value::as_str)
@@ -879,8 +879,11 @@ fn node_entry(
     require(item.plain(1) == range, &format!("{at}.range"), || {
         format!("the second line must be `{range}`, got `{}`", item.plain(1))
     })?;
-    require(item.plain(2) == id, &format!("{at}.id"), || {
-        format!("the third line must be `{id}`, got `{}`", item.plain(2))
+    require(item.plain(2) == address, &format!("{at}.index"), || {
+        format!(
+            "the third line must be `{address}`, got `{}`",
+            item.plain(2)
+        )
     })?;
     if let Some(symbol) = text_at(node, "/symbol") {
         require(item.has_line(symbol), &format!("{at}.symbol"), || {
@@ -2187,16 +2190,9 @@ mod tests {
     }
 
     #[test]
-    fn a_documentation_node_and_file_hit_state_their_place() -> Result<(), String> {
+    fn a_documentation_and_file_hit_state_their_place() -> Result<(), String> {
         let answer = json!({
             "results": [
-                {
-                    "hit": { "target": "node", "node": "rift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e" },
-                    "matched_by": ["content"],
-                    "path": "a.rs",
-                    "range": { "start": 4, "end": 13 },
-                    "line": 2
-                },
                 {
                     "hit": {
                         "target": "documentation",
@@ -2216,26 +2212,20 @@ mod tests {
             "pagination": { "page_index": 0, "total_pages": 1 }
         });
         let text = "\
-3 results
-\t[1] a.rs:2 · content
-\t\t4..13
-\t\trift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e
-\t[2] Guide
+2 results
+\t[1] Guide
 \t\tdocs/g.md:7 · documentation
 \t\trift://symbol/rust/a.rs/a
 \t\t# Guide
-\t[3] rift://source/p/a.rs
+\t[2] rift://source/p/a.rs
 ";
         assert_eq!(text_states(Tool::Search, text, &answer), Ok(()));
-        let unplaced = edited(text, "\t\t4..13\n", "")?;
-        let failure = refused(Tool::Search, &unplaced, &answer)?;
-        assert!(failure.contains("$.results[0].range"), "{failure}");
         let moved = edited(text, "docs/g.md:7", "docs/g.md:8")?;
         let failure = refused(Tool::Search, &moved, &answer)?;
-        assert!(failure.contains("$.results[1]"), "{failure}");
-        let unnumbered = edited(text, "\t[3] ", "\t")?;
+        assert!(failure.contains("$.results[0]"), "{failure}");
+        let unnumbered = edited(text, "\t[2] ", "\t")?;
         let failure = refused(Tool::Search, &unnumbered, &answer)?;
-        assert!(failure.contains("$.results[2]"), "{failure}");
+        assert!(failure.contains("$.results[1]"), "{failure}");
         Ok(())
     }
 
@@ -2252,7 +2242,7 @@ mod tests {
         json!({
             "nodes": [
                 {
-                    "id": "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "index": 0,
                     "symbol": "rift://symbol/rust/a.rs/A",
                     "kind": "function_item",
                     "facets": ["declaration", "test", "generated"],
@@ -2263,7 +2253,7 @@ mod tests {
                     ]
                 },
                 {
-                    "id": "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "index": 1,
                     "kind": "identifier",
                     "range": { "start": 3, "end": 9 }
                 }
@@ -2278,12 +2268,12 @@ mod tests {
 2 nodes
 \t[1] function_item · 4 lines · generated · test
 \t\t0..20
-\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+\t\tindex 0
 \t\trift://symbol/rust/a.rs/A
 \t\tname 3..4 · body 8..20
 \t[2] identifier · 3 lines
 \t\t3..9
-\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+\t\tindex 1
 
 \t\ta
 
@@ -2312,13 +2302,13 @@ mod tests {
     fn one_node_has_no_marker_and_no_indent() {
         let answer = json!({
             "nodes": [{
-                "id": "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "index": 1,
                 "kind": "identifier",
                 "range": { "start": 3, "end": 9 }
             }],
             "source": ["name"]
         });
-        let text = "1 node\n\tidentifier\n\t3..9\n\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\n\tname\n";
+        let text = "1 node\n\tidentifier\n\t3..9\n\tindex 1\n\n\tname\n";
         assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
         let indented = text.replace("\n\tname\n", "\n\t\tname\n");
         assert!(text_states(Tool::Nodes, &indented, &answer).is_err());
@@ -2341,10 +2331,10 @@ mod tests {
     fn a_node_head_states_its_kind_range_and_identity_in_order() -> Result<(), String> {
         nodes_refusal("[1] function_item", "[1] block", "$.nodes[0]")?;
         nodes_refusal("\t\t0..20\n", "\t\t0..21\n", "$.nodes[0].range")?;
-        nodes_refusal("rust/aaaaaaaa", "rust/cccccccc", "$.nodes[0].id")?;
+        nodes_refusal("index 0\n", "index 2\n", "$.nodes[0].index")?;
         nodes_refusal("[2] identifier", "[2] function_item", "$.nodes[1]")?;
         nodes_refusal("\t\t3..9\n", "", "$.nodes[1].range")?;
-        nodes_refusal("rust/bbbbbbbb", "rust/cccccccc", "$.nodes[1].id")?;
+        nodes_refusal("index 1\n", "index 2\n", "$.nodes[1].index")?;
         nodes_refusal("\t\trift://symbol/rust/a.rs/A\n", "", "$.nodes[0].symbol")?;
         nodes_refusal("\t\tname 3..4 · body 8..20\n", "", "$.nodes[0].regions")?;
         nodes_refusal("name 3..4", "name 3..5", "$.nodes[0].regions")
@@ -2376,7 +2366,7 @@ mod tests {
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.source[1]")?;
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.source[1]")?;
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.warnings")?;
-        let blank = edited(NODES_TEXT, "bbbbbbbb\n\n\t\ta", "bbbbbbbb\n\t\ta")?;
+        let blank = edited(NODES_TEXT, "index 1\n\n\t\ta", "index 1\n\t\ta")?;
         let failure = refused(Tool::Nodes, &blank, &nodes_answer())?;
         assert!(failure.contains("$.source[1]"), "{failure}");
         Ok(())
