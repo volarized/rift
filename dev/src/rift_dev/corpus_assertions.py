@@ -233,7 +233,7 @@ def number(value: object, context: str) -> int:
 def lists_position(
     answer: JsonObject, nodes: list[JsonObject], unit: str, position: int
 ) -> bool:
-    """Whether `nodes`, a prefix of a position read's pages, hold every node it checks.
+    """Whether `nodes`, a position read's first page, hold every node its check reads.
 
     A unit answer lists one file's nodes in preorder, so their starts never decrease: a
     listed node starting past `position` means no later page covers it. A symbol answer

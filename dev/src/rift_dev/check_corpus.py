@@ -778,6 +778,7 @@ class Corpus:
             selected=details,
         )
         identities: set[str] = set()
+        beyond = 0
         for hit in selected:
             symbol = object_value(
                 object_value(hit.get("hit"), "search hit").get("symbol"), "symbol"
@@ -816,13 +817,6 @@ class Corpus:
             answer = await client.call("nodes", request)
             nodes = objects(answer, "nodes")
             require(bool(nodes), f"nodes listed nothing at {path}:{end - 1}")
-            cursor = answer.get("node_cursor")
-            for _ in range(NODE_PAGES_MAX):
-                if cursor is None or lists_position(answer, nodes, unit, end - 1):
-                    break
-                page = await client.call("nodes", {**request, "node_cursor": cursor})
-                nodes = nodes + objects(page, "nodes")
-                cursor = page.get("node_cursor")
             if answer.get("symbol") is None:
                 require(
                     nodes[0].get("kind") == "file"
@@ -830,6 +824,16 @@ class Corpus:
                     f"a unit answer did not open with the file node of {path}",
                 )
             self.require_node_sources(nodes, unit, content, path)
+            # The nodes covering the position can lie on a later page. Each page is another
+            # read, which the deadline cannot afford for every sample, so the report counts
+            # the declarations whose covering nodes the first page did not reach.
+            listed = answer.get("node_cursor") is None or lists_position(
+                answer, nodes, unit, end - 1
+            )
+            if not listed:
+                beyond += 1
+                require(path.read_bytes() == content, f"read changed {path}")
+                continue
             matching = [
                 node
                 for node in nodes
@@ -864,7 +868,12 @@ class Corpus:
                 f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
             )
             require(path.read_bytes() == content, f"read changed {path}")
-        self.record("identities", count=len(identities), seed=SEED)
+        self.record(
+            "identities",
+            count=len(identities),
+            seed=SEED,
+            raw_beyond_first_page=beyond,
+        )
 
     @staticmethod
     def require_node_sources(
