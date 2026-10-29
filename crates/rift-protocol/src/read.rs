@@ -1820,6 +1820,10 @@ pub struct Relationship {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 1))]
     pub confidence: Option<f64>,
+    /// The external producer that emitted the edge, named by a package publication that
+    /// carries its facts. Absent for an edge Rift's own analysis produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<crate::producer::FactProducer>,
     /// Edge facts the model has no field for, namespaced by the provider that emitted them.
     /// Absent when empty.
     #[serde(default, skip_serializing_if = "Extensions::is_empty")]

@@ -22,6 +22,7 @@ pub mod identity;
 pub mod index;
 pub mod lock;
 pub mod map;
+pub mod producer;
 pub mod read;
 pub mod retry;
 pub mod revision;

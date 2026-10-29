@@ -30,6 +30,7 @@ pub const REGISTERED_SLUGS: &[&str] = &[
     "rift.analysis.package_retained_source_bytes_exceeded",
     "rift.analysis.package_retained_source_limits_invalid",
     "rift.analysis.package_syntax_unavailable",
+    "rift.analysis.producer_fact_invalid",
     "rift.analysis.source_pattern_invalid",
     "rift.cli.config_home_unresolved",
     "rift.cli.config_write_failed",

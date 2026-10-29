@@ -384,6 +384,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.analysis.package_input_origin_invalid",
                 "rift.analysis.package_provider_failed",
                 "rift.analysis.package_syntax_unavailable",
+                "rift.analysis.producer_fact_invalid",
                 "rift.core.contribution_duplicate_fact",
                 "rift.core.contribution_invalid_kind",
                 "rift.core.contribution_invalid_language",

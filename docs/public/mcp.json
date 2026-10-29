@@ -7310,6 +7310,25 @@
             },
             "type": "object"
           },
+          "FactProducer": {
+            "additionalProperties": false,
+            "description": "The external program that produced a fact, and its revision. A fact without one was\nproduced by Rift's built-in analyzer.",
+            "properties": {
+              "name": {
+                "$ref": "#/$defs/ProducerName",
+                "description": "The producer's name, stable across its revisions."
+              },
+              "revision": {
+                "$ref": "#/$defs/ProducerRevision",
+                "description": "The producer revision that emitted the fact."
+              }
+            },
+            "required": [
+              "name",
+              "revision"
+            ],
+            "type": "object"
+          },
           "GlobalFailureClass": {
             "description": "Bounded classes a global API failure can carry in a read warning.",
             "oneOf": [
@@ -7772,6 +7791,26 @@
               "variadic"
             ],
             "type": "object"
+          },
+          "ProducerName": {
+            "description": "Name of one external producer: a lowercase ASCII letter, then lowercase letters, digits, `.`, `_`, or `-`.",
+            "examples": [
+              "demo-indexer"
+            ],
+            "maxLength": 64,
+            "minLength": 1,
+            "pattern": "^[a-z][a-z0-9._-]*$",
+            "type": "string"
+          },
+          "ProducerRevision": {
+            "description": "Revision of one external producer: an ASCII letter or digit, then letters, digits, `.`, `_`, `+`, or `-`.",
+            "examples": [
+              "0.6.1"
+            ],
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+            "type": "string"
           },
           "ProjectPath": {
             "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
@@ -8884,6 +8923,10 @@
               "occurrence": {
                 "$ref": "#/$defs/SourceUnitSpan",
                 "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node."
+              },
+              "producer": {
+                "$ref": "#/$defs/FactProducer",
+                "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
               },
               "to": {
                 "$ref": "#/$defs/SymbolId",

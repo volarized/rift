@@ -1055,6 +1055,7 @@ pub(crate) mod tests {
     fn engine_hop(from: &str, to: &str) -> GraphHop {
         GraphHop {
             relationship: Relationship {
+                producer: None,
                 from: rift_protocol::read::SymbolId(from.to_owned()),
                 kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
                 facets: vec![RelationshipFacet::References],

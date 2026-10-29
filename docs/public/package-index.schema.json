@@ -894,6 +894,58 @@
       },
       "type": "object"
     },
+    "FactCoverage": {
+      "additionalProperties": false,
+      "description": "One fact kind a publication covers for one language, and the producer of those facts.\n\nA covered kind with no facts means its producer found none. A kind no entry names was\nnot produced, so its absence says nothing about the source. Two producers of one kind\ntake two entries.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/FactKind",
+          "description": "The fact kind covered."
+        },
+        "producer": {
+          "$ref": "#/$defs/FactProducer",
+          "description": "The external producer of the facts this entry covers. Absent for the facts the\nbuilt-in analyzer produced."
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "FactKind": {
+      "description": "One kind of fact a publication may carry beside its declarations.",
+      "oneOf": [
+        {
+          "const": "relationships",
+          "description": "Edges between two symbols, in `relationships`.",
+          "type": "string"
+        },
+        {
+          "const": "occurrences",
+          "description": "Places a unit's source names a symbol, in `occurrences`.",
+          "type": "string"
+        }
+      ]
+    },
+    "FactProducer": {
+      "additionalProperties": false,
+      "description": "The external program that produced a fact, and its revision. A fact without one was\nproduced by Rift's built-in analyzer.",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/ProducerName",
+          "description": "The producer's name, stable across its revisions."
+        },
+        "revision": {
+          "$ref": "#/$defs/ProducerRevision",
+          "description": "The producer revision that emitted the fact."
+        }
+      },
+      "required": [
+        "name",
+        "revision"
+      ],
+      "type": "object"
+    },
     "Language": {
       "description": "A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.",
       "examples": [
@@ -1263,6 +1315,13 @@
           "description": "Selected artifact and platform or export conditions establish this scope.",
           "type": "boolean"
         },
+        "facts": {
+          "description": "The fact kinds produced for this language, each with its producer. A kind no entry\nnames was not produced.",
+          "items": {
+            "$ref": "#/$defs/FactCoverage"
+          },
+          "type": "array"
+        },
         "identity_complete": {
           "description": "Every retained object and binding has an established canonical identity.",
           "type": "boolean"
@@ -1288,7 +1347,8 @@
         "inventory_complete",
         "identity_complete",
         "applicability_complete",
-        "relationships"
+        "relationships",
+        "facts"
       ],
       "type": "object"
     },
@@ -1417,6 +1477,34 @@
         "registry",
         "name",
         "version"
+      ],
+      "type": "object"
+    },
+    "PackageOccurrence": {
+      "additionalProperties": false,
+      "description": "One place a unit's source names a symbol.",
+      "properties": {
+        "producer": {
+          "$ref": "#/$defs/FactProducer",
+          "description": "The external producer that found the occurrence. Absent when the built-in analyzer\nfound it."
+        },
+        "range": {
+          "$ref": "#/$defs/TextRange",
+          "description": "The occurrence's byte range inside its unit. It resolves to a syntax node of the\nunit."
+        },
+        "symbol": {
+          "$ref": "#/$defs/SymbolId",
+          "description": "The symbol the source names at `range`."
+        },
+        "unit": {
+          "$ref": "#/$defs/SourceUnitId",
+          "description": "The unit carrying the occurrence."
+        }
+      },
+      "required": [
+        "symbol",
+        "unit",
+        "range"
       ],
       "type": "object"
     },
@@ -1595,6 +1683,26 @@
       ],
       "type": "object"
     },
+    "ProducerName": {
+      "description": "Name of one external producer: a lowercase ASCII letter, then lowercase letters, digits, `.`, `_`, or `-`.",
+      "examples": [
+        "demo-indexer"
+      ],
+      "maxLength": 64,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9._-]*$",
+      "type": "string"
+    },
+    "ProducerRevision": {
+      "description": "Revision of one external producer: an ASCII letter or digit, then letters, digits, `.`, `_`, `+`, or `-`.",
+      "examples": [
+        "0.6.1"
+      ],
+      "maxLength": 128,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+      "type": "string"
+    },
     "ProjectPath": {
       "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
       "examples": [
@@ -1651,6 +1759,10 @@
         "occurrence": {
           "$ref": "#/$defs/SourceUnitSpan",
           "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node."
+        },
+        "producer": {
+          "$ref": "#/$defs/FactProducer",
+          "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced."
         },
         "to": {
           "$ref": "#/$defs/SymbolId",
@@ -2760,12 +2872,19 @@
       "maxItems": 50000000,
       "type": "array"
     },
+    "occurrences": {
+      "description": "Places a unit's source names a symbol, in unit, range, and symbol order. Absent when\nno producer covered occurrences.",
+      "items": {
+        "$ref": "#/$defs/PackageOccurrence"
+      },
+      "type": "array"
+    },
     "owner": {
       "$ref": "#/$defs/SymbolOwner",
       "description": "Defining package, runtime, or compiler owner. It names no version: every symbol id\nand source unit of the publication carries this owner across releases."
     },
     "relationships": {
-      "description": "Normalized relationships, preserving their source occurrences and derivation.",
+      "description": "Normalized relationships, preserving their source occurrences and derivation. A\nrelationship an external producer wrote names it in `producer`.",
       "items": {
         "$ref": "#/$defs/Relationship"
       },

@@ -498,7 +498,10 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
 }
 
 heap_fields!(crate::read::SourceUnitSpan, unit);
-heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, evidence => vector, occurrence, extensions);
+heap_fields!(crate::producer::ProducerName, 0);
+heap_fields!(crate::producer::ProducerRevision, 0);
+heap_fields!(crate::producer::FactProducer, name, revision);
+heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, evidence => vector, occurrence, producer, extensions);
 heap_fields!(crate::search::GraphHop, relationship);
 
 impl GetSize for crate::read::RelationshipFacet {
@@ -591,9 +594,16 @@ mod tests {
             }),
             derivation: crate::read::RelationshipDerivation::Resolution,
             confidence: None,
+            producer: Some(crate::producer::FactProducer {
+                name: crate::producer::ProducerName::parse("demo-indexer").expect("name"),
+                revision: crate::producer::ProducerRevision::parse("0.6.1").expect("revision"),
+            }),
             extensions: Extensions::default(),
         };
+        let producer = edge.producer.as_ref().expect("producer");
         let minimum = edge.kind.0.capacity()
+            + producer.name.as_str().len()
+            + producer.revision.as_str().len()
             + edge.facets.capacity() * std::mem::size_of::<crate::read::RelationshipFacet>()
             + edge.from.0.capacity()
             + edge.to.0.capacity();

@@ -662,6 +662,7 @@ fn callee_hops(seed: &SymbolId, callees: impl IntoIterator<Item = SymbolId>) -> 
 fn call_hop(from: &SymbolId, to: SymbolId) -> GraphHop {
     GraphHop {
         relationship: Relationship {
+            producer: None,
             from: from.clone(),
             to,
             kind: ExactKind(RelationshipFacet::Calls.as_ref().to_owned()),
@@ -1234,6 +1235,7 @@ fn map_references(
         .into_iter()
         .map(|caller| GraphHop {
             relationship: Relationship {
+                producer: None,
                 from: caller,
                 to: SymbolId(target.as_str().to_owned()),
                 kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
