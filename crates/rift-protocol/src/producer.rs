@@ -12,6 +12,11 @@ use rift_error::{RiftError, errors};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::read::{
+    ExactKind, Language, RelationshipDerivation, RelationshipFacet, SourceUnitId, SourceUnitSpan,
+    SymbolId, TextRange,
+};
+
 /// Longest producer name, in bytes.
 pub const PRODUCER_NAME_BYTES_MAX: usize = 64;
 
@@ -239,6 +244,66 @@ pub struct FactCoverage {
     /// built-in analyzer produced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producer: Option<FactProducer>,
+}
+
+/// Facts one external producer emitted for one language of one publication.
+///
+/// An importer resolves each fact against the publication's source units, names the
+/// producer on every fact it adds, and records the covered kinds in the language's
+/// coverage. A fact may name a source range in place of the symbol it starts at; the
+/// importer resolves the range to the declaration enclosing it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerFacts {
+    /// The producer that emitted every fact here.
+    pub producer: FactProducer,
+    /// The language whose source the producer read.
+    pub language: Language,
+    /// The fact kinds the producer covered for `language`, including kinds it found no
+    /// fact of.
+    pub kinds: Vec<FactKind>,
+    /// Edges the producer found.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relationships: Vec<ProducerRelationship>,
+    /// Places the producer found a unit's source naming a symbol.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub occurrences: Vec<ProducerOccurrence>,
+}
+
+/// One edge an external producer found.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerRelationship {
+    /// The symbol the edge starts at. Absent when the producer named only `occurrence`:
+    /// the importer then starts the edge at the declaration enclosing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<SymbolId>,
+    /// What the edge is in the producer's vocabulary, such as `call`.
+    pub kind: ExactKind,
+    /// Portable classification of the edge.
+    pub facets: Vec<RelationshipFacet>,
+    /// The symbol the edge points at.
+    pub to: SymbolId,
+    /// Where the edge was read from. Required when `from` is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<SourceUnitSpan>,
+    /// How the producer established the edge.
+    pub derivation: RelationshipDerivation,
+    /// How likely a `heuristic` edge is to hold, from 0 to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+}
+
+/// One place an external producer found a unit's source naming a symbol.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerOccurrence {
+    /// The symbol the source names.
+    pub symbol: SymbolId,
+    /// The unit carrying the occurrence.
+    pub unit: SourceUnitId,
+    /// The occurrence's byte range inside `unit`.
+    pub range: TextRange,
 }
 
 #[cfg(test)]

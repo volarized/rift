@@ -45,11 +45,12 @@ use rift_ranking::{
     identifier_terms,
 };
 use rift_syntax::{
-    ByteRange, NodeMatch, NodePlace, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource,
-    SyntaxSymbol, registry,
+    ByteRange, NodeMatch, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol,
+    registry,
 };
 use sha2::{Digest as _, Sha256};
 
+use crate::LocatedNode;
 use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
@@ -58,7 +59,6 @@ use crate::documentation::NotebookFiles;
 use crate::language::{ClassifiedPath, WorkspaceLanguagePolicy};
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemantics};
-use crate::{LocatedNode, NodeAddress};
 use rift_analysis::{DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict};
 
 #[derive(Debug)]
@@ -4403,20 +4403,13 @@ impl WorkspaceIndex {
             let declarations = (0..document.symbols().len())
                 .map(|position| self.declaration_address(path, position))
                 .collect::<Result<Vec<_>, _>>()?;
-            let places = document
-                .node_places(|position, _| declarations.get(position).is_some_and(Option::is_some));
-            let located = document.node_at(range, matching).and_then(|node| {
-                let position = document
-                    .nodes()
-                    .iter()
-                    .position(|candidate| std::ptr::eq(candidate, node))?;
-                Some(LocatedNode {
-                    address: node_address(places[position], &declarations),
-                    kind: node.kind,
-                    range: node.range,
-                })
-            });
-            return Ok(located.or_else(|| LocatedNode::file(source, range, matching)));
+            return Ok(LocatedNode::in_document(
+                &document,
+                source,
+                &declarations,
+                range,
+                matching,
+            ));
         }
         Ok(self
             .text_file(path)
@@ -6792,24 +6785,6 @@ pub fn relative_path(path: &Path) -> Result<ProjectPath, RiftError> {
 /// package hit's class under the same rule this index orders by.
 fn symbol_rank(symbol: &SyntaxSymbol, matcher: &IdentifierMatcher<'_>) -> Option<IdentifierMatch> {
     matcher.matches(&symbol.name, &symbol.qualified_name)
-}
-
-/// The address `place` names, given the address of each declaration of its file.
-fn node_address(place: NodePlace, declarations: &[Option<(SymbolId, usize)>]) -> NodeAddress {
-    let held = match place.holder {
-        rift_syntax::NodeHolder::Declaration(position) => {
-            declarations.get(position).and_then(Option::as_ref)
-        }
-        rift_syntax::NodeHolder::Unit => None,
-    };
-    match held {
-        Some((symbol, declaration)) => NodeAddress::Declaration {
-            symbol: symbol.clone(),
-            declaration: *declaration,
-            index: place.index,
-        },
-        None => NodeAddress::Unit { index: place.index },
-    }
 }
 
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a
