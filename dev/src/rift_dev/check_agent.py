@@ -143,7 +143,6 @@ async def declaration_node(client: Client, name: str) -> str:
         "get_symbol",
         {
             "id": identity,
-            "include": ["source"],
             "view": string_value(captured.get("id"), "view.id"),
         },
     )
@@ -155,11 +154,15 @@ async def declaration_node(client: Client, name: str) -> str:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path", "range", "source"):
+    for field in ("path", "range"):
         require(
             declaration.get(field) == hit.get(field),
             f"symbol declaration changed {field}: {answer}",
         )
+    require(
+        "source" not in declaration,
+        f"symbol declaration carried source: {answer}",
+    )
     span = object_value(declaration.get("range"), "declaration.range")
     start, end = span.get("start"), span.get("end")
     require(
@@ -188,7 +191,7 @@ async def declaration_node(client: Client, name: str) -> str:
     ]
     require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
     node, excerpt = matches[0]
-    require(excerpt == declaration.get("source"), f"nodes changed source: {listing}")
+    require(excerpt == hit.get("source"), f"nodes changed source: {listing}")
     return string_value(node.get("id"), "node.id")
 
 

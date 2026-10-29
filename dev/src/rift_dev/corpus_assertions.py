@@ -603,14 +603,19 @@ def churn_answer(
         require(len(matches) == 1, "nodes lost probe declaration")
         hit, excerpt = matches[0]
         found = string_value(hit.get("symbol"), "probe identity")
-    elif tool == "get_symbol":
-        require(answer.get("outcome") == "found", "get_symbol lost probe declaration")
-        symbol = object_value(answer.get("symbol"), "probe symbol")
-        found = string_value(symbol.get("id"), "probe identity")
-        declarations = array_value(answer.get("declarations"), "probe declarations")
-        require(len(declarations) == 1, "get_symbol lost probe declaration")
-        hit = object_value(declarations[0], "probe declaration")
-        require(hit.get("path") == probe_path, "get_symbol returned another probe path")
+    elif tool == "symbol_nodes":
+        matches = [
+            object_value(node, "probe node")
+            for node in array_value(answer.get("nodes"), "probe symbol nodes")
+            if object_value(node, "probe node").get("of") == identity
+        ]
+        require(len(matches) == 1, "symbol nodes lost probe declaration")
+        hit = matches[0]
+        found = string_value(hit.get("of"), "probe identity")
+        require(
+            hit.get("unit") == f"{FILE_PREFIX}{probe_path}",
+            "symbol nodes returned another probe path",
+        )
         excerpt = hit.get("source")
     else:
         rows = array_value(answer.get("results"), "probe hits")
