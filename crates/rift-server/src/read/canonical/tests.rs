@@ -663,9 +663,9 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
     let item = nodes
         .0
         .nodes
-        .first()
-        .expect("the captured function holds nodes");
-    assert_eq!(item.index, 0);
+        .iter()
+        .find(|node| node.index == 0 && node.unit.as_str() == "rift://file/index.js")
+        .expect("the captured function's declaration in index.js holds nodes");
     assert!(
         reads
             .index
