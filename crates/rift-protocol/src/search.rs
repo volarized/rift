@@ -186,11 +186,6 @@ pub enum ResultOrder {
 #[schemars(transform = schema::pair_range_with_line)]
 #[schemars(transform = schema::declare_search_hit_empty_defaults)]
 pub struct SearchHit {
-    /// The immutable view that supplied this hit. The caller passes its `id` to later
-    /// exact, source, declaration, and relationship reads to retain the same context.
-    /// Absent when the caller selected latest facts without retained serving context.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<crate::symbol_read::CapturedView>,
     /// What was found. A symbol, a file, a documentation block, or a commit -
     /// whichever `target` allowed.
     pub hit: SearchHitTarget,

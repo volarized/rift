@@ -1296,7 +1296,7 @@ class Corpus:
                     "id": symbol.get("id"),
                     "path": hit.get("path"),
                     "history": answer.get("history"),
-                    "view": answer.get("view"),
+                    "revision": answer.get("revision"),
                     "root": str(root),
                 }
                 history = object_value(

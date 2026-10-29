@@ -85,21 +85,6 @@ async fn travelled_history(
         rift_protocol::identity::SymbolOwner::Local
     ));
     assert_eq!(identity.wire_identity(), id);
-    let view = search
-        .get("view")
-        .ok_or("search carries its captured view")?;
-    let unavailable = call_retrying_acceptance(
-        client,
-        tool_request(
-            "get_symbol",
-            &json!({"id": id, "include": ["history"], "view": view["id"]}),
-        ),
-    )
-    .await?;
-    assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
-    assert_eq!(unavailable["reason"], "insufficient_coverage");
-    assert_eq!(unavailable["id"], id);
-    assert_eq!(unavailable["view"], *view);
     let structured = call_retrying_acceptance(
         client,
         tool_request("get_symbol", &json!({"id": id, "include": ["history"]})),
@@ -107,20 +92,17 @@ async fn travelled_history(
     .await?;
     assert_eq!(structured["outcome"], "found", "{structured}");
     assert_eq!(structured["symbol"]["id"], id);
-    let history_view = structured
-        .get("view")
-        .ok_or("history carries its captured view")?;
     let repeated = call_retrying_acceptance(
         client,
         tool_request(
             "get_symbol",
-            &json!({"id": id, "include": ["history"], "view": history_view["id"]}),
+            &json!({"id": id, "include": ["history"], "revision": structured["revision"]}),
         ),
     )
     .await?;
     assert_eq!(repeated["outcome"], "found", "{repeated}");
     assert_eq!(repeated["symbol"]["id"], id);
-    assert_eq!(repeated["view"], *history_view);
+    assert_eq!(repeated["revision"], structured["revision"]);
     assert_eq!(repeated["history"], structured["history"]);
     structured
         .get("history")

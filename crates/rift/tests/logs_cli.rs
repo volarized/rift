@@ -578,19 +578,10 @@ async fn repository_beacon(
     assert_eq!(parsed.wire_identity(), identity);
     assert_eq!(parsed.language().name, "rust", "{answer}");
     assert_eq!(hit["hit"]["symbol"]["kind"], "function", "{answer}");
-    let view = hit["view"]["id"]
-        .as_str()
-        .ok_or("the seed retains its captured view")?;
-    let lookup = proxied_call(
-        client,
-        "get_symbol",
-        &serde_json::json!({"id": identity, "view": view}),
-    )
-    .await?;
+    let lookup = proxied_call(client, "get_symbol", &serde_json::json!({"id": identity})).await?;
     assert_eq!(lookup["outcome"], "found", "{lookup}");
     assert_eq!(lookup["symbol"]["id"], identity, "{lookup}");
     assert_eq!(lookup["symbol"]["name"], "beacon", "{lookup}");
-    assert_eq!(lookup["view"], hit["view"], "{lookup}");
     let declarations = lookup["declarations"]
         .as_array()
         .ok_or("the seed has source declarations")?;
@@ -605,12 +596,7 @@ async fn repository_beacon(
         "one original seed binding: {lookup}"
     );
     assert_eq!(declaration["range"], hit["range"], "{lookup}");
-    let nodes = proxied_call(
-        client,
-        "nodes",
-        &serde_json::json!({"symbol": identity, "view": view}),
-    )
-    .await?;
+    let nodes = proxied_call(client, "nodes", &serde_json::json!({"symbol": identity})).await?;
     assert_eq!(nodes["symbol"], identity, "{nodes}");
     assert_eq!(nodes["nodes"][0]["index"], 0, "{nodes}");
     assert_eq!(nodes["nodes"][0]["source"], hit["source"], "{nodes}");

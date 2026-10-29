@@ -211,7 +211,6 @@ pub(super) fn commit_hit(reads: &StoreReads, id: &str) -> Result<Option<SearchHi
         paths_truncated,
     };
     Ok(Some(SearchHit {
-        view: None,
         hit: SearchHitTarget::Commit {
             commit: Box::new(hit),
         },

@@ -941,7 +941,7 @@
         },
         "responses": {
           "200": {
-            "description": "One exact logical symbol and its captured view.",
+            "description": "One exact logical symbol.",
             "content": {
               "application/json": {
                 "schema": {
@@ -956,10 +956,6 @@
                         "language": "rust",
                         "name": "Beacon",
                         "kind": "struct"
-                      },
-                      "view": {
-                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "expires_at": "2026-10-10T01:00:00Z"
                       },
                       "revision": "rift://revision/cargo/crates.io/tokio@1.50.0",
                       "declarations": []
@@ -1139,7 +1135,7 @@
       "post": {
         "operationId": "nodes",
         "summary": "List the nodes of one package or runtime symbol.",
-        "description": "Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `view`; the server refuses `path`, `position`, and `rev`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.",
+        "description": "Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `revision`; the server refuses `path` and `position`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.",
         "security": [
           {},
           {
@@ -1246,10 +1242,6 @@
                           "parent": 0
                         }
                       ],
-                      "view": {
-                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "expires_at": "2026-10-10T01:00:00Z"
-                      },
                       "revision": "rift://revision/cargo/crates.io/demo@1.0.0"
                     }
                   }
@@ -4333,10 +4325,6 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "view": {
-            "description": "The immutable view that supplied this hit. The caller passes its `id` to later\nexact, source, declaration, and relationship reads to retain the same context.\nAbsent when the caller selected latest facts without retained serving context.",
-            "$ref": "#/components/schemas/CapturedView"
-          },
           "hit": {
             "$ref": "#/components/schemas/SearchHitTarget",
             "description": "What was found. A symbol, a file, a documentation block, or a commit -\nwhichever `target` allowed."
@@ -5110,12 +5098,8 @@
             "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`."
           },
           "revision": {
-            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses it beside `view` and once the index no longer serves it.",
+            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses a tree revision once the index serves another tree.",
             "$ref": "#/components/schemas/Revision"
-          },
-          "view": {
-            "description": "A view returned by a preceding read. Expiry never selects latest implicitly.",
-            "$ref": "#/components/schemas/CapturedViewId"
           },
           "declaration_limit": {
             "type": "integer",
@@ -5127,7 +5111,7 @@
           },
           "declaration_cursor": {
             "type": "string",
-            "description": "Continuation bound to this exact symbol, projections and serving view.",
+            "description": "Continuation a preceding read returned, bound to this symbol and the revision it read.\nThe server refuses it for another symbol and once that revision is no longer served.",
             "minLength": 1,
             "maxLength": 4096
           }
@@ -5156,10 +5140,6 @@
                 "$ref": "#/components/schemas/Symbol",
                 "description": "One logical symbol. Its established `id` is required by read validation."
               },
-              "view": {
-                "$ref": "#/components/schemas/CapturedView",
-                "description": "The immutable context used for this result and its continuations."
-              },
               "revision": {
                 "$ref": "#/components/schemas/Revision",
                 "description": "The revision this answer was read at: a commit, a release, or a working tree."
@@ -5174,7 +5154,7 @@
               },
               "declaration_cursor": {
                 "type": "string",
-                "description": "Continuation for remaining declarations in this exact view.",
+                "description": "Continuation for the remaining declarations at `revision`.",
                 "minLength": 1,
                 "maxLength": 4096
               },
@@ -5201,7 +5181,6 @@
             "required": [
               "outcome",
               "symbol",
-              "view",
               "revision",
               "declarations"
             ],
@@ -5214,10 +5193,6 @@
               "symbol_not_found": {
                 "$ref": "#/components/schemas/SymbolNotFound",
                 "description": "Definite exact miss and its actual structural candidates."
-              },
-              "view": {
-                "$ref": "#/components/schemas/CapturedView",
-                "description": "The exact immutable selection searched."
               },
               "revision": {
                 "$ref": "#/components/schemas/Revision",
@@ -5238,7 +5213,6 @@
             "required": [
               "outcome",
               "symbol_not_found",
-              "view",
               "revision"
             ],
             "description": "The valid identity is absent from the completely searched exact selection."
@@ -5250,10 +5224,6 @@
               "id": {
                 "$ref": "#/components/schemas/SymbolIdentity",
                 "description": "The requested exact canonical identity."
-              },
-              "view": {
-                "description": "The selected view, when one could be captured.",
-                "$ref": "#/components/schemas/CapturedView"
               },
               "revision": {
                 "description": "The revision the read selected, when it established one.",
@@ -7562,10 +7532,6 @@
             "minLength": 1,
             "maxLength": 4096
           },
-          "view": {
-            "description": "Captured view selected by discovery. The server reads nodes from that view and\nrefuses an expired or foreign view. The caller MUST omit `revision` beside `view`.",
-            "$ref": "#/components/schemas/CapturedViewId"
-          },
           "revision": {
             "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's dependencies pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree.",
             "$ref": "#/components/schemas/Revision"
@@ -7642,10 +7608,6 @@
           "revision": {
             "$ref": "#/components/schemas/Revision",
             "description": "The revision this answer was read at: a commit, a release, or a working tree."
-          },
-          "view": {
-            "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view.",
-            "$ref": "#/components/schemas/CapturedView"
           },
           "warnings": {
             "type": "array",

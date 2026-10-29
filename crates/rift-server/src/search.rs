@@ -10,8 +10,6 @@ mod commit;
 #[cfg(test)]
 mod commit_tests;
 mod documentation;
-
-pub(crate) use documentation::populate_sources_from;
 #[cfg(test)]
 mod documentation_tests;
 mod pattern;
@@ -295,47 +293,6 @@ impl ReadService {
     pub(crate) fn accept_search_revision(&self, params: &SearchParams) -> Result<(), RiftError> {
         self.validate_dependency_scope(&params.scope, is_git_revision(params.revision.as_ref()))?;
         self.accept_revision(params.revision.as_ref())
-    }
-
-    /// Returns the ordered traversal search results before applying a page window.
-    ///
-    /// # Errors
-    ///
-    /// Returns the search refusal, or refuses request-only source outside the captured index.
-    pub fn search_traversal_hits(
-        &self,
-        params: &SearchParams,
-        store: &StoreAnswer,
-        references: &EngineReferences,
-    ) -> Result<(Vec<SearchHit>, Vec<ReadWarning>), RiftError> {
-        self.accept_search_revision(params)?;
-        let pattern = self.validated_pattern(params, store, references)?;
-        if params.traversal.is_none()
-            || pattern.is_some()
-            || params.change.is_some()
-            || params.target == SearchParamsTarget::Commit
-            || force_include_requested(params)
-        {
-            return errors::server::read_unsupported()
-                .capability("traversal results on a captured snapshot")
-                .fail();
-        }
-        self.ordered_search_hits(
-            params,
-            store,
-            references,
-            |mut results, selected, payloads, _| {
-                let warnings = self.populate_search_payloads(
-                    &mut results,
-                    selected,
-                    HitPayloads {
-                        source: false,
-                        ..payloads
-                    },
-                )?;
-                Ok((results, warnings))
-            },
-        )
     }
 
     fn ordered_search_hits<Output>(
@@ -1533,7 +1490,6 @@ fn assembled_symbol_hit(
     let line = (!payloads.defer_line)
         .then(|| line::line_number_at(matched.file.source(), matched.symbol.range.start));
     SearchHit {
-        view: None,
         hit: SearchHitTarget::Symbol {
             symbol: Box::new(symbol),
         },
@@ -1599,7 +1555,6 @@ fn source_file_hit(
     payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
-        view: None,
         hit: SearchHitTarget::File {
             size: u64::try_from(file.source().len()).unwrap_or(u64::MAX),
             languages: vec![file.syntax().language().clone()],
@@ -1635,7 +1590,6 @@ fn text_file_hit(
     payloads: HitPayloads,
 ) -> SearchHit {
     SearchHit {
-        view: None,
         hit: text_file_hit_target(file),
         score,
         matched_by,
@@ -4777,7 +4731,6 @@ impl Tower {
 
     fn file_hit_stub(path: &str, score: f64) -> SearchHit {
         SearchHit {
-            view: None,
             hit: SearchHitTarget::File {
                 size: 0,
                 languages: Vec::new(),

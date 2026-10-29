@@ -33,7 +33,9 @@ use rift_syntax::{ByteRange, SyntaxProvider, registry};
 use crate::history::{StoredHistory, SymbolTimelines};
 
 mod canonical;
+mod cursor;
 mod nodes;
+mod symbol;
 pub use canonical::{LocalSymbolViewInput, LocalSymbolViews};
 
 /// Inputs for one cancellable current-tree read-service build.
@@ -795,10 +797,6 @@ impl ReadService {
         &self.revisions.tree_revision
     }
 
-    pub(crate) fn engine_index_current(&self) -> bool {
-        self.revisions.tree_revision == self.revisions.index_tree_revision
-    }
-
     /// Returns at most two established identities retained during this snapshot's capture.
     ///
     /// # Errors
@@ -1037,12 +1035,6 @@ impl ReadService {
     /// a cursor minted for another symbol or tree, a symbol with no declaration here, an
     /// invalid or missing path, or a `position` at or past the file's byte length.
     pub fn nodes(&self, params: &NodesParams) -> Result<NodesResult, RiftError> {
-        if let Some(view) = &params.view {
-            return errors::server::search_view_context()
-                .operation("nodes")
-                .view(view.as_str())
-                .fail();
-        }
         self.accept_revision(params.revision.as_ref())?;
         match nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)? {
             nodes::NodesSelector::Position {
@@ -1159,13 +1151,6 @@ impl ReadService {
     /// Returns [`RiftError`] for an invalid or absent path, a path outside the selected source
     /// set, a parse refusal, or a source that changed during the read.
     pub fn nodes_for_preparation(&self, params: &NodesParams) -> Result<NodesResult, RiftError> {
-        if let Some(view) = &params.view {
-            return errors::server::search_view_context()
-                .operation("nodes")
-                .view(view.as_str())
-                .fail();
-        }
-
         self.accept_revision(params.revision.as_ref())?;
         let nodes::NodesSelector::Position {
             path,
@@ -1676,7 +1661,6 @@ fn nodes_result(
         nodes: page.nodes,
         node_cursor: page.node_cursor,
         revision,
-        view: None,
         warnings,
     }
 }

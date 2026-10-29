@@ -397,44 +397,20 @@ impl RiftProxy {
         }
     }
 
-    fn warning_project(&self, request: &CallToolRequestParams) -> String {
+    /// The project whose framework warnings a `tools/call` answer reports: the extra
+    /// project a `get_symbol` identity names, else the primary one.
+    fn warning_project(request: &CallToolRequestParams) -> String {
         if request.name != "get_symbol" {
             return "local".to_owned();
         }
-        let selected = request
+        request
             .arguments
             .as_ref()
-            .and_then(|arguments| arguments.get("view"))
+            .and_then(|arguments| arguments.get("id"))
             .and_then(serde_json::Value::as_str)
-            .and_then(|view| rift_protocol::symbol_read::CapturedViewId::parse(view).ok())
-            .and_then(|view| {
-                self.candidate_views
-                    .backend(&view, std::time::SystemTime::now())
-                    .ok()
-                    .and_then(Result::ok)
-                    .flatten()
-            });
-        selected.map_or_else(
-            || {
-                request
-                    .arguments
-                    .as_ref()
-                    .and_then(|arguments| arguments.get("id"))
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|id| rift_protocol::identity::SymbolIdentity::parse(id).ok())
-                    .and_then(|identity| identity::backend_key(identity.owner()))
-                    .unwrap_or_else(|| "local".to_owned())
-            },
-            |selected| {
-                selected.project.unwrap_or_else(|| {
-                    if selected.backend == "global" {
-                        "local".to_owned()
-                    } else {
-                        selected.backend
-                    }
-                })
-            },
-        )
+            .and_then(|id| rift_protocol::identity::SymbolIdentity::parse(id).ok())
+            .and_then(|identity| identity::backend_key(identity.owner()))
+            .unwrap_or_else(|| "local".to_owned())
     }
 
     fn call_backend(&self, request: &CallToolRequestParams) -> Result<&Self, RiftError> {
@@ -1717,7 +1693,7 @@ impl ServerHandler for RiftProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let warning_project = self.warning_project(&request);
+        let warning_project = Self::warning_project(&request);
         let measured = McpRequest::tool_call(&request.name);
         let span = rift_tracing::info_span!(
             "mcp.forward",
@@ -1734,8 +1710,7 @@ impl ServerHandler for RiftProxy {
             answered = span
                 .instrument(async {
                     rift_tracing::debug!("tool forward started");
-                    let registered: Result<_, RiftError> = match self.captured_read(&request).await
-                    {
+                    let registered: Result<_, RiftError> = match self.routed_read(&request).await {
                         Err(error) => Err(error),
                         Ok(Some(answer)) => Ok(answer),
                         Ok(None) => match self.captured_search(&request).await {
@@ -1886,7 +1861,6 @@ fn list_tools_request(page: Option<PaginatedRequestParams>) -> ClientRequest {
 
 #[cfg(test)]
 mod tests {
-    mod dependency_views;
     use crate::failure::WireFailure as _;
     use std::any::TypeId;
     use std::net::Ipv4Addr;
@@ -3823,7 +3797,7 @@ mod tests {
             json!({"pattern":7, "scope":"local:docs"}),
         )?);
         let error = proxy
-            .captured_read(&invalid)
+            .routed_read(&invalid)
             .await
             .expect_err("pattern must be text");
         assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
@@ -3832,7 +3806,7 @@ mod tests {
         let revision = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
             json!({"pattern":"beacon", "scope":"local:docs", "revision":"rift://revision/git/HEAD"}),
         )?);
-        assert!(proxy.captured_read(&revision).await?.is_none());
+        assert!(proxy.routed_read(&revision).await?.is_none());
         assert_eq!(
             proxy.backends[":docs"]
                 .upstream
@@ -3856,7 +3830,7 @@ mod tests {
             json!({"pattern":"beacon", "scope":"local@cloud", "target":"symbol"}),
         )?);
         let CallToolResponse::Complete(answer) = proxy
-            .captured_read(&request)
+            .routed_read(&request)
             .await?
             .ok_or("selected search")??
         else {
@@ -3900,7 +3874,7 @@ mod tests {
             json!({"pattern":"plain", "scope":"local@cloud", "target":"symbol"}),
         )?);
         let error = proxy
-            .captured_read(&request)
+            .routed_read(&request)
             .await
             .expect_err("successful search requires structured content");
         assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
@@ -3964,7 +3938,7 @@ mod tests {
                 proxy.call_backend(&request)?,
                 &raw const proxy
             ));
-            assert!(proxy.captured_read(&request).await?.is_none());
+            assert!(proxy.routed_read(&request).await?.is_none());
             let upstream = super::candidates::dispatch_read_request(&request, "global")?;
             assert_eq!(upstream.arguments, request.arguments);
         }
@@ -4005,8 +3979,8 @@ mod tests {
         let position = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
             json!({"path": "lib.rs", "position": 0}),
         )?);
-        assert!(proxy.captured_read(&position).await?.is_none());
-        assert!(proxy.captured_read(&primary_request).await?.is_none());
+        assert!(proxy.routed_read(&position).await?.is_none());
+        assert!(proxy.routed_read(&primary_request).await?.is_none());
         let malformed = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
             json!({"symbol": id, "position": "zero"}),
         )?);
@@ -4101,7 +4075,7 @@ mod tests {
             json!({"pattern":"beacon", "scope":"local@cloud:docs", "target":"symbol"}),
         )?);
         let CallToolResponse::Complete(answer) = proxy
-            .captured_read(&request)
+            .routed_read(&request)
             .await?
             .ok_or("selected search")??
         else {
@@ -4227,15 +4201,6 @@ mod tests {
         );
     }
 
-    fn assert_named_held_get(
-        held_value: &serde_json::Value,
-        initial_revision: &serde_json::Value,
-        held: &serde_json::Value,
-    ) {
-        assert_eq!(&held_value["view"], initial_revision);
-        assert_eq!(held_value["symbol"]["id"], held["id"]);
-    }
-
     fn assert_named_walk(initial: &serde_json::Value) {
         assert_eq!(initial["results"][0]["hit"]["symbol"]["name"], "zulu");
         assert_eq!(initial["results"][1]["hit"]["symbol"]["name"], "alpha");
@@ -4249,7 +4214,7 @@ mod tests {
                 format!("fn {name}() {{}}")
             );
             assert_eq!(initial["results"][index]["path"], "lib.rs");
-            assert_eq!(initial["results"][index]["view"], initial["view"]);
+            assert!(initial["results"][index].get("view").is_none());
         }
     }
 
@@ -4263,7 +4228,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn named_initial_get_keeps_typed_ids_and_original_view_after_extra_root_retargets()
+    async fn named_get_keeps_typed_ids_and_the_accepted_root_after_extra_root_retargets()
     -> TestResult {
         use std::os::unix::fs::symlink;
         use tokio::io::AsyncWriteExt as _;
@@ -4283,9 +4248,6 @@ mod tests {
             });
             slot.generation_next = 1;
         }
-        let expires_at = jiff::Timestamp::now()
-            .checked_add(std::time::Duration::from_secs(600))?
-            .to_string();
         let answering = tokio::spawn(async move {
             let (reading, mut writing) = tokio::io::split(upstream);
             let mut lines = tokio::io::BufReader::new(reading).lines();
@@ -4300,15 +4262,10 @@ mod tests {
                     request["params"]["arguments"]["id"],
                     "rift://symbol/local/rust/app/load"
                 );
-                if count == 0 {
-                    assert_eq!(request["params"]["arguments"]["revision"], HEAD);
-                } else {
-                    assert!(request["params"]["arguments"].get("revision").is_none());
-                    assert_eq!(request["params"]["arguments"]["view"], "claims.original");
-                }
+                assert_eq!(request["params"]["arguments"]["revision"], HEAD);
                 let answer = json!({"content":[],"structuredContent":{
                     "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function"},
-                    "view":{"id":"claims.original","expires_at":expires_at}, "revision":COMMIT_REVISION,
+                    "revision":COMMIT_REVISION,
                     "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
                 }});
                 let response = json!({"jsonrpc":"2.0","id":request["id"],"result":answer});
@@ -4323,7 +4280,7 @@ mod tests {
         let request = CallToolRequestParams::new("get_symbol")
             .with_arguments(serde_json::from_value(arguments.clone())?);
         let first_response = proxy
-            .captured_read(&request)
+            .routed_read(&request)
             .await?
             .ok_or("captured request")??;
         let CallToolResponse::Complete(first_response) = first_response else {
@@ -4331,47 +4288,43 @@ mod tests {
         };
         let first_value = first_response.structured_content.ok_or("typed result")?;
         assert_named_get(&first_value, &arguments, &proxy);
+        assert_eq!(first_value["revision"], COMMIT_REVISION);
         std::fs::remove_file(&registration_path)?;
         symlink(second.path(), &registration_path)?;
-        let mut held = arguments;
-        held.as_object_mut().ok_or("request")?.remove("revision");
-        held["view"] = json!("claims.original");
-        // The served revision is a backend request selector, not a rewritten identity.
-        let initial_revision = first_value["view"].clone();
-        let held_request = CallToolRequestParams::new("get_symbol")
-            .with_arguments(serde_json::from_value(held.clone())?);
+        let repeated = CallToolRequestParams::new("get_symbol")
+            .with_arguments(serde_json::from_value(arguments.clone())?);
         // Keep the same accepted startup root even after the configured symlink changes.
         assert_eq!(
             proxy.backends["cloud"].accepted_root.as_deref(),
             Some(first.path().canonicalize()?.as_path())
         );
-        let held_response = proxy
-            .captured_read(&held_request)
+        let repeated_response = proxy
+            .routed_read(&repeated)
             .await?
-            .ok_or("held request")??;
-        let CallToolResponse::Complete(held_response) = held_response else {
-            return Err("complete held result".into());
+            .ok_or("repeated request")??;
+        let CallToolResponse::Complete(repeated_response) = repeated_response else {
+            return Err("complete repeated result".into());
         };
-        assert_named_held_get(
-            held_response
+        assert_named_get(
+            repeated_response
                 .structured_content
                 .as_ref()
-                .ok_or("held value")?,
-            &initial_revision,
-            &held,
+                .ok_or("repeated value")?,
+            &arguments,
+            &proxy,
         );
         assert_eq!(answering.await??, 2);
         proxy.backends = Arc::new(std::collections::BTreeMap::new());
         assert!(
-            proxy.captured_read(&held_request).await.is_err(),
-            "removed registration cannot retarget an issued view"
+            proxy.routed_read(&repeated).await.is_err(),
+            "a removed registration answers no read"
         );
         Ok(())
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn named_initial_walk_keeps_order_source_and_view_after_extra_root_retargets()
+    async fn named_walk_keeps_order_source_and_the_accepted_root_after_extra_root_retargets()
     -> TestResult {
         use std::os::unix::fs::symlink;
         use tokio::io::AsyncWriteExt as _;
@@ -4391,13 +4344,10 @@ mod tests {
             });
             slot.generation_next = 1;
         }
-        let expires_at = jiff::Timestamp::now()
-            .checked_add(std::time::Duration::from_secs(600))?
-            .to_string();
         let answering = tokio::spawn(async move {
             let (reading, mut writing) = tokio::io::split(upstream);
             let mut lines = tokio::io::BufReader::new(reading).lines();
-            for count in 0..2 {
+            for _ in 0..2 {
                 let line = lines
                     .next_line()
                     .await?
@@ -4411,16 +4361,11 @@ mod tests {
                 assert_eq!(arguments["scope"], "all");
                 assert_eq!(arguments["limit"], 2);
                 assert_eq!(arguments["page_index"], 0);
-                if count == 0 {
-                    assert!(arguments.get("view").is_none());
-                } else {
-                    assert_eq!(arguments["view"], "claims.walk");
-                }
-                let view = json!({"id":"claims.walk", "expires_at":expires_at});
+                assert!(arguments.get("view").is_none());
                 let hits: Vec<_> = ["zulu", "alpha"]
                     .into_iter()
                     .map(|name| {
-                        json!({"view":view, "hit":{"target":"symbol", "symbol":{
+                        json!({"hit":{"target":"symbol", "symbol":{
                         "id":format!("rift://symbol/local/rust/app/{name}"),
                         "language":"rust", "name":name, "kind":"function"
                     }}, "source":format!("fn {name}() {{}}"), "path":"lib.rs",
@@ -4428,7 +4373,7 @@ mod tests {
                     })
                     .collect();
                 let answer = json!({"content":[], "structuredContent":{
-                    "view":view, "results":hits,
+                    "results":hits,
                     "pagination":{"page_index":0, "total_pages":1}
                 }});
                 let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":answer});
@@ -4438,14 +4383,14 @@ mod tests {
             }
             Ok::<_, std::io::Error>(2)
         });
-        let mut arguments = json!({"scope":"all", "limit":2,
+        let arguments = json!({"scope":"all", "limit":2,
         "include":["source"], "traversal":{
             "seed":"rift://symbol/local@cloud/rust/app/load", "direction":"incoming"
         }});
         let initial = CallToolRequestParams::new("search")
             .with_arguments(serde_json::from_value(arguments.clone())?);
         let CallToolResponse::Complete(initial) = proxy
-            .captured_read(&initial)
+            .routed_read(&initial)
             .await?
             .ok_or("captured walk")??
         else {
@@ -4456,11 +4401,10 @@ mod tests {
         assert_eq!(proxy.upstream.lock().await.generation_next, 0);
         std::fs::remove_file(&registration_path)?;
         symlink(second.path(), &registration_path)?;
-        arguments["view"] = json!("claims.walk");
         let held =
             CallToolRequestParams::new("search").with_arguments(serde_json::from_value(arguments)?);
         let CallToolResponse::Complete(continued) =
-            proxy.captured_read(&held).await?.ok_or("held walk")??
+            proxy.routed_read(&held).await?.ok_or("held walk")??
         else {
             return Err("complete held walk".into());
         };
@@ -4471,7 +4415,7 @@ mod tests {
         );
         assert_eq!(answering.await??, 2);
         proxy.backends = Arc::new(std::collections::BTreeMap::new());
-        assert!(proxy.captured_read(&held).await.is_err());
+        assert!(proxy.routed_read(&held).await.is_err());
         Ok(())
     }
 
@@ -4694,11 +4638,10 @@ mod tests {
         let id = "rift://symbol/local@docs/rust/app/missing";
         let request = CallToolRequestParams::new("get_symbol")
             .with_arguments(serde_json::from_value(json!({"id":id})).expect("symbol arguments"));
-        let first_project = proxy.warning_project(&request);
+        let first_project = RiftProxy::warning_project(&request);
         assert_eq!(first_project, "docs");
         let answer: rift_protocol::symbol_read::GetSymbolResult = serde_json::from_value(json!({
             "outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},
-            "view":{"id":"claims.docs","expires_at":"2030-01-01T00:00:00Z"},
             "revision":format!("rift://revision/tree/{}", "0".repeat(64)),
             "warnings":[{"code":"framework_context_unresolved", "unit":"rift://source/project/a.ts",
                 "framework":"tailwind", "detail":"missing version"}]

@@ -896,7 +896,6 @@ fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> Result<NodesResult, T
         .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
     Ok(NodesResult {
         symbol: None,
-        view: None,
         nodes: Vec::new(),
         node_cursor: None,
         revision,
@@ -2311,8 +2310,8 @@ impl RiftMcp {
             .server_configuration()
     }
 
-    /// Reads one logical symbol by its canonical `id`. The caller may select a preceding
-    /// immutable `view`; continuations retain that selection and its original expiry.
+    /// Reads one logical symbol by its canonical `id` at one `revision`; the answer names the
+    /// revision it read, and `declaration_cursor` continues its declarations at that revision.
     /// A complete exact miss returns `symbol_not_found` and up to three alternatives.
     /// An unavailable selection returns its typed cause. A found symbol carries its facts and
     /// each declaration's location; `nodes` with `symbol` reads a declaration's source. Use
@@ -2323,12 +2322,7 @@ impl RiftMcp {
         Parameters(params): Parameters<rift_protocol::symbol_read::GetSymbolParams>,
         extensions: rmcp::model::Extensions,
     ) -> Result<Json<rift_protocol::symbol_read::GetSymbolResult>, ToolFailure> {
-        let context = extensions.get::<std::sync::Arc<
-            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
-        >>();
-        let result = self
-            .exact_symbol_with_context(params, context.map(std::sync::Arc::as_ref))
-            .await;
+        let result = self.exact_symbol(params).await;
         if let Err(ToolFailure::Registered(failure, _)) = &result
             && let Some(operation) = extensions.get::<rift_tracing::Span>()
         {
@@ -2364,17 +2358,7 @@ impl RiftMcp {
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
-        extensions: rmcp::model::Extensions,
     ) -> Result<Json<rift_protocol::search_read::SearchReadResult>, ToolFailure> {
-        if params.traversal.is_some() {
-            let context = extensions.get::<std::sync::Arc<
-                std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
-            >>();
-            return self
-                .captured_traversal(&params, context.map(std::sync::Arc::as_ref))
-                .await
-                .map(Json);
-        }
         if let Some(captured) = self.captured_query(&params).await? {
             return Ok(Json(captured));
         }
@@ -3260,18 +3244,10 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ToolFailure> {
-        let local_view = params
-            .view
-            .as_ref()
-            .filter(|view| self.has_captured_context(view));
         if let Some(symbol) = &params.symbol
-            && local_view.is_none()
             && is_release_symbol(symbol)?
         {
             return self.global_nodes(&params).await;
-        }
-        if let Some(view) = &params.view {
-            return self.captured_nodes(&params, view).map(Json);
         }
         let git = params.revision.as_ref().and_then(Revision::git_revision);
         if git.is_some() {
@@ -4209,22 +4185,6 @@ impl ServerHandler for RiftMcp {
     ) -> Result<CallToolResponse, ErrorData> {
         let parameter_failure = ParameterFailure::default();
         let _ = context.extensions.insert(parameter_failure.clone());
-        let expected = match crate::global::candidates::SavedCandidateBackend::from_request(
-            request.meta.as_ref(),
-        ) {
-            Ok(expected) => expected,
-            Err(error) => {
-                return error
-                    .mcp()
-                    .tool_failure(wire::ErrorPhase::Read)
-                    .into_call_tool_result();
-            }
-        };
-        let captured = matches!(request.name.as_ref(), "get_symbol" | "search")
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new(expected)));
-        if let Some(captured) = &captured {
-            let _ = context.extensions.insert(std::sync::Arc::clone(captured));
-        }
         let measured =
             McpRequest::tool_call(&request.name).served(context.protocol_version().as_ref());
         // `workspace` routes every record inside the request to this workspace's log store
@@ -4262,7 +4222,7 @@ impl ServerHandler for RiftMcp {
                         };
                         let _ = context.extensions.insert(SymbolExamples(examples));
                     }
-                    let mut result = if request.name == "search_candidates" {
+                    let result = if request.name == "search_candidates" {
                         self.search_candidates_call(request, &operation).await
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
@@ -4283,7 +4243,6 @@ impl ServerHandler for RiftMcp {
                             Ok(response) => Ok(response),
                         }
                     };
-                    candidates::write_captured_context(&mut result, captured.as_deref());
                     rift_tracing::debug!(
                         is_error = Ending::of_tool_call(&result) != Ending::Answered,
                         "tool request completed"
@@ -6075,9 +6034,7 @@ done
             &self,
             params: Parameters<SearchParams>,
         ) -> Result<super::Json<SearchResult>, super::ToolFailure> {
-            let super::Json(answer) = self
-                .search(params, rmcp::model::Extensions::default())
-                .await?;
+            let super::Json(answer) = self.search(params).await?;
             match answer {
                 rift_protocol::search_read::SearchReadResult::Results(answer) => {
                     Ok(super::Json(*answer))
@@ -7198,7 +7155,8 @@ done
             json!({"start": 0, "end": "pub fn beacon() {}".len()})
         );
         assert!(structured.get("declaration_cursor").is_none());
-        assert!(structured["view"]["id"].as_str().is_some());
+        assert!(structured.get("view").is_none());
+        assert!(structured["revision"].as_str().is_some());
 
         let search = client
             .call_tool(

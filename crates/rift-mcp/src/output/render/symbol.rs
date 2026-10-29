@@ -170,10 +170,9 @@ pub(super) fn canonical(
     result: &rift_protocol::symbol_read::GetSymbolResult,
 ) -> Result<(), TextError> {
     use rift_protocol::symbol_read::GetSymbolResult;
-    let (view, revision, warnings) = match result {
+    let (revision, warnings) = match result {
         GetSymbolResult::Found {
             symbol,
-            view,
             revision,
             declarations,
             declaration_cursor,
@@ -207,11 +206,10 @@ pub(super) fn canonical(
             if let Some(cursor) = declaration_cursor {
                 lines.line(0, &format!("declaration_cursor {cursor}"))?;
             }
-            (Some(view), Some(revision), warnings)
+            (Some(revision), warnings)
         }
         GetSymbolResult::Missing {
             symbol_not_found,
-            view,
             revision,
             warnings,
         } => {
@@ -231,11 +229,10 @@ pub(super) fn canonical(
             if let Some(detail) = &symbol_not_found.detail {
                 lines.verbatim(0, detail)?;
             }
-            (Some(view), Some(revision), warnings)
+            (Some(revision), warnings)
         }
         GetSymbolResult::Unavailable {
             id,
-            view,
             revision,
             reason,
             warnings,
@@ -243,16 +240,10 @@ pub(super) fn canonical(
             let mut lines = Lines::new(out, 0, 1);
             lines.head(&format!("unavailable · {reason:?}"))?;
             lines.line(0, id.as_str())?;
-            (view.as_ref(), revision.as_ref(), warnings)
+            (revision.as_ref(), warnings)
         }
     };
     layout::revision(out, revision)?;
-    if let Some(view) = view {
-        out.raw_line(
-            0,
-            &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
-        )?;
-    }
     warning::section(out, warnings)
 }
 

@@ -468,7 +468,7 @@ async fn get_symbol_miss_proposes_three_project_alternatives() -> TestResult {
         .ok_or("structured answer absent")?;
     eprintln!(
         "exact miss context: {}",
-        json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+        json!({"outcome":answer["outcome"], "reason":answer["reason"], "revision":answer["revision"], "warnings":answer["warnings"]})
     );
     assert_validates(&validator, &answer, "get_symbol miss");
     assert_eq!(answer["outcome"], "missing");
@@ -559,7 +559,7 @@ async fn get_symbol_configured_work_preserves_named_miss_and_exact_hits() -> Tes
             .ok_or("structured answer absent")?;
         eprintln!(
             "exact miss context: {}",
-            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+            json!({"outcome":answer["outcome"], "reason":answer["reason"], "revision":answer["revision"], "warnings":answer["warnings"]})
         );
         assert_validates(output, &answer, "configured work result");
         let warning = &answer["symbol_not_found"];
@@ -630,7 +630,7 @@ async fn get_symbol_miss_reports_unavailable_alternatives_at_the_work_bound() ->
             .ok_or("structured answer absent")?;
         eprintln!(
             "exact miss context: {}",
-            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+            json!({"outcome":answer["outcome"], "reason":answer["reason"], "revision":answer["revision"], "warnings":answer["warnings"]})
         );
         assert_validates(&validator, &answer, "get_symbol work bound");
         let warning = &answer["symbol_not_found"];
@@ -679,7 +679,7 @@ async fn get_symbol_miss_uses_requested_revision_and_remote_matches_clear_the_wa
             .ok_or("structured answer absent")?;
         eprintln!(
             "exact miss context: {}",
-            json!({"outcome":answer["outcome"], "reason":answer["reason"], "view":answer["view"], "warnings":answer["warnings"]})
+            json!({"outcome":answer["outcome"], "reason":answer["reason"], "revision":answer["revision"], "warnings":answer["warnings"]})
         );
         let alternatives = answer["symbol_not_found"]["alternatives"]
             .as_array()

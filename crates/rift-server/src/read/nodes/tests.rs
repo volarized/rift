@@ -294,7 +294,7 @@ fn a_served_cursor_continues_the_read_and_refuses_another_symbol() -> TestResult
     let dim = identity(&service, "dim")?;
     let lamp = identity(&service, "lamp")?;
     let revision = service.revisions.index_tree_revision.clone();
-    let cursor = super::cursor(1, dim.as_str(), &revision);
+    let cursor = super::super::cursor::mint(1, dim.as_str(), &revision);
 
     let rest = service.nodes(&NodesParams {
         node_cursor: Some(cursor.clone()),
@@ -382,7 +382,7 @@ fn a_cursor_beside_a_position_continues_the_answer_it_came_with() -> TestResult 
     let revision = service.revisions.index_tree_revision.clone();
 
     let rest = service.nodes(&NodesParams {
-        node_cursor: Some(super::cursor(1, dim.as_str(), &revision)),
+        node_cursor: Some(super::super::cursor::mint(1, dim.as_str(), &revision)),
         ..NodesParams::at(path.clone(), position)
     })?;
 
@@ -390,7 +390,7 @@ fn a_cursor_beside_a_position_continues_the_answer_it_came_with() -> TestResult 
     assert_eq!(rest.nodes, symbol_nodes(&service, &dim)?.nodes[1..]);
     let foreign = service
         .nodes(&NodesParams {
-            node_cursor: Some(super::cursor(
+            node_cursor: Some(super::super::cursor::mint(
                 1,
                 "rift://source/project/src/lib.rs",
                 &revision,

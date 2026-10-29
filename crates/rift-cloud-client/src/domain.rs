@@ -53,7 +53,6 @@ impl TryFrom<&PackagePatternHit> for PackagePatternMatch {
             return Err(invalid("location"));
         }
         let file = rift_protocol::read::SearchHit {
-            view: None,
             hit: rift_protocol::read::SearchHitTarget::File {
                 size,
                 languages: Vec::new(),
@@ -106,7 +105,6 @@ fn declaration_hit(
     let line =
         u64::try_from(declaration.line).map_err(|source| invalid_source("location", source))?;
     Ok(rift_protocol::read::SearchHit {
-        view: None,
         hit: rift_protocol::read::SearchHitTarget::Symbol {
             symbol: Box::new(convert_symbol(&declaration.symbol)?),
         },
@@ -161,7 +159,6 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
             .map_err(|source| invalid_source("symbol_identity", source))?;
         let match_class = crate::search_match_class(&value.match_class)?;
         let hit = rift_protocol::read::SearchHit {
-            view: None,
             hit: rift_protocol::read::SearchHitTarget::Symbol {
                 symbol: Box::new(symbol),
             },
@@ -234,7 +231,6 @@ fn documentation_candidate(
         })
         .collect();
     let hit = rift_protocol::read::SearchHit {
-        view: None,
         hit: rift_protocol::read::SearchHitTarget::Documentation {
             documentation: Box::new(documentation.clone()),
         },

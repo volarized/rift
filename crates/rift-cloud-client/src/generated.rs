@@ -2159,9 +2159,6 @@ pub struct PackageDocumentationHit {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHit {
-    /// The immutable serving view and the expiry promised by its owner.
-    #[validate(nested)]
-    pub view: Option<CapturedView>,
     /// What a search hit is. Tagged, so the payload correlation survives code generation.
     pub hit: SearchHitTarget,
     /// The ranking value attached to this hit and used to merge duplicate hits.
@@ -2677,22 +2674,10 @@ pub struct RuntimeIdentity {
     pub version: String,
 }
 /// The immutable serving view and the expiry promised by its owner.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    validator::Validate,
-    oas3_gen_support::Default
-)]
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct CapturedView {
     /// A service-issued key for one immutable view in one serving context.
-    #[validate(
-        length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
-    )]
     pub id: String,
     /// RFC 3339 expiry. The service retains the view's required facts until this time.
     pub expires_at: chrono::DateTime<chrono::Utc>,
@@ -2824,17 +2809,12 @@ pub struct GetSymbolParams {
         regex(path = "REGEX_GET_SYMBOL_PARAMS_REVISION")
     )]
     pub revision: Option<String>,
-    /// A service-issued key for one immutable view in one serving context.
-    #[validate(
-        length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
-    )]
-    pub view: Option<String>,
     /// Most declarations returned in this read. Omitted uses the existing five-item bound.
     #[validate(range(min = 1, max = 10000))]
     #[default(Some(5u64))]
     pub declaration_limit: Option<u64>,
-    /// Continuation bound to this exact symbol, projections and serving view.
+    /// Continuation a preceding read returned, bound to this symbol and the revision it read.
+    /// The server refuses it for another symbol and once that revision is no longer served.
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub declaration_cursor: Option<String>,
 }
@@ -3753,12 +3733,6 @@ pub struct NodesParams {
     /// the server refuses it for another symbol or unit and once the tree has moved.
     #[validate(length(min = 1u64, max = 4_096u64))]
     pub node_cursor: Option<String>,
-    /// A service-issued key for one immutable view in one serving context.
-    #[validate(
-        length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
-    )]
-    pub view: Option<String>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     #[validate(
         length(min = 1u64, max = 8_192u64),
@@ -3781,8 +3755,6 @@ pub struct NodesResult {
     pub node_cursor: Option<String>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: Option<CapturedView>,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[default(Some(Default::default()))]
     pub warnings: Option<Vec<ReadWarning>>,
@@ -4586,7 +4558,7 @@ impl GetSymbolRequest {
 /// Response types for get_symbol
 #[derive(Debug, Clone)]
 pub enum GetSymbolResponse {
-    ///200: One exact logical symbol and its captured view.
+    ///200: One exact logical symbol.
     Ok(GetSymbolResult),
     ///400: Request JSON, query parameters, or field relationships are invalid.
     BadRequest(ProblemDetails),
@@ -4617,7 +4589,7 @@ pub enum GetSymbolResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `view`; the server refuses `path`, `position`, and `rev`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.
+/// Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `revision`; the server refuses `path` and `position`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct NodesRequest {
     /// The package or runtime symbol whose nodes the request lists.
@@ -5447,8 +5419,6 @@ pub struct PackageSearchItemVariant2Hit {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct PackageSearchItemVariant2 {
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: Option<CapturedView>,
     pub hit: PackageSearchItemVariant2Hit,
     /// The ranking value attached to this hit and used to merge duplicate hits.
     /// Exact original identifier spelling ranks before this value under `relevance`.
@@ -5536,13 +5506,11 @@ pub struct GetSymbolResultObject {
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
     /// and is connected through Relationship.
     pub symbol: Symbol,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: CapturedView,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
     /// Declaration bindings in deterministic source order.
     pub declarations: Vec<SymbolDeclaration>,
-    /// Continuation for remaining declarations in this exact view.
+    /// Continuation for the remaining declarations at `revision`.
     pub declaration_cursor: Option<String>,
     /// One symbol's timeline across the workspace's version-control history, newest revision
     /// first. The timeline follows first parents from the served revision, or the selected
@@ -5563,8 +5531,6 @@ pub struct GetSymbolResultObject {
 pub struct GetSymbolResultObject2 {
     /// Definite absence after a complete exact selection, with bounded alternatives.
     pub symbol_not_found: SymbolNotFound,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: CapturedView,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
     /// Warnings, including incomplete candidate work.
@@ -5578,8 +5544,6 @@ pub struct GetSymbolResultObject2 {
 pub struct GetSymbolResultObject3 {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub id: String,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: Option<CapturedView>,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: Option<String>,
     /// Why an exact selection cannot establish presence or definite absence.

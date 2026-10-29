@@ -40,7 +40,6 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     assert_eq!(request.declaration_limit, 5);
     assert_eq!(request.declaration_cursor, None);
     assert_eq!(request.revision, None);
-    assert_eq!(request.view, None);
     let empty: GetSymbolParams =
         serde_json::from_value(json!({"id": ID, "include": []})).expect("valid fixture");
     assert!(empty.include.is_empty());
@@ -62,6 +61,7 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
         "language",
         "limit",
         "page_index",
+        "view",
     ] {
         let mut value = json!({"id": ID});
         value[field] = json!("removed");
@@ -216,7 +216,6 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
     let found = json!({
         "outcome": "found",
         "symbol": symbol(),
-        "view": {"id": VIEW, "expires_at": "2026-10-10T12:00:00Z"},
         "revision": COMMIT_REVISION,
         "declarations": []
     });
@@ -259,7 +258,6 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
             "name": "read",
             "match_context": ["module", "name"]
         }]},
-        "view": {"id": VIEW, "expires_at": "2026-10-10T12:00:00Z"},
         "revision": COMMIT_REVISION
     });
     let result: GetSymbolResult = serde_json::from_value(missing.clone()).expect("valid fixture");
@@ -268,7 +266,7 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
         serde_json::to_value(result).expect("valid fixture"),
         missing
     );
-    let unavailable = json!({"outcome": "unavailable", "id": ID, "reason": "view_expired"});
+    let unavailable = json!({"outcome": "unavailable", "id": ID, "reason": "index_preparing"});
     let result: GetSymbolResult =
         serde_json::from_value(unavailable.clone()).expect("valid fixture");
     assert!(result.is_valid_for(&requested));
