@@ -145,6 +145,13 @@ fn missing_store_tables_retain_each_read_operation_and_sqlite_source() -> TestRe
             "read changed paths",
             "changed_paths",
         ),
+        (
+            reads
+                .changed_declarations(&head, 10)
+                .expect_err("missing table"),
+            "read changed declarations",
+            "changed_declarations",
+        ),
     ] {
         assert_eq!(
             sqlite_refusal(&error, operation).to_string(),
@@ -423,6 +430,36 @@ fn changed_paths_answer_in_path_order_up_to_the_limit() -> TestResult {
     );
     assert_eq!(reads.changed_paths(&commit, 2)?, ["new.rs", "old.rs"]);
     assert!(reads.changed_paths(&commit, 0)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn changed_declarations_answer_in_key_order_up_to_the_limit() -> TestResult {
+    let folder = tempfile::tempdir()?;
+    let store = HistoryStore::open(&StoreLocation::new(folder.path(), "aa"))?;
+    let mut filler = store.filler()?.ok_or("the first filler takes the lock")?;
+    let mut record = commit("c1", None, 10, "Change three");
+    record.declarations = [("src/lib.rs", "parse"), ("a.rs", "b"), ("a.rs", "a")]
+        .map(|(path, qualified_name)| DeclarationChange {
+            path: path.to_owned(),
+            qualified_name: qualified_name.to_owned(),
+            change: SymbolVersionKind::BodyChanged,
+        })
+        .to_vec();
+    filler.write_batch(&[record])?;
+    let reads = store.reader().connect()?;
+    let commit = reads.commit("c1")?.ok_or("c1 is held")?;
+    let keys = |limit| -> Result<Vec<String>, rift_error::RiftError> {
+        Ok(reads
+            .changed_declarations(&commit, limit)?
+            .into_iter()
+            .map(|key| format!("{}:{}", key.path, key.qualified_name))
+            .collect())
+    };
+
+    assert_eq!(keys(10)?, ["a.rs:a", "a.rs:b", "src/lib.rs:parse"]);
+    assert_eq!(keys(2)?, ["a.rs:a", "a.rs:b"]);
+    assert!(keys(0)?.is_empty());
     Ok(())
 }
 

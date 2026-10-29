@@ -171,29 +171,32 @@ async fn a_symbol_history_answers_from_the_store_with_authors_across_a_move() ->
 
     let history = complete_history(&client).await?;
 
-    let versions: Vec<(String, String)> = history["versions"]
+    let edges: Vec<(String, String)> = history["edges"]
         .as_array()
-        .ok_or("versions is an array")?
+        .ok_or("edges is an array")?
         .iter()
-        .map(|version| {
+        .map(|edge| {
             (
-                version["kind"].as_str().unwrap_or_default().to_owned(),
-                version["path"].as_str().unwrap_or_default().to_owned(),
+                edge["edge"].as_str().unwrap_or_default().to_owned(),
+                edge["commit"]["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
             )
         })
         .collect();
     let expected = [
-        ("moved", "after.rs"),
-        ("body_changed", "before.rs"),
-        ("introduced", "before.rs"),
+        ("renamed_from", "after.rs"),
+        ("changed_in", "before.rs"),
+        ("introduced_in", "before.rs"),
     ]
-    .map(|(kind, path)| (kind.to_owned(), path.to_owned()));
-    assert_eq!(versions, expected, "{history}");
-    for version in history["versions"].as_array().into_iter().flatten() {
+    .map(|(edge, path)| (edge.to_owned(), path.to_owned()));
+    assert_eq!(edges, expected, "{history}");
+    for edge in history["edges"].as_array().into_iter().flatten() {
         assert_eq!(
-            version["author"],
+            edge["commit"]["author"],
             json!({"name": "Rift Fixture", "email": "fixture@rift.invalid"}),
-            "{version}"
+            "{edge}"
         );
     }
     assert_eq!(store_files(&directory.path().join(".git/.rift")).len(), 1);
@@ -231,7 +234,7 @@ async fn a_second_worktree_reads_the_store_the_first_filled() -> TestResult {
         json!(true),
         "the store already holds every shared commit: {history}"
     );
-    assert_eq!(history["versions"].as_array().map(Vec::len), Some(3));
+    assert_eq!(history["edges"].as_array().map(Vec::len), Some(3));
     assert_eq!(
         store_files(&root.join(".git/.rift")).len(),
         1,
