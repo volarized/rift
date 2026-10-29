@@ -1,14 +1,16 @@
-//! Symbol timelines: version-control history read through the syntax tier.
+//! Symbol histories: version-control history read through the syntax tier, answered as
+//! edges from the symbol.
 //!
-//! A workspace whose server keeps a history store answers a timeline from
+//! A workspace whose server keeps a history store answers a history from
 //! it: the store holds, per analyzed commit, the declarations whose shape
-//! changed and the files moved without a byte changed, and the timeline
-//! follows the commits it holds from the served revision. With no store
-//! attached, one request's composition walks each hit path's first-parent
-//! history, parses the committed blobs with the path's syntax provider, and
-//! classifies each adjacent pair of parsed states into a wire
-//! [`SymbolVersionKind`]. The caller runs either on its blocking lane; the
-//! classifier itself is sans-I/O.
+//! changed and the files moved without a byte changed, and the history
+//! follows the commits it holds from the served revision, then counts the
+//! symbols those commits changed beside it. With no store attached, one
+//! request's composition walks each hit path's first-parent history, parses
+//! the committed blobs with the path's syntax provider, and classifies each
+//! adjacent pair of parsed states into a [`SymbolVersionKind`], which
+//! [`commit_edge`] turns into the wire edge. The caller runs either on its
+//! blocking lane; the classifier itself is sans-I/O.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
@@ -18,13 +20,16 @@ use std::sync::{Arc, Mutex};
 use rift_core::ProjectPath;
 use rift_error::errors;
 use rift_history::{PathHistory, PathRevision, Repository, ResolvedRevision, TreeFile};
+use rift_history_store::edges::{CoChangeTally, DeclarationKey, commit_edge, edge_commit};
 use rift_history_store::{StoreReader, StoreReads, StoredCommit};
-use rift_index::SymbolMatch;
+use rift_index::{SymbolMatch, WorkspaceIndex};
 use rift_protocol::configuration::{HISTORY_REVISIONS_MAX, HistoryConfiguration, HistoryStrategy};
 use rift_protocol::read::{
-    CommitAuthor, ProjectPath as WireProjectPath, ReadWarning, RevisionId, SymbolHistory, SymbolId,
-    SymbolVersion, SymbolVersionKind,
+    CO_CHANGE_COMMIT_DECLARATIONS_MAX, CommitAuthor, HistoryCommit, HistoryEdge,
+    ProjectPath as WireProjectPath, ReadWarning, RevisionId, SymbolHistory, SymbolId,
+    SymbolVersionKind,
 };
+use rift_protocol::revision::Revision;
 use rift_syntax::{SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource, SyntaxSymbol};
 
 use crate::read::{RiftError, project_path};
@@ -303,25 +308,28 @@ impl SymbolTimelines {
         })
     }
 
-    /// Composes one symbol's timeline over every file its declarations live in, newest
-    /// first: one timeline per distinct path and qualified name among `bindings`, merged
-    /// by commit time, versions of one time keeping their binding order. The timeline is
-    /// complete when every merged one is.
+    /// Composes one symbol's history over every file its declarations live in: one
+    /// timeline per distinct path and qualified name among `bindings`, its commit edges
+    /// merged newest first, edges of one time keeping their binding order, then the
+    /// symbol's `co_changes` edges over every commit those timelines list. The history is
+    /// complete when every merged timeline is.
     ///
     /// Work is one timeline per distinct path, each under the `max_revisions` bound;
-    /// `bindings` is the index's bounded page of the symbol's declarations.
+    /// `bindings` is the index's bounded page of the symbol's declarations. Co-change
+    /// reads at most [`CO_CHANGE_COMMIT_DECLARATIONS_MAX`] declarations past one per
+    /// listed commit, and `index` binds each to the served tree's symbol.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] when the repository or the store cannot be read.
+    /// Returns [`RiftError`] when the repository, the store, or the index cannot be read.
     pub(crate) fn symbol_timeline(
         &mut self,
+        index: &WorkspaceIndex,
         bindings: &[SymbolMatch<'_>],
         identity: SymbolId,
     ) -> Result<SymbolHistory, RiftError> {
         let mut composed = BTreeSet::new();
-        let mut versions = Vec::new();
-        let mut complete = true;
+        let mut merged = PathTimeline::complete();
         for matched in bindings {
             let key = (
                 matched.file.path().as_str(),
@@ -331,36 +339,103 @@ impl SymbolTimelines {
                 continue;
             }
             let provider = crate::read::language_provider(matched.file.syntax().language());
-            let timeline = self.timeline(provider, *matched, identity.clone())?;
-            complete &= timeline.complete;
-            versions.extend(timeline.versions);
+            merged.absorb(self.path_timeline(provider, *matched)?);
         }
-        versions.sort_by_cached_key(|version| {
-            std::cmp::Reverse(
-                chrono::DateTime::parse_from_rfc3339(&version.timestamp)
-                    .ok()
-                    .map(|time| time.timestamp()),
-            )
-        });
-        Ok(timeline_answer(identity, versions, complete))
+        self.answer(index, identity, merged)
     }
 
-    /// Composes one hit's timeline, newest first.
+    /// Composes one hit's history, newest first, with its `co_changes` edges.
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError`] when the repository or the store cannot be
-    /// read. A blob the tier cannot analyze contributes no version instead of
-    /// failing.
+    /// Returns [`RiftError`] when the repository, the store, or the index cannot be
+    /// read. A blob the tier cannot analyze contributes no edge instead of failing.
     pub(crate) fn timeline(
         &mut self,
+        index: &WorkspaceIndex,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
         identity: SymbolId,
     ) -> Result<SymbolHistory, RiftError> {
+        let timeline = self.path_timeline(provider, matched)?;
+        self.answer(index, identity, timeline)
+    }
+
+    /// One declaration's commit edges and the commits that changed it.
+    fn path_timeline(
+        &mut self,
+        provider: &dyn SyntaxProvider,
+        matched: SymbolMatch<'_>,
+    ) -> Result<PathTimeline, RiftError> {
         match &mut self.source {
-            TimelineSource::Store(stored) => stored.timeline(matched, identity),
-            TimelineSource::Walk(walked) => walked.timeline(provider, matched, identity),
+            TimelineSource::Store(stored) => stored.timeline(matched),
+            TimelineSource::Walk(walked) => walked.timeline(provider, matched),
+        }
+    }
+
+    /// The wire history of `identity` from its composed timeline: commit edges newest
+    /// first, then the `co_changes` edges the store's listed commits answer. A walked
+    /// timeline holds no store, so it answers no `co_changes` edge.
+    fn answer(
+        &self,
+        index: &WorkspaceIndex,
+        identity: SymbolId,
+        timeline: PathTimeline,
+    ) -> Result<SymbolHistory, RiftError> {
+        let PathTimeline {
+            mut edges,
+            touched,
+            complete,
+        } = timeline;
+        edges.sort_by_cached_key(|edge| {
+            std::cmp::Reverse(
+                edge_commit(edge)
+                    .and_then(|commit| chrono::DateTime::parse_from_rfc3339(&commit.timestamp).ok())
+                    .map(|time| time.timestamp()),
+            )
+        });
+        let mut tally = CoChangeTally::new(identity.clone());
+        if let TimelineSource::Store(stored) = &self.source {
+            stored.count_co_changes(index, &touched, &mut tally)?;
+        }
+        let (co_changes, co_changes_truncated) = tally.into_edges();
+        edges.extend(co_changes);
+        Ok(SymbolHistory {
+            symbol: identity,
+            edges,
+            complete,
+            co_changes_truncated,
+        })
+    }
+}
+
+/// One composed timeline: its commit edges, the held commits that changed the
+/// declaration, and whether it reached the repository's first commit.
+#[derive(Debug)]
+struct PathTimeline {
+    edges: Vec<HistoryEdge>,
+    touched: Vec<StoredCommit>,
+    complete: bool,
+}
+
+impl PathTimeline {
+    /// The empty timeline a merge starts from: complete until a merged one is not.
+    const fn complete() -> Self {
+        Self {
+            edges: Vec::new(),
+            touched: Vec::new(),
+            complete: true,
+        }
+    }
+
+    /// Merges `other` into this timeline, each touched commit once.
+    fn absorb(&mut self, other: Self) {
+        self.complete &= other.complete;
+        self.edges.extend(other.edges);
+        for commit in other.touched {
+            if !self.touched.iter().any(|held| held.id == commit.id) {
+                self.touched.push(commit);
+            }
         }
     }
 }
@@ -380,7 +455,7 @@ impl StoredTimelines {
     /// Under `everything` they start at the served commit. Under `selective`
     /// a current-tree read starts at the newest release the store holds and
     /// a revision read at the served commit when it is a held release. A
-    /// start the store does not hold answers no version, and a current-tree
+    /// start the store does not hold answers no edge, and a current-tree
     /// read that meets one asks the history task to fill.
     fn open(
         stored: &StoredHistory,
@@ -409,49 +484,61 @@ impl StoredTimelines {
 
     /// One declaration's timeline through the held commits, newest first.
     ///
-    /// Each held commit contributes the change the store recorded for the
-    /// declaration at the path it lived at then. A file the commit moved
-    /// without changing a byte, or a declaration it moved unchanged into
-    /// another file, contributes a `moved` version, and the timeline goes on
-    /// at the path it came from. The timeline is
-    /// complete once it passes a commit compared with nothing; it is not
-    /// when it meets a commit the store does not hold, a boundary, or the
-    /// `max_revisions` bound first, nor when the store holds no commit to
-    /// start at, as a `selective` store holding no release yet does.
-    fn timeline(
-        &self,
-        matched: SymbolMatch<'_>,
-        symbol: SymbolId,
-    ) -> Result<SymbolHistory, RiftError> {
+    /// Each held commit contributes the edge of the change the store recorded
+    /// for the declaration at the path it lived at then. A file the commit
+    /// moved without changing a byte, or a declaration it moved unchanged into
+    /// another file, contributes a `renamed_from` edge, and the timeline goes
+    /// on at the path it came from. The timeline is complete once it passes a
+    /// commit compared with nothing; it is not when it meets a commit the
+    /// store does not hold, a boundary, or the `max_revisions` bound first, nor
+    /// when the store holds no commit to start at, as a `selective` store
+    /// holding no release yet does.
+    fn timeline(&self, matched: SymbolMatch<'_>) -> Result<PathTimeline, RiftError> {
+        let mut timeline = PathTimeline {
+            edges: Vec::new(),
+            touched: Vec::new(),
+            complete: false,
+        };
         let Some(start) = self.start.clone() else {
-            return Ok(timeline_answer(symbol, Vec::new(), false));
+            return Ok(timeline);
         };
         let qualified_name = matched.symbol.qualified_name.as_str();
         let mut path = matched.file.path().as_str().to_owned();
-        let mut versions = Vec::new();
         let mut next = Some(start);
-        let mut complete = false;
         for _ in 0..self.revisions_max {
             let Some(id) = next else {
-                complete = true;
+                timeline.complete = true;
                 break;
             };
             let Some(commit) = self.reads.commit(&id)? else {
                 break;
             };
-            if let Some(kind) = self
+            if let Some(change) = self
                 .reads
                 .declaration_change(&commit, &path, qualified_name)?
             {
-                versions.push(stored_version(&commit, &path, kind));
-                if kind == SymbolVersionKind::Moved
-                    && let Some(old_path) = self.reads.moved_from(&commit, &path, qualified_name)?
-                {
+                let from = match change {
+                    SymbolVersionKind::Moved => {
+                        self.reads.moved_from(&commit, &path, qualified_name)?
+                    }
+                    _ => None,
+                };
+                let edge = commit_edge(
+                    change,
+                    stored_commit(&commit, &path)?,
+                    from.clone().map(WireProjectPath),
+                );
+                timeline.edges.extend(edge);
+                timeline.touched.push(commit.clone());
+                if let Some(old_path) = from {
                     path = old_path;
                 }
             }
             if let Some(old_path) = self.reads.renamed_from(&commit, &path)? {
-                versions.push(stored_version(&commit, &path, SymbolVersionKind::Moved));
+                timeline.edges.push(HistoryEdge::RenamedFrom {
+                    commit: stored_commit(&commit, &path)?,
+                    from: WireProjectPath(old_path.clone()),
+                });
                 path = old_path;
             }
             if commit.boundary {
@@ -459,33 +546,82 @@ impl StoredTimelines {
             }
             next = commit.base;
         }
-        Ok(timeline_answer(symbol, versions, complete))
+        Ok(timeline)
+    }
+
+    /// Counts the `co_changes` of `touched`, the commits that changed the symbol, into
+    /// `tally`: each commit's changed declarations, read one past the bound, bound to the
+    /// served tree's symbols through `index`, each distinct declaration key resolved once.
+    fn count_co_changes(
+        &self,
+        index: &WorkspaceIndex,
+        touched: &[StoredCommit],
+        tally: &mut CoChangeTally,
+    ) -> Result<(), RiftError> {
+        let mut bound: HashMap<DeclarationKey, Option<SymbolId>> = HashMap::new();
+        let mut resolve = |key: &DeclarationKey| -> Result<Option<SymbolId>, RiftError> {
+            if let Some(symbol) = bound.get(key) {
+                return Ok(symbol.clone());
+            }
+            let symbol = served_symbol(index, key)?;
+            bound.insert(key.clone(), symbol.clone());
+            Ok(symbol)
+        };
+        for commit in touched {
+            let changed = self
+                .reads
+                .changed_declarations(commit, CO_CHANGE_COMMIT_DECLARATIONS_MAX + 1)?;
+            tally.count_commit(&changed, &mut resolve)?;
+        }
+        Ok(())
     }
 }
 
-/// One version a held commit contributes.
-fn stored_version(commit: &StoredCommit, path: &str, kind: SymbolVersionKind) -> SymbolVersion {
-    SymbolVersion {
-        revision: RevisionId(commit.id.clone()),
+/// The symbol the served tree binds to one declaration key: the logical identity of the
+/// first declaration of that qualified name in the file at that path. `None` when the
+/// served tree holds no such file or declaration, or establishes no identity for it.
+fn served_symbol(
+    index: &WorkspaceIndex,
+    key: &DeclarationKey,
+) -> Result<Option<SymbolId>, RiftError> {
+    let Ok(path) = ProjectPath::new(key.path.clone()) else {
+        return Ok(None);
+    };
+    let Some(file) = index.file(&path) else {
+        return Ok(None);
+    };
+    let Some(declaration) = file
+        .syntax()
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.qualified_name == key.qualified_name)
+    else {
+        return Ok(None);
+    };
+    let address =
+        declaration.provider_address(&file.syntax().language().identity_segment(), path.as_str());
+    let Some(matched) = index
+        .symbols_by_provider_identity(&address, 1)?
+        .into_iter()
+        .next()
+    else {
+        return Ok(None);
+    };
+    let assembled = index.assembled_symbol(matched)?;
+    Ok(assembled
+        .identity()
+        .map(|identity| SymbolId(identity.as_str().to_owned())))
+}
+
+/// The commit one held commit names, at the path the declaration lived at in it.
+fn stored_commit(commit: &StoredCommit, path: &str) -> Result<HistoryCommit, RiftError> {
+    Ok(HistoryCommit {
+        revision: Revision::commit(&commit.id)?,
         path: WireProjectPath(path.to_owned()),
-        kind,
         timestamp: commit.committed_at.clone(),
         summary: commit.summary().map(str::to_owned),
         author: commit.author.clone(),
-    }
-}
-
-/// The wire timeline one composition answers.
-const fn timeline_answer(
-    symbol: SymbolId,
-    versions: Vec<SymbolVersion>,
-    complete: bool,
-) -> SymbolHistory {
-    SymbolHistory {
-        symbol,
-        versions,
-        complete,
-    }
+    })
 }
 
 /// Timelines walked through git per request: one repository handle, one
@@ -503,13 +639,13 @@ struct WalkedTimelines {
 impl WalkedTimelines {
     /// Composes one hit's timeline: the path's touching commits newest
     /// first, each parsed through `provider` and classified against its
-    /// adjacent older state.
+    /// adjacent older state. A walk holds no store, so it lists no touched
+    /// commit for co-change.
     fn timeline(
         &mut self,
         provider: &dyn SyntaxProvider,
         matched: SymbolMatch<'_>,
-        identity: SymbolId,
-    ) -> Result<SymbolHistory, RiftError> {
+    ) -> Result<PathTimeline, RiftError> {
         let path = matched.file.path();
         let Self {
             repository,
@@ -539,32 +675,36 @@ impl WalkedTimelines {
         }
         // The state past the oldest walked commit: provably absent when the
         // walk covered the path's whole history, unknown - contributing no
-        // version - when the examination bound cut the walk short.
+        // edge - when the examination bound cut the walk short.
         let complete = history.is_complete();
         let boundary = if complete {
             SymbolState::Absent
         } else {
             SymbolState::Unknown
         };
-        let mut versions = Vec::with_capacity(states.len());
+        let mut edges = Vec::with_capacity(states.len());
         for (index, revision) in history.revisions().iter().enumerate() {
             let older = states.get(index + 1).unwrap_or(&boundary);
             let Some(kind) = classify(older, &states[index]) else {
                 continue;
             };
-            versions.push(SymbolVersion {
-                revision: RevisionId(revision.commit_id().to_owned()),
+            let commit = HistoryCommit {
+                revision: Revision::commit(revision.commit_id())?,
                 path: project_path(path),
-                kind,
                 timestamp: revision.timestamp().to_owned(),
                 summary: revision.summary().map(str::to_owned),
                 author: CommitAuthor {
                     name: revision.author_name().to_owned(),
                     email: revision.author_email().to_owned(),
                 },
-            });
+            };
+            edges.extend(commit_edge(kind, commit, None));
         }
-        Ok(timeline_answer(identity, versions, complete))
+        Ok(PathTimeline {
+            edges,
+            touched: Vec::new(),
+            complete,
+        })
     }
 }
 
@@ -1089,6 +1229,33 @@ mod tests {
         Ok(rift_protocol::read::SymbolId(identity.as_str().to_owned()))
     }
 
+    /// Each edge as one line: its wire tag, its change, and the path its commit names, or
+    /// the other symbol and the shared commit count of a `co_changes` edge.
+    fn edge_rows(history: &SymbolHistory) -> Vec<String> {
+        history
+            .edges
+            .iter()
+            .map(|edge| match edge {
+                HistoryEdge::IntroducedIn { commit } => format!("introduced_in {}", commit.path.0),
+                HistoryEdge::RemovedIn { commit } => format!("removed_in {}", commit.path.0),
+                HistoryEdge::ChangedIn { commit, change } => {
+                    let change = serde_json::to_value(change).unwrap_or_default();
+                    format!(
+                        "changed_in {} {}",
+                        change.as_str().unwrap_or_default(),
+                        commit.path.0
+                    )
+                }
+                HistoryEdge::RenamedFrom { commit, from } => {
+                    format!("renamed_from {} from {}", commit.path.0, from.0)
+                }
+                HistoryEdge::CoChanges { symbol, commits } => {
+                    format!("co_changes {} {commits}", symbol.as_str())
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn timelines_sharing_one_path_walk_once_and_parse_each_blob_once() -> TestResult {
         let (directory, service) = shared_path_fixture()?;
@@ -1108,14 +1275,15 @@ mod tests {
                 .map_err(|error| error.to_string())?;
             let timeline = timelines
                 .timeline(
+                    service.index(),
                     &provider,
                     matches[0],
                     timeline_identity(&service, matches[0])?,
                 )
                 .map_err(|error| error.to_string())?;
             assert_eq!(
-                timeline.versions.len(),
-                2,
+                edge_rows(&timeline),
+                ["changed_in body_changed lib.rs", "introduced_in lib.rs"],
                 "{name} grew after its introduction"
             );
         }
@@ -1191,6 +1359,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let timeline = timelines
             .timeline(
+                service.index(),
                 &RustSyntaxProvider::default(),
                 matches[0],
                 timeline_identity(service, matches[0])?,
@@ -1244,8 +1413,8 @@ mod tests {
             "a clone whose shallow file names the served commit holds none of its parents"
         );
         assert!(
-            timeline.versions.is_empty(),
-            "nothing older than the boundary is provable, so no version is classified"
+            timeline.edges.is_empty(),
+            "nothing older than the boundary is provable, so no edge is classified"
         );
         Ok(())
     }
@@ -1321,6 +1490,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let timeline = timelines
             .timeline(
+                service.index(),
                 &RustSyntaxProvider::default(),
                 matches[0],
                 timeline_identity(service, matches[0])?,
@@ -1341,11 +1511,82 @@ mod tests {
             stored_timeline(directory.path(), &service, &history, &stored, "beacon_one")?;
         let walked = beacon_timeline(directory.path(), &service, &history)?;
 
-        assert_eq!(from_store, walked);
+        let beacon_two = timeline_identity(&service, service.index().symbols("beacon_two", 1)?[0])?;
+        let commit_edges = |history: &SymbolHistory| {
+            history
+                .edges
+                .iter()
+                .filter(|edge| edge_commit(edge).is_some())
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(commit_edges(&from_store), walked.edges);
+        assert_eq!(from_store.complete, walked.complete);
         assert!(from_store.complete);
-        assert_eq!(from_store.versions.len(), 2);
-        assert_eq!(from_store.versions[0].author.name, "Rift Fixture");
+        assert_eq!(
+            edge_rows(&from_store),
+            [
+                "changed_in body_changed lib.rs".to_owned(),
+                "introduced_in lib.rs".to_owned(),
+                format!("co_changes {} 2", beacon_two.as_str()),
+            ],
+            "both commits changed both declarations, and a walk holds no store"
+        );
+        assert_eq!(walked.edges.len(), 2);
+        let author = edge_commit(&from_store.edges[0]).map(|commit| commit.author.name.as_str());
+        assert_eq!(author, Some("Rift Fixture"));
+        assert_eq!(from_store.co_changes_truncated, None);
         assert_eq!(lagged.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// A commit changing more declarations than the co-change bound ties the symbol to none
+    /// of them and is counted, while a narrow commit still ties the two it changed.
+    #[test]
+    fn a_sweeping_commit_counts_toward_no_co_change_and_is_counted() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        rift_history::fixture::init(root);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        let fillers = (0..CO_CHANGE_COMMIT_DECLARATIONS_MAX)
+            .map(|index| format!("pub fn filler_{index}() {{}}\n"))
+            .collect::<Vec<_>>()
+            .concat();
+        let source = |grown: &str| {
+            format!("pub fn beacon() {{ {grown} }}\npub fn partner() {{ {grown} }}\n{fillers}")
+        };
+        fs::write(root.join("lib.rs"), source(""))?;
+        rift_history::fixture::commit_all(root, "introduce everything");
+        fs::write(root.join("lib.rs"), source("let _grown = 1;"))?;
+        rift_history::fixture::commit_all(root, "grow beacon and partner");
+        let service = current(root)?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let store = filled_store(root, folder.path(), &history)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+
+        let timeline = stored_timeline(root, &service, &history, &stored, "beacon")?;
+
+        let partner = timeline_identity(&service, service.index().symbols("partner", 1)?[0])?;
+        assert_eq!(
+            edge_rows(&timeline),
+            [
+                "changed_in body_changed lib.rs".to_owned(),
+                "introduced_in lib.rs".to_owned(),
+                format!("co_changes {} 1", partner.as_str()),
+            ]
+        );
+        assert_eq!(
+            timeline.co_changes_truncated,
+            Some(rift_protocol::read::CoChangeTruncation {
+                commits_past_bound: 1,
+                symbols_past_bound: 0,
+            }),
+            "the introducing commit changed every declaration at once"
+        );
         Ok(())
     }
 
@@ -1393,17 +1634,9 @@ mod tests {
         else {
             return Err("the read carries the symbol's history".into());
         };
-        let kinds = history
-            .versions
-            .iter()
-            .map(|version| version.kind)
-            .collect::<Vec<_>>();
         assert_eq!(
-            kinds,
-            [
-                SymbolVersionKind::BodyChanged,
-                SymbolVersionKind::Introduced
-            ]
+            edge_rows(&history),
+            ["changed_in body_changed lib.rs", "introduced_in lib.rs"]
         );
         assert!(history.complete);
         request.id = rift_protocol::read::SymbolId("rift://symbol/local/rust/beacon/absent".into());
@@ -1414,6 +1647,36 @@ mod tests {
             ),
             "a symbol no declaration binds reads no timeline"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_stored_history_answers_commit_and_co_change_edges() -> TestResult {
+        use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+
+        let (directory, service) = shared_path_fixture()?;
+        let folder = tempfile::tempdir()?;
+        let history = HistoryConfiguration::default();
+        let store = filled_store(directory.path(), folder.path(), &history)?;
+        let (stored, _) = stored(&store, HistoryStrategy::Everything);
+        service.attach_history_store(&stored);
+        let matched = service.index().symbols("beacon_one", 1)?[0];
+        let request = GetSymbolParams {
+            id: timeline_identity(&service, matched)?,
+            include: vec![rift_protocol::read::GetSymbolInclude::History],
+            revision: None,
+            declaration_limit: 1,
+            declaration_cursor: None,
+        };
+        let GetSymbolResult::Found {
+            history: Some(history),
+            ..
+        } = service.exact_symbol(&request, true)?
+        else {
+            return Err("the read carries the stored history".into());
+        };
+        assert_eq!(history.edges.len(), 3, "two commit edges and one co-change");
+        assert!(history.complete);
         Ok(())
     }
 
@@ -1430,7 +1693,7 @@ mod tests {
         let lagging = stored_timeline(root, &service, &history, &stored_empty, "beacon_one")?;
 
         assert!(!lagging.complete, "the store holds nothing yet");
-        assert!(lagging.versions.is_empty());
+        assert!(lagging.edges.is_empty());
         assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
         drop(stored_empty);
         drop(empty);
@@ -1458,12 +1721,15 @@ mod tests {
             stored_timeline(directory.path(), &service, &history, &stored, "beacon_one")?;
 
         assert!(!timeline.complete);
-        let kinds: Vec<SymbolVersionKind> = timeline
-            .versions
-            .iter()
-            .map(|version| version.kind)
-            .collect();
-        assert_eq!(kinds, [SymbolVersionKind::BodyChanged]);
+        assert_eq!(edge_rows(&timeline)[0], "changed_in body_changed lib.rs");
+        assert_eq!(
+            timeline
+                .edges
+                .iter()
+                .filter(|edge| edge_commit(edge).is_some())
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -1489,17 +1755,12 @@ mod tests {
 
         let timeline = stored_timeline(root, &service, &history, &stored, "travelled")?;
 
-        let versions: Vec<(SymbolVersionKind, &str)> = timeline
-            .versions
-            .iter()
-            .map(|version| (version.kind, version.path.0.as_str()))
-            .collect();
         assert_eq!(
-            versions,
+            edge_rows(&timeline),
             [
-                (SymbolVersionKind::Moved, "after.rs"),
-                (SymbolVersionKind::BodyChanged, "before.rs"),
-                (SymbolVersionKind::Introduced, "before.rs"),
+                "renamed_from after.rs from before.rs",
+                "changed_in body_changed before.rs",
+                "introduced_in before.rs",
             ]
         );
         assert!(timeline.complete);
@@ -1523,12 +1784,15 @@ mod tests {
 
         let timeline = stored_timeline(root, &service, &history, &stored, "beacon_one")?;
 
-        let kinds: Vec<SymbolVersionKind> = timeline
-            .versions
-            .iter()
-            .map(|version| version.kind)
-            .collect();
-        assert_eq!(kinds, [SymbolVersionKind::BodyChanged]);
+        assert_eq!(edge_rows(&timeline)[0], "changed_in body_changed lib.rs");
+        assert_eq!(
+            timeline
+                .edges
+                .iter()
+                .filter(|edge| edge_commit(edge).is_some())
+                .count(),
+            1
+        );
         assert!(
             !timeline.complete,
             "the oldest selected release is compared with nothing"
@@ -1559,17 +1823,14 @@ mod tests {
 
         let timeline = stored_timeline(root, &service, &history, &stored, "travelled")?;
 
-        let versions: Vec<(SymbolVersionKind, &str)> = timeline
-            .versions
-            .iter()
-            .map(|version| (version.kind, version.path.0.as_str()))
-            .collect();
         assert_eq!(
-            versions,
+            edge_rows(&timeline),
             [
-                (SymbolVersionKind::Moved, "to.rs"),
-                (SymbolVersionKind::Introduced, "from.rs"),
-            ]
+                "renamed_from to.rs from from.rs",
+                "introduced_in from.rs",
+                "co_changes rift://symbol/local/rust/beacon/arrived 1",
+            ],
+            "the move introduced `arrived` beside it; the removed `stays` binds no served symbol"
         );
         assert!(timeline.complete);
         Ok(())
@@ -1645,7 +1906,7 @@ mod tests {
 
         let timeline = stored_timeline(root, &service, &history, &stored, "beacon_one")?;
 
-        assert!(timeline.versions.is_empty());
+        assert!(timeline.edges.is_empty());
         assert!(!timeline.complete, "no held release starts the timeline");
         assert_eq!(lagged.load(Ordering::SeqCst), 1, "the read asks for a fill");
         Ok(())

@@ -475,7 +475,7 @@ compared to: a revision spelled the same way, or the working tree, spelled
 
 The server lists the paths the two sides hold differently, reads and parses those paths alone on
 each side, and matches declarations within one path by the provider's qualified name and kind. A declaration both revisions hold whose bytes are equal produces no hit; one whose
-bytes differ is classified the way a [symbol timeline](#tool-get_symbol) classifies two adjacent
+bytes differ is classified the way a [symbol history](#tool-get_symbol) classifies two adjacent
 revisions, into `signature_changed`, `body_changed`, or `decorators_changed`. A declaration only
 `head` holds is `introduced`, and one only `base` holds is `removed`.
 
@@ -740,7 +740,7 @@ bounds retain the definite miss and report incomplete alternative work.
 <ReadExample name="missing-symbol" />
 
 `include` selects projections: `documentation` adds bounded referring documentation, and
-`history` adds the logical symbol's timeline. An omitted or empty `include` requests none. The
+`history` adds the logical symbol's history edges. An omitted or empty `include` requests none. The
 server refuses any other entry, `source` included, as an invalid request. A declaration's
 source is read by [`nodes`](#tool-nodes) with `symbol`.
 
@@ -756,16 +756,25 @@ indices into the symbol's signatures, types, and documentation.
 
 <ReadExample name="multi-declaration-next" />
 
-`history` follows the revisions held by the [history store](/docs/developer/architecture#history)
-from the served revision. It records `introduced`, `body_changed`, `signature_changed`,
-`moved`, `removed`, and `decorators_changed`. A revision whose source cannot be parsed,
-or where the symbol is absent, contributes no version. Commit author name and email remain
-the commit's author; timestamps remain committer time. An unchanged file rename or unchanged
-declaration move records `moved` and follows the previous path.
+`history` follows the commits held by the [history store](/docs/developer/architecture#history)
+from the served revision and answers edges from the symbol. The commit edges come newest first:
+`introduced_in`, `changed_in` with a `change` of `signature_changed`, `body_changed`, or
+`decorators_changed`, `renamed_from` with the `from` path an unchanged file rename or unchanged
+declaration move came from, and `removed_in`. Each names its commit as a
+`rift://revision/git/<commit>` revision and the path the declaration lived at in it. A commit
+whose source cannot be parsed, or where the symbol is absent, contributes no edge. Commit author
+name and email remain the commit's author; timestamps remain committer time.
+
+The `co_changes` edges follow the commit edges, most shared commits first, then by symbol. Each
+names a symbol the served tree binds to a declaration one of the listed commits changed, and the
+number of listed commits that changed both. A commit that changed more than 256 declarations
+counts toward no co-change edge, and the server answers at most 32 of them;
+`co_changes_truncated` counts the commits and symbols past those bounds and is absent when they
+left out nothing.
 
 `complete: false` means history depth, a shallow clone, the oldest selected release, or a store
-still filling ended the timeline before the repository's first commit. When the store did not
-open, the server walks Git per request instead.
+still filling ended the history before the repository's first commit. When the store did not
+open, the server walks Git per request instead, and that history carries no `co_changes` edge.
 
 ### Symbol ownership [#get_symbol-scope]
 

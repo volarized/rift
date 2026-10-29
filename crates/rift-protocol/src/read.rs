@@ -476,28 +476,38 @@ fn default_get_symbol_params_page_index() -> u64 {
                 },
                 "history": {
                     "symbol": "rift://symbol/local/rust/app/config/load_config",
-                    "versions": [
+                    "edges": [
                         {
-                            "revision": "1f2080e49da12fee4431e6872630509355cd62d1",
-                            "path": "src/config.rs",
-                            "kind": "signature_changed",
-                            "timestamp": "2026-08-21T14:03:22+00:00",
-                            "summary": "Return ConfigError from load_config",
-                            "author": {
-                                "name": "Alice",
-                                "email": "alice@example.com"
+                            "edge": "changed_in",
+                            "commit": {
+                                "revision": "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1",
+                                "path": "src/config.rs",
+                                "timestamp": "2026-08-21T14:03:22+00:00",
+                                "summary": "Return ConfigError from load_config",
+                                "author": {
+                                    "name": "Alice",
+                                    "email": "alice@example.com"
+                                }
+                            },
+                            "change": "signature_changed"
+                        },
+                        {
+                            "edge": "introduced_in",
+                            "commit": {
+                                "revision": "rift://revision/git/8259026556ceae156a29adb53178c842ca32c4a2",
+                                "path": "src/config.rs",
+                                "timestamp": "2026-08-17T09:41:05+00:00",
+                                "summary": "Add workspace configuration loading",
+                                "author": {
+                                    "name": "Alice",
+                                    "email": "alice@example.com"
+                                }
                             }
                         },
                         {
-                            "revision": "8259026556ceae156a29adb53178c842ca32c4a2",
-                            "path": "src/config.rs",
-                            "kind": "introduced",
-                            "timestamp": "2026-08-17T09:41:05+00:00",
-                            "summary": "Add workspace configuration loading",
-                            "author": {
-                                "name": "Alice",
-                                "email": "alice@example.com"
-                            }
+                            "edge": "co_changes",
+                            "symbol": "rift://symbol/local/rust/app/config/Config",
+                            "commits": 2
                         }
                     ],
                     "complete": true
@@ -2606,23 +2616,123 @@ pub enum SymbolFacet {
     Generator,
 }
 
-/// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The timeline follows first parents from the served revision, or the selected
-/// releases in version order, through the revisions the history store holds, and follows
-/// the declaration's file across a rename that kept its bytes. It is bounded by
+/// Most declarations one commit may change and still count toward co-change edges. A commit
+/// changing more of them, such as a sweeping rename, counts toward none, and
+/// [`CoChangeTruncation::commits_past_bound`] counts it.
+pub const CO_CHANGE_COMMIT_DECLARATIONS_MAX: usize = 256;
+
+/// Most `co_changes` edges one symbol history answers. The symbols changed in the most shared
+/// commits come first; [`CoChangeTruncation::symbols_past_bound`] counts the rest.
+pub const CO_CHANGE_SYMBOLS_MAX: usize = 32;
+
+/// One symbol's history as edges from the symbol to the commits that touched it and to the
+/// symbols changed beside it. The history follows first parents from the served revision,
+/// or the selected releases in version order, through the commits the history store holds,
+/// and follows the declaration's file across a rename that kept its bytes. It is bounded by
 /// `[providers.history] max_revisions` and by a shallow clone's boundary.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
-    /// The symbol the timeline is for.
+    /// The symbol the history is for.
     pub symbol: SymbolId,
-    /// Revisions that touched the symbol, newest first.
-    pub versions: Vec<SymbolVersion>,
-    /// Whether the timeline reached the repository's first commit. `false` when the
+    /// The commit edges newest first, then the `co_changes` edges, most shared commits
+    /// first.
+    pub edges: Vec<HistoryEdge>,
+    /// Whether the history reached the repository's first commit. `false` when the
     /// `max_revisions` bound, a shallow clone's boundary, or the oldest selected release
     /// ended it first, or while the history store has not yet analyzed the served
-    /// revision, so revisions older than the listed ones may have touched the symbol.
+    /// revision, so commits older than the listed ones may have touched the symbol.
     pub complete: bool,
+    /// The co-change edges the co-change bounds left out. Absent when they left out none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub co_changes_truncated: Option<CoChangeTruncation>,
+}
+
+/// One edge from a symbol in its history. Every commit edge names the commit as a
+/// `rift://revision/git/<commit>` revision.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "edge", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryEdge {
+    /// The commit brought the symbol into existence.
+    IntroducedIn {
+        /// The commit and where the declaration lived in it.
+        commit: HistoryCommit,
+    },
+    /// The commit changed the symbol's declaration in place.
+    ChangedIn {
+        /// The commit and where the declaration lived in it.
+        commit: HistoryCommit,
+        /// Which part of the declaration the commit changed.
+        change: HistoryChange,
+    },
+    /// The commit deleted the symbol's declaration.
+    RemovedIn {
+        /// The commit and where the declaration lived before it.
+        commit: HistoryCommit,
+    },
+    /// The commit moved the symbol's declaration, unchanged, from another path: the file
+    /// moved with its bytes kept, or the declaration moved into another file. The
+    /// declaration at `from` under the same qualified name is the symbol it was renamed
+    /// from.
+    RenamedFrom {
+        /// The commit and the path it moved the declaration to.
+        commit: HistoryCommit,
+        /// The path the declaration lived at before the commit.
+        from: ProjectPath,
+    },
+    /// The symbol and `symbol` changed in the same commits, counted over the commits the
+    /// history lists.
+    CoChanges {
+        /// The other symbol, as the served tree identifies it.
+        symbol: SymbolId,
+        /// How many listed commits changed both symbols.
+        commits: u64,
+    },
+}
+
+/// One commit a history edge names, with where the symbol's declaration lived in it.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryCommit {
+    /// The commit, as `rift://revision/git/<commit>`.
+    pub revision: crate::revision::Revision,
+    /// Where the declaration lived at that commit.
+    pub path: ProjectPath,
+    /// When the commit was committed, as RFC 3339 date-time carrying the recorded offset:
+    /// the committer time, not the author time.
+    #[schemars(length(max = 64))]
+    pub timestamp: String,
+    /// The commit's own first summary line, where the version control records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(max = 4096))]
+    pub summary: Option<String>,
+    /// Who authored the commit, as the version control records it.
+    pub author: CommitAuthor,
+}
+
+/// Which part of a declaration a `changed_in` commit changed.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryChange {
+    /// The commit changed the declared interface.
+    SignatureChanged,
+    /// The commit changed the implementation without touching the signature.
+    BodyChanged,
+    /// The commit changed the annotations on the declaration.
+    DecoratorsChanged,
+}
+
+/// The co-change edges a symbol history left out, counted per bound.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CoChangeTruncation {
+    /// Listed commits that changed too many declarations to count toward any co-change
+    /// edge.
+    pub commits_past_bound: u64,
+    /// Co-changed symbols past the most `co_changes` edges one history answers.
+    pub symbols_past_bound: u64,
 }
 
 /// Canonical logical symbol identity with local, profile, registered local, package or runtime ownership.
@@ -2722,30 +2832,6 @@ impl SymbolOrigin {
     fn is_common_default(&self) -> bool {
         self == &default_symbol_origin()
     }
-}
-
-/// One revision that touched a symbol. The history provider parses the declaration at each
-/// first-parent revision that changed its file and classifies adjacent states; a revision
-/// whose source cannot be parsed contributes no version.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SymbolVersion {
-    /// The revision that touched the symbol.
-    pub revision: RevisionId,
-    /// Where the declaration lived at that revision.
-    pub path: ProjectPath,
-    /// How the revision changed the symbol.
-    pub kind: SymbolVersionKind,
-    /// When the revision was committed, as RFC 3339 date-time carrying the recorded offset:
-    /// the committer time, not the author time.
-    #[schemars(length(max = 64))]
-    pub timestamp: String,
-    /// The revision's own first summary line, where the version control records one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 4096))]
-    pub summary: Option<String>,
-    /// Who authored the revision, as the version control records it.
-    pub author: CommitAuthor,
 }
 
 /// The author one revision records, as committed: no `.mailmap` rewrites the name or the

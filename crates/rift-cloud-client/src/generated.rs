@@ -3405,23 +3405,136 @@ pub struct SymbolDeclaration {
     /// Entries in the result symbol's documentation array supplied by this declaration.
     pub documentation_indices: Vec<u64>,
 }
-/// One symbol's timeline across the workspace's version-control history, newest revision
-/// first. The timeline follows first parents from the served revision, or the selected
-/// releases in version order, through the revisions the history store holds, and follows
-/// the declaration's file across a rename that kept its bytes. It is bounded by
+/// One symbol's history as edges from the symbol to the commits that touched it and to the
+/// symbols changed beside it. The history follows first parents from the served revision,
+/// or the selected releases in version order, through the commits the history store holds,
+/// and follows the declaration's file across a rename that kept its bytes. It is bounded by
 /// `[providers.history] max_revisions` and by a shallow clone's boundary.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct SymbolHistory {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub symbol: String,
-    /// Revisions that touched the symbol, newest first.
-    pub versions: Vec<SymbolVersion>,
-    /// Whether the timeline reached the repository's first commit. `false` when the
+    /// The commit edges newest first, then the `co_changes` edges, most shared commits
+    /// first.
+    pub edges: Vec<HistoryEdge>,
+    /// Whether the history reached the repository's first commit. `false` when the
     /// `max_revisions` bound, a shallow clone's boundary, or the oldest selected release
     /// ended it first, or while the history store has not yet analyzed the served
-    /// revision, so revisions older than the listed ones may have touched the symbol.
+    /// revision, so commits older than the listed ones may have touched the symbol.
     pub complete: bool,
+    /// The co-change edges a symbol history left out, counted per bound.
+    pub co_changes_truncated: Option<CoChangeTruncation>,
+}
+/// One edge from a symbol in its history. Every commit edge names the commit as a
+/// `rift://revision/git/<commit>` revision.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(untagged)]
+pub enum HistoryEdge {
+    /// The commit brought the symbol into existence.
+    #[default]
+    HistoryCommit(HistoryEdgeHistoryCommit),
+    /// The commit changed the symbol's declaration in place.
+    Object(HistoryEdgeObject),
+    /// The commit deleted the symbol's declaration.
+    HistoryCommit2(HistoryEdgeHistoryCommit2),
+    /// The commit moved the symbol's declaration, unchanged, from another path: the file
+    /// moved with its bytes kept, or the declaration moved into another file. The
+    /// declaration at `from` under the same qualified name is the symbol it was renamed
+    /// from.
+    Object2(HistoryEdgeObject2),
+    /// The symbol and `symbol` changed in the same commits, counted over the commits the
+    /// history lists.
+    SymbolId(HistoryEdgeSymbolId),
+}
+impl HistoryEdge {
+    /// The commit brought the symbol into existence.
+    pub fn commit(commit: HistoryCommit) -> Self {
+        Self::HistoryCommit(HistoryEdgeHistoryCommit {
+            commit,
+            ..Default::default()
+        })
+    }
+    /// The commit deleted the symbol's declaration.
+    pub fn commit2(commit: HistoryCommit) -> Self {
+        Self::HistoryCommit2(HistoryEdgeHistoryCommit2 {
+            commit,
+            ..Default::default()
+        })
+    }
+}
+/// One commit a history edge names, with where the symbol's declaration lived in it.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct HistoryCommit {
+    /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
+    pub revision: String,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    pub path: String,
+    /// When the commit was committed, as RFC 3339 date-time carrying the recorded offset:
+    /// the committer time, not the author time.
+    pub timestamp: String,
+    /// The commit's own first summary line, where the version control records one.
+    pub summary: Option<String>,
+    /// The author one revision records, as committed: no `.mailmap` rewrites the name or the
+    /// address.
+    pub author: CommitAuthor,
+}
+/// Which part of a declaration a `changed_in` commit changed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, oas3_gen_support::Default)]
+pub enum HistoryChange {
+    /// The commit changed the declared interface.
+    #[default]
+    SignatureChanged,
+    /// The commit changed the implementation without touching the signature.
+    BodyChanged,
+    /// The commit changed the annotations on the declaration.
+    DecoratorsChanged,
+}
+impl core::fmt::Display for HistoryChange {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::SignatureChanged => write!(f, "signature_changed"),
+            Self::BodyChanged => write!(f, "body_changed"),
+            Self::DecoratorsChanged => write!(f, "decorators_changed"),
+        }
+    }
+}
+impl<'de> serde::Deserialize<'de> for HistoryChange {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "signature_changed" => Ok(HistoryChange::SignatureChanged),
+            "body_changed" => Ok(HistoryChange::BodyChanged),
+            "decorators_changed" => Ok(HistoryChange::DecoratorsChanged),
+            _ => {
+                Err(
+                    serde::de::Error::unknown_variant(
+                        &s,
+                        &["signature_changed", "body_changed", "decorators_changed"],
+                    ),
+                )
+            }
+        }
+    }
+}
+/// The co-change edges a symbol history left out, counted per bound.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields)]
+pub struct CoChangeTruncation {
+    /// Listed commits that changed too many declarations to count toward any co-change
+    /// edge.
+    pub commits_past_bound: u64,
+    /// Co-changed symbols past the most `co_changes` edges one history answers.
+    pub symbols_past_bound: u64,
 }
 /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
 pub type SymbolIdentity = String;
@@ -3565,36 +3678,6 @@ impl<'de> serde::Deserialize<'de> for SymbolUnavailableReason {
             }
         }
     }
-}
-/// One revision that touched a symbol. The history provider parses the declaration at each
-/// first-parent revision that changed its file and classifies adjacent states; a revision
-/// whose source cannot be parsed contributes no version.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(deny_unknown_fields)]
-pub struct SymbolVersion {
-    /// Identity of one revision in the workspace's version-control history, spelled the way the
-    /// version-control system spells it: a branch, tag, or commit id, optionally followed by
-    /// ancestry suffixes, such as `HEAD~2` for the second first-parent ancestor or `main^2` for
-    /// the second parent. Rift carries it opaquely and never orders two revisions by comparing
-    /// their identifiers.
-    pub revision: String,
-    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
-    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
-    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
-    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
-    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
-    /// fails the read that touches them with `content_unavailable`.
-    pub path: String,
-    /// What the revision did to the symbol.
-    pub kind: SymbolVersionKind,
-    /// When the revision was committed, as RFC 3339 date-time carrying the recorded offset:
-    /// the committer time, not the author time.
-    pub timestamp: String,
-    /// The revision's own first summary line, where the version control records one.
-    pub summary: Option<String>,
-    /// The author one revision records, as committed: no `.mailmap` rewrites the name or the
-    /// address.
-    pub author: CommitAuthor,
 }
 /// What the revision did to the symbol.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
@@ -5512,10 +5595,10 @@ pub struct GetSymbolResultObject {
     pub declarations: Vec<SymbolDeclaration>,
     /// Continuation for the remaining declarations at `revision`.
     pub declaration_cursor: Option<String>,
-    /// One symbol's timeline across the workspace's version-control history, newest revision
-    /// first. The timeline follows first parents from the served revision, or the selected
-    /// releases in version order, through the revisions the history store holds, and follows
-    /// the declaration's file across a rename that kept its bytes. It is bounded by
+    /// One symbol's history as edges from the symbol to the commits that touched it and to the
+    /// symbols changed beside it. The history follows first parents from the served revision,
+    /// or the selected releases in version order, through the commits the history store holds,
+    /// and follows the declaration's file across a rename that kept its bytes. It is bounded by
     /// `[providers.history] max_revisions` and by a shallow clone's boundary.
     pub history: Option<SymbolHistory>,
     /// Bounded documentation context requested for one exact declaration.
@@ -5552,5 +5635,65 @@ pub struct GetSymbolResultObject3 {
     pub warnings: Option<Vec<ReadWarning>>,
     #[default("unavailable".to_string())]
     pub outcome: String,
+}
+/// The commit brought the symbol into existence.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeHistoryCommit {
+    #[default("introduced_in".to_string())]
+    pub edge: String,
+    /// One commit a history edge names, with where the symbol's declaration lived in it.
+    pub commit: HistoryCommit,
+}
+/// The commit changed the symbol's declaration in place.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeObject {
+    #[default("changed_in".to_string())]
+    pub edge: String,
+    /// One commit a history edge names, with where the symbol's declaration lived in it.
+    pub commit: HistoryCommit,
+    /// Which part of a declaration a `changed_in` commit changed.
+    pub change: HistoryChange,
+}
+/// The commit deleted the symbol's declaration.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeHistoryCommit2 {
+    #[default("removed_in".to_string())]
+    pub edge: String,
+    /// One commit a history edge names, with where the symbol's declaration lived in it.
+    pub commit: HistoryCommit,
+}
+/// The commit moved the symbol's declaration, unchanged, from another path: the file
+/// moved with its bytes kept, or the declaration moved into another file. The
+/// declaration at `from` under the same qualified name is the symbol it was renamed
+/// from.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeObject2 {
+    #[default("renamed_from".to_string())]
+    pub edge: String,
+    /// One commit a history edge names, with where the symbol's declaration lived in it.
+    pub commit: HistoryCommit,
+    /// One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift
+    /// normalizes what it emits and what it accepts, and compares byte-for-byte. The empty path
+    /// names the root itself. Absolute paths, backslashes, control characters, empty segments,
+    /// and `.` or `..` segments are refused before the filesystem is touched. The limit is 1000
+    /// UTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal
+    /// fails the read that touches them with `content_unavailable`.
+    pub from: String,
+}
+/// The symbol and `symbol` changed in the same commits, counted over the commits the
+/// history lists.
+#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryEdgeSymbolId {
+    #[default("co_changes".to_string())]
+    pub edge: String,
+    /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
+    pub symbol: String,
+    /// How many listed commits changed both symbols.
+    pub commits: u64,
 }
 

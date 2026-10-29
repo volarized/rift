@@ -149,7 +149,7 @@ impl ReadService {
         }
         let mut timelines = self.symbol_timelines()?;
         timelines
-            .symbol_timeline(&bindings, request.id.clone())
+            .symbol_timeline(&self.index, &bindings, request.id.clone())
             .map(Some)
     }
 }

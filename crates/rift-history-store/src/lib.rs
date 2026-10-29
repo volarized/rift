@@ -22,6 +22,7 @@
 //! from.
 
 mod database;
+pub mod edges;
 mod lock;
 mod record;
 mod store;

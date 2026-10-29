@@ -8364,7 +8364,7 @@ done
             !lagging.complete,
             "the store holds nothing while the task is held"
         );
-        assert!(lagging.versions.is_empty());
+        assert!(lagging.edges.is_empty());
         assert!(!searched.results.is_empty(), "{searched:#?}");
 
         held.release();
@@ -8379,9 +8379,11 @@ done
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        let kinds: Vec<_> = filled.versions.iter().map(|version| version.kind).collect();
-        assert_eq!(kinds, [rift_protocol::read::SymbolVersionKind::Introduced]);
-        assert_eq!(filled.versions[0].author.name, "Rift Fixture");
+        let [rift_protocol::read::HistoryEdge::IntroducedIn { commit }] = filled.edges.as_slice()
+        else {
+            return Err(format!("one introduction expected: {:?}", filled.edges).into());
+        };
+        assert_eq!(commit.author.name, "Rift Fixture");
         Ok(())
     }
 

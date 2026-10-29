@@ -5,11 +5,13 @@ use rift_protocol::error::{
 };
 use rift_protocol::read::{
     CommitAuthor, DiagnosticContext, Digest, Documentation, DocumentationFormat, ExactKind,
-    Extensions, GetSymbolHit, GetSymbolResult, Language, Node, NodeFacet, NodeRegion, NodesResult,
-    PackageIdentity, Pagination, ProjectPath, ReadWarning, RegionRole, RelationshipFacet,
-    RevisionId, Signature, SourceKind, SourceLocationKind, SourceUnitId, Symbol, SymbolFacet,
-    SymbolHistory, SymbolId, SymbolOrigin, SymbolVersion, SymbolVersionKind, TextRange,
+    Extensions, GetSymbolHit, GetSymbolResult, HistoryChange, HistoryCommit, HistoryEdge, Language,
+    Node, NodeFacet, NodeRegion, NodesResult, PackageIdentity, Pagination, ProjectPath,
+    ReadWarning, RegionRole, RelationshipFacet, RevisionId, Signature, SourceKind,
+    SourceLocationKind, SourceUnitId, Symbol, SymbolFacet, SymbolHistory, SymbolId, SymbolOrigin,
+    SymbolVersionKind, TextRange,
 };
+use rift_protocol::revision::Revision;
 use rift_protocol::search::{
     CommitHit, GraphHop, MatchedField, SearchHit, SearchHitTarget, SearchResult, SymbolChange,
 };
@@ -3067,10 +3069,11 @@ fn the_owner_get_symbol_example_with_documentation_and_history() {
             "\tLoads the workspace configuration from `rift.toml`.",
             "",
             "\thistory:",
-            "\t\t2026-08-21 · 1f2080e4 · signature changed · Alice <alice@example.com>",
+            "\t\t2026-08-21 · 1f2080e4 · changed in · signature changed · Alice <alice@example.com>",
             "\t\t\tReturn ConfigError from load_config",
-            "\t\t2026-08-17 · 82590265 · introduced · Alice <alice@example.com>",
+            "\t\t2026-08-17 · 82590265 · introduced in · Alice <alice@example.com>",
             "\t\t\tAdd workspace configuration loading",
+            "\t\tco changes · rift://symbol/local/rust/app/config/Config · 2 commits",
         ],
     );
 }
@@ -3326,13 +3329,18 @@ fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     let guide = documentation_hit_at("docs/guide.md", 2, &["Step 1: Install", "a · b"], None);
     let mut hit = symbol_hit();
     hit.documentation = Some(context(&json!([reference(&guide, None)]), false));
-    let mut moved = version("aaaaaaaa11", "src/a · b.rs", SymbolVersionKind::Moved, None);
+    let mut moved = history_commit("aaaaaaaa11", "src/a · b.rs", None);
     moved.author = CommitAuthor {
         name: "Ops: \"bot\" \\ team".to_owned(),
         email: "ops@example.com".to_owned(),
     };
-    let mut odd_time = version("bbbbbbbb22", "a.rs", SymbolVersionKind::Introduced, None);
+    let moved = HistoryEdge::RenamedFrom {
+        commit: moved,
+        from: project_path("old: a.rs"),
+    };
+    let mut odd_time = history_commit("bbbbbbbb22", "a.rs", None);
     odd_time.timestamp = "day 1: noon".to_owned();
+    let odd_time = HistoryEdge::IntroducedIn { commit: odd_time };
     hit.history = Some(history(vec![moved, odd_time], true));
     golden(
         &symbol_result(vec![hit], pagination(0, 1)),
@@ -3346,8 +3354,8 @@ fn a_get_symbol_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "\t\tdocs/guide.md:2 · \"Step 1: Install > a · b\"",
             "",
             "\thistory:",
-            "\t\t2026-08-21 · aaaaaaaa · moved · \"Ops: \\\"bot\\\" \\\\ team <ops@example.com>\" · \"src/a · b.rs\"",
-            "\t\t\"day 1: noon\" · bbbbbbbb · introduced · Alice <alice@example.com>",
+            "\t\t2026-08-21 · aaaaaaaa · renamed from · \"old: a.rs\" · \"Ops: \\\"bot\\\" \\\\ team <ops@example.com>\" · \"src/a · b.rs\"",
+            "\t\t\"day 1: noon\" · bbbbbbbb · introduced in · Alice <alice@example.com>",
         ],
     );
 }
@@ -3449,32 +3457,54 @@ fn a_workspace_value_holding_a_delimiter_is_quoted_and_others_stay_bare() {
     );
 }
 
-fn version(
-    revision: &str,
-    path: &str,
-    kind: SymbolVersionKind,
-    summary: Option<&str>,
-) -> SymbolVersion {
-    SymbolVersion {
-        revision: RevisionId(revision.to_owned()),
+/// One history commit at the full commit id `revision` pads with zeros.
+fn history_commit(revision: &str, path: &str, summary: Option<&str>) -> HistoryCommit {
+    HistoryCommit {
+        revision: Revision::commit(&format!("{revision:0<40}")).expect("a hex commit id"),
         path: project_path(path),
-        kind,
         timestamp: "2026-08-21T14:03:22+00:00".to_owned(),
         summary: summary.map(str::to_owned),
         author: author(),
     }
 }
 
-fn history(versions: Vec<SymbolVersion>, complete: bool) -> SymbolHistory {
+/// The commit edge `kind` names at one history commit; a `moved` declaration came from
+/// `old.rs`.
+fn version(
+    revision: &str,
+    path: &str,
+    kind: SymbolVersionKind,
+    summary: Option<&str>,
+) -> HistoryEdge {
+    let commit = history_commit(revision, path, summary);
+    let changed = |change| HistoryEdge::ChangedIn {
+        commit: commit.clone(),
+        change,
+    };
+    match kind {
+        SymbolVersionKind::Introduced => HistoryEdge::IntroducedIn { commit },
+        SymbolVersionKind::Removed => HistoryEdge::RemovedIn { commit },
+        SymbolVersionKind::Moved => HistoryEdge::RenamedFrom {
+            commit,
+            from: project_path("old.rs"),
+        },
+        SymbolVersionKind::BodyChanged => changed(HistoryChange::BodyChanged),
+        SymbolVersionKind::SignatureChanged => changed(HistoryChange::SignatureChanged),
+        SymbolVersionKind::DecoratorsChanged => changed(HistoryChange::DecoratorsChanged),
+    }
+}
+
+fn history(edges: Vec<HistoryEdge>, complete: bool) -> SymbolHistory {
     SymbolHistory {
         symbol: SymbolId(A_ID.to_owned()),
-        versions,
+        edges,
         complete,
+        co_changes_truncated: None,
     }
 }
 
 #[test]
-fn history_lists_versions_and_marks_an_incomplete_timeline() {
+fn history_lists_edges_and_marks_an_incomplete_history() {
     let mut complete = symbol_hit();
     complete.history = Some(history(
         vec![
@@ -3484,7 +3514,7 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
                 SymbolVersionKind::BodyChanged,
                 Some("Fix\nit"),
             ),
-            version("HEAD~2", "a.rs", SymbolVersionKind::Introduced, None),
+            version("2b", "a.rs", SymbolVersionKind::Introduced, None),
         ],
         true,
     ));
@@ -3499,9 +3529,9 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
             "\t\trift://symbol/local/rust/app/a/A",
             "",
             "\t\thistory:",
-            "\t\t\t2026-08-21 · 1f2080e4 · body changed · Alice <alice@example.com>",
+            "\t\t\t2026-08-21 · 1f2080e4 · changed in · body changed · Alice <alice@example.com>",
             "\t\t\t\tFix\\nit",
-            "\t\t\t2026-08-21 · HEAD~2 · introduced · Alice <alice@example.com>",
+            "\t\t\t2026-08-21 · 2b000000 · introduced in · Alice <alice@example.com>",
             "\t[2] struct A",
             "\t\ta.rs:1",
             "\t\trift://symbol/local/rust/app/a/A",
@@ -3512,7 +3542,37 @@ fn history_lists_versions_and_marks_an_incomplete_timeline() {
 }
 
 #[test]
-fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
+fn a_truncated_co_change_count_writes_one_line_after_the_edges() {
+    let mut hit = symbol_hit();
+    let mut truncated = history(
+        vec![HistoryEdge::CoChanges {
+            symbol: SymbolId("rift://symbol/local/rust/app/b/B".to_owned()),
+            commits: 3,
+        }],
+        true,
+    );
+    truncated.co_changes_truncated = Some(rift_protocol::read::CoChangeTruncation {
+        commits_past_bound: 1,
+        symbols_past_bound: 4,
+    });
+    hit.history = Some(truncated);
+    golden(
+        &symbol_result(vec![hit], pagination(0, 1)),
+        &[
+            "1 result",
+            "\tstruct A",
+            "\ta.rs:1",
+            "\trift://symbol/local/rust/app/a/A",
+            "",
+            "\thistory:",
+            "\t\tco changes · rift://symbol/local/rust/app/b/B · 3 commits",
+            "\t\tco-changes truncated: 1 commits past bound, 4 symbols past bound",
+        ],
+    );
+}
+
+#[test]
+fn a_commit_edge_names_its_path_only_when_it_differs_from_the_hit() {
     let mut hit = symbol_hit();
     hit.history = Some(history(
         vec![
@@ -3536,15 +3596,15 @@ fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
     let output = rendered(&symbol_result(vec![hit, dependency], pagination(0, 1)));
     assert_no_trailing_space(&output);
     assert!(
-        output.contains("aaaaaaaa · moved · Alice <alice@example.com> · b/a.rs\n"),
+        output.contains("aaaaaaaa · renamed from · old.rs · Alice <alice@example.com> · b/a.rs\n"),
         "{output}"
     );
     assert!(
-        output.contains("bbbbbbbb · introduced · Alice <alice@example.com>\n"),
+        output.contains("bbbbbbbb · introduced in · Alice <alice@example.com>\n"),
         "{output}"
     );
     assert!(
-        output.contains("cccccccc · removed · Alice <alice@example.com> · a.rs\n"),
+        output.contains("cccccccc · removed in · Alice <alice@example.com> · a.rs\n"),
         "{output}"
     );
 }
@@ -3580,7 +3640,7 @@ fn sections_come_in_order_documentation_text_context_history() {
             "\t\tdocs/guide.md:2 · Guide",
             "",
             "\thistory:",
-            "\t\t2026-08-21 · 1f2080e4 · introduced · Alice <alice@example.com>",
+            "\t\t2026-08-21 · 1f2080e4 · introduced in · Alice <alice@example.com>",
         ])
     );
 }

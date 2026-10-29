@@ -1382,7 +1382,7 @@ impl ReadService {
         let mut disagreements = Vec::new();
         for (matched, assembled) in window {
             let (mut hit, disagreement) =
-                Self::project_hit(matched, assembled, timelines.as_mut())?;
+                Self::project_hit(&self.index, matched, assembled, timelines.as_mut())?;
             disagreements.extend(disagreement);
             if include_documentation && let Some(symbol) = &hit.symbol.id {
                 hit.documentation = Some(rift_index::documentation_context_with_budget(
@@ -1467,6 +1467,7 @@ impl ReadService {
     /// One `get_symbol` hit from the project index, with the `symbol_disagreement`
     /// warning its assembly raised.
     fn project_hit(
+        index: &WorkspaceIndex,
         matched: SymbolMatch<'_>,
         assembled: (Symbol, Option<ReadWarning>),
         timelines: Option<&mut SymbolTimelines>,
@@ -1474,6 +1475,7 @@ impl ReadService {
         let (symbol, disagreement) = assembled;
         let history = match (timelines, symbol.id.as_ref()) {
             (Some(timelines), Some(identity)) => Some(timelines.timeline(
+                index,
                 language_provider(matched.file.syntax().language()),
                 matched,
                 identity.clone(),
@@ -3464,6 +3466,20 @@ pub fn compute() -> i32 {
         Ok(directory)
     }
 
+    /// Each wire history edge as its `edge` tag, followed by its `change` when it has one.
+    fn edge_labels(edges: &[serde_json::Value]) -> Vec<String> {
+        edges
+            .iter()
+            .map(|edge| {
+                let tag = edge["edge"].as_str().unwrap_or_default();
+                match edge["change"].as_str() {
+                    Some(change) => format!("{tag} {change}"),
+                    None => tag.to_owned(),
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn symbol_history_lists_the_committed_timeline_newest_first() -> TestResult {
         let directory = timeline_fixture()?;
@@ -3482,25 +3498,22 @@ pub fn compute() -> i32 {
             history["symbol"],
             json!(local_identity("rust", &["beacon", "beacon"]))
         );
-        let versions = history["versions"]
+        let edges = history["edges"]
             .as_array()
-            .ok_or("history must carry versions")?;
-        let kinds: Vec<&str> = versions
-            .iter()
-            .filter_map(|version| version["kind"].as_str())
-            .collect();
+            .ok_or("history must carry edges")?;
+        let kinds = edge_labels(edges);
         assert_eq!(
             kinds,
             [
-                "decorators_changed",
-                "signature_changed",
-                "body_changed",
-                "introduced"
+                "changed_in decorators_changed",
+                "changed_in signature_changed",
+                "changed_in body_changed",
+                "introduced_in"
             ]
         );
-        let summaries: Vec<&str> = versions
+        let summaries: Vec<&str> = edges
             .iter()
-            .filter_map(|version| version["summary"].as_str())
+            .filter_map(|edge| edge["commit"]["summary"].as_str())
             .collect();
         assert_eq!(
             summaries,
@@ -3511,13 +3524,17 @@ pub fn compute() -> i32 {
                 "introduce beacon"
             ]
         );
-        for version in versions {
-            assert_eq!(version["path"], json!("src/lib.rs"));
-            assert_eq!(version["timestamp"], json!("2026-01-01T00:00:00+00:00"));
+        for edge in edges {
+            let commit = &edge["commit"];
+            assert_eq!(commit["path"], json!("src/lib.rs"));
+            assert_eq!(commit["timestamp"], json!("2026-01-01T00:00:00+00:00"));
             assert_eq!(
-                version["revision"].as_str().map(str::len),
+                commit["revision"]
+                    .as_str()
+                    .and_then(|revision| revision.strip_prefix("rift://revision/git/"))
+                    .map(str::len),
                 Some(40),
-                "a served revision is the full hex commit id"
+                "a commit edge names the full hex commit id as a git revision"
             );
         }
         Ok(())
@@ -3531,16 +3548,12 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams =
             serde_json::from_value(json!({"name": "beacon", "include": ["history"]}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
-        let versions = value["hits"][0]["history"]["versions"]
+        let edges = value["hits"][0]["history"]["edges"]
             .as_array()
-            .ok_or("history must carry versions")?;
-        let kinds: Vec<&str> = versions
-            .iter()
-            .filter_map(|version| version["kind"].as_str())
-            .collect();
+            .ok_or("history must carry edges")?;
         assert_eq!(
-            kinds,
-            ["body_changed", "introduced"],
+            edge_labels(edges),
+            ["changed_in body_changed", "introduced_in"],
             "the walk starts at the addressed commit, not the branch head"
         );
         Ok(())
@@ -4681,17 +4694,14 @@ pub fn compute() -> i32 {
             history["symbol"],
             json!(local_identity("typescript", &["beacon", "lookup"]))
         );
-        let versions = history["versions"]
+        let edges = history["edges"]
             .as_array()
-            .ok_or("history must carry versions")?;
-        let kinds: Vec<&str> = versions
+            .ok_or("history must carry edges")?;
+        let kinds = edge_labels(edges);
+        assert_eq!(kinds, ["changed_in body_changed", "introduced_in"]);
+        let summaries: Vec<&str> = edges
             .iter()
-            .filter_map(|version| version["kind"].as_str())
-            .collect();
-        assert_eq!(kinds, ["body_changed", "introduced"]);
-        let summaries: Vec<&str> = versions
-            .iter()
-            .filter_map(|version| version["summary"].as_str())
+            .filter_map(|edge| edge["commit"]["summary"].as_str())
             .collect();
         assert_eq!(summaries, ["grow lookup body", "introduce lookup"]);
         Ok(())
