@@ -1,20 +1,17 @@
 use std::time::Duration;
 
 use rift_error::{ErrorSlug, RiftError, errors};
-use rift_protocol::read::{Language, NodeId, SourceUnitId, SymbolId, TextRange};
+use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
 
 use super::{
     GraphAnswer, GraphDataset, GraphDatasetBuilder, GraphFact, GraphLimits, GraphQuery, GraphTerm,
-    HistoryEvent, NodeFact, NodeLocation, QueryCancellation, RevisionIri, SymbolRelation,
+    HistoryEvent, NodeAddress, NodeFact, NodeLocation, QueryCancellation, RevisionIri,
+    SymbolRelation,
 };
 
 const MAIN: &str = "rift://symbol/local/rust/app/main";
 const PARSE: &str = "rift://symbol/local/rust/app/parser/parse";
 const LOAD: &str = "rift://symbol/local/rust/app/config/load";
-const NODE: &str =
-    "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28";
-const FILE_NODE: &str =
-    "rift://node/rust/1111111111111111111111111111111111111111111111111111111111111111";
 const UNIT: &str = "rift://source/project/src/main.rs";
 const COMMIT: &str = "rift://revision/git/0123456789abcdef0123456789abcdef01234567";
 const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
@@ -39,31 +36,15 @@ fn revision(iri: &str) -> RevisionIri {
 /// A dataset holding every fact kind once.
 fn model(limits: GraphLimits) -> Result<GraphDataset, RiftError> {
     let (main, parse, load) = (symbol(MAIN), symbol(PARSE), symbol(LOAD));
-    let (node, file_node) = (NodeId(NODE.to_owned()), NodeId(FILE_NODE.to_owned()));
     let unit = SourceUnitId(UNIT.to_owned());
     let (commit, release, tree) = (revision(COMMIT), revision(RELEASE), revision(TREE));
     let language = rust();
-    let (first, second) = (
-        TextRange { start: 4, end: 30 },
-        TextRange { start: 40, end: 66 },
-    );
-    let declaration = |range| NodeFact {
-        node: &node,
-        kind: "function_item",
-        language: &language,
-        of: Some(&main),
-        parent: Some(&file_node),
-        location: Some(NodeLocation { unit: &unit, range }),
-        source: Some("fn main() { parse(); }"),
-    };
     let facts = [
         GraphFact::Symbol {
             symbol: &main,
             kind: "function",
             language: &language,
         },
-        GraphFact::Node(declaration(&first)),
-        GraphFact::Node(declaration(&second)),
         GraphFact::Relation {
             source: &main,
             relation: SymbolRelation::Calls,
@@ -78,10 +59,6 @@ fn model(limits: GraphLimits) -> Result<GraphDataset, RiftError> {
             source: &load,
             relation: SymbolRelation::RenamedFrom,
             target: &parse,
-        },
-        GraphFact::Usage {
-            symbol: &parse,
-            node: &node,
         },
         GraphFact::History {
             symbol: &main,
@@ -109,10 +86,75 @@ fn model(limits: GraphLimits) -> Result<GraphDataset, RiftError> {
         },
     ];
     let mut graph = GraphDataset::builder(limits);
+    insert_nodes(&mut graph, &main, &unit, &language)?;
     for fact in facts {
         graph.insert(fact)?;
     }
     Ok(graph.build())
+}
+
+/// A file node holding `main`'s declaration node, which holds a call that uses `parse`.
+fn insert_nodes(
+    graph: &mut GraphDatasetBuilder,
+    main: &SymbolId,
+    unit: &SourceUnitId,
+    language: &Language,
+) -> Result<(), RiftError> {
+    let file = NodeAddress::Unit { unit, index: 0 };
+    let declaration = NodeAddress::Declaration {
+        symbol: main,
+        declaration: 0,
+        index: 0,
+    };
+    let call = NodeAddress::Declaration {
+        symbol: main,
+        declaration: 0,
+        index: 3,
+    };
+    let (file_range, declaration_range, call_range) = (
+        TextRange { start: 0, end: 30 },
+        TextRange { start: 4, end: 30 },
+        TextRange { start: 16, end: 23 },
+    );
+    let node = |address, kind, parent, range, source| NodeFact {
+        address,
+        kind,
+        language,
+        parent,
+        location: Some(NodeLocation { unit, range }),
+        source: Some(source),
+    };
+    let nodes = [
+        node(
+            file,
+            "source_file",
+            None,
+            &file_range,
+            "\n\n\n\nfn main() { parse(); }",
+        ),
+        node(
+            declaration,
+            "function_item",
+            Some(file),
+            &declaration_range,
+            "fn main() { parse(); }",
+        ),
+        node(
+            call,
+            "call_expression",
+            Some(declaration),
+            &call_range,
+            "parse()",
+        ),
+    ];
+    for fact in nodes.into_iter().map(GraphFact::Node) {
+        graph.insert(fact)?;
+    }
+    let parse = symbol(PARSE);
+    graph.insert(GraphFact::Usage {
+        symbol: &parse,
+        node: call,
+    })
 }
 
 fn answer(dataset: &GraphDataset, text: &str) -> Result<GraphAnswer, RiftError> {
@@ -160,35 +202,45 @@ fn test_graph_dataset_answers_symbol_node_and_edge_vocabulary() {
         ),
         vec![vec![LOAD.to_owned()]]
     );
+    let declared = "SELECT ?symbol ?declaration ?index ?kind ?parent ?source { ?n a :Node ; :of ?symbol ; :declaration ?declaration ; :index ?index ; :kind ?kind ; :source ?source ; :parent/:kind ?parent }";
     assert_eq!(
-        rows(
-            &dataset,
-            "SELECT ?symbol ?kind ?parent ?source { ?n a :Node ; :of ?symbol ; :kind ?kind ; :parent ?parent ; :source ?source }"
-        ),
-        vec![vec![
-            MAIN.to_owned(),
-            "function_item".to_owned(),
-            FILE_NODE.to_owned(),
-            "fn main() { parse(); }".to_owned()
-        ]]
-    );
-    assert_eq!(
-        rows(
-            &dataset,
-            "SELECT ?unit ?start ?end { ?n :range ?r . ?r :unit ?unit ; :start ?start ; :end ?end . ?unit a :SourceUnit }"
-        ),
+        rows(&dataset, declared),
         vec![
-            vec![UNIT.to_owned(), "4".to_owned(), "30".to_owned()],
-            vec![UNIT.to_owned(), "40".to_owned(), "66".to_owned()],
+            vec![
+                MAIN,
+                "0",
+                "0",
+                "function_item",
+                "source_file",
+                "fn main() { parse(); }"
+            ],
+            vec![
+                MAIN,
+                "0",
+                "3",
+                "call_expression",
+                "function_item",
+                "parse()"
+            ],
         ]
     );
+    let outside =
+        "SELECT ?unit ?index ?kind { ?n a :Node ; :unit ?unit ; :index ?index ; :kind ?kind }";
     assert_eq!(
-        rows(
-            &dataset,
-            "SELECT ?node { ?s :usages ?node . ?node a :Node }"
-        ),
-        vec![vec![NODE.to_owned()]]
+        rows(&dataset, outside),
+        vec![vec![UNIT, "0", "source_file"]]
     );
+    let ranges = "SELECT ?kind ?start ?end { ?n :kind ?kind ; :range ?r . ?r :unit ?unit ; :start ?start ; :end ?end . ?unit a :SourceUnit }";
+    assert_eq!(
+        rows(&dataset, ranges),
+        vec![
+            vec!["call_expression", "16", "23"],
+            vec!["function_item", "4", "30"],
+            vec!["source_file", "0", "30"],
+        ]
+    );
+    let usages = "SELECT ?user ?start { <rift://symbol/local/rust/app/parser/parse> :usages ?n . ?n :of ?user ; :range/:start ?start }";
+    assert_eq!(rows(&dataset, usages), vec![vec![MAIN, "16"]]);
     assert_eq!(
         rows(
             &dataset,

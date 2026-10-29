@@ -34,13 +34,17 @@ pub enum VocabularyProperty {
     Kind,
     /// The language identity segment.
     Language,
-    /// The symbol a node declares.
+    /// The symbol whose declaration holds a node.
     Of,
+    /// The position of a node's declaration among its symbol's declarations.
+    Declaration,
+    /// The preorder position of a node in its declaration or source unit.
+    Index,
     /// The node enclosing a node.
     Parent,
-    /// One place a node is written.
+    /// The place a node is written.
     Range,
-    /// The source unit a range lies in.
+    /// The source unit a range lies in, or that holds a node outside every declaration.
     Unit,
     /// The first byte of a range.
     Start,
@@ -124,7 +128,7 @@ impl VocabularyClass {
                 "A logical, timeless unit of code: `rift://symbol/<owner>/<language>/<qualified path>`. Several declarations of one path are several nodes of one symbol."
             }
             Self::Node => {
-                "A physical part of a symbol: `rift://node/<language>/<sha256>` over its language, kind and exact bytes. Equal bytes share one node; each place they are written is one `range`."
+                "A syntax node, written as a blank node: inside a declaration it carries `of`, `declaration` and `index`, outside every declaration `unit` and `index`. It has one `range` at the read's revision."
             }
             Self::Revision => {
                 "A point on the history axis: `rift://revision/git/<commit sha>`, a package or runtime release such as `rift://revision/cargo/crates.io/demo@1.0.0`, or a served working tree `rift://revision/tree/<digest>`."
@@ -163,21 +167,31 @@ impl VocabularyProperty {
                 String,
                 "The language identity segment, such as `rust`.",
             ),
-            Self::Of => (&[NODE], Resource(SYMBOL), "The symbol the node declares."),
-            Self::Parent => (
+            Self::Of => (
                 &[NODE],
-                Resource(NODE),
-                "The node enclosing this node in its syntax tree.",
+                Resource(SYMBOL),
+                "The symbol whose declaration holds the node.",
             ),
+            Self::Declaration => (
+                &[NODE],
+                Integer,
+                "The position of the node's declaration among its symbol's declarations.",
+            ),
+            Self::Index => (
+                &[NODE],
+                Integer,
+                "The preorder position of the node in its declaration, the declaration's own node at 0, or among its unit's nodes outside every declaration.",
+            ),
+            Self::Parent => (&[NODE], Resource(NODE), "The node enclosing this node."),
             Self::Range => (
                 &[NODE],
                 Resource(Range),
-                "One place the node is written at the read's revision.",
+                "The place the node is written at the read's revision.",
             ),
             Self::Unit => (
-                &[Range],
+                &[Range, NODE],
                 Resource(SOURCE_UNIT),
-                "The source unit the range lies in.",
+                "The source unit the range lies in, or that holds a node outside every declaration.",
             ),
             Self::Start => (&[Range], Integer, "The first UTF-8 byte of the range."),
             Self::End => (&[Range], Integer, "One past the last byte of the range."),
@@ -195,22 +209,14 @@ impl VocabularyProperty {
             Self::Usages => (
                 &[SYMBOL],
                 Resource(NODE),
-                "A node that uses the symbol: the evidence an incoming `calls` or `references` edge was read from.",
+                "A node that uses the symbol, the evidence an incoming `calls` or `references` edge was read from; its `of` names the using symbol and its `range` the place.",
             ),
-            Self::IntroducedIn => (
-                &[SYMBOL],
-                Resource(REVISION),
-                "The revision that added the symbol.",
-            ),
-            Self::ChangedIn => (
-                &[SYMBOL],
-                Resource(REVISION),
-                "A revision that changed the symbol.",
-            ),
+            Self::IntroducedIn => (&[SYMBOL], Resource(REVISION), "The revision that added it."),
+            Self::ChangedIn => (&[SYMBOL], Resource(REVISION), "A revision that changed it."),
             Self::RemovedIn => (
                 &[SYMBOL],
                 Resource(REVISION),
-                "The revision that deleted the symbol.",
+                "The revision that deleted it.",
             ),
             Self::RenamedFrom => (
                 &[SYMBOL],

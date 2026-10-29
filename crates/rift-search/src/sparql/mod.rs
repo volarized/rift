@@ -51,8 +51,8 @@ mod conformance_tests;
 mod tests;
 
 pub use dataset::{
-    GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeFact, NodeLocation,
-    RevisionIri, SymbolRelation,
+    GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress, NodeFact,
+    NodeLocation, RevisionIri, SymbolRelation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
 pub use limits::{

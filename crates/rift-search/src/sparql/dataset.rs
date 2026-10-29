@@ -5,7 +5,7 @@ use oxrdf::{
     BlankNode, Dataset, Graph, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Term, Triple,
 };
 use rift_error::{RiftError, errors};
-use rift_protocol::read::{Language, NodeId, SourceUnitId, SymbolId, TextRange};
+use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
 use sha2::{Digest as _, Sha256};
 
 use super::limits::GraphLimits;
@@ -13,8 +13,6 @@ use super::vocabulary::{VocabularyClass, VocabularyProperty};
 
 /// IRI prefix of a symbol identity.
 const SYMBOL_PREFIX: &str = "rift://symbol/";
-/// IRI prefix of a node identity.
-const NODE_PREFIX: &str = "rift://node/";
 /// IRI prefix of a source unit identity.
 const SOURCE_UNIT_PREFIX: &str = "rift://source/";
 /// IRI prefix of a revision identity.
@@ -50,7 +48,29 @@ impl RevisionIri {
     }
 }
 
-/// One place a node is written.
+/// Where one syntax node sits in the model. A node has no identity of its own: its address
+/// names it, and the dataset writes it as a blank node labeled by that address.
+#[derive(Clone, Copy, Debug)]
+pub enum NodeAddress<'a> {
+    /// A node inside one declaration of a symbol.
+    Declaration {
+        /// The symbol the declaration belongs to.
+        symbol: &'a SymbolId,
+        /// The declaration's position among the symbol's declarations.
+        declaration: u64,
+        /// The node's preorder position inside the declaration, its own node at 0.
+        index: u64,
+    },
+    /// A node outside every declaration, such as a file's outermost node.
+    Unit {
+        /// The source unit holding it.
+        unit: &'a SourceUnitId,
+        /// The node's preorder position among the unit's nodes outside every declaration.
+        index: u64,
+    },
+}
+
+/// The place a node is written at the read's revision.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeLocation<'a> {
     /// The source unit holding the node.
@@ -62,16 +82,14 @@ pub struct NodeLocation<'a> {
 /// The facts one syntax node carries.
 #[derive(Clone, Copy, Debug)]
 pub struct NodeFact<'a> {
-    /// The node's content identity.
-    pub node: &'a NodeId,
+    /// Where the node sits.
+    pub address: NodeAddress<'a>,
     /// The syntax kind.
     pub kind: &'a str,
     /// The node's language.
     pub language: &'a Language,
-    /// The symbol the node declares, when it declares one.
-    pub of: Option<&'a SymbolId>,
     /// The enclosing node, absent for a file's outermost node.
-    pub parent: Option<&'a NodeId>,
+    pub parent: Option<NodeAddress<'a>>,
     /// Where the node is written at the read's revision.
     pub location: Option<NodeLocation<'a>>,
     /// The node's exact source text.
@@ -100,7 +118,7 @@ pub enum HistoryEvent {
     Removed,
 }
 
-/// One fact a graph dataset holds. Every IRI a fact names is typed with its class, so a
+/// One fact a graph dataset holds. Every resource a fact names is typed with its class, so a
 /// query reaches it through `rdf:type` whichever fact introduced it.
 #[derive(Clone, Copy, Debug)]
 pub enum GraphFact<'a> {
@@ -129,7 +147,7 @@ pub enum GraphFact<'a> {
         /// The used symbol.
         symbol: &'a SymbolId,
         /// The node using it.
-        node: &'a NodeId,
+        node: NodeAddress<'a>,
     },
     /// A revision's effect on a symbol.
     History {
@@ -341,16 +359,12 @@ impl GraphFact<'_> {
 }
 
 impl NodeFact<'_> {
-    /// Writes the node's triples, its range as a blank node labeled by its content.
+    /// Writes the node's triples, its range as a blank node labeled by its node and bytes.
     fn write_triples(&self, out: &mut TripleWriter) -> Result<(), RiftError> {
         use VocabularyProperty as Property;
-        let node = out.node(self.node)?;
+        let node = out.node(self.address)?;
         out.literal(&node, Property::Kind, self.kind);
         out.literal(&node, Property::Language, &self.language.identity_segment());
-        if let Some(symbol) = self.of {
-            let symbol = out.symbol(symbol)?;
-            out.link(&node, Property::Of, symbol);
-        }
         if let Some(parent) = self.parent {
             let parent = out.node(parent)?;
             out.link(&node, Property::Parent, parent);
@@ -359,10 +373,7 @@ impl NodeFact<'_> {
             out.literal(&node, Property::Source, source);
         }
         if let Some(NodeLocation { unit, range }) = self.location {
-            let unit = out.typed(
-                identity_iri(&unit.0, SOURCE_UNIT_PREFIX)?,
-                VocabularyClass::SourceUnit,
-            );
+            let unit = out.unit(unit)?;
             let (start, end) = (range.start.to_string(), range.end.to_string());
             let location = content_blank_node(&[node.as_str(), unit.as_str(), &start, &end]);
             out.link(&node, Property::Range, location.clone());
@@ -394,16 +405,25 @@ impl HistoryEvent {
     }
 }
 
-/// The triples one fact writes. Every IRI it names is typed with its class.
+/// The triples one fact writes. Every resource it names is typed with its class.
 #[derive(Default)]
 struct TripleWriter(Vec<Triple>);
 
 impl TripleWriter {
-    /// Writes `iri rdf:type class` and returns `iri`.
-    fn typed(&mut self, iri: NamedNode, class: VocabularyClass) -> NamedNode {
+    /// Writes `resource rdf:type class` and returns `resource`.
+    fn typed<R: Clone + Into<NamedOrBlankNode>>(
+        &mut self,
+        resource: R,
+        class: VocabularyClass,
+    ) -> R {
         self.0
-            .push(Triple::new(iri.clone(), rdf::TYPE, class.iri()));
-        iri
+            .push(Triple::new(resource.clone(), rdf::TYPE, class.iri()));
+        resource
+    }
+
+    fn unit(&mut self, unit: &SourceUnitId) -> Result<NamedNode, RiftError> {
+        let iri = identity_iri(&unit.0, SOURCE_UNIT_PREFIX)?;
+        Ok(self.typed(iri, VocabularyClass::SourceUnit))
     }
 
     fn symbol(&mut self, symbol: &SymbolId) -> Result<NamedNode, RiftError> {
@@ -411,9 +431,34 @@ impl TripleWriter {
         Ok(self.typed(iri, VocabularyClass::Symbol))
     }
 
-    fn node(&mut self, node: &NodeId) -> Result<NamedNode, RiftError> {
-        let iri = identity_iri(&node.0, NODE_PREFIX)?;
-        Ok(self.typed(iri, VocabularyClass::Node))
+    /// Writes the node at `address` as a blank node labeled by the address, with the triples
+    /// that place it: `of`, `declaration` and `index` inside a declaration, `unit` and `index`
+    /// outside every declaration.
+    fn node(&mut self, address: NodeAddress<'_>) -> Result<BlankNode, RiftError> {
+        use VocabularyProperty as Property;
+        let (owner, declaration, index) = match address {
+            NodeAddress::Declaration {
+                symbol,
+                declaration,
+                index,
+            } => (self.symbol(symbol)?, Some(declaration), index),
+            NodeAddress::Unit { unit, index } => (self.unit(unit)?, None, index),
+        };
+        let (declared, indexed) = (
+            declaration.map(|value| value.to_string()),
+            index.to_string(),
+        );
+        let label = [owner.as_str(), declared.as_deref().unwrap_or("-"), &indexed];
+        let node = self.typed(content_blank_node(&label), VocabularyClass::Node);
+        match declaration {
+            Some(declaration) => {
+                self.link(&node, Property::Of, owner);
+                self.link(&node, Property::Declaration, Literal::from(declaration));
+            }
+            None => self.link(&node, Property::Unit, owner),
+        }
+        self.link(&node, Property::Index, Literal::from(index));
+        Ok(node)
     }
 
     /// Types a revision `Revision`, and `Commit` when it is a git commit.
@@ -438,7 +483,12 @@ impl TripleWriter {
     }
 
     /// Writes `subject property "value"`.
-    fn literal(&mut self, subject: &NamedNode, property: VocabularyProperty, value: &str) {
+    fn literal(
+        &mut self,
+        subject: &(impl Clone + Into<NamedOrBlankNode>),
+        property: VocabularyProperty,
+        value: &str,
+    ) {
         self.link(
             subject,
             property,
