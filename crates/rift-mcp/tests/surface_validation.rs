@@ -107,21 +107,13 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
     }
     if name == "get_symbol" {
         let include = request.get("include").and_then(Value::as_array);
-        let expects_source = include.is_none_or(|entries| entries.contains(&Value::from("source")));
         let expects_history =
             include.is_some_and(|entries| entries.contains(&Value::from("history")));
         for hit in structured["declarations"].as_array().into_iter().flatten() {
-            assert_eq!(
-                hit.get("source").is_some(),
-                expects_source,
-                "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
-            );
-            // A package hit carries `unit` and no node address.
-            let addressable = hit.get("unit").is_none();
-            assert_eq!(
-                hit.get("node").is_some(),
-                expects_source && addressable,
-                "the node address rides with source on a project hit: {request:#} {hit:#}"
+            assert!(
+                hit.get("source").is_none() && hit.get("node").is_none(),
+                "a declaration carries no source and no node address; `nodes` reads them: \
+                 {request:#} {hit:#}"
             );
             if !expects_history {
                 assert!(

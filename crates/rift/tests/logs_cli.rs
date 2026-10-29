@@ -584,7 +584,7 @@ async fn repository_beacon(
     let lookup = proxied_call(
         client,
         "get_symbol",
-        &serde_json::json!({"id": identity, "view": view, "include": ["source"]}),
+        &serde_json::json!({"id": identity, "view": view}),
     )
     .await?;
     assert_eq!(lookup["outcome"], "found", "{lookup}");
@@ -605,8 +605,14 @@ async fn repository_beacon(
         "one original seed binding: {lookup}"
     );
     assert_eq!(declaration["range"], hit["range"], "{lookup}");
-    assert_eq!(declaration["source"], hit["source"], "{lookup}");
-    assert_eq!(declaration["source_complete"], true, "{lookup}");
+    let nodes = proxied_call(
+        client,
+        "nodes",
+        &serde_json::json!({"symbol": identity, "view": view}),
+    )
+    .await?;
+    assert_eq!(nodes["nodes"][0]["of"], identity, "{nodes}");
+    assert_eq!(nodes["nodes"][0]["source"], hit["source"], "{nodes}");
     Ok(())
 }
 

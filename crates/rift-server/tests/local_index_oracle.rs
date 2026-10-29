@@ -17,8 +17,8 @@ use rift_protocol::{
     configuration::HistoryConfiguration,
     map::WorkspaceMap,
     read::{
-        GetSymbolInclude, GetSymbolParams, GetSymbolResult, NodesParams, ReadWarning,
-        SYMBOL_ALTERNATIVES_MAX, SearchScope, SyntaxFramework,
+        GetSymbolParams, GetSymbolResult, NodesParams, ReadWarning, SYMBOL_ALTERNATIVES_MAX,
+        SearchScope, SyntaxFramework,
     },
 };
 use rift_server::ReadService;
@@ -83,7 +83,7 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
             language: None,
             scope: SearchScope::Local,
             packages: Vec::new(),
-            include: vec![GetSymbolInclude::Source],
+            include: Vec::new(),
             limit: 10,
             page_index: 0,
             rev: None,
@@ -95,12 +95,10 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
         );
         let start = usize::try_from(hit.range.start)?;
         let end = usize::try_from(hit.range.end)?;
-        assert_eq!(hit.source.as_deref(), Some(&source[start..end]));
-        assert!(
-            hit.source
-                .as_deref()
-                .is_some_and(|text| text.contains("class Beacon"))
-        );
+        let declared = source
+            .get(start..end)
+            .ok_or("declaration range inside the file")?;
+        assert!(declared.contains("class Beacon"), "{declared}");
 
         let position = u64::try_from(source.find("灯").ok_or("Unicode source")?)?;
         let nodes = service.nodes(&NodesParams::at(
@@ -244,7 +242,7 @@ fn symbol_pages(
             language: None,
             scope: SearchScope::Local,
             packages: Vec::new(),
-            include: vec![GetSymbolInclude::Source],
+            include: Vec::new(),
             limit: 1,
             page_index,
             rev: None,

@@ -165,10 +165,6 @@ fn valid_result(
                         rift_core::SourceUnitId::parse(&unit.0)
                             .is_ok_and(|unit| unit.source_owner() == Some(owner))
                     }) && valid_origin(&declaration.origin, owner)
-                        && declaration.source.as_ref().is_none_or(|source| {
-                            request.include.contains(&GetSymbolInclude::Source)
-                                && source.len() <= source_bytes_max
-                        })
                 })
                 && (history.is_none() || request.include.contains(&GetSymbolInclude::History))
                 && documentation.as_ref().is_none_or(|context| {

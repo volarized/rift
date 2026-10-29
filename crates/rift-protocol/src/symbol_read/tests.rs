@@ -24,8 +24,6 @@ fn declaration(path: &str, signature: u64, documentation: u64) -> Value {
         "path": path,
         "range": {"start": 0, "end": 12},
         "line": 1,
-        "source": "fn parse() {}",
-        "source_complete": true,
         "signature_indices": [signature],
         "type_indices": [0],
         "documentation_indices": [documentation]
@@ -37,7 +35,7 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     let request: GetSymbolParams =
         serde_json::from_value(json!({"id": ID})).expect("valid fixture");
     assert_eq!(request.id.as_str(), ID);
-    assert_eq!(request.include, [GetSymbolInclude::Source]);
+    assert!(request.include.is_empty());
     assert_eq!(request.declaration_limit, 5);
     assert_eq!(request.declaration_cursor, None);
     assert_eq!(request.rev, None);
@@ -45,6 +43,16 @@ fn exact_requests_validate_identity_and_reject_removed_fields() {
     let empty: GetSymbolParams =
         serde_json::from_value(json!({"id": ID, "include": []})).expect("valid fixture");
     assert!(empty.include.is_empty());
+    let history: GetSymbolParams =
+        serde_json::from_value(json!({"id": ID, "include": ["history"]})).expect("valid fixture");
+    assert_eq!(history.include, [GetSymbolInclude::History]);
+    let source =
+        serde_json::from_value::<GetSymbolParams>(json!({"id": ID, "include": ["source"]}))
+            .expect_err("a declaration's source is read by `nodes`, never through `include`");
+    assert!(
+        source.to_string().contains("unknown variant `source`"),
+        "{source}"
+    );
 
     for field in [
         "name",
@@ -134,7 +142,7 @@ fn captured_view_accepts_bounded_opaque_keys_without_claiming_authentication() {
 }
 
 #[test]
-fn declaration_projection_references_one_object_and_keeps_source_association() {
+fn declaration_projection_references_one_object() {
     let mut value = symbol();
     value["signatures"]
         .as_array_mut()
@@ -182,7 +190,6 @@ fn declaration_projection_references_one_object_and_keeps_source_association() {
         ("type_indices", json!([1])),
         ("line", json!(0)),
         ("range", json!({"start": 13, "end": 12})),
-        ("source", Value::Null),
     ] {
         let mut value = declaration("src/parse.rs", 0, 0);
         value[field] = invalid;

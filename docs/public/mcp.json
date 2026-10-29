@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Reads one logical symbol by its canonical `id`. The caller may select a preceding\nimmutable `view`; continuations retain that selection and its original expiry.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. Use `search` for discovery.",
+      "description": "Reads one logical symbol by its canonical `id`. The caller may select a preceding\nimmutable `view`; continuations retain that selection and its original expiry.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. A found symbol carries its facts and\neach declaration's location; `nodes` with `symbol` reads a declaration's source. Use\n`search` for discovery.",
       "input_schema": {
         "$defs": {
           "CapturedViewId": {
@@ -15,11 +15,6 @@
           "GetSymbolInclude": {
             "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
             "oneOf": [
-              {
-                "const": "source",
-                "description": "The hit's node identity and declaration source excerpt.",
-                "type": "string"
-              },
               {
                 "const": "history",
                 "description": "The hit's version-control timeline.",
@@ -67,7 +62,7 @@
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
             "include": [
-              "source"
+              "documentation"
             ]
           }
         ],
@@ -91,10 +86,7 @@
             "description": "Canonical identity. Ownership and language come from this address."
           },
           "include": {
-            "default": [
-              "source"
-            ],
-            "description": "Requested projections. Omitted defaults to source; an empty list requests none.",
+            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`.",
             "items": {
               "$ref": "#/$defs/GetSymbolInclude"
             },
@@ -948,16 +940,6 @@
             ],
             "maxLength": 129,
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
-            "type": "string"
-          },
-          "NodeId": {
-            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
-            "examples": [
-              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-            ],
-            "maxLength": 206,
-            "minLength": 78,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
             "type": "string"
           },
           "NotebookCell": {
@@ -2768,10 +2750,6 @@
                 "minimum": 1,
                 "type": "integer"
               },
-              "node": {
-                "$ref": "#/$defs/NodeId",
-                "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration."
-              },
               "origin": {
                 "$ref": "#/$defs/SymbolOrigin",
                 "description": "Contextual owner and source kind of this declaration's source."
@@ -2793,15 +2771,6 @@
                 },
                 "type": "array"
               },
-              "source": {
-                "description": "Source excerpt when requested and available.",
-                "maxLength": 67108864,
-                "type": "string"
-              },
-              "source_complete": {
-                "description": "Whether the supplied excerpt contains this declaration's complete source.",
-                "type": "boolean"
-              },
               "type_indices": {
                 "description": "Entries in the result symbol's type array supplied by this declaration.",
                 "items": {
@@ -2820,7 +2789,6 @@
               "origin",
               "range",
               "line",
-              "source_complete",
               "signature_indices",
               "type_indices",
               "documentation_indices"

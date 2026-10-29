@@ -931,9 +931,6 @@
                 "exact": {
                   "value": {
                     "id": "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
-                    "include": [
-                      "source"
-                    ],
                     "declaration_limit": 5
                   }
                 }
@@ -5115,12 +5112,10 @@
         "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
         "type": "string",
         "enum": [
-          "source",
           "history",
           "documentation"
         ],
         "x-enum-descriptions": [
-          "The hit's node identity and declaration source excerpt.",
           "The hit's version-control timeline.",
           "Bounded documentation referring to the exact declaration."
         ]
@@ -5138,10 +5133,7 @@
             "items": {
               "$ref": "#/components/schemas/GetSymbolInclude"
             },
-            "description": "Requested projections. Omitted defaults to source; an empty list requests none.",
-            "default": [
-              "source"
-            ]
+            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`."
           },
           "rev": {
             "description": "A local Git revision. Refused for a package or runtime owner and beside `view`.",
@@ -5174,7 +5166,7 @@
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
             "include": [
-              "source"
+              "documentation"
             ]
           }
         ],
@@ -6627,19 +6619,6 @@
             "minimum": 1,
             "description": "One-based line where this declaration begins."
           },
-          "node": {
-            "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration.",
-            "$ref": "#/components/schemas/NodeId"
-          },
-          "source": {
-            "type": "string",
-            "description": "Source excerpt when requested and available.",
-            "maxLength": 67108864
-          },
-          "source_complete": {
-            "type": "boolean",
-            "description": "Whether the supplied excerpt contains this declaration's complete source."
-          },
           "signature_indices": {
             "type": "array",
             "items": {
@@ -6672,7 +6651,6 @@
           "origin",
           "range",
           "line",
-          "source_complete",
           "signature_indices",
           "type_indices",
           "documentation_indices"
