@@ -861,7 +861,10 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
             );
         }
         assert_eq!(package_node["unit"], COLLECTED_UNIT, "{package:#}");
-        assert_eq!(local_node["unit"], "rift://file/src/lib.rs", "{local:#}");
+        assert_eq!(
+            local_node["unit"], "rift://source/project/src/lib.rs",
+            "{local:#}"
+        );
     }
     assert_eq!(package_nodes[0]["of"], json!(id), "{package:#}");
     assert_eq!(

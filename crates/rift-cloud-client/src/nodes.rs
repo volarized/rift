@@ -2,7 +2,7 @@ use rift_error::RiftError;
 
 use rift_protocol::{
     identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity},
-    read::{NODES_SOURCE_BYTES_MAX, Node, NodeUnit, NodesParams, NodesResult, SymbolId},
+    read::{NODES_SOURCE_BYTES_MAX, Node, NodesParams, NodesResult, SymbolId},
 };
 
 use crate::{
@@ -174,9 +174,7 @@ fn valid_result(
 /// Whether `node` is a node of `symbol`: written in a source unit of the symbol's owner,
 /// naming no other symbol, and carrying exactly as many bytes as its range spans.
 fn valid_node(node: &Node, symbol: &RequestedSymbol<'_>) -> bool {
-    let NodeUnit::Source(unit) = &node.unit else {
-        return false;
-    };
+    let unit = &node.unit;
     let in_release = parse_source_unit_identity(unit.as_str())
         .is_ok_and(|(unit_owner, _)| unit_owner.as_ref() == Some(&symbol.owner));
     let names_symbol = node.of.as_ref().is_none_or(|of| of == symbol.id);

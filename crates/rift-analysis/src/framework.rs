@@ -6,7 +6,7 @@ use std::path::Path;
 use rift_core::ProjectPath;
 use rift_error::{RiftError, errors};
 use rift_protocol::configuration::{SyntaxFrameworkConfiguration, TailwindVersion};
-use rift_protocol::read::{FileId, ReadWarning, SyntaxFramework};
+use rift_protocol::read::{ReadWarning, SourceUnitId, SyntaxFramework};
 use rift_syntax::{AngularTemplate, ByteRange, SyntaxDocument, SyntaxLimits, SyntaxSource};
 
 use crate::{PackageSource, PathMatcher};
@@ -487,10 +487,7 @@ impl<'source> FrameworkInputs<'source> {
 
 fn warning(path: &ProjectPath, framework: SyntaxFramework, detail: &str) -> ReadWarning {
     ReadWarning::FrameworkContextUnresolved {
-        unit: FileId(format!(
-            "rift://file/{}",
-            rift_core::encode_path(path.as_str())
-        )),
+        unit: SourceUnitId::project(path.as_str()),
         framework,
         detail: detail.to_owned(),
     }

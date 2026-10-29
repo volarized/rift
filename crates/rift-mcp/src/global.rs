@@ -635,10 +635,7 @@ fn declared_nodes_match(
     let mut declared = answer
         .nodes
         .iter()
-        .filter(|node| {
-            node.of.as_ref() == Some(id)
-                && matches!(&node.unit, rift_protocol::read::NodeUnit::Source(source) if source == unit)
-        })
+        .filter(|node| node.of.as_ref() == Some(id) && &node.unit == unit)
         .peekable();
     answer.view.as_ref() == Some(view)
         && declared.peek().is_some()

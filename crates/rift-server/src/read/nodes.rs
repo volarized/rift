@@ -8,8 +8,8 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_error::{RiftError, errors};
 use rift_index::{IndexedFile, LocatedNode, SymbolMatch, whole_range};
 use rift_protocol::read::{
-    Extensions, FILE_NODE_KIND, FileId, Language, NODES_SOURCE_BYTES_MAX, Node, NodeUnit,
-    NodesParams, SymbolId,
+    Extensions, FILE_NODE_KIND, Language, NODES_SOURCE_BYTES_MAX, Node, NodesParams, SourceUnitId,
+    SymbolId,
 };
 use rift_syntax::{ByteRange, SyntaxDocument};
 use sha2::{Digest as _, Sha256};
@@ -259,7 +259,7 @@ pub(crate) fn file_node(file: &IndexedFile) -> Node {
 
 fn wire(
     language: &Language,
-    unit: FileId,
+    unit: SourceUnitId,
     located: LocatedNode,
     source: &str,
     (facets, of): (Vec<rift_protocol::read::NodeFacet>, Option<SymbolId>),
@@ -267,7 +267,7 @@ fn wire(
     Node {
         id: located.id,
         of,
-        unit: NodeUnit::File(unit),
+        unit,
         language: language.clone(),
         kind: super::wire_kind(located.kind),
         facets,

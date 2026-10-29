@@ -833,16 +833,6 @@
             },
             "type": "object"
           },
-          "FileId": {
-            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
-            "maxLength": 8192,
-            "minLength": 13,
-            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
-            "type": "string"
-          },
           "GlobalFailureClass": {
             "description": "Bounded classes a global API failure can carry in a read warning.",
             "oneOf": [
@@ -1347,7 +1337,7 @@
                     "description": "The framework whose context could not be established."
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
+                    "$ref": "#/$defs/SourceUnitId",
                     "description": "The source whose framework context is unresolved."
                   }
                 },
@@ -1655,7 +1645,7 @@
                   "files": {
                     "description": "The files cut at the bound.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -1722,7 +1712,7 @@
                     "type": "string"
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
+                    "$ref": "#/$defs/SourceUnitId",
                     "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
                   }
                 },
@@ -1775,7 +1765,7 @@
                   "files": {
                     "description": "The files held as text alone.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -1804,7 +1794,7 @@
                   "files": {
                     "description": "The selected lockfiles search leaves out.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -3948,16 +3938,6 @@
             },
             "type": "object"
           },
-          "FileId": {
-            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
-            "maxLength": 8192,
-            "minLength": 13,
-            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
-            "type": "string"
-          },
           "GlobalFailureClass": {
             "description": "Bounded classes a global API failure can carry in a read warning.",
             "oneOf": [
@@ -4116,8 +4096,8 @@
                 "type": "string"
               },
               "unit": {
-                "$ref": "#/$defs/NodeUnit",
-                "description": "The source unit the node is written in: a project file, or a package or runtime\nsource unit for a node of a package or runtime symbol."
+                "$ref": "#/$defs/SourceUnitId",
+                "description": "The source unit the node is written in: a project file, as\n`rift://source/project/src/lib.rs`, or a package or runtime source unit for a node of\na package or runtime symbol. It names no revision; the answer's `revision` does."
               }
             },
             "required": [
@@ -4253,19 +4233,6 @@
               "range"
             ],
             "type": "object"
-          },
-          "NodeUnit": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/FileId",
-                "description": "A file of the project tree, as `rift://file/src/lib.rs`."
-              },
-              {
-                "$ref": "#/$defs/SourceUnitId",
-                "description": "A source unit of a package or runtime, as `rift://source/cargo/crates.io/demo/src/lib.rs`."
-              }
-            ],
-            "description": "The source unit a [`Node`] is written in: a file of the project tree the read targets, or\na source unit of the package or runtime release that owns the node's symbol."
           },
           "NotebookCell": {
             "additionalProperties": false,
@@ -4628,7 +4595,7 @@
                     "description": "The framework whose context could not be established."
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
+                    "$ref": "#/$defs/SourceUnitId",
                     "description": "The source whose framework context is unresolved."
                   }
                 },
@@ -4936,7 +4903,7 @@
                   "files": {
                     "description": "The files cut at the bound.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -5003,7 +4970,7 @@
                     "type": "string"
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
+                    "$ref": "#/$defs/SourceUnitId",
                     "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
                   }
                 },
@@ -5056,7 +5023,7 @@
                   "files": {
                     "description": "The files held as text alone.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -5085,7 +5052,7 @@
                   "files": {
                     "description": "The selected lockfiles search leaves out.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -5857,7 +5824,7 @@
                   "start": 0
                 },
                 "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-                "unit": "rift://file/src/config.rs"
+                "unit": "rift://source/project/src/config.rs"
               },
               {
                 "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
@@ -5868,7 +5835,7 @@
                   "start": 0
                 },
                 "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-                "unit": "rift://file/src/config.rs"
+                "unit": "rift://source/project/src/config.rs"
               },
               {
                 "facets": [
@@ -5884,7 +5851,7 @@
                   "start": 218
                 },
                 "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-                "unit": "rift://file/src/config.rs"
+                "unit": "rift://source/project/src/config.rs"
               },
               {
                 "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
@@ -5895,7 +5862,7 @@
                   "start": 281
                 },
                 "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-                "unit": "rift://file/src/config.rs"
+                "unit": "rift://source/project/src/config.rs"
               },
               {
                 "facets": [
@@ -5909,7 +5876,7 @@
                   "start": 334
                 },
                 "source": "parse_config(&text)",
-                "unit": "rift://file/src/config.rs"
+                "unit": "rift://source/project/src/config.rs"
               },
               {
                 "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
@@ -5920,7 +5887,7 @@
                   "start": 334
                 },
                 "source": "parse_config",
-                "unit": "rift://file/src/config.rs"
+                "unit": "rift://source/project/src/config.rs"
               }
             ],
             "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
@@ -7343,16 +7310,6 @@
             },
             "type": "object"
           },
-          "FileId": {
-            "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from.",
-            "examples": [
-              "rift://file/src/lib.rs"
-            ],
-            "maxLength": 8192,
-            "minLength": 13,
-            "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
-            "type": "string"
-          },
           "GlobalFailureClass": {
             "description": "Bounded classes a global API failure can carry in a read warning.",
             "oneOf": [
@@ -7971,7 +7928,7 @@
                     "description": "The framework whose context could not be established."
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
+                    "$ref": "#/$defs/SourceUnitId",
                     "description": "The source whose framework context is unresolved."
                   }
                 },
@@ -8279,7 +8236,7 @@
                   "files": {
                     "description": "The files cut at the bound.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -8346,7 +8303,7 @@
                     "type": "string"
                   },
                   "unit": {
-                    "$ref": "#/$defs/FileId",
+                    "$ref": "#/$defs/SourceUnitId",
                     "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`."
                   }
                 },
@@ -8399,7 +8356,7 @@
                   "files": {
                     "description": "The files held as text alone.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"
@@ -8428,7 +8385,7 @@
                   "files": {
                     "description": "The selected lockfiles search leaves out.",
                     "items": {
-                      "$ref": "#/$defs/FileId"
+                      "$ref": "#/$defs/SourceUnitId"
                     },
                     "maxItems": 8,
                     "type": "array"

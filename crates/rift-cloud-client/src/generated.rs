@@ -2752,11 +2752,6 @@ pub enum DeclarationPositionResult {
 }
 /// A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.
 pub type Duration = String;
-/// Identity of one file in the tree a request targets. The path after `rift://file/` is a
-/// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
-/// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
-/// whatever schema its implementation generated from.
-pub type FileId = String;
 /// Finds declarations holding positions in one immutable selection.
 #[serde_with::skip_serializing_none]
 #[derive(
@@ -3819,9 +3814,8 @@ pub struct Node {
     pub id: String,
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.
     pub of: Option<String>,
-    /// The source unit a [`Node`] is written in: a file of the project tree the read targets, or
-    /// a source unit of the package or runtime release that owns the node's symbol.
-    pub unit: Box<NodeUnit>,
+    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
+    pub unit: String,
     /// A language name and its optional dialect, joined by `:`. `sql` and `sql:postgresql` are two languages with two symbol spaces.
     pub language: String,
     /// A provider-local kind preserving the construct name used by that language implementation.
@@ -3987,20 +3981,6 @@ pub struct NodeRegion {
     /// another, so that `end` is never below `start` is asserted by the surface
     /// validation tests instead.
     pub range: TextRange,
-}
-/// The source unit a [`Node`] is written in: a file of the project tree the read targets, or
-/// a source unit of the package or runtime release that owns the node's symbol.
-#[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
-#[serde(untagged)]
-pub enum NodeUnit {
-    /// Identity of one file in the tree a request targets. The path after `rift://file/` is a
-    /// `ProjectPath` in canonical percent-encoding. The server re-validates the decoded path
-    /// wherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,
-    /// whatever schema its implementation generated from.
-    #[default]
-    File(FileId),
-    /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
-    SourceUnit(SourceUnitId),
 }
 /// One named part of a node. A language marks these out inside a declaration, so an
 /// operation can address the body of a function without addressing its documentation.

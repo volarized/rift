@@ -2460,14 +2460,14 @@ mod tests {
                 {
                     "id": "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "of": "rift://symbol/rust/a.rs/A",
-                    "unit": "rift://file/a.rs",
+                    "unit": "rift://source/project/a.rs",
                     "kind": "function_item",
                     "range": { "start": 0, "end": 9 },
                     "source": "fn a() {}"
                 },
                 {
                     "id": "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "unit": "rift://file/a.rs",
+                    "unit": "rift://source/project/a.rs",
                     "kind": "identifier",
                     "range": { "start": 3, "end": 4 },
                     "source": "a"
@@ -2475,7 +2475,7 @@ mod tests {
                 {
                     "id": "rift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                     "of": "rift://symbol/rust/a.rs/A",
-                    "unit": "rift://file/b.rs",
+                    "unit": "rift://source/project/b.rs",
                     "kind": "function_item",
                     "range": { "start": 0, "end": 9 },
                     "source": "fn a() {}"

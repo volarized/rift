@@ -4054,7 +4054,8 @@ impl Tower {
         );
         let names_deep = value["warnings"].as_array().is_some_and(|warnings| {
             warnings.iter().any(|warning| {
-                warning["code"] == "source_unavailable" && warning["unit"] == "rift://file/deep.rs"
+                warning["code"] == "source_unavailable"
+                    && warning["unit"] == "rift://source/project/deep.rs"
             })
         });
         assert!(names_deep, "{value:#}");

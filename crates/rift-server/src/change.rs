@@ -1242,9 +1242,9 @@ mod tests {
         assert_eq!(
             units,
             [
-                "rift://file/assets/diagram.md",
-                "rift://file/docs/notes.md",
-                "rift://file/src/shout.rs"
+                "rift://source/project/assets/diagram.md",
+                "rift://source/project/docs/notes.md",
+                "rift://source/project/src/shout.rs"
             ]
         );
         assert!(named[0].1.contains("`lfs` filter driver"), "{named:?}");
@@ -1282,7 +1282,7 @@ mod tests {
             matches!(
                 answer.warnings.as_slice(),
                 [ReadWarning::SourceUnavailable { unit: Some(unit), .. }]
-                    if unit.0 == "rift://file/src/grown.rs"
+                    if unit.0 == "rift://source/project/src/grown.rs"
             ),
             "{answer:?}"
         );
@@ -1332,8 +1332,10 @@ mod tests {
                 other => panic!("only source_unavailable is expected: {other:?}"),
             })
             .collect();
-        let mut expected: Vec<Option<String>> = vec![Some("rift://file/src/a_grown.rs".to_owned())];
-        expected.extend((0..7).map(|index| Some(format!("rift://file/src/f{index:02}.rs"))));
+        let mut expected: Vec<Option<String>> =
+            vec![Some("rift://source/project/src/a_grown.rs".to_owned())];
+        expected
+            .extend((0..7).map(|index| Some(format!("rift://source/project/src/f{index:02}.rs"))));
         expected.push(None);
         let expected: Vec<Option<&str>> = expected.iter().map(Option::as_deref).collect();
         assert_eq!(units, expected);

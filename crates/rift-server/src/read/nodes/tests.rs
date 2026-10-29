@@ -141,7 +141,7 @@ fn a_symbol_with_several_declarations_lists_each_outermost_first() -> TestResult
     for (item, binding) in items.iter().zip(&bindings) {
         assert_eq!(
             item.unit,
-            rift_protocol::read::NodeUnit::File(crate::read::file_id(binding.file.path())),
+            crate::read::file_id(binding.file.path()),
             "item nodes follow binding order"
         );
         assert_eq!(item.range.start, binding.symbol.item_range.start);
@@ -161,7 +161,7 @@ fn a_symbol_with_several_declarations_lists_each_outermost_first() -> TestResult
     for item in &items {
         let start = usize::try_from(item.range.start)?;
         let end = usize::try_from(item.range.end)?;
-        if item.unit.as_str() == "rift://file/index.d.ts" {
+        if item.unit.as_str() == "rift://source/project/index.d.ts" {
             assert_eq!(item.source, declarations[start..end]);
         }
     }
