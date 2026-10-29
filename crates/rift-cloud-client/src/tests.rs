@@ -48,6 +48,7 @@ mod cache;
 mod collection;
 mod declaration;
 mod documentation;
+mod nodes;
 mod pages;
 mod pattern;
 mod resolution;
@@ -86,6 +87,8 @@ enum OperationFixture {
     Valid,
     ExactSymbol(serde_json::Value),
     SourceDeclarations(serde_json::Value, StatusCode),
+    /// The `/v1/nodes` answer: this body with this status, or a problem for a 404.
+    Nodes(serde_json::Value, StatusCode),
     Documentation {
         search: serde_json::Value,
         symbols: serde_json::Value,
@@ -414,6 +417,19 @@ fn operation_response(
         }
         return json_response(&declaration::declaration_response_json(), None);
     }
+    if path.ends_with("/nodes") {
+        return match mode {
+            OperationFixture::Nodes(_, StatusCode::NOT_FOUND) => {
+                problem_response(StatusCode::NOT_FOUND)
+            }
+            OperationFixture::Nodes(value, status) => {
+                let mut response = json_response(value, None);
+                *response.status_mut() = *status;
+                response
+            }
+            _ => json_response(&nodes::nodes_response_json(), None),
+        };
+    }
     if path.ends_with("/patterns") {
         let mut page = pattern::pattern_page_json(query_cursor(query));
         if let OperationFixture::CollectionBounds { source_bytes, .. } = mode {
@@ -425,6 +441,9 @@ fn operation_response(
     }
     status_response(StatusCode::NOT_FOUND)
 }
+
+/// The `cursor_bytes_max` the nodes fixture advertises, below the client's own bound.
+const NODES_CURSOR_BYTES_ADVERTISED: usize = 64;
 
 /// The `page_limit_max` the pattern fixture advertises, below the client's own bound.
 const PATTERN_PAGE_LIMIT_ADVERTISED: i64 = 200;
@@ -485,6 +504,11 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
         OperationFixture::PageLimitMax(advertised) => {
             value["bounds"]["page_limit_max"] = serde_json::json!(advertised);
         }
+        OperationFixture::Nodes(_, _) => {
+            value["supported_features"] =
+                serde_json::json!(["resolutions", "search", "symbols", "nodes"]);
+            value["bounds"]["cursor_bytes_max"] = serde_json::json!(NODES_CURSOR_BYTES_ADVERTISED);
+        }
         OperationFixture::Declarations | OperationFixture::SourceDeclarations(_, _) => {
             value["supported_features"] =
                 serde_json::json!(["resolutions", "search", "symbols", "declarations"]);
@@ -500,7 +524,8 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
                 "search",
                 "symbols",
                 "patterns",
-                "declarations"
+                "declarations",
+                "nodes"
             ]);
         }
         _ => {}
@@ -1634,6 +1659,7 @@ async fn operation_failure(
             .await
             .err(),
         Endpoint::Symbols => client.get_symbol(&symbol_request()).await.err(),
+        Endpoint::Nodes => client.nodes(&nodes::nodes_request()).await.err(),
         Endpoint::Patterns => client
             .search_package_patterns(&pattern::pattern_request(), OPERATION_PAGE_LIMIT, None)
             .await
@@ -1692,6 +1718,7 @@ async fn test_fixture_every_operation_answers_problem_statuses() {
         Endpoint::Resolutions,
         Endpoint::Search,
         Endpoint::Symbols,
+        Endpoint::Nodes,
         Endpoint::Patterns,
         Endpoint::Declarations,
     ];

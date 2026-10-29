@@ -8,8 +8,8 @@ use rift_core::ProjectPath as CoreProjectPath;
 use rift_error::{RiftError, errors};
 use rift_index::{IndexedFile, LocatedNode, SymbolMatch, whole_range};
 use rift_protocol::read::{
-    Extensions, FILE_NODE_KIND, FileId, Language, NODES_SOURCE_BYTES_MAX, Node, NodesParams,
-    SymbolId,
+    Extensions, FILE_NODE_KIND, FileId, Language, NODES_SOURCE_BYTES_MAX, Node, NodeUnit,
+    NodesParams, SymbolId,
 };
 use rift_syntax::{ByteRange, SyntaxDocument};
 use sha2::{Digest as _, Sha256};
@@ -267,7 +267,7 @@ fn wire(
     Node {
         id: located.id,
         of,
-        unit,
+        unit: NodeUnit::File(unit),
         language: language.clone(),
         kind: super::wire_kind(located.kind),
         facets,

@@ -1136,6 +1136,278 @@
         "x-rift-response-body-bytes-max": 33554432
       }
     },
+    "/v1/nodes": {
+      "post": {
+        "operationId": "nodes",
+        "summary": "List the nodes of one package or runtime symbol.",
+        "description": "Lists the syntax nodes of one package or runtime symbol with their source text, in the exact release its identity names: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration. Every node's `unit` is a source unit of that release. The request carries `symbol` and MAY carry `node_cursor` and `view`; the server refuses `path`, `position`, and `rev`. A page holds at most `page_limit_max` nodes and, beyond its first node, at most `x-rift-page-source-bytes-max` bytes of node source; `node_cursor` continues where the page stopped. A symbol the release does not declare answers 404.",
+        "security": [
+          {},
+          {
+            "bearerAuth": []
+          }
+        ],
+        "requestBody": {
+          "description": "The package or runtime symbol whose nodes the request lists.",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodesParams"
+              },
+              "examples": {
+                "symbol": {
+                  "value": {
+                    "symbol": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The symbol's nodes with their source text.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodesResult"
+                },
+                "examples": {
+                  "symbol": {
+                    "value": {
+                      "nodes": [
+                        {
+                          "id": "rift://node/rust/822c5120b879aefaf4292665e14f74685b0af62426f7be48abeaa8119617b6f0",
+                          "of": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "language": "rust",
+                          "kind": "function_item",
+                          "facets": [
+                            "declaration",
+                            "definition"
+                          ],
+                          "range": {
+                            "start": 26,
+                            "end": 44
+                          },
+                          "source": "pub fn beacon() {}"
+                        },
+                        {
+                          "id": "rift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47",
+                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "language": "rust",
+                          "kind": "visibility_modifier",
+                          "range": {
+                            "start": 26,
+                            "end": 29
+                          },
+                          "source": "pub"
+                        },
+                        {
+                          "id": "rift://node/rust/9b04c3deca33e42e8320a198a92e8228c839f6896f7355d628794a903e7e1e65",
+                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "language": "rust",
+                          "kind": "identifier",
+                          "range": {
+                            "start": 33,
+                            "end": 39
+                          },
+                          "source": "beacon"
+                        },
+                        {
+                          "id": "rift://node/rust/edfb51c0954ad93ebc6b3d756002deff7e5ad9a2bfbd0c0d98863a1967b36305",
+                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "language": "rust",
+                          "kind": "parameters",
+                          "range": {
+                            "start": 39,
+                            "end": 41
+                          },
+                          "source": "()"
+                        },
+                        {
+                          "id": "rift://node/rust/2d72b267e7fb58ef18e81465a0ac23fa48c5ca8d840ffe88f8e79cc458a14c2e",
+                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "language": "rust",
+                          "kind": "block",
+                          "range": {
+                            "start": 42,
+                            "end": 44
+                          },
+                          "source": "{}"
+                        }
+                      ],
+                      "view": {
+                        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "expires_at": "2026-10-10T01:00:00Z"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Request JSON, query parameters, or field relationships are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication is required or credentials are invalid.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "WWW-Authenticate": {
+                "schema": {
+                  "$ref": "#/components/schemas/WWWAuthenticate"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Credentials do not permit this operation.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "406": {
+            "description": "The server cannot produce an accepted media type.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The request body exceeds the request body bound.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The request media type is unsupported.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The request rate limit is exhausted.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              },
+              "RateLimit-Limit": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitLimit"
+                }
+              },
+              "RateLimit-Remaining": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitRemaining"
+                }
+              },
+              "RateLimit-Reset": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitReset"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The server encountered an unexpected failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The server received an invalid upstream response.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Typed selection unavailability or service failure.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryAfter"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The upstream request timed out.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The release the symbol names declares no such symbol.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            }
+          }
+        },
+        "x-rift-page-source-bytes-max": 1048576
+      }
+    },
     "/v1/patterns": {
       "post": {
         "operationId": "searchPackagePatterns",
@@ -7280,9 +7552,13 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "symbol": {
+            "description": "The symbol whose nodes the read lists: each declaration's item node, then the\ndescendants that belong to that declaration and not to a declaration nested in it,\noutermost first per declaration. A package or runtime symbol's nodes come from the\nglobal API. The caller MUST omit `path` and `position` beside it.",
+            "$ref": "#/components/schemas/SymbolId"
+          },
           "path": {
-            "$ref": "#/components/schemas/ProjectPath",
-            "description": "Project-relative file to inspect."
+            "description": "Project-relative file to inspect. The caller MUST send it together with `position`.",
+            "$ref": "#/components/schemas/ProjectPath"
           },
           "position": {
             "type": "integer",
@@ -7290,6 +7566,12 @@
             "minimum": 0,
             "description": "UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes\nthemselves carry the spans. A position inside a multi-byte character is valid and\nanswers with its enclosing nodes; a position at or past the file's byte length\nrefuses.",
             "maximum": 9007199254740991
+          },
+          "node_cursor": {
+            "type": "string",
+            "description": "Continuation a preceding `symbol` read returned, bound to that symbol and the tree\nrevision it read. The server refuses it beside `path` and once the tree has moved.",
+            "minLength": 1,
+            "maxLength": 4096
           },
           "view": {
             "description": "Captured view selected by discovery. The server reads nodes from that view and\nrefuses an expired or foreign view. The caller MUST omit `rev` beside `view`.",
@@ -7300,16 +7582,65 @@
             "$ref": "#/components/schemas/RevisionId"
           }
         },
-        "required": [
-          "path",
-          "position"
-        ],
-        "description": "Lists the syntax nodes covering one position, outermost first. Each node carries its\nsource range and kind, including expressions smaller than a declaration.",
+        "description": "Lists syntax nodes with their source, outermost first: every node of one `symbol`, or the\nnodes covering one `position` in one file. Each node carries its kind, range, and source\ntext, including expressions smaller than a declaration.",
         "rift:since": "v0.0.4",
         "examples": [
           {
+            "symbol": "rift://symbol/local/rust/app/config/load_config"
+          },
+          {
             "path": "src/config.rs",
             "position": 338
+          }
+        ],
+        "allOf": [
+          {
+            "oneOf": [
+              {
+                "required": [
+                  "symbol"
+                ],
+                "not": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "path"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "position"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "required": [
+                  "path",
+                  "position"
+                ],
+                "not": {
+                  "required": [
+                    "symbol"
+                  ]
+                }
+              }
+            ],
+            "description": "nodes selects a symbol, or a path with a position"
+          },
+          {
+            "if": {
+              "required": [
+                "node_cursor"
+              ]
+            },
+            "then": {
+              "required": [
+                "symbol"
+              ]
+            },
+            "description": "node_cursor continues a symbol read"
           }
         ]
       },
@@ -7322,14 +7653,11 @@
             "items": {
               "$ref": "#/components/schemas/Node"
             },
-            "description": "Nodes covering the position, outermost first."
+            "description": "Nodes the read selected, outermost first: per declaration for a `symbol` read, from\nthe file node inward for a `position` read."
           },
-          "source": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "One excerpt per node in `nodes`, in the same order, each spanning that node's own\nrange. Empty when `nodes` is empty."
+          "node_cursor": {
+            "type": "string",
+            "description": "Continuation for the rest of a `symbol` read whose nodes crossed the answer's node\ncount or source byte bound. Absent when the answer holds the last node."
           },
           "view": {
             "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view.",
@@ -7345,13 +7673,23 @@
           }
         },
         "required": [
-          "nodes",
-          "source"
+          "nodes"
         ],
-        "description": "The nodes covering one position, with identities derived from their source bytes.",
+        "description": "The nodes a read selected, each with its source text and identity derived from its bytes.",
         "examples": [
           {
             "nodes": [
+              {
+                "id": "rift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2",
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "file",
+                "range": {
+                  "start": 0,
+                  "end": 356
+                },
+                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
+              },
               {
                 "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
                 "unit": "rift://file/src/config.rs",
@@ -7360,11 +7698,12 @@
                 "range": {
                   "start": 0,
                   "end": 356
-                }
+                },
+                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
               },
               {
                 "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
+                "of": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "function_item",
@@ -7376,23 +7715,7 @@
                   "start": 218,
                   "end": 355
                 },
-                "regions": [
-                  {
-                    "role": "name",
-                    "range": {
-                      "start": 225,
-                      "end": 236
-                    }
-                  },
-                  {
-                    "role": "body",
-                    "range": {
-                      "start": 281,
-                      "end": 355
-                    }
-                  }
-                ],
-                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"
+                "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
               },
               {
                 "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
@@ -7403,7 +7726,7 @@
                   "start": 281,
                   "end": 355
                 },
-                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
+                "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
               },
               {
                 "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
@@ -7417,7 +7740,7 @@
                   "start": 334,
                   "end": 353
                 },
-                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189"
+                "source": "parse_config(&text)"
               },
               {
                 "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
@@ -7428,15 +7751,8 @@
                   "start": 334,
                   "end": 346
                 },
-                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690"
+                "source": "parse_config"
               }
-            ],
-            "source": [
-              "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-              "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-              "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-              "parse_config(&text)",
-              "parse_config"
             ]
           }
         ]
@@ -7447,15 +7763,15 @@
         "properties": {
           "id": {
             "$ref": "#/components/schemas/NodeId",
-            "description": "Unique identifier of this source region, and the URI that resolves it."
+            "description": "Content identity of this node. Nodes of one language and kind with equal bytes share\nit; `unit` and `range` locate this one."
           },
-          "symbol": {
-            "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment.",
+          "of": {
+            "description": "The symbol this node declares. Absent where a node declares no symbol -\npunctuation, a keyword, a comment, an expression.",
             "$ref": "#/components/schemas/SymbolId"
           },
           "unit": {
-            "$ref": "#/components/schemas/FileId",
-            "description": "The file the node is written in."
+            "$ref": "#/components/schemas/NodeUnit",
+            "description": "The source unit the node is written in: a project file, or a package or runtime\nsource unit for a node of a package or runtime symbol."
           },
           "language": {
             "$ref": "#/components/schemas/Language",
@@ -7476,6 +7792,10 @@
           "range": {
             "$ref": "#/components/schemas/TextRange",
             "description": "The bytes it spans, as offsets into the file."
+          },
+          "source": {
+            "type": "string",
+            "description": "The node's exact source text: the bytes `range` spans at the read's revision."
           },
           "regions": {
             "type": "array",
@@ -7500,9 +7820,10 @@
           "unit",
           "language",
           "kind",
-          "range"
+          "range",
+          "source"
         ],
-        "description": "One node of a file's concrete syntax tree. It identifies a source range and\nprovider-local syntax kind. `symbol` connects the node to semantic identity when the\nlanguage supplies one."
+        "description": "One node of a source unit's syntax tree, with its source text. It identifies a source\nrange and provider-local syntax kind. `of` connects the node to the symbol it declares."
       },
       "NodeFacet": {
         "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
@@ -7566,6 +7887,19 @@
           "range"
         ],
         "description": "One named part of a node, and the bytes it spans."
+      },
+      "NodeUnit": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/FileId",
+            "description": "A file of the project tree, as `rift://file/src/lib.rs`."
+          },
+          {
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "A source unit of a package or runtime release, as\n`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`."
+          }
+        ],
+        "description": "The source unit a [`Node`] is written in: a file of the project tree the read targets, or\na source unit of the package or runtime release that owns the node's symbol."
       },
       "RegionRole": {
         "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",

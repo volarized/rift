@@ -282,6 +282,46 @@ pub struct FileId(
     pub String,
 );
 
+/// The source unit a [`Node`] is written in: a file of the project tree the read targets, or
+/// a source unit of the package or runtime release that owns the node's symbol.
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum NodeUnit {
+    /// A file of the project tree, as `rift://file/src/lib.rs`.
+    File(FileId),
+    /// A source unit of a package or runtime release, as
+    /// `rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`.
+    Source(SourceUnitId),
+}
+
+impl NodeUnit {
+    /// The unit's canonical identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::File(file) => &file.0,
+            Self::Source(unit) => unit.as_str(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeUnit {
+    /// Selects the variant by the identity's scheme prefix: a `FileId` accepts any string,
+    /// so an untagged decode would never reach `Source`.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value.starts_with(FILE_ID_PREFIX) {
+            return Ok(Self::File(FileId(value)));
+        }
+        SourceUnitId::parse(&value)
+            .map(Self::Source)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// The scheme and kind prefix every [`FileId`] starts with.
+const FILE_ID_PREFIX: &str = "rift://file/";
+
 /// One declaration a `get_symbol` lookup found.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -703,8 +743,9 @@ pub struct Node {
     /// punctuation, a keyword, a comment, an expression.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub of: Option<SymbolId>,
-    /// The file the node is written in.
-    pub unit: FileId,
+    /// The source unit the node is written in: a project file, or a package or runtime
+    /// source unit for a node of a package or runtime symbol.
+    pub unit: NodeUnit,
     /// The grammar that produced this node. It belongs to the identity because two
     /// providers can produce different trees over the same file bytes.
     pub language: Language,
@@ -874,7 +915,8 @@ pub struct NodeRegion {
 pub struct NodesParams {
     /// The symbol whose nodes the read lists: each declaration's item node, then the
     /// descendants that belong to that declaration and not to a declaration nested in it,
-    /// outermost first per declaration. The caller MUST omit `path` and `position` beside it.
+    /// outermost first per declaration. A package or runtime symbol's nodes come from the
+    /// global API. The caller MUST omit `path` and `position` beside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub symbol: Option<SymbolId>,
     /// Project-relative file to inspect. The caller MUST send it together with `position`.
@@ -2825,6 +2867,34 @@ mod tests {
     use schemars::schema_for;
     use serde_json::json;
     use strum::VariantArray;
+
+    /// A node's unit decodes by its scheme: a project file stays a `FileId`, a package source
+    /// unit decodes through the source unit codec, and a string neither form holds refuses.
+    #[test]
+    fn a_node_unit_decodes_a_project_file_and_a_package_source_unit_by_scheme() {
+        let file = "rift://file/src/lib.rs";
+        let package = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+        let decoded: super::NodeUnit = serde_json::from_value(json!(file)).expect("file unit");
+        assert_eq!(decoded, super::NodeUnit::File(FileId(file.to_owned())));
+        assert_eq!(decoded.as_str(), file);
+        let decoded: super::NodeUnit =
+            serde_json::from_value(json!(package)).expect("package unit");
+        assert!(matches!(&decoded, super::NodeUnit::Source(unit) if unit.as_str() == package));
+        assert_eq!(decoded.as_str(), package);
+        assert_eq!(
+            serde_json::to_value(&decoded).expect("unit encodes"),
+            json!(package)
+        );
+        for refused in [
+            "src/lib.rs",
+            "rift://source/cargo/crates.io/demo/src/lib.rs",
+        ] {
+            assert!(
+                serde_json::from_value::<super::NodeUnit>(json!(refused)).is_err(),
+                "{refused}"
+            );
+        }
+    }
 
     #[test]
     fn unavailable_read_objects_pair_source_fields_in_serde_and_schema() {

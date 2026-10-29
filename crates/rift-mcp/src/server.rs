@@ -896,18 +896,12 @@ fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> NodesResult {
     }
 }
 
-/// Refuses a `nodes` symbol this server cannot read: one owned by a package or a runtime,
-/// whose facts the project index does not hold.
-fn refuse_unserved_symbol_owner(symbol: &rift_protocol::read::SymbolId) -> Result<(), ToolFailure> {
+/// Whether `symbol` belongs to a package or a runtime release, whose nodes the global API
+/// serves: the project index holds no facts of such a symbol.
+fn is_release_symbol(symbol: &rift_protocol::read::SymbolId) -> Result<bool, ToolFailure> {
     let identity = rift_protocol::identity::SymbolIdentity::parse(symbol.as_str())
         .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
-    if identity.owner().is_local() {
-        return Ok(());
-    }
-    Err(errors::server::read_unsupported()
-        .capability("nodes of package and runtime symbols")
-        .mcp()
-        .tool_failure(wire::ErrorPhase::Read))
+    Ok(!identity.owner().is_local())
 }
 
 fn nodes_preparing_warnings(resolved: &ResolvedWorkspace) -> Vec<ReadWarning> {
@@ -3237,28 +3231,37 @@ impl RiftMcp {
 
     /// Lists syntax nodes with their source text, outermost first: every node of one `symbol`
     /// (each declaration's item node and the descendants that belong to it), or the nodes
-    /// covering one UTF-8 byte `position` in one file, from the file node inward. A symbol
-    /// read is the way to read a declaration's source. Each node's identity is a digest of
-    /// its language, kind, and bytes, so equal nodes share one identity and an edit elsewhere
-    /// in the file leaves it unchanged; `unit` and `range` locate the node, and `of` names the
-    /// symbol a node declares. A symbol read whose nodes cross the answer's node count or
-    /// source byte bound returns `node_cursor` for the rest. Every file has a file node
-    /// spanning it whole, and a file no syntax provider parses answers that node alone. `rev`
-    /// lists the nodes as of a version-control revision instead of the current tree. If
-    /// discovery is incomplete or a targeted read spends the request's remaining time, the
-    /// result has empty `nodes` and carries `local_index_preparing`. A selected source path
-    /// can answer within that remaining time, with the same warning until the publication
-    /// records the path: workspace byte and declaration bounds remain unchecked.
+    /// covering one UTF-8 byte `position` in one file, from the file node inward. A symbol read
+    /// is the way to read a declaration's source, and a package or runtime symbol's nodes come
+    /// from the global API, each in a source unit of that symbol's release. Each node's
+    /// identity is a digest of its language, kind, and bytes, so equal nodes share one identity
+    /// and an edit elsewhere in the file leaves it unchanged; `unit` and `range` locate the
+    /// node, and `of` names the symbol a node declares. A symbol read whose nodes cross the
+    /// answer's node count or source byte bound returns `node_cursor` for the rest. Every file
+    /// has a file node spanning it whole, and a file no syntax provider parses answers that
+    /// node alone. `rev` lists the nodes as of a version-control revision instead of the
+    /// current tree. If discovery is incomplete or a targeted read spends the request's
+    /// remaining time, the result has empty `nodes` and carries `local_index_preparing`. A
+    /// selected source path can answer within that remaining time, with the same warning until
+    /// the publication records the path: workspace byte and declaration bounds remain
+    /// unchecked.
     #[tool]
     async fn nodes(
         &self,
         Parameters(params): Parameters<NodesParams>,
     ) -> Result<Json<NodesResult>, ToolFailure> {
+        let local_view = params
+            .view
+            .as_ref()
+            .filter(|view| self.has_captured_context(view));
+        if let Some(symbol) = &params.symbol
+            && local_view.is_none()
+            && is_release_symbol(symbol)?
+        {
+            return self.global_nodes(&params).await;
+        }
         if let Some(view) = &params.view {
             return self.captured_nodes(&params, view).map(Json);
-        }
-        if let Some(symbol) = &params.symbol {
-            refuse_unserved_symbol_owner(symbol)?;
         }
         let rev = params.rev.clone();
         if rev.is_some() {
@@ -5630,24 +5633,25 @@ done
     }
 
     #[test]
-    fn nodes_of_a_package_symbol_refuse_and_project_symbols_pass() {
-        let package = rift_protocol::read::SymbolId(
-            "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon".to_owned(),
-        );
-        let refused = super::refuse_unserved_symbol_owner(&package);
-        assert!(
-            matches!(
-                &refused,
-                Err(super::ToolFailure::Registered(failure, _))
-                    if failure.registered().slug() == errors::server::read_unsupported::SLUG
+    fn package_and_runtime_symbols_are_release_symbols_and_project_symbols_are_not() -> TestResult {
+        for (id, released) in [
+            (
+                "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+                true,
             ),
-            "{refused:?}"
-        );
-        let project =
-            rift_protocol::read::SymbolId("rift://symbol/local@sdk/rust/app/beacon".to_owned());
-        assert!(super::refuse_unserved_symbol_owner(&project).is_ok());
+            (
+                "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
+                true,
+            ),
+            ("rift://symbol/local@sdk/rust/app/beacon", false),
+            ("rift://symbol/local/rust/app/beacon", false),
+        ] {
+            let symbol = rift_protocol::read::SymbolId(id.to_owned());
+            assert_eq!(super::is_release_symbol(&symbol)?, released, "{id}");
+        }
         let malformed = rift_protocol::read::SymbolId("rift://symbol/".to_owned());
-        assert!(super::refuse_unserved_symbol_owner(&malformed).is_err());
+        assert!(super::is_release_symbol(&malformed).is_err());
+        Ok(())
     }
 
     fn assert_empty_preparing_nodes(answer: &NodesResult, prepared: u64, total: Option<u64>) {

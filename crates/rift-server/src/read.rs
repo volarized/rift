@@ -3706,7 +3706,7 @@ pub fn compute() -> i32 {
             .map(|node| (node.kind.0.as_str(), node.source.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(kinds, [("file", "default:\n    echo hi\n")]);
-        assert_eq!(answer.nodes[0].unit.0, "rift://file/justfile");
+        assert_eq!(answer.nodes[0].unit.as_str(), "rift://file/justfile");
         Ok(())
     }
 

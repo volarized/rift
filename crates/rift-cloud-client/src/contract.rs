@@ -40,11 +40,12 @@ const ERROR_STATUSES: [StatusCode; 10] = [
     StatusCode::SERVICE_UNAVAILABLE,
 ];
 
-const ENDPOINTS: [Endpoint; 6] = [
+const ENDPOINTS: [Endpoint; 7] = [
     Endpoint::Capabilities,
     Endpoint::Resolutions,
     Endpoint::Search,
     Endpoint::Symbols,
+    Endpoint::Nodes,
     Endpoint::Patterns,
     Endpoint::Declarations,
 ];
@@ -55,6 +56,7 @@ pub(crate) enum Endpoint {
     Resolutions,
     Search,
     Symbols,
+    Nodes,
     Patterns,
     Declarations,
 }
@@ -66,6 +68,7 @@ impl Endpoint {
             Self::Resolutions => "/v1/resolutions",
             Self::Search => "/v1/search",
             Self::Symbols => "/v1/symbols",
+            Self::Nodes => "/v1/nodes",
             Self::Patterns => "/v1/patterns",
             Self::Declarations => "/v1/declarations",
         }
@@ -77,6 +80,7 @@ impl Endpoint {
             Self::Resolutions
             | Self::Search
             | Self::Symbols
+            | Self::Nodes
             | Self::Patterns
             | Self::Declarations => Method::POST,
         }
@@ -88,6 +92,7 @@ impl Endpoint {
             Self::Resolutions => "resolvePackageContext",
             Self::Search => "searchPackages",
             Self::Symbols => "get_symbol",
+            Self::Nodes => "nodes",
             Self::Patterns => "searchPackagePatterns",
             Self::Declarations => "findDeclarations",
         }
@@ -97,7 +102,7 @@ impl Endpoint {
         let mut statuses = ERROR_STATUSES.into_iter().collect::<BTreeSet<_>>();
         statuses.insert(StatusCode::OK);
         statuses.insert(StatusCode::GATEWAY_TIMEOUT);
-        if self == Self::Symbols {
+        if matches!(self, Self::Symbols | Self::Nodes) {
             statuses.insert(StatusCode::NOT_FOUND);
         }
         if self == Self::Capabilities {
@@ -209,6 +214,7 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     validate_security(&spec).map_err(&invalid)?;
     validate_operations(&spec).map_err(&invalid)?;
     validate_symbol_contract(&document).map_err(&invalid)?;
+    validate_nodes_contract(&document).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
     validate_optional_properties_omit_null(&document).map_err(&invalid)?;
     validate_patterns(&document).map_err(&invalid)?;
@@ -433,6 +439,33 @@ fn validate_symbol_contract(document: &Value) -> Result<(), String> {
         expect_bound(path, actual, expected)?;
     }
     Ok(())
+}
+
+/// Pins `/v1/nodes` to the shared node models and the source bound a symbol read pages by.
+fn validate_nodes_contract(document: &Value) -> Result<(), String> {
+    let operation = &document["paths"]["/v1/nodes"]["post"];
+    if operation.get("parameters").is_some() {
+        return Err("POST /v1/nodes must not declare query selectors".to_owned());
+    }
+    let request = &operation["requestBody"]["content"]["application/json"]["schema"];
+    if request != &json!({"$ref": "#/components/schemas/NodesParams"}) {
+        return Err("POST /v1/nodes request must use NodesParams".to_owned());
+    }
+    let response = &operation["responses"]["200"]["content"]["application/json"]["schema"];
+    if response != &json!({"$ref": "#/components/schemas/NodesResult"}) {
+        return Err("POST /v1/nodes 200 response must use NodesResult".to_owned());
+    }
+    expect_bound(
+        "x-rift-page-source-bytes-max",
+        operation["x-rift-page-source-bytes-max"].as_u64(),
+        rift_protocol::read::NODES_SOURCE_BYTES_MAX,
+    )?;
+    expect_bound(
+        "NodesParams/node_cursor/maxLength",
+        document["components"]["schemas"]["NodesParams"]["properties"]["node_cursor"]["maxLength"]
+            .as_u64(),
+        u64::try_from(crate::CURSOR_BYTES_MAX).map_err(|error| error.to_string())?,
+    )
 }
 
 fn validate_bounds(spec: &Spec) -> Result<(), String> {
@@ -777,6 +810,8 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<rift_protocol::read::SearchTraversal>();
     let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolParams>();
     let _ = generator.subschema_for::<rift_protocol::symbol_read::GetSymbolResult>();
+    let _ = generator.subschema_for::<rift_protocol::read::NodesParams>();
+    let _ = generator.subschema_for::<rift_protocol::read::NodesResult>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
 

@@ -3945,6 +3945,32 @@ mod tests {
         ))
     }
 
+    /// A package or runtime symbol's nodes go to the primary server, which reads them from the
+    /// global API: the proxy forwards the request as written, and a captured global view
+    /// dispatches it with its identity untouched.
+    #[tokio::test]
+    async fn a_package_nodes_symbol_reaches_the_primary_server_unchanged() -> TestResult {
+        let primary = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        let proxy = extra_profile_proxy(primary.path(), extra.path())?;
+        for id in [
+            "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+            "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
+        ] {
+            let request = CallToolRequestParams::new("nodes").with_arguments(
+                serde_json::from_value(json!({"symbol": id, "node_cursor": "1.ab"}))?,
+            );
+            assert!(std::ptr::eq(
+                proxy.call_backend(&request)?,
+                &raw const proxy
+            ));
+            assert!(proxy.captured_read(&request).await?.is_none());
+            let upstream = super::candidates::dispatch_read_request(&request, "global")?;
+            assert_eq!(upstream.arguments, request.arguments);
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn a_nodes_symbol_selects_its_owner_backend_and_dispatches_a_local_identity() -> TestResult
     {
