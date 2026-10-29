@@ -814,6 +814,11 @@ The first entry of `nodes` is the file's outermost node, and its `source` excerp
 file's source. A declaration's source is read through the `source` member of its
 [`get_symbol`](#tool-get_symbol) declarations.
 
+Each node's `id` is a [`NodeId`](/docs/developer/protocol/reference#NodeId): the SHA-256 of the
+node's language, kind, and bytes. Two nodes with equal bytes share one `id`, and an edit outside
+a node leaves its `id` unchanged. The `id` therefore names content alone, and a caller **MUST**
+carry the node's `unit` and `range` beside it to address one place.
+
 This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
 
 <ReadExample name="local-nodes" />
@@ -1100,7 +1105,7 @@ The further lines of the symbol hit follow unchanged: the first documentation li
 
 A root whose symbol is no hit of the result writes one line: `at ` and the symbol identity. A branch whose symbol is no hit writes its head line and the `at` line, and no other line. A branch is no hit when its own hit lies on another page. The root is no hit because a walk does not return the symbol it starts from. When a hit outside the walk is the root symbol, as a `query` beside the `traversal` can return it, the server **MUST** write that hit as the root and not as an item.
 
-A file hit has the location and the `matched_by` field names on its first line, then the source directly below. A node hit adds the node identity between those two lines. A documentation hit starts with the heading path joined by ` > `, or `documentation` without headings, then the location of the block and the `matched_by` field names, the identity of the symbol the block documents, and the source.
+A file hit has the location and the `matched_by` field names on its first line, then the source directly below. A node hit adds its byte range as `START..END`, when the hit carries `range`, and then the node identity between those two lines. A documentation hit starts with the heading path joined by ` > `, or `documentation` without headings, then the location of the block and the `matched_by` field names, the identity of the symbol the block documents, and the source.
 
 A commit hit has these lines:
 
@@ -1122,6 +1127,7 @@ with `view ID · expires TIMESTAMP`, followed by warnings when present.
 A `nodes` result lists the nodes from the outermost to the innermost. Each node has these lines:
 
 - the `kind`, then ` · N lines` when its excerpt holds more than one line, then `generated` and `test` when the node has those facets
+- the byte range as `START..END`
 - the node identity
 - the symbol identity, when the node has one
 - the regions as `role START..END`, joined by ` · `, when the node has regions
