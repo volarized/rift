@@ -159,7 +159,6 @@ mod tests {
                 to: WireSymbolId(to.as_str().to_owned()),
                 kind: ExactKind("calls".to_owned()),
                 facets: vec![RelationshipFacet::Calls],
-                evidence: Vec::new(),
                 occurrence: None,
                 derivation: RelationshipDerivation::Syntax,
                 confidence: None,

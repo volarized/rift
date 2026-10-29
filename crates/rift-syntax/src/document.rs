@@ -12,7 +12,10 @@ use crate::markdown::MarkdownFacts;
 /// the `~N` suffix `SymbolId` advertises.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
+mod node_places;
 mod retained_size;
+
+pub use node_places::{NodeHolder, NodePlace};
 pub(crate) mod rust_macros;
 
 /// Half-open UTF-8 byte range.
@@ -608,62 +611,6 @@ impl SyntaxDocument {
         })
     }
 
-    /// Returns the nodes that belong to one declaration, outermost first: its item node, the
-    /// node of `node_kind` spanning `item_range`, then every descendant outside the
-    /// declarations nested in it. Empty when the table holds no item node.
-    ///
-    /// One pass over the item's subtree, with a binary search over the nested declarations'
-    /// spans per node: `O(n log m)` for `n` subtree nodes and `m` nested declarations.
-    #[must_use]
-    pub fn declaration_nodes(&self, symbol: &SyntaxSymbol) -> Vec<&SyntaxNode> {
-        let nodes = self.nodes();
-        let Some(item) = nodes.iter().position(|node| {
-            node.range == symbol.item_range && symbol.node_kind.is_none_or(|kind| kind == node.kind)
-        }) else {
-            return Vec::new();
-        };
-        let nested = self.nested_declaration_spans(symbol);
-        let mut belongs = vec![true];
-        let mut owned = vec![&nodes[item]];
-        // Pre-order keeps the item's subtree contiguous: the walk ends at the first node whose
-        // parent lies before the item.
-        for node in &nodes[item + 1..] {
-            let parent = node.parent.and_then(|parent| parent.checked_sub(item));
-            let Some(parent_belongs) = parent.and_then(|parent| belongs.get(parent).copied())
-            else {
-                break;
-            };
-            let member = parent_belongs && !within_any(&nested, node.range);
-            belongs.push(member);
-            if member {
-                owned.push(node);
-            }
-        }
-        owned
-    }
-
-    /// The outermost spans of the declarations nested inside `symbol`'s item, sorted by start
-    /// and disjoint, each the nested declaration's complete range.
-    fn nested_declaration_spans(&self, symbol: &SyntaxSymbol) -> Vec<ByteRange> {
-        let mut spans = self
-            .symbols()
-            .iter()
-            .chain(self.facts.left_out_symbols())
-            .filter(|other| {
-                other.item_range != symbol.item_range && symbol.item_range.encloses(other.range)
-            })
-            .map(|other| other.range)
-            .collect::<Vec<_>>();
-        spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
-        let mut outermost: Vec<ByteRange> = Vec::with_capacity(spans.len());
-        for span in spans {
-            if outermost.last().is_none_or(|last| !last.encloses(span)) {
-                outermost.push(span);
-            }
-        }
-        outermost
-    }
-
     /// Clones the shared path-independent facts.
     #[must_use]
     pub fn shared_facts(&self) -> Arc<SyntaxFacts> {
@@ -754,15 +701,6 @@ impl SyntaxFacts {
     pub const fn markdown_facts(&self) -> Option<&MarkdownFacts> {
         self.markdown_facts.as_ref()
     }
-}
-
-/// Whether `range` lies within one of `spans`, which are sorted by start and disjoint.
-fn within_any(spans: &[ByteRange], range: ByteRange) -> bool {
-    let after = spans.partition_point(|span| span.start <= range.start);
-    after
-        .checked_sub(1)
-        .and_then(|index| spans.get(index))
-        .is_some_and(|span| span.encloses(range))
 }
 
 fn declaration_node_kinds(
@@ -1138,56 +1076,15 @@ mod tests {
     }
 
     #[test]
-    fn declaration_nodes_hold_the_item_subtree_without_nested_declarations() {
+    fn a_released_node_table_answers_no_node() {
         let path = ProjectPath::new("src/lib.rs").expect("valid path");
         let document = rust_document(&path, NESTED_SOURCE);
-        let lamp = declared(&document, "lamp");
-        let light = declared(&document, "light");
-
-        let module = document.declaration_nodes(lamp);
-        let function = document.declaration_nodes(light);
-
-        assert_eq!(module.first().map(|node| node.range), Some(lamp.item_range));
-        assert!(
-            module.iter().all(|node| !light.range.encloses(node.range)),
-            "the nested function and its doc comment belong to the function: {module:?}"
-        );
-        assert!(module.iter().any(|node| node.kind == "declaration_list"));
-        assert_eq!(
-            function.first().map(|node| node.range),
-            Some(light.item_range)
-        );
-        assert!(function.iter().any(|node| node.kind == "integer_literal"));
-        assert!(
-            function
-                .iter()
-                .all(|node| light.item_range.encloses(node.range))
-        );
-        let dim = document.declaration_nodes(declared(&document, "dim"));
-        assert!(
-            dim.iter()
-                .all(|node| node.range.start >= range_of("pub fn dim").start)
-        );
-    }
-
-    #[test]
-    fn declaration_nodes_are_empty_without_an_item_node_or_a_node_table() {
-        let path = ProjectPath::new("src/lib.rs").expect("valid path");
-        let document = rust_document(&path, NESTED_SOURCE);
-        let mut moved = declared(&document, "light").clone();
-        moved.item_range = ByteRange { start: 0, end: 1 };
-        assert!(document.declaration_nodes(&moved).is_empty());
-
         let released = SyntaxDocument {
             path: path.clone(),
-            facts: document.clone().into_facts(),
+            facts: document.into_facts(),
         };
         assert!(released.nodes().is_empty());
-        assert!(
-            released
-                .declaration_nodes(declared(&document, "light"))
-                .is_empty()
-        );
+        assert!(released.node_places(|_, _| true).is_empty());
         assert_eq!(
             released.node_at(ByteRange { start: 0, end: 1 }, NodeMatch::Enclosing),
             None

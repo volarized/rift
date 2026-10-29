@@ -889,6 +889,7 @@ impl ResolvedWorkspace {
 
 fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> NodesResult {
     NodesResult {
+        symbol: None,
         view: None,
         nodes: Vec::new(),
         node_cursor: None,
@@ -3231,22 +3232,21 @@ impl RiftMcp {
         u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
     }
 
-    /// Lists syntax nodes with their source text, outermost first: every node of one `symbol`
-    /// (each declaration's item node and the descendants that belong to it), or the nodes
-    /// covering one UTF-8 byte `position` in one file, from the file node inward. A symbol read
-    /// is the way to read a declaration's source, and a package or runtime symbol's nodes come
-    /// from the global API, each in a source unit of that symbol's release. Each node's
-    /// identity is a digest of its language, kind, and bytes, so equal nodes share one identity
-    /// and an edit elsewhere in the file leaves it unchanged; `unit` and `range` locate the
-    /// node, and `of` names the symbol a node declares. A symbol read whose nodes cross the
-    /// answer's node count or source byte bound returns `node_cursor` for the rest. Every file
-    /// has a file node spanning it whole, and a file no syntax provider parses answers that
-    /// node alone. `rev` lists the nodes as of a version-control revision instead of the
-    /// current tree. If discovery is incomplete or a targeted read spends the request's
-    /// remaining time, the result has empty `nodes` and carries `local_index_preparing`. A
-    /// selected source path can answer within that remaining time, with the same warning until
-    /// the publication records the path: workspace byte and declaration bounds remain
-    /// unchecked.
+    /// Lists syntax nodes with their source text: every node of one `symbol`, or, for one
+    /// UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
+    /// it, or the file's unit nodes when no declaration holds it. A symbol read is the way to
+    /// read a declaration's source, and a package or runtime symbol's nodes come from the
+    /// global API, each in a source unit of that symbol's release. The answer names `symbol`;
+    /// each node is addressed by its place: node `index` of declaration `declaration` of
+    /// that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
+    /// index in the same declaration or unit. An edit renumbers the nodes after it. An answer
+    /// whose nodes cross its node count or source byte bound returns `node_cursor` for the
+    /// rest. A file no syntax provider parses answers its file node alone. `rev` lists the
+    /// nodes as of a version-control revision instead of the current tree. If discovery is
+    /// incomplete or a targeted read spends the request's remaining time, the result has
+    /// empty `nodes` and carries `local_index_preparing`. A selected source path can answer
+    /// within that remaining time, with the same warning until the publication records the
+    /// path: workspace byte and declaration bounds remain unchecked.
     #[tool]
     async fn nodes(
         &self,
@@ -7151,7 +7151,7 @@ done
 
     #[tokio::test]
     async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
-        let (directory, server, id) = canonical_fixture().await?;
+        let (_directory, server, id) = canonical_fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -7227,20 +7227,14 @@ done
             !listed.is_empty(),
             "position 8 sits inside `pub fn beacon`, so at least one node covers it"
         );
-        let outermost = &listed[0];
-        let range = &outermost["range"];
-        let start = usize::try_from(range["start"].as_u64().ok_or("node range start")?)?;
-        let end = usize::try_from(range["end"].as_u64().ok_or("node range end")?)?;
-        let language: rift_protocol::read::Language =
-            serde_json::from_value(outermost["language"].clone())?;
-        let kind = outermost["kind"].as_str().ok_or("node kind")?;
-        let source = fs::read(directory.path().join("lib.rs"))?;
-        let bytes = source.get(start..end).ok_or("node range in source")?;
+        let item = &listed[0];
+        assert_eq!(item["kind"], json!("function_item"), "{structured}");
         assert_eq!(
-            outermost["id"],
-            json!(rift_protocol::read::NodeId::for_content(&language, kind, bytes).0),
-            "a node identity is the digest of the bytes at the node's own range"
+            (&item["declaration"], &item["index"]),
+            (&json!(0), &json!(0)),
+            "position 8 answers `pub fn beacon`, whose item node is node 0"
         );
+        assert!(structured["symbol"].is_string(), "{structured}");
 
         client.cancel().await?;
         server_task.await?;
@@ -10751,11 +10745,12 @@ done
             .nodes(Parameters(rift_protocol::read::NodesParams::of(id.clone())))
             .await?
             .0;
+        assert_eq!(nodes.symbol.as_ref(), Some(&id), "{nodes:?}");
         assert!(
             nodes
                 .nodes
                 .first()
-                .is_some_and(|node| node.of.as_ref() == Some(&id) && node.source.contains("BLOB")),
+                .is_some_and(|node| node.index == 0 && node.source.contains("BLOB")),
             "{nodes:?}"
         );
         assert!(search_symbols(&server, "HUGE").await?.results.is_empty());

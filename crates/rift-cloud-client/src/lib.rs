@@ -63,7 +63,7 @@ pub use generated::{
     DocumentationLicense, DocumentationReferenceEvidence, DocumentationSelectionReason,
     DocumentationSource, DocumentationSourceFormat, DocumentationSourceIdentity,
     DocumentationStage, DocumentationWarningKind, ExactKind, Extensions, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, IdentifierMatchClass, Language, NodeId, NotebookCellIdentity,
+    GetCapabilitiesResponse, IdentifierMatchClass, Language, NotebookCellIdentity,
     NotebookCellKind, PackageAvailability, PackageContextEntry, PackageDocumentationHit,
     PackageDocumentationHitContributingField, PackageIdentity, PackagePatternDeclaration,
     PackagePatternHit, PackagePatternPage, PackagePatternRequest, PackageResolutionRequest,

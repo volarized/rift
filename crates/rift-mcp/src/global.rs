@@ -581,8 +581,9 @@ async fn captured_callee_source(
     Ok(true)
 }
 
-/// Whether the first page of `answer` holds a node of `id` in `unit`, and every such node's
-/// source equals `held` at the node's byte range, in the captured `view`.
+/// Whether the first page of `answer` lists the nodes of `id` with an item node in `unit`, and
+/// every such item node's source equals `held` at the node's byte range, in the captured
+/// `view`.
 fn declared_nodes_match(
     answer: &rift_protocol::read::NodesResult,
     id: &SymbolId,
@@ -594,11 +595,12 @@ fn declared_nodes_match(
         .nodes
         .iter()
         .filter(|node| {
-            node.of.as_ref() == Some(id)
+            node.index == 0
                 && matches!(&node.unit, rift_protocol::read::NodeUnit::Source(source) if source == unit)
         })
         .peekable();
     answer.view.as_ref() == Some(view)
+        && answer.symbol.as_ref() == Some(id)
         && declared.peek().is_some()
         && declared.all(|node| node_matches(node, held))
 }
@@ -1191,7 +1193,6 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
                     .error()
             })?
         }
-        (SearchHitTarget::Node { node }, ..) => node_identity(hit, node)?,
         (SearchHitTarget::Documentation { documentation }, ..) => {
             DocumentIdentity::for_documentation_block(&documentation.block.identity.0).map_err(
                 |error| {
@@ -1216,31 +1217,6 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
 
 /// A unit-addressed symbol hit's identity: its source unit and the qualified name its
 /// symbol address encodes.
-/// The identity a node hit ranks under: its content identity, then the path or unit and the
-/// byte range it lies at, since two nodes with equal bytes share one content identity.
-fn node_identity(
-    hit: &SearchHit,
-    node: &rift_protocol::read::NodeId,
-) -> Result<DocumentIdentity, RiftError> {
-    let place = hit
-        .path
-        .as_ref()
-        .map(|path| path.0.as_str())
-        .or_else(|| hit.unit.as_ref().map(|unit| unit.0.as_str()));
-    let (Some(place), Some(range)) = (place, hit.range.as_ref()) else {
-        return Err(errors::mcp::project_hit_identity_missing()
-            .hit(&node.0)
-            .error());
-    };
-    let identity = format!("{} {place}@{}-{}", node.0, range.start, range.end);
-    DocumentIdentity::new(identity).map_err(|error| {
-        errors::mcp::project_hit_identity_refused()
-            .hit(&node.0)
-            .cause(error)
-            .error()
-    })
-}
-
 fn unit_identity(
     unit: &rift_protocol::read::SourceUnitId,
     symbol_id: &SymbolId,
@@ -1268,18 +1244,12 @@ pub(crate) fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
                 .cmp(&right.path.is_none())
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| left.unit.cmp(&right.unit))
-                .then_with(|| identity_ordering(left, right))
+                .then_with(|| search_hit_key(left).cmp(search_hit_key(right)))
         }),
-        ResultOrder::Identity => hits.sort_by(identity_ordering),
+        ResultOrder::Identity => {
+            hits.sort_by(|left, right| search_hit_key(left).cmp(search_hit_key(right)));
+        }
     }
-}
-
-/// Orders two hits by key, then by place: two node hits with equal bytes share one key, so
-/// the place keeps the order total.
-fn identity_ordering(left: &SearchHit, right: &SearchHit) -> std::cmp::Ordering {
-    search_hit_key(left)
-        .cmp(search_hit_key(right))
-        .then_with(|| left.place().cmp(&right.place()))
 }
 
 fn search_hit_key(hit: &SearchHit) -> &str {
@@ -1289,7 +1259,6 @@ fn search_hit_key(hit: &SearchHit) -> &str {
             .as_ref()
             .map_or(symbol.name.as_str(), |identity| identity.0.as_str()),
         SearchHitTarget::File { .. } => hit.path.as_ref().map_or("", |path| path.0.as_str()),
-        SearchHitTarget::Node { node } => node.0.as_str(),
         SearchHitTarget::Documentation { documentation } => documentation.block.identity.0.as_str(),
         SearchHitTarget::Commit { commit } => commit.revision.0.as_str(),
     }
@@ -1948,33 +1917,6 @@ mod tests {
         hit
     }
 
-    /// Two node hits with equal bytes share one content identity, so they rank under their
-    /// places, never collapse into one payload, and order by place; a node hit with no place
-    /// has no ranking identity.
-    #[test]
-    fn equal_node_hits_rank_apart_by_their_place() {
-        let node =
-            "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2";
-        let at = |start: u64| -> SearchHit {
-            serde_json::from_value(serde_json::json!({
-                "hit": {"target": "node", "node": node},
-                "path": "src/config.rs",
-                "range": {"start": start, "end": start + 12}
-            }))
-            .expect("a node hit")
-        };
-        let (first, second) = (at(40), at(334));
-        let first_identity = super::ranking_identity(&first).expect("a placed node ranks");
-        let second_identity = super::ranking_identity(&second).expect("a placed node ranks");
-        assert_ne!(first_identity, second_identity);
-        let mut ordered = vec![second.clone(), first.clone()];
-        super::order_search_hits(&mut ordered, super::ResultOrder::Identity);
-        assert_eq!(ordered, vec![first.clone(), second]);
-        let mut unplaced = first;
-        unplaced.range = None;
-        assert!(super::ranking_identity(&unplaced).is_err());
-    }
-
     /// Each kind of project hit ranks under the identity the fusion keys it by, and a merge
     /// beside no package candidate answers every one of them.
     #[test]
@@ -1986,12 +1928,6 @@ mod tests {
         let mut unit_hit = example.results[0].clone();
         unit_hit.path = None;
         unit_hit.unit = Some(SourceUnitId(unit.to_owned()));
-        let node_hit: SearchHit = serde_json::from_value(serde_json::json!({
-            "hit": {"target": "node", "node": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"},
-            "path": "src/lib.rs",
-            "range": {"start": 0, "end": 10}
-        }))
-        .expect("a node hit");
         let documentation_hit = documentation_hits().remove(0);
         let revision = "9c1d4e7a2b8f03d5e6a1c4b7d9e2f0a3b5c8d1e4";
         let commit_hit: SearchHit = serde_json::from_value(serde_json::json!({
@@ -2016,7 +1952,6 @@ mod tests {
             example.results[0].clone(),
             unit_hit,
             example.results[1].clone(),
-            node_hit,
             documentation_hit,
             commit_hit,
         ];
@@ -2024,7 +1959,6 @@ mod tests {
             "rift://symbol/local/rust/app/config/load_config",
             unit_identity.as_str(),
             "src/lib.rs",
-            "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961 src/lib.rs@0-10",
             block_identity.as_str(),
             revision,
         ];
@@ -3074,7 +3008,7 @@ mod tests {
 #[cfg(test)]
 mod captured_runtime_tests {
     use super::declared_nodes_match;
-    use rift_protocol::read::{Language, NodeId, NodesResult, SymbolId};
+    use rift_protocol::read::{NodesResult, SymbolId};
     use rift_protocol::symbol_read::CapturedView;
 
     const ID: &str = "rift://symbol/stdlib/cpython@3.12.3/python/builtins/len";
@@ -3082,26 +3016,29 @@ mod captured_runtime_tests {
     const STUB: &str = "x = 1\ndef len(obj): ...\n";
     const DECLARED: &str = "def len(obj): ...";
 
-    fn node(of: Option<&str>, unit: &str, start: u64, source: &str) -> serde_json::Value {
-        let language = Language {
-            name: "python".to_owned(),
-            dialect: None,
-        };
-        let id = NodeId::for_content(&language, "function_definition", source.as_bytes());
+    fn node(index: u64, unit: &str, start: u64, source: &str) -> serde_json::Value {
         let end = start + u64::try_from(source.len()).expect("fixture length fits u64");
         let mut node = serde_json::json!({
-            "id": id, "unit": unit, "language": "python", "kind": "function_definition",
-            "range": {"start": start, "end": end}, "source": source
+            "declaration": 0, "index": index, "unit": unit, "language": "python",
+            "kind": "function_definition", "range": {"start": start, "end": end},
+            "source": source
         });
-        if let Some(of) = of {
-            node["of"] = serde_json::json!(of);
+        if index > 0 {
+            node["parent"] = serde_json::json!(0);
         }
         node
     }
 
-    fn answer(view: &CapturedView, nodes: &[serde_json::Value]) -> NodesResult {
-        serde_json::from_value(serde_json::json!({"nodes": nodes, "view": view}))
-            .expect("nodes answer")
+    fn answer(
+        view: &CapturedView,
+        symbol: Option<&str>,
+        nodes: &[serde_json::Value],
+    ) -> NodesResult {
+        let mut answer = serde_json::json!({"nodes": nodes, "view": view});
+        if let Some(symbol) = symbol {
+            answer["symbol"] = serde_json::json!(symbol);
+        }
+        serde_json::from_value(answer).expect("nodes answer")
     }
 
     #[test]
@@ -3114,10 +3051,8 @@ mod captured_runtime_tests {
         let unit = serde_json::from_value(serde_json::json!(UNIT)).expect("runtime source unit");
         let matching = answer(
             &view,
-            &[
-                node(Some(ID), UNIT, 6, DECLARED),
-                node(None, UNIT, 10, "obj"),
-            ],
+            Some(ID),
+            &[node(0, UNIT, 6, DECLARED), node(1, UNIT, 10, "obj")],
         );
         assert!(declared_nodes_match(&matching, &id, &unit, &view, STUB));
         assert!(!declared_nodes_match(
@@ -3130,24 +3065,25 @@ mod captured_runtime_tests {
         assert!(!declared_nodes_match(&matching, &id, &unit, &view, "short"));
         let other_unit = answer(
             &view,
+            Some(ID),
             &[node(
-                Some(ID),
+                0,
                 "rift://source/stdlib/cpython@3.11.3/builtins.pyi",
                 6,
                 DECLARED,
             )],
         );
         assert!(!declared_nodes_match(&other_unit, &id, &unit, &view, STUB));
-        let shifted = answer(&view, &[node(Some(ID), UNIT, 5, DECLARED)]);
+        let shifted = answer(&view, Some(ID), &[node(0, UNIT, 5, DECLARED)]);
         assert!(!declared_nodes_match(&shifted, &id, &unit, &view, STUB));
-        let unnamed = answer(&view, &[node(None, UNIT, 6, DECLARED)]);
+        let unnamed = answer(&view, None, &[node(0, UNIT, 6, DECLARED)]);
         assert!(!declared_nodes_match(&unnamed, &id, &unit, &view, STUB));
         let mut other_view = view.clone();
         other_view.id = serde_json::from_value(serde_json::json!("a_B-9.z_Y-0")).expect("view id");
-        let elsewhere = answer(&other_view, &[node(Some(ID), UNIT, 6, DECLARED)]);
+        let elsewhere = answer(&other_view, Some(ID), &[node(0, UNIT, 6, DECLARED)]);
         assert!(!declared_nodes_match(&elsewhere, &id, &unit, &view, STUB));
         let unviewed: NodesResult = serde_json::from_value(
-            serde_json::json!({"nodes": [node(Some(ID), UNIT, 6, DECLARED)]}),
+            serde_json::json!({"symbol": ID, "nodes": [node(0, UNIT, 6, DECLARED)]}),
         )
         .expect("nodes answer");
         assert!(!declared_nodes_match(&unviewed, &id, &unit, &view, STUB));

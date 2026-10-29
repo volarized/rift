@@ -598,7 +598,6 @@ mod tests {
         Ok(DeclarationBinding::new(
             source_unit(path)?,
             SourceRange::new(range.0, range.1)?,
-            None,
         ))
     }
 

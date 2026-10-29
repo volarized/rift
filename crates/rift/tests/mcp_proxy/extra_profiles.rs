@@ -169,7 +169,12 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
 
     let nodes = proxied_call(&client, "nodes", &json!({"symbol":profile_id})).await?;
     let item = &nodes["nodes"][0];
-    assert_eq!(item["of"].as_str(), Some(profile_id.as_str()), "{nodes}");
+    assert_eq!(
+        nodes["symbol"].as_str(),
+        Some(profile_id.as_str()),
+        "{nodes}"
+    );
+    assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
     assert_eq!(item["source"].as_str(), Some(PROFILE_SOURCE), "{nodes}");
 
     for scope in ["local@other:api", "local:docs"] {

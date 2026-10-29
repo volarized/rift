@@ -3,12 +3,11 @@ use std::time::SystemTime;
 
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::read::{NodesParams, NodesResult, SymbolId};
+use rift_protocol::read::{Language, NodesParams, NodesResult};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
 use super::super::nodes::{
-    NodesPage, NodesSelector, PageBounds, declared_syntax, file_node, located_node, symbol_page,
-    text_file_node,
+    NodesPage, NodesSelector, PageBounds, UnitSource, position_page, symbol_page, unit_page,
 };
 use super::{CapturedMetadata, LocalSymbolMaterial, LocalSymbolViews, invalid, material_error};
 
@@ -54,25 +53,21 @@ impl LocalSymbolMaterial {
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         let view = request.view.as_ref().map_or("", CapturedViewId::as_str);
+        let bounds = PageBounds::served(self.index.results_max());
+        let index = self.index.as_ref();
         let answer = match NodesSelector::of(request, view)? {
-            NodesSelector::Position { path, position } => self.position_nodes(&path, position)?,
+            NodesSelector::Position {
+                path,
+                position,
+                cursor,
+            } => self.position_nodes(&path, position, cursor, view)?,
             NodesSelector::Symbol { id, key, offset } => {
-                let results_max = self.index.results_max();
-                let (declarations, _) =
-                    self.index.symbols_by_identity_page(&key, 0, results_max)?;
-                if declarations.is_empty() {
-                    return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
-                }
-                Ok(symbol_page(
-                    &declarations,
-                    |path| declared_syntax(path, self.index.syntax(path)),
-                    (id, view),
-                    offset,
-                    PageBounds::served(results_max),
-                )?)
+                symbol_page(index, (id, &key), (offset, view), bounds)?
+                    .ok_or(SymbolUnavailableReason::InsufficientCoverage)
             }
         };
         Ok(answer.map(|page| NodesResult {
+            symbol: page.symbol,
             nodes: page.nodes,
             node_cursor: page.node_cursor,
             view: None,
@@ -80,36 +75,41 @@ impl LocalSymbolMaterial {
         }))
     }
 
-    /// The captured nodes covering `position`, from the file node inward.
+    /// The captured nodes of the declaration or unit holding `position`.
     fn position_nodes(
         &self,
         path: &rift_core::ProjectPath,
         position: u64,
+        cursor: Option<&str>,
+        view: &str,
     ) -> Result<Result<NodesPage, SymbolUnavailableReason>, RiftError> {
-        let Some(file) = self.index.file(path) else {
-            let Some(text) = self.index.source(path) else {
-                return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
-            };
-            inside(text, position)?;
-            return Ok(Ok(NodesPage {
-                nodes: vec![text_file_node(path, text)],
-                node_cursor: None,
-            }));
+        let bounds = PageBounds::served(self.index.results_max());
+        if let Some(file) = self.index.file(path) {
+            inside(file.source(), position)?;
+            return Ok(position_page(
+                self.index.as_ref(),
+                (path, position),
+                (cursor, view),
+                bounds,
+            )?
+            .ok_or(SymbolUnavailableReason::InsufficientCoverage));
+        }
+        let Some(text) = self.index.source(path) else {
+            return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
         };
-        inside(file.source(), position)?;
-        let document = declared_syntax(path, self.index.syntax(path))?;
-        let mut nodes = vec![file_node(file)];
-        nodes.extend(document.nodes_at(position).into_iter().map(|node| {
-            let of = self
-                .index
-                .symbol_identity(path, node.range)
-                .map(|identity| SymbolId(identity.as_str().to_owned()));
-            located_node(file, node.kind, node.range, of)
-        }));
-        Ok(Ok(NodesPage {
-            nodes,
-            node_cursor: None,
-        }))
+        inside(text, position)?;
+        let unit = super::super::file_id(path);
+        Ok(Ok(unit_page(
+            UnitSource {
+                unit: &unit,
+                language: &Language::text(),
+                source: text,
+            },
+            None,
+            cursor,
+            view,
+            bounds,
+        )?))
     }
 }
 
