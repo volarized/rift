@@ -12,6 +12,39 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    graph_dataset_limit,
+    slug = "rift.search.graph_dataset_limit",
+    message = "graph dataset needs {required} {bound}, exceeding accepted limit {limit}",
+    action = "narrow the facts the dataset is built from below {limit} {bound} and retry",
+    fields = {
+        bound: required(string),
+        limit: required(unsigned),
+        required: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
+    graph_identity_invalid,
+    slug = "rift.search.graph_identity_invalid",
+    message = "graph fact identity {identity} is not an IRI of the form {expected}",
+    action = "pass identities in their canonical wire form and retry",
+    fields = {
+        expected: required(string),
+        identity: required(string),
+    },
+);
+
+__rift_error_definition!(
+    graph_limit_zero,
+    slug = "rift.search.graph_limit_zero",
+    message = "graph query bound {bound} is zero",
+    action = "set every graph query bound above zero",
+    fields = {
+        bound: required(string),
+    },
+);
+
+__rift_error_definition!(
     model_cache_unavailable,
     slug = "rift.search.model_cache_unavailable",
     message = "model cache directory could not be resolved from environment variables {variables}",
@@ -73,6 +106,77 @@ __rift_error_definition!(
         expected: required(string),
         model: required(string),
         source: optional(source),
+    },
+);
+
+__rift_error_definition!(
+    query_answer_limit,
+    slug = "rift.search.query_answer_limit",
+    message = "SPARQL answer needs more than {limit} {bound}",
+    action = "narrow the query with LIMIT or tighter patterns and resend the request",
+    fields = {
+        bound: required(string),
+        limit: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
+    query_cancelled,
+    slug = "rift.search.query_cancelled",
+    message = "SPARQL evaluation was cancelled",
+    action = "resend the request",
+    fields = {},
+);
+
+__rift_error_definition!(
+    query_deadline_exceeded,
+    slug = "rift.search.query_deadline_exceeded",
+    message = "SPARQL evaluation exceeded its deadline of {timeout_ms} ms",
+    action = "narrow the query with tighter patterns and resend the request",
+    fields = {
+        timeout_ms: required(unsigned),
+    },
+);
+
+__rift_error_definition!(
+    query_evaluation_failed,
+    slug = "rift.search.query_evaluation_failed",
+    message = "SPARQL evaluation failed: {detail}",
+    action = "correct the query and resend the request",
+    fields = {
+        detail: required(string),
+        source: optional(source),
+    },
+);
+
+__rift_error_definition!(
+    query_feature_refused,
+    slug = "rift.search.query_feature_refused",
+    message = "SPARQL query uses {feature}, which the read-only graph does not serve",
+    action = "send a SELECT or ASK query without {feature} and resend the request",
+    fields = {
+        feature: required(string),
+    },
+);
+
+__rift_error_definition!(
+    query_syntax_invalid,
+    slug = "rift.search.query_syntax_invalid",
+    message = "SPARQL query does not parse: {detail}",
+    action = "correct the SPARQL 1.1 query syntax at the reported position and resend the request",
+    fields = {
+        detail: required(string),
+    },
+);
+
+__rift_error_definition!(
+    query_too_large,
+    slug = "rift.search.query_too_large",
+    message = "SPARQL query of {observed} bytes exceeds accepted limit {limit}",
+    action = "shorten the query below {limit} bytes and resend the request",
+    fields = {
+        limit: required(unsigned),
+        observed: required(unsigned),
     },
 );
 

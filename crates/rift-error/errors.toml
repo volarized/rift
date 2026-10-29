@@ -817,6 +817,56 @@ fields = { query_width = { type = "unsigned" }, stored_width = { type = "unsigne
 message = "embedded coordinate {coordinate} cannot be represented in the stored f32 format"
 action = "use an embedding model that returns finite coordinates within the stored range"
 fields = { coordinate = { type = "string" } }
+[error.search.graph_limit_zero]
+message = "graph query bound {bound} is zero"
+action = "set every graph query bound above zero"
+fields = { bound = { type = "string" } }
+
+[error.search.graph_identity_invalid]
+message = "graph fact identity {identity} is not an IRI of the form {expected}"
+action = "pass identities in their canonical wire form and retry"
+fields = { identity = { type = "string" }, expected = { type = "string" } }
+
+[error.search.graph_dataset_limit]
+message = "graph dataset needs {required} {bound}, exceeding accepted limit {limit}"
+action = "narrow the facts the dataset is built from below {limit} {bound} and retry"
+fields = { bound = { type = "string" }, limit = { type = "unsigned" }, required = { type = "unsigned" } }
+
+[error.search.query_too_large]
+message = "SPARQL query of {observed} bytes exceeds accepted limit {limit}"
+action = "shorten the query below {limit} bytes and resend the request"
+fields = { limit = { type = "unsigned" }, observed = { type = "unsigned" } }
+
+[error.search.query_syntax_invalid]
+message = "SPARQL query does not parse: {detail}"
+action = "correct the SPARQL 1.1 query syntax at the reported position and resend the request"
+fields = { detail = { type = "string" } }
+
+[error.search.query_feature_refused]
+message = "SPARQL query uses {feature}, which the read-only graph does not serve"
+action = "send a SELECT or ASK query without {feature} and resend the request"
+fields = { feature = { type = "string" } }
+
+[error.search.query_answer_limit]
+message = "SPARQL answer needs more than {limit} {bound}"
+action = "narrow the query with LIMIT or tighter patterns and resend the request"
+fields = { bound = { type = "string" }, limit = { type = "unsigned" } }
+
+[error.search.query_deadline_exceeded]
+message = "SPARQL evaluation exceeded its deadline of {timeout_ms} ms"
+action = "narrow the query with tighter patterns and resend the request"
+fields = { timeout_ms = { type = "unsigned" } }
+
+[error.search.query_cancelled]
+message = "SPARQL evaluation was cancelled"
+action = "resend the request"
+fields = {}
+
+[error.search.query_evaluation_failed]
+message = "SPARQL evaluation failed: {detail}"
+action = "correct the query and resend the request"
+fields = { detail = { type = "string" }, source = { type = "error", role = "source", optional = true } }
+
 [error.syntax.zero_limit]
 message = "syntax bound {bound} is zero"
 action = "set syntax bounds above zero"
