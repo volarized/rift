@@ -46,19 +46,19 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     Ok(())
 }
 
-/// Writes one node: kind and facts, byte range, identity, symbol, and regions. The identity is
-/// a content digest that equal nodes share, so the range is what places this one.
+/// Writes one node: kind and facts, byte range, address, symbol, and regions.
 fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextError> {
     let Node {
-        id,
         symbol,
+        declaration,
+        index,
         unit: _,
         language: _,
         kind,
         facets,
         range,
         regions,
-        parent: _,
+        parent,
         extensions: _,
     } = node;
     let mut facts = Facts::default();
@@ -75,11 +75,25 @@ fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextEr
     }
     lines.head(facts.as_str())?;
     lines.line(0, &format!("{}..{}", range.start, range.end))?;
-    lines.line(0, &id.0)?;
+    lines.line(0, &address(*declaration, *index, *parent))?;
     if let Some(symbol) = symbol {
         lines.line(0, &symbol.0)?;
     }
     lines.line(0, &regions_fact(regions)?)
+}
+
+/// The node's address as `declaration D · index I · parent P`, each part present when the
+/// node carries it.
+fn address(declaration: Option<u64>, index: u64, parent: Option<u64>) -> String {
+    let mut facts = Facts::default();
+    if let Some(declaration) = declaration {
+        facts.push(&format!("declaration {declaration}"));
+    }
+    facts.push(&format!("index {index}"));
+    if let Some(parent) = parent {
+        facts.push(&format!("parent {parent}"));
+    }
+    facts.as_str().to_owned()
 }
 
 /// The regions as `role START..END`, joined like facts. Empty without regions.

@@ -25,7 +25,7 @@ use rift_server::ReadService;
 use tempfile::TempDir;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
-type RelationshipRow = (String, String, String, String, u64, u64, Option<String>);
+type RelationshipRow = (String, String, String, String, u64, u64);
 const SYMBOL_PAGES_MAX: u64 = 32;
 
 const SOURCE_A: &str = "pub struct Beacon;\npub fn old() {}\n";
@@ -228,7 +228,6 @@ fn relationship_rows(
                 occurrence.unit().to_string(),
                 range.start(),
                 range.end(),
-                occurrence.node().map(|node| node.0.clone()),
             ));
         }
     }

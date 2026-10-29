@@ -460,7 +460,6 @@ struct BindingKey {
     unit: String,
     start: u64,
     end: u64,
-    node: Option<String>,
 }
 
 fn binding_key(binding: &rift_core::DeclarationBinding) -> BindingKey {
@@ -468,7 +467,6 @@ fn binding_key(binding: &rift_core::DeclarationBinding) -> BindingKey {
         unit: binding.unit().to_string(),
         start: binding.range().start(),
         end: binding.range().end(),
-        node: binding.node().map(|node| format!("{node:?}")),
     }
 }
 
@@ -1058,7 +1056,6 @@ mod tests {
         DeclarationBinding::new(
             source_unit(path),
             SourceRange::new(start, start + 8).expect("range"),
-            None,
         )
     }
 

@@ -35,7 +35,7 @@ pub use lexical::{
     LexicalChange, LexicalIndexLimits, LexicalMatch, LexicalRanking, LexicalSearchIndex,
     LexicalStamp, PublishedIndex, RevisionScoped, is_connection_unavailable,
 };
-pub use located_node::{LocatedNode, whole_range};
+pub use located_node::{LocatedNode, NodeAddress, whole_range};
 pub use relationship::{RELATIONSHIP_EDGES_MAX, RelationshipEdge, RelationshipStore};
 pub use revision::RevisionPaths;
 pub use rift_analysis::documentation::{

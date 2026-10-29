@@ -116,12 +116,9 @@ fn assert_wire_hygiene(name: &str, request: &Value, structured: &Value) {
                 expects_source,
                 "a hit carries source exactly when the request includes it: {request:#} {hit:#}"
             );
-            // A package hit carries `unit` and no node address.
-            let addressable = hit.get("unit").is_none();
-            assert_eq!(
-                hit.get("node").is_some(),
-                expects_source && addressable,
-                "the node address rides with source on a project hit: {request:#} {hit:#}"
+            assert!(
+                hit.get("node").is_none(),
+                "a declaration carries no node identity: {request:#} {hit:#}"
             );
             if !expects_history {
                 assert!(

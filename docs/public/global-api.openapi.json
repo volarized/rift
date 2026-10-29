@@ -2169,16 +2169,6 @@
         ],
         "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list."
       },
-      "NodeId": {
-        "type": "string",
-        "examples": [
-          "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-        ],
-        "minLength": 78,
-        "maxLength": 206,
-        "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-        "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do."
-      },
       "TypeBinding": {
         "type": "object",
         "properties": {
@@ -4063,7 +4053,7 @@
           },
           "hit": {
             "$ref": "#/components/schemas/SearchHitTarget",
-            "description": "What was found. A symbol, a node, a file, a documentation block, or a commit -\nwhichever `target` allowed."
+            "description": "What was found. A symbol, a file, a documentation block, or a commit -\nwhichever `target` allowed."
           },
           "score": {
             "type": "number",
@@ -4124,7 +4114,7 @@
         "required": [
           "hit"
         ],
-        "description": "One search hit. Its file, node, symbol, or commit payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
+        "description": "One search hit. Its file, symbol, documentation, or commit payload carries the canonical\nidentity. Dependency and synthetic symbols can have no readable source; file hits cannot.",
         "allOf": [
           {
             "oneOf": [
@@ -4159,7 +4149,6 @@
                   "properties": {
                     "target": {
                       "enum": [
-                        "node",
                         "file"
                       ]
                     }
@@ -4285,25 +4274,6 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "node": {
-                "$ref": "#/components/schemas/NodeId",
-                "description": "Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`\nlocate it."
-              },
-              "target": {
-                "type": "string",
-                "const": "node"
-              }
-            },
-            "required": [
-              "target",
-              "node"
-            ],
-            "description": "A node hit: one place in a syntax tree, without its enclosing symbol record."
-          },
-          {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
               "size": {
                 "type": "integer",
                 "format": "uint64",
@@ -4393,7 +4363,7 @@
           "relationship",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `relationship` retains source-node evidence and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `relationship` retains its occurrence and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -4493,14 +4463,6 @@
             "$ref": "#/components/schemas/SymbolId",
             "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
           },
-          "evidence": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/NodeId"
-            },
-            "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
-            "default": []
-          },
           "occurrence": {
             "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node.",
             "$ref": "#/components/schemas/SourceUnitSpan"
@@ -4529,7 +4491,7 @@
           "to",
           "derivation"
         ],
-        "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read."
+        "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
       },
       "RelationshipDerivation": {
         "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
@@ -6355,10 +6317,6 @@
             "minimum": 1,
             "description": "One-based line where this declaration begins."
           },
-          "node": {
-            "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration.",
-            "$ref": "#/components/schemas/NodeId"
-          },
           "source": {
             "type": "string",
             "description": "Source excerpt when requested and available.",
@@ -7348,23 +7306,25 @@
           "nodes",
           "source"
         ],
-        "description": "The nodes covering one position, with identities derived from their source bytes.",
+        "description": "The nodes covering one position, outermost first, each addressed by its place inside its\nsymbol or its unit.",
         "examples": [
           {
             "nodes": [
               {
-                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
+                "index": 1,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "source_file",
                 "range": {
                   "start": 0,
                   "end": 356
-                }
+                },
+                "parent": 0
               },
               {
-                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
                 "symbol": "rift://symbol/local/rust/app/config/load_config",
+                "declaration": 0,
+                "index": 0,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "function_item",
@@ -7391,11 +7351,12 @@
                       "end": 355
                     }
                   }
-                ],
-                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"
+                ]
               },
               {
-                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
+                "declaration": 0,
+                "index": 13,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "block",
@@ -7403,10 +7364,12 @@
                   "start": 281,
                   "end": 355
                 },
-                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
+                "parent": 0
               },
               {
-                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
+                "declaration": 0,
+                "index": 25,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "call_expression",
@@ -7417,10 +7380,12 @@
                   "start": 334,
                   "end": 353
                 },
-                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189"
+                "parent": 13
               },
               {
-                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
+                "declaration": 0,
+                "index": 26,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
@@ -7428,7 +7393,7 @@
                   "start": 334,
                   "end": 346
                 },
-                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690"
+                "parent": 25
               }
             ],
             "source": [
@@ -7445,13 +7410,23 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "id": {
-            "$ref": "#/components/schemas/NodeId",
-            "description": "Unique identifier of this source region, and the URI that resolves it."
-          },
           "symbol": {
-            "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment.",
+            "description": "The symbol whose declaration holds this node. Absent for a node outside every\ndeclaration: a file's root, an import, a top-level statement.",
             "$ref": "#/components/schemas/SymbolId"
+          },
+          "declaration": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Ordinal of the declaration holding this node among the declarations of `symbol`, from\n0 in the order a symbol read lists them. Present exactly when `symbol` is."
+          },
+          "index": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0."
           },
           "unit": {
             "$ref": "#/components/schemas/FileId",
@@ -7486,8 +7461,11 @@
             "default": []
           },
           "parent": {
-            "description": "The region this one is nested inside. Absent at the top level of a unit.",
-            "$ref": "#/components/schemas/NodeId"
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "`index` of the node this one is nested inside, in the same declaration or unit. Absent\nfor node 0."
           },
           "extensions": {
             "$ref": "#/components/schemas/Extensions",
@@ -7496,13 +7474,13 @@
           }
         },
         "required": [
-          "id",
+          "index",
           "unit",
           "language",
           "kind",
           "range"
         ],
-        "description": "One node of a file's concrete syntax tree. It identifies a source range and\nprovider-local syntax kind. `symbol` connects the node to semantic identity when the\nlanguage supplies one."
+        "description": "One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node\ninside a declaration's item subtree is node `index` of declaration `declaration` of\n`symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in\npre-order from 0 at the declaration's item node, or from 0 at the unit's file node, and\nskip the subtrees of nested declarations, whose nodes belong to the nested symbol. The address\nnames a place at the read's revision: an edit renumbers the nodes after it."
       },
       "NodeFacet": {
         "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",

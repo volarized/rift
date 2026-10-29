@@ -741,8 +741,7 @@ bounds retain the definite miss and report incomplete alternative work.
 
 <ReadExample name="missing-symbol" />
 
-`include` selects projections: `source` adds declaration excerpts and node identities when
-available, `documentation` adds bounded referring documentation, and `history` adds the
+`include` selects projections: `source` adds declaration excerpts when available, `documentation` adds bounded referring documentation, and `history` adds the
 logical symbol's timeline. Omitted `include` defaults to `["source"]`; `[]` requests none.
 
 `view` retains a preceding immutable selection. Its expiry refuses the read; it never selects
@@ -814,10 +813,14 @@ The first entry of `nodes` is the file's outermost node, and its `source` excerp
 file's source. A declaration's source is read through the `source` member of its
 [`get_symbol`](#tool-get_symbol) declarations.
 
-Each node's `id` is a [`NodeId`](/docs/developer/protocol/reference#NodeId): the SHA-256 of the
-node's language, kind, and bytes. Two nodes with equal bytes share one `id`, and an edit outside
-a node leaves its `id` unchanged. The `id` therefore names content alone, and a caller **MUST**
-carry the node's `unit` and `range` beside it to address one place.
+A node carries no identity. The server **MUST** address each node by its place: a node inside a
+declaration's item subtree carries `symbol`, the `declaration` ordinal among that symbol's
+declarations, and its pre-order `index` from the item node at 0; a node outside every declaration
+carries its `index` in the `unit` alone, from the unit's file node at 0, so the file's root is
+1. Nodes of a nested declaration
+count toward the nested symbol. `parent` names the `index` of the enclosing node in the same
+declaration or unit, and is absent for node 0. An address names a place at the read's revision,
+so an edit renumbers the nodes after it.
 
 This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
 
@@ -1105,7 +1108,7 @@ The further lines of the symbol hit follow unchanged: the first documentation li
 
 A root whose symbol is no hit of the result writes one line: `at ` and the symbol identity. A branch whose symbol is no hit writes its head line and the `at` line, and no other line. A branch is no hit when its own hit lies on another page. The root is no hit because a walk does not return the symbol it starts from. When a hit outside the walk is the root symbol, as a `query` beside the `traversal` can return it, the server **MUST** write that hit as the root and not as an item.
 
-A file hit has the location and the `matched_by` field names on its first line, then the source directly below. A node hit adds its byte range as `START..END`, when the hit carries `range`, and then the node identity between those two lines. A documentation hit starts with the heading path joined by ` > `, or `documentation` without headings, then the location of the block and the `matched_by` field names, the identity of the symbol the block documents, and the source.
+A file hit has the location and the `matched_by` field names on its first line, then the source directly below. A documentation hit starts with the heading path joined by ` > `, or `documentation` without headings, then the location of the block and the `matched_by` field names, the identity of the symbol the block documents, and the source.
 
 A commit hit has these lines:
 
@@ -1117,7 +1120,7 @@ A commit hit has these lines:
 
 A found `get_symbol` result writes the declaration, exact identity, exceptional facts,
 then documentation and requested documentation context or history. A `declarations:` section
-retains each physical location, byte range, available node identity, and requested source.
+retains each physical location, byte range, and requested source.
 A returned `declaration_cursor` names remaining bindings. There is no hit count or hit paging.
 A missing result writes `error: symbol_not_found`, the requested identity and bounded
 alternatives below `closest matches:` when alternatives exist;
@@ -1128,7 +1131,7 @@ A `nodes` result lists the nodes from the outermost to the innermost. Each node 
 
 - the `kind`, then ` · N lines` when its excerpt holds more than one line, then `generated` and `test` when the node has those facets
 - the byte range as `START..END`
-- the node identity
+- the address as `declaration D · index I · parent P`, each part present when the node carries it
 - the symbol identity, when the node has one
 - the regions as `role START..END`, joined by ` · `, when the node has regions
 
@@ -1149,8 +1152,8 @@ The layout leaves these fields to `structuredContent`:
 - the byte range of a symbol that has an identity
 - the `distance` of a walk hit, which the level of its branch shows, and the `relationship` entry of its `matched_by`, which the tree shows
 - the size and languages of a file hit
-- the unit, language, other facets, parent, and byte range of a node
-- the `node` of a `get_symbol` hit, the `reference` of a referenced block, the `source` and `documentation_revision` of a documentation hit and of a referenced block, and the `documentation_revision` of a documentation context
+- the unit, language, and other facets of a node
+- the `reference` of a referenced block, the `source` and `documentation_revision` of a documentation hit and of a referenced block, and the `documentation_revision` of a documentation context
 
 The server **MUST** write a value that is lowercase hex of at least 8 characters as its first 8 characters: the revision of a commit hit or a history entry, and each digest in a warning line or a resource text. The server resolves a request revision with git revision parsing, which accepts a commit id prefix, so a caller **MAY** send the cut value wherever a request takes a revision. `structuredContent` carries the full revision.
 

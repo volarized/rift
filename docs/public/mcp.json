@@ -950,16 +950,6 @@
             "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
             "type": "string"
           },
-          "NodeId": {
-            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
-            "examples": [
-              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-            ],
-            "maxLength": 206,
-            "minLength": 78,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-            "type": "string"
-          },
           "NotebookCell": {
             "additionalProperties": false,
             "description": "A selected cell addressed within its parent notebook.",
@@ -2768,10 +2758,6 @@
                 "minimum": 1,
                 "type": "integer"
               },
-              "node": {
-                "$ref": "#/$defs/NodeId",
-                "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration."
-              },
               "origin": {
                 "$ref": "#/$defs/SymbolOrigin",
                 "description": "Contextual owner and source kind of this declaration's source."
@@ -3568,7 +3554,7 @@
       }
     },
     {
-      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each node's identity is a digest of its language, kind,\nand bytes, so equal nodes share one identity and an edit elsewhere in the\nfile leaves it unchanged; `unit` and `range` locate the node. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and `source` and\ncarries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.\nPer-file refusals keep their typed errors. A visible path no syntax\nprovider parses refuses `capability_unavailable`, naming the extension.",
+      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each node is addressed by its place: node `index` of\ndeclaration `declaration` of `symbol`, or node `index` of its unit\noutside every declaration, with `parent` an index in the same holder;\nan edit renumbers the nodes after it. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and `source` and\ncarries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.\nPer-file refusals keep their typed errors. A visible path no syntax\nprovider parses refuses `capability_unavailable`, naming the extension.",
       "input_schema": {
         "$defs": {
           "CapturedViewId": {
@@ -3980,8 +3966,15 @@
           },
           "Node": {
             "additionalProperties": false,
-            "description": "One node of a file's concrete syntax tree. It identifies a source range and\nprovider-local syntax kind. `symbol` connects the node to semantic identity when the\nlanguage supplies one.",
+            "description": "One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node\ninside a declaration's item subtree is node `index` of declaration `declaration` of\n`symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in\npre-order from 0 at the declaration's item node, or from 0 at the unit's file node, and\nskip the subtrees of nested declarations, whose nodes belong to the nested symbol. The address\nnames a place at the read's revision: an edit renumbers the nodes after it.",
             "properties": {
+              "declaration": {
+                "description": "Ordinal of the declaration holding this node among the declarations of `symbol`, from\n0 in the order a symbol read lists them. Present exactly when `symbol` is.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
+              },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
                 "default": {},
@@ -3995,9 +3988,12 @@
                 },
                 "type": "array"
               },
-              "id": {
-                "$ref": "#/$defs/NodeId",
-                "description": "Content identity of this node. Nodes of one language and kind with equal bytes share\nit; `unit` and `range` locate this one."
+              "index": {
+                "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
               },
               "kind": {
                 "$ref": "#/$defs/ExactKind",
@@ -4008,8 +4004,11 @@
                 "description": "The grammar that produced this node. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
               },
               "parent": {
-                "$ref": "#/$defs/NodeId",
-                "description": "The region this one is nested inside. Absent at the top level of a unit."
+                "description": "`index` of the node this one is nested inside, in the same declaration or unit. Absent\nfor node 0.",
+                "format": "uint64",
+                "maximum": 9007199254740991,
+                "minimum": 0,
+                "type": "integer"
               },
               "range": {
                 "$ref": "#/$defs/TextRange",
@@ -4025,7 +4024,7 @@
               },
               "symbol": {
                 "$ref": "#/$defs/SymbolId",
-                "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment."
+                "description": "The symbol whose declaration holds this node. Absent for a node outside every\ndeclaration: a file's root, an import, a top-level statement."
               },
               "unit": {
                 "$ref": "#/$defs/FileId",
@@ -4033,7 +4032,7 @@
               }
             },
             "required": [
-              "id",
+              "index",
               "unit",
               "language",
               "kind",
@@ -4135,16 +4134,6 @@
                 "type": "string"
               }
             ]
-          },
-          "NodeId": {
-            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
-            "examples": [
-              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-            ],
-            "maxLength": 206,
-            "minLength": 78,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-            "type": "string"
           },
           "NodeRegion": {
             "additionalProperties": false,
@@ -5732,9 +5721,10 @@
           {
             "nodes": [
               {
-                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
+                "index": 1,
                 "kind": "source_file",
                 "language": "rust",
+                "parent": 0,
                 "range": {
                   "end": 356,
                   "start": 0
@@ -5742,14 +5732,14 @@
                 "unit": "rift://file/src/config.rs"
               },
               {
+                "declaration": 0,
                 "facets": [
                   "declaration",
                   "definition"
                 ],
-                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
+                "index": 0,
                 "kind": "function_item",
                 "language": "rust",
-                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
                 "range": {
                   "end": 355,
                   "start": 218
@@ -5774,39 +5764,45 @@
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
+                "declaration": 0,
+                "index": 13,
                 "kind": "block",
                 "language": "rust",
-                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
+                "parent": 0,
                 "range": {
                   "end": 355,
                   "start": 281
                 },
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs"
               },
               {
+                "declaration": 0,
                 "facets": [
                   "expression"
                 ],
-                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
+                "index": 25,
                 "kind": "call_expression",
                 "language": "rust",
-                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
+                "parent": 13,
                 "range": {
                   "end": 353,
                   "start": 334
                 },
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
+                "declaration": 0,
+                "index": 26,
                 "kind": "identifier",
                 "language": "rust",
-                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
+                "parent": 25,
                 "range": {
                   "end": 346,
                   "start": 334
                 },
+                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs"
               }
             ],
@@ -7327,7 +7323,7 @@
           },
           "GraphHop": {
             "additionalProperties": false,
-            "description": "One auditable step in a search traversal. `relationship` retains source-node evidence and\nderivation; `direction` records how the walk followed it.",
+            "description": "One auditable step in a search traversal. `relationship` retains its occurrence and\nderivation; `direction` records how the walk followed it.",
             "properties": {
               "direction": {
                 "$ref": "#/$defs/HopDirection",
@@ -7412,16 +7408,6 @@
                 "type": "string"
               }
             ]
-          },
-          "NodeId": {
-            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
-            "examples": [
-              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-            ],
-            "maxLength": 206,
-            "minLength": 78,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-            "type": "string"
           },
           "NotebookCell": {
             "additionalProperties": false,
@@ -8759,7 +8745,7 @@
           },
           "Relationship": {
             "additionalProperties": false,
-            "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read.",
+            "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read.",
             "properties": {
               "confidence": {
                 "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
@@ -8771,14 +8757,6 @@
               "derivation": {
                 "$ref": "#/$defs/RelationshipDerivation",
                 "description": "How this edge was established."
-              },
-              "evidence": {
-                "default": [],
-                "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
-                "items": {
-                  "$ref": "#/$defs/NodeId"
-                },
-                "type": "array"
               },
               "extensions": {
                 "$ref": "#/$defs/Extensions",
@@ -9058,7 +9036,6 @@
                       "properties": {
                         "target": {
                           "enum": [
-                            "node",
                             "file"
                           ]
                         }
@@ -9074,7 +9051,7 @@
                 }
               }
             ],
-            "description": "One search hit. Its file, node, symbol, or commit payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
+            "description": "One search hit. Its file, symbol, documentation, or commit payload carries the canonical\nidentity. Dependency and synthetic symbols can have no readable source; file hits cannot.",
             "properties": {
               "change": {
                 "$ref": "#/$defs/SymbolChange",
@@ -9089,7 +9066,7 @@
               },
               "hit": {
                 "$ref": "#/$defs/SearchHitTarget",
-                "description": "What was found. A symbol, a node, a file, a documentation block, or a commit -\nwhichever `target` allowed."
+                "description": "What was found. A symbol, a file, a documentation block, or a commit -\nwhichever `target` allowed."
               },
               "line": {
                 "description": "The 1-based source line where the hit begins, or absent with `range`.",
@@ -9183,25 +9160,6 @@
                 "required": [
                   "target",
                   "symbol"
-                ],
-                "type": "object"
-              },
-              {
-                "additionalProperties": false,
-                "description": "A node hit: one place in a syntax tree, without its enclosing symbol record.",
-                "properties": {
-                  "node": {
-                    "$ref": "#/$defs/NodeId",
-                    "description": "Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`\nlocate it."
-                  },
-                  "target": {
-                    "const": "node",
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "target",
-                  "node"
                 ],
                 "type": "object"
               },
