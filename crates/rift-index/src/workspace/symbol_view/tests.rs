@@ -136,7 +136,16 @@ fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
     let path = rift_core::ProjectPath::new("component.ts").expect("path");
     let position = u64::try_from(text.find("title").expect("template bytes")).expect("position");
     let original = index
-        .nodes(&path, position)
+        .syntax(&path)
+        .map(|document| {
+            document.map(|document| {
+                document
+                    .nodes_at(position)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+        })
         .expect("original nodes")
         .expect("selected source");
     assert!(original.iter().any(|node| node.kind == "interpolation"));
@@ -148,22 +157,36 @@ fn captured_nodes_keep_inline_framework_source_after_current_context_changes() {
     fs::write(root.path().join("package.json"), "{\"name\":\"changed\"}")
         .expect("new package context");
     assert_eq!(
-        view.nodes(&path, position).expect("captured nodes"),
+        view.syntax(&path)
+            .map(|document| document.map(|document| document
+                .nodes_at(position)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()))
+            .expect("captured nodes"),
         Some(original)
     );
     assert_eq!(view.file(&path).expect("captured source").source(), text);
     assert_eq!(view.retained_material_bytes(), charge);
     assert_eq!(
-        view.nodes(&path, u64::MAX).expect("outside source"),
+        view.syntax(&path)
+            .map(|document| document.map(|document| document
+                .nodes_at(u64::MAX)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()))
+            .expect("outside source"),
         Some(Vec::new())
     );
     assert!(
-        view.nodes(
-            &rift_core::ProjectPath::new("missing.ts").expect("missing path"),
-            0
-        )
-        .expect("missing captured source")
-        .is_none()
+        view.syntax(&rift_core::ProjectPath::new("missing.ts").expect("missing path"))
+            .map(|document| document.map(|document| document
+                .nodes_at(0)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()))
+            .expect("missing captured source")
+            .is_none()
     );
 }
 

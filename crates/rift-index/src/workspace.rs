@@ -44,9 +44,13 @@ use rift_ranking::{
     IndexDocument, ParsedQuery, RankingInput, SIGNATURE_BYTES_MAX, SearchableField,
     identifier_terms,
 };
-use rift_syntax::{SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource, SyntaxSymbol, registry};
+use rift_syntax::{
+    ByteRange, NodeMatch, SyntaxDocument, SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource,
+    SyntaxSymbol, registry,
+};
 use sha2::{Digest as _, Sha256};
 
+use crate::LocatedNode;
 use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
@@ -4299,21 +4303,17 @@ impl WorkspaceIndex {
         checked_chunk_bytes_max(self.text_chunk_bytes_max())
     }
 
-    /// Parses one selected source path and returns syntax nodes covering byte position.
+    /// Parses one held source file again and returns its document with the complete node
+    /// table, which the index itself does not keep.
     ///
-    /// The selected provider and syntax bounds belong to this index. `None` means no
-    /// provider selected the path; `Skipped` carries a catalog or syntax warning; `Included`
-    /// carries the parsed file and matching nodes.
+    /// The selected provider, framework context, and syntax bounds belong to this index.
+    /// `None` means the index holds no parsed file at `path`.
     ///
     /// # Errors
     ///
     /// Returns [`RiftError`] when the provider refuses captured source or path
     /// policy no longer identifies the held file.
-    pub fn nodes(
-        &self,
-        path: &ProjectPath,
-        position: u64,
-    ) -> Result<Option<Vec<SyntaxNode>>, RiftError> {
+    pub fn syntax(&self, path: &ProjectPath) -> Result<Option<SyntaxDocument>, RiftError> {
         let Some(file) = self.file(path) else {
             return Ok(None);
         };
@@ -4344,9 +4344,35 @@ impl WorkspaceIndex {
                     .cause(error)
                     .error()
             })?;
-        Ok(Some(
-            syntax.nodes_at(position).into_iter().cloned().collect(),
-        ))
+        Ok(Some(syntax))
+    }
+
+    /// Resolves the node at one location: the innermost node spanning `range` exactly, or
+    /// under [`NodeMatch::Enclosing`] the innermost one containing it.
+    ///
+    /// A held file without a syntax provider answers its file node, which spans the whole
+    /// file, alone. `None` when the index holds no file at `path` or no node matches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError`] when the held file no longer parses under this index's provider
+    /// and bounds.
+    pub fn node_at(
+        &self,
+        path: &ProjectPath,
+        range: ByteRange,
+        matching: NodeMatch,
+    ) -> Result<Option<LocatedNode>, RiftError> {
+        if let Some(document) = self.syntax(path)? {
+            let source = self.file(path).map_or("", IndexedFile::source);
+            return Ok(document
+                .node_at(range, matching)
+                .map(|node| LocatedNode::of(document.language(), node.kind, node.range, source))
+                .or_else(|| LocatedNode::file(document.language(), source, range, matching)));
+        }
+        Ok(self
+            .text_file(path)
+            .and_then(|file| LocatedNode::file(&Language::text(), file.content(), range, matching)))
     }
 
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
@@ -8933,7 +8959,14 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         assert_eq!(
-            index.nodes(&path, 4).expect("node parse"),
+            index
+                .syntax(&path)
+                .map(|document| document.map(|document| document
+                    .nodes_at(4)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()))
+                .expect("node parse"),
             Some(expected),
             "reparsed nodes preserve complete provider rows and order"
         );
@@ -10230,7 +10263,12 @@ mod tests {
         assert!(index.file(&missing).is_none());
         assert!(
             index
-                .nodes(&missing, 0)
+                .syntax(&missing)
+                .map(|document| document.map(|document| document
+                    .nodes_at(0)
+                    .into_iter()
+                    .cloned()
+                    .collect::<Vec<_>>()))
                 .expect("missing path has no node parse")
                 .is_none()
         );

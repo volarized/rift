@@ -58,9 +58,10 @@ impl LocalSymbolMaterial {
                 "position must be inside captured source",
             ));
         }
-        let Some(matched) = self.index.nodes(&path, request.position)? else {
+        let Some(document) = self.index.syntax(&path)? else {
             return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
         };
+        let matched = document.nodes_at(request.position);
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         let nodes = matched

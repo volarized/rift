@@ -798,6 +798,25 @@ pub struct NodeId(
 /// The scheme and kind prefix every [`NodeId`] starts with.
 const NODE_ID_PREFIX: &str = "rift://node/";
 
+/// The kind of the node that spans one whole source unit. Every source unit has one, the
+/// outermost node of its tree, whether or not a syntax provider parses the unit.
+pub const FILE_NODE_KIND: &str = "file";
+
+/// The language of a source unit no syntax provider parses. Its only node is its file node.
+pub const TEXT_LANGUAGE_NAME: &str = "text";
+
+impl Language {
+    /// The language of a source unit no syntax provider parses: [`TEXT_LANGUAGE_NAME`], with
+    /// no dialect.
+    #[must_use]
+    pub fn text() -> Self {
+        Self {
+            name: TEXT_LANGUAGE_NAME.to_owned(),
+            dialect: None,
+        }
+    }
+}
+
 impl NodeId {
     /// Mints the content identity of one syntax node from its language, kind, and bytes.
     ///

@@ -1013,10 +1013,15 @@ impl ReadService {
             .file(&path)
             .ok_or_else(|| self.missing_file_fault(&path))?;
         validate_node_position(file, params.position)?;
-        let nodes = self
+        let document = self
             .index
-            .nodes(&path, params.position)?
+            .syntax(&path)?
             .ok_or_else(|| self.missing_file_fault(&path))?;
+        let nodes = document
+            .nodes_at(params.position)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
         let mut warnings = self.revisions.warnings();
         warnings.extend(
             self.index
