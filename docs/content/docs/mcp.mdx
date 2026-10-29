@@ -581,8 +581,9 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-Every answer of `search`, `get_symbol`, and `nodes` names the revision it was read at, such as
-`rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
+Every `get_symbol` and `nodes` answer names the revision it was read at, such as
+`rift://revision/tree/<digest>` for the working tree the index serves, and so does a `search`
+answer that read one project tree. The agent can read older
 project code by adding `revision` to the same tools. For example, this reads the function from
 `main` without changing the working tree:
 

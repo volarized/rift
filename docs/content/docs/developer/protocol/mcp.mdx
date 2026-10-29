@@ -1230,10 +1230,11 @@ that names one point on the history axis:
 - `rift://revision/tree/<digest>` - the working tree the index serves, by its complete SHA-256
   digest
 
-Every `get_symbol` and `nodes` answer carries the `revision` it was read at, and a `search`
-answer carries the revision of the project tree it read. An answer names a commit, a release, or
-a tree, never a reference, so a caller **MAY** send the reported revision back to pin a later
-read to the same point.
+Every `get_symbol` and `nodes` answer carries the `revision` it was read at. A `search` answer
+carries the revision of the one project tree it read, and omits it when it merged several trees,
+read packages alone, or answered from a captured view. An answer names a commit, a release, or a
+tree, never a reference, so a caller **MAY** send the reported revision back to pin a later read
+to the same point.
 
 A git revision reads committed bytes. The server resolves it in place from the workspace's git
 objects, with no checkout, and indexes that commit's tree under the same
