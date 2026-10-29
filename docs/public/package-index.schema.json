@@ -903,16 +903,6 @@
       "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
       "type": "string"
     },
-    "NodeId": {
-      "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
-      "examples": [
-        "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-      ],
-      "maxLength": 206,
-      "minLength": 78,
-      "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-      "type": "string"
-    },
     "NotebookCell": {
       "additionalProperties": false,
       "description": "A selected cell addressed within its parent notebook.",
@@ -1602,7 +1592,7 @@
     },
     "Relationship": {
       "additionalProperties": false,
-      "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read.",
+      "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read.",
       "properties": {
         "confidence": {
           "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
@@ -1614,14 +1604,6 @@
         "derivation": {
           "$ref": "#/$defs/RelationshipDerivation",
           "description": "How this edge was established."
-        },
-        "evidence": {
-          "default": [],
-          "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
-          "items": {
-            "$ref": "#/$defs/NodeId"
-          },
-          "type": "array"
         },
         "extensions": {
           "$ref": "#/$defs/Extensions",

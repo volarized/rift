@@ -285,7 +285,6 @@ impl SyntaxPublicationBuilder {
             let source = rift_core::DeclarationBinding::new(
                 placement.unit().clone(),
                 SourceRange::new(symbol.item_range.start, symbol.item_range.end)?,
-                None,
             );
             let mut contribution = Contribution::builder(
                 ContributionKey::new(self.provider.clone(), self.publication, provider_symbol),
@@ -328,7 +327,6 @@ impl SyntaxPublicationBuilder {
             let source = rift_core::DeclarationBinding::new(
                 placement.unit().clone(),
                 SourceRange::new(alias.range.start, alias.range.end)?,
-                None,
             );
             let facts = PortableSymbolFacts::new(
                 syntax.language().clone(),

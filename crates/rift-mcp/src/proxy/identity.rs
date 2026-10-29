@@ -162,9 +162,7 @@ pub(super) fn qualify_nodes(
     result: &mut rift_protocol::read::NodesResult,
     backend: &str,
 ) -> Result<(), RiftError> {
-    for node in &mut result.nodes {
-        qualify_optional(&mut node.of, backend)?;
-    }
+    qualify_optional(&mut result.symbol, backend)?;
     qualify_warnings(&mut result.warnings, backend)
 }
 

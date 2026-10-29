@@ -1,13 +1,35 @@
-//! A syntax node located in one held file, minted with its content identity.
+//! A syntax node located in one held file, addressed by its place inside its symbol or unit.
 
-use rift_protocol::read::{FILE_NODE_KIND, Language, NodeId};
+use rift_core::SymbolId;
+use rift_protocol::read::FILE_NODE_KIND;
 use rift_syntax::{ByteRange, NodeMatch};
 
-/// One node at a location: its content identity, its kind, and the bytes it spans.
+/// Where one node sits: inside a declaration of a symbol, or inside its unit.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NodeAddress {
+    /// Node `index` of declaration `declaration` of `symbol`, counted in pre-order from the
+    /// declaration's item node at 0.
+    Declaration {
+        /// The symbol the declaration binds.
+        symbol: SymbolId,
+        /// Ordinal of the declaration among the symbol's declarations, in the order a symbol
+        /// read lists them.
+        declaration: usize,
+        /// Pre-order position inside the declaration's item subtree.
+        index: usize,
+    },
+    /// Node `index` of its unit: 0 for the file node, then the nodes no declaration holds.
+    Unit {
+        /// Pre-order position inside the unit.
+        index: usize,
+    },
+}
+
+/// One node at a location: its address, its kind, and the bytes it spans.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocatedNode {
-    /// Content identity over the node's language, kind, and exact bytes.
-    pub id: NodeId,
+    /// The node's place inside its symbol or unit.
+    pub address: NodeAddress,
     /// Kind in the provider's vocabulary, or [`FILE_NODE_KIND`] for the whole unit.
     pub kind: &'static str,
     /// Byte range the node spans in its file.
@@ -15,47 +37,21 @@ pub struct LocatedNode {
 }
 
 impl LocatedNode {
-    /// Mints the located node of `kind` spanning `range` in `source`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `range` does not land inside `source` on character boundaries: every
-    /// caller passes a range the same bytes' parse produced, or the whole source.
-    #[must_use]
-    pub fn of(language: &Language, kind: &'static str, range: ByteRange, source: &str) -> Self {
-        let bytes = usize::try_from(range.start)
-            .ok()
-            .zip(usize::try_from(range.end).ok())
-            .and_then(|(start, end)| source.as_bytes().get(start..end))
-            .unwrap_or_else(|| {
-                panic!(
-                    "a node range lands inside the source its parse produced: range={range:?}, \
-                     source_len={}",
-                    source.len()
-                )
-            });
-        Self {
-            id: NodeId::for_content(language, kind, bytes),
-            kind,
-            range,
-        }
-    }
-
     /// The file node of `source`, when it answers `range` under `matching`: it spans the
-    /// whole unit, so it matches exactly that span or, enclosing, any range inside it.
+    /// whole unit, so it matches exactly that span or, enclosing, any range inside it. It is
+    /// node 0 of the unit.
     #[must_use]
-    pub fn file(
-        language: &Language,
-        source: &str,
-        range: ByteRange,
-        matching: NodeMatch,
-    ) -> Option<Self> {
+    pub fn file(source: &str, range: ByteRange, matching: NodeMatch) -> Option<Self> {
         let whole = whole_range(source);
         let answers = match matching {
             NodeMatch::Exact => whole == range,
             NodeMatch::Enclosing => whole.encloses(range),
         };
-        answers.then(|| Self::of(language, FILE_NODE_KIND, whole, source))
+        answers.then_some(Self {
+            address: NodeAddress::Unit { index: 0 },
+            kind: FILE_NODE_KIND,
+            range: whole,
+        })
     }
 }
 
@@ -73,9 +69,10 @@ mod tests {
     use std::fs;
 
     use rift_core::{ProjectPath, SourceVisibility, TextFileInclusion};
-    use rift_protocol::read::{FILE_NODE_KIND, Language, NodeId};
+    use rift_protocol::read::FILE_NODE_KIND;
     use rift_syntax::{ByteRange, NodeMatch};
 
+    use super::NodeAddress;
     use crate::{WorkspaceIndex, WorkspaceIndexLimits};
 
     const SOURCE: &str = "\n\npub fn beacon() -> u8 {\n    7\n}\n\n";
@@ -83,6 +80,11 @@ mod tests {
     fn index() -> (tempfile::TempDir, WorkspaceIndex) {
         let root = tempfile::tempdir().expect("workspace");
         fs::write(root.path().join("lib.rs"), SOURCE).expect("source");
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+        )
+        .expect("manifest");
         fs::write(root.path().join("notes.txt"), "one\ntwo\n").expect("text");
         let index = WorkspaceIndex::build(
             root.path(),
@@ -103,13 +105,9 @@ mod tests {
     }
 
     #[test]
-    fn node_at_resolves_exact_and_enclosing_ranges_to_content_identities() {
+    fn node_at_resolves_exact_and_enclosing_ranges_to_their_addresses() {
         let (_root, index) = index();
         let path = ProjectPath::new("lib.rs").expect("path");
-        let rust = Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        };
         let function = span("pub fn beacon() -> u8 {\n    7\n}");
 
         let exact = index
@@ -118,10 +116,14 @@ mod tests {
             .expect("the function node");
         assert_eq!(exact.kind, "function_item");
         assert_eq!(exact.range, function);
-        assert_eq!(
-            exact.id,
-            NodeId::for_content(&rust, "function_item", SOURCE[2..].trim_end().as_bytes())
-        );
+        let NodeAddress::Declaration {
+            symbol,
+            declaration: 0,
+            index: 0,
+        } = &exact.address
+        else {
+            panic!("the function is node 0 of its declaration: {exact:?}");
+        };
         let seven = span("7");
         let enclosing = index
             .node_at(
@@ -135,6 +137,14 @@ mod tests {
             .expect("parse")
             .expect("the literal node");
         assert_eq!(enclosing.kind, "integer_literal");
+        assert!(
+            matches!(
+                &enclosing.address,
+                NodeAddress::Declaration { symbol: held, declaration: 0, index }
+                    if held == symbol && *index > 0
+            ),
+            "the literal lies inside the function's declaration: {enclosing:?}"
+        );
         assert_eq!(
             index
                 .node_at(&path, ByteRange { start: 1, end: 4 }, NodeMatch::Exact)
@@ -174,6 +184,7 @@ mod tests {
             None
         );
         assert_eq!(located.kind, FILE_NODE_KIND);
+        assert_eq!(located.address, NodeAddress::Unit { index: 0 });
     }
 
     #[test]
@@ -189,10 +200,7 @@ mod tests {
 
         assert_eq!(located.kind, FILE_NODE_KIND);
         assert_eq!(located.range, ByteRange { start: 0, end: 8 });
-        assert_eq!(
-            located.id,
-            NodeId::for_content(&Language::text(), FILE_NODE_KIND, b"one\ntwo\n")
-        );
+        assert_eq!(located.address, NodeAddress::Unit { index: 0 });
         assert_eq!(
             index
                 .node_at(&path, line, NodeMatch::Exact)
