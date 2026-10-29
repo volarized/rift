@@ -1376,6 +1376,78 @@ mod tests {
         Ok(())
     }
 
+    /// A symbol declared twice in one file answers one timeline over both declarations:
+    /// the edit to the second declaration is a version, and the shared path is walked once.
+    #[test]
+    fn a_symbol_timeline_covers_every_declaration_of_the_symbol() -> TestResult {
+        use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path();
+        rift_history::fixture::init(root);
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"beacon\"\nversion = \"1.0.0\"\n[lib]\npath = \"lib.rs\"\n",
+        )?;
+        let declarations = |second: &str| {
+            format!(
+                "#[cfg(unix)]\npub fn tick() {{}}\n#[cfg(windows)]\npub fn tick() {{ {second} }}\n"
+            )
+        };
+        fs::write(root.join("lib.rs"), declarations(""))?;
+        rift_history::fixture::commit_all(root, "introduce tick twice");
+        fs::write(root.join("lib.rs"), declarations("let _grown = 1;"))?;
+        rift_history::fixture::commit_all(root, "grow the second tick");
+        let service = ReadService::build(
+            root,
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        let matched = service.index().symbols("tick", 1)?[0];
+        let mut request = GetSymbolParams {
+            id: timeline_identity(&service, matched)?,
+            include: vec![rift_protocol::read::GetSymbolInclude::History],
+            rev: None,
+            view: None,
+            declaration_limit: 2,
+            declaration_cursor: None,
+        };
+        let views = crate::read::LocalSymbolViews::new(1 << 20, [7; 32]);
+        let view = views
+            .capture(service.local_symbol_view_input(&request, true)?)?
+            .ok_or("captured history admission")?;
+        request.view = Some(view.id);
+        let GetSymbolResult::Found {
+            history: Some(history),
+            ..
+        } = views.resolve(&request, service.index().root(), service.index().owner())?
+        else {
+            return Err("captured history missing".into());
+        };
+        let kinds = history
+            .versions
+            .iter()
+            .map(|version| version.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SymbolVersionKind::BodyChanged,
+                SymbolVersionKind::Introduced
+            ]
+        );
+        assert!(history.complete);
+        request.id = rift_protocol::read::SymbolId("rift://symbol/local/rust/beacon/absent".into());
+        request.view = None;
+        assert!(
+            service.local_symbol_view_input(&request, true).is_ok(),
+            "a symbol no declaration binds captures no timeline"
+        );
+        Ok(())
+    }
+
     #[test]
     fn retained_local_history_survives_trim_and_refuses_uncaptured_symbols() -> TestResult {
         use std::collections::BTreeSet;
