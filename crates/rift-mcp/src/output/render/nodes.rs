@@ -11,21 +11,27 @@ use crate::output::text::{TextError, TextWriter};
 /// Noun counted by the title of a `nodes` answer.
 const NODE_NOUN: &str = "node";
 
-/// Writes the nodes section, the written sources, the cursor, and the warnings section.
+/// Writes the title with the answer's symbol, the nodes section, the written sources, the
+/// cursor, and the warnings section.
 ///
 /// An outer node's source holds the sources of the nodes inside it, so the text writes each
-/// source once: an answer opening with a node that declares a symbol, as a symbol read does,
-/// writes the source of each node no earlier node encloses, one per declaration; any other
-/// answer, as a position read, writes its innermost node's source.
+/// source once: the source of each node no earlier node encloses, one per declaration of a
+/// symbol, or the file node's for a unit.
 pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), TextError> {
     let NodesResult {
+        symbol,
         nodes,
         node_cursor,
         revision,
         view,
         warnings,
     } = result;
-    layout::title(out, nodes.len(), NODE_NOUN, None)?;
+    layout::title(
+        out,
+        nodes.len(),
+        NODE_NOUN,
+        symbol.as_ref().map(|symbol| symbol.0.as_str()),
+    )?;
     layout::items(out, nodes, entry)?;
     let mut lines = Lines::after_last(out, nodes.len());
     for node in written(nodes) {
@@ -46,21 +52,16 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     Ok(())
 }
 
-/// The nodes whose source the text writes, in answer order.
+/// The nodes whose source the text writes, in answer order: each node no earlier node
+/// encloses.
 fn written(nodes: &[Node]) -> Vec<&Node> {
-    match nodes {
-        [first, ..] if first.of.is_some() => {
-            let mut outermost: Vec<&Node> = Vec::new();
-            for node in nodes {
-                if !outermost.iter().any(|outer| encloses(outer, node)) {
-                    outermost.push(node);
-                }
-            }
-            outermost
+    let mut outermost: Vec<&Node> = Vec::new();
+    for node in nodes {
+        if !outermost.iter().any(|outer| encloses(outer, node)) {
+            outermost.push(node);
         }
-        [.., innermost] => vec![innermost],
-        [] => Vec::new(),
     }
+    outermost
 }
 
 /// Whether `outer` spans `inner` within the same unit.
@@ -70,12 +71,11 @@ fn encloses(outer: &Node, inner: &Node) -> bool {
         && inner.range.end <= outer.range.end
 }
 
-/// Writes one node: kind and facts, byte range, identity, symbol, and regions. The identity is
-/// a content digest that equal nodes share, so the range is what places this one.
+/// Writes one node: kind and facts, byte range, address, and regions.
 fn entry(lines: &mut Lines<'_>, node: &Node) -> Result<(), TextError> {
     let Node {
-        id,
-        of,
+        declaration,
+        index,
         unit: _,
         language: _,
         kind,
@@ -83,7 +83,7 @@ fn entry(lines: &mut Lines<'_>, node: &Node) -> Result<(), TextError> {
         range,
         source,
         regions,
-        parent: _,
+        parent,
         extensions: _,
     } = node;
     let mut facts = Facts::default();
@@ -100,11 +100,22 @@ fn entry(lines: &mut Lines<'_>, node: &Node) -> Result<(), TextError> {
     }
     lines.head(facts.as_str())?;
     lines.line(0, &format!("{}..{}", range.start, range.end))?;
-    lines.line(0, &id.0)?;
-    if let Some(symbol) = of {
-        lines.line(0, &symbol.0)?;
-    }
+    lines.line(0, &address(*declaration, *index, *parent))?;
     lines.line(0, &regions_fact(regions)?)
+}
+
+/// The node's address as `declaration D · index I · parent P`, each part present when the
+/// node carries it.
+fn address(declaration: Option<u64>, index: u64, parent: Option<u64>) -> String {
+    let mut facts = Facts::default();
+    if let Some(declaration) = declaration {
+        facts.push(&format!("declaration {declaration}"));
+    }
+    facts.push(&format!("index {index}"));
+    if let Some(parent) = parent {
+        facts.push(&format!("parent {parent}"));
+    }
+    facts.as_str().to_owned()
 }
 
 /// The regions as `role START..END`, joined like facts. Empty without regions.

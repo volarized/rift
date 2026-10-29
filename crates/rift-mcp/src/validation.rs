@@ -12592,7 +12592,7 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    type RelationshipRow = (String, String, String, String, u64, u64, Option<String>);
+    type RelationshipRow = (String, String, String, String, u64, u64);
 
     /// Complete indexed facts exposed by one immutable read publication.
     #[derive(Debug, PartialEq)]
@@ -12678,7 +12678,6 @@ pub(crate) mod tests {
                     occurrence.unit().to_string(),
                     range.start(),
                     range.end(),
-                    occurrence.node().map(|node| node.0.clone()),
                 ));
             }
         }

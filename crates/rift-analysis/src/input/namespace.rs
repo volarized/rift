@@ -34,7 +34,7 @@ impl<'input> NamespaceInput<'input> {
     pub(super) fn from_package(input: &ExactPackageInput<'input>) -> Self {
         Self {
             owner: input.owner,
-            release_version: super::origin_version(input.origin),
+            release_version: Some(input.release_version),
             language: input.language,
             files: input.files,
             context_sources: input.context_sources,

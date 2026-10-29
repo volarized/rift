@@ -303,10 +303,11 @@ fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Re
         || format!("the title must open with `{counted}`, got `{title}`"),
     )?;
     if tool == Tool::Nodes {
+        let symbol = text_at(structured, "/symbol");
         return require(
-            facts.next().is_none(),
-            &format!("$.{}", tool.items_key()),
-            || format!("a nodes title states no page, got `{title}`"),
+            facts.next() == symbol && facts.next().is_none(),
+            "$.symbol",
+            || format!("a nodes title states its symbol alone, got `{title}`"),
         );
     }
     let number = |name: &str| {
@@ -661,20 +662,8 @@ fn located_states(
             || format!("no `{name}` on the location line {facts:?}"),
         )?;
     }
-    if target == "node"
-        && let (Some(start), Some(end)) = (
-            hit.pointer("/range/start").and_then(Value::as_u64),
-            hit.pointer("/range/end").and_then(Value::as_u64),
-        )
-    {
-        let range = format!("{start}..{end}");
-        require(item.has_line(&range), &format!("{at}.range"), || {
-            format!("no line equals the node range `{range}`")
-        })?;
-    }
     let identity = match target {
         "symbol" => text_at(hit, "/hit/symbol/id"),
-        "node" => text_at(hit, "/hit/node"),
         "documentation" => text_at(hit, "/hit/documentation/block/symbol"),
         _ => None,
     };
@@ -861,9 +850,21 @@ fn version_states(entry: Option<&str>, version: &Value, at: &str) -> Result<(), 
     Ok(())
 }
 
-/// Checks one `nodes` entry against its lines: head, byte range, identity, symbol, and regions.
+/// Checks one `nodes` entry against its lines: head, byte range, address, and regions.
 fn node_entry(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String> {
-    let id = text_at(node, "/id").ok_or_else(|| format!("{at}.id: must be a string"))?;
+    let place = node
+        .pointer("/index")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{at}.index: must be an integer"))?;
+    let mut address = Vec::new();
+    if let Some(declaration) = node.pointer("/declaration").and_then(Value::as_u64) {
+        address.push(format!("declaration {declaration}"));
+    }
+    address.push(format!("index {place}"));
+    if let Some(parent) = node.pointer("/parent").and_then(Value::as_u64) {
+        address.push(format!("parent {parent}"));
+    }
+    let address = address.join(" · ");
     let excerpt =
         text_at(node, "/source").ok_or_else(|| format!("{at}.source: must be a string"))?;
     node_head_states(item, node, excerpt, (at, &format!("{at}.source")))?;
@@ -879,14 +880,12 @@ fn node_entry(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String> {
     require(item.plain(1) == range, &format!("{at}.range"), || {
         format!("the second line must be `{range}`, got `{}`", item.plain(1))
     })?;
-    require(item.plain(2) == id, &format!("{at}.id"), || {
-        format!("the third line must be `{id}`, got `{}`", item.plain(2))
+    require(item.plain(2) == address, &format!("{at}.index"), || {
+        format!(
+            "the third line must be `{address}`, got `{}`",
+            item.plain(2)
+        )
     })?;
-    if let Some(symbol) = text_at(node, "/of") {
-        require(item.has_line(symbol), &format!("{at}.of"), || {
-            format!("no line equals the symbol `{symbol}`")
-        })?;
-    }
     regions_states(item, node, at)
 }
 
@@ -994,8 +993,8 @@ fn cursor_states<'text, 'sections>(
     }
 }
 
-/// The nodes whose source the text writes: when the first node declares a symbol, each node
-/// no earlier node of the same unit encloses; otherwise the innermost node, the last.
+/// The nodes whose source the text writes: each node no earlier node of the same unit
+/// encloses.
 fn written_nodes(nodes: &[Value]) -> Vec<(usize, &Value)> {
     fn span(node: &Value) -> (Option<&str>, Option<u64>, Option<u64>) {
         let number = |name: &str| {
@@ -1003,10 +1002,6 @@ fn written_nodes(nodes: &[Value]) -> Vec<(usize, &Value)> {
                 .and_then(Value::as_u64)
         };
         (text_at(node, "/unit"), number("start"), number("end"))
-    }
-    let declares = nodes.first().is_some_and(|first| first.get("of").is_some());
-    if !declares {
-        return nodes.iter().enumerate().next_back().into_iter().collect();
     }
     let mut outermost: Vec<(usize, &Value)> = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
@@ -2253,16 +2248,9 @@ mod tests {
     }
 
     #[test]
-    fn a_documentation_node_and_file_hit_state_their_place() -> Result<(), String> {
+    fn a_documentation_and_file_hit_state_their_place() -> Result<(), String> {
         let answer = json!({
             "results": [
-                {
-                    "hit": { "target": "node", "node": "rift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e" },
-                    "matched_by": ["content"],
-                    "path": "a.rs",
-                    "range": { "start": 4, "end": 13 },
-                    "line": 2
-                },
                 {
                     "hit": {
                         "target": "documentation",
@@ -2282,26 +2270,20 @@ mod tests {
             "pagination": { "page_index": 0, "total_pages": 1 }
         });
         let text = "\
-3 results
-\t[1] a.rs:2 · content
-\t\t4..13
-\t\trift://node/rust/3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e3f9a1c2e
-\t[2] Guide
+2 results
+\t[1] Guide
 \t\tdocs/g.md:7 · documentation
 \t\trift://symbol/rust/a.rs/a
 \t\t# Guide
-\t[3] rift://source/p/a.rs
+\t[2] rift://source/p/a.rs
 ";
         assert_eq!(text_states(Tool::Search, text, &answer), Ok(()));
-        let unplaced = edited(text, "\t\t4..13\n", "")?;
-        let failure = refused(Tool::Search, &unplaced, &answer)?;
-        assert!(failure.contains("$.results[0].range"), "{failure}");
         let moved = edited(text, "docs/g.md:7", "docs/g.md:8")?;
         let failure = refused(Tool::Search, &moved, &answer)?;
-        assert!(failure.contains("$.results[1]"), "{failure}");
-        let unnumbered = edited(text, "\t[3] ", "\t")?;
+        assert!(failure.contains("$.results[0]"), "{failure}");
+        let unnumbered = edited(text, "\t[2] ", "\t")?;
         let failure = refused(Tool::Search, &unnumbered, &answer)?;
-        assert!(failure.contains("$.results[2]"), "{failure}");
+        assert!(failure.contains("$.results[1]"), "{failure}");
         Ok(())
     }
 
@@ -2318,7 +2300,8 @@ mod tests {
         json!({
             "nodes": [
                 {
-                    "id": "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "declaration": 0,
+                    "index": 0,
                     "kind": "function_item",
                     "facets": ["declaration", "test", "generated"],
                     "range": { "start": 0, "end": 20 },
@@ -2329,10 +2312,9 @@ mod tests {
                     ]
                 },
                 {
-                    "id": "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "of": "rift://symbol/rust/a.rs/A",
+                    "index": 1,
                     "kind": "identifier",
-                    "range": { "start": 3, "end": 9 },
+                    "range": { "start": 21, "end": 29 },
                     "source": "a\n\nb"
                 }
             ],
@@ -2345,12 +2327,16 @@ mod tests {
 2 nodes
 \t[1] function_item · 4 lines · generated · test
 \t\t0..20
-\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+\t\tdeclaration 0 · index 0
 \t\tname 3..4 · body 8..20
 \t[2] identifier · 3 lines
-\t\t3..9
-\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-\t\trift://symbol/rust/a.rs/A
+\t\t21..29
+\t\tindex 1
+
+\t\tfn a() {
+\t\t    b
+\t\t}
+\t\t// tail
 
 \t\ta
 
@@ -2379,13 +2365,13 @@ mod tests {
     fn one_node_has_no_marker_and_no_indent() {
         let answer = json!({
             "nodes": [{
-                "id": "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "index": 1,
                 "kind": "identifier",
                 "range": { "start": 3, "end": 9 },
                 "source": "name"
             }]
         });
-        let text = "1 node\n\tidentifier\n\t3..9\n\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\n\tname\n";
+        let text = "1 node\n\tidentifier\n\t3..9\n\tindex 1\n\n\tname\n";
         assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
         let indented = text.replace("\n\tname\n", "\n\t\tname\n");
         assert!(text_states(Tool::Nodes, &indented, &answer).is_err());
@@ -2408,11 +2394,10 @@ mod tests {
     fn a_node_head_states_its_kind_range_and_identity_in_order() -> Result<(), String> {
         nodes_refusal("[1] function_item", "[1] block", "$.nodes[0]")?;
         nodes_refusal("\t\t0..20\n", "\t\t0..21\n", "$.nodes[0].range")?;
-        nodes_refusal("rust/aaaaaaaa", "rust/cccccccc", "$.nodes[0].id")?;
+        nodes_refusal("index 0\n", "index 2\n", "$.nodes[0].index")?;
         nodes_refusal("[2] identifier", "[2] function_item", "$.nodes[1]")?;
-        nodes_refusal("\t\t3..9\n", "", "$.nodes[1].range")?;
-        nodes_refusal("rust/bbbbbbbb", "rust/cccccccc", "$.nodes[1].id")?;
-        nodes_refusal("\t\trift://symbol/rust/a.rs/A\n", "", "$.nodes[1].of")?;
+        nodes_refusal("\t\t21..29\n", "", "$.nodes[1].range")?;
+        nodes_refusal("index 1\n", "index 2\n", "$.nodes[1].index")?;
         nodes_refusal("\t\tname 3..4 · body 8..20\n", "", "$.nodes[0].regions")?;
         nodes_refusal("name 3..4", "name 3..5", "$.nodes[0].regions")
     }
@@ -2442,12 +2427,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_innermost_excerpt_ends_the_text_and_outer_excerpts_are_not_checked()
-    -> Result<(), String> {
+    fn each_outermost_source_ends_the_text_after_a_blank_line() -> Result<(), String> {
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.nodes[1].source")?;
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.nodes[1].source")?;
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.warnings")?;
-        let blank = edited(NODES_TEXT, "a.rs/A\n\n\t\ta", "a.rs/A\n\t\ta")?;
+        let blank = edited(NODES_TEXT, "// tail\n\n\t\ta", "// tail\n\t\ta")?;
         let failure = refused(Tool::Nodes, &blank, &nodes_answer())?;
         assert!(failure.contains("$.nodes[1].source"), "{failure}");
         Ok(())
@@ -2456,25 +2440,28 @@ mod tests {
     #[test]
     fn a_symbol_answer_writes_each_outermost_source_then_its_cursor() {
         let answer = json!({
+            "symbol": "rift://symbol/rust/a.rs/A",
             "nodes": [
                 {
-                    "id": "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                    "of": "rift://symbol/rust/a.rs/A",
+                    "declaration": 0,
+                    "index": 0,
                     "unit": "rift://source/project/a.rs",
                     "kind": "function_item",
                     "range": { "start": 0, "end": 9 },
                     "source": "fn a() {}"
                 },
                 {
-                    "id": "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "declaration": 0,
+                    "index": 2,
+                    "parent": 0,
                     "unit": "rift://source/project/a.rs",
                     "kind": "identifier",
                     "range": { "start": 3, "end": 4 },
                     "source": "a"
                 },
                 {
-                    "id": "rift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                    "of": "rift://symbol/rust/a.rs/A",
+                    "declaration": 1,
+                    "index": 0,
                     "unit": "rift://source/project/b.rs",
                     "kind": "function_item",
                     "range": { "start": 0, "end": 9 },
@@ -2483,7 +2470,7 @@ mod tests {
             ],
             "node_cursor": "3.0123456789abcdef"
         });
-        let text = "3 nodes\n\t[1] function_item\n\t\t0..9\n\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\t\trift://symbol/rust/a.rs/A\n\t[2] identifier\n\t\t3..4\n\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\t[3] function_item\n\t\t0..9\n\t\trift://node/rust/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n\t\trift://symbol/rust/a.rs/A\n\n\t\tfn a() {}\n\n\t\tfn a() {}\nnode_cursor 3.0123456789abcdef\n";
+        let text = "3 nodes · rift://symbol/rust/a.rs/A\n\t[1] function_item\n\t\t0..9\n\t\tdeclaration 0 · index 0\n\t[2] identifier\n\t\t3..4\n\t\tdeclaration 0 · index 2 · parent 0\n\t[3] function_item\n\t\t0..9\n\t\tdeclaration 1 · index 0\n\n\t\tfn a() {}\n\n\t\tfn a() {}\nnode_cursor 3.0123456789abcdef\n";
         assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
         let one_source = text.replace("\n\n\t\tfn a() {}\nnode_cursor", "\nnode_cursor");
         assert!(text_states(Tool::Nodes, &one_source, &answer).is_err());

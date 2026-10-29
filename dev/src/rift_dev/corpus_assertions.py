@@ -230,6 +230,33 @@ def number(value: object, context: str) -> int:
     return value
 
 
+def lists_position(
+    answer: JsonObject, nodes: list[JsonObject], unit: str, position: int
+) -> bool:
+    """Whether `nodes`, a position read's first page, hold every node its check reads.
+
+    A unit answer lists one file's nodes in preorder, so their starts never decrease: a
+    listed node starting past `position` means no later page covers it. A symbol answer
+    lists each declaration from its item node, so the item covering `position` in `unit`
+    is the one item node the raw declaration check reads.
+    """
+
+    def span(node: JsonObject) -> tuple[int, int]:
+        bounds = object_value(node.get("range"), "node range")
+        return number(bounds.get("start"), "node start"), number(
+            bounds.get("end"), "node end"
+        )
+
+    if answer.get("symbol") is None:
+        return span(nodes[-1])[0] > position
+    return any(
+        node.get("index") == 0
+        and node.get("unit") == unit
+        and span(node)[0] <= position < span(node)[1]
+        for node in nodes
+    )
+
+
 def warnings(answer: JsonObject) -> list[JsonObject]:
     values = array_value(answer.get("warnings", []), "warnings")
     found = [object_value(value, "warning") for value in values]
@@ -596,15 +623,22 @@ def churn_answer(
             object_value(node, "probe node")
             for node in array_value(answer.get("nodes"), "probe nodes")
         ]
-        matches = [node for node in nodes if node.get("of") == identity]
-        require(len(matches) == 1, f"{tool} lost probe declaration")
+        matches = [
+            node
+            for node in nodes
+            if node.get("index") == 0 and node.get("declaration") is not None
+        ]
+        require(
+            answer.get("symbol") is not None and len(matches) == 1,
+            "nodes lost probe declaration",
+        )
         hit = matches[0]
         require(
             hit.get("unit") == f"{FILE_PREFIX}{probe_path}",
             f"{tool} returned another probe path",
         )
         excerpt = hit.get("source")
-        found = string_value(hit.get("of"), "probe identity")
+        found = string_value(answer.get("symbol"), "probe identity")
     else:
         rows = array_value(answer.get("results"), "probe hits")
         require(len(rows) == 1, f"{tool} lost probe declaration")
