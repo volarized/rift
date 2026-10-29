@@ -696,6 +696,43 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
     );
 }
 
+/// A captured view already names the revision it holds, so a request naming one beside the
+/// view, or beside a continuation, refuses naming `revision`.
+#[test]
+fn a_revision_beside_a_captured_view_refuses_naming_the_field() {
+    let (_directory, reads, id) = fixture(true);
+    let store = LocalSymbolViews::new(1 << 20, [15; 32]);
+    let view = capture(&store, &reads, SystemTime::now());
+    let revision = reads.served_revision().expect("served revision");
+    let mut symbol = request(id, view.id.clone());
+    symbol.revision = Some(revision.clone());
+    let nodes = rift_protocol::read::NodesParams {
+        view: Some(view.id.clone()),
+        revision: Some(revision),
+        ..rift_protocol::read::NodesParams::at(
+            rift_protocol::read::ProjectPath("index.js".to_owned()),
+            0,
+        )
+    };
+    let refusals = [
+        store
+            .resolve(&symbol, reads.index.root(), reads.index.owner())
+            .expect_err("a revision beside a view"),
+        store
+            .nodes(&nodes, &view.id, reads.index.root(), reads.index.owner())
+            .expect_err("a revision beside a view"),
+    ];
+    for refused in refusals {
+        assert_eq!(refused.slug(), errors::server::read_invalid::SLUG);
+        assert!(
+            refused
+                .context()
+                .any(|(field, value)| field == "field" && value == "revision"),
+            "{refused}"
+        );
+    }
+}
+
 #[test]
 fn captured_nodes_refuse_foreign_selection_and_invalid_positions() {
     let (_directory, reads, _) = fixture(true);

@@ -237,6 +237,13 @@ fn source_less_success_stays_distinct_from_missing_and_unavailable() {
             .is_valid_for(&requested),
         "a project answer never reports a release revision"
     );
+    let unparsed = SymbolId("rift://symbol/local".to_owned());
+    assert!(
+        !serde_json::from_value::<GetSymbolResult>(found.clone())
+            .expect("valid fixture")
+            .is_valid_for(&unparsed),
+        "an unparsed request identity"
+    );
     let mut wrong_language = found;
     wrong_language["symbol"]["language"] = json!("typescript");
     assert!(

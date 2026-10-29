@@ -89,6 +89,10 @@ fn each_broken_spelling_names_its_violation() {
             "rift://revision/stdlib/cpython@3.12",
             RevisionViolation::Release,
         ),
+        (
+            "rift://revision/cargo/crates%2Eio/serde@1.0.228",
+            RevisionViolation::Release,
+        ),
     ];
     for (value, expected) in refused {
         let message = violation(value);
