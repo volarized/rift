@@ -104,13 +104,22 @@ that physical source address.
 
 The `history` family is resolved from the workspace's version-control history rather than from
 the current tree. A [`SymbolHistory`](/docs/developer/protocol/reference#SymbolHistory) is one
-symbol's timeline - each [`SymbolVersion`](/docs/developer/protocol/reference#SymbolVersion) names
-the [`RevisionId`](/docs/developer/protocol/reference#RevisionId) that touched it and what the
-revision did: introduced it, changed its body, changed its signature, moved it, removed it.
+symbol's history as edges. Each commit edge, a
+[`HistoryEdge`](/docs/developer/protocol/reference#HistoryEdge) of kind `introduced_in`,
+`changed_in`, `renamed_from`, or `removed_in`, names a
+[`HistoryCommit`](/docs/developer/protocol/reference#HistoryCommit): the commit as a
+`rift://revision/git/<commit>` revision, its author and time, and the path the declaration lived
+at in it. A `co_changes` edge names another symbol and the number of listed commits that changed
+both.
 
-The history provider correlates declarations across revisions using their parsed structure and
-surrounding changes. A [`SymbolId`](/docs/developer/protocol/reference#SymbolId) can change when a
-language includes a module path in its qualified name; the timeline still records the move.
+The history store keys each declaration change by the path and qualified name the commit held. A
+[`SymbolId`](/docs/developer/protocol/reference#SymbolId) depends on the module layout of the tree
+that holds the declaration, so the server binds those keys to symbols through the served tree: a
+`renamed_from` edge names the path the declaration came from, and a co-changed declaration the
+served tree no longer holds answers no `co_changes` edge.
 
-The walk is bounded by the configured history depth, and the timeline rides a
-[`get_symbol`](/docs/mcp#tool-get_symbol) result when the request asks for history.
+The walk is bounded by the configured history depth. A commit that changed more than 256
+declarations counts toward no `co_changes` edge, and one history answers at most 32 of them;
+[`CoChangeTruncation`](/docs/developer/protocol/reference#CoChangeTruncation) counts what either
+bound left out. The history rides a [`get_symbol`](/docs/mcp#tool-get_symbol) result when the
+request asks for it.
