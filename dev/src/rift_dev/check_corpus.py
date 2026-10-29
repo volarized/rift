@@ -44,6 +44,7 @@ from rift_dev.corpus_assertions import (
     stop_sizes,
     symbol_pool,
     token_past_chunk,
+    unit_path,
     warnings,
 )
 from rift_dev.corpus_cache import Pin, git
@@ -796,7 +797,9 @@ class Corpus:
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
-            unit = f"rift://file/{path.relative_to(self.root).as_posix()}"
+            # A node's `unit` percent-encodes its path, `[` in a Next.js route included,
+            # so nodes are matched on the decoded path.
+            unit = path.relative_to(self.root).as_posix()
             # Every read validates the served tree first, so the case's deadline buys a
             # fixed number of reads: a sampled identity costs its symbol read alone.
             if identity is not None:
@@ -834,7 +837,7 @@ class Corpus:
             matching = [
                 node
                 for node in nodes
-                if node.get("unit") == unit
+                if unit_path(node) == unit
                 and number(
                     object_value(node.get("range"), "node range").get("end"),
                     "node end",
@@ -876,9 +879,9 @@ class Corpus:
     def require_node_sources(
         nodes: list[JsonObject], unit: str, content: bytes, path: Path
     ) -> None:
-        """Require each node of `unit` to carry the bytes its range spans."""
+        """Require each node of the file at project path `unit` to carry its bytes."""
         for node in nodes:
-            if node.get("unit") != unit:
+            if unit_path(node) != unit:
                 continue
             node_span = object_value(node.get("range"), "node range")
             node_start = number(node_span.get("start"), "node start")
@@ -915,7 +918,7 @@ class Corpus:
             self.require_node_sources(nodes, unit, content, path)
             if any(
                 node.get("index") == 0
-                and node.get("unit") == unit
+                and unit_path(node) == unit
                 and cast(JsonObject, node.get("range")).get("end") == end
                 for node in nodes
             ):
