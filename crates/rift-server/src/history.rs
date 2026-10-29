@@ -755,6 +755,7 @@ mod tests {
         let symbol = SyntaxSymbol {
             name: "beacon".to_owned(),
             qualified_name: "beacon".to_owned(),
+            declaration_ordinal: 0,
             container: None,
             kind: "function",
             node_kind: None,

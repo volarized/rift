@@ -954,20 +954,11 @@ fn captured_input_warnings_remain_measured_after_current_source_changes() {
         panic!("held object")
     };
     assert_eq!(initial_warnings, later_warnings);
-    assert_eq!(initial_warnings.len(), metadata.warnings.len() + 1);
     assert_eq!(
-        &initial_warnings[..metadata.warnings.len()],
-        metadata.warnings.as_slice()
+        initial_warnings, metadata.warnings,
+        "the overloads and the implementation spell one qualified name, so nothing disagrees"
     );
     assert!(initial_warnings.contains(&warning));
-    assert!(matches!(
-        initial_warnings.last(),
-        Some(rift_protocol::read::ReadWarning::SymbolDisagreement {
-            symbol,
-            providers,
-            detail,
-        }) if symbol == &selected.id && providers == &["syntax"] && !detail.is_empty()
-    ));
     assert_eq!(initial_view, later_view);
     assert_eq!(later_view, view);
 }

@@ -6,7 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rift_core::symbol_identity;
 use rift_protocol::read::{ProjectPath, SymbolId, TextRange};
 use rift_syntax::SyntaxSymbol;
 
@@ -251,7 +250,7 @@ fn stub_forms_by_name(stub: &AnalyzedFile) -> BTreeMap<&rift_core::SymbolId, Vec
 /// One stub declaration as the form a joined declaration answers for.
 fn stub_form(stub: &AnalyzedFile, form: &SyntaxSymbol) -> StubForm {
     StubForm {
-        identity: identity_of(stub, &form.qualified_name),
+        identity: identity_of(stub, form),
         path: ProjectPath(stub.file.path().as_str().to_owned()),
         range: TextRange {
             start: form.range.start,
@@ -260,12 +259,11 @@ fn stub_form(stub: &AnalyzedFile, form: &SyntaxSymbol) -> StubForm {
     }
 }
 
-/// The identity one declaration of `held` carries.
-fn identity_of(held: &AnalyzedFile, qualified_name: &str) -> SymbolId {
-    SymbolId(symbol_identity(
+/// The provider address one declaration of `held` carries.
+fn identity_of(held: &AnalyzedFile, declaration: &SyntaxSymbol) -> SymbolId {
+    SymbolId(declaration.provider_address(
         &held.file.syntax().language().identity_segment(),
         held.placement.identity_path(),
-        qualified_name,
     ))
 }
 
@@ -364,7 +362,7 @@ mod tests {
             .iter()
             .map(|symbol| implementation.stub_forms(&symbol.qualified_name).len())
             .collect::<Vec<_>>();
-        assert_eq!(forms, [0, 2]);
+        assert_eq!(forms, [2, 2], "the stub forms belong to the one symbol");
         assert_eq!(analysis.publication().declarations.len(), 4);
         let identities = analysis
             .publication()
@@ -373,5 +371,16 @@ mod tests {
             .map(|declaration| &declaration.symbol)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(identities.len(), 1);
+        let documented = analysis
+            .publication()
+            .documents
+            .iter()
+            .filter_map(|document| document.qualified_name.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            documented,
+            ["repeat"],
+            "the one symbol ranks under its logical name"
+        );
     }
 }

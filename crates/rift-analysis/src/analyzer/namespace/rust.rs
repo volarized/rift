@@ -302,22 +302,13 @@ fn file_anchors(
                 symbol.item_range.end > range.end || admitted.contains(range)
             })
     };
-    let mut counts = BTreeMap::<String, usize>::new();
-    for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
-        let name = match symbol.container.as_deref() {
-            Some(container) => format!("{container}::{}", symbol.name),
-            None => symbol.name.clone(),
-        };
-        *counts.entry(name).or_default() += 1;
-    }
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| supported(symbol)) {
         let base = match symbol.container.as_deref() {
             Some(container) => format!("{container}::{}", symbol.name),
             None => symbol.name.clone(),
         };
-        let repeated = counts.get(&base).copied().unwrap_or_default() > 1;
-        if symbol.qualified_name != base && !repeated {
+        if symbol.qualified_name != base {
             continue;
         }
         let Some(names) = base

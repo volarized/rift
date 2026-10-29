@@ -8,10 +8,6 @@ use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
 
 use crate::markdown::MarkdownFacts;
 
-/// The character a qualified name carries its disambiguating number after, keeping the
-/// provider key of each declaration distinct within one file.
-const DUPLICATE_SUFFIX_MARKER: char = '~';
-
 mod retained_size;
 pub(crate) mod rust_macros;
 
@@ -91,8 +87,12 @@ pub enum PythonOverload {
 pub struct SyntaxSymbol {
     /// Declared short name.
     pub name: String,
-    /// Container-qualified name, unique within the file's symbol space.
+    /// Container-qualified name. Every declaration of one symbol in the file spells it,
+    /// so several declarations can share it.
     pub qualified_name: String,
+    /// Position among the file's declarations spelling `qualified_name`, counted from 0
+    /// in source order. With `qualified_name` it keys the declaration within its file.
+    pub declaration_ordinal: usize,
     /// The containing symbol's qualified name; `None` for a declaration at
     /// the top level of the file.
     pub container: Option<String>,
@@ -270,73 +270,25 @@ impl PartialEq for SyntaxDocument {
     }
 }
 
-/// Suffixes every repeated qualified name apart, in source order.
+/// Numbers the declarations of every qualified name from 0, in source order.
 ///
-/// A qualified name is the address half of a declaration's provider key, so two
-/// declarations spelling one name would share one key. A name exactly one
-/// declaration spells keeps its spelling. A name several declarations spell is
-/// held by none of them: each takes a `~N` suffix counting from 1 in source
-/// order, so no provider key silently names the first declaration. A logical
-/// symbol identity never carries the suffix: namespace analysis binds every
-/// declaration of one path to one identity. Only
-/// `qualified_name` changes: ranges, containers, and kinds stay as the
-/// provider extracted them. Whole names are compared, never parsed, so a
-/// name the source already spells with a `~` is an ordinary name here.
+/// Several declarations spelling one qualified name are one logical symbol; the ordinal
+/// tells them apart without changing the name. Every provider funnels through
+/// [`SyntaxDocument::new`], so the rule holds for every language, and a document
+/// assembled again from numbered declarations numbers them the same way.
 ///
-/// Every provider funnels through [`SyntaxDocument::new`], so the rule holds
-/// for every language without a provider restating it.
-///
-/// The pass needs no budget of its own: the provider's node bound already
-/// fixed how many declarations reach here, and the search for an unused
-/// number cannot outrun the names already taken.
-fn suffix_duplicate_qualified_names(symbols: &mut [SyntaxSymbol]) {
-    let occurrences = qualified_name_occurrences(symbols);
-    let mut taken = kept_names(&occurrences);
-    let mut counts: HashMap<String, u32> = HashMap::new();
-    for symbol in symbols {
-        if occurrences.get(&symbol.qualified_name) == Some(&1) {
-            continue;
-        }
-        let count = counts.entry(symbol.qualified_name.clone()).or_default();
-        let suffixed = unused_suffixed_name(&symbol.qualified_name, count, &taken);
-        taken.insert(suffixed.clone());
-        symbol.qualified_name = suffixed;
-    }
-}
-
-/// How many declarations spell each qualified name in one document.
-fn qualified_name_occurrences(symbols: &[SyntaxSymbol]) -> HashMap<String, usize> {
-    let mut occurrences: HashMap<String, usize> = HashMap::with_capacity(symbols.len());
-    for symbol in symbols {
-        *occurrences
-            .entry(symbol.qualified_name.clone())
-            .or_default() += 1;
-    }
-    occurrences
-}
-
-/// The names one declaration each spells, which keep their spelling and are
-/// therefore unavailable to a suffix.
-fn kept_names(occurrences: &HashMap<String, usize>) -> HashSet<String> {
-    occurrences
-        .iter()
-        .filter(|(_, occurrence_count)| **occurrence_count == 1)
-        .map(|(name, _)| name.clone())
-        .collect()
-}
-
-/// The first `{name}~{number}` past `count` that no declaration holds,
-/// leaving `count` at the number it took.
-///
-/// Counting continues past a number another declaration keeps, so a suffix
-/// this pass writes can never repeat a name the source authored.
-fn unused_suffixed_name(name: &str, count: &mut u32, taken: &HashSet<String>) -> String {
-    loop {
+/// One pass with one map lookup per declaration: the provider's node bound already
+/// fixed how many declarations reach here, and no count passes the slice's length.
+fn number_declarations(symbols: &mut [SyntaxSymbol]) {
+    let mut counts: HashMap<&str, usize> = HashMap::with_capacity(symbols.len());
+    let mut ordinals = Vec::with_capacity(symbols.len());
+    for symbol in symbols.iter() {
+        let count = counts.entry(symbol.qualified_name.as_str()).or_default();
+        ordinals.push(*count);
         *count += 1;
-        let suffixed = format!("{name}{DUPLICATE_SUFFIX_MARKER}{count}");
-        if !taken.contains(&suffixed) {
-            return suffixed;
-        }
+    }
+    for (symbol, ordinal) in symbols.iter_mut().zip(ordinals) {
+        symbol.declaration_ordinal = ordinal;
     }
 }
 
@@ -364,10 +316,10 @@ impl SyntaxDocument {
         Self::new(language, path, Vec::new(), Vec::new(), false)
     }
 
-    /// Assembles one document from a provider's extracted facts, suffixing
-    /// every repeated qualified name apart so each declaration addresses
-    /// one identity. Declarations outside the Contribution name bounds retain
-    /// their complete syntax facts in the omitted collection.
+    /// Assembles one document from a provider's extracted facts, numbering the
+    /// declarations of every qualified name in source order. Declarations outside the
+    /// Contribution name bounds retain their complete syntax facts in the omitted
+    /// collection.
     pub(crate) fn new(
         language: Language,
         path: ProjectPath,
@@ -462,7 +414,7 @@ impl SyntaxDocument {
         has_errors: bool,
         captured: Option<Vec<MacroInvocation>>,
     ) -> Self {
-        suffix_duplicate_qualified_names(&mut symbols);
+        number_declarations(&mut symbols);
         let declaration_nodes = declaration_node_kinds(&nodes, &symbols);
         for symbol in &mut symbols {
             if symbol.node_kind.is_none() {
@@ -833,16 +785,11 @@ impl SyntaxFacts {
 
 #[cfg(test)]
 mod tests {
-    use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, encode_path, symbol_identity};
+    use rift_core::{PROVIDER_SYMBOL_ID_BYTES_MAX, symbol_identity};
 
     use super::*;
     use crate::contribution::DocumentPlacement;
     use crate::provider::{SyntaxLimits, SyntaxProvider, SyntaxSource};
-
-    /// The literal characters `SymbolId`'s advertised pattern accepts in the
-    /// segments after the language, transcribed from `rift-protocol`, with
-    /// `%` for the escape form it also allows.
-    const SYMBOL_ID_TAIL_CHARACTERS: &str = "._~!$&'()*+,;=:/@-%";
 
     fn language() -> Language {
         Language {
@@ -872,6 +819,7 @@ mod tests {
         SyntaxSymbol {
             name: qualified_name.to_owned(),
             qualified_name: qualified_name.to_owned(),
+            declaration_ordinal: 0,
             container: None,
             kind: "mapping_entry",
             node_kind: None,
@@ -1224,115 +1172,67 @@ mod tests {
         assert_eq!(qualified_names(&document), ["updates"]);
     }
 
-    /// No member of a repeated name holds the bare name: both take a
-    /// suffix, so an address carrying the bare name resolves to neither.
-    #[test]
-    fn test_two_declarations_under_one_name_both_take_suffixes() {
-        let document = document(&["port", "port"]);
-        assert_eq!(qualified_names(&document), ["port~1", "port~2"]);
-    }
-
-    #[test]
-    fn test_four_declarations_under_one_name_number_in_source_order() {
-        let document = document(&["port", "port", "port", "port"]);
-        assert_eq!(
-            qualified_names(&document),
-            ["port~1", "port~2", "port~3", "port~4"]
-        );
-    }
-
-    /// A name one declaration spells stays byte-identical beside a repeated
-    /// name that every member of suffixes.
-    #[test]
-    fn test_a_name_one_declaration_spells_stays_bare_beside_a_repeated_name() {
-        let document = document(&["version", "port", "port"]);
-        assert_eq!(qualified_names(&document), ["version", "port~1", "port~2"]);
-    }
-
-    /// Two repeated names interleaved in one document count apart from each
-    /// other: each name's own declarations number it.
-    #[test]
-    fn test_interleaved_repeated_names_number_independently() {
-        let document = document(&["port", "host", "port", "host", "port"]);
-        assert_eq!(
-            qualified_names(&document),
-            ["port~1", "host~1", "port~2", "host~2", "port~3"]
-        );
-    }
-
-    /// The pass compares whole qualified names and appends, so a name the
-    /// source already spells with the suffix character is an ordinary name.
-    #[test]
-    fn test_a_name_already_carrying_the_suffix_character_is_not_parsed() {
-        let document = document(&["a~b", "a~b", "a~b"]);
-        assert_eq!(qualified_names(&document), ["a~b~1", "a~b~2", "a~b~3"]);
-    }
-
-    /// A name one declaration spells as `foo~1` keeps that spelling, so the
-    /// repeated `foo` counts past it. The result does not depend on where
-    /// the kept name sits in source order.
-    #[test]
-    fn test_a_repeated_name_counts_past_a_suffix_another_declaration_keeps() {
-        let kept_first = document(&["foo~1", "foo", "foo"]);
-        assert_eq!(qualified_names(&kept_first), ["foo~1", "foo~2", "foo~3"]);
-        let kept_last = document(&["foo", "foo", "foo~1"]);
-        assert_eq!(qualified_names(&kept_last), ["foo~2", "foo~3", "foo~1"]);
-    }
-
-    /// Source order, not iteration order, decides which declaration takes
-    /// which suffix: the suffixes ascend with the declaration spans.
-    #[test]
-    fn test_source_order_decides_which_declaration_takes_which_suffix() {
-        let document = document(&["port", "port", "port"]);
-        let numbered = document
+    /// The keys `(qualified_name, declaration_ordinal)` every declaration of `document`
+    /// carries, in source order.
+    fn keys(document: &SyntaxDocument) -> Vec<(&str, usize)> {
+        document
             .symbols()
             .iter()
-            .map(|symbol| (symbol.qualified_name.as_str(), symbol.range.start))
-            .collect::<Vec<_>>();
-        assert_eq!(numbered, [("port~1", 0), ("port~2", 1), ("port~3", 2)]);
+            .map(|symbol| (symbol.qualified_name.as_str(), symbol.declaration_ordinal))
+            .collect()
     }
 
-    /// Only the qualified name moves: the container, kind, and every span
-    /// stay as the provider extracted them.
+    /// Two declarations of one name both keep the name and take ordinals 0 and 1.
     #[test]
-    fn test_a_suffixed_declaration_keeps_every_other_fact() {
+    fn test_two_declarations_under_one_name_keep_it_and_number_apart() {
         let document = document(&["port", "port"]);
-        let suffixed = &document.symbols()[1];
-        assert_eq!(suffixed.qualified_name, "port~2");
-        assert_eq!(suffixed.name, "port");
-        assert_eq!(suffixed.container, None);
-        assert_eq!(suffixed.kind, "mapping_entry");
-        assert_eq!(suffixed.range, ByteRange { start: 1, end: 2 });
-        assert_eq!(suffixed.item_range, ByteRange { start: 1, end: 2 });
+        assert_eq!(keys(&document), [("port", 0), ("port", 1)]);
     }
 
-    /// The suffix marker reaches the wire identity literally: `encode_path`
-    /// keeps `~` out of its escape set, and the minted identity carries
-    /// only characters `SymbolId`'s pattern accepts.
+    /// Two repeated names interleaved in one document number apart from each other, and a
+    /// name one declaration spells keeps ordinal 0.
     #[test]
-    fn test_a_suffixed_name_reaches_the_wire_identity_unescaped() {
+    fn test_interleaved_repeated_names_number_independently() {
+        let document = document(&["version", "port", "host", "port", "host", "port"]);
+        assert_eq!(
+            keys(&document),
+            [
+                ("version", 0),
+                ("port", 0),
+                ("host", 0),
+                ("port", 1),
+                ("host", 1),
+                ("port", 2)
+            ]
+        );
+    }
+
+    /// Numbering a numbered document again assigns the same ordinals.
+    #[test]
+    fn test_assembling_numbered_declarations_again_keeps_their_ordinals() {
+        let first = document(&["port", "port", "host"]);
+        let again = SyntaxDocument::new(
+            language(),
+            path(),
+            Vec::new(),
+            first.symbols().to_vec(),
+            false,
+        );
+        assert_eq!(keys(&again), keys(&first));
+    }
+
+    /// The provider address keeps the first declaration on its name's address and keeps
+    /// every later one apart by its ordinal.
+    #[test]
+    fn test_repeated_declarations_take_distinct_provider_addresses() {
         let document = document(&["updates > package-ecosystem", "updates > package-ecosystem"]);
-        let suffixed = document.symbols()[0].qualified_name.as_str();
-        assert_eq!(suffixed, "updates > package-ecosystem~1");
-        assert_eq!(
-            encode_path(suffixed),
-            "updates%20%3E%20package-ecosystem~1",
-            "encode_path keeps the suffix marker literal"
-        );
-        let identity = symbol_identity("yaml", path().as_str(), suffixed);
-        assert_eq!(
-            identity,
-            "rift://symbol/yaml/.github/dependabot.yml/updates%20%3E%20package-ecosystem~1"
-        );
-        let tail = identity
-            .strip_prefix("rift://symbol/yaml/")
-            .expect("the identity files under its language segment");
-        assert!(
-            tail.chars()
-                .all(|character| character.is_ascii_alphanumeric()
-                    || SYMBOL_ID_TAIL_CHARACTERS.contains(character)),
-            "every character must be one SymbolId's pattern accepts: identity={identity}"
-        );
+        let addresses = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.provider_address("yaml", path().as_str()))
+            .collect::<Vec<_>>();
+        let first = symbol_identity("yaml", path().as_str(), "updates > package-ecosystem");
+        assert_eq!(addresses, [first.clone(), format!("{first}#1")]);
     }
 
     /// A declaration whose name is empty, holds a control character, or
@@ -1368,14 +1268,16 @@ mod tests {
         assert_eq!(document.left_out_declaration_count(), 2);
     }
 
-    /// The suffix pass runs first, so the bound holds for the qualified name
-    /// the Contribution carries: two declarations spelling one name at the
-    /// bound each take a suffix that passes it, and both are left out.
+    /// Declarations of one name at the bound stay, numbered apart, beside a name past it.
     #[test]
-    fn test_the_bound_holds_for_the_suffixed_qualified_name() {
+    fn test_repeated_names_at_the_bound_stay_numbered() {
         let at_bound = "n".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX);
-        let document = document(&[at_bound.as_str(), at_bound.as_str(), "kept"]);
-        assert_eq!(qualified_names(&document), ["kept"]);
-        assert_eq!(document.left_out_declaration_count(), 2);
+        let past_bound = "n".repeat(PROVIDER_SYMBOL_ID_BYTES_MAX + 1);
+        let document = document(&[at_bound.as_str(), at_bound.as_str(), past_bound.as_str()]);
+        assert_eq!(
+            keys(&document),
+            [(at_bound.as_str(), 0), (at_bound.as_str(), 1)]
+        );
+        assert_eq!(document.left_out_declaration_count(), 1);
     }
 }

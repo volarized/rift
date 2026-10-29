@@ -681,6 +681,7 @@ pub(crate) fn literal_function(
     };
     let signatures = extract::callable_signature(&declaration, item_range, source, language)?;
     Some(crate::SyntaxSymbol {
+        declaration_ordinal: 0,
         name: name.clone(),
         qualified_name: name,
         container: None,

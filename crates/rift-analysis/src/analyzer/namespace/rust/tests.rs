@@ -371,18 +371,18 @@ fn repeated_declarations_share_one_identity() {
     let source = "pub fn repeat() {}\npub fn repeat() {}";
     let found = anchors(&[("Cargo.toml", MANIFEST)], "src/lib.rs", source);
     let expected = "rift://symbol/cargo/crates.io/crate-root@1.0.0/rust/crate_root/repeat";
-    assert_eq!(found["repeat~1"].as_str(), expected);
-    assert_eq!(found["repeat~2"].as_str(), expected);
+    assert_eq!(found.len(), 1, "both declarations spell one qualified name");
+    assert_eq!(found["repeat"].as_str(), expected);
 }
 
 #[test]
-fn suffix_without_repeated_declared_name_stays_unresolved() {
+fn qualified_name_differing_from_its_declared_path_stays_unresolved() {
     assert!(
         anchors_with_qualified_name(
             &[("Cargo.toml", MANIFEST)],
             "src/lib.rs",
             "pub fn repeat() {}",
-            Some("repeat~2"),
+            Some("other::repeat"),
         )
         .is_empty()
     );

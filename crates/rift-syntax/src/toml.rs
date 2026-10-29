@@ -22,9 +22,9 @@
 //! - Qualified names join with ` > ` (`server > port`), the JSON and YAML
 //!   spelling.
 //! - Every `[[hooks]]` element repeats its header key, so both the table
-//!   symbol and every identically-named pair beneath each element collide on
-//!   qualified name. `SyntaxDocument` already appends the `~N` suffix
-//!   `SymbolId` reserves, so this module does nothing further for it.
+//!   symbol and every identically-named pair beneath each element share one
+//!   qualified name. `SyntaxDocument` numbers the declarations of each name
+//!   apart, so this module does nothing further for it.
 //! - **This grammar declares no fields anywhere** - `Language::field_count`
 //!   is `0` on the pinned grammar, not only for `pair`, `table`, and
 //!   `table_array_element`. A pair's key is its first named child and its
@@ -558,17 +558,23 @@ mod tests {
         assert!(!document.has_errors());
     }
 
-    /// Repeated `[[hooks]]` headers collide on qualified name, and so does
-    /// every identically named pair beneath each element; the document's
-    /// shared suffix pass numbers each group apart independently.
+    /// Repeated `[[hooks]]` headers share one qualified name, and so does
+    /// every identically named pair beneath each element; the document numbers
+    /// each group's declarations apart independently.
     #[test]
-    fn test_repeated_table_array_elements_and_their_pairs_take_distinct_suffixes() {
+    fn test_repeated_table_array_elements_and_their_pairs_number_apart() {
         let text = "[[hooks]]\nid = \"a\"\n[[hooks]]\nid = \"b\"\n";
         let document = analyze(text);
         assert_eq!(
             qualified_names(&document),
-            ["hooks~1", "hooks > id~1", "hooks~2", "hooks > id~2"]
+            ["hooks", "hooks > id", "hooks", "hooks > id"]
         );
+        let ordinals = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.declaration_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 0, 1, 1]);
         assert_eq!(document.symbols()[0].kind, "table");
         assert_eq!(document.symbols()[1].kind, "member");
     }
@@ -657,7 +663,7 @@ mod tests {
         let document = analyze(text);
         assert_eq!(
             qualified_names(&document),
-            ["servers", "servers > host~1", "servers > host~2"]
+            ["servers", "servers > host", "servers > host"]
         );
         assert_ne!(
             document.symbols()[1].range,
