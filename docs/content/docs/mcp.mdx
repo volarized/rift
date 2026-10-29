@@ -402,7 +402,7 @@ crate and declaration, rather than the physical file:
 The result carries `outcome: "found"`, one `symbol`, an immutable `view` with an expiry,
 and `declarations` in deterministic source order. Each declaration keeps its own origin,
 source address, byte range, and indices into the symbol's signatures, types, and documentation.
-Several declaration bindings still belong to one logical symbol. A source-less object can
+Every declaration of one qualified path, such as two `cfg` variants of one Rust function, is a binding of that one logical symbol. A source-less object can
 be found with no declarations. These runtime reads distinguish a declaration with no
 captured source from a synthetic builtin:
 
