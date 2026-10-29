@@ -230,6 +230,14 @@ def number(value: object, context: str) -> int:
     return value
 
 
+def unit_path(node: JsonObject) -> str | None:
+    """The project path a node's file `unit` names, its percent escapes decoded."""
+    unit = node.get("unit")
+    if not isinstance(unit, str) or not unit.startswith(FILE_PREFIX):
+        return None
+    return unquote(unit.removeprefix(FILE_PREFIX), errors="strict")
+
+
 def lists_position(
     answer: JsonObject, nodes: list[JsonObject], unit: str, position: int
 ) -> bool:
@@ -237,8 +245,8 @@ def lists_position(
 
     A unit answer lists one file's nodes in preorder, so their starts never decrease: a
     listed node starting past `position` means no later page covers it. A symbol answer
-    lists each declaration from its item node, so the item covering `position` in `unit`
-    is the one item node the raw declaration check reads.
+    lists each declaration from its item node, so the item covering `position` in the
+    file at project path `unit` is the one item node the raw declaration check reads.
     """
 
     def span(node: JsonObject) -> tuple[int, int]:
@@ -251,7 +259,7 @@ def lists_position(
         return span(nodes[-1])[0] > position
     return any(
         node.get("index") == 0
-        and node.get("unit") == unit
+        and unit_path(node) == unit
         and span(node)[0] <= position < span(node)[1]
         for node in nodes
     )
