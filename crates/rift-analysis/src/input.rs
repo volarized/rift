@@ -483,12 +483,6 @@ impl<'input> ExactPackageInput<'input> {
         rift_protocol::revision::Revision::release(self.owner, self.release_version)
     }
 
-    /// The version of the release this input analyzes, as its origin names it.
-    #[must_use]
-    pub const fn release_version(self) -> &'input str {
-        self.release_version
-    }
-
     /// Borrows the admitted source and metadata context for namespace placement.
     #[cfg(feature = "collector")]
     #[must_use]
