@@ -798,9 +798,13 @@ class Corpus:
                 "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
             )
             nodes = objects(answer, "nodes")
-            excerpts = array_value(answer.get("source"), "node sources")
-            require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
-            for node, excerpt in zip(nodes, excerpts, strict=True):
+            require(
+                bool(nodes)
+                and nodes[0].get("kind") == "file"
+                and nodes[0].get("range") == {"start": 0, "end": len(content)},
+                f"nodes did not open with the file node of {path}",
+            )
+            for node in nodes:
                 node_span = object_value(node.get("range"), "node range")
                 node_start = number(node_span.get("start"), "node start")
                 node_end = number(node_span.get("end"), "node end")
@@ -808,6 +812,7 @@ class Corpus:
                     0 <= node_start <= node_end <= len(content),
                     "node range exceeds source",
                 )
+                excerpt = node.get("source")
                 require(
                     isinstance(excerpt, str)
                     and excerpt.encode() == content[node_start:node_end],
@@ -815,14 +820,14 @@ class Corpus:
                 )
             if identity is not None:
                 require(
-                    any(node.get("symbol") == identity for node in nodes),
+                    any(node.get("of") == identity for node in nodes),
                     f"nodes omitted sampled declaration: {identity} at {end - 1}; "
-                    f"returned {[(node.get('kind'), node.get('range'), node.get('symbol')) for node in nodes]}",
+                    f"returned {[(node.get('kind'), node.get('range'), node.get('of')) for node in nodes]}",
                 )
             else:
                 matching = [
                     node
-                    for node in nodes
+                    for node in nodes[1:]
                     if number(
                         object_value(node.get("range"), "node range").get("end"),
                         "node end",
@@ -842,7 +847,7 @@ class Corpus:
                     f"nodes omitted raw declaration at {path}:{start}-{end}",
                 )
                 require(
-                    all(node.get("symbol") is None for node in matching),
+                    all(node.get("of") is None for node in matching),
                     f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
                 )
             require(path.read_bytes() == content, f"read changed {path}")
