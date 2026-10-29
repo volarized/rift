@@ -188,19 +188,12 @@ fn identity_anchors_with_roots(
     let Some(module) = python_module(path, roots) else {
         return BTreeMap::new();
     };
-    let mut declarations = BTreeMap::<String, usize>::new();
-    for symbol in syntax.symbols() {
-        if let Some(name) = python_declaration_name(symbol) {
-            *declarations.entry(name).or_default() += 1;
-        }
-    }
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols() {
         let Some(name) = python_declaration_name(symbol) else {
             continue;
         };
-        let repeated = declarations.get(&name).copied().unwrap_or_default() > 1;
-        if symbol.qualified_name != name && !repeated {
+        if symbol.qualified_name != name {
             continue;
         }
         let names = name.split('.').collect::<Vec<_>>();

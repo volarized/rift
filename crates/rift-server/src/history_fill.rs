@@ -603,11 +603,13 @@ impl HistoryAnalysis {
         let Ok(document) = provider.analyze(SyntaxSource { path, text: &text }, self.syntax) else {
             return Ok(ParsedSide::unknown(parsed_bytes));
         };
-        let mut shapes: BTreeMap<String, (&'static str, SymbolShape)> = BTreeMap::new();
+        let mut shapes: BTreeMap<String, (&'static str, Vec<SymbolShape>)> = BTreeMap::new();
         for symbol in document.symbols() {
             shapes
                 .entry(symbol.qualified_name.clone())
-                .or_insert_with(|| (symbol.kind, SymbolShape::from_source(&text, symbol)));
+                .or_insert_with(|| (symbol.kind, Vec::new()))
+                .1
+                .push(SymbolShape::from_source(&text, symbol));
         }
         Ok(ParsedSide {
             shapes: Some(shapes),
@@ -616,11 +618,11 @@ impl HistoryAnalysis {
     }
 }
 
-/// One side of a changed path as the classifier sees it: the declarations
-/// its parse holds by qualified name, the first one under a name as a symbol
-/// timeline looks it up, or `None` when the side cannot be analyzed.
+/// One side of a changed path as the classifier sees it: every declaration its
+/// parse holds, grouped by qualified name in source order with the first one's
+/// kind word, or `None` when the side cannot be analyzed.
 struct ParsedSide {
-    shapes: Option<BTreeMap<String, (&'static str, SymbolShape)>>,
+    shapes: Option<BTreeMap<String, (&'static str, Vec<SymbolShape>)>>,
     parsed_bytes: u64,
 }
 
@@ -649,18 +651,18 @@ impl ParsedSide {
             .collect()
     }
 
-    /// The state of the declaration `name` on this side.
+    /// The state of the symbol `name` on this side: all its declarations.
     fn state(&self, name: &str) -> SymbolState {
         match &self.shapes {
             None => SymbolState::Unknown,
-            Some(shapes) => shapes.get(name).map_or(SymbolState::Absent, |(_, shape)| {
-                SymbolState::Present(shape.clone())
+            Some(shapes) => shapes.get(name).map_or(SymbolState::Absent, |(_, shapes)| {
+                SymbolState::of_declarations(shapes.clone())
             }),
         }
     }
 
-    /// Every declaration this side holds at `path`, keyed the way a move
-    /// pairs them.
+    /// Every symbol this side holds at `path`, keyed the way a move pairs
+    /// them.
     fn move_keys(&self, path: &str) -> Vec<MoveCandidate> {
         self.shapes
             .iter()
@@ -673,12 +675,12 @@ impl ParsedSide {
     }
 }
 
-/// The key a moved declaration keeps on both sides: its qualified name, its
-/// kind word, and the exact bytes it is written in - the key a comparison's
-/// move pairing uses.
-type MoveKey = (String, &'static str, SymbolShape);
+/// The key a moved symbol keeps on both sides: its qualified name, its first
+/// declaration's kind word, and the exact bytes every declaration is written
+/// in - the key a comparison's move pairing uses.
+type MoveKey = (String, &'static str, Vec<SymbolShape>);
 
-/// One declaration an added or a deleted file holds.
+/// One symbol an added or a deleted file holds.
 struct MoveCandidate {
     key: MoveKey,
     path: String,

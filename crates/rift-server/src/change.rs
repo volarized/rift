@@ -382,10 +382,14 @@ impl<'current> ComparedRevisions<'current> {
                 unpaired.added.push(added);
                 continue;
             };
-            let older =
-                SymbolState::Present(SymbolShape::from_source(base_file.source(), base_symbol));
-            let newer =
-                SymbolState::Present(SymbolShape::from_source(head_file.source(), head_symbol));
+            let older = SymbolState::Present(vec![SymbolShape::from_source(
+                base_file.source(),
+                base_symbol,
+            )]);
+            let newer = SymbolState::Present(vec![SymbolShape::from_source(
+                head_file.source(),
+                head_symbol,
+            )]);
             let Some(kind) = classify(&older, &newer) else {
                 continue;
             };
@@ -480,9 +484,9 @@ impl<'current> ComparedRevisions<'current> {
     }
 }
 
-/// One declaration's identity inside one path: the provider's qualified name and
-/// its kind word.
-type DeclarationKey<'side> = (&'side str, &'static str);
+/// One declaration's identity inside one path: its qualified name, its declaration
+/// ordinal, and its kind word.
+type DeclarationKey<'side> = (&'side str, usize, &'static str);
 
 /// The pairing key an addition and a removal have to share to be one declaration
 /// that moved: the qualified name, the kind word, and the exact bytes it is
@@ -493,20 +497,24 @@ type MoveKey = (String, &'static str, SymbolShape);
 /// unpaired lists.
 type MoveGroup = (Vec<usize>, Vec<usize>);
 
-/// The declarations one side holds in one path, keyed by the provider's qualified
-/// name and its kind word.
-///
-/// A provider names one declaration once per document, so the first entry under a
-/// key is the declaration - the same rule a symbol timeline's revision state
-/// applies when it looks one up by qualified name.
+/// The declarations one side holds in one path, keyed by qualified name, declaration
+/// ordinal, and kind word: the n-th declaration of a name on one side compares with
+/// the n-th on the other.
 fn declarations(file: &IndexedFile) -> BTreeMap<DeclarationKey<'_>, &SyntaxSymbol> {
-    let mut declarations = BTreeMap::new();
-    for symbol in file.syntax().symbols() {
-        declarations
-            .entry((symbol.qualified_name.as_str(), symbol.kind))
-            .or_insert(symbol);
-    }
-    declarations
+    file.syntax()
+        .symbols()
+        .iter()
+        .map(|symbol| {
+            (
+                (
+                    symbol.qualified_name.as_str(),
+                    symbol.declaration_ordinal,
+                    symbol.kind,
+                ),
+                symbol,
+            )
+        })
+        .collect()
 }
 
 /// Every declaration one indexed file holds, as the side holding it sees them:

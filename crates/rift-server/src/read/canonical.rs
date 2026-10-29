@@ -638,26 +638,23 @@ impl ReadService {
         let key = rift_core::SymbolId::new(request.id.as_str())?;
         let (index, metadata) = self.local_view_material()?;
         let history = if ready && request.include.contains(&GetSymbolInclude::History) {
-            let (bindings, _) = self.index.symbols_by_identity_page(&key, 0, 1)?;
-            match bindings.first().copied() {
-                Some(matched) => {
-                    let mut timelines = crate::history::SymbolTimelines::open_captured(
-                        self.index.root(),
-                        self.revision.as_ref(),
-                        &self.history,
-                        self.index.limits().syntax(),
-                        self.stored_history.get(),
-                    )?;
-                    let history = timelines.timeline(
-                        super::language_provider(matched.file.syntax().language()),
-                        matched,
-                        request.id.clone(),
-                    )?;
-                    let bytes = serde_json::to_vec(&history)
-                        .map_err(|error| material_error("capture symbol history", &error))?;
-                    Some((request.id.as_str().to_owned(), Arc::<[u8]>::from(bytes)))
-                }
-                None => None,
+            let (bindings, _) =
+                self.index
+                    .symbols_by_identity_page(&key, 0, self.index.results_max())?;
+            if bindings.is_empty() {
+                None
+            } else {
+                let mut timelines = crate::history::SymbolTimelines::open_captured(
+                    self.index.root(),
+                    self.revision.as_ref(),
+                    &self.history,
+                    self.index.limits().syntax(),
+                    self.stored_history.get(),
+                )?;
+                let history = timelines.symbol_timeline(&bindings, request.id.clone())?;
+                let bytes = serde_json::to_vec(&history)
+                    .map_err(|error| material_error("capture symbol history", &error))?;
+                Some((request.id.as_str().to_owned(), Arc::<[u8]>::from(bytes)))
             }
         } else {
             None

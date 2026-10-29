@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rift_core::{
     Contribution, ContributionKey, ContributionOrigin, ContributionReference, ExactKind,
     PortableSymbolFacts, ProjectPath, ProviderId, ProviderRevision, ProviderSymbolId,
     SourceApplicability, SourceKind, SourceLocation, SourceRange, SourceRevision, SourceUnitId,
-    SymbolId, TreeRevision, encode_path, symbol_identity,
+    SymbolId, TreeRevision, declaration_address, encode_path, symbol_identity,
 };
 use rift_error::RiftError;
 use rift_provider::{ProviderPublication, PublicationLimits};
@@ -128,7 +128,8 @@ impl DocumentPlacement {
         self
     }
 
-    /// Returns the current established identity for one physical declaration key.
+    /// Returns the current established identity for one qualified name, which every
+    /// declaration spelling it shares.
     #[must_use]
     pub fn logical_identity(&self, qualified_name: &str) -> Option<&SymbolId> {
         self.logical_declarations
@@ -251,14 +252,11 @@ impl SyntaxPublicationBuilder {
     ) -> Result<(), RiftError> {
         let language_segment = syntax.language().identity_segment();
         let mut additions = Vec::with_capacity(syntax.symbols().len());
+        let mut latest: HashMap<&str, &crate::SyntaxSymbol> = HashMap::new();
         for symbol in syntax.symbols() {
             let logical = placement.logical_declarations.get(&symbol.qualified_name);
-            let identity = symbol_identity(
-                &language_segment,
-                placement.identity_path(),
-                &symbol.qualified_name,
-            );
-            let provider_symbol = ProviderSymbolId::for_symbol(&identity)?;
+            let address = symbol.provider_address(&language_segment, placement.identity_path());
+            let provider_symbol = ProviderSymbolId::for_symbol(&address)?;
             let anchor = logical.map_or_else(
                 || {
                     placement
@@ -271,13 +269,19 @@ impl SyntaxPublicationBuilder {
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
             let mut facts = symbol.facts(language);
             if let Some(container) = &symbol.container {
-                let container_identity =
-                    symbol_identity(&language_segment, placement.identity_path(), container);
+                let ordinal = enclosing_ordinal(latest.get(container.as_str()).copied(), symbol);
+                let container_address = declaration_address(
+                    &language_segment,
+                    placement.identity_path(),
+                    container,
+                    ordinal,
+                );
                 facts = facts.container(ContributionReference::new(
                     self.provider.clone(),
-                    ProviderSymbolId::for_symbol(&container_identity)?,
+                    ProviderSymbolId::for_symbol(&container_address)?,
                 ));
             }
+            latest.insert(symbol.qualified_name.as_str(), symbol);
             let source = rift_core::DeclarationBinding::new(
                 placement.unit().clone(),
                 SourceRange::new(symbol.item_range.start, symbol.item_range.end)?,
@@ -378,6 +382,18 @@ impl SyntaxPublicationBuilder {
     }
 }
 
+/// The ordinal of the container declaration `latest` names for `symbol`: the latest
+/// earlier declaration spelling the container's name, when it encloses `symbol`.
+///
+/// A qualified name never nests inside a declaration of itself, so no earlier declaration
+/// of the name can enclose `symbol` when the latest one does not. A container no earlier
+/// declaration encloses keeps ordinal 0, the address its name alone spells.
+fn enclosing_ordinal(latest: Option<&crate::SyntaxSymbol>, symbol: &crate::SyntaxSymbol) -> usize {
+    latest
+        .filter(|container| container.range.encloses(symbol.range))
+        .map_or(0, |container| container.declaration_ordinal)
+}
+
 /// Mints one syntax document's project source-unit identity.
 ///
 /// The spelling is `rift://source/project/<escaped path>`, the identity every
@@ -404,6 +420,19 @@ pub fn source_unit_for_path(path: &ProjectPath) -> Result<SourceUnitId, RiftErro
 }
 
 impl crate::SyntaxSymbol {
+    /// The provider-local address of this declaration under `language_segment` and
+    /// `path`: its qualified name and declaration ordinal, as [`declaration_address`]
+    /// spells them.
+    #[must_use]
+    pub fn provider_address(&self, language_segment: &str, path: &str) -> String {
+        declaration_address(
+            language_segment,
+            path,
+            &self.qualified_name,
+            self.declaration_ordinal,
+        )
+    }
+
     /// Copies retained declaration facts without admitting a portable identity.
     #[must_use]
     pub fn facts(&self, language: &rift_protocol::read::Language) -> PortableSymbolFacts {
@@ -498,6 +527,55 @@ mod tests {
         assert_eq!(
             run.facts().expect("portable facts").visibility_spelling(),
             Some("pub")
+        );
+    }
+
+    /// Repeated declarations of one module publish under distinct provider keys, and each
+    /// member's container reference names the declaration enclosing it.
+    #[test]
+    fn repeated_declarations_publish_distinct_keys_and_enclosing_containers() {
+        let provider = RustSyntaxProvider::default();
+        let path = ProjectPath::new("src/lib.rs").expect("path");
+        let document = provider
+            .analyze(
+                SyntaxSource {
+                    path: &path,
+                    text: "#[cfg(unix)]\nmod sys { pub fn open() {} }\n#[cfg(windows)]\nmod sys { pub fn open() {} }\n",
+                },
+                SyntaxLimits::default(),
+            )
+            .expect("syntax document");
+        let mut builder = SyntaxPublicationBuilder::new(
+            publication(1),
+            source_revision(1),
+            tree_revision(1),
+            rift_provider::PublicationLimits::default(),
+        )
+        .expect("builder");
+        builder.add_document(&document).expect("document");
+        let publication = builder.build().expect("distinct keys publish");
+        let keys = publication
+            .contributions()
+            .iter()
+            .map(|contribution| {
+                let facts = contribution.facts().expect("portable facts");
+                (
+                    contribution.key().reference().symbol().as_str().to_owned(),
+                    facts
+                        .container_reference()
+                        .map(|reference| reference.symbol().as_str().to_owned()),
+                )
+            })
+            .collect::<Vec<_>>();
+        let address = |name: &str| format!("rift://symbol/rust/src/lib.rs/{name}");
+        assert_eq!(
+            keys,
+            [
+                (address("sys"), None),
+                (address("sys::open"), Some(address("sys"))),
+                (address("sys#1"), None),
+                (address("sys::open#1"), Some(address("sys#1"))),
+            ]
         );
     }
 

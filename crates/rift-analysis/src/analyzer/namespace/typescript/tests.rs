@@ -306,10 +306,10 @@ fn lexical_collision_and_unestablished_reexports_keep_incomplete_export_coverage
 }
 
 #[test]
-fn typescript_overload_signatures_bind_one_function_without_occurrence_suffix() {
+fn typescript_overload_signatures_bind_one_function() {
     let source = "export function format(value: string): string;\nexport function format(value: number): string;";
     let found = one(TYPES, "index.d.ts", source);
-    assert_eq!(found.len(), 2);
+    assert_eq!(found.len(), 1);
     assert!(found.values().all(|identity| identity.as_str()
         == "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"));
 }
@@ -318,7 +318,7 @@ fn typescript_overload_signatures_bind_one_function_without_occurrence_suffix() 
 fn competing_function_bodies_share_one_identity() {
     let source = "export function format() {}\nexport function format() {}";
     let found = one(TYPES, "index.d.ts", source);
-    assert_eq!(found.len(), 2);
+    assert_eq!(found.len(), 1);
     assert!(found.values().all(|identity| identity.as_str()
         == "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"));
 }
@@ -496,7 +496,7 @@ fn repeated_declarations_of_one_export_keep_one_canonical_target() {
         "export function format(value) { return value; }",
     );
     let mappings = &found.mappings["index.d.ts"];
-    assert_eq!(mappings.len(), 2);
+    assert_eq!(mappings.len(), 1);
     let target = &found.anchors["index.mjs"]["format"];
     assert!(mappings.values().all(|mapping| &mapping.identity == target));
 }
@@ -927,8 +927,11 @@ fn package_ambient_overloads_and_repeated_bodies_share_one_identity() {
         .filter(|(name, _)| name.contains(".read"))
         .map(|(_, identity)| identity)
         .collect::<Vec<_>>();
-    assert_eq!(identities.len(), 2);
-    assert_eq!(identities[0], identities[1]);
+    assert_eq!(
+        identities.len(),
+        1,
+        "every declaration spells one qualified name"
+    );
     let repeated =
         "declare module \"node:buffer\" { export function read() {} export function read() {} }";
     let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), repeated);
@@ -937,8 +940,11 @@ fn package_ambient_overloads_and_repeated_bodies_share_one_identity() {
         .filter(|(name, _)| name.contains(".read"))
         .map(|(_, identity)| identity)
         .collect::<Vec<_>>();
-    assert_eq!(identities.len(), 2);
-    assert_eq!(identities[0], identities[1]);
+    assert_eq!(
+        identities.len(),
+        1,
+        "every declaration spells one qualified name"
+    );
 }
 
 fn commonjs_prepared(

@@ -1383,13 +1383,13 @@ mod tests {
         let id = |name: &str| SymbolId(format!("rift://symbol/python/lib.py/{name}"));
         let hops = super::callee_hops(
             &id("seed"),
-            ["max", "max~1", "max", "join", "seed", "max~1"].map(id),
+            ["max", "maximum", "max", "join", "seed", "maximum"].map(id),
         );
         let reached: Vec<_> = hops
             .iter()
             .map(|hop| hop.relationship.to.0.rsplit('/').next().unwrap_or_default())
             .collect();
-        assert_eq!(reached, ["join", "max", "max~1"]);
+        assert_eq!(reached, ["join", "max", "maximum"]);
         for hop in &hops {
             assert_eq!(hop.direction, rift_protocol::read::HopDirection::Outgoing);
             assert_eq!(hop.relationship.from, id("seed"));
