@@ -476,9 +476,18 @@ See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bou
 
 ## Nodes [#tool-nodes]
 
-After reading a declaration, the agent may need to change only its name, body, or one expression.
-`nodes` identifies the syntax around a position in a local file, giving the agent source ranges
-for a precise edit target.
+After reading a declaration, the agent may need its source, or only its name, body, or one
+expression. `nodes` lists syntax nodes with their source: every node of one symbol, or the nodes
+around a position in a local file, giving the agent source ranges for a precise edit target.
+
+To read the `Config` struct of the sample project, the agent passes its symbol identity:
+
+<ReadExample name="symbol-nodes" />
+
+The first node is the declaration itself, and its source is the declaration's source. The nodes
+after it are the parts inside it, down to each identifier. A symbol with several declarations,
+such as an overloaded function, lists each declaration's nodes in turn. A long answer ends with
+`node_cursor`, which the agent sends back to read the rest.
 
 <Callout type="info">
 
@@ -490,11 +499,13 @@ In the sample `src/config.rs`, byte `338` lies inside the `parse_config` call:
 
 <ReadExample name="local-nodes" />
 
-The response lists enclosing nodes from outermost to innermost, with source excerpts and byte ranges:
+The response lists enclosing nodes from outermost to innermost, with their source and byte
+ranges:
 
 | Node in this example | What the agent can inspect |
 | --- | --- |
-| File | The surrounding source |
+| File | The whole file |
+| Source file | The tree the grammar parsed |
 | `load_config` function | The complete declaration |
 | Function body | The implementation inside the braces |
 | `parse_config(&text)` call | The expression to change |
@@ -505,14 +516,15 @@ In the text response:
 - Each node shows its syntax kind and line count, its byte range, then its node identity:
   `334..353` is the `parse_config(&text)` call.
 - The node identity is a digest of the node's language, kind, and bytes, so it stays the same
-  when the agent edits another part of the file, and two calls written the same way share one
-  identity. The byte range is what places the node.
-- The function also shows its symbol identity and the ranges of its name and body.
-- The excerpt of the innermost node closes the answer; the structured output carries the excerpt
-  of every node.
+  when the agent edits another part of the file, and two nodes written the same way share one
+  identity. The byte range is what places the node: both `pub` keywords of `Config` above share
+  one identity.
+- A node that declares a symbol also shows the symbol's identity.
+- The source of the innermost node closes a position answer, and the declaration's source closes
+  a symbol answer; the structured output carries the source of every node.
 
-The outermost node is the file itself, so its excerpt carries the file's source. A declaration's
-own source comes with its `get_symbol` declarations.
+Every file has a file node spanning all of it, so a file no syntax provider parses, such as a
+`justfile`, answers that one node with the file's text.
 
 The agent chooses the range it needs and applies the change with its own editing tools.
 After the file changes, it should read again before using its ranges for another edit.

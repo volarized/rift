@@ -642,9 +642,20 @@
       "path": "src/config.rs",
       "position": 338
     },
-    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961\n\t[2] function_item \u00b7 4 lines\n\t\t218..355\n\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\t281..355\n\t\trift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189\n\t[4] call_expression\n\t\t334..353\n\t\trift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690\n\t[5] identifier\n\t\t334..346\n\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2\n\n\t\tparse_config\n",
+    "text": "6 nodes\n\t[1] file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2\n\t[2] source_file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961\n\t[3] function_item \u00b7 4 lines\n\t\t218..355\n\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[4] block \u00b7 4 lines\n\t\t281..355\n\t\trift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189\n\t[5] call_expression\n\t\t334..353\n\t\trift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690\n\t[6] identifier\n\t\t334..346\n\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2\n\n\t\tparse_config\n",
     "json": {
       "nodes": [
+        {
+          "id": "rift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "file",
+          "range": {
+            "start": 0,
+            "end": 356
+          },
+          "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
+        },
         {
           "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
           "unit": "rift://file/src/config.rs",
@@ -653,11 +664,12 @@
           "range": {
             "start": 0,
             "end": 356
-          }
+          },
+          "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
         },
         {
           "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-          "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+          "of": "rift://symbol/local/rust/example_project/config/load_config",
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "function_item",
@@ -665,7 +677,8 @@
           "range": {
             "start": 218,
             "end": 355
-          }
+          },
+          "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
         },
         {
           "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
@@ -675,7 +688,8 @@
           "range": {
             "start": 281,
             "end": 355
-          }
+          },
+          "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
         },
         {
           "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
@@ -686,7 +700,8 @@
           "range": {
             "start": 334,
             "end": 353
-          }
+          },
+          "source": "parse_config(&text)"
         },
         {
           "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
@@ -696,15 +711,155 @@
           "range": {
             "start": 334,
             "end": 346
-          }
+          },
+          "source": "parse_config"
         }
-      ],
-      "source": [
-        "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-        "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-        "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-        "parse_config(&text)",
-        "parse_config"
+      ]
+    }
+  },
+  "symbol-nodes": {
+    "tool": "nodes",
+    "arguments": {
+      "symbol": "rift://symbol/local/rust/example_project/config/Config"
+    },
+    "text": "12 nodes\n\t[1] struct_item \u00b7 3 lines\n\t\t105..160\n\t\trift://node/rust/d2d8d019704b7a19d141808c6c9c418764905fa8f79265bfc76bf49b63d803bc\n\t\trift://symbol/local/rust/example_project/config/Config\n\t[2] visibility_modifier\n\t\t105..108\n\t\trift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47\n\t[3] type_identifier\n\t\t116..122\n\t\trift://node/rust/db2c4ebb346e2ae232139298cc2f302a780322ca9d90a3b8b42158b22ab03652\n\t[4] field_declaration_list \u00b7 3 lines\n\t\t123..160\n\t\trift://node/rust/8c03c8063cd4bdb3286a3666675fe2a4ec7c64c68753840c3157ac8f7f8aea52\n\t[5] field_declaration\n\t\t129..157\n\t\trift://node/rust/5a79743aa4810e8efa2a313dec943efe9e1a102128d4664f8c247cfd71270a67\n\t[6] visibility_modifier\n\t\t129..132\n\t\trift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47\n\t[7] field_identifier\n\t\t133..137\n\t\trift://node/rust/363f2f784bc6c1dfe7d657d1c23bc2799be4347fac476878e4a7fbd14ba252dc\n\t[8] scoped_type_identifier\n\t\t139..157\n\t\trift://node/rust/ceeb424730384142768bc216729967e7abe0335d4d07bbadf2335bdbc9e0613a\n\t[9] scoped_identifier\n\t\t139..148\n\t\trift://node/rust/5c297e67ab167bd68a8101a08e6d780c7154f09292ef57ea7c86a4c178c41962\n\t[10] identifier\n\t\t139..142\n\t\trift://node/rust/e1498d9bcf50d5e6a716f16a8f84f1e13b851b383f2dc147c30a6da3825d89b3\n\t[11] identifier\n\t\t144..148\n\t\trift://node/rust/2881c581b6a03b53eb0daf9b7aec667a7d5a07d0dfffa9a933b0cc71ceac2db0\n\t[12] type_identifier\n\t\t150..157\n\t\trift://node/rust/c28259b3d51103cd87667447c36c0953dbc4995f67bd6dbb0de6c7467a4d3413\n\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n",
+    "json": {
+      "nodes": [
+        {
+          "id": "rift://node/rust/d2d8d019704b7a19d141808c6c9c418764905fa8f79265bfc76bf49b63d803bc",
+          "of": "rift://symbol/local/rust/example_project/config/Config",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "struct_item",
+          "facets": ["declaration", "definition"],
+          "range": {
+            "start": 105,
+            "end": 160
+          },
+          "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
+        },
+        {
+          "id": "rift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "visibility_modifier",
+          "range": {
+            "start": 105,
+            "end": 108
+          },
+          "source": "pub"
+        },
+        {
+          "id": "rift://node/rust/db2c4ebb346e2ae232139298cc2f302a780322ca9d90a3b8b42158b22ab03652",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "type_identifier",
+          "range": {
+            "start": 116,
+            "end": 122
+          },
+          "source": "Config"
+        },
+        {
+          "id": "rift://node/rust/8c03c8063cd4bdb3286a3666675fe2a4ec7c64c68753840c3157ac8f7f8aea52",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "field_declaration_list",
+          "range": {
+            "start": 123,
+            "end": 160
+          },
+          "source": "{\n    pub root: std::path::PathBuf,\n}"
+        },
+        {
+          "id": "rift://node/rust/5a79743aa4810e8efa2a313dec943efe9e1a102128d4664f8c247cfd71270a67",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "field_declaration",
+          "facets": ["declaration", "definition"],
+          "range": {
+            "start": 129,
+            "end": 157
+          },
+          "source": "pub root: std::path::PathBuf"
+        },
+        {
+          "id": "rift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "visibility_modifier",
+          "range": {
+            "start": 129,
+            "end": 132
+          },
+          "source": "pub"
+        },
+        {
+          "id": "rift://node/rust/363f2f784bc6c1dfe7d657d1c23bc2799be4347fac476878e4a7fbd14ba252dc",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "field_identifier",
+          "range": {
+            "start": 133,
+            "end": 137
+          },
+          "source": "root"
+        },
+        {
+          "id": "rift://node/rust/ceeb424730384142768bc216729967e7abe0335d4d07bbadf2335bdbc9e0613a",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "scoped_type_identifier",
+          "range": {
+            "start": 139,
+            "end": 157
+          },
+          "source": "std::path::PathBuf"
+        },
+        {
+          "id": "rift://node/rust/5c297e67ab167bd68a8101a08e6d780c7154f09292ef57ea7c86a4c178c41962",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "scoped_identifier",
+          "range": {
+            "start": 139,
+            "end": 148
+          },
+          "source": "std::path"
+        },
+        {
+          "id": "rift://node/rust/e1498d9bcf50d5e6a716f16a8f84f1e13b851b383f2dc147c30a6da3825d89b3",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "identifier",
+          "range": {
+            "start": 139,
+            "end": 142
+          },
+          "source": "std"
+        },
+        {
+          "id": "rift://node/rust/2881c581b6a03b53eb0daf9b7aec667a7d5a07d0dfffa9a933b0cc71ceac2db0",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "identifier",
+          "range": {
+            "start": 144,
+            "end": 148
+          },
+          "source": "path"
+        },
+        {
+          "id": "rift://node/rust/c28259b3d51103cd87667447c36c0953dbc4995f67bd6dbb0de6c7467a4d3413",
+          "unit": "rift://file/src/config.rs",
+          "language": "rust",
+          "kind": "type_identifier",
+          "range": {
+            "start": 150,
+            "end": 157
+          },
+          "source": "PathBuf"
+        }
       ]
     }
   },
