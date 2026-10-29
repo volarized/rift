@@ -355,7 +355,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\n\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -394,9 +394,6 @@
             "end": 355
           },
           "line": 11,
-          "node": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-          "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-          "source_complete": true,
           "signature_indices": [0],
           "type_indices": [],
           "documentation_indices": [0]
@@ -409,7 +406,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\n\t\trift://node/rust/d0ea302257b9292cacc66265bb8e26e7df04004cf6062ed56e51dd9565ca14d6\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -448,9 +445,6 @@
             "end": 59
           },
           "line": 2,
-          "node": "rift://node/rust/d0ea302257b9292cacc66265bb8e26e7df04004cf6062ed56e51dd9565ca14d6",
-          "source": "/// Loads configuration.\npub fn load_config() -> u32 { 42 }",
-          "source_complete": true,
           "signature_indices": [0],
           "type_indices": [],
           "documentation_indices": [0]
@@ -1508,9 +1502,9 @@
     "tool": "get_symbol",
     "arguments": {
       "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-      "include": ["source", "documentation"]
+      "include": ["documentation"]
     },
-    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\n\t\tpub fn beacon() {}\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1551,8 +1545,6 @@
             "end": 44
           },
           "line": 2,
-          "source": "pub fn beacon() {}",
-          "source_complete": true,
           "signature_indices": [],
           "type_indices": [],
           "documentation_indices": []
@@ -1681,7 +1673,7 @@
     "arguments": {
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1722,8 +1714,6 @@
             "end": 46
           },
           "line": 1,
-          "source": "export function format(value: string): string;",
-          "source_complete": true,
           "signature_indices": [],
           "type_indices": [],
           "documentation_indices": []
@@ -1745,8 +1735,6 @@
             "end": 93
           },
           "line": 2,
-          "source": "export function format(value: number): string;",
-          "source_complete": true,
           "signature_indices": [],
           "type_indices": [],
           "documentation_indices": []
@@ -1760,7 +1748,7 @@
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
       "declaration_limit": 1
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\texport function format(value: string): string;\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1801,8 +1789,6 @@
             "end": 46
           },
           "line": 1,
-          "source": "export function format(value: string): string;",
-          "source_complete": true,
           "signature_indices": [],
           "type_indices": [],
           "documentation_indices": []
@@ -1819,7 +1805,7 @@
       "declaration_cursor": "fixture-next",
       "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\n\t\texport function format(value: number): string;\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1860,8 +1846,6 @@
             "end": 93
           },
           "line": 2,
-          "source": "export function format(value: number): string;",
-          "source_complete": true,
           "signature_indices": [],
           "type_indices": [],
           "documentation_indices": []

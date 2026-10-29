@@ -207,8 +207,8 @@ records the size of each database under `.rift` and its sidecar files before and
 The corpus checks serve the same source and dependency configuration used by a workspace.
 Embedding model downloads stay disabled for corpus runs, so repository checks measure source and lexical indexing.
 
-The Next.js churn case writes a probe declaration every two seconds while `search`, `get_symbol`,
-and `nodes` read it. It runs at least 50 calls across those tools and requires at least two writes
+The Next.js churn case writes a probe declaration every two seconds while `search` and `nodes`,
+by position and by the probe's symbol, read it. It runs at least 50 calls across those reads and requires at least two writes
 during pending reads. Every call must return the same symbol identity, a complete written source
 revision, and its matching byte range. Source older than the revision present when the call started
 must carry `stale_index`.

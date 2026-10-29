@@ -741,14 +741,15 @@ bounds retain the definite miss and report incomplete alternative work.
 
 <ReadExample name="missing-symbol" />
 
-`include` selects projections: `source` adds declaration excerpts and node identities when
-available, `documentation` adds bounded referring documentation, and `history` adds the
-logical symbol's timeline. Omitted `include` defaults to `["source"]`; `[]` requests none.
+`include` selects projections: `documentation` adds bounded referring documentation, and
+`history` adds the logical symbol's timeline. An omitted or empty `include` requests none. The
+server refuses any other entry, `source` included, as an invalid request. A declaration's
+source is read by [`nodes`](#tool-nodes) with `symbol`.
 
 `view` retains a preceding immutable selection. Its expiry refuses the read; it never selects
 latest implicitly. `declaration_limit` defaults to 5 and accepts 1 through 10000.
 `declaration_cursor` continues the exact symbol, projections, and serving view. Each binding
-retains `origin`, exactly one of `path` and `unit`, `range`, `line`, `source_complete`, and
+retains `origin`, exactly one of `path` and `unit`, `range`, `line`, and
 indices into the symbol's signatures, types, and documentation.
 
 <ReadExample name="multi-declaration-full" />
@@ -1144,7 +1145,7 @@ A commit hit has these lines:
 
 A found `get_symbol` result writes the declaration, exact identity, exceptional facts,
 then documentation and requested documentation context or history. A `declarations:` section
-retains each physical location, byte range, available node identity, and requested source.
+retains each physical location and byte range.
 A returned `declaration_cursor` names remaining bindings. There is no hit count or hit paging.
 A missing result writes `error: symbol_not_found`, the requested identity and bounded
 alternatives below `closest matches:` when alternatives exist;
@@ -1177,7 +1178,7 @@ The layout leaves these fields to `structuredContent`:
 - the `distance` of a walk hit, which the level of its branch shows, and the `relationship` entry of its `matched_by`, which the tree shows
 - the size and languages of a file hit
 - the unit, language, other facets, parent, and byte range of a node
-- the `node` of a `get_symbol` hit, the `reference` of a referenced block, the `source` and `documentation_revision` of a documentation hit and of a referenced block, and the `documentation_revision` of a documentation context
+- the `reference` of a referenced block, the `source` and `documentation_revision` of a documentation hit and of a referenced block, and the `documentation_revision` of a documentation context
 
 The server **MUST** write a value that is lowercase hex of at least 8 characters as its first 8 characters: the revision of a commit hit or a history entry, and each digest in a warning line or a resource text. The server resolves a request revision with git revision parsing, which accepts a commit id prefix, so a caller **MAY** send the cut value wherever a request takes a revision. `structuredContent` carries the full revision.
 
