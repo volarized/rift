@@ -32,6 +32,7 @@ from rift_dev.corpus_assertions import (
     last_line_pattern,
     lexical_breach,
     lexical_content,
+    lists_position,
     map_paths,
     no_failed_builds,
     number,
@@ -794,6 +795,15 @@ class Corpus:
             )
             content = path.read_bytes()
             require(0 <= start < end <= len(content), "symbol range exceeds source")
+            unit = f"rift://file/{path.relative_to(self.root).as_posix()}"
+            # Every read validates the served tree first, so the case's deadline buys a
+            # fixed number of reads: a sampled identity costs its symbol read alone.
+            if identity is not None:
+                await self.require_symbol_item(
+                    client, identity, unit, end, content, path
+                )
+                require(path.read_bytes() == content, f"read changed {path}")
+                continue
             # Declarations can start with attached comments or attributes. Extraction
             # keeps their end equal to the item end, so its final byte is in the item.
             request: JsonObject = {
@@ -801,17 +811,15 @@ class Corpus:
                 "position": end - 1,
             }
             answer = await client.call("nodes", request)
-            unit = f"rift://file/{path.relative_to(self.root).as_posix()}"
             nodes = objects(answer, "nodes")
             require(bool(nodes), f"nodes listed nothing at {path}:{end - 1}")
-            if identity is None:
-                cursor = answer.get("node_cursor")
-                for _ in range(NODE_PAGES_MAX):
-                    if cursor is None:
-                        break
-                    page = await client.call("nodes", {**request, "node_cursor": cursor})
-                    nodes = nodes + objects(page, "nodes")
-                    cursor = page.get("node_cursor")
+            cursor = answer.get("node_cursor")
+            for _ in range(NODE_PAGES_MAX):
+                if cursor is None or lists_position(answer, nodes, unit, end - 1):
+                    break
+                page = await client.call("nodes", {**request, "node_cursor": cursor})
+                nodes = nodes + objects(page, "nodes")
+                cursor = page.get("node_cursor")
             if answer.get("symbol") is None:
                 require(
                     nodes[0].get("kind") == "file"
@@ -819,44 +827,39 @@ class Corpus:
                     f"a unit answer did not open with the file node of {path}",
                 )
             self.require_node_sources(nodes, unit, content, path)
-            if identity is not None:
-                await self.require_symbol_item(client, identity, unit, end, content, path)
-            else:
-                matching = [
-                    node
-                    for node in nodes
-                    if node.get("unit") == unit
-                    and number(
-                        object_value(node.get("range"), "node range").get("end"),
-                        "node end",
-                    )
-                    >= end
+            matching = [
+                node
+                for node in nodes
+                if node.get("unit") == unit
+                and number(
+                    object_value(node.get("range"), "node range").get("end"),
+                    "node end",
+                )
+                >= end
+                and number(cast(JsonObject, node["range"]).get("start"), "node start")
+                <= end - 1
+                and (
+                    cast(JsonObject, node["range"]).get("end") == end
+                    or "declaration" in node.get("facets", [])
+                )
+            ]
+            require(
+                bool(matching) or answer.get("symbol") is not None,
+                f"nodes omitted raw declaration at {path}:{start}-{end}",
+            )
+            require(
+                not any(
+                    node.get("index") == 0
+                    and node.get("declaration") is not None
                     and number(
                         cast(JsonObject, node["range"]).get("start"), "node start"
                     )
-                    <= end - 1
-                    and (
-                        cast(JsonObject, node["range"]).get("end") == end
-                        or "declaration" in node.get("facets", [])
-                    )
-                ]
-                require(
-                    bool(matching) or answer.get("symbol") is not None,
-                    f"nodes omitted raw declaration at {path}:{start}-{end}",
-                )
-                require(
-                    not any(
-                        node.get("index") == 0
-                        and node.get("declaration") is not None
-                        and number(
-                            cast(JsonObject, node["range"]).get("start"), "node start"
-                        )
-                        >= start
-                        and cast(JsonObject, node["range"]).get("end") == end
-                        for node in matching
-                    ),
-                    f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
-                )
+                    >= start
+                    and cast(JsonObject, node["range"]).get("end") == end
+                    for node in matching
+                ),
+                f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
+            )
             require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
 
@@ -912,7 +915,10 @@ class Corpus:
             if cursor is None:
                 break
             arguments = {"symbol": identity, "node_cursor": cursor}
-        require(False, f"nodes omitted sampled declaration: {identity} ending at {path}:{end}")
+        require(
+            False,
+            f"nodes omitted sampled declaration: {identity} ending at {path}:{end}",
+        )
 
     async def lexical_persistence(self, client: Client) -> None:
         """Preserve unrelated lexical rows after external source creation and removal."""
