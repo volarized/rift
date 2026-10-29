@@ -69,7 +69,11 @@ fn every_served_identity_pattern_spells_its_path_with_the_shared_class() -> Test
         "the served document advertises one pattern per identity: {identities:?}"
     );
     for pattern in identities {
-        if pattern.starts_with("^rift://symbol/") || pattern.starts_with("^rift://source/") {
+        // A node identity carries a content digest in place of a path.
+        if pattern.starts_with("^rift://symbol/")
+            || pattern.starts_with("^rift://source/")
+            || pattern.starts_with("^rift://node/")
+        {
             continue;
         }
         assert!(

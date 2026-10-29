@@ -820,7 +820,6 @@ fn convert_parameter(
 ) -> Result<rift_protocol::read::Parameter, RiftError> {
     Ok(rift_protocol::read::Parameter {
         name: value.name.clone(),
-        node: value.node.clone().map(rift_protocol::read::NodeId),
         types: value
             .types
             .as_deref()

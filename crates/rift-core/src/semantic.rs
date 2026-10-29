@@ -169,7 +169,9 @@ pub struct DeclarationBinding {
 }
 
 impl DeclarationBinding {
-    /// Constructs one source declaration binding.
+    /// Constructs one source declaration binding. `node` is the content identity of the
+    /// syntax node spanning `range` in `unit`; the identity alone locates nothing, since
+    /// equal bytes share it, so it travels with the unit and range it was minted at.
     #[must_use]
     pub const fn new(unit: SourceUnitId, range: SourceRange, node: Option<NodeId>) -> Self {
         Self { unit, range, node }
@@ -187,7 +189,7 @@ impl DeclarationBinding {
         self.range
     }
 
-    /// Returns witnessed syntax node when supplied.
+    /// Returns the content identity of the syntax node at this binding, when supplied.
     #[must_use]
     pub const fn node(&self) -> Option<&NodeId> {
         self.node.as_ref()

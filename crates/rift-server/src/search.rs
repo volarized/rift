@@ -1855,16 +1855,24 @@ fn hit_ordering(left: &SearchHit, right: &SearchHit, order: ResultOrder) -> Orde
             .score
             .partial_cmp(&left.score)
             .unwrap_or(Ordering::Equal)
-            .then_with(|| hit_identity(left).cmp(hit_identity(right))),
+            .then_with(|| identity_ordering(left, right)),
         ResultOrder::Path => left
             .path
             .is_none()
             .cmp(&right.path.is_none())
             .then_with(|| left.path.cmp(&right.path))
             .then_with(|| left.unit.cmp(&right.unit))
-            .then_with(|| hit_identity(left).cmp(hit_identity(right))),
-        ResultOrder::Identity => hit_identity(left).cmp(hit_identity(right)),
+            .then_with(|| identity_ordering(left, right)),
+        ResultOrder::Identity => identity_ordering(left, right),
     }
+}
+
+/// Orders two hits by wire identity, then by place: two node hits with equal bytes share one
+/// identity, so the place keeps the order total.
+fn identity_ordering(left: &SearchHit, right: &SearchHit) -> Ordering {
+    hit_identity(left)
+        .cmp(hit_identity(right))
+        .then_with(|| left.place().cmp(&right.place()))
 }
 
 /// The wire identity `order_hits` breaks a `relevance` or `path` tie on.
@@ -4821,26 +4829,80 @@ impl Tower {
     /// `order: "path"` groups by project path, breaking a tie - two hits at the same path -
     /// on the hit's own wire identity, the same tie-break `relevance` uses. A file hit's
     /// own identity is its `path`, so two file hits can never tie this way; a node hit's
-    /// identity is its own witnessed id, distinct from the path it also carries, so this
+    /// identity is its content digest, distinct from the path it also carries, so this
     /// proves the tie-break through node hits instead.
     #[test]
     fn order_hits_path_sorts_by_path_then_breaks_ties_on_identity() {
+        let (first, second) = ordered_node_ids(b"left", b"right");
+        let last = node_digest(b"last");
         let mut hits = vec![
-            node_hit_stub_with_path("rift://node/rust/z.rs@0-1#00000000", Some("z.rs"), 0.9),
-            node_hit_stub_with_path("rift://node/rust/a.rs@0-1#00000002", Some("a.rs"), 0.1),
-            node_hit_stub_with_path("rift://node/rust/a.rs@0-1#00000001", Some("a.rs"), 0.5),
+            node_hit_stub_with_path(&last, Some("z.rs"), 0.9),
+            node_hit_stub_with_path(&second, Some("a.rs"), 0.1),
+            node_hit_stub_with_path(&first, Some("a.rs"), 0.5),
         ];
         super::order_hits(&mut hits, ResultOrder::Path);
         let ids: Vec<&str> = hits.iter().map(super::hit_identity).collect();
         assert_eq!(
             ids,
-            [
-                "rift://node/rust/a.rs@0-1#00000001",
-                "rift://node/rust/a.rs@0-1#00000002",
-                "rift://node/rust/z.rs@0-1#00000000",
-            ],
+            [first.as_str(), second.as_str(), last.as_str()],
             "path order groups by path; two hits at the same path break the tie on identity"
         );
+    }
+
+    /// Equal bytes give two node hits one identity, so every order breaks that tie on the
+    /// place the hits lie at, whichever order the hits arrive in.
+    #[test]
+    fn order_hits_breaks_an_identity_tie_between_equal_nodes_on_their_place() {
+        let shared = node_digest(b"parse_config");
+        let at = |start: u64, path: &str| {
+            let mut hit = node_hit_stub_with_path(&shared, Some(path), 0.5);
+            hit.range = Some(rift_protocol::read::TextRange {
+                start,
+                end: start + 12,
+            });
+            hit
+        };
+        for order in [
+            ResultOrder::Relevance,
+            ResultOrder::Path,
+            ResultOrder::Identity,
+        ] {
+            let mut hits = vec![at(40, "b.rs"), at(90, "a.rs"), at(10, "a.rs")];
+            super::order_hits(&mut hits, order);
+            let places: Vec<(&str, u64)> = hits
+                .iter()
+                .map(|hit| {
+                    (
+                        hit.path.as_ref().map_or("", |path| path.0.as_str()),
+                        hit.range.as_ref().map_or(0, |range| range.start),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                places,
+                [("a.rs", 10), ("a.rs", 90), ("b.rs", 40)],
+                "{order:?} must order equal node identities by place"
+            );
+        }
+    }
+
+    /// A node identity minted over `bytes` as an identifier of the Rust grammar.
+    fn node_digest(bytes: &[u8]) -> String {
+        let rust = rift_protocol::read::Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        NodeId::for_content(&rust, "identifier", bytes).0
+    }
+
+    /// Two minted node identities, the lower one first.
+    fn ordered_node_ids(left: &[u8], right: &[u8]) -> (String, String) {
+        let (left, right) = (node_digest(left), node_digest(right));
+        if left < right {
+            (left, right)
+        } else {
+            (right, left)
+        }
     }
 
     /// `order: "identity"` sorts by each hit's own wire id alone, ignoring score.
@@ -4891,17 +4953,15 @@ impl Tower {
     /// node's own wire id, exactly as the `File` and `Symbol` arms already do.
     #[test]
     fn hit_identity_uses_the_node_id_as_tiebreak() {
+        let node = node_digest(b"beacon");
         let mut results = vec![
             file_hit_stub("rift://file/z.rs", 0.5),
-            node_hit_stub("rift://node/rust/lib.rs@0-1#00000000", 0.5),
+            node_hit_stub(&node, 0.5),
         ];
         super::order_hits(&mut results, ResultOrder::Relevance);
         let ids: Vec<&str> = results.iter().map(super::hit_identity).collect();
         // "rift://file/..." sorts before "rift://node/..." lexicographically ('f' < 'n').
-        assert_eq!(
-            ids,
-            ["rift://file/z.rs", "rift://node/rust/lib.rs@0-1#00000000",]
-        );
+        assert_eq!(ids, ["rift://file/z.rs", node.as_str()]);
     }
 
     /// `path` order lists every project path before any unit, then the units in their own
@@ -4910,13 +4970,13 @@ impl Tower {
     fn order_hits_path_lists_project_paths_before_units_and_units_in_unit_order() {
         let mut results = vec![
             node_hit_stub_with_unit(
-                "rift://node/rust/lib.rs@0-1#00000000",
+                &node_digest(b"zeta"),
                 "rift://source/cargo/zeta@1.0.0/src/lib.rs",
                 0.5,
             ),
             file_hit_stub("z.rs", 0.5),
             node_hit_stub_with_unit(
-                "rift://node/rust/lib.rs@2-3#00000000",
+                &node_digest(b"alpha"),
                 "rift://source/cargo/alpha@1.0.0/src/lib.rs",
                 0.5,
             ),

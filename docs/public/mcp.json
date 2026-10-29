@@ -165,7 +165,7 @@
             "type": "object"
           },
           "Digest": {
-            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire.",
             "examples": [
               "3f9a1c2e"
             ],
@@ -951,13 +951,13 @@
             "type": "string"
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names.",
+            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
             "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
+              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
             ],
-            "maxLength": 8192,
-            "minLength": 27,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "maxLength": 206,
+            "minLength": 78,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
             "type": "string"
           },
           "NotebookCell": {
@@ -1181,10 +1181,6 @@
               "name": {
                 "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
                 "type": "string"
-              },
-              "node": {
-                "$ref": "#/$defs/NodeId",
-                "description": "Where this parameter is written in the source."
               },
               "optional": {
                 "description": "Whether a call may leave it out.",
@@ -2774,7 +2770,7 @@
               },
               "node": {
                 "$ref": "#/$defs/NodeId",
-                "description": "Source node when available and requested."
+                "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration."
               },
               "origin": {
                 "$ref": "#/$defs/SymbolOrigin",
@@ -3572,7 +3568,7 @@
       }
     },
     {
-      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each identity carries a witness, so an address taken\nfrom this listing refuses cleanly once the file's bytes drift. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and `source` and\ncarries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.\nPer-file refusals keep their typed errors. A visible path no syntax\nprovider parses refuses `capability_unavailable`, naming the extension.",
+      "description": "Lists the syntax nodes covering one UTF-8 byte position in one file,\noutermost first. Each node's identity is a digest of its language, kind,\nand bytes, so equal nodes share one identity and an edit elsewhere in the\nfile leaves it unchanged; `unit` and `range` locate the node. `rev`\nlists the nodes as of a version-control revision instead of the\ncurrent tree. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and `source` and\ncarries `local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication\nrecords the path: workspace byte and declaration bounds remain unchecked.\nPer-file refusals keep their typed errors. A visible path no syntax\nprovider parses refuses `capability_unavailable`, naming the extension.",
       "input_schema": {
         "$defs": {
           "CapturedViewId": {
@@ -3669,7 +3665,7 @@
             "type": "string"
           },
           "Digest": {
-            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire.",
             "examples": [
               "3f9a1c2e"
             ],
@@ -4001,7 +3997,7 @@
               },
               "id": {
                 "$ref": "#/$defs/NodeId",
-                "description": "Unique identifier of this source region, and the URI that resolves it."
+                "description": "Content identity of this node. Nodes of one language and kind with equal bytes share\nit; `unit` and `range` locate this one."
               },
               "kind": {
                 "$ref": "#/$defs/ExactKind",
@@ -4141,13 +4137,13 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names.",
+            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
             "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
+              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
             ],
-            "maxLength": 8192,
-            "minLength": 27,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "maxLength": 206,
+            "minLength": 78,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
             "type": "string"
           },
           "NodeRegion": {
@@ -5736,7 +5732,7 @@
           {
             "nodes": [
               {
-                "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
                 "kind": "source_file",
                 "language": "rust",
                 "range": {
@@ -5750,10 +5746,10 @@
                   "declaration",
                   "definition"
                 ],
-                "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
                 "kind": "function_item",
                 "language": "rust",
-                "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
                 "range": {
                   "end": 355,
                   "start": 218
@@ -5778,10 +5774,10 @@
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
                 "kind": "block",
                 "language": "rust",
-                "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
                 "range": {
                   "end": 355,
                   "start": 281
@@ -5792,10 +5788,10 @@
                 "facets": [
                   "expression"
                 ],
-                "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
                 "kind": "call_expression",
                 "language": "rust",
-                "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
                 "range": {
                   "end": 353,
                   "start": 334
@@ -5803,10 +5799,10 @@
                 "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
                 "kind": "identifier",
                 "language": "rust",
-                "parent": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
                 "range": {
                   "end": 346,
                   "start": 334
@@ -6677,7 +6673,7 @@
             "type": "object"
           },
           "Digest": {
-            "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+            "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire.",
             "examples": [
               "3f9a1c2e"
             ],
@@ -7418,13 +7414,13 @@
             ]
           },
           "NodeId": {
-            "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names.",
+            "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
             "examples": [
-              "rift://node/rust/lib.rs@220-268#3f9a1c2e"
+              "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
             ],
-            "maxLength": 8192,
-            "minLength": 27,
-            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "maxLength": 206,
+            "minLength": 78,
+            "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
             "type": "string"
           },
           "NotebookCell": {
@@ -7673,10 +7669,6 @@
               "name": {
                 "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
                 "type": "string"
-              },
-              "node": {
-                "$ref": "#/$defs/NodeId",
-                "description": "Where this parameter is written in the source."
               },
               "optional": {
                 "description": "Whether a call may leave it out.",
@@ -8782,7 +8774,7 @@
               },
               "evidence": {
                 "default": [],
-                "description": "The nodes this edge was read from. Absent when empty.",
+                "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
                 "items": {
                   "$ref": "#/$defs/NodeId"
                 },
@@ -9200,7 +9192,7 @@
                 "properties": {
                   "node": {
                     "$ref": "#/$defs/NodeId",
-                    "description": "The syntax-tree node's identity in the captured source revision."
+                    "description": "Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`\nlocate it."
                   },
                   "target": {
                     "const": "node",

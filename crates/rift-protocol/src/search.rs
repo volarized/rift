@@ -244,6 +244,27 @@ pub struct SearchHit {
     pub change: Option<SymbolChange>,
 }
 
+/// Where one search hit lies: its project path, its source unit, then its byte range.
+pub type SearchHitPlace<'hit> = (
+    Option<&'hit ProjectPath>,
+    Option<&'hit SourceUnitId>,
+    Option<(u64, u64)>,
+);
+
+impl SearchHit {
+    /// Where this hit lies, for ordering hits whose identities tie. Two node hits of one
+    /// language and kind with equal bytes share their identity, so only their places tell
+    /// them apart.
+    #[must_use]
+    pub fn place(&self) -> SearchHitPlace<'_> {
+        (
+            self.path.as_ref(),
+            self.unit.as_ref(),
+            self.range.as_ref().map(|range| (range.start, range.end)),
+        )
+    }
+}
+
 /// What a search hit is. Tagged, so the payload correlation survives code generation.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(tag = "target", deny_unknown_fields, rename_all = "snake_case")]
@@ -261,7 +282,8 @@ pub enum SearchHitTarget {
     },
     /// A node hit: one place in a syntax tree, without its enclosing symbol record.
     Node {
-        /// The syntax-tree node's identity in the captured source revision.
+        /// Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`
+        /// locate it.
         node: NodeId,
     },
     /// A file hit: one entry of the tree, whether or not any provider reads it.

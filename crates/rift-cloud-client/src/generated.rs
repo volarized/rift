@@ -49,10 +49,10 @@ static REGEX_PACKAGE_SEARCH_REQUEST_VIEW: std::sync::LazyLock<regex::Regex> = st
     regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
         .expect("invalid regex")
 });
-static REGEX_PARAMETER_NODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
+static REGEX_SEARCH_HIT_TARGET_NODE_ID_NODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 {
     regex::Regex::new(
-            "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+            "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
         )
         .expect("invalid regex")
 });
@@ -642,15 +642,6 @@ pub struct Parameter {
     /// What the parameter is called. Absent where the language allows an unnamed one, as
     /// a positional parameter in a function type.
     pub name: Option<String>,
-    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
-    /// revision the response names.
-    #[validate(
-        length(min = 27u64, max = 8_192u64),
-        regex(path = "REGEX_PARAMETER_NODE")
-    )]
-    pub node: Option<String>,
     /// What it accepts, absent when empty. An array because a declared type and an
     /// inferred one are separate bindings.
     #[validate(nested)]
@@ -667,10 +658,12 @@ pub struct Parameter {
     /// implement.
     pub extensions: Option<serde_json::Value>,
 }
-/// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-/// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-/// of the SHA-256 of the node's source bytes. The identity describes the node in the
-/// revision the response names.
+/// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
+/// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
+/// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
+/// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
+/// kind with equal bytes share one identity wherever they are written, so the identity never
+/// locates a node: the `unit` and `range` beside it do.
 pub type NodeId = String;
 /// One type a symbol carries, together with the role it plays for that symbol.
 #[derive(
@@ -1429,9 +1422,8 @@ pub struct ProblemDetails {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-/// uses. The full digest is computed and compared internally; only this short form ever
-/// reaches the wire.
+/// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+/// compared internally; only this short form ever reaches the wire.
 pub type Digest = String;
 /// Documentation metadata addressing bytes held by an existing content owner.
 #[serde_with::skip_serializing_none]
@@ -1553,9 +1545,8 @@ pub struct DocumentationContentIdentity {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationContext {
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     pub documentation_revision: String,
     /// References ordered by evidence, source, block range, and identity.
     pub references: Vec<DocumentationReferenceHit>,
@@ -1601,9 +1592,8 @@ pub struct DocumentationHit {
     /// Source facts shared by every block belonging to one content owner.
     #[validate(nested)]
     pub source: DocumentationSource,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     #[validate(
         length(min = 1u64),
         regex(path = "REGEX_DOCUMENTATION_HIT_DOCUMENTATION_REVISION")
@@ -2594,7 +2584,8 @@ pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
-    /// The nodes this edge was read from. Absent when empty.
+    /// Content identities of the nodes this edge was read from, each spanning `occurrence`,
+    /// which is present whenever this list is not empty. Absent when empty.
     #[default(Some(Default::default()))]
     pub evidence: Option<Vec<String>>,
     /// One byte range in a source-catalog unit.
@@ -3094,13 +3085,11 @@ pub struct ReadWarning {
     pub alternatives: Option<Vec<String>>,
     /// One bounded warning with repeated conditions counted per source.
     pub warning: Option<DocumentationWarning>,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     pub index_tree_revision: Option<String>,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     pub captured_tree_revision: Option<String>,
     /// Declarations of the captured tree that already carry a vector.
     pub prepared: Option<u64>,
@@ -3461,10 +3450,12 @@ pub struct SymbolDeclaration {
     pub range: TextRange,
     /// One-based line where this declaration begins.
     pub line: u64,
-    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
-    /// revision the response names.
+    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
+    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
+    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
+    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
+    /// kind with equal bytes share one identity wherever they are written, so the identity never
+    /// locates a node: the `unit` and `range` beside it do.
     pub node: Option<String>,
     /// Source excerpt when requested and available.
     pub source: Option<String>,
@@ -4925,13 +4916,15 @@ pub struct SearchHitTargetSymbol {
 )]
 #[serde(deny_unknown_fields, default)]
 pub struct SearchHitTargetNodeId {
-    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
-    /// revision the response names.
+    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
+    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
+    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
+    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
+    /// kind with equal bytes share one identity wherever they are written, so the identity never
+    /// locates a node: the `unit` and `range` beside it do.
     #[validate(
-        length(min = 27u64, max = 8_192u64),
-        regex(path = "REGEX_PARAMETER_NODE")
+        length(min = 78u64, max = 206u64),
+        regex(path = "REGEX_SEARCH_HIT_TARGET_NODE_ID_NODE")
     )]
     pub node: String,
     #[default("node".to_string())]

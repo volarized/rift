@@ -3222,8 +3222,9 @@ impl RiftMcp {
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
-    /// outermost first. Each identity carries a witness, so an address taken
-    /// from this listing refuses cleanly once the file's bytes drift. `rev`
+    /// outermost first. Each node's identity is a digest of its language, kind,
+    /// and bytes, so equal nodes share one identity and an edit elsewhere in the
+    /// file leaves it unchanged; `unit` and `range` locate the node. `rev`
     /// lists the nodes as of a version-control revision instead of the
     /// current tree. If discovery is incomplete or a targeted read spends the
     /// request's remaining time, the result has empty `nodes` and `source` and
@@ -7099,7 +7100,7 @@ done
 
     #[tokio::test]
     async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
-        let (_directory, server, id) = canonical_fixture().await?;
+        let (directory, server, id) = canonical_fixture().await?;
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
         let server_task = tokio::spawn(async move {
             let service = server
@@ -7172,26 +7173,24 @@ done
             !listed.is_empty(),
             "position 8 sits inside `pub fn beacon`, so at least one node covers it"
         );
-        let witness_suffix = has_witness_fragment(listed[0]["id"].as_str().unwrap_or_default());
-        assert!(
-            witness_suffix,
-            "every listed node id must end in an eight-hex-character witness: {}",
-            listed[0]["id"]
+        let outermost = &listed[0];
+        let range = &outermost["range"];
+        let start = usize::try_from(range["start"].as_u64().ok_or("node range start")?)?;
+        let end = usize::try_from(range["end"].as_u64().ok_or("node range end")?)?;
+        let language: rift_protocol::read::Language =
+            serde_json::from_value(outermost["language"].clone())?;
+        let kind = outermost["kind"].as_str().ok_or("node kind")?;
+        let source = fs::read(directory.path().join("lib.rs"))?;
+        let bytes = source.get(start..end).ok_or("node range in source")?;
+        assert_eq!(
+            outermost["id"],
+            json!(rift_protocol::read::NodeId::for_content(&language, kind, bytes).0),
+            "a node identity is the digest of the bytes at the node's own range"
         );
 
         client.cancel().await?;
         server_task.await?;
         Ok(())
-    }
-
-    /// Reports whether a node id ends in `#` plus eight lowercase hex digits.
-    fn has_witness_fragment(id: &str) -> bool {
-        id.rsplit_once('#').is_some_and(|(_, witness)| {
-            witness.len() == 8
-                && witness
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit() && !character.is_uppercase())
-        })
     }
 
     #[tokio::test]

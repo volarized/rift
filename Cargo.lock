@@ -4906,6 +4906,7 @@ dependencies = [
 name = "rift-protocol"
 version = "0.0.73"
 dependencies = [
+ "data-encoding",
  "get-size2",
  "jsonschema",
  "pep440_rs",
@@ -4917,6 +4918,7 @@ dependencies = [
  "serde_json",
  "serde_json_canonicalizer",
  "serde_path_to_error",
+ "sha2 0.11.1",
  "strum",
  "unicode-ident",
  "url",

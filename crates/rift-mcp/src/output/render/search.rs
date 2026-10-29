@@ -255,11 +255,16 @@ fn file_hit(lines: &mut Lines<'_>, view: &HitView<'_>) -> Result<(), TextError> 
     plain_source(lines, view.source)
 }
 
-/// Writes a node hit: its place and matched fields, its identity, then the source.
+/// Writes a node hit: its place and matched fields, its byte range, its identity, then the
+/// source. The identity is a content digest that equal nodes share, so the range is what
+/// places this one.
 fn node_hit(lines: &mut Lines<'_>, node: &NodeId, view: &HitView<'_>) -> Result<(), TextError> {
     let place = location(view.path, view.unit, view.line);
     let facts = place_facts(view, &place, &Facts::default())?;
     lines.head(facts.as_str())?;
+    if let Some(range) = view.range {
+        lines.line(0, &format!("{}..{}", range.start, range.end))?;
+    }
     lines.line(0, &node.0)?;
     plain_source(lines, view.source)
 }

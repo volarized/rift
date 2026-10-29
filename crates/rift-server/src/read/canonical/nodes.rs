@@ -68,7 +68,7 @@ impl LocalSymbolMaterial {
             .map(|node| {
                 let language = file.syntax().language();
                 Node {
-                    id: super::super::node_id(file, node.range),
+                    id: super::super::node_id(file, node.range, node.kind),
                     symbol: self
                         .index
                         .symbol_identity(&path, node.range)

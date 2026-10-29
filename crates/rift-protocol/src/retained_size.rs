@@ -300,7 +300,7 @@ heap_fields!(SymbolOrigin, package, runtime);
 heap_fields!(SignatureLink, symbol);
 heap_fields!(TypeBinding, r#type);
 heap_fields!(TypeExpression, language, source, resolved, extensions);
-heap_fields!(Parameter, name, node, types => vector, default, extensions);
+heap_fields!(Parameter, name, types => vector, default, extensions);
 heap_fields!(
     Signature,
     display,
@@ -568,7 +568,14 @@ mod tests {
             kind: ExactKind(kind),
             facets,
             to: SymbolId("rift://symbol/local/rust/app/callee".to_owned()),
-            evidence: vec![NodeId("rift://node/rust/lib.rs@0-12#12345678".to_owned())],
+            evidence: vec![NodeId::for_content(
+                &Language {
+                    name: "rust".to_owned(),
+                    dialect: None,
+                },
+                "call_expression",
+                b"callee(1, 2)",
+            )],
             occurrence: Some(crate::read::SourceUnitSpan {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },
@@ -700,7 +707,6 @@ mod tests {
             receiver: None,
             parameters: vec![Parameter {
                 name: Some("value".to_owned()),
-                node: None,
                 types: Vec::new(),
                 optional: false,
                 variadic: false,

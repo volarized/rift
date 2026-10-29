@@ -1,7 +1,7 @@
 {
   "$defs": {
     "Digest": {
-      "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+      "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire.",
       "examples": [
         "3f9a1c2e"
       ],
@@ -904,13 +904,13 @@
       "type": "string"
     },
     "NodeId": {
-      "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names.",
+      "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do.",
       "examples": [
-        "rift://node/rust/lib.rs@220-268#3f9a1c2e"
+        "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
       ],
-      "maxLength": 8192,
-      "minLength": 27,
-      "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
+      "maxLength": 206,
+      "minLength": 78,
+      "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
       "type": "string"
     },
     "NotebookCell": {
@@ -1568,10 +1568,6 @@
           "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
           "type": "string"
         },
-        "node": {
-          "$ref": "#/$defs/NodeId",
-          "description": "Where this parameter is written in the source."
-        },
         "optional": {
           "description": "Whether a call may leave it out.",
           "type": "boolean"
@@ -1621,7 +1617,7 @@
         },
         "evidence": {
           "default": [],
-          "description": "The nodes this edge was read from. Absent when empty.",
+          "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
           "items": {
             "$ref": "#/$defs/NodeId"
           },

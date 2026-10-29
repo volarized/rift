@@ -35,7 +35,7 @@ use crate::read::{
 /// It changes only when the publication shape or a record identity changes in a way a
 /// consumer cannot read past: a consumer that meets a higher revision than it knows
 /// refuses the publication rather than reading fields it cannot place.
-pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 3;
+pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 4;
 
 /// Source units one publication may carry.
 pub const PACKAGE_UNITS_MAX: u32 = 100_000;

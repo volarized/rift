@@ -46,7 +46,8 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     Ok(())
 }
 
-/// Writes one node: kind and facts, identity, symbol, and regions.
+/// Writes one node: kind and facts, byte range, identity, symbol, and regions. The identity is
+/// a content digest that equal nodes share, so the range is what places this one.
 fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextError> {
     let Node {
         id,
@@ -55,7 +56,7 @@ fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextEr
         language: _,
         kind,
         facets,
-        range: _,
+        range,
         regions,
         parent: _,
         extensions: _,
@@ -73,6 +74,7 @@ fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextEr
         facts.push("test");
     }
     lines.head(facts.as_str())?;
+    lines.line(0, &format!("{}..{}", range.start, range.end))?;
     lines.line(0, &id.0)?;
     if let Some(symbol) = symbol {
         lines.line(0, &symbol.0)?;

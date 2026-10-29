@@ -28,7 +28,6 @@ use rift_protocol::read::{
     SourceUnitId, Symbol, SymbolId, TextRange,
 };
 use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
-use sha2::{Digest as _, Sha256};
 
 use crate::history::{StoredHistory, SymbolTimelines};
 
@@ -1376,7 +1375,9 @@ impl ReadService {
             unit,
             range: text_range(matched.symbol.range),
             line: line::line_number_at(matched.file.source(), matched.symbol.range.start),
-            node: include_source.then(|| node_id(matched.file, matched.symbol.range)),
+            node: include_source
+                .then(|| declaration_node(matched.file, matched.symbol))
+                .flatten(),
             source: include_source.then(|| excerpt(matched.file, matched.symbol.range)),
             history,
             documentation: None,
@@ -1570,7 +1571,7 @@ fn wire_node_facts(
         .transpose()?
         .flatten();
     Ok(Node {
-        id: node_id(file, range),
+        id: node_id(file, range, kind),
         symbol,
         unit: file_id(file.path()),
         language: language.clone(),
@@ -1920,19 +1921,31 @@ fn validate_node_position(file: &IndexedFile, position: u64) -> Result<(), RiftE
     Ok(())
 }
 
-fn node_id(file: &IndexedFile, range: ByteRange) -> NodeId {
-    NodeId(node_address(file, range))
+/// Content identity of the syntax node of `kind` spanning `range` in `file`, minted over the
+/// node's exact bytes.
+///
+/// # Panics
+///
+/// Panics when `range` does not land inside the file's source - a programmer error, since
+/// every caller passes a range the file's own parse produced.
+fn node_id(file: &IndexedFile, range: ByteRange, kind: &str) -> NodeId {
+    let start = usize::try_from(range.start).expect("node range start fits this platform's usize");
+    let end = usize::try_from(range.end).expect("node range end fits this platform's usize");
+    let bytes = file
+        .source()
+        .as_bytes()
+        .get(start..end)
+        .expect("node range lands inside the source its parse produced");
+    NodeId::for_content(file.syntax().language(), kind, bytes)
 }
 
-fn node_address(file: &IndexedFile, range: ByteRange) -> String {
-    format!(
-        "rift://node/{}/{}@{}-{}#{}",
-        file.syntax().language().identity_segment(),
-        rift_core::encode_path(file.path().as_str()),
-        range.start,
-        range.end,
-        node_witness(file.source(), range)
-    )
+/// Content identity of a declaration's syntax node: the node spanning `item_range`, whose
+/// grammar kind the provider names in `node_kind`. `None` when the provider names no kind,
+/// since no identity can be minted without one.
+pub(crate) fn declaration_node(file: &IndexedFile, symbol: &SyntaxSymbol) -> Option<NodeId> {
+    symbol
+        .node_kind
+        .map(|kind| node_id(file, symbol.item_range, kind))
 }
 
 /// Tree revisions captured when one read service is built, at full SHA-256
@@ -2056,34 +2069,6 @@ fn captured_revisions(index: &WorkspaceIndex) -> CapturedRevisions {
     }
 }
 
-/// The witness a node address carries: the first eight lowercase hex characters of the
-/// SHA-256 of the node's source bytes. Recomputing it is how resolution proves the bytes
-/// behind an address have not drifted.
-///
-/// `range` must already land inside `source`: minting hashes a real indexed node's own
-/// range, and [`resolve_node_range`] proves a caller-supplied range lands before calling
-/// this. Neither caller clamps, so this does not either.
-///
-/// # Panics
-///
-/// Panics when `range` does not land inside `source` - a programmer error, since every
-/// caller proves the range first.
-pub(crate) fn node_witness(source: &str, range: ByteRange) -> String {
-    let start = usize::try_from(range.start).expect("node range start fits this platform's usize");
-    let end = usize::try_from(range.end).expect("node range end fits this platform's usize");
-    let bytes = source
-        .get(start..end)
-        .expect("node range lands inside the source it was minted or resolved against");
-    digest_hex8(bytes)
-}
-
-/// First `DIGEST_WIRE_CHARS` lowercase hex characters of the SHA-256 of `source` - the sole
-/// wire constructor for a witness or a `Digest`. A 64-character digest reaching the wire is a
-/// defect this stays the single choke point against.
-pub(crate) fn digest_hex8(source: &str) -> String {
-    digest_wire_hex(&Sha256::digest(source.as_bytes()))
-}
-
 /// Truncates an already-hashed full-length hex digest to its wire form. `full` keeps
 /// collision resistance for internal identity computation; only the truncated form crosses
 /// the wire boundary.
@@ -2097,13 +2082,7 @@ pub fn wire_digest(full: &str) -> Digest {
     Digest(full[..DIGEST_WIRE_CHARS].to_owned())
 }
 
-/// Renders one already-computed SHA-256 digest in the `DIGEST_WIRE_CHARS` wire form, the
-/// truncation behind [`digest_hex8`] and the minted `ChangeId`.
-pub(crate) fn digest_wire_hex(digest: &sha2::digest::Output<Sha256>) -> String {
-    data_encoding::HEXLOWER.encode(digest)[..DIGEST_WIRE_CHARS].to_owned()
-}
-
-/// Finds the symbol a witnessed syntax node belongs to.
+/// Finds the symbol a syntax node belongs to.
 ///
 /// A node's range matches a symbol's declaration range (the whole
 /// declaration, including attached docs and attributes) for most nodes, but
@@ -3374,10 +3353,18 @@ pub fn compute() -> i32 {
 
         let node = value["hits"][0]["node"]
             .as_str()
-            .ok_or("node must be the bare witnessed address string")?;
-        assert!(
-            node.starts_with("rift://node/rust/src/lib.rs@"),
-            "the address embeds the language, path, and range: {node}"
+            .ok_or("node must be the bare content identity string")?;
+        let source = value["hits"][0]["source"]
+            .as_str()
+            .ok_or("the declaration source is requested")?;
+        let rust = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        assert_eq!(
+            node,
+            rift_protocol::read::NodeId::for_content(&rust, "function_item", source.as_bytes()).0,
+            "the identity is the digest of the declaration node's language, kind, and bytes"
         );
 
         let top_level: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
@@ -4350,6 +4337,115 @@ pub fn compute() -> i32 {
         for (internal, wire) in cases {
             assert_eq!(super::wire_source_location_kind(&internal), wire);
         }
+    }
+
+    /// Two calls of one function, so two nodes with equal bytes in one file.
+    const REPEATED_CALL_SOURCE: &str = "pub fn alpha() -> u8 { seven() }\npub fn beta() -> u8 { seven() }\nfn seven() -> u8 { 7 }\n";
+
+    fn service_over(source: &str) -> TestResult<(TempDir, ReadService)> {
+        let directory = tempfile::tempdir()?;
+        captured_rust_package(directory.path())?;
+        fs::create_dir(directory.path().join("src"))?;
+        fs::write(directory.path().join("src/lib.rs"), source)?;
+        let service = ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &rift_core::TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )?;
+        Ok((directory, service))
+    }
+
+    /// The innermost and outermost nodes covering the `index`th `seven()` call in `source`.
+    fn call_nodes(
+        service: &ReadService,
+        source: &str,
+        index: usize,
+    ) -> TestResult<(rift_protocol::read::Node, rift_protocol::read::Node)> {
+        let (position, _) = source
+            .match_indices("seven()")
+            .nth(index)
+            .ok_or("the fixture holds the call")?;
+        let result = service.nodes(NodesParams {
+            view: None,
+            path: ProjectPath("src/lib.rs".to_owned()),
+            position: u64::try_from(position)?,
+            rev: None,
+        })?;
+        let innermost = result.nodes.last().ok_or("a node covers the call")?.clone();
+        let outermost = result
+            .nodes
+            .first()
+            .ok_or("a node covers the call")?
+            .clone();
+        Ok((innermost, outermost))
+    }
+
+    /// Equal bytes of one language and kind are one node identity, wherever they are written;
+    /// the location of each stays its own.
+    #[test]
+    fn nodes_with_equal_bytes_share_one_identity_and_keep_their_own_ranges() -> TestResult {
+        let (_directory, service) = service_over(REPEATED_CALL_SOURCE)?;
+        let (first, _) = call_nodes(&service, REPEATED_CALL_SOURCE, 0)?;
+        let (second, _) = call_nodes(&service, REPEATED_CALL_SOURCE, 1)?;
+        assert_eq!(first.kind, second.kind);
+        assert_eq!(first.id, second.id, "equal bytes answer one identity");
+        assert_eq!(first.unit, second.unit);
+        assert_ne!(first.range, second.range, "each node keeps its own range");
+        let start = usize::try_from(first.range.start)?;
+        let end = usize::try_from(first.range.end)?;
+        let bytes = REPEATED_CALL_SOURCE
+            .get(start..end)
+            .ok_or("the range lands in the source")?;
+        assert_eq!(
+            first.id,
+            rift_protocol::read::NodeId::for_content(
+                &first.language,
+                &first.kind.0,
+                bytes.as_bytes()
+            )
+        );
+        Ok(())
+    }
+
+    /// An edit elsewhere in the file moves a node without changing its identity, while the
+    /// file node, whose bytes the edit changed, answers another identity.
+    #[test]
+    fn a_node_identity_survives_an_edit_elsewhere_in_the_file() -> TestResult {
+        let (_before_directory, before) = service_over(REPEATED_CALL_SOURCE)?;
+        let edited = REPEATED_CALL_SOURCE
+            .replace("{ seven() }\npub fn beta", "{ 1 + seven() }\npub fn beta");
+        let (_after_directory, after) = service_over(&edited)?;
+        let (call_before, file_before) = call_nodes(&before, REPEATED_CALL_SOURCE, 1)?;
+        let (call_after, file_after) = call_nodes(&after, &edited, 1)?;
+        assert_eq!(
+            call_before.id, call_after.id,
+            "the call's own bytes did not change"
+        );
+        assert_eq!(call_after.range.start, call_before.range.start + 4);
+        assert_ne!(file_before.id, file_after.id, "the file's bytes changed");
+        Ok(())
+    }
+
+    /// A declaration's node is its item node: the bytes without the attached documentation
+    /// and attributes the declaration's own range covers.
+    #[test]
+    fn a_documented_declaration_names_its_item_node() -> TestResult {
+        let (_directory, service) = documented_fixture()?;
+        let params: GetSymbolParams =
+            serde_json::from_value(json!({"name": "Beacon", "include": ["source"]}))?;
+        let value = serde_json::to_value(service.get_symbol(&params)?)?;
+        let hit = &value["hits"][0];
+        let rust = Language {
+            name: "rust".to_owned(),
+            dialect: None,
+        };
+        let item =
+            rift_protocol::read::NodeId::for_content(&rust, "struct_item", b"pub struct Beacon;");
+        assert_eq!(hit["node"], json!(item.0));
+        assert_eq!(hit["source"], json!(DOCUMENTED_SOURCE.trim_end()));
+        Ok(())
     }
 
     #[test]

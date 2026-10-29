@@ -1201,14 +1201,7 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
                     .error()
             })?
         }
-        (SearchHitTarget::Node { node }, ..) => {
-            DocumentIdentity::new(node.0.clone()).map_err(|error| {
-                errors::mcp::project_hit_identity_refused()
-                    .hit(&node.0)
-                    .cause(error)
-                    .error()
-            })?
-        }
+        (SearchHitTarget::Node { node }, ..) => node_identity(hit, node)?,
         (SearchHitTarget::Documentation { documentation }, ..) => {
             DocumentIdentity::for_documentation_block(&documentation.block.identity.0).map_err(
                 |error| {
@@ -1233,6 +1226,31 @@ fn ranking_identity(hit: &SearchHit) -> Result<DocumentIdentity, RiftError> {
 
 /// A unit-addressed symbol hit's identity: its source unit and the qualified name its
 /// symbol address encodes.
+/// The identity a node hit ranks under: its content identity, then the path or unit and the
+/// byte range it lies at, since two nodes with equal bytes share one content identity.
+fn node_identity(
+    hit: &SearchHit,
+    node: &rift_protocol::read::NodeId,
+) -> Result<DocumentIdentity, RiftError> {
+    let place = hit
+        .path
+        .as_ref()
+        .map(|path| path.0.as_str())
+        .or_else(|| hit.unit.as_ref().map(|unit| unit.0.as_str()));
+    let (Some(place), Some(range)) = (place, hit.range.as_ref()) else {
+        return Err(errors::mcp::project_hit_identity_missing()
+            .hit(&node.0)
+            .error());
+    };
+    let identity = format!("{} {place}@{}-{}", node.0, range.start, range.end);
+    DocumentIdentity::new(identity).map_err(|error| {
+        errors::mcp::project_hit_identity_refused()
+            .hit(&node.0)
+            .cause(error)
+            .error()
+    })
+}
+
 fn unit_identity(
     unit: &rift_protocol::read::SourceUnitId,
     symbol_id: &SymbolId,
@@ -1260,12 +1278,18 @@ pub(crate) fn order_search_hits(hits: &mut [SearchHit], order: ResultOrder) {
                 .cmp(&right.path.is_none())
                 .then_with(|| left.path.cmp(&right.path))
                 .then_with(|| left.unit.cmp(&right.unit))
-                .then_with(|| search_hit_key(left).cmp(search_hit_key(right)))
+                .then_with(|| identity_ordering(left, right))
         }),
-        ResultOrder::Identity => {
-            hits.sort_by(|left, right| search_hit_key(left).cmp(search_hit_key(right)));
-        }
+        ResultOrder::Identity => hits.sort_by(identity_ordering),
     }
+}
+
+/// Orders two hits by key, then by place: two node hits with equal bytes share one key, so
+/// the place keeps the order total.
+fn identity_ordering(left: &SearchHit, right: &SearchHit) -> std::cmp::Ordering {
+    search_hit_key(left)
+        .cmp(search_hit_key(right))
+        .then_with(|| left.place().cmp(&right.place()))
 }
 
 fn search_hit_key(hit: &SearchHit) -> &str {
@@ -1934,6 +1958,33 @@ mod tests {
         hit
     }
 
+    /// Two node hits with equal bytes share one content identity, so they rank under their
+    /// places, never collapse into one payload, and order by place; a node hit with no place
+    /// has no ranking identity.
+    #[test]
+    fn equal_node_hits_rank_apart_by_their_place() {
+        let node =
+            "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2";
+        let at = |start: u64| -> SearchHit {
+            serde_json::from_value(serde_json::json!({
+                "hit": {"target": "node", "node": node},
+                "path": "src/config.rs",
+                "range": {"start": start, "end": start + 12}
+            }))
+            .expect("a node hit")
+        };
+        let (first, second) = (at(40), at(334));
+        let first_identity = super::ranking_identity(&first).expect("a placed node ranks");
+        let second_identity = super::ranking_identity(&second).expect("a placed node ranks");
+        assert_ne!(first_identity, second_identity);
+        let mut ordered = vec![second.clone(), first.clone()];
+        super::order_search_hits(&mut ordered, super::ResultOrder::Identity);
+        assert_eq!(ordered, vec![first.clone(), second]);
+        let mut unplaced = first;
+        unplaced.range = None;
+        assert!(super::ranking_identity(&unplaced).is_err());
+    }
+
     /// Each kind of project hit ranks under the identity the fusion keys it by, and a merge
     /// beside no package candidate answers every one of them.
     #[test]
@@ -1946,8 +1997,9 @@ mod tests {
         unit_hit.path = None;
         unit_hit.unit = Some(SourceUnitId(unit.to_owned()));
         let node_hit: SearchHit = serde_json::from_value(serde_json::json!({
-            "hit": {"target": "node", "node": "rift://node/rust/src/lib.rs@0-10#dcbef6dd"},
-            "path": "src/lib.rs"
+            "hit": {"target": "node", "node": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"},
+            "path": "src/lib.rs",
+            "range": {"start": 0, "end": 10}
         }))
         .expect("a node hit");
         let documentation_hit = documentation_hits().remove(0);
@@ -1982,7 +2034,7 @@ mod tests {
             "rift://symbol/local/rust/app/config/load_config",
             unit_identity.as_str(),
             "src/lib.rs",
-            "rift://node/rust/src/lib.rs@0-10#dcbef6dd",
+            "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961 src/lib.rs@0-10",
             block_identity.as_str(),
             revision,
         ];

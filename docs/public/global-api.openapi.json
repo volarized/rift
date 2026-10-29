@@ -2137,10 +2137,6 @@
             "type": "string",
             "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type."
           },
-          "node": {
-            "description": "Where this parameter is written in the source.",
-            "$ref": "#/components/schemas/NodeId"
-          },
           "types": {
             "type": "array",
             "items": {
@@ -2176,12 +2172,12 @@
       "NodeId": {
         "type": "string",
         "examples": [
-          "rift://node/rust/lib.rs@220-268#3f9a1c2e"
+          "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
         ],
-        "minLength": 27,
-        "maxLength": 8192,
-        "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
-        "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names."
+        "minLength": 78,
+        "maxLength": 206,
+        "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
+        "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do."
       },
       "TypeBinding": {
         "type": "object",
@@ -3407,7 +3403,7 @@
           "3f9a1c2e"
         ],
         "pattern": "^[0-9a-f]{8}$",
-        "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire."
+        "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire."
       },
       "DocumentationBlock": {
         "type": "object",
@@ -4291,7 +4287,7 @@
             "properties": {
               "node": {
                 "$ref": "#/components/schemas/NodeId",
-                "description": "The syntax-tree node's identity in the captured source revision."
+                "description": "Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`\nlocate it."
               },
               "target": {
                 "type": "string",
@@ -4502,7 +4498,7 @@
             "items": {
               "$ref": "#/components/schemas/NodeId"
             },
-            "description": "The nodes this edge was read from. Absent when empty.",
+            "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
             "default": []
           },
           "occurrence": {
@@ -6360,7 +6356,7 @@
             "description": "One-based line where this declaration begins."
           },
           "node": {
-            "description": "Source node when available and requested.",
+            "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration.",
             "$ref": "#/components/schemas/NodeId"
           },
           "source": {
@@ -7357,7 +7353,7 @@
           {
             "nodes": [
               {
-                "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "source_file",
@@ -7367,7 +7363,7 @@
                 }
               },
               {
-                "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
+                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
                 "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
@@ -7396,10 +7392,10 @@
                     }
                   }
                 ],
-                "parent": "rift://node/rust/src/config.rs@0-356#dcbef6dd"
+                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"
               },
               {
-                "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "block",
@@ -7407,10 +7403,10 @@
                   "start": 281,
                   "end": 355
                 },
-                "parent": "rift://node/rust/src/config.rs@218-355#67ecfb36"
+                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
               },
               {
-                "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "call_expression",
@@ -7421,10 +7417,10 @@
                   "start": 334,
                   "end": 353
                 },
-                "parent": "rift://node/rust/src/config.rs@281-355#4e554fa8"
+                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189"
               },
               {
-                "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
@@ -7432,7 +7428,7 @@
                   "start": 334,
                   "end": 346
                 },
-                "parent": "rift://node/rust/src/config.rs@334-353#4df4426e"
+                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690"
               }
             ],
             "source": [
