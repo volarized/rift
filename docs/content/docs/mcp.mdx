@@ -160,7 +160,7 @@ right after startup or an edit doesn't wait for it. Files the index doesn't hold
 too, and when they're too many for one search, the answer covers the files the index holds and
 carries a `pattern_index_preparing` warning until the index catches up.
 
-`pattern` doesn't combine with `query`, `traversal`, `change`, or `rev`. With `scope` set to
+`pattern` doesn't combine with `query`, `traversal`, `change`, or a git `revision`. With `scope` set to
 `global` or `all`, it also searches the package files the global index holds. The
 [pattern reference](/docs/developer/protocol/mcp#search-pattern) describes the bounds a search
 runs under and the warning a file with too many matches carries.
@@ -240,7 +240,7 @@ it. This request searches Tokio 1.47.1 beside the project code:
 
 An entry without `version` reads the newest release the global index has collected. `packages`
 takes effect with `scope` set to `global` or `all` on the current tree, and the server refuses it
-beside the `local` scope or `rev`.
+beside the `local` scope or a git `revision`.
 
 A dependency no public registry serves, such as a path outside the project or a git repository,
 has no declarations in the global index, and the answer names it in a `package_unavailable`
@@ -455,8 +455,9 @@ continue those bindings in the same view:
 
 <ReadExample name="multi-declaration-next" />
 
-Local Git `rev` is refused beside `view` and for package or runtime owners. Released source
-units remain physical addresses separate from logical symbol identities.
+`revision` is refused beside `view`. For a package or runtime symbol it can only name the release
+the symbol's identity carries. Released source units remain physical addresses separate from
+logical symbol identities.
 
 A valid absent identity returns MCP `isError: true` and `outcome: "missing"` with
 `symbol_not_found` and bounded structural alternatives. Its compact text starts with
@@ -580,15 +581,26 @@ The [result content reference](/docs/developer/protocol/mcp#result-content) defi
 <Accordions>
 <Accordion title="Earlier revisions" id="revision-reads">
 
-The agent can read older project code by adding `rev` to `search`, `get_symbol`, or `nodes`.
-For example, this reads the function from `main` without changing the working tree:
+Every answer of `search`, `get_symbol`, and `nodes` names the revision it was read at, such as
+`rift://revision/tree/<digest>` for the working tree the index serves. The agent can read older
+project code by adding `revision` to the same tools. For example, this reads the function from
+`main` without changing the working tree:
 
 ```json
-{ "id": "rift://symbol/local/rust/example_project/config/load_config", "rev": "main" }
+{
+  "id": "rift://symbol/local/rust/example_project/config/load_config",
+  "revision": "rift://revision/git/main"
+}
 ```
 
-Git's ancestry suffixes work too, so `"rev": "HEAD~1"` reads the commit below `HEAD`.
-Revision reads use committed source from a branch, tag, or commit and require a Git repository.
+The server resolves `main` to its commit, and the answer reports that commit, such as
+`rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1`, so a later read can name the
+same point. Git's `~` ancestry suffix works too, so `rift://revision/git/HEAD~1` reads the commit
+below `HEAD`. Revision reads use committed source and require a Git repository.
+
+A tree revision pins a read to the working tree an earlier answer reported. Once the project
+changes and the index serves another tree, the server refuses that read with
+`resource_not_found` instead of answering from the newer tree.
 See [revision-addressed reads](/docs/developer/protocol/mcp#revision-reads) for configuration
 and argument constraints.
 

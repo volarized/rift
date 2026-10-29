@@ -355,7 +355,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -382,6 +382,7 @@
         "id": "e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3",
         "expires_at": "2026-10-12T15:50:28.711117+00:00"
       },
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "declarations": [
         {
           "origin": {
@@ -406,7 +407,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -433,6 +434,7 @@
         "id": "e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd",
         "expires_at": "2026-10-12T16:17:02.916991+00:00"
       },
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "declarations": [
         {
           "origin": {
@@ -483,8 +485,9 @@
       "include": ["source"],
       "limit": 10
     },
-    "text": "7 results\n\t[1] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[2] README.md:14 \u00b7 content\n\t\tCall `load_config`.\n\t[3] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[4] src/config.rs:11 \u00b7 content\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t[5] src/main.rs:6 \u00b7 content\n\t\tuse config::load_config;\n\t[6] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\n\t[7] src/main.rs:12 \u00b7 content\n\t\t        load_config(Path::new(\"rift.toml\"))\n",
+    "text": "7 results\n\t[1] heading Configuration\n\t\tREADME.md:12 \u00b7 content\n\t\t360..398\n\n\t\t## Configuration\n\n\t\tCall `load_config`.\n\n\t[2] README.md:14 \u00b7 content\n\t\tCall `load_config`.\n\t[3] pub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\t\tsrc/config.rs:10 \u00b7 content\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t\tLoads the workspace configuration from `rift.toml`.\n\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\n\t[4] src/config.rs:11 \u00b7 content\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t[5] src/main.rs:6 \u00b7 content\n\t\tuse config::load_config;\n\t[6] private async fn main() -> Result<(), ConfigError>\n\t\tsrc/main.rs:9 \u00b7 content\n\t\t96..343\n\n\t\t#[tokio::main]\n\t\tasync fn main() -> Result<(), ConfigError> {\n\t\t    let config = tokio::task::spawn_blocking(|| {\n\t\t        load_config(Path::new(\"rift.toml\"))\n\t\t    })\n\t\t    .await??;\n\n\t\t    println!(\"Workspace root: {}\", config.root.display());\n\t\t    Ok(())\n\t\t}\n\t[7] src/main.rs:12 \u00b7 content\n\t\t        load_config(Path::new(\"rift.toml\"))\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11",
       "results": [
         {
           "hit": {
@@ -636,7 +639,7 @@
       "path": "src/config.rs",
       "position": 338
     },
-    "text": "6 nodes\n\t[1] file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2\n\t[2] source_file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961\n\t[3] function_item \u00b7 4 lines\n\t\t218..355\n\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[4] block \u00b7 4 lines\n\t\t281..355\n\t\trift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189\n\t[5] call_expression\n\t\t334..353\n\t\trift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690\n\t[6] identifier\n\t\t334..346\n\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2\n\n\t\tparse_config\n",
+    "text": "6 nodes\n\t[1] file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2\n\t[2] source_file \u00b7 14 lines\n\t\t0..356\n\t\trift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961\n\t[3] function_item \u00b7 4 lines\n\t\t218..355\n\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[4] block \u00b7 4 lines\n\t\t281..355\n\t\trift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189\n\t[5] call_expression\n\t\t334..353\n\t\trift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690\n\t[6] identifier\n\t\t334..346\n\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2\n\n\t\tparse_config\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
       "nodes": [
         {
@@ -708,7 +711,8 @@
           },
           "source": "parse_config"
         }
-      ]
+      ],
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
   },
   "symbol-nodes": {
@@ -716,7 +720,7 @@
     "arguments": {
       "symbol": "rift://symbol/local/rust/example_project/config/Config"
     },
-    "text": "12 nodes\n\t[1] struct_item \u00b7 3 lines\n\t\t105..160\n\t\trift://node/rust/d2d8d019704b7a19d141808c6c9c418764905fa8f79265bfc76bf49b63d803bc\n\t\trift://symbol/local/rust/example_project/config/Config\n\t[2] visibility_modifier\n\t\t105..108\n\t\trift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47\n\t[3] type_identifier\n\t\t116..122\n\t\trift://node/rust/db2c4ebb346e2ae232139298cc2f302a780322ca9d90a3b8b42158b22ab03652\n\t[4] field_declaration_list \u00b7 3 lines\n\t\t123..160\n\t\trift://node/rust/8c03c8063cd4bdb3286a3666675fe2a4ec7c64c68753840c3157ac8f7f8aea52\n\t[5] field_declaration\n\t\t129..157\n\t\trift://node/rust/5a79743aa4810e8efa2a313dec943efe9e1a102128d4664f8c247cfd71270a67\n\t[6] visibility_modifier\n\t\t129..132\n\t\trift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47\n\t[7] field_identifier\n\t\t133..137\n\t\trift://node/rust/363f2f784bc6c1dfe7d657d1c23bc2799be4347fac476878e4a7fbd14ba252dc\n\t[8] scoped_type_identifier\n\t\t139..157\n\t\trift://node/rust/ceeb424730384142768bc216729967e7abe0335d4d07bbadf2335bdbc9e0613a\n\t[9] scoped_identifier\n\t\t139..148\n\t\trift://node/rust/5c297e67ab167bd68a8101a08e6d780c7154f09292ef57ea7c86a4c178c41962\n\t[10] identifier\n\t\t139..142\n\t\trift://node/rust/e1498d9bcf50d5e6a716f16a8f84f1e13b851b383f2dc147c30a6da3825d89b3\n\t[11] identifier\n\t\t144..148\n\t\trift://node/rust/2881c581b6a03b53eb0daf9b7aec667a7d5a07d0dfffa9a933b0cc71ceac2db0\n\t[12] type_identifier\n\t\t150..157\n\t\trift://node/rust/c28259b3d51103cd87667447c36c0953dbc4995f67bd6dbb0de6c7467a4d3413\n\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\n",
+    "text": "12 nodes\n\t[1] struct_item \u00b7 3 lines\n\t\t105..160\n\t\trift://node/rust/d2d8d019704b7a19d141808c6c9c418764905fa8f79265bfc76bf49b63d803bc\n\t\trift://symbol/local/rust/example_project/config/Config\n\t[2] visibility_modifier\n\t\t105..108\n\t\trift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47\n\t[3] type_identifier\n\t\t116..122\n\t\trift://node/rust/db2c4ebb346e2ae232139298cc2f302a780322ca9d90a3b8b42158b22ab03652\n\t[4] field_declaration_list \u00b7 3 lines\n\t\t123..160\n\t\trift://node/rust/8c03c8063cd4bdb3286a3666675fe2a4ec7c64c68753840c3157ac8f7f8aea52\n\t[5] field_declaration\n\t\t129..157\n\t\trift://node/rust/5a79743aa4810e8efa2a313dec943efe9e1a102128d4664f8c247cfd71270a67\n\t[6] visibility_modifier\n\t\t129..132\n\t\trift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47\n\t[7] field_identifier\n\t\t133..137\n\t\trift://node/rust/363f2f784bc6c1dfe7d657d1c23bc2799be4347fac476878e4a7fbd14ba252dc\n\t[8] scoped_type_identifier\n\t\t139..157\n\t\trift://node/rust/ceeb424730384142768bc216729967e7abe0335d4d07bbadf2335bdbc9e0613a\n\t[9] scoped_identifier\n\t\t139..148\n\t\trift://node/rust/5c297e67ab167bd68a8101a08e6d780c7154f09292ef57ea7c86a4c178c41962\n\t[10] identifier\n\t\t139..142\n\t\trift://node/rust/e1498d9bcf50d5e6a716f16a8f84f1e13b851b383f2dc147c30a6da3825d89b3\n\t[11] identifier\n\t\t144..148\n\t\trift://node/rust/2881c581b6a03b53eb0daf9b7aec667a7d5a07d0dfffa9a933b0cc71ceac2db0\n\t[12] type_identifier\n\t\t150..157\n\t\trift://node/rust/c28259b3d51103cd87667447c36c0953dbc4995f67bd6dbb0de6c7467a4d3413\n\n\t\tpub struct Config {\n\t\t    pub root: std::path::PathBuf,\n\t\t}\nrevision rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11\n",
     "json": {
       "nodes": [
         {
@@ -854,7 +858,8 @@
           },
           "source": "PathBuf"
         }
-      ]
+      ],
+      "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
   },
   "local-search": {
@@ -1504,7 +1509,7 @@
       "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
       "include": ["documentation"]
     },
-    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\nrevision rift://revision/cargo/crates.io/demo@1.0.0\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1527,6 +1532,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/cargo/crates.io/demo@1.0.0",
       "declarations": [
         {
           "origin": {
@@ -1620,7 +1626,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nrevision rift://revision/stdlib/node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1641,6 +1647,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/stdlib/node@26.11.1",
       "declarations": []
     }
   },
@@ -1649,7 +1656,7 @@
     "arguments": {
       "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
     },
-    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nrevision rift://revision/stdlib/cpython@3.12.9\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1665,6 +1672,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/stdlib/cpython@3.12.9",
       "declarations": []
     }
   },
@@ -1673,7 +1681,7 @@
     "arguments": {
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1696,6 +1704,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
         {
           "origin": {
@@ -1748,7 +1757,7 @@
       "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
       "declaration_limit": 1
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1771,6 +1780,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
         {
           "origin": {
@@ -1805,7 +1815,7 @@
       "declaration_cursor": "fixture-next",
       "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -1828,6 +1838,7 @@
         "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "expires_at": "2099-10-10T10:05:00Z"
       },
+      "revision": "rift://revision/npm/npmjs.org/prettier@3.8.5",
       "declarations": [
         {
           "origin": {
