@@ -169,6 +169,18 @@ impl WorkspaceSymbolView {
         self.identities.get(&(path.clone(), position))
     }
 
+    /// The symbol the captured declaration at `position` of `path`'s symbols binds, and that
+    /// declaration's ordinal among the symbol's declarations in the order
+    /// [`Self::symbols_by_identity_page`] lists them.
+    #[must_use]
+    pub fn declaration_address(
+        &self,
+        path: &ProjectPath,
+        position: usize,
+    ) -> Option<(&SymbolId, usize)> {
+        self.declarations.address(path, position)
+    }
+
     /// Captured source file, without any filesystem read or path selection.
     #[must_use]
     pub fn file(&self, path: &ProjectPath) -> Option<&IndexedFile> {

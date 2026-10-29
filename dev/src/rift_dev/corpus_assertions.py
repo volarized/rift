@@ -596,11 +596,18 @@ def churn_answer(
             object_value(node, "probe node")
             for node in array_value(answer.get("nodes"), "probe nodes")
         ]
-        matches = [node for node in nodes if node.get("of") == identity]
-        require(len(matches) == 1, "nodes lost probe declaration")
+        matches = [
+            node
+            for node in nodes
+            if node.get("index") == 0 and node.get("declaration") is not None
+        ]
+        require(
+            answer.get("symbol") is not None and len(matches) == 1,
+            "nodes lost probe declaration",
+        )
         hit = matches[0]
         excerpt = hit.get("source")
-        found = string_value(hit.get("of"), "probe identity")
+        found = string_value(answer.get("symbol"), "probe identity")
     elif tool == "get_symbol":
         require(answer.get("outcome") == "found", "get_symbol lost probe declaration")
         symbol = object_value(answer.get("symbol"), "probe symbol")

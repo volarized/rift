@@ -290,7 +290,7 @@ impl LspContributionAdapter {
             })?,
         )
         .map_err(|error| lsp_error(LspContributionViolation::InvalidRange, error.to_string()))?;
-        Ok(DeclarationBinding::new(self.unit.clone(), range, None))
+        Ok(DeclarationBinding::new(self.unit.clone(), range))
     }
 }
 

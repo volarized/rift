@@ -45,12 +45,11 @@ use rift_ranking::{
     identifier_terms,
 };
 use rift_syntax::{
-    ByteRange, NodeMatch, SyntaxDocument, SyntaxLimits, SyntaxNode, SyntaxProvider, SyntaxSource,
+    ByteRange, NodeMatch, NodePlace, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource,
     SyntaxSymbol, registry,
 };
 use sha2::{Digest as _, Sha256};
 
-use crate::LocatedNode;
 use crate::capture::{CaptureBoundary, CapturedPath, LastCapture, capture_path, root_identity};
 use crate::change_set::{FileDigest, FileRecord, PathChanges, WorkspaceDigests, tree_revision_of};
 use crate::chunk::text_chunks;
@@ -59,6 +58,7 @@ use crate::documentation::NotebookFiles;
 use crate::language::{ClassifiedPath, WorkspaceLanguagePolicy};
 use crate::relationship::RelationshipStore;
 use crate::semantic::{BuiltSemantics, WorkspaceSemantics};
+use crate::{LocatedNode, NodeAddress};
 use rift_analysis::{DocumentationSelection, ForceIncludeReach, PathMatcher, PathVerdict};
 
 #[derive(Debug)]
@@ -1236,13 +1236,14 @@ fn is_syntax_bound(slug: ErrorSlug) -> bool {
     )
 }
 
-/// Indexed file and syntax nodes selected for one source position.
+/// Indexed file and its parse, read for one unpublished source path.
 #[derive(Debug)]
 pub struct IndexedFileNodes {
     /// Parsed file used to validate source identity and position.
     pub file: IndexedFile,
-    /// Nodes that cover the requested position.
-    pub nodes: Vec<SyntaxNode>,
+    /// The parse with its complete node table. The file is not published, so no declaration
+    /// of it has an established identity and its unit holds every node.
+    pub document: SyntaxDocument,
     /// Framework context unresolved for these captured source bytes.
     pub warnings: Vec<rift_protocol::read::ReadWarning>,
 }
@@ -2670,9 +2671,22 @@ struct SymbolDeclarations {
     objects: BTreeMap<SymbolId, usize>,
     assembled: BTreeMap<SymbolId, Result<ReadableSymbol, RiftError>>,
     facts: BTreeMap<(ProjectPath, usize), rift_protocol::symbol_read::SymbolDeclaration>,
+    addresses: BTreeMap<(ProjectPath, usize), (SymbolId, usize)>,
 }
 
 impl SymbolDeclarations {
+    /// The symbol one declaration binds, and the declaration's ordinal among that symbol's
+    /// bindings in the order a symbol read lists them.
+    pub(super) fn address(
+        &self,
+        path: &ProjectPath,
+        position: usize,
+    ) -> Option<(&SymbolId, usize)> {
+        self.addresses
+            .get(&(path.clone(), position))
+            .map(|(identity, ordinal)| (identity, *ordinal))
+    }
+
     fn object_positions(records: &[rift_core::SymbolRecord]) -> BTreeMap<SymbolId, usize> {
         records
             .iter()
@@ -3920,6 +3934,28 @@ impl WorkspaceIndex {
             .transpose()
     }
 
+    /// The symbol the declaration at `position` of `path`'s symbols binds, and that
+    /// declaration's ordinal among the symbol's declarations in the order
+    /// [`Self::symbols_by_identity_page`] lists them. `None` for a declaration without an
+    /// established identity.
+    ///
+    /// # Errors
+    /// Returns [`RiftError`] when the canonical declaration directory cannot be built.
+    pub fn declaration_address(
+        &self,
+        path: &ProjectPath,
+        position: usize,
+    ) -> Result<Option<(SymbolId, usize)>, RiftError> {
+        let declarations = self
+            .symbol_declarations
+            .get_or_init(|| self.build_symbol_declarations().map(Arc::new))
+            .as_ref()
+            .map_err(Clone::clone)?;
+        Ok(declarations
+            .address(path, position)
+            .map(|(identity, ordinal)| (identity.clone(), ordinal)))
+    }
+
     /// Returns a bounded page of physical declarations and the complete binding count.
     ///
     /// # Errors
@@ -3974,7 +4010,6 @@ impl WorkspaceIndex {
                 end: binding.range().end(),
             },
             line: rift_core::line::line_of(starts, binding.range().start()),
-            node: None,
             source: None,
             source_complete: false,
             signature_indices: rift_core::fact_indices(
@@ -4123,6 +4158,13 @@ impl WorkspaceIndex {
                     .map(|matched| (matched.rank, matched.symbol.qualified_name.as_str()))
             });
         }
+        for (identity, bindings) in &declarations.canonical {
+            for (ordinal, binding) in bindings.iter().enumerate() {
+                declarations
+                    .addresses
+                    .insert(binding.clone(), (identity.clone(), ordinal));
+            }
+        }
         Ok(declarations)
     }
 
@@ -4162,7 +4204,7 @@ impl WorkspaceIndex {
         self.files.get(path).map(AsRef::as_ref)
     }
 
-    /// Parses one selected source path and keeps only nodes covering `position` for this read.
+    /// Parses one selected source path for a read, keeping its complete node table.
     ///
     /// Returns `None` when no provider selects `path`, `Skipped` when a catalog or syntax
     /// bound leaves it out, and `Included` when parsing succeeds.
@@ -4174,7 +4216,6 @@ impl WorkspaceIndex {
     pub fn parse_source_file_with_nodes(
         &self,
         path: &ProjectPath,
-        position: u64,
     ) -> Result<Option<IndexRead<IndexedFileNodes>>, RiftError> {
         let absolute = self.root.join(path.as_str());
         let Some(ClassifiedPath::Source(provider)) = self.language.classifies(&absolute)? else {
@@ -4221,7 +4262,7 @@ impl WorkspaceIndex {
                 Err(error) => return error.fail(),
             },
         };
-        let nodes = syntax.nodes_at(position).into_iter().cloned().collect();
+        let document = syntax.clone();
         let file = IndexedFile::new(
             text_file.path().clone(),
             Arc::clone(&text_file.content),
@@ -4231,7 +4272,7 @@ impl WorkspaceIndex {
         );
         Ok(Some(IndexRead::Included(IndexedFileNodes {
             file,
-            nodes,
+            document,
             warnings,
         })))
     }
@@ -4348,7 +4389,8 @@ impl WorkspaceIndex {
     }
 
     /// Resolves the node at one location: the innermost node spanning `range` exactly, or
-    /// under [`NodeMatch::Enclosing`] the innermost one containing it.
+    /// under [`NodeMatch::Enclosing`] the innermost one containing it, addressed by its place
+    /// inside its symbol or unit.
     ///
     /// A held file without a syntax provider answers its file node, which spans the whole
     /// file, alone. `None` when the index holds no file at `path` or no node matches.
@@ -4356,7 +4398,7 @@ impl WorkspaceIndex {
     /// # Errors
     ///
     /// Returns [`RiftError`] when the held file no longer parses under this index's provider
-    /// and bounds.
+    /// and bounds, or the canonical declaration directory cannot be built.
     pub fn node_at(
         &self,
         path: &ProjectPath,
@@ -4365,14 +4407,27 @@ impl WorkspaceIndex {
     ) -> Result<Option<LocatedNode>, RiftError> {
         if let Some(document) = self.syntax(path)? {
             let source = self.file(path).map_or("", IndexedFile::source);
-            return Ok(document
-                .node_at(range, matching)
-                .map(|node| LocatedNode::of(document.language(), node.kind, node.range, source))
-                .or_else(|| LocatedNode::file(document.language(), source, range, matching)));
+            let declarations = (0..document.symbols().len())
+                .map(|position| self.declaration_address(path, position))
+                .collect::<Result<Vec<_>, _>>()?;
+            let places = document
+                .node_places(|position, _| declarations.get(position).is_some_and(Option::is_some));
+            let located = document.node_at(range, matching).and_then(|node| {
+                let position = document
+                    .nodes()
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, node))?;
+                Some(LocatedNode {
+                    address: node_address(places[position], &declarations),
+                    kind: node.kind,
+                    range: node.range,
+                })
+            });
+            return Ok(located.or_else(|| LocatedNode::file(source, range, matching)));
         }
         Ok(self
             .text_file(path)
-            .and_then(|file| LocatedNode::file(&Language::text(), file.content(), range, matching)))
+            .and_then(|file| LocatedNode::file(file.content(), range, matching)))
     }
 
     /// Walks the workspace on demand for `.rs` files matching `force_include`'s globs that are
@@ -6744,6 +6799,24 @@ pub fn relative_path(path: &Path) -> Result<ProjectPath, RiftError> {
 /// package hit's class under the same rule this index orders by.
 fn symbol_rank(symbol: &SyntaxSymbol, matcher: &IdentifierMatcher<'_>) -> Option<IdentifierMatch> {
     matcher.matches(&symbol.name, &symbol.qualified_name)
+}
+
+/// The address `place` names, given the address of each declaration of its file.
+fn node_address(place: NodePlace, declarations: &[Option<(SymbolId, usize)>]) -> NodeAddress {
+    let held = match place.holder {
+        rift_syntax::NodeHolder::Declaration(position) => {
+            declarations.get(position).and_then(Option::as_ref)
+        }
+        rift_syntax::NodeHolder::Unit => None,
+    };
+    match held {
+        Some((symbol, declaration)) => NodeAddress::Declaration {
+            symbol: symbol.clone(),
+            declaration: *declaration,
+            index: place.index,
+        },
+        None => NodeAddress::Unit { index: place.index },
+    }
 }
 
 /// One declaration's ranking identity: the same `SymbolId` a read answers with, so a
