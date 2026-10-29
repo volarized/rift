@@ -1279,6 +1279,47 @@ mod tests {
         assert_eq!(symbol.extensions.0.len(), 1);
     }
 
+    /// A canonical hit's origin names the release of the owner its identity carries: an origin
+    /// of another package or runtime refuses.
+    #[test]
+    fn canonical_candidate_refuses_an_origin_of_another_owner() {
+        let hit = |id: &str, language: &str, origin: serde_json::Value| {
+            serde_json::from_value::<rift_protocol::read::SearchHit>(serde_json::json!({
+                "hit": {"target": "symbol", "symbol": {
+                    "id": id, "language": language, "name": "beacon", "kind": "function",
+                    "origin": origin
+                }},
+                "matched_by": ["name"], "range": {"start": 0, "end": 4}, "line": 1,
+                "unit": "rift://source/cargo/crates.io/demo/src/lib.rs"
+            }))
+            .expect("canonical hit fixture")
+        };
+        let package = |name: &str| {
+            serde_json::json!({"location": "dependency", "source_kind": "authored", "package": {
+                "manager": "cargo", "registry": "crates.io", "name": name, "version": "1.0.0"
+            }})
+        };
+        let runtime = |name: &str| {
+            serde_json::json!({"location": "stdlib", "source_kind": "authored", "runtime": {
+                "runtime": name, "version": "3.12.9"
+            }})
+        };
+        let package_id = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
+        let runtime_id = "rift://symbol/stdlib/cpython/python/builtins/beacon";
+        assert!(canonical_candidate(hit(package_id, "rust", package("demo"))).is_ok());
+        assert!(canonical_candidate(hit(runtime_id, "python", runtime("cpython"))).is_ok());
+        for (id, language, origin) in [
+            (package_id, "rust", package("other")),
+            (runtime_id, "python", runtime("pypy")),
+            (runtime_id, "python", package("demo")),
+        ] {
+            assert_response_field(
+                &canonical_candidate(hit(id, language, origin)).expect_err("another owner"),
+                "symbol.origin",
+            );
+        }
+    }
+
     #[test]
     fn candidate_rejects_a_malformed_kind() {
         let package = package();

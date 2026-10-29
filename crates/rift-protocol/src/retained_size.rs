@@ -547,6 +547,27 @@ mod tests {
     }
 
     #[test]
+    fn released_owner_material_counts_every_coordinate_capacity() {
+        let held = |text: &str| {
+            let mut value = String::with_capacity(128);
+            value.push_str(text);
+            value
+        };
+        let (manager, registry, name) = (held("cargo"), held("crates.io"), held("demo"));
+        let capacity = manager.capacity() + registry.capacity() + name.capacity();
+        let package = crate::identity::SymbolOwner::Package {
+            manager,
+            registry,
+            name,
+        };
+        assert_eq!(package.get_heap_size(), capacity);
+        let runtime = held("cpython");
+        let capacity = runtime.capacity();
+        let runtime = crate::identity::SymbolOwner::Runtime { runtime };
+        assert_eq!(runtime.get_heap_size(), capacity);
+    }
+
+    #[test]
     fn retained_relationship_material_counts_capacity_and_refuses_unmeasured_facts() {
         let mut kind = String::with_capacity(256);
         kind.push_str("calls");

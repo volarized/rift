@@ -1512,6 +1512,19 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
         }),
         "stdlib rift://revision/stdlib/rustc@1.98.1"
     );
+    assert_eq!(
+        facts(SymbolOrigin {
+            location: Some(SourceLocationKind::Stdlib),
+            package: None,
+            runtime: Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "rustc".to_owned(),
+                version: "1.98".to_owned(),
+            }),
+            source_kind: SourceKind::Authored,
+        }),
+        "stdlib rustc@1.98",
+        "a version no release revision spells keeps its plain form"
+    );
 }
 
 #[test]

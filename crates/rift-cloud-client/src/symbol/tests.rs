@@ -314,6 +314,14 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
     let source_less = serde_json::from_value(source_less).expect("source-less documented symbol");
     assert!(valid_result(&request, &source_less, 5));
     assert!(!valid_result(&request, &source_less, 4));
+    let mut intrinsic = original.clone();
+    intrinsic["declarations"] = json!([]);
+    intrinsic["symbol"]["origin"] = json!({"source_kind": "synthetic"});
+    let intrinsic = serde_json::from_value(intrinsic).expect("synthetic documented symbol");
+    assert!(
+        !valid_result(&request, &intrinsic, 100),
+        "package documentation needs the answered release in the symbol's origin"
+    );
     for (pointer, changed) in [
         (
             "/documentation/references/0/reference/target",
