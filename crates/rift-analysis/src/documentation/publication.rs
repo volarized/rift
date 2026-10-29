@@ -230,6 +230,25 @@ impl DocumentationCollection {
         Self::from_index(index, limits)
     }
 
+    /// Validates a stored index under its accepted collection bounds, keeping its recorded
+    /// documentation revision.
+    ///
+    /// A publication stored by an earlier build carries that build's documentation
+    /// revision, which [`Self::new_with_limits`] refuses. This constructor serves the stored
+    /// facts under the revision they were collected at and applies every other check
+    /// `new_with_limits` applies.
+    ///
+    /// # Errors
+    ///
+    /// Refuses invalid identities, ranges, ordering, relationships, or collection bounds.
+    pub fn from_stored(
+        index: DocumentationIndex,
+        limits: Option<super::DocumentationLimits>,
+    ) -> Result<Self, RiftError> {
+        validate_counts(&index, limits.as_ref())?;
+        Self::from_index(index, limits)
+    }
+
     fn from_index(
         index: DocumentationIndex,
         limits: Option<super::DocumentationLimits>,

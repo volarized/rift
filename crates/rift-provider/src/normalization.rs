@@ -1263,8 +1263,8 @@ mod tests {
 
     #[test]
     fn test_source_less_anchors_keep_distinct_owners_and_unresolved_facts() {
-        let package = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
-        let runtime = "rift://symbol/stdlib/rust@1.98.0/rust/core/Beacon";
+        let package = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
+        let runtime = "rift://symbol/stdlib/rust/rust/core/Beacon";
         let anchored = |provider, identity| {
             contribution(ContributionInput {
                 provider,
@@ -1618,23 +1618,23 @@ mod tests {
     #[test]
     fn explicit_owner_anchor_replaces_previous_provider_local_identity() {
         assert_explicit_anchor_replacement(
-            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
-            "rift://symbol/cargo/packages.example/tokio@1.50.0/rust/tokio/Beacon",
+            "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
+            "rift://symbol/cargo/packages.example/tokio/rust/tokio/Beacon",
         );
     }
 
     #[test]
     fn explicit_namespace_anchor_replaces_previous_provider_local_identity() {
         assert_explicit_anchor_replacement(
-            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/old_module/Beacon",
-            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/new_module/Beacon",
+            "rift://symbol/cargo/crates.io/tokio/rust/tokio/old_module/Beacon",
+            "rift://symbol/cargo/crates.io/tokio/rust/tokio/new_module/Beacon",
         );
     }
 
     #[test]
     fn competing_canonical_anchors_remain_distinct_despite_explicit_equivalence() {
-        let first_identity = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
-        let other_identity = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Other";
+        let first_identity = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
+        let other_identity = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Other";
         let first = contribution(ContributionInput {
             provider: "syntax",
             publication: 1,
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[test]
     fn equal_canonical_anchors_join_independent_provider_contributions() {
-        let identity = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+        let identity = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
         let anchored = |provider| {
             contribution(ContributionInput {
                 provider,

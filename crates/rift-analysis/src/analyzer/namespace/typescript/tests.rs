@@ -73,12 +73,11 @@ fn prepared_languages(
     files: &[(&str, &str)],
     languages: Option<&[ShippedLanguage]>,
 ) -> super::PreparedNamespace {
-    let owner = SymbolIdentity::parse(
-        "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
-    )
-    .expect("exact package owner")
-    .owner()
-    .clone();
+    let owner =
+        SymbolIdentity::parse("rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format")
+            .expect("exact package owner")
+            .owner()
+            .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {
@@ -194,11 +193,11 @@ fn captured_types_root_and_container_members_have_defining_module_names() {
     );
     assert_eq!(
         found["format"].as_str(),
-        "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
+        "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"
     );
     assert_eq!(
         found["SemVer.format"].as_str(),
-        "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/SemVer/format"
+        "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/SemVer/format"
     );
     assert_ne!(found["format"], found["SemVer.format"]);
 }
@@ -241,11 +240,11 @@ fn javascript_export_alias_keeps_defining_name_and_container_separate() {
     let found = &found["index.mjs"];
     assert_eq!(
         found["format2"].as_str(),
-        "rift://symbol/npm/npmjs.org/prettier@3.8.5/javascript/prettier/format2"
+        "rift://symbol/npm/npmjs.org/prettier/javascript/prettier/format2"
     );
     assert_eq!(
         found["SemVer.format"].as_str(),
-        "rift://symbol/npm/npmjs.org/prettier@3.8.5/javascript/prettier/SemVer/format"
+        "rift://symbol/npm/npmjs.org/prettier/javascript/prettier/SemVer/format"
     );
     assert!(
         !found.contains_key("format"),
@@ -311,7 +310,7 @@ fn typescript_overload_signatures_bind_one_function() {
     let found = one(TYPES, "index.d.ts", source);
     assert_eq!(found.len(), 1);
     assert!(found.values().all(|identity| identity.as_str()
-        == "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"));
+        == "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"));
 }
 
 #[test]
@@ -320,7 +319,7 @@ fn competing_function_bodies_share_one_identity() {
     let found = one(TYPES, "index.d.ts", source);
     assert_eq!(found.len(), 1);
     assert!(found.values().all(|identity| identity.as_str()
-        == "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"));
+        == "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"));
 }
 
 #[test]
@@ -334,9 +333,9 @@ fn members_of_a_repeated_container_take_its_one_path() {
     assert_eq!(
         identities,
         [
-            "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/Tools",
-            "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/Tools/a",
-            "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/Tools/b",
+            "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/Tools",
+            "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/Tools/a",
+            "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/Tools/b",
         ]
         .into_iter()
         .collect(),
@@ -730,6 +729,9 @@ fn raw_anonymous_export_bindings_need_module_export_context_before_identity() {
     }
 }
 
+/// The release every ambient fixture analyzes, matching the captured `package.json`.
+const AMBIENT_RELEASE: &str = "26.6.4";
+
 fn ambient_prepared(
     owner: &rift_protocol::identity::SymbolOwner,
     metadata: Option<&str>,
@@ -751,19 +753,18 @@ fn ambient_prepared(
             manager,
             registry,
             name,
-            version,
         } => SourceLocation::Dependency {
             package: PackageIdentity {
                 manager: manager.clone(),
                 registry: registry.clone(),
                 name: name.clone(),
-                version: version.clone(),
+                version: AMBIENT_RELEASE.to_owned(),
             },
         },
-        SymbolOwner::Runtime { runtime, version } => SourceLocation::Stdlib {
+        SymbolOwner::Runtime { runtime } => SourceLocation::Stdlib {
             runtime: Some(RuntimeIdentity {
                 runtime: runtime.clone(),
-                version: version.clone(),
+                version: AMBIENT_RELEASE.to_owned(),
             }),
         },
         _ => SourceLocation::Project { package: None },
@@ -804,12 +805,10 @@ fn ambient_prepared(
 }
 
 fn types_node_owner() -> rift_protocol::identity::SymbolOwner {
-    SymbolIdentity::parse(
-        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node:buffer/isUtf8",
-    )
-    .expect("exact declaration package owner")
-    .owner()
-    .clone()
+    SymbolIdentity::parse("rift://symbol/npm/npmjs.org/@types/node/typescript/node:buffer/isUtf8")
+        .expect("exact declaration package owner")
+        .owner()
+        .clone()
 }
 
 #[test]
@@ -885,7 +884,6 @@ fn package_ambient_missing_wrong_metadata_and_other_owners_remain_unknown() {
         },
         SymbolOwner::Runtime {
             runtime: "node".to_owned(),
-            version: "26.6.4".to_owned(),
         },
     ] {
         let (found, facts) = ambient_prepared(&owner, Some(original), source);
@@ -956,11 +954,10 @@ fn commonjs_prepared(
     super::PreparedNamespace,
     Vec<std::sync::Arc<rift_syntax::SyntaxFacts>>,
 ) {
-    let owner =
-        SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react@19.3.0/javascript/react/open")
-            .expect("captured package owner")
-            .owner()
-            .clone();
+    let owner = SymbolIdentity::parse("rift://symbol/npm/npmjs.org/react/javascript/react/open")
+        .expect("captured package owner")
+        .owner()
+        .clone();
     let origin = ContributionOrigin::new(
         Some(SourceLocation::Dependency {
             package: PackageIdentity {

@@ -2,8 +2,8 @@ use super::*;
 use rift_protocol::read::{NODES_SOURCE_BYTES_MAX, NodeUnit, NodesParams, NodesResult, SymbolId};
 use serde_json::{Value, json};
 
-const SYMBOL: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon";
-const UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+const SYMBOL: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
+const UNIT: &str = "rift://source/cargo/crates.io/demo/src/lib.rs";
 const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
 
 fn revision(value: &str) -> rift_protocol::revision::Revision {
@@ -145,7 +145,7 @@ async fn nodes_requests_outside_the_served_form_refuse_before_any_request() {
         (
             "revision",
             NodesParams {
-                revision: Some(revision("rift://revision/cargo/crates.io/demo@2.0.0")),
+                revision: Some(revision("rift://revision/cargo/crates.io/other@1.0.0")),
                 ..nodes_request()
             },
         ),
@@ -244,13 +244,12 @@ async fn nodes_breaking_the_contract_refuse_as_invalid_responses() {
         ("project file unit", |answer| {
             answer["nodes"][1]["unit"] = json!("rift://file/src/lib.rs");
         }),
-        ("unit of another release", |answer| {
-            answer["nodes"][1]["unit"] =
-                json!("rift://source/cargo/crates.io/demo@2.0.0/src/lib.rs");
+        ("unit of another package", |answer| {
+            answer["nodes"][1]["unit"] = json!("rift://source/cargo/crates.io/other/src/lib.rs");
         }),
         ("another symbol", |answer| {
             answer["nodes"][0]["of"] =
-                json!("rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/helper_beacon");
+                json!("rift://symbol/cargo/crates.io/demo/rust/demo/helper_beacon");
         }),
         ("source shorter than its range", |answer| {
             answer["nodes"][1]["source"] = json!("beaco");
@@ -330,4 +329,20 @@ async fn an_answer_for_another_view_refuses() {
     let (_server, client) = operation_client(OperationFixture::Nodes(answer, StatusCode::OK)).await;
     let answered = client.nodes(&request).await.expect("the requested view");
     assert!(answered.view.is_some());
+}
+
+/// A request naming one release refuses an answer read at another release of the package.
+#[tokio::test]
+async fn an_answer_at_another_release_than_the_requested_one_refuses() {
+    let request = NodesParams {
+        revision: Some(revision("rift://revision/cargo/crates.io/demo@2.0.0")),
+        ..nodes_request()
+    };
+    let (_server, client) = operation_client(OperationFixture::Nodes(
+        nodes_response_json(),
+        StatusCode::OK,
+    ))
+    .await;
+    let error = client.nodes(&request).await.expect_err("another release");
+    assert_registered_field(&error, "rift.client.response_invalid", "body");
 }

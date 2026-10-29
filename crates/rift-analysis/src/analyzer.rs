@@ -71,13 +71,8 @@ pub use join::StubForm;
 
 pub(super) fn package_label(owner: &SymbolOwner) -> String {
     match owner {
-        SymbolOwner::Package {
-            manager,
-            name,
-            version,
-            ..
-        } => format!("{manager}/{name}@{version}"),
-        SymbolOwner::Runtime { runtime, version } => format!("stdlib/{runtime}@{version}"),
+        SymbolOwner::Package { manager, name, .. } => format!("{manager}/{name}"),
+        SymbolOwner::Runtime { runtime } => format!("stdlib/{runtime}"),
         SymbolOwner::Local => "local".to_owned(),
         SymbolOwner::NamedLocal { name } => format!("local@{name}"),
         SymbolOwner::ProfileLocal { name } => format!("local:{name}"),
@@ -92,6 +87,7 @@ pub struct AnalyzedFile {
     file: IndexedFile,
     placement: DocumentPlacement,
     public_names: BTreeSet<String>,
+    item_kinds: BTreeMap<(u64, u64), &'static str>,
     role: ModuleRole,
 }
 
@@ -100,6 +96,13 @@ impl AnalyzedFile {
     #[must_use]
     pub const fn file(&self) -> &IndexedFile {
         &self.file
+    }
+
+    /// The grammar kind of the item node of the declaration bound at `range`; absent when
+    /// the syntax provider names none.
+    fn item_kind(&self, range: rift_core::SourceRange) -> Option<String> {
+        let key = (range.start(), range.end());
+        self.item_kinds.get(&key).map(|kind| (*kind).to_owned())
     }
 
     /// The unit, origin, and identity path the file's declarations carry.
@@ -241,12 +244,27 @@ fn analyzed_file(
     let placement =
         placement_of(input.owner(), input.origin(), file)?.with_identity_anchors(BTreeMap::new());
     let public_names = public_qualified_names(parsed.syntax().language(), parsed.syntax());
+    let item_kinds = item_kinds(parsed.syntax().symbols());
     Ok(AnalyzedFile {
         file: parsed,
         placement,
         public_names,
+        item_kinds,
         role: ModuleRole::Unpaired,
     })
+}
+
+/// The grammar kind of each declaration's item node, keyed by the item range a declaration
+/// binding spans. One pass over the file's declarations, so a binding's lookup is
+/// logarithmic.
+fn item_kinds(symbols: &[rift_syntax::SyntaxSymbol]) -> BTreeMap<(u64, u64), &'static str> {
+    symbols
+        .iter()
+        .filter_map(|symbol| {
+            let kind = symbol.node_kind?;
+            Some(((symbol.item_range.start, symbol.item_range.end), kind))
+        })
+        .collect()
 }
 
 fn external_work_limits(input: &ExactPackageInput<'_>) -> (std::cell::Cell<usize>, usize) {
@@ -569,6 +587,7 @@ fn publish(
             identity_format: rift_protocol::identity::SYMBOL_IDENTITY_FORMAT_REVISION,
             analyzer_revision: analyzer_revision(),
             owner: package.clone(),
+            revision: input.release()?,
             source_digest,
             units: records.units,
             coverage,
@@ -1902,6 +1921,7 @@ impl Records {
                 start: binding.range().start(),
                 end: binding.range().end(),
             },
+            node_kind: held.item_kind(binding.range()),
             line: line_of(starts, binding.range().start()),
             signature_indices: fact_indices(owner, &object.signatures, facts.signatures_slice())?,
             type_indices: fact_indices(owner, &object.types, facts.type_bindings())?,
@@ -2537,9 +2557,11 @@ mod tests {
         let publication = analysis.publication();
         assert_eq!(publication.owner, owner);
         assert_eq!(publication.units.len(), 2);
-        assert!(publication.units.iter().any(|unit| {
-            unit.unit.as_str() == "rift://source/stdlib/cpython@3.14.3/sys/__init__.pyi"
-        }));
+        assert!(
+            publication.units.iter().any(|unit| {
+                unit.unit.as_str() == "rift://source/stdlib/cpython/sys/__init__.pyi"
+            })
+        );
         assert!(!publication.objects.is_empty());
         assert!(publication.objects.iter().all(|object| {
             object.origin.package.is_none() && object.origin.runtime.as_ref() == Some(&runtime)
@@ -2556,7 +2578,7 @@ mod tests {
                 && source.origin.runtime.as_ref() == Some(&runtime)
                 && matches!(&source.identity.source,
                     DocumentationSourceIdentity::Package { unit }
-                    if unit.as_str() == "rift://source/stdlib/cpython@3.14.3/README.md")
+                    if unit.as_str() == "rift://source/stdlib/cpython/README.md")
         }));
     }
 
@@ -2580,7 +2602,7 @@ mod tests {
         assert!(
             provider
                 .context()
-                .any(|(key, value)| key == "package" && value == "cargo/beacon@1.0.0")
+                .any(|(key, value)| key == "package" && value == "cargo/beacon")
         );
         let child = std::error::Error::source(&provider)
             .and_then(|source| source.downcast_ref::<RiftError>())
@@ -2753,12 +2775,27 @@ mod tests {
         assert_eq!(public, ["spawn"], "the export rule keeps `pub` alone");
         assert_eq!(
             document_identities(&publication, PackageDocumentKind::Symbol),
-            ["rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/spawn"],
+            ["rift://symbol/cargo/crates.io/beacon/rust/beacon/spawn"],
             "a document stands for every public declaration and no other"
         );
         assert_eq!(
             document_identities(&publication, PackageDocumentKind::File),
-            ["rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs"]
+            ["rift://source/cargo/crates.io/beacon/src/lib.rs"]
+        );
+        assert_eq!(
+            publication.revision.to_string(),
+            "rift://revision/cargo/crates.io/beacon@1.0.0",
+            "the release lives on the publication, never in its ids"
+        );
+        let kinds = publication
+            .declarations
+            .iter()
+            .map(|declaration| declaration.node_kind.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [Some("function_item"), Some("function_item")],
+            "each declaration names its item node's grammar kind"
         );
     }
 
@@ -2842,7 +2879,7 @@ mod tests {
         );
         assert_eq!(
             block.chunks[0].identity,
-            "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs"
+            "rift://source/cargo/crates.io/beacon/src/lib.rs"
         );
     }
 
@@ -3152,7 +3189,7 @@ mod tests {
             .collect();
         assert_eq!(
             changed_symbols,
-            ["rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a/alpha"]
+            ["rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"]
         );
         let changed_documents: Vec<&str> = before
             .documents
@@ -3164,8 +3201,8 @@ mod tests {
         assert_eq!(
             changed_documents,
             [
-                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a/alpha",
-                "rift://source/cargo/crates.io/beacon@1.0.0/src/a.rs",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha",
+                "rift://source/cargo/crates.io/beacon/src/a.rs",
             ],
             "the changed declaration's own document and its file's document move"
         );
@@ -3211,8 +3248,8 @@ mod tests {
         assert_eq!(
             added,
             [
-                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/b",
-                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/b/beta"
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/b",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/b/beta"
             ]
         );
         let unchanged: Vec<&str> = arrived
@@ -3223,8 +3260,8 @@ mod tests {
         assert_eq!(
             unchanged,
             [
-                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a",
-                "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/a/alpha"
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a",
+                "rift://symbol/cargo/crates.io/beacon/rust/beacon/a/alpha"
             ],
             "an untouched declaration keeps its digest"
         );
@@ -3317,7 +3354,7 @@ mod tests {
             block.source.source
                 == DocumentationSourceIdentity::Package {
                     unit: rift_protocol::read::SourceUnitId(
-                        "rift://source/cargo/crates.io/beacon@1.0.0/README.md".to_owned(),
+                        "rift://source/cargo/crates.io/beacon/README.md".to_owned(),
                     ),
                 }
         }));
@@ -3366,7 +3403,7 @@ mod tests {
         assert_eq!(
             unit.to_string(),
             format!(
-                "rift://source/cargo/r.example%2F{}/{}@1.0.0/notebooks/guide.ipynb",
+                "rift://source/cargo/r.example%2F{}/{}/notebooks/guide.ipynb",
                 "a".repeat(4_086),
                 package.name
             )
@@ -3487,9 +3524,9 @@ mod tests {
         .expect("captured bounded library root");
         let publication = analysis.publication();
         let documentation = &publication.documentation;
-        let markdown_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{markdown_path}");
-        let rst_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{rst_path}");
-        let attached_unit = format!("rift://source/cargo/crates.io/beacon@1.0.0/{attached_path}");
+        let markdown_unit = format!("rift://source/cargo/crates.io/beacon/{markdown_path}");
+        let rst_unit = format!("rift://source/cargo/crates.io/beacon/{rst_path}");
+        let attached_unit = format!("rift://source/cargo/crates.io/beacon/{attached_path}");
 
         assert_eq!(documentation.coverage.selected, 3);
         assert_eq!(documentation.coverage.parsed, 3);

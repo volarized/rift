@@ -1344,7 +1344,7 @@
         },
         "owner": {
           "$ref": "#/$defs/SymbolOwner",
-          "description": "Exact logical owner of the document."
+          "description": "Logical owner of the document, across releases."
         },
         "qualified_name": {
           "description": "The container-qualified name. Absent on a file document.",
@@ -1487,6 +1487,10 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "node_kind": {
+          "description": "The grammar kind of the declaration's item node, the syntax node spanning `range`,\nas `function_item`. Absent when the syntax provider names no item node for the\ndeclaration.",
+          "type": "string"
         },
         "origin": {
           "$ref": "#/$defs/SymbolOrigin",
@@ -1851,6 +1855,21 @@
         }
       ]
     },
+    "Revision": {
+      "description": "One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.",
+      "examples": [
+        "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1",
+        "rift://revision/git/main",
+        "rift://revision/cargo/crates.io/serde@1.0.228",
+        "rift://revision/npm/npmjs.org/@types/node@26.6.4",
+        "rift://revision/stdlib/cpython@3.12.9",
+        "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
+      ],
+      "maxLength": 8192,
+      "minLength": 1,
+      "pattern": "^rift://revision/(?:git/[A-Za-z0-9._/-]+(?:~[0-9]*)*|tree/[0-9a-f]{64}|stdlib/[a-z][a-z0-9_-]*@[^/?#]+|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+)$",
+      "type": "string"
+    },
     "RuntimeIdentity": {
       "additionalProperties": false,
       "description": "One exact runtime or compiler release.",
@@ -2020,14 +2039,14 @@
       ]
     },
     "SourceUnitId": {
-      "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+      "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
       "else": {
         "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
       },
       "examples": [
         "rift://source/project/src/lib.rs",
-        "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
-        "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+        "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+        "rift://source/stdlib/cpython/Lib/sys.py"
       ],
       "if": {
         "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
@@ -2043,16 +2062,16 @@
             "pattern": "^rift://source/[^/]+/[A-Za-z]:"
           },
           {
-            "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+            "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+/)[A-Za-z]:"
           },
           {
-            "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+            "pattern": "^rift://source/stdlib/[^/]+/[A-Za-z]:"
           }
         ]
       },
       "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
       "then": {
-        "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+        "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/|stdlib/[a-z][a-z0-9_-]*/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
       },
       "type": "string"
     },
@@ -2231,21 +2250,21 @@
       ]
     },
     "SymbolId": {
-      "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+      "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
       "examples": [
         "rift://symbol/local/rust/app/parser/parse",
         "rift://symbol/local@cloud/rust/app/load",
         "rift://symbol/local:docs/typescript/page/beacon",
         "rift://symbol/local@cloud:docs/typescript/page/beacon",
-        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-        "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+        "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+        "rift://symbol/stdlib/cpython/python/builtins/len"
       ],
       "maxLength": 8192,
       "minLength": 1,
       "not": {
         "pattern": "/\\.{1,2}(?:/|$)"
       },
-      "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+      "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
       "type": "string"
     },
     "SymbolOrigin": {
@@ -2354,7 +2373,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "One exact release from its defining registry.",
+          "description": "One package from its defining registry, across its releases. A release revision\nnames the version a read selects.",
           "properties": {
             "kind": {
               "const": "package",
@@ -2371,24 +2390,19 @@
             "registry": {
               "description": "Canonical registry authority and optional endpoint path.",
               "type": "string"
-            },
-            "version": {
-              "description": "Exact release version.",
-              "type": "string"
             }
           },
           "required": [
             "kind",
             "manager",
             "registry",
-            "name",
-            "version"
+            "name"
           ],
           "type": "object"
         },
         {
           "additionalProperties": false,
-          "description": "Standard-library object owned by a runtime or compiler.",
+          "description": "Standard-library object owned by a runtime or compiler, across its releases. A\nrelease revision names the version a read selects.",
           "properties": {
             "kind": {
               "const": "runtime",
@@ -2397,16 +2411,11 @@
             "runtime": {
               "description": "Canonical runtime or compiler name.",
               "type": "string"
-            },
-            "version": {
-              "description": "Exact runtime or compiler version.",
-              "type": "string"
             }
           },
           "required": [
             "kind",
-            "runtime",
-            "version"
+            "runtime"
           ],
           "type": "object"
         }
@@ -2753,7 +2762,7 @@
     },
     "owner": {
       "$ref": "#/$defs/SymbolOwner",
-      "description": "Exact defining package, runtime, or compiler owner."
+      "description": "Defining package, runtime, or compiler owner. It names no version: every symbol id\nand source unit of the publication carries this owner across releases."
     },
     "relationships": {
       "description": "Normalized relationships, preserving their source occurrences and derivation.",
@@ -2761,6 +2770,10 @@
         "$ref": "#/$defs/Relationship"
       },
       "type": "array"
+    },
+    "revision": {
+      "$ref": "#/$defs/Revision",
+      "description": "The one release this publication analyzed, a release revision of `owner`, as\n`rift://revision/cargo/crates.io/demo@1.0.0`."
     },
     "source_digest": {
       "$ref": "#/$defs/Digest",
@@ -2788,6 +2801,7 @@
     "identity_format",
     "analyzer_revision",
     "owner",
+    "revision",
     "source_digest",
     "units",
     "objects",

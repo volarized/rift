@@ -335,15 +335,10 @@ fn file_anchors(
 }
 
 pub(super) fn library(input: &NamespaceInput<'_>) -> Option<(String, String)> {
-    let SymbolOwner::Package {
-        manager,
-        name,
-        version,
-        ..
-    } = input.owner()
-    else {
+    let SymbolOwner::Package { manager, name, .. } = input.owner() else {
         return None;
     };
+    let version = input.release_version()?;
     if manager != "cargo" {
         return None;
     }

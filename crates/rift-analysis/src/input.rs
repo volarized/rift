@@ -464,10 +464,22 @@ impl<'input> ExactPackageInput<'input> {
         })
     }
 
-    /// Exact defining package, runtime, or compiler owner.
+    /// Defining package, runtime, or compiler owner, across its releases.
     #[must_use]
     pub const fn owner(self) -> &'input SymbolOwner {
         self.owner
+    }
+
+    /// The release revision this input analyzes: its owner at the version its origin
+    /// names.
+    ///
+    /// # Errors
+    /// Returns the existing origin refusal when the origin names no release of the owner.
+    pub fn release(self) -> Result<rift_protocol::revision::Revision, RiftError> {
+        let version = origin_version(self.origin)
+            .ok_or_else(|| errors::analysis::package_input_origin_invalid().error())?;
+        rift_protocol::revision::Revision::release(self.owner, version)
+            .map_err(|_| errors::analysis::package_input_origin_invalid().error())
     }
 
     /// Borrows the admitted source and metadata context for namespace placement.
@@ -668,6 +680,17 @@ impl<'input> ExactPackageInput<'input> {
     #[must_use]
     pub const fn limits(self) -> ExactPackageLimits {
         self.limits
+    }
+}
+
+/// The version a package or runtime origin names.
+fn origin_version(origin: &ContributionOrigin) -> Option<&str> {
+    match origin.location() {
+        Some(SourceLocation::Dependency { package }) => Some(&package.version),
+        Some(SourceLocation::Stdlib {
+            runtime: Some(runtime),
+        }) => Some(&runtime.version),
+        _ => None,
     }
 }
 
@@ -1122,9 +1145,12 @@ mod tests {
         .expect("exact runtime input");
         assert_eq!(input.owner(), &owner);
         assert_eq!(input.files()[0].path(), &path);
+        assert_eq!(
+            input.release().expect("release").to_string(),
+            "rift://revision/stdlib/cpython@3.14.3"
+        );
         let wrong_owner = SymbolOwner::Runtime {
-            runtime: "cpython".to_owned(),
-            version: "3.13.3".to_owned(),
+            runtime: "pypy".to_owned(),
         };
         let error = ExactPackageInput::new(
             &wrong_owner,
@@ -1133,7 +1159,7 @@ mod tests {
             &files,
             ExactPackageLimits::new(1, 64),
         )
-        .expect_err("different runtime version");
+        .expect_err("different runtime");
         assert_eq!(
             error.slug().as_str(),
             "rift.analysis.package_input_origin_invalid"

@@ -93,8 +93,8 @@ fn every_served_identity_pattern_spells_its_path_with_the_shared_class() -> Test
     let source_validator = jsonschema::validator_for(source_schema)?;
     for source in [
         "rift://source/project/packages/@scope/core.ts",
-        "rift://source/npm/registry.npmjs.org/@scope/core@1.0.0/src/core.ts",
-        "rift://source/stdlib/python@3.14.3/sys/__init__.pyi",
+        "rift://source/npm/registry.npmjs.org/@scope/core/src/core.ts",
+        "rift://source/stdlib/python/sys/__init__.pyi",
     ] {
         assert!(
             source_validator.is_valid(&serde_json::json!(source)),

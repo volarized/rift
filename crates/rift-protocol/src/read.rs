@@ -289,8 +289,7 @@ pub struct FileId(
 pub enum NodeUnit {
     /// A file of the project tree, as `rift://file/src/lib.rs`.
     File(FileId),
-    /// A source unit of a package or runtime release, as
-    /// `rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`.
+    /// A source unit of a package or runtime, as `rift://source/cargo/crates.io/demo/src/lib.rs`.
     Source(SourceUnitId),
 }
 
@@ -924,10 +923,11 @@ pub struct NodesParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<crate::symbol_read::CapturedViewId>,
     /// The revision to read: a git revision reads that commit, a tree revision the served
-    /// working tree, and a release revision names the release a package or runtime
-    /// `symbol` carries. Omitted reads the served working tree. The server refuses a git
-    /// revision when the workspace has no version-control repository, and a tree revision
-    /// once the index serves another tree.
+    /// working tree, and a release revision selects the release of a package or runtime
+    /// `symbol`'s owner. Omitted reads the served working tree, or for a package the version
+    /// the workspace's lockfiles pin, else the newest collected release. The server refuses
+    /// a git revision when the workspace has no version-control repository, and a tree
+    /// revision once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<crate::revision::Revision>,
 }
@@ -1094,10 +1094,12 @@ pub struct RuntimeIdentity {
 }
 
 impl PackageIdentity {
-    /// Validated defining registry owner of this exact package release.
+    /// Validated defining registry owner of this package; [`Self::release`] names its
+    /// version.
     ///
     /// # Errors
-    /// Returns the violated owner or length bound.
+    /// Returns the violated owner or length bound, or an owner violation when `version` is
+    /// not a canonical release of this package.
     pub fn owner(&self) -> Result<crate::identity::SymbolOwner, rift_error::RiftError> {
         if self.manager.len() > 128
             || self.registry.len() > 4096
@@ -1110,10 +1112,20 @@ impl PackageIdentity {
             manager: self.manager.clone(),
             registry: self.registry.clone(),
             name: self.name.clone(),
-            version: self.version.clone(),
         };
         owner.validate()?;
+        if !owner.accepts_release(&self.version) {
+            return Err(crate::identity::SymbolIdentityViolation::Owner.into());
+        }
         Ok(owner)
+    }
+
+    /// The release revision of this exact package version.
+    ///
+    /// # Errors
+    /// Returns the refusal [`Self::owner`] names for invalid coordinates.
+    pub fn release(&self) -> Result<crate::revision::Revision, rift_error::RiftError> {
+        crate::revision::Revision::release(&self.owner()?, &self.version)
     }
 }
 
@@ -1142,20 +1154,31 @@ impl<'de> Deserialize<'de> for PackageIdentity {
 }
 
 impl RuntimeIdentity {
-    /// Validated defining runtime or compiler owner of this exact release.
+    /// Validated defining runtime or compiler owner; [`Self::release`] names its version.
     ///
     /// # Errors
-    /// Returns the violated owner or length bound.
+    /// Returns the violated owner or length bound, or an owner violation when `version` is
+    /// not a canonical release of this runtime.
     pub fn owner(&self) -> Result<crate::identity::SymbolOwner, rift_error::RiftError> {
         if self.runtime.len() > 128 || self.version.len() > 4096 {
             return Err(crate::identity::SymbolIdentityViolation::Length.into());
         }
         let owner = crate::identity::SymbolOwner::Runtime {
             runtime: self.runtime.clone(),
-            version: self.version.clone(),
         };
         owner.validate()?;
+        if !owner.accepts_release(&self.version) {
+            return Err(crate::identity::SymbolIdentityViolation::Owner.into());
+        }
         Ok(owner)
+    }
+
+    /// The release revision of this exact runtime version.
+    ///
+    /// # Errors
+    /// Returns the refusal [`Self::owner`] names for invalid coordinates.
+    pub fn release(&self) -> Result<crate::revision::Revision, rift_error::RiftError> {
+        crate::revision::Revision::release(&self.owner()?, &self.version)
     }
 }
 
@@ -2345,14 +2368,14 @@ impl JsonSchema for SourceUnitId {
             "not": {"anyOf": [
                 {"pattern": "/\\.{1,2}(?:/|$)"},
                 {"pattern": "^rift://source/[^/]+/[A-Za-z]:"},
-                {"pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"},
-                {"pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"}
+                {"pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+/)[A-Za-z]:"},
+                {"pattern": "^rift://source/stdlib/[^/]+/[A-Za-z]:"}
             ]},
-            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
                 "rift://source/project/src/lib.rs",
-                "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
-                "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+                "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+                "rift://source/stdlib/cpython/Lib/sys.py"
             ]
         })
     }
@@ -2862,7 +2885,7 @@ mod tests {
     #[test]
     fn a_node_unit_decodes_a_project_file_and_a_package_source_unit_by_scheme() {
         let file = "rift://file/src/lib.rs";
-        let package = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+        let package = "rift://source/cargo/crates.io/demo/src/lib.rs";
         let decoded: super::NodeUnit = serde_json::from_value(json!(file)).expect("file unit");
         assert_eq!(decoded, super::NodeUnit::File(FileId(file.to_owned())));
         assert_eq!(decoded.as_str(), file);
@@ -2876,7 +2899,7 @@ mod tests {
         );
         for refused in [
             "src/lib.rs",
-            "rift://source/cargo/crates.io/demo/src/lib.rs",
+            "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
         ] {
             assert!(
                 serde_json::from_value::<super::NodeUnit>(json!(refused)).is_err(),
@@ -4214,8 +4237,8 @@ mod tests {
         let validator = jsonschema::validator_for(&schema).expect("symbol validator");
         for value in [
             "rift://symbol/local/python/app/member",
-            "rift://symbol/cargo/crates.io/example@1.0.0/rust/example/member",
-            "rift://symbol/stdlib/python@3.14.3/python/sys/version",
+            "rift://symbol/cargo/crates.io/example/rust/example/member",
+            "rift://symbol/stdlib/python/python/sys/version",
         ] {
             let parsed: SymbolId = serde_json::from_value(json!(value)).expect("canonical ID");
             assert_eq!(

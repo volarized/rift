@@ -43,21 +43,21 @@
             "type": "string"
           },
           "SymbolIdentity": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           }
         },
@@ -99,7 +99,7 @@
           },
           "revision": {
             "$ref": "#/$defs/Revision",
-            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision names the release\na package or runtime `id` carries. Omitted reads the served working tree. The\nserver refuses it beside `view` and once the index no longer serves it."
+            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses it beside `view` and once the index no longer serves it."
           },
           "view": {
             "$ref": "#/$defs/CapturedViewId",
@@ -2593,14 +2593,14 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
             "else": {
               "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "examples": [
               "rift://source/project/src/lib.rs",
-              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
-              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+              "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+              "rift://source/stdlib/cpython/Lib/sys.py"
             ],
             "if": {
               "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
@@ -2616,16 +2616,16 @@
                   "pattern": "^rift://source/[^/]+/[A-Za-z]:"
                 },
                 {
-                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+/)[A-Za-z]:"
                 },
                 {
-                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                  "pattern": "^rift://source/stdlib/[^/]+/[A-Za-z]:"
                 }
               ]
             },
             "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
             "then": {
-              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/|stdlib/[a-z][a-z0-9_-]*/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "type": "string"
           },
@@ -2998,39 +2998,39 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           },
           "SymbolIdentity": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           },
           "SymbolMatchContext": {
@@ -3131,7 +3131,7 @@
             "oneOf": [
               {
                 "const": "exact_release",
-                "description": "The encoded exact release has no accepted publication.",
+                "description": "The selected release has no accepted publication.",
                 "type": "string"
               },
               {
@@ -3605,21 +3605,21 @@
             "type": "string"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           }
         },
@@ -3704,7 +3704,7 @@
           },
           "revision": {
             "$ref": "#/$defs/Revision",
-            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision names the release a package or runtime\n`symbol` carries. Omitted reads the served working tree. The server refuses a git\nrevision when the workspace has no version-control repository, and a tree revision\nonce the index serves another tree."
+            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's lockfiles pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree."
           },
           "symbol": {
             "$ref": "#/$defs/SymbolId",
@@ -4262,7 +4262,7 @@
               },
               {
                 "$ref": "#/$defs/SourceUnitId",
-                "description": "A source unit of a package or runtime release, as\n`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`."
+                "description": "A source unit of a package or runtime, as `rift://source/cargo/crates.io/demo/src/lib.rs`."
               }
             ],
             "description": "The source unit a [`Node`] is written in: a file of the project tree the read targets, or\na source unit of the package or runtime release that owns the node's symbol."
@@ -5743,14 +5743,14 @@
             "type": "string"
           },
           "SourceUnitId": {
-            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
             "else": {
               "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "examples": [
               "rift://source/project/src/lib.rs",
-              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
-              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+              "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+              "rift://source/stdlib/cpython/Lib/sys.py"
             ],
             "if": {
               "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
@@ -5766,35 +5766,35 @@
                   "pattern": "^rift://source/[^/]+/[A-Za-z]:"
                 },
                 {
-                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+/)[A-Za-z]:"
                 },
                 {
-                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                  "pattern": "^rift://source/stdlib/[^/]+/[A-Za-z]:"
                 }
               ]
             },
             "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
             "then": {
-              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/|stdlib/[a-z][a-z0-9_-]*/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "type": "string"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           },
           "SyntaxFramework": {
@@ -6437,21 +6437,21 @@
             "type": "object"
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           },
           "TraversalDirection": {
@@ -9748,14 +9748,14 @@
             ]
           },
           "SourceUnitId": {
-            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
             "else": {
               "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "examples": [
               "rift://source/project/src/lib.rs",
-              "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
-              "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+              "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+              "rift://source/stdlib/cpython/Lib/sys.py"
             ],
             "if": {
               "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
@@ -9771,16 +9771,16 @@
                   "pattern": "^rift://source/[^/]+/[A-Za-z]:"
                 },
                 {
-                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+                  "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+/)[A-Za-z]:"
                 },
                 {
-                  "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+                  "pattern": "^rift://source/stdlib/[^/]+/[A-Za-z]:"
                 }
               ]
             },
             "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%[0-9A-F]{2})+)*$",
             "then": {
-              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/|stdlib/[a-z][a-z0-9_-]*/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
             },
             "type": "string"
           },
@@ -10075,21 +10075,21 @@
             ]
           },
           "SymbolId": {
-            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+            "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
             "examples": [
               "rift://symbol/local/rust/app/parser/parse",
               "rift://symbol/local@cloud/rust/app/load",
               "rift://symbol/local:docs/typescript/page/beacon",
               "rift://symbol/local@cloud:docs/typescript/page/beacon",
-              "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-              "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+              "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+              "rift://symbol/stdlib/cpython/python/builtins/len"
             ],
             "maxLength": 8192,
             "minLength": 1,
             "not": {
               "pattern": "/\\.{1,2}(?:/|$)"
             },
-            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+            "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
             "type": "string"
           },
           "SymbolOrigin": {
@@ -10122,7 +10122,7 @@
             "oneOf": [
               {
                 "const": "exact_release",
-                "description": "The encoded exact release has no accepted publication.",
+                "description": "The selected release has no accepted publication.",
                 "type": "string"
               },
               {

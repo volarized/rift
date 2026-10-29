@@ -12746,7 +12746,6 @@ mod tests {
             },
             SymbolOwner::Runtime {
                 runtime: "rust".to_owned(),
-                version: "1.98.1".to_owned(),
             },
         ] {
             let Err(error) = WorkspaceIndexPreparation::new_with_owner(

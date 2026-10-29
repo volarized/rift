@@ -1595,7 +1595,7 @@ mod tests {
     #[test]
     fn named_package_callees_end_one_edge_each_and_the_rest_drop() -> TestResult {
         let caller = rift_core::SymbolId::new("rift://symbol/python/app.py/hello")?;
-        let len = SymbolId("rift://symbol/stdlib/cpython@3.12.9/python/builtins/len".into());
+        let len = SymbolId("rift://symbol/stdlib/cpython/python/builtins/len".into());
         let python = rift_protocol::read::RuntimeIdentity {
             runtime: "cpython".to_owned(),
             version: "3.12.9".to_owned(),
@@ -1621,6 +1621,7 @@ mod tests {
                 origin: rift_core::SourceLocation::Stdlib {
                     runtime: Some(python.clone()),
                 },
+                revision: python.release().expect("runtime release"),
             })
         });
         let edges: Vec<&SymbolId> = references
@@ -1636,7 +1637,7 @@ mod tests {
             .ok_or("the edge's end is a package declaration")?;
         assert_eq!(
             declaration.unit.0,
-            "rift://source/stdlib/cpython@3.12.9/builtins.pyi"
+            "rift://source/stdlib/cpython/builtins.pyi"
         );
         assert_eq!(declaration.symbol.name, "len");
         assert_eq!(declaration.symbol.kind.0, "function", "the stored kind");

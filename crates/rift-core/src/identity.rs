@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn parse_symbol_identity_accepts_bounded_package_paths() {
-        let path = format!("cargo/crates.io/beacon@1.0.0/{}lib.rs", "a/".repeat(490));
+        let path = format!("cargo/crates.io/beacon/{}lib.rs", "a/".repeat(490));
         assert!(ProjectPath::new(&path).is_err());
         let identity = symbol_identity("rust", &path, "serve");
         let parsed = parse_symbol_identity(&identity).expect("package symbol identity");
@@ -992,8 +992,8 @@ mod tests {
     #[test]
     fn source_unit_parser_keeps_custom_keys_separate_from_released_owners() {
         for value in [
-            "rift://source/project/registry.example/demo@1.0.0/file.rs",
-            "rift://source/custom/registry.example/demo@1.0.0/file.rs",
+            "rift://source/project/registry.example/demo/file.rs",
+            "rift://source/custom/registry.example/demo/file.rs",
             "rift://source/project/src/file~2.rs",
         ] {
             let id = SourceUnitId::parse(value).expect("custom source key");
@@ -1004,7 +1004,7 @@ mod tests {
             );
             assert!(id.owner.is_none());
         }
-        let runtime = "rift://source/stdlib/cpython@3.12.9/Lib/sys.py";
+        let runtime = "rift://source/stdlib/cpython/Lib/sys.py";
         let id = SourceUnitId::parse(runtime).expect("runtime source owner");
         assert!(matches!(
             id.owner.as_ref(),
@@ -1013,7 +1013,7 @@ mod tests {
         assert_eq!(id.to_string(), runtime);
         for value in [
             "rift://source/project/a//b",
-            "rift://source/stdlib/python/Lib/sys.py",
+            "rift://source/stdlib/cpython@3.12.9/Lib/sys.py",
         ] {
             assert!(SourceUnitId::parse(value).is_err(), "{value}");
         }
@@ -1241,7 +1241,7 @@ mod tests {
             .expect("unit fits protocol bound");
         assert_eq!(
             unit.to_string(),
-            "rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs"
+            "rift://source/cargo/crates.io/helper/src/lib.rs"
         );
         assert_eq!(unit.resolver().as_str(), "cargo");
         assert_eq!(unit.key().as_str(), "src/lib.rs");

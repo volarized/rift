@@ -46,7 +46,7 @@ Parameters:
 - `position` - UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes themselves carry the spans.
 - `node_cursor` - Continuation a preceding `symbol` read returned, bound to that symbol and the tree revision it read.
 - `view` - Captured view selected by discovery.
-- `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision names the release a package or runtime `symbol` carries.
+- `revision` - The revision to read: a git revision reads that commit, a tree revision the served working tree, and a release revision selects the release of a package or runtime `symbol`'s owner.
 
 ## search
 

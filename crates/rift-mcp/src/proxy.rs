@@ -3954,8 +3954,8 @@ mod tests {
         let extra = tempfile::tempdir()?;
         let proxy = extra_profile_proxy(primary.path(), extra.path())?;
         for id in [
-            "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-            "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
+            "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+            "rift://symbol/stdlib/cpython/python/builtins/len",
         ] {
             let request = CallToolRequestParams::new("nodes").with_arguments(
                 serde_json::from_value(json!({"symbol": id, "node_cursor": "1.ab"}))?,

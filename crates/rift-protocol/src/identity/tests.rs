@@ -6,10 +6,10 @@ const REVISION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef01234567
 #[test]
 fn test_released_source_owner_and_path_round_trip() {
     for value in [
-        "rift://source/cargo/crates.io/example@1.0.0/src/lib.rs",
-        "rift://source/npm/npmjs.org/@types/node@26.6.2/fs.d.ts",
-        "rift://source/npm/registry.example:8443%2Fteam%2Fapi/example@1.0.0/src/file%7E2.ts",
-        "rift://source/stdlib/cpython@3.12.9/Lib/sys.py",
+        "rift://source/cargo/crates.io/example/src/lib.rs",
+        "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+        "rift://source/npm/registry.example:8443%2Fteam%2Fapi/example/src/file%7E2.ts",
+        "rift://source/stdlib/cpython/Lib/sys.py",
     ] {
         let (owner, path) =
             super::parse_released_source_identity(value).expect("canonical source owner");
@@ -19,12 +19,13 @@ fn test_released_source_owner_and_path_round_trip() {
         );
     }
     for invalid in [
-        "rift://source/cargo/example@1.0.0/src/lib.rs",
-        "rift://source/stdlib/python/Lib/sys.py",
-        "rift://source/cargo/crates.io/example@1.0.0/../lib.rs",
-        "rift://source/cargo/crates.io/example@1.0.0/%2Flib.rs",
-        "rift://source/cargo/crates.io/example@1.0.0/%6Cib.rs",
-        "rift://source/cargo/crates.io/example@1.0.0/lib.rs?rev=x",
+        "rift://source/cargo/crates.io/example@1.0.0/src/lib.rs",
+        "rift://source/stdlib/cpython@3.12.9/Lib/sys.py",
+        "rift://source/stdlib/cpython",
+        "rift://source/cargo/crates.io/example/../lib.rs",
+        "rift://source/cargo/crates.io/example/%2Flib.rs",
+        "rift://source/cargo/crates.io/example/%6Cib.rs",
+        "rift://source/cargo/crates.io/example/lib.rs?rev=x",
         "rift://source/local/rust/lib.rs",
     ] {
         assert!(
@@ -50,14 +51,14 @@ fn test_source_unit_boundary_keeps_resolvers_paths_and_released_owners_distinct(
         ),
         ("rift://source/project/src/caf%C3%A9%20file.rs", false),
         ("rift://source/project/src/cafe%CC%81.rs", false),
-        ("rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs", true),
+        ("rift://source/cargo/crates.io/demo/src/lib.rs", true),
         (
-            "rift://source/npm/registry.example:8443%2Fnpm/@types/node@26.6.4/fs%7E2.d.ts",
+            "rift://source/npm/registry.example:8443%2Fnpm/@types/node/fs%7E2.d.ts",
             true,
         ),
-        ("rift://source/stdlib/cpython@3.12.9/Lib/sys.py", true),
+        ("rift://source/stdlib/cpython/Lib/sys.py", true),
         (
-            "rift://source/pypi/pypi.org/demo@1.0/notebook.ipynb/cell:2",
+            "rift://source/pypi/pypi.org/demo/notebook.ipynb/cell:2",
             true,
         ),
     ] {
@@ -85,9 +86,9 @@ fn test_source_unit_boundary_keeps_resolvers_paths_and_released_owners_distinct(
         "rift://source/project/C:/file.rs",
         "rift://source/project/src%5Clib.rs",
         "rift://source/Project/file.rs",
-        "rift://source/cargo/demo@1.0.0/lib.rs",
-        "rift://source/stdlib/python/Lib/sys.py",
-        "rift://source/npm/npmjs.org/demo@1.0.0/file~2.ts",
+        "rift://source/cargo/crates.io/demo@1.0.0/lib.rs",
+        "rift://source/stdlib/cpython@3.12.9/Lib/sys.py",
+        "rift://source/npm/npmjs.org/demo/file~2.ts",
     ] {
         assert!(SourceUnitId::parse(value).is_err(), "{value}");
         assert!(
@@ -99,7 +100,6 @@ fn test_source_unit_boundary_keeps_resolvers_paths_and_released_owners_distinct(
         manager: "custom".into(),
         registry: "registry.example".into(),
         name: "demo".into(),
-        version: "2026.10".into(),
     };
     assert!(super::released_source_identity(&custom, "file.rs").is_err());
 }
@@ -144,13 +144,13 @@ fn test_source_unit_schema_preserves_owner_boundaries_and_relative_paths() {
             true,
         ),
         (
-            "rift://source/npm/registry.example:8443%2Fnpm/@types/node@26.6.4/fs%7E2.d.ts",
+            "rift://source/npm/registry.example:8443%2Fnpm/@types/node/fs%7E2.d.ts",
             true,
         ),
-        ("rift://source/stdlib/cpython@3.12.9/Lib/sys.py", true),
+        ("rift://source/stdlib/cpython/Lib/sys.py", true),
         ("rift://source/project/src/cafe%CC%81.rs", true),
-        ("rift://source/cargo/demo@1.0.0/src/lib.rs", false),
-        ("rift://source/stdlib/python/3.12.9/Lib/sys.py", false),
+        ("rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs", false),
+        ("rift://source/stdlib/cpython@3.12.9/Lib/sys.py", false),
         ("rift://source/project/src//lib.rs", false),
         ("rift://source/project/src/../lib.rs", false),
         ("rift://source/project/src%2Flib.rs", false),
@@ -159,9 +159,9 @@ fn test_source_unit_schema_preserves_owner_boundaries_and_relative_paths() {
         ("rift://source/project/src/%0A.rs", false),
         ("rift://source/project/src/%7F.rs", false),
         ("rift://source/project/.", false),
-        ("rift://source/stdlib/cpython@3.12.9/C:/sys.py", false),
+        ("rift://source/stdlib/cpython/C:/sys.py", false),
         ("rift://source/project/C:/file.rs", false),
-        ("rift://source/npm/npmjs.org/demo@1.0.0/file~2.ts", false),
+        ("rift://source/npm/npmjs.org/demo/file~2.ts", false),
     ] {
         assert_eq!(
             validator.is_valid(&serde_json::json!(value)),
@@ -182,15 +182,12 @@ fn source_unit_project_scope_uses_the_canonical_resolver() {
         ("rift://source/project/src/lib.rs", true),
         ("rift://source/project2/src/lib.rs", false),
         ("rift://source/cargo2/src/lib.rs", false),
+        ("rift://source/cargo/crates.io/beacon/src/lib.rs", false),
         (
-            "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+            "rift://source/npm/registry.npmjs.org/@types/node/index.d.ts",
             false,
         ),
-        (
-            "rift://source/npm/registry.npmjs.org/@types/node@26.6.4/index.d.ts",
-            false,
-        ),
-        ("rift://source/stdlib/python@3.14.3/sys/__init__.pyi", false),
+        ("rift://source/stdlib/python/sys/__init__.pyi", false),
     ] {
         assert_eq!(
             source_unit_is_project(address).expect("canonical source scope"),
@@ -207,7 +204,7 @@ fn source_unit_project_scope_uses_the_canonical_resolver() {
         "rift://source/project/../secret.rs",
         "rift://source/%70roject/src/lib.rs",
         "rift://source/project/src%2Flib.rs",
-        "rift://source/cargo/beacon@1.0.0/src/lib.rs",
+        "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
     ] {
         assert!(source_unit_is_project(address).is_err());
         assert!(!crate::read::SourceUnitId(address.to_owned()).is_project());
@@ -256,7 +253,6 @@ fn test_typed_symbol_identity_conversion_preserves_wire_and_rejects_incomplete_o
             manager: "npm".into(),
             registry: registry.into(),
             name: name.into(),
-            version: "1.0.0".into(),
         };
         assert!(SymbolIdentity::new(owner, language(), vec!["demo".into()]).is_err());
     }
@@ -268,9 +264,8 @@ fn test_released_source_full_encoded_bound() {
         manager: "npm".to_owned(),
         registry: "registry.example".to_owned(),
         name: "example".to_owned(),
-        version: "1.0.0".to_owned(),
     };
-    let prefix = "rift://source/npm/registry.example/example@1.0.0/";
+    let prefix = "rift://source/npm/registry.example/example/";
     let path = "x".repeat(SYMBOL_ID_BYTES_MAX - prefix.len());
     let value = super::released_source_identity(&owner, &path).expect("encoded ceiling");
     assert_eq!(value.len(), SYMBOL_ID_BYTES_MAX);
@@ -288,13 +283,12 @@ fn test_canonical_owners_round_trip_without_losing_hierarchy() {
     for value in [
         "rift://symbol/local/rust/app/parser/parse",
         "rift://symbol/local@service/rust/app/parser/parse",
-        "rift://symbol/cargo/crates.io/tokio@1.53.2/rust/tokio/sync/mpsc/Sender",
-        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-        "rift://symbol/pypi/pypi.org/click@8.3.3/python/click/core/Command",
-        "rift://symbol/pypi/pypi.org/demo@1!2.0.post1+local/python/demo/Callable",
-        "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
-        "rift://symbol/npm/artifacts.example%2Fnpm/demo@1.0.0/javascript/demo/export",
-        "rift://symbol/custom/registry.example/demo@2026.10/rust/demo/export",
+        "rift://symbol/cargo/crates.io/tokio/rust/tokio/sync/mpsc/Sender",
+        "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+        "rift://symbol/pypi/pypi.org/click/python/click/core/Command",
+        "rift://symbol/stdlib/cpython/python/builtins/len",
+        "rift://symbol/npm/artifacts.example%2Fnpm/demo/javascript/demo/export",
+        "rift://symbol/custom/registry.example/demo/rust/demo/export",
         "rift://symbol/local/typescript:tsx/app/components/Button",
     ] {
         let identity =
@@ -307,7 +301,7 @@ fn test_canonical_owners_round_trip_without_losing_hierarchy() {
         );
     }
     let package = SymbolIdentity::parse(
-        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+        "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
     )
     .expect("scoped package");
     assert_eq!(
@@ -316,7 +310,6 @@ fn test_canonical_owners_round_trip_without_losing_hierarchy() {
             manager: "npm".into(),
             registry: "npmjs.org".into(),
             name: "@types/node".into(),
-            version: "26.6.4".into()
         }
     );
     assert_eq!(package.qualified_path(), ["node", "buffer", "Buffer"]);
@@ -364,6 +357,13 @@ fn test_package_owner_requires_registry_and_runtime_has_no_registry() {
     assert!(
         matches!(package.owner().expect("owner"), SymbolOwner::Package { registry, .. } if registry == "crates.io")
     );
+    assert_eq!(
+        package.release().expect("release").to_string(),
+        "rift://revision/cargo/crates.io/demo@1.0.0"
+    );
+    let mut ranged = json.clone();
+    ranged["version"] = serde_json::json!("^1.0");
+    assert!(serde_json::from_value::<PackageIdentity>(ranged).is_err());
     let runtime = RuntimeIdentity {
         runtime: "cpython".into(),
         version: "3.12.9".into(),
@@ -372,6 +372,15 @@ fn test_package_owner_requires_registry_and_runtime_has_no_registry() {
         runtime.owner().expect("runtime"),
         SymbolOwner::Runtime { .. }
     ));
+    assert_eq!(
+        runtime.release().expect("release").to_string(),
+        "rift://revision/stdlib/cpython@3.12.9"
+    );
+    let partial = RuntimeIdentity {
+        runtime: "cpython".into(),
+        version: "3.12".into(),
+    };
+    assert!(partial.owner().is_err());
     for registry in [
         "",
         "https://crates.io",
@@ -397,7 +406,6 @@ fn test_full_endpoint_width_obeys_final_encoded_identity_bound() {
         manager: "cargo".into(),
         registry,
         name: "demo".into(),
-        version: "1.0.0".into(),
     };
     owner.validate().expect("owner at endpoint bound");
     let base =
@@ -505,7 +513,8 @@ fn test_invalid_structure_names_owners_and_versions_are_refused() {
         "rift://symbol/local@/rust/app/Name",
         "rift://symbol/local@all/rust/app/Name",
         "rift://symbol/local@Upper/rust/app/Name",
-        "rift://symbol/global/registry.example/demo@1.0.0/rust/Name",
+        "rift://symbol/global/registry.example/demo/rust/Name",
+        "rift://symbol/stdlib/registry.example/demo/rust/Name",
         "rift://symbol/local/rust/",
         "rift://symbol/local/rust/app//Name",
         "rift://symbol/local/rust/app/../Name",
@@ -514,19 +523,18 @@ fn test_invalid_structure_names_owners_and_versions_are_refused() {
         "rift://symbol/local/rust/app/%0A",
         "rift://symbol/local/Rust/app/Name",
         "rift://symbol/local/typescript::tsx/app/Name",
-        "rift://symbol/cargo/crates.io/demo@1.0/rust/Name",
-        "rift://symbol/cargo/crates.io/demo@^1.0.0/rust/Name",
-        "rift://symbol/pypi/pypi.org/demo@>=1/python/Name",
-        "rift://symbol/pypi/pypi.org/Demo@1.0/python/Name",
-        "rift://symbol/pypi/pypi.org/demo_name@1.0/python/Name",
+        "rift://symbol/cargo/crates.io/demo@1.0.0/rust/Name",
+        "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/Buffer",
+        "rift://symbol/pypi/pypi.org/Demo/python/Name",
+        "rift://symbol/pypi/pypi.org/demo_name/python/Name",
         "rift://symbol/npm/npmjs.org/@scope/demo/Name",
-        "rift://symbol/npm/npmjs.org/@scope/name/extra@1.0.0/javascript/Name",
-        "rift://symbol/npm/user:secret@registry.example/demo@1.0.0/javascript/Name",
-        "rift://symbol/npm/REGISTRY.EXAMPLE/demo@1.0.0/javascript/Name",
-        "rift://symbol/npm/registry.example%2F..%2Fnpm/demo@1.0.0/javascript/Name",
-        "rift://symbol/npm/registry.example%3Ftoken=secret/demo@1.0.0/javascript/Name",
-        "rift://symbol/npm/registry.example%23data/demo@1.0.0/javascript/Name",
-        "rift://symbol/stdlib/cpython@3.12/python/Name",
+        "rift://symbol/npm/npmjs.org/@Scope/name/javascript/Name",
+        "rift://symbol/npm/user:secret@registry.example/demo/javascript/Name",
+        "rift://symbol/npm/REGISTRY.EXAMPLE/demo/javascript/Name",
+        "rift://symbol/npm/registry.example%2F..%2Fnpm/demo/javascript/Name",
+        "rift://symbol/npm/registry.example%3Ftoken=secret/demo/javascript/Name",
+        "rift://symbol/npm/registry.example%23data/demo/javascript/Name",
+        "rift://symbol/stdlib/cpython@3.12.9/python/Name",
     ] {
         assert!(SymbolIdentity::parse(value).is_err(), "{value}");
         assert!(

@@ -271,30 +271,24 @@ fn canonical_candidate(
         return Err(invalid("symbol"));
     }
     let package = match parsed.owner() {
-        SymbolOwner::Package {
-            manager,
-            registry,
-            name,
-            version,
-        } => {
-            let package = rift_protocol::read::PackageIdentity {
-                manager: manager.clone(),
-                registry: registry.clone(),
-                name: name.clone(),
-                version: version.clone(),
-            };
-            if symbol.origin.package.as_ref() != Some(&package) || symbol.origin.runtime.is_some() {
+        owner @ SymbolOwner::Package { .. } => {
+            let package = symbol
+                .origin
+                .package
+                .as_ref()
+                .filter(|package| package.owner().is_ok_and(|actual| &actual == owner));
+            if package.is_none() || symbol.origin.runtime.is_some() {
                 return Err(invalid("symbol.origin"));
             }
-            Some(package)
+            package.cloned()
         }
-        SymbolOwner::Runtime { runtime, version } => {
+        owner @ SymbolOwner::Runtime { .. } => {
             if symbol.origin.package.is_some()
                 || symbol
                     .origin
                     .runtime
                     .as_ref()
-                    .is_none_or(|owner| &owner.runtime != runtime || &owner.version != version)
+                    .is_none_or(|runtime| runtime.owner().ok().as_ref() != Some(owner))
             {
                 return Err(invalid("symbol.origin"));
             }
@@ -954,8 +948,7 @@ mod tests {
     }
 
     fn symbol(package: &PackageIdentity) -> Symbol {
-        let id =
-            rift_core::symbol_identity("rust", "cargo/helper@1.0.0/src/lib.rs", "helper_beacon");
+        let id = rift_core::symbol_identity("rust", "cargo/helper/src/lib.rs", "helper_beacon");
         Symbol {
             id: Some(id),
             language: "rust".to_owned(),
@@ -977,7 +970,7 @@ mod tests {
     }
 
     fn unit() -> String {
-        "rift://source/cargo/crates.io/helper@1.0.0/src/lib.rs".to_owned()
+        "rift://source/cargo/crates.io/helper/src/lib.rs".to_owned()
     }
 
     fn documentation() -> rift_protocol::documentation::DocumentationHit {
@@ -985,11 +978,11 @@ mod tests {
             "documentation_revision":"0123abcd",
             "block": {
                 "identity":"1".repeat(64), "content_digest":"2".repeat(64),
-                "source":{"source":{"kind":"package","unit":"rift://source/cargo/crates.io/helper@1.0.0/README.md"}},
+                "source":{"source":{"kind":"package","unit":"rift://source/cargo/crates.io/helper/README.md"}},
                 "range":{"start":0,"end":40}, "line":1, "kind":"prose"
             },
             "source": {
-                "identity":{"source":{"kind":"package","unit":"rift://source/cargo/crates.io/helper@1.0.0/README.md"}},
+                "identity":{"source":{"kind":"package","unit":"rift://source/cargo/crates.io/helper/README.md"}},
                 "revision":"3".repeat(64), "content_digest":"4".repeat(64),
                 "origin":{"location":"dependency","source_kind":"authored","package":{"manager":"cargo","registry":"crates.io","name":"helper","version":"1.0.0"}},
                 "format":"markdown", "media_type":"text/markdown", "selection":"package_archive", "byte_length":40
@@ -1016,7 +1009,7 @@ mod tests {
 
         let target = SymbolId(rift_core::symbol_identity(
             "rust",
-            "cargo/helper@1.0.0/src/lib.rs",
+            "cargo/helper/src/lib.rs",
             "helper_beacon",
         ));
         let context = docs::DocumentationContext {
@@ -1062,7 +1055,7 @@ mod tests {
                 let mut hit = original.clone();
                 hit.block.source.source = DocumentationSourceIdentity::Package {
                     unit: rift_protocol::read::SourceUnitId(
-                        "rift://source/cargo/crates.io/other@1.0.0/README.md".to_owned(),
+                        "rift://source/cargo/crates.io/other/README.md".to_owned(),
                     ),
                 };
                 hit
@@ -1120,7 +1113,7 @@ mod tests {
         let mut omitted = documentation().source.identity;
         omitted.source = docs::DocumentationSourceIdentity::Package {
             unit: rift_protocol::read::SourceUnitId(
-                "rift://source/cargo/crates.io/other@1.0.0/README.md".to_owned(),
+                "rift://source/cargo/crates.io/other/README.md".to_owned(),
             ),
         };
         context.warnings.push(docs::DocumentationWarning {
@@ -1276,7 +1269,7 @@ mod tests {
         };
         assert_eq!(
             symbol.id.as_ref().expect("id").0,
-            rift_core::symbol_identity("rust", "cargo/helper@1.0.0/src/lib.rs", "helper_beacon")
+            rift_core::symbol_identity("rust", "cargo/helper/src/lib.rs", "helper_beacon")
         );
         assert_eq!(symbol.documentation[0].text, "Beacon docs");
         assert_eq!(
@@ -1322,7 +1315,7 @@ mod tests {
             contributing_fields: vec![PackageSearchHitContributingField::QualifiedName],
             additional_properties: HashMap::new(),
         };
-        hit.unit = "rift://source/cargo/crates.io/other@1.0.0/src/lib.rs".to_owned();
+        hit.unit = "rift://source/cargo/crates.io/other/src/lib.rs".to_owned();
         assert_response_field(
             &(PackageSearchCandidate::try_from(hit)).expect_err("registered refusal"),
             "source_identity",

@@ -5,7 +5,7 @@ use crate::pattern::{
 use rift_protocol::read::SEARCH_PATTERN_CHARS_MAX;
 use serde_json::{Value, json};
 
-const UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/first.rs";
+const UNIT: &str = "rift://source/cargo/crates.io/demo/src/first.rs";
 
 /// One edit to a pattern page fixture, beside the field the client names when it refuses it.
 type PageEdit = (&'static str, fn(&mut Value));
@@ -15,12 +15,7 @@ const FILE_SIZE: u64 = 64;
 
 fn pattern_hit_json(unit: &str, start: u64) -> Value {
     let mut symbol = symbol_json("demo", "first");
-    symbol["id"] = json!(pattern_symbol_identity(
-        "demo",
-        "crates.io",
-        "1.0.0",
-        "rust"
-    ));
+    symbol["id"] = json!(pattern_symbol_identity("demo", "crates.io", "rust"));
     json!({
         "package": package_json("demo"), "unit": unit,
         "range": {"start": start, "end": start + 4}, "line": 2, "size": FILE_SIZE,
@@ -28,13 +23,12 @@ fn pattern_hit_json(unit: &str, start: u64) -> Value {
     })
 }
 
-fn pattern_symbol_identity(package: &str, registry: &str, version: &str, language: &str) -> String {
+fn pattern_symbol_identity(package: &str, registry: &str, language: &str) -> String {
     rift_protocol::identity::SymbolIdentity::new(
         rift_protocol::identity::SymbolOwner::Package {
             manager: "cargo".to_owned(),
             registry: registry.to_owned(),
             name: package.to_owned(),
-            version: version.to_owned(),
         },
         rift_protocol::read::Language::from_identity_segment(language).expect("fixture language"),
         vec!["library".to_owned(), "demo".to_owned()],
@@ -339,8 +333,7 @@ fn test_pattern_pages_refuse_matches_breaking_the_contract() {
             page["items"][0]["source"] = json!("fn demo");
         }),
         ("source_identity", |page| {
-            page["items"][0]["unit"] =
-                json!("rift://source/cargo/crates.io/other@1.0.0/src/first.rs");
+            page["items"][0]["unit"] = json!("rift://source/cargo/crates.io/other/src/first.rs");
         }),
         ("source_identity", |page| {
             page["items"][0]["unit"] = json!("rift://source/npm/demo@1.0.0/src/first.rs");
@@ -393,11 +386,10 @@ fn test_pattern_declarations_validate_canonical_owner_and_language() {
 
     let invalid_ids = [
         "not-an-identity".to_owned(),
-        "rift://symbol/rust/cargo/demo@1.0.0/src/first.rs/demo".to_owned(),
-        pattern_symbol_identity("other", "crates.io", "1.0.0", "rust"),
-        pattern_symbol_identity("demo", "other.example", "1.0.0", "rust"),
-        pattern_symbol_identity("demo", "crates.io", "2.0.0", "rust"),
-        pattern_symbol_identity("demo", "crates.io", "1.0.0", "typescript"),
+        "rift://symbol/rust/cargo/demo/src/first.rs/demo".to_owned(),
+        pattern_symbol_identity("other", "crates.io", "rust"),
+        pattern_symbol_identity("demo", "other.example", "rust"),
+        pattern_symbol_identity("demo", "crates.io", "typescript"),
     ];
     for id in invalid_ids {
         let mut invalid_page = page.clone();
@@ -468,7 +460,7 @@ fn test_pattern_pages_refuse_past_their_bounds() {
             (0..count)
                 .map(|file| {
                     pattern_hit_json(
-                        &format!("rift://source/cargo/crates.io/demo@1.0.0/src/first{file}.rs"),
+                        &format!("rift://source/cargo/crates.io/demo/src/first{file}.rs"),
                         10,
                     )
                 })
@@ -572,7 +564,7 @@ fn test_a_pattern_match_converts_into_a_file_hit_and_its_declaration() {
         "location",
     );
     let mut foreign = hit;
-    foreign.unit = "rift://source/cargo/crates.io/other@1.0.0/src/first.rs".to_owned();
+    foreign.unit = "rift://source/cargo/crates.io/other/src/first.rs".to_owned();
     assert_registered_field(
         &PackagePatternMatch::try_from(&foreign).expect_err("registered refusal"),
         "rift.client.response_invalid",

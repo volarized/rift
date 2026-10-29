@@ -642,7 +642,7 @@
                             "registry": "crates.io"
                           },
                           "symbol": {
-                            "id": "rift://symbol/rust/cargo/serde@1.0.219/src/de.rs/ReadService",
+                            "id": "rift://symbol/rust/cargo/serde/src/de.rs/ReadService",
                             "language": "rust",
                             "name": "ReadService",
                             "kind": "struct",
@@ -657,7 +657,7 @@
                               "source_kind": "authored"
                             }
                           },
-                          "unit": "rift://source/cargo/crates.io/serde@1.0.219/src/de.rs",
+                          "unit": "rift://source/cargo/crates.io/serde/src/de.rs",
                           "range": {
                             "start": 0,
                             "end": 10
@@ -699,7 +699,7 @@
                               "source": {
                                 "source": {
                                   "kind": "package",
-                                  "unit": "rift://source/cargo/crates.io/serde@1.0.219/README.md"
+                                  "unit": "rift://source/cargo/crates.io/serde/README.md"
                                 }
                               },
                               "content_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -714,7 +714,7 @@
                               "identity": {
                                 "source": {
                                   "kind": "package",
-                                  "unit": "rift://source/cargo/crates.io/serde@1.0.219/README.md"
+                                  "unit": "rift://source/cargo/crates.io/serde/README.md"
                                 }
                               },
                               "revision": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -930,7 +930,7 @@
               "examples": {
                 "exact": {
                   "value": {
-                    "id": "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+                    "id": "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
                     "revision": "rift://revision/cargo/crates.io/tokio@1.50.0",
                     "declaration_limit": 5
                   }
@@ -952,7 +952,7 @@
                     "value": {
                       "outcome": "found",
                       "symbol": {
-                        "id": "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+                        "id": "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
                         "language": "rust",
                         "name": "Beacon",
                         "kind": "struct"
@@ -1157,7 +1157,7 @@
               "examples": {
                 "symbol": {
                   "value": {
-                    "symbol": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon"
+                    "symbol": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon"
                   }
                 }
               }
@@ -1178,8 +1178,8 @@
                       "nodes": [
                         {
                           "id": "rift://node/rust/822c5120b879aefaf4292665e14f74685b0af62426f7be48abeaa8119617b6f0",
-                          "of": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "of": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "function_item",
                           "facets": [
@@ -1194,7 +1194,7 @@
                         },
                         {
                           "id": "rift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47",
-                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "visibility_modifier",
                           "range": {
@@ -1205,7 +1205,7 @@
                         },
                         {
                           "id": "rift://node/rust/9b04c3deca33e42e8320a198a92e8228c839f6896f7355d628794a903e7e1e65",
-                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "identifier",
                           "range": {
@@ -1216,7 +1216,7 @@
                         },
                         {
                           "id": "rift://node/rust/edfb51c0954ad93ebc6b3d756002deff7e5ad9a2bfbd0c0d98863a1967b36305",
-                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "parameters",
                           "range": {
@@ -1227,7 +1227,7 @@
                         },
                         {
                           "id": "rift://node/rust/2d72b267e7fb58ef18e81465a0ac23fa48c5ca8d840ffe88f8e79cc458a14c2e",
-                          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "block",
                           "range": {
@@ -1477,7 +1477,7 @@
                             "version": "1.0.0",
                             "registry": "crates.io"
                           },
-                          "unit": "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+                          "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
                           "range": {
                             "start": 24,
                             "end": 32
@@ -1486,7 +1486,7 @@
                           "size": 88,
                           "declaration": {
                             "symbol": {
-                              "id": "rift://symbol/rust/cargo/beacon@1.0.0/src/lib.rs/serve",
+                              "id": "rift://symbol/rust/cargo/beacon/src/lib.rs/serve",
                               "language": "rust",
                               "name": "serve",
                               "kind": "function",
@@ -1700,12 +1700,14 @@
                     "position_encoding": "utf-16",
                     "positions": [
                       {
-                        "unit": "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+                        "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
+                        "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
                         "line": 3,
                         "character": 4
                       },
                       {
-                        "unit": "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+                        "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
+                        "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
                         "line": 0,
                         "character": 2
                       }
@@ -1732,12 +1734,14 @@
                         {
                           "outcome": "found",
                           "position": {
-                            "unit": "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+                            "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
+                            "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
                             "line": 3,
                             "character": 4
                           },
-                          "id": "rift://symbol/cargo/crates.io/beacon@1.0.0/rust/beacon/serve",
+                          "id": "rift://symbol/cargo/crates.io/beacon/rust/beacon/serve",
                           "kind": "function",
+                          "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
                           "view": {
                             "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                             "expires_at": "2026-10-10T10:05:00Z"
@@ -1746,7 +1750,8 @@
                         {
                           "outcome": "missing",
                           "position": {
-                            "unit": "rift://source/cargo/crates.io/beacon@1.0.0/src/lib.rs",
+                            "unit": "rift://source/cargo/crates.io/beacon/src/lib.rs",
+                            "revision": "rift://revision/cargo/crates.io/beacon@1.0.0",
                             "line": 0,
                             "character": 2
                           },
@@ -1990,7 +1995,7 @@
           "pattern": "^rift://source/(?:cargo|npm|pypi|stdlib)/"
         },
         "then": {
-          "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#@]+/|stdlib/[a-z][a-z0-9_-]*@[^/?#@]+/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
+          "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/(?:[A-Za-z0-9._!$&'()*+,;=:-]|%[0-9A-F]{2})+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/|stdlib/[a-z][a-z0-9_-]*/)(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
         },
         "else": {
           "pattern": "^rift://source/[a-z][a-z0-9_.-]{0,127}/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@~-]|%(?:2[0-9A-E]|[34689A-F][0-9A-F]|5[0-9ABDEF]|7[0-9A-E]))+)*$"
@@ -2004,36 +2009,36 @@
               "pattern": "^rift://source/[^/]+/[A-Za-z]:"
             },
             {
-              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+@[^/]+/)[A-Za-z]:"
+              "pattern": "^rift://source/(?:(?:cargo|npm|pypi)/[^/]+/(?:@[^/]+/)?[^/]+/)[A-Za-z]:"
             },
             {
-              "pattern": "^rift://source/stdlib/[^/]+@[^/]+/[A-Za-z]:"
+              "pattern": "^rift://source/stdlib/[^/]+/[A-Za-z]:"
             }
           ]
         },
-        "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
+        "description": "Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://source/project/src/lib.rs",
-          "rift://source/npm/npmjs.org/@types/node@26.6.4/fs.d.ts",
-          "rift://source/stdlib/cpython@3.12.9/Lib/sys.py"
+          "rift://source/npm/npmjs.org/@types/node/fs.d.ts",
+          "rift://source/stdlib/cpython/Lib/sys.py"
         ]
       },
       "SymbolId": {
-        "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+        "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://symbol/local/rust/app/parser/parse",
           "rift://symbol/local@cloud/rust/app/load",
           "rift://symbol/local:docs/typescript/page/beacon",
           "rift://symbol/local@cloud:docs/typescript/page/beacon",
-          "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-          "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+          "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+          "rift://symbol/stdlib/cpython/python/builtins/len"
         ],
         "maxLength": 8192,
         "minLength": 1,
         "not": {
           "pattern": "/\\.{1,2}(?:/|$)"
         },
-        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
         "type": "string"
       },
       "Symbol": {
@@ -4965,6 +4970,10 @@
                 "$ref": "#/components/schemas/ExactKind",
                 "description": "Declaration kind in the provider's vocabulary."
               },
+              "revision": {
+                "$ref": "#/components/schemas/Revision",
+                "description": "The release of the declaration's owner that `id` answers in. It differs from\nthe position's release when a proved stub mapping names a runtime declaration."
+              },
               "view": {
                 "$ref": "#/components/schemas/CapturedView",
                 "description": "Immutable selection supplying this declaration."
@@ -4979,6 +4988,7 @@
               "position",
               "id",
               "kind",
+              "revision",
               "view"
             ],
             "description": "An established declaration holds this exact position."
@@ -5135,7 +5145,7 @@
             "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`."
           },
           "revision": {
-            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision names the release\na package or runtime `id` carries. Omitted reads the served working tree. The\nserver refuses it beside `view` and once the index no longer serves it.",
+            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses it beside `view` and once the index no longer serves it.",
             "$ref": "#/components/schemas/Revision"
           },
           "view": {
@@ -6552,6 +6562,10 @@
             "$ref": "#/components/schemas/SourceUnitId",
             "description": "Canonical physical source unit, independent of the logical symbol owner."
           },
+          "revision": {
+            "$ref": "#/components/schemas/Revision",
+            "description": "The release of the unit's package or runtime owner whose bytes hold the position, as\n`rift://revision/cargo/crates.io/demo@1.0.0`. Present exactly when the unit has such an\nowner: a custom resolver's unit names no release."
+          },
           "line": {
             "type": "integer",
             "format": "uint64",
@@ -6572,7 +6586,7 @@
           "line",
           "character"
         ],
-        "description": "One exact position in a project, package or runtime source unit."
+        "description": "One exact position in a source unit, at the release of a package or runtime unit."
       },
       "SourceUnitSpan": {
         "type": "object",
@@ -6713,21 +6727,21 @@
         "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The timeline follows first parents from the served revision, or the selected\nreleases in version order, through the revisions the history store holds, and follows\nthe declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary."
       },
       "SymbolIdentity": {
-        "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.",
+        "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
         "examples": [
           "rift://symbol/local/rust/app/parser/parse",
           "rift://symbol/local@cloud/rust/app/load",
           "rift://symbol/local:docs/typescript/page/beacon",
           "rift://symbol/local@cloud:docs/typescript/page/beacon",
-          "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
-          "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+          "rift://symbol/npm/npmjs.org/@types/node/typescript/node/buffer/Buffer",
+          "rift://symbol/stdlib/cpython/python/builtins/len"
         ],
         "maxLength": 8192,
         "minLength": 1,
         "not": {
           "pattern": "/\\.{1,2}(?:/|$)"
         },
-        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
+        "pattern": "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*$",
         "type": "string"
       },
       "SymbolMatchContext": {
@@ -6793,7 +6807,7 @@
           "view_context"
         ],
         "x-enum-descriptions": [
-          "The encoded exact release has no accepted publication.",
+          "The selected release has no accepted publication.",
           "The selected index is preparing.",
           "The serving read failed.",
           "The publication failed validation.",
@@ -7588,7 +7602,7 @@
             "$ref": "#/components/schemas/CapturedViewId"
           },
           "revision": {
-            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision names the release a package or runtime\n`symbol` carries. Omitted reads the served working tree. The server refuses a git\nrevision when the workspace has no version-control repository, and a tree revision\nonce the index serves another tree.",
+            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's lockfiles pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree.",
             "$ref": "#/components/schemas/Revision"
           }
         },
@@ -7912,7 +7926,7 @@
           },
           {
             "$ref": "#/components/schemas/SourceUnitId",
-            "description": "A source unit of a package or runtime release, as\n`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`."
+            "description": "A source unit of a package or runtime, as `rift://source/cargo/crates.io/demo/src/lib.rs`."
           }
         ],
         "description": "The source unit a [`Node`] is written in: a file of the project tree the read targets, or\na source unit of the package or runtime release that owns the node's symbol."

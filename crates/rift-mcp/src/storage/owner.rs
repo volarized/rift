@@ -143,13 +143,11 @@ mod tests {
         for owner in [
             SymbolOwner::Runtime {
                 runtime: "rust".to_owned(),
-                version: "1.98.0".to_owned(),
             },
             SymbolOwner::Package {
                 manager: "cargo".to_owned(),
                 registry: "crates.io".to_owned(),
                 name: "serde".to_owned(),
-                version: "1.0.0".to_owned(),
             },
         ] {
             owner.validate().expect("valid released owner");

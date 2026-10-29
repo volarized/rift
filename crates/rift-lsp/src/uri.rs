@@ -395,7 +395,7 @@ impl PackageFile {
         &self.path
     }
 
-    /// The file's source unit, such as `rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs`.
+    /// The file's source unit, such as `rift://source/cargo/crates.io/helper/src/lib.rs`.
     #[must_use]
     pub const fn unit(&self) -> &SourceUnitId {
         &self.unit
@@ -622,11 +622,11 @@ mod tests {
         let answers = [
             (
                 "file:///work/ws/node_modules/nanoid/index.d.ts",
-                "rift://source/npm/npmjs.org/nanoid@5.1.6/index.d.ts",
+                "rift://source/npm/npmjs.org/nanoid/index.d.ts",
             ),
             (
                 "file:///work/ws/vendor/helper/src/lib.rs",
-                "rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs",
+                "rift://source/cargo/crates.io/helper/src/lib.rs",
             ),
             ("file:///work/ws/src/lib.rs", "project src/lib.rs"),
             (
@@ -635,7 +635,7 @@ mod tests {
             ),
             (
                 "file:///work/elsewhere.rs",
-                "rift://source/cargo/crates.io/outer@1.0.0/elsewhere.rs",
+                "rift://source/cargo/crates.io/outer/elsewhere.rs",
             ),
         ];
         for (text, expected) in answers {
@@ -668,14 +668,14 @@ mod tests {
                 "file:///work/ws/node_modules/.pnpm/nanoid%405.1.6/node_modules/nanoid/index.d.ts"
             )
             .expect("package address"),
-            "rift://source/npm/npmjs.org/nanoid@5.1.6/index.d.ts".to_owned()
+            "rift://source/npm/npmjs.org/nanoid/index.d.ts".to_owned()
         );
         assert_eq!(
             addressed(
                 &roots,
                 "file:///work/ws/node_modules/.pnpm/%40types%2Bnode%4026.6.2/node_modules/%40types/node/fs.d.ts"
             ).expect("package address"),
-            "rift://source/npm/npmjs.org/@types/node@26.6.2/fs.d.ts".to_owned()
+            "rift://source/npm/npmjs.org/@types/node/fs.d.ts".to_owned()
         );
     }
 
@@ -703,13 +703,13 @@ mod tests {
         let answers = [
             (
                 "jwt/api_jwt.py",
-                "rift://source/pypi/pypi.org/pyjwt@2.10.1/jwt/api_jwt.py",
+                "rift://source/pypi/pypi.org/pyjwt/jwt/api_jwt.py",
             ),
             (
                 "google/protobuf/message.py",
-                "rift://source/pypi/pypi.org/protobuf@6.33.0/google/protobuf/message.py",
+                "rift://source/pypi/pypi.org/protobuf/google/protobuf/message.py",
             ),
-            ("six.py", "rift://source/pypi/pypi.org/six@1.17.0/six.py"),
+            ("six.py", "rift://source/pypi/pypi.org/six/six.py"),
             (
                 "google/other.py",
                 "project .venv/lib/python3.12/site-packages/google/other.py",
@@ -751,7 +751,7 @@ mod tests {
         };
         assert_eq!(
             file.unit(),
-            &unit("rift://source/cargo/crates.io/helper@0.1.0/src/lib.rs")
+            &unit("rift://source/cargo/crates.io/helper/src/lib.rs")
         );
         assert_eq!(
             file.origin(),
@@ -774,11 +774,11 @@ mod tests {
             assert_eq!(
                 addressed(&roots, "file:///cache/outer/vendor/inner/src/lib.rs")
                     .expect("inner address"),
-                "rift://source/cargo/crates.io/inner@2.0.0/src/lib.rs".to_owned()
+                "rift://source/cargo/crates.io/inner/src/lib.rs".to_owned()
             );
             assert_eq!(
                 addressed(&roots, "file:///cache/outer/vendor/other.rs").expect("outer address"),
-                "rift://source/cargo/crates.io/outer@1.0.0/vendor/other.rs".to_owned()
+                "rift://source/cargo/crates.io/outer/vendor/other.rs".to_owned()
             );
         }
     }

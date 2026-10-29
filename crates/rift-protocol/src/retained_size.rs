@@ -25,25 +25,16 @@ impl GetSize for crate::identity::SymbolOwner {
                 manager,
                 registry,
                 name,
-                version,
             } => {
                 let (manager, tracker) = manager.get_heap_size_with_tracker(tracker);
                 let (registry, tracker) = registry.get_heap_size_with_tracker(tracker);
                 let (name, tracker) = name.get_heap_size_with_tracker(tracker);
-                let (version, tracker) = version.get_heap_size_with_tracker(tracker);
                 (
-                    manager
-                        .saturating_add(registry)
-                        .saturating_add(name)
-                        .saturating_add(version),
+                    manager.saturating_add(registry).saturating_add(name),
                     tracker,
                 )
             }
-            Self::Runtime { runtime, version } => {
-                let (runtime, tracker) = runtime.get_heap_size_with_tracker(tracker);
-                let (version, tracker) = version.get_heap_size_with_tracker(tracker);
-                (runtime.saturating_add(version), tracker)
-            }
+            Self::Runtime { runtime } => runtime.get_heap_size_with_tracker(tracker),
         }
     }
 }
