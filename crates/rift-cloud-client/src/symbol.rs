@@ -181,7 +181,7 @@ fn valid_result(
                         && valid_documentation(
                             context,
                             &request.id,
-                            &symbol.origin,
+                            (owner, &symbol.origin),
                             source_bytes_max,
                         )
                 })
@@ -221,18 +221,14 @@ fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner, version: Option<&str
     }
 }
 
-/// Whether documentation answered for `target` stays inside the owner and release of the
-/// answered symbol's `origin`.
+/// Whether documentation answered for `target` stays inside its `owner` at the release of
+/// the answered symbol's `origin`.
 fn valid_documentation(
     context: &rift_protocol::documentation::DocumentationContext,
     target: &rift_protocol::read::SymbolId,
-    origin: &SymbolOrigin,
+    (owner, origin): (&SymbolOwner, &SymbolOrigin),
     source_bytes_max: usize,
 ) -> bool {
-    let Ok(identity) = SymbolIdentity::parse(target.as_str()) else {
-        return false;
-    };
-    let owner = identity.owner();
     if context
         .references
         .iter()

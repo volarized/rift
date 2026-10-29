@@ -585,7 +585,7 @@ async fn captured_callee_source(
         let Some(held) = callee.captured_source() else {
             continue;
         };
-        let Some(origin) = callee_origin(callee) else {
+        let Some((origin, release)) = callee_release(callee) else {
             continue;
         };
         let Ok(unit) = rift_core::SourceUnitId::for_origin(&origin, callee.path()) else {
@@ -597,9 +597,6 @@ async fn captured_callee_source(
         }
         let parsed = rift_protocol::identity::SymbolIdentity::parse(id.as_str());
         let CalleePackage::Runtime(runtime) = callee.package() else {
-            return Ok(false);
-        };
-        let Ok(release) = runtime.release() else {
             return Ok(false);
         };
         if position.revision.as_ref() != Some(&release)
@@ -734,15 +731,30 @@ fn batched_positions(
 /// The exact physical source origin established by the callee's installed root.
 /// Unversioned standard libraries establish no released source identity.
 fn callee_origin(callee: &PackageCallee) -> Option<rift_protocol::read::SourceLocation> {
+    callee_release(callee).map(|(origin, _)| origin)
+}
+
+/// The callee's physical source origin and the release whose bytes hold it; `None` for an
+/// unversioned standard library or a version its ecosystem does not spell canonically.
+fn callee_release(
+    callee: &PackageCallee,
+) -> Option<(
+    rift_protocol::read::SourceLocation,
+    rift_protocol::revision::Revision,
+)> {
     match callee.package() {
-        CalleePackage::Installed(package) => {
-            Some(rift_protocol::read::SourceLocation::Dependency {
+        CalleePackage::Installed(package) => Some((
+            rift_protocol::read::SourceLocation::Dependency {
                 package: package.clone(),
-            })
-        }
-        CalleePackage::Runtime(runtime) => Some(rift_protocol::read::SourceLocation::Stdlib {
-            runtime: Some(runtime.clone()),
-        }),
+            },
+            package.release().ok()?,
+        )),
+        CalleePackage::Runtime(runtime) => Some((
+            rift_protocol::read::SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            },
+            runtime.release().ok()?,
+        )),
         CalleePackage::StandardLibrary(_) => None,
     }
 }
@@ -761,14 +773,8 @@ fn callee_position(
     if !within_bound {
         return None;
     }
+    let (_, revision) = callee_release(callee)?;
     let unit = rift_core::SourceUnitId::for_origin(origin, callee.path()).ok()?;
-    let revision = match origin {
-        rift_protocol::read::SourceLocation::Dependency { package } => package.release().ok()?,
-        rift_protocol::read::SourceLocation::Stdlib {
-            runtime: Some(runtime),
-        } => runtime.release().ok()?,
-        _ => return None,
-    };
     Some(CalleePosition {
         unit: unit.to_string(),
         revision: revision.to_string(),
