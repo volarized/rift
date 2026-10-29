@@ -67,6 +67,10 @@ skip = [
   { name = "zip", version = "8.6.0" },
   # These two zip releases require typed-path 0.12 and 0.13 respectively.
   { name = "typed-path", version = "0.12.3" },
+  # Oxigraph's spargebra parser uses chumsky 0.13, which requires hashbrown 0.15
+  # and its foldhash 0.1 default hasher beside the workspace's newer versions.
+  { name = "hashbrown", version = "0.15.5" },
+  { name = "foldhash", version = "0.1.5" },
 
   # Rig 0.45 still requires sha2 0.10 and its digest 0.10
   # stack. Rift uses sha2 0.11, whose ARM and x86 backends detect CPU features
@@ -141,7 +145,9 @@ unknown-git = "deny"
 # ty_project and ty_ide are unpublished, so the embedded ty engine's crates
 # come from the ruff repository at a pinned revision.
 # The Cython grammar is unpublished and pinned in the workspace dependencies.
+# The SPARQL engine's Oxigraph crates are pinned to one development revision.
 allow-git = [
+  "https://github.com/oxigraph/oxigraph",
   "https://github.com/astral-sh/ruff",
   "https://github.com/b0o/tree-sitter-cython",
   "https://github.com/tree-sitter/tree-sitter-typescript",

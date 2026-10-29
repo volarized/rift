@@ -69,6 +69,13 @@ nix = { version = "0.31.3", features = ["signal"] }
 notify = "=8.2.1"
 oas3-gen-support = "=0.28.0"
 oas3 = "=0.22.0"
+# The SPARQL engine. One pinned Oxigraph revision serves every member, and its members
+# require each other at exactly these development versions.
+oxrdf = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.4.0-dev", default-features = false }
+oxttl = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.3.0-dev", default-features = false }
+sparesults = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.4.0-dev", default-features = false }
+spareval = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.3.0-dev", default-features = false }
+spargebra = { git = "https://github.com/oxigraph/oxigraph", rev = "7dc1266c55a0bc5d73e8d1f8cf2723d1490ce149", version = "=0.5.0-dev", default-features = false }
 # The OTLP export stack rift-tracing owns. tracing-opentelemetry pins the opentelemetry minor it
 # builds against (0.34.0 requires opentelemetry ^0.33.0), and opentelemetry_sdk /
 # opentelemetry-otlp move in lockstep with opentelemetry itself, so every member is
