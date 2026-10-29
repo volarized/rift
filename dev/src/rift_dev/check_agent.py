@@ -180,18 +180,25 @@ async def declaration_node(client: Client, name: str) -> str:
         },
     )
     require(listing.get("view") == view, f"nodes changed captured view: {listing}")
-    nodes = array_value(listing.get("nodes"), "nodes.nodes")
-    sources = array_value(listing.get("source"), "nodes.source")
-    require(len(nodes) == len(sources), f"nodes lost source excerpts: {listing}")
+    nodes = [
+        object_value(entry, "node")
+        for entry in array_value(listing.get("nodes"), "nodes.nodes")
+    ]
+    require(
+        bool(nodes) and nodes[0].get("kind") == "file",
+        f"nodes did not open with the file node: {listing}",
+    )
     matches = [
-        (object_value(entry, "node"), excerpt)
-        for entry, excerpt in zip(nodes, sources, strict=True)
-        if object_value(entry, "node").get("symbol") == identity
-        and object_value(entry, "node").get("range") == span
+        node
+        for node in nodes
+        if node.get("of") == identity and node.get("range") == span
     ]
     require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
-    node, excerpt = matches[0]
-    require(excerpt == hit.get("source"), f"nodes changed source: {listing}")
+    node = matches[0]
+    require(
+        node.get("source") == hit.get("source"),
+        f"nodes changed source: {listing}",
+    )
     return string_value(node.get("id"), "node.id")
 
 
