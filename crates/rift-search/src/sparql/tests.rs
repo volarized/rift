@@ -573,6 +573,42 @@ fn test_graph_query_parse_counts_brackets_wherever_written() {
 }
 
 #[test]
+fn test_graph_query_parse_counts_codepoint_escapes_as_their_characters() {
+    let limits = GraphLimits::default();
+    let (open, close) = (
+        "\\u0028".repeat(limits.brackets_max()),
+        "\\u0029".repeat(limits.brackets_max()),
+    );
+    let escaped = format!("SELECT ?x {{ BIND({open}1{close} AS ?x) }}");
+    assert!(structure_refusal(&escaped, &limits).contains("opening brackets"));
+    let chained = format!(
+        "SELECT ?x {{ BIND(1{} AS ?x) }}",
+        "\\u002b1".repeat(limits.operators_max() + 1)
+    );
+    assert!(structure_refusal(&chained, &limits).contains("operator characters"));
+    let letters = "SELECT ?x { BIND(\"\\u00e9\\u0041\" AS ?x) }";
+    assert!(
+        GraphQuery::parse(letters, &limits).is_ok(),
+        "escapes of other characters count nothing"
+    );
+}
+
+#[test]
+fn test_graph_query_parse_refuses_algebra_past_depth_bound() {
+    let limits = GraphLimits::builder()
+        .algebra_depth_max(8)
+        .build()
+        .expect("nonzero");
+    let shallow = "SELECT ?x { BIND(1 + 1 AS ?x) }";
+    assert!(
+        GraphQuery::parse(shallow, &limits).is_ok(),
+        "a shallow query fits"
+    );
+    let deep = format!("SELECT ?x {{ BIND(1{} AS ?x) }}", "+1".repeat(8));
+    assert!(structure_refusal(&deep, &limits).contains("algebra levels"));
+}
+
+#[test]
 fn test_graph_query_parse_refuses_patterns_past_planner_bound() {
     let limits = GraphLimits::builder()
         .patterns_max(2)

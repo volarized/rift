@@ -12,6 +12,9 @@ pub const BRACKETS_MAX: usize = 4096;
 /// Default most operator characters (`+ - * / & | ^ !`) a query's text may hold, wherever they
 /// stand: parsing recurses at most once per operator of a chain such as `1 + 1 + ...`.
 pub const OPERATORS_MAX: usize = 4096;
+/// Default deepest algebra a parsed query may hold, the levels the text bounds allow together:
+/// the planner and the evaluator recurse once per level.
+pub const ALGEBRA_DEPTH_MAX: usize = BRACKETS_MAX + OPERATORS_MAX;
 /// Default most triple, path and `VALUES` patterns one query may join. Planning a join orders
 /// its patterns in time that grows faster than their count squared.
 pub const PATTERNS_MAX: usize = 128;
@@ -39,6 +42,7 @@ pub struct GraphLimits {
     brackets_max: usize,
     operators_max: usize,
     patterns_max: usize,
+    algebra_depth_max: usize,
     expression_bytes_max: usize,
     computed_bytes_max: usize,
     triples_max: usize,
@@ -55,6 +59,7 @@ impl Default for GraphLimits {
             brackets_max: BRACKETS_MAX,
             operators_max: OPERATORS_MAX,
             patterns_max: PATTERNS_MAX,
+            algebra_depth_max: ALGEBRA_DEPTH_MAX,
             expression_bytes_max: EXPRESSION_BYTES_MAX,
             computed_bytes_max: COMPUTED_BYTES_MAX,
             triples_max: TRIPLES_MAX,
@@ -96,6 +101,12 @@ impl GraphLimits {
     #[must_use]
     pub const fn patterns_max(&self) -> usize {
         self.patterns_max
+    }
+
+    /// Deepest algebra of a parsed query.
+    #[must_use]
+    pub const fn algebra_depth_max(&self) -> usize {
+        self.algebra_depth_max
     }
 
     /// Most bytes one computed string value holds.
@@ -173,6 +184,12 @@ impl GraphLimitsBuilder {
         self
     }
 
+    /// Sets the deepest algebra of a parsed query.
+    pub const fn algebra_depth_max(mut self, value: usize) -> Self {
+        self.limits.algebra_depth_max = value;
+        self
+    }
+
     /// Sets the most bytes one computed string value holds.
     pub const fn expression_bytes_max(mut self, value: usize) -> Self {
         self.limits.expression_bytes_max = value;
@@ -228,6 +245,7 @@ impl GraphLimitsBuilder {
             ("brackets_max", limits.brackets_max),
             ("operators_max", limits.operators_max),
             ("patterns_max", limits.patterns_max),
+            ("algebra_depth_max", limits.algebra_depth_max),
             ("expression_bytes_max", limits.expression_bytes_max),
             ("computed_bytes_max", limits.computed_bytes_max),
             ("triples_max", limits.triples_max),
@@ -254,6 +272,7 @@ mod tests {
             .brackets_max(7)
             .operators_max(9)
             .patterns_max(10)
+            .algebra_depth_max(12)
             .expression_bytes_max(8)
             .computed_bytes_max(11)
             .triples_max(2)
@@ -269,6 +288,7 @@ mod tests {
                 limits.brackets_max(),
                 limits.operators_max(),
                 limits.patterns_max(),
+                limits.algebra_depth_max(),
                 limits.expression_bytes_max(),
                 limits.computed_bytes_max(),
                 limits.triples_max(),
@@ -277,7 +297,7 @@ mod tests {
                 limits.answer_bytes_max(),
                 limits.evaluation_timeout(),
             ),
-            (1, 7, 9, 10, 8, 11, 2, 3, 4, 5, Duration::from_millis(6))
+            (1, 7, 9, 10, 12, 8, 11, 2, 3, 4, 5, Duration::from_millis(6))
         );
         assert_eq!(
             GraphLimits::builder().build().ok(),

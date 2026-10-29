@@ -35,7 +35,8 @@ impl GraphQuery {
     ///
     /// - `query_too_large` when `text` passes the query byte bound, checked before parsing.
     /// - `query_structure_limit` when the text holds more opening brackets or operator
-    ///   characters than allowed, or the query joins more patterns than allowed.
+    ///   characters than allowed, codepoint escapes counted as the character they name, or the
+    ///   parsed query joins more patterns or nests deeper than allowed.
     /// - `query_syntax_invalid` when `text` is neither a query nor an update.
     /// - `query_feature_refused` naming the feature for an update, `CONSTRUCT`, `DESCRIBE`,
     ///   `FROM`, `FROM NAMED`, any `SERVICE`, `SERVICE SILENT` included, and a join of patterns
@@ -105,6 +106,18 @@ const BRACKETS: &[u8] = b"({[";
 /// Bytes that can chain operators, each a level the parser may recurse into.
 const OPERATORS: &[u8] = b"+-*/&|^!";
 
+/// The ASCII character a codepoint escape starting after its backslash names, if any.
+fn escaped(rest: &[u8]) -> Option<u8> {
+    let digits = match rest {
+        [b'u', digits @ ..] => digits.get(..4)?,
+        [b'U', digits @ ..] => digits.get(..8)?,
+        _ => return None,
+    };
+    let digits = std::str::from_utf8(digits).ok()?;
+    let codepoint = u32::from_str_radix(digits, 16).ok()?;
+    u8::try_from(codepoint).ok().filter(u8::is_ascii)
+}
+
 /// What the scan counted: opening brackets and operator characters, wherever they stand.
 ///
 /// The scan reads every byte, string literals, IRIs, escapes and comments included, so it never
@@ -117,12 +130,22 @@ struct Structure {
 }
 
 impl Structure {
+    /// Counts each byte, and each `\uXXXX` or `\UXXXXXXXX` codepoint escape by the character
+    /// it names, so a bracket written as an escape counts as one.
     fn of(text: &[u8]) -> Self {
-        let count = |set: &[u8]| text.iter().filter(|byte| set.contains(byte)).count();
-        Self {
-            brackets: count(BRACKETS),
-            operators: count(OPERATORS),
+        let mut structure = Self::default();
+        for (index, byte) in text.iter().enumerate() {
+            let character = match byte {
+                b'\\' => escaped(&text[index + 1..]),
+                _ => Some(*byte),
+            };
+            match character {
+                Some(character) if BRACKETS.contains(&character) => structure.brackets += 1,
+                Some(character) if OPERATORS.contains(&character) => structure.operators += 1,
+                Some(_) | None => {}
+            }
         }
+        structure
     }
 
     /// Refuses a count past its bound, before the parser recurses into it.

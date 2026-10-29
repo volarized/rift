@@ -42,8 +42,8 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Vec<Strin
     };
     let mut separators = Vec::new();
     let mut joined = Joined::default();
-    let mut pending = vec![Visit::Pattern(root)];
-    while let Some(visit) = pending.pop() {
+    let mut pending = Pending::from(Visit::Pattern(root));
+    while let Some(visit) = pending.next(limits)? {
         match visit {
             Visit::Pattern(pattern) => {
                 joined.count(pattern);
@@ -54,6 +54,53 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Vec<Strin
     }
     joined.admit(limits)?;
     Ok(separators)
+}
+
+/// The algebra elements still to inspect, each with its depth below the root.
+struct Pending<'a> {
+    stack: Vec<(Visit<'a>, usize)>,
+    depth: usize,
+}
+
+impl<'a> From<Visit<'a>> for Pending<'a> {
+    fn from(root: Visit<'a>) -> Self {
+        Self {
+            stack: vec![(root, 0)],
+            depth: 0,
+        }
+    }
+}
+
+impl<'a> Pending<'a> {
+    /// The next element, or a refusal once one lies deeper than the planner and evaluator may
+    /// recurse: both recurse once per level, and the text bounds bound the depth only as far
+    /// as the parser and this scan agree on what the text holds.
+    fn next(&mut self, limits: &GraphLimits) -> Result<Option<Visit<'a>>, RiftError> {
+        let Some((visit, depth)) = self.stack.pop() else {
+            return Ok(None);
+        };
+        if depth > limits.algebra_depth_max() {
+            return errors::search::query_structure_limit()
+                .bound("algebra levels")
+                .count(depth)
+                .limit(limits.algebra_depth_max())
+                .fail();
+        }
+        self.depth = depth;
+        Ok(Some(visit))
+    }
+
+    /// Queues a child of the element last returned.
+    fn push(&mut self, visit: Visit<'a>) {
+        self.stack.push((visit, self.depth + 1));
+    }
+
+    /// Queues children of the element last returned.
+    fn extend(&mut self, visits: impl IntoIterator<Item = Visit<'a>>) {
+        let depth = self.depth + 1;
+        self.stack
+            .extend(visits.into_iter().map(|visit| (visit, depth)));
+    }
 }
 
 /// What one query joins: its leaf patterns, and the product of its inline rows.
@@ -111,7 +158,7 @@ impl Joined {
 fn admit_pattern<'a>(
     pattern: &'a mut QueryExpression,
     separators: &mut Vec<String>,
-    pending: &mut Vec<Visit<'a>>,
+    pending: &mut Pending<'a>,
 ) -> Result<(), RiftError> {
     match pattern {
         QueryExpression::Service { name, .. } => return refused(&format!("SERVICE {name}")),
@@ -248,7 +295,7 @@ fn pattern_terms(pattern: &TriplePattern) -> Vec<String> {
 }
 
 /// Pushes the patterns and expressions one pattern holds.
-fn push_pattern_children<'a>(pattern: &'a mut QueryExpression, pending: &mut Vec<Visit<'a>>) {
+fn push_pattern_children<'a>(pattern: &'a mut QueryExpression, pending: &mut Pending<'a>) {
     match pattern {
         QueryExpression::Bgp { .. }
         | QueryExpression::Path { .. }
@@ -305,7 +352,7 @@ fn push_pattern_children<'a>(pattern: &'a mut QueryExpression, pending: &mut Vec
 }
 
 /// Pushes the subexpressions and `EXISTS` patterns one expression holds.
-fn push_expression_children<'a>(expression: &'a mut Expression, pending: &mut Vec<Visit<'a>>) {
+fn push_expression_children<'a>(expression: &'a mut Expression, pending: &mut Pending<'a>) {
     match expression {
         Expression::NamedNode(_)
         | Expression::Literal(_)
