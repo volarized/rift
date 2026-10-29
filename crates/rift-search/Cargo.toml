@@ -15,11 +15,13 @@ candle-core.workspace = true
 candle-nn.workspace = true
 candle-transformers.workspace = true
 data-encoding.workspace = true
+oxrdf.workspace = true
 rayon.workspace = true
 reqwest.workspace = true
 rift-core.workspace = true
 rift-error.workspace = true
 rift-index.workspace = true
+rift-protocol.workspace = true
 rift-ranking.workspace = true
 rift-tracing.workspace = true
 rig-core.workspace = true
@@ -28,10 +30,15 @@ futures-util = { version = "=0.3.34", default-features = false, features = ["std
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+spareval.workspace = true
+spargebra.workspace = true
+strum.workspace = true
 tokenizers.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+oxttl.workspace = true
 rift-tracing = { workspace = true, features = ["fixtures"] }
+sparesults.workspace = true
 tempfile.workspace = true
