@@ -245,12 +245,13 @@ fn stale_index() -> ReadWarning {
 fn node(id: &str, kind: &str, start: u64, end: u64) -> Node {
     Node {
         id: NodeId(id.to_owned()),
-        symbol: None,
+        of: None,
         unit: FileId("rift://file/src/lib.rs".to_owned()),
         language: rust(),
         kind: ExactKind(kind.to_owned()),
         facets: Vec::new(),
         range: range(start, end),
+        source: String::new(),
         regions: Vec::new(),
         parent: None,
         extensions: Extensions::default(),
@@ -350,11 +351,16 @@ fn symbol_result(hits: Vec<GetSymbolHit>, page: Pagination) -> GetSymbolResult {
     }
 }
 
-fn nodes_result(nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
+/// A `nodes` answer whose nodes carry `source`, one text per node in order.
+fn nodes_result(mut nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
+    assert_eq!(nodes.len(), source.len(), "one source per fixture node");
+    for (node, text) in nodes.iter_mut().zip(source) {
+        text.clone_into(&mut node.source);
+    }
     NodesResult {
         view: None,
         nodes,
-        source: source.into_iter().map(str::to_owned).collect(),
+        node_cursor: None,
         warnings: Vec::new(),
     }
 }
@@ -3713,6 +3719,57 @@ fn outer_and_inner() -> NodesResult {
 }
 
 #[test]
+fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
+    let mut first = node(
+        "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "function_item",
+        0,
+        9,
+    );
+    first.of = Some(SymbolId(A_ID.to_owned()));
+    let name = node(
+        "rift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "identifier",
+        3,
+        4,
+    );
+    let mut second = node(
+        "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "function_item",
+        20,
+        29,
+    );
+    second.of = Some(SymbolId(A_ID.to_owned()));
+    let mut answer = nodes_result(
+        vec![first, name, second],
+        vec!["fn a() {}", "a", "fn a() {}"],
+    );
+    answer.node_cursor = Some("3.0123456789abcdef".to_owned());
+    golden(
+        &answer,
+        &[
+            "3 nodes",
+            "\t[1] function_item",
+            "\t\t0..9",
+            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\trift://symbol/local/rust/app/a/A",
+            "\t[2] identifier",
+            "\t\t3..4",
+            "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "\t[3] function_item",
+            "\t\t20..29",
+            "\t\trift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "\t\trift://symbol/local/rust/app/a/A",
+            "",
+            "\t\tfn a() {}",
+            "",
+            "\t\tfn a() {}",
+            "node_cursor 3.0123456789abcdef",
+        ],
+    );
+}
+
+#[test]
 fn an_empty_nodes_answer_writes_only_the_header() {
     let answer = nodes_result(Vec::new(), Vec::new());
     golden(&answer, &["0 nodes"]);
@@ -3774,7 +3831,7 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
         0,
         20,
     );
-    item.symbol = Some(SymbolId(A_ID.to_owned()));
+    item.of = Some(SymbolId(A_ID.to_owned()));
     item.facets = vec![
         NodeFacet::Declaration,
         NodeFacet::Test,
@@ -3811,7 +3868,9 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
             "\t\t9..10",
             "\t\trift://node/rust/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             "",
-            "\t\t{",
+            "\t\tfn a() {",
+            "\t\t    b",
+            "\t\t}",
         ],
     );
 }
@@ -3966,30 +4025,6 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
         .collect();
     assert_eq!(recovered.join("\n"), excerpt);
 }
-
-#[test]
-fn nodes_and_excerpts_that_differ_in_length_are_refused() {
-    let one_node = || {
-        vec![node(
-            "rift://node/rust/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "a",
-            0,
-            1,
-        )]
-    };
-    for answer in [
-        nodes_result(one_node(), Vec::new()),
-        nodes_result(Vec::new(), vec!["extra"]),
-        nodes_result(one_node(), vec!["a", "b"]),
-    ] {
-        assert_eq!(
-            text_of(&answer),
-            Err(TextError::Unsupported("nodes and source differ in length"))
-        );
-    }
-}
-
-// Failures.
 
 #[test]
 fn a_failure_without_limit_or_causes_is_one_entry_with_its_message() {
@@ -4280,22 +4315,24 @@ fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_sourc
     golden(
         &example::<NodesResult>(0),
         &[
-            "5 nodes",
-            "\t[1] source_file · 14 lines",
+            "6 nodes",
+            "\t[1] file · 14 lines",
+            "\t\t0..356",
+            "\t\trift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2",
+            "\t[2] source_file · 14 lines",
             "\t\t0..356",
             "\t\trift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
-            "\t[2] function_item · 4 lines",
+            "\t[3] function_item · 4 lines",
             "\t\t218..355",
             "\t\trift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
             "\t\trift://symbol/local/rust/app/config/load_config",
-            "\t\tname 225..236 · body 281..355",
-            "\t[3] block · 4 lines",
+            "\t[4] block · 4 lines",
             "\t\t281..355",
             "\t\trift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
-            "\t[4] call_expression",
+            "\t[5] call_expression",
             "\t\t334..353",
             "\t\trift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
-            "\t[5] identifier",
+            "\t[6] identifier",
             "\t\t334..346",
             "\t\trift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
             "",

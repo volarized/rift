@@ -690,9 +690,8 @@ fn is_language_word(word: &str) -> bool {
         })
 }
 
-/// One node of a file's concrete syntax tree. It identifies a source range and
-/// provider-local syntax kind. `symbol` connects the node to semantic identity when the
-/// language supplies one.
+/// One node of a source unit's syntax tree, with its source text. It identifies a source
+/// range and provider-local syntax kind. `of` connects the node to the symbol it declares.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_node_empty_defaults)]
@@ -700,10 +699,10 @@ pub struct Node {
     /// Content identity of this node. Nodes of one language and kind with equal bytes share
     /// it; `unit` and `range` locate this one.
     pub id: NodeId,
-    /// The symbol written at this node. Absent where a node writes no symbol -
-    /// punctuation, a keyword, a comment.
+    /// The symbol this node declares. Absent where a node declares no symbol -
+    /// punctuation, a keyword, a comment, an expression.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<SymbolId>,
+    pub of: Option<SymbolId>,
     /// The file the node is written in.
     pub unit: FileId,
     /// The grammar that produced this node. It belongs to the identity because two
@@ -718,6 +717,8 @@ pub struct Node {
     pub facets: Vec<NodeFacet>,
     /// The bytes it spans, as offsets into the file.
     pub range: TextRange,
+    /// The node's exact source text: the bytes `range` spans at the read's revision.
+    pub source: String,
     /// The node's named parts, including its function body and documentation. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<NodeRegion>,
@@ -798,6 +799,25 @@ pub struct NodeId(
 /// The scheme and kind prefix every [`NodeId`] starts with.
 const NODE_ID_PREFIX: &str = "rift://node/";
 
+/// The kind of the node that spans one whole source unit. Every source unit has one, the
+/// outermost node of its tree, whether or not a syntax provider parses the unit.
+pub const FILE_NODE_KIND: &str = "file";
+
+/// The language of a source unit no syntax provider parses. Its only node is its file node.
+pub const TEXT_LANGUAGE_NAME: &str = "text";
+
+impl Language {
+    /// The language of a source unit no syntax provider parses: [`TEXT_LANGUAGE_NAME`], with
+    /// no dialect.
+    #[must_use]
+    pub fn text() -> Self {
+        Self {
+            name: TEXT_LANGUAGE_NAME.to_owned(),
+            dialect: None,
+        }
+    }
+}
+
 impl NodeId {
     /// Mints the content identity of one syntax node from its language, kind, and bytes.
     ///
@@ -835,27 +855,44 @@ pub struct NodeRegion {
     pub range: TextRange,
 }
 
-/// Lists the syntax nodes covering one position, outermost first. Each node carries its
-/// source range and kind, including expressions smaller than a declaration.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+/// Lists syntax nodes with their source, outermost first: every node of one `symbol`, or the
+/// nodes covering one `position` in one file. Each node carries its kind, range, and source
+/// text, including expressions smaller than a declaration.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::require_one_node_selector)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
 #[schemars(extend("examples" = [
+    {
+        "symbol": "rift://symbol/local/rust/app/config/load_config"
+    },
     {
         "path": "src/config.rs",
         "position": 338
     }
 ]))]
 pub struct NodesParams {
-    /// Project-relative file to inspect.
+    /// The symbol whose nodes the read lists: each declaration's item node, then the
+    /// descendants that belong to that declaration and not to a declaration nested in it,
+    /// outermost first per declaration. The caller MUST omit `path` and `position` beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<SymbolId>,
+    /// Project-relative file to inspect. The caller MUST send it together with `position`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub path: ProjectPath,
+    pub path: Option<ProjectPath>,
     /// UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes
     /// themselves carry the spans. A position inside a multi-byte character is valid and
     /// answers with its enclosing nodes; a position at or past the file's byte length
     /// refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub position: u64,
+    pub position: Option<u64>,
+    /// Continuation a preceding `symbol` read returned, bound to that symbol and the tree
+    /// revision it read. The server refuses it beside `path` and once the tree has moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub node_cursor: Option<String>,
     /// Captured view selected by discovery. The server reads nodes from that view and
     /// refuses an expired or foreign view. The caller MUST omit `rev` beside `view`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -867,13 +904,50 @@ pub struct NodesParams {
     pub rev: Option<RevisionId>,
 }
 
-/// The nodes covering one position, with identities derived from their source bytes.
+impl NodesParams {
+    /// A read of the nodes covering `position` in the file at `path`.
+    #[must_use]
+    pub fn at(path: ProjectPath, position: u64) -> Self {
+        Self {
+            path: Some(path),
+            position: Some(position),
+            ..Self::default()
+        }
+    }
+
+    /// A read of every node of `symbol`.
+    #[must_use]
+    pub fn of(symbol: SymbolId) -> Self {
+        Self {
+            symbol: Some(symbol),
+            ..Self::default()
+        }
+    }
+}
+
+/// Most source bytes the nodes of one `nodes` answer carry together. A symbol read stops
+/// before the node that would cross it and returns `node_cursor`; a page always holds at
+/// least one node, whose own size `[providers.syntax] max_file` bounds.
+pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
+
+/// The nodes a read selected, each with its source text and identity derived from its bytes.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_nodes_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
         "nodes": [
+            {
+                "id": "rift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2",
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "file",
+                "range": {
+                    "start": 0,
+                    "end": 356
+                },
+                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
+            },
             {
                 "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
                 "unit": "rift://file/src/config.rs",
@@ -882,11 +956,12 @@ pub struct NodesParams {
                 "range": {
                     "start": 0,
                     "end": 356
-                }
+                },
+                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
             },
             {
                 "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
+                "of": "rift://symbol/local/rust/app/config/load_config",
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "function_item",
@@ -898,23 +973,7 @@ pub struct NodesParams {
                     "start": 218,
                     "end": 355
                 },
-                "regions": [
-                    {
-                        "role": "name",
-                        "range": {
-                            "start": 225,
-                            "end": 236
-                        }
-                    },
-                    {
-                        "role": "body",
-                        "range": {
-                            "start": 281,
-                            "end": 355
-                        }
-                    }
-                ],
-                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"
+                "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
             },
             {
                 "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
@@ -925,7 +984,7 @@ pub struct NodesParams {
                     "start": 281,
                     "end": 355
                 },
-                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
+                "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
             },
             {
                 "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
@@ -939,7 +998,7 @@ pub struct NodesParams {
                     "start": 334,
                     "end": 353
                 },
-                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189"
+                "source": "parse_config(&text)"
             },
             {
                 "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
@@ -950,24 +1009,19 @@ pub struct NodesParams {
                     "start": 334,
                     "end": 346
                 },
-                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690"
+                "source": "parse_config"
             }
-        ],
-        "source": [
-            "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-            "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-            "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-            "parse_config(&text)",
-            "parse_config"
         ]
     }
 ]))]
 pub struct NodesResult {
-    /// Nodes covering the position, outermost first.
+    /// Nodes the read selected, outermost first: per declaration for a `symbol` read, from
+    /// the file node inward for a `position` read.
     pub nodes: Vec<Node>,
-    /// One excerpt per node in `nodes`, in the same order, each spanning that node's own
-    /// range. Empty when `nodes` is empty.
-    pub source: Vec<String>,
+    /// Continuation for the rest of a `symbol` read whose nodes crossed the answer's node
+    /// count or source byte bound. Absent when the answer holds the last node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_cursor: Option<String>,
     /// Captured view used for this read, with its original expiry. Absent when the
     /// request did not select a captured view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4193,7 +4247,7 @@ mod captured_nodes_tests {
         };
         let result = NodesResult {
             nodes: Vec::new(),
-            source: Vec::new(),
+            node_cursor: None,
             warnings: Vec::new(),
             view: Some(view.clone()),
         };
@@ -4211,7 +4265,7 @@ mod captured_nodes_tests {
             assert!(serde_json::from_value::<NodesParams>(wire).is_err());
         }
         let legacy: NodesResult =
-            serde_json::from_value(json!({"nodes":[],"source":[]})).expect("legacy result");
+            serde_json::from_value(json!({"nodes":[]})).expect("legacy result");
         assert!(legacy.view.is_none());
         assert!(
             serde_json::to_value(legacy)

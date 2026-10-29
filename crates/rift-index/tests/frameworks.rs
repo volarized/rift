@@ -44,7 +44,12 @@ fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
     assert!(index.text_file(&path).is_none());
     assert!(
         index
-            .nodes(&path, position)
+            .syntax(&path)
+            .map(|document| document.map(|document| document
+                .nodes_at(position)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()))
             .expect("refused source nodes")
             .is_none()
     );
@@ -58,7 +63,12 @@ fn inline_template_aggregate_bound_refuses_partial_workspace_publication() {
     assert_eq!(file.syntax().language().identity_segment(), "typescript");
     assert!(
         accepted
-            .nodes(&path, position)
+            .syntax(&path)
+            .map(|document| document.map(|document| document
+                .nodes_at(position)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()))
             .expect("accepted source nodes")
             .expect("selected source")
             .iter()
@@ -184,7 +194,16 @@ fn angular_workspace_keeps_owned_templates_separate_from_plain_html() {
             let position = u64::try_from(file.source().find("title").expect("inline expression"))
                 .expect("source position");
             let nodes = index
-                .nodes(file.path(), position)
+                .syntax(file.path())
+                .map(|document| {
+                    document.map(|document| {
+                        document
+                            .nodes_at(position)
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                })
                 .expect("inline template nodes")
                 .expect("selected source");
             assert!(nodes.iter().any(|node| node.kind == "interpolation"));

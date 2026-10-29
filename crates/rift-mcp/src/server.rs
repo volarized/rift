@@ -891,9 +891,23 @@ fn nodes_preparing_answer(resolved: &ResolvedWorkspace) -> NodesResult {
     NodesResult {
         view: None,
         nodes: Vec::new(),
-        source: Vec::new(),
+        node_cursor: None,
         warnings: nodes_preparing_warnings(resolved),
     }
+}
+
+/// Refuses a `nodes` symbol this server cannot read: one owned by a package or a runtime,
+/// whose facts the project index does not hold.
+fn refuse_unserved_symbol_owner(symbol: &rift_protocol::read::SymbolId) -> Result<(), ToolFailure> {
+    let identity = rift_protocol::identity::SymbolIdentity::parse(symbol.as_str())
+        .map_err(|error| error.mcp().tool_failure(wire::ErrorPhase::Read))?;
+    if identity.owner().is_local() {
+        return Ok(());
+    }
+    Err(errors::server::read_unsupported()
+        .capability("nodes of package and runtime symbols")
+        .mcp()
+        .tool_failure(wire::ErrorPhase::Read))
 }
 
 fn nodes_preparing_warnings(resolved: &ResolvedWorkspace) -> Vec<ReadWarning> {
@@ -3221,18 +3235,20 @@ impl RiftMcp {
         u32::try_from(self.limits.results_max()).unwrap_or(u32::MAX)
     }
 
-    /// Lists the syntax nodes covering one UTF-8 byte position in one file,
-    /// outermost first. Each node's identity is a digest of its language, kind,
-    /// and bytes, so equal nodes share one identity and an edit elsewhere in the
-    /// file leaves it unchanged; `unit` and `range` locate the node. `rev`
-    /// lists the nodes as of a version-control revision instead of the
-    /// current tree. If discovery is incomplete or a targeted read spends the
-    /// request's remaining time, the result has empty `nodes` and `source` and
-    /// carries `local_index_preparing`. A selected source path can answer
-    /// within that remaining time, with the same warning until the publication
+    /// Lists syntax nodes with their source text, outermost first: every node of one `symbol`
+    /// (each declaration's item node and the descendants that belong to it), or the nodes
+    /// covering one UTF-8 byte `position` in one file, from the file node inward. A symbol
+    /// read is the way to read a declaration's source. Each node's identity is a digest of
+    /// its language, kind, and bytes, so equal nodes share one identity and an edit elsewhere
+    /// in the file leaves it unchanged; `unit` and `range` locate the node, and `of` names the
+    /// symbol a node declares. A symbol read whose nodes cross the answer's node count or
+    /// source byte bound returns `node_cursor` for the rest. Every file has a file node
+    /// spanning it whole, and a file no syntax provider parses answers that node alone. `rev`
+    /// lists the nodes as of a version-control revision instead of the current tree. If
+    /// discovery is incomplete or a targeted read spends the request's remaining time, the
+    /// result has empty `nodes` and carries `local_index_preparing`. A selected source path
+    /// can answer within that remaining time, with the same warning until the publication
     /// records the path: workspace byte and declaration bounds remain unchecked.
-    /// Per-file refusals keep their typed errors. A visible path no syntax
-    /// provider parses refuses `capability_unavailable`, naming the extension.
     #[tool]
     async fn nodes(
         &self,
@@ -3241,42 +3257,52 @@ impl RiftMcp {
         if let Some(view) = &params.view {
             return self.captured_nodes(&params, view).map(Json);
         }
+        if let Some(symbol) = &params.symbol {
+            refuse_unserved_symbol_owner(symbol)?;
+        }
         let rev = params.rev.clone();
         if rev.is_some() {
-            return self.read_at(rev, move |reads| reads.nodes(params)).await;
+            return self.read_at(rev, move |reads| reads.nodes(&params)).await;
         }
         let deadline = self.request_deadline().await;
         let resolved = self
             .published_workspace(wire::ErrorPhase::Read, deadline)
             .await?;
         let preparation = resolved.published.preparation.as_ref();
-        let path = rift_core::ProjectPath::new(params.path.0.clone()).map_err(|error| {
-            errors::server::read_invalid()
-                .field("path")
-                .violation(error.detail())
-                .cause(error)
-                .mcp()
-                .tool_failure(wire::ErrorPhase::Read)
-        })?;
+        let path = params
+            .path
+            .as_ref()
+            .map(|path| rift_core::ProjectPath::new(path.0.clone()))
+            .transpose()
+            .map_err(|error| {
+                errors::server::read_invalid()
+                    .field("path")
+                    .violation(error.detail())
+                    .cause(error)
+                    .mcp()
+                    .tool_failure(wire::ErrorPhase::Read)
+            })?;
         if preparation.is_some_and(|preparation| preparation.total.is_none()) {
             return Ok(Json(nodes_preparing_answer(&resolved)));
         }
         // A complete batch clears `preparation`; retained selected paths therefore carry
         // the warning used by a deadline answer.
-        let selected_source = preparation.is_some_and(|preparation| {
-            preparation
-                .map_source_paths
-                .iter()
-                .any(|(path, _)| path.as_str() == params.path.0)
+        let selected = path.filter(|path| {
+            preparation.is_some_and(|preparation| {
+                preparation
+                    .map_source_paths
+                    .iter()
+                    .any(|(selected, _)| selected.as_str() == path.as_str())
+            })
         });
-        if selected_source && resolved.published.reads.file_record(&path).is_none() {
+        if selected.is_some_and(|path| resolved.published.reads.file_record(&path).is_none()) {
             return self
                 .targeted_nodes_read(&resolved, deadline, move |reads| {
-                    reads.nodes_for_preparation(params)
+                    reads.nodes_for_preparation(&params)
                 })
                 .await;
         }
-        self.current_tree_read(&resolved, false, move |reads| reads.nodes(params))
+        self.current_tree_read(&resolved, false, move |reads| reads.nodes(&params))
             .await
     }
 
@@ -5109,7 +5135,7 @@ done
     fn cold_nodes(
         root: &std::path::Path,
         configuration: &crate::validation::ConfigurationState,
-        params: NodesParams,
+        params: &NodesParams,
     ) -> TestResult<NodesResult> {
         let limits = configuration.index_limits(WorkspaceIndexLimits::default())?;
         let visibility = configuration.source_visibility();
@@ -5243,7 +5269,6 @@ done
         crate::validation::prepare_initial_workspace_from(&assembled.context, initial).await?;
         let complete_nodes = served_nodes(&client, "src/lib.rs").await?;
         assert_eq!(nodes.nodes, complete_nodes.nodes);
-        assert_eq!(nodes.source, complete_nodes.source);
         assert!(complete_nodes.warnings.is_empty());
         let answer = client.call_tool(request).await?;
         let complete: SearchResult = serde_json::from_value(
@@ -5449,7 +5474,6 @@ done
         let params: NodesParams = serde_json::from_value(json!({"path": "b.rs", "position": 8}))?;
         let answer = assembled.server.nodes(Parameters(params.clone())).await?.0;
         assert!(!answer.nodes.is_empty());
-        assert_eq!(answer.nodes.len(), answer.source.len());
         assert!(answer.warnings.iter().any(|warning| matches!(
             warning,
             ReadWarning::LocalIndexPreparing {
@@ -5507,7 +5531,7 @@ done
         let configuration = published.configuration.clone();
         let params: NodesParams =
             serde_json::from_value(json!({"path": "src/lib.rs", "position": 8}))?;
-        let expected = cold_nodes(directory.path(), &configuration, params.clone())?;
+        let expected = cold_nodes(directory.path(), &configuration, &params)?;
         server.force_capture(|current| {
             Ok((
                 current.reads.workspace_digests(),
@@ -5595,7 +5619,7 @@ done
                 RequestDeadline::starting(Duration::from_millis(20)),
                 {
                     let params = params.clone();
-                    move |reads| reads.nodes_for_preparation(params)
+                    move |reads| reads.nodes_for_preparation(&params)
                 },
             )
             .await?
@@ -5605,9 +5629,30 @@ done
         Ok(())
     }
 
+    #[test]
+    fn nodes_of_a_package_symbol_refuse_and_project_symbols_pass() {
+        let package = rift_protocol::read::SymbolId(
+            "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon".to_owned(),
+        );
+        let refused = super::refuse_unserved_symbol_owner(&package);
+        assert!(
+            matches!(
+                &refused,
+                Err(super::ToolFailure::Registered(failure, _))
+                    if failure.registered().slug() == errors::server::read_unsupported::SLUG
+            ),
+            "{refused:?}"
+        );
+        let project =
+            rift_protocol::read::SymbolId("rift://symbol/local@sdk/rust/app/beacon".to_owned());
+        assert!(super::refuse_unserved_symbol_owner(&project).is_ok());
+        let malformed = rift_protocol::read::SymbolId("rift://symbol/".to_owned());
+        assert!(super::refuse_unserved_symbol_owner(&malformed).is_err());
+    }
+
     fn assert_empty_preparing_nodes(answer: &NodesResult, prepared: u64, total: Option<u64>) {
         assert!(answer.nodes.is_empty());
-        assert!(answer.source.is_empty());
+        assert_eq!(answer.node_cursor, None);
         assert!(answer.warnings.iter().any(|warning| matches!(
             warning,
             ReadWarning::LocalIndexPreparing {
@@ -5642,7 +5687,7 @@ done
                     release_rx
                         .recv_timeout(Duration::from_secs(5))
                         .expect("test releases admitted work");
-                    reads.nodes_for_preparation(params)
+                    reads.nodes_for_preparation(&params)
                 })
                 .await
         });

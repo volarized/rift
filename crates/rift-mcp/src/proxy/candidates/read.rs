@@ -23,6 +23,7 @@ impl RiftProxy {
                 self.captured_traversal(request).await
             }
             "search" if !arguments.contains_key("view") => self.project_search(request).await,
+            "nodes" if !arguments.contains_key("view") => self.project_nodes(request).await,
             _ => self.held_read(request).await,
         }
     }
@@ -182,8 +183,35 @@ impl RiftProxy {
         let Some(name) = super::super::identity::scope_key(&params.scope) else {
             return Ok(None);
         };
+        self.project_read(request, &name).await.map(Some)
+    }
+
+    /// Reads the nodes of a symbol an accepted extra project or profile owns from that
+    /// project's own server, which knows the symbol under its `local` owner.
+    async fn project_nodes(
+        &self,
+        request: &CallToolRequestParams,
+    ) -> Result<Option<Result<CallToolResponse, rmcp::ErrorData>>, RiftError> {
+        let arguments = request.arguments.clone().unwrap_or_default();
+        let Some(symbol) = arguments.get("symbol").and_then(serde_json::Value::as_str) else {
+            return Ok(None);
+        };
+        let owner = SymbolIdentity::parse(symbol)?.owner().clone();
+        let Some(name) = super::super::identity::backend_key(&owner) else {
+            return Ok(None);
+        };
+        self.project_read(request, &name).await.map(Some)
+    }
+
+    /// Forwards one read to the backend `request` selects with its identities dispatched to
+    /// that backend, and qualifies the identities of the answer with `name` again.
+    async fn project_read(
+        &self,
+        request: &CallToolRequestParams,
+        name: &str,
+    ) -> Result<Result<CallToolResponse, rmcp::ErrorData>, RiftError> {
         let backend = self.call_backend(request)?;
-        let upstream = dispatch_read_request(request, &name)?;
+        let upstream = dispatch_read_request(request, name)?;
         let mut response = backend.forward_read(upstream).await?;
         if let Ok(CallToolResponse::Complete(result)) = &response
             && result.is_error != Some(true)
@@ -193,16 +221,16 @@ impl RiftProxy {
             let value = result.structured_content.clone().ok_or_else(|| {
                 invalid(
                     "structuredContent",
-                    "search response has no structured result",
+                    "project response has no structured result",
                 )
             })?;
             let meta = result.meta.clone();
-            response = qualified_read_response(request, value, &name)?;
+            response = qualified_read_response(request, value, name)?;
             if let Ok(CallToolResponse::Complete(answered)) = &mut response {
                 answered.meta = meta;
             }
         }
-        Ok(Some(response))
+        Ok(response)
     }
 
     async fn capture_project_search(
@@ -275,6 +303,7 @@ impl RiftProxy {
         })?;
         let owner = arguments
             .get("id")
+            .or_else(|| arguments.get("symbol"))
             .and_then(serde_json::Value::as_str)
             .or_else(|| {
                 arguments
@@ -384,10 +413,13 @@ impl RiftProxy {
     }
 }
 
-fn dispatch_read_request(
+pub(in crate::proxy) fn dispatch_read_request(
     request: &CallToolRequestParams,
     backend: &str,
 ) -> Result<CallToolRequestParams, RiftError> {
+    if request.name == "nodes" {
+        return dispatch_nodes_request(request, backend);
+    }
     if request.name != "search" {
         return Ok(request.clone());
     }
@@ -416,6 +448,36 @@ fn dispatch_read_request(
             .as_object()
             .cloned()
             .ok_or_else(|| invalid("arguments", "search request is not an object"))?,
+    );
+    Ok(upstream)
+}
+
+/// `request` with its `symbol` dispatched to `backend`'s own `local` owner.
+fn dispatch_nodes_request(
+    request: &CallToolRequestParams,
+    backend: &str,
+) -> Result<CallToolRequestParams, RiftError> {
+    let mut params: rift_protocol::read::NodesParams = serde_json::from_value(
+        request.arguments.clone().unwrap_or_default().into(),
+    )
+    .map_err(|source| {
+        errors::mcp::parameter_invalid()
+            .tool("nodes")
+            .field("arguments")
+            .accepted(source.to_string())
+            .error()
+    })?;
+    if let Some(symbol) = &mut params.symbol {
+        *symbol = super::super::identity::dispatch_id(symbol, backend)?;
+    }
+    let value = serde_json::to_value(params)
+        .map_err(|source| errors::mcp::forward_failed().source(source).error())?;
+    let mut upstream = request.clone();
+    upstream.arguments = Some(
+        value
+            .as_object()
+            .cloned()
+            .ok_or_else(|| invalid("arguments", "nodes request is not an object"))?,
     );
     Ok(upstream)
 }

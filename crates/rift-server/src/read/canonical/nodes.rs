@@ -1,12 +1,15 @@
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::SystemTime;
 
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolOwner;
-use rift_protocol::read::{Extensions, Node, NodesParams, NodesResult, SymbolId};
+use rift_protocol::read::{NodesParams, NodesResult, SymbolId};
 use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 
+use super::super::nodes::{
+    NodesPage, NodesSelector, PageBounds, declared_syntax, file_node, located_node, symbol_page,
+    text_file_node,
+};
 use super::{CapturedMetadata, LocalSymbolMaterial, LocalSymbolViews, invalid, material_error};
 
 impl LocalSymbolViews {
@@ -48,51 +51,75 @@ impl LocalSymbolMaterial {
         &self,
         request: &NodesParams,
     ) -> Result<Result<NodesResult, SymbolUnavailableReason>, RiftError> {
-        let path = rift_core::ProjectPath::new(&request.path.0)?;
-        let Some(file) = self.index.file(&path) else {
-            return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
-        };
-        if request.position >= u64::try_from(file.source().len()).unwrap_or(u64::MAX) {
-            return Err(invalid(
-                "position",
-                "position must be inside captured source",
-            ));
-        }
-        let Some(matched) = self.index.nodes(&path, request.position)? else {
-            return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
-        };
         let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
-        let nodes = matched
-            .iter()
-            .map(|node| {
-                let language = file.syntax().language();
-                Node {
-                    id: super::super::node_id(file, node.range, node.kind),
-                    symbol: self
-                        .index
-                        .symbol_identity(&path, node.range)
-                        .map(|identity| SymbolId(identity.as_str().to_owned())),
-                    unit: super::super::file_id(file.path()),
-                    language: language.clone(),
-                    kind: super::super::wire_kind(node.kind),
-                    facets: super::super::language_provider(language).node_facets(node.kind),
-                    range: super::super::text_range(node.range),
-                    regions: Vec::new(),
-                    parent: None,
-                    extensions: Extensions(BTreeMap::new()),
+        let view = request.view.as_ref().map_or("", CapturedViewId::as_str);
+        let answer = match NodesSelector::of(request, view)? {
+            NodesSelector::Position { path, position } => self.position_nodes(&path, position)?,
+            NodesSelector::Symbol { id, key, offset } => {
+                let results_max = self.index.results_max();
+                let (declarations, _) =
+                    self.index.symbols_by_identity_page(&key, 0, results_max)?;
+                if declarations.is_empty() {
+                    return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
                 }
-            })
-            .collect();
-        let source = matched
-            .iter()
-            .map(|node| super::super::excerpt(file, node.range))
-            .collect();
-        Ok(Ok(NodesResult {
-            nodes,
-            source,
+                Ok(symbol_page(
+                    &declarations,
+                    |path| declared_syntax(path, self.index.syntax(path)),
+                    (id, view),
+                    offset,
+                    PageBounds::served(results_max),
+                )?)
+            }
+        };
+        Ok(answer.map(|page| NodesResult {
+            nodes: page.nodes,
+            node_cursor: page.node_cursor,
             view: None,
             warnings: metadata.warnings,
         }))
     }
+
+    /// The captured nodes covering `position`, from the file node inward.
+    fn position_nodes(
+        &self,
+        path: &rift_core::ProjectPath,
+        position: u64,
+    ) -> Result<Result<NodesPage, SymbolUnavailableReason>, RiftError> {
+        let Some(file) = self.index.file(path) else {
+            let Some(text) = self.index.source(path) else {
+                return Ok(Err(SymbolUnavailableReason::InsufficientCoverage));
+            };
+            inside(text, position)?;
+            return Ok(Ok(NodesPage {
+                nodes: vec![text_file_node(path, text)],
+                node_cursor: None,
+            }));
+        };
+        inside(file.source(), position)?;
+        let document = declared_syntax(path, self.index.syntax(path))?;
+        let mut nodes = vec![file_node(file)];
+        nodes.extend(document.nodes_at(position).into_iter().map(|node| {
+            let of = self
+                .index
+                .symbol_identity(path, node.range)
+                .map(|identity| SymbolId(identity.as_str().to_owned()));
+            located_node(file, node.kind, node.range, of)
+        }));
+        Ok(Ok(NodesPage {
+            nodes,
+            node_cursor: None,
+        }))
+    }
+}
+
+/// Refuses a `position` at or past the captured source's byte length.
+fn inside(source: &str, position: u64) -> Result<(), RiftError> {
+    if position >= u64::try_from(source.len()).unwrap_or(u64::MAX) {
+        return Err(invalid(
+            "position",
+            "position must be inside captured source",
+        ));
+    }
+    Ok(())
 }

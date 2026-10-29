@@ -650,10 +650,11 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
         .expect("admission")
         .expect("view");
     let node_request = rift_protocol::read::NodesParams {
-        path: rift_protocol::read::ProjectPath("index.js".to_owned()),
-        position: 40,
         view: Some(view.id.clone()),
-        rev: None,
+        ..rift_protocol::read::NodesParams::at(
+            rift_protocol::read::ProjectPath("index.js".to_owned()),
+            40,
+        )
     };
     let nodes = store
         .nodes(
@@ -671,10 +672,10 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
             .0
             .nodes
             .iter()
-            .any(|node| node.symbol.as_ref() == Some(&id))
+            .any(|node| node.of.as_ref() == Some(&id))
     );
     assert_eq!(
-        nodes.0.source.first().map(String::as_str),
+        nodes.0.nodes.first().map(|node| node.source.as_str()),
         Some(
             reads
                 .index
@@ -712,10 +713,11 @@ fn captured_nodes_refuse_foreign_selection_and_invalid_positions() {
         .expect("admission")
         .expect("view");
     let nodes = rift_protocol::read::NodesParams {
-        path: rift_protocol::read::ProjectPath("index.js".to_owned()),
-        position: u64::MAX,
         view: Some(view.id.clone()),
-        rev: None,
+        ..rift_protocol::read::NodesParams::at(
+            rift_protocol::read::ProjectPath("index.js".to_owned()),
+            u64::MAX,
+        )
     };
     assert!(
         store
@@ -801,11 +803,11 @@ fn captured_nodes_keep_inline_framework_after_current_source_changes() {
     let store = LocalSymbolViews::new(1 << 20, [19; 32]);
     let view = store.capture(input).expect("capture").expect("admission");
     let request = rift_protocol::read::NodesParams {
-        path: rift_protocol::read::ProjectPath("component.ts".to_owned()),
-        position: u64::try_from(original.find("title").expect("template position"))
-            .expect("position"),
         view: Some(view.id.clone()),
-        rev: None,
+        ..rift_protocol::read::NodesParams::at(
+            rift_protocol::read::ProjectPath("component.ts".to_owned()),
+            u64::try_from(original.find("title").expect("template position")).expect("position"),
+        )
     };
     let captured = store
         .nodes(&request, &view.id, reads.index.root(), reads.index.owner())
@@ -822,9 +824,9 @@ fn captured_nodes_keep_inline_framework_after_current_source_changes() {
     assert!(
         captured
             .0
-            .source
+            .nodes
             .iter()
-            .any(|source| source.contains("title"))
+            .any(|node| node.source.contains("title"))
     );
     std::fs::write(
         directory.path().join("component.ts"),
@@ -1576,4 +1578,125 @@ fn assert_measured_held_source(
             .expect("held original source"),
         original
     );
+}
+
+/// A captured view over a workspace holding one JavaScript function and one text file, and
+/// the function's identity.
+fn text_and_symbol_view() -> (
+    tempfile::TempDir,
+    Arc<ReadService>,
+    LocalSymbolViews,
+    CapturedView,
+    SymbolId,
+) {
+    let directory = tempfile::tempdir().expect("workspace");
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#,
+    )
+    .expect("captured metadata");
+    std::fs::write(
+        directory.path().join("index.js"),
+        "export function open(path) {\n  return path;\n}\n",
+    )
+    .expect("implementation");
+    std::fs::write(directory.path().join("notes.txt"), "beacon notes\n").expect("text");
+    let reads = Arc::new(
+        ReadService::build(
+            directory.path(),
+            WorkspaceIndexLimits::default(),
+            &SourceVisibility::default(),
+            &TextFileInclusion::default(),
+            HistoryConfiguration::default(),
+        )
+        .expect("captured index"),
+    );
+    let matched = reads.index.symbols("open", 1).expect("declaration")[0];
+    let id = SymbolId(
+        reads
+            .index
+            .assembled_symbol(matched)
+            .expect("assembled object")
+            .identity()
+            .expect("canonical identity")
+            .as_str()
+            .to_owned(),
+    );
+    let store = LocalSymbolViews::new(1 << 20, [17; 32]);
+    let view = store
+        .capture(captured_input(&reads))
+        .expect("admission")
+        .expect("view");
+    (directory, reads, store, view, id)
+}
+
+/// The captured nodes `request` reads, or the reason the view refuses them.
+fn captured_read(
+    reads: &ReadService,
+    store: &LocalSymbolViews,
+    view: &CapturedView,
+    request: rift_protocol::read::NodesParams,
+) -> Result<rift_protocol::read::NodesResult, SymbolUnavailableReason> {
+    let request = rift_protocol::read::NodesParams {
+        view: Some(view.id.clone()),
+        ..request
+    };
+    store
+        .nodes(&request, &view.id, reads.index.root(), reads.index.owner())
+        .expect("node read")
+        .map(|(nodes, _)| nodes)
+}
+
+#[test]
+fn captured_nodes_list_a_symbol_and_the_file_node_of_a_text_file() {
+    let (_directory, reads, store, view, id) = text_and_symbol_view();
+
+    let symbol = captured_read(
+        &reads,
+        &store,
+        &view,
+        rift_protocol::read::NodesParams::of(id.clone()),
+    )
+    .expect("captured symbol nodes");
+    let text = captured_read(
+        &reads,
+        &store,
+        &view,
+        rift_protocol::read::NodesParams::at(
+            rift_protocol::read::ProjectPath("notes.txt".to_owned()),
+            3,
+        ),
+    )
+    .expect("captured text nodes");
+
+    assert_eq!(symbol.nodes[0].of.as_ref(), Some(&id));
+    assert!(symbol.nodes[0].source.contains("function open(path)"));
+    assert!(
+        symbol
+            .nodes
+            .iter()
+            .any(|node| node.source == "return path;")
+    );
+    assert_eq!(symbol.node_cursor, None);
+    assert_eq!(text.nodes.len(), 1);
+    assert_eq!(text.nodes[0].kind.0, "file");
+    assert_eq!(text.nodes[0].source, "beacon notes\n");
+}
+
+#[test]
+fn captured_nodes_refuse_an_absent_symbol_and_an_absent_file_as_uncovered() {
+    let (_directory, reads, store, view, _id) = text_and_symbol_view();
+    let absent =
+        rift_protocol::read::SymbolId("rift://symbol/local/javascript/beacon/absent".to_owned());
+    let missing = rift_protocol::read::NodesParams::at(
+        rift_protocol::read::ProjectPath("absent.txt".to_owned()),
+        0,
+    );
+
+    for request in [rift_protocol::read::NodesParams::of(absent), missing] {
+        assert_eq!(
+            captured_read(&reads, &store, &view, request).err(),
+            Some(SymbolUnavailableReason::InsufficientCoverage)
+        );
+    }
 }

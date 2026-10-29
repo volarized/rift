@@ -103,19 +103,16 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
         );
 
         let position = u64::try_from(source.find("灯").ok_or("Unicode source")?)?;
-        let nodes = service.nodes(NodesParams {
-            view: None,
-            path: rift_protocol::read::ProjectPath("component.ts".to_owned()),
+        let nodes = service.nodes(&NodesParams::at(
+            rift_protocol::read::ProjectPath("component.ts".to_owned()),
             position,
-            rev: None,
-        })?;
+        ))?;
         assert!(!nodes.nodes.is_empty());
-        assert_eq!(nodes.nodes.len(), nodes.source.len());
-        for (node, excerpt) in nodes.nodes.iter().zip(&nodes.source) {
+        for node in &nodes.nodes {
             assert_eq!(node.language.identity_segment(), "typescript");
             let start = usize::try_from(node.range.start)?;
             let end = usize::try_from(node.range.end)?;
-            assert_eq!(excerpt, &source[start..end]);
+            assert_eq!(node.source, source[start..end]);
         }
         assert!(nodes.warnings.iter().any(|warning| matches!(
             warning,
@@ -125,18 +122,16 @@ fn unresolved_angular_template_urls_keep_source_nodes_and_path_owned_warnings() 
                 detail,
             } if unit.0 == "rift://file/component.ts" && !detail.is_empty()
         )));
-        let plain_nodes = service.nodes(NodesParams {
-            view: None,
-            path: rift_protocol::read::ProjectPath("view.html".to_owned()),
-            position: u64::try_from(plain.find("灯").ok_or("plain Unicode source")?)?,
-            rev: None,
-        })?;
+        let plain_nodes = service.nodes(&NodesParams::at(
+            rift_protocol::read::ProjectPath("view.html".to_owned()),
+            u64::try_from(plain.find("灯").ok_or("plain Unicode source")?)?,
+        ))?;
         assert!(!plain_nodes.nodes.is_empty());
-        for (node, excerpt) in plain_nodes.nodes.iter().zip(&plain_nodes.source) {
+        for node in &plain_nodes.nodes {
             assert_eq!(node.language.identity_segment(), "html");
             let start = usize::try_from(node.range.start)?;
             let end = usize::try_from(node.range.end)?;
-            assert_eq!(excerpt, &plain[start..end]);
+            assert_eq!(node.source, plain[start..end]);
         }
         assert!(
             !plain_nodes

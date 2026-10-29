@@ -1,4 +1,5 @@
-//! Text of a `nodes` answer: one item per node, the innermost source last, then the warnings.
+//! Text of a `nodes` answer: one item per node, the written sources, the cursor, then the
+//! warnings.
 
 use rift_protocol::read::{Node, NodeFacet, NodeRegion, NodesResult};
 
@@ -7,34 +8,31 @@ use super::layout::{self, Lines};
 use super::warning;
 use crate::output::text::{TextError, TextWriter};
 
-/// The failure of an answer whose `nodes` and `source` differ in length.
-const NODE_EXCERPT_MISSING: TextError = TextError::Unsupported("nodes and source differ in length");
 /// Noun counted by the title of a `nodes` answer.
 const NODE_NOUN: &str = "node";
 
-/// Writes the nodes section, the innermost excerpt, and the warnings section.
+/// Writes the nodes section, the written sources, the cursor, and the warnings section.
 ///
-/// Each outer excerpt holds the inner ones, so only the innermost excerpt is written: it carries
-/// the source of all of them.
+/// An outer node's source holds the sources of the nodes inside it, so the text writes each
+/// source once: an answer opening with a node that declares a symbol, as a symbol read does,
+/// writes the source of each node no earlier node encloses, one per declaration; any other
+/// answer, as a position read, writes its innermost node's source.
 pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), TextError> {
     let NodesResult {
         nodes,
-        source,
+        node_cursor,
         view,
         warnings,
     } = result;
-    if nodes.len() != source.len() {
-        return Err(NODE_EXCERPT_MISSING);
-    }
     layout::title(out, nodes.len(), NODE_NOUN, None)?;
-    let pairs: Vec<(&Node, &String)> = nodes.iter().zip(source).collect();
-    layout::items(out, &pairs, |lines, (node, excerpt)| {
-        entry(lines, node, excerpt)
-    })?;
-    if let Some(innermost) = source.last() {
-        let mut lines = Lines::after_last(out, nodes.len());
+    layout::items(out, nodes, entry)?;
+    let mut lines = Lines::after_last(out, nodes.len());
+    for node in written(nodes) {
         lines.blank()?;
-        lines.verbatim(0, innermost)?;
+        lines.verbatim(0, &node.source)?;
+    }
+    if let Some(cursor) = node_cursor {
+        out.raw_line(0, &format!("node_cursor {cursor}"))?;
     }
     warning::section(out, warnings)?;
     if let Some(view) = view {
@@ -46,24 +44,49 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
     Ok(())
 }
 
+/// The nodes whose source the text writes, in answer order.
+fn written(nodes: &[Node]) -> Vec<&Node> {
+    match nodes {
+        [first, ..] if first.of.is_some() => {
+            let mut outermost: Vec<&Node> = Vec::new();
+            for node in nodes {
+                if !outermost.iter().any(|outer| encloses(outer, node)) {
+                    outermost.push(node);
+                }
+            }
+            outermost
+        }
+        [.., innermost] => vec![innermost],
+        [] => Vec::new(),
+    }
+}
+
+/// Whether `outer` spans `inner` within the same unit.
+fn encloses(outer: &Node, inner: &Node) -> bool {
+    outer.unit == inner.unit
+        && outer.range.start <= inner.range.start
+        && inner.range.end <= outer.range.end
+}
+
 /// Writes one node: kind and facts, byte range, identity, symbol, and regions. The identity is
 /// a content digest that equal nodes share, so the range is what places this one.
-fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextError> {
+fn entry(lines: &mut Lines<'_>, node: &Node) -> Result<(), TextError> {
     let Node {
         id,
-        symbol,
+        of,
         unit: _,
         language: _,
         kind,
         facets,
         range,
+        source,
         regions,
         parent: _,
         extensions: _,
     } = node;
     let mut facts = Facts::default();
     facts.push_value(&kind.0);
-    let count = excerpt.lines().count();
+    let count = source.lines().count();
     if count > 1 {
         facts.push(&format!("{count} lines"));
     }
@@ -76,7 +99,7 @@ fn entry(lines: &mut Lines<'_>, node: &Node, excerpt: &str) -> Result<(), TextEr
     lines.head(facts.as_str())?;
     lines.line(0, &format!("{}..{}", range.start, range.end))?;
     lines.line(0, &id.0)?;
-    if let Some(symbol) = symbol {
+    if let Some(symbol) = of {
         lines.line(0, &symbol.0)?;
     }
     lines.line(0, &regions_fact(regions)?)

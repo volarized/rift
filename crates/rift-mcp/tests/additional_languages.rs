@@ -7,11 +7,10 @@ mod hermetic_search;
 )]
 mod workspace_client;
 
-use rift_protocol::error::ErrorCode;
 use serde_json::{Value, json};
 use workspace_client::{
-    TestResult, call_retrying_acceptance, failed_call, search_after_population,
-    served_relative_workspace, tool_request,
+    TestResult, call_retrying_acceptance, search_after_population, served_relative_workspace,
+    tool_request,
 };
 
 type Client = rmcp::service::RunningService<rmcp::RoleClient, ()>;
@@ -132,16 +131,14 @@ async fn workspace_discovers_native_web_and_explicit_template_languages() -> Tes
             assert_workspace_symbol(&client, case, name).await?;
         }
     }
-    let failure = failed_call(
-        client
-            .call_tool(tool_request(
-                "nodes",
-                &json!({"path":"unknown.beacon", "position":0}),
-            ))
-            .await,
-    )?;
-    assert_eq!(failure.code, ErrorCode::CapabilityUnavailable);
-    assert!(failure.message.contains("beacon"), "{}", failure.message);
+    let unknown = call_retrying_acceptance(
+        &client,
+        tool_request("nodes", &json!({"path":"unknown.beacon", "position":0})),
+    )
+    .await?;
+    assert_eq!(unknown["nodes"][0]["kind"], "file", "{unknown}");
+    assert_eq!(unknown["nodes"][0]["language"], "text", "{unknown}");
+    assert_eq!(unknown["nodes"][0]["source"], "unsupported_beacon 灯");
     client.cancel().await?;
     server_task.await?;
     Ok(())
@@ -161,8 +158,8 @@ async fn assert_workspace_nodes(client: &Client, case: &SourceCase) -> TestResul
         case.path
     );
     assert_eq!(
-        output["source"][0], case.text,
-        "{}: original source",
+        nodes[0]["source"], case.text,
+        "{}: the file node carries the original source",
         case.path
     );
     Ok(())
@@ -266,20 +263,17 @@ async fn assert_workspace_symbol_node(
     .await?;
     assert_eq!(output["view"], hit["view"], "original captured view");
     let nodes = output["nodes"].as_array().ok_or("nodes array")?;
-    let sources = output["source"].as_array().ok_or("node source array")?;
-    assert_eq!(nodes.len(), sources.len(), "one original source per node");
     let start = u64::try_from(start)?;
     let end = u64::try_from(end)?;
-    let (index, node) = nodes
+    let node = nodes
         .iter()
-        .enumerate()
-        .filter(|(_, node)| {
+        .filter(|node| {
             node["range"]["start"]
                 .as_u64()
                 .is_some_and(|node_start| node_start >= start && node_start <= position)
                 && node["range"]["end"] == end
         })
-        .max_by_key(|(_, node)| node["range"]["start"].as_u64())
+        .max_by_key(|node| node["range"]["start"].as_u64())
         .ok_or_else(|| format!("{name} declaration node: {output}"))?;
     assert!(
         node["id"].is_string(),
@@ -289,7 +283,7 @@ async fn assert_workspace_symbol_node(
     let node_start = usize::try_from(node["range"]["start"].as_u64().ok_or("node start")?)?;
     let node_end = usize::try_from(end)?;
     assert_eq!(
-        sources[index],
+        node["source"],
         Value::from(&case.text[node_start..node_end])
     );
     Ok(())
