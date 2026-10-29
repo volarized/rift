@@ -796,12 +796,22 @@ class Corpus:
             require(0 <= start < end <= len(content), "symbol range exceeds source")
             # Declarations can start with attached comments or attributes. Extraction
             # keeps their end equal to the item end, so its final byte is in the item.
-            answer = await client.call(
-                "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
-            )
+            request: JsonObject = {
+                "path": str(path.relative_to(self.root)),
+                "position": end - 1,
+            }
+            answer = await client.call("nodes", request)
             unit = f"rift://file/{path.relative_to(self.root).as_posix()}"
             nodes = objects(answer, "nodes")
             require(bool(nodes), f"nodes listed nothing at {path}:{end - 1}")
+            if identity is None:
+                cursor = answer.get("node_cursor")
+                for _ in range(NODE_PAGES_MAX):
+                    if cursor is None:
+                        break
+                    page = await client.call("nodes", {**request, "node_cursor": cursor})
+                    nodes = nodes + objects(page, "nodes")
+                    cursor = page.get("node_cursor")
             if answer.get("symbol") is None:
                 require(
                     nodes[0].get("kind") == "file"
