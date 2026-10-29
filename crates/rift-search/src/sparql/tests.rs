@@ -522,44 +522,95 @@ fn test_graph_dataset_evaluate_refuses_string_past_expression_bound() {
     );
 }
 
-#[test]
-fn test_graph_query_parse_refuses_nesting_past_bound_and_survives_it() {
-    let limits = GraphLimits::default();
-    let nested = |depth: usize| {
-        let (open, close) = ("(".repeat(depth - 2), ")".repeat(depth - 2));
-        format!("SELECT ?x {{ BIND({open}1{close} AS ?x) }}")
-    };
-    let deepest = nested(limits.nesting_depth_max());
-    let dataset = GraphDataset::builder(limits).build();
-    assert_eq!(rows(&dataset, &deepest), vec![vec!["1".to_owned()]]);
-    let error = GraphQuery::parse(&nested(limits.nesting_depth_max() + 1), &limits)
-        .expect_err("one level too deep");
-    assert_eq!(error.slug(), errors::search::query_nesting_limit::SLUG);
-    let shallow = GraphLimits::builder()
-        .nesting_depth_max(2)
-        .build()
-        .expect("nonzero");
-    let quoted =
-        "ASK { FILTER(\"((\" != '''[[''' && <urn:a(b)> != <urn:c> && 1 < 2 && 2 > 1) } # (((";
-    assert!(
-        GraphQuery::parse(quoted, &shallow).is_ok(),
-        "brackets in literals, IRIs and comments count nothing"
+fn structure_refusal(text: &str, limits: &GraphLimits) -> String {
+    let error = GraphQuery::parse(text, limits).expect_err("the structure passes its bound");
+    assert_eq!(
+        error.slug(),
+        errors::search::query_structure_limit::SLUG,
+        "{error}"
     );
+    error.to_string()
 }
 
 #[test]
-fn test_graph_query_parse_survives_nesting_and_operators_at_their_bounds() {
+fn test_graph_query_parse_survives_brackets_and_operators_at_their_bounds() {
     let limits = GraphLimits::default();
-    let open = "(".repeat(limits.nesting_depth_max() - 2);
-    let close = ")".repeat(limits.nesting_depth_max() - 2);
+    let open = "(".repeat(limits.brackets_max() - 2);
+    let close = ")".repeat(limits.brackets_max() - 2);
     let chain = "+1".repeat(limits.operators_max());
     let text = format!("SELECT ?x {{ BIND({open}1{chain}{close} AS ?x) }}");
     let dataset = GraphDataset::builder(limits).build();
     let expected = (limits.operators_max() + 1).to_string();
     assert_eq!(rows(&dataset, &text), vec![vec![expected]]);
-    let past = format!("SELECT ?x {{ BIND(1{chain}+1 AS ?x) }}");
-    let error = GraphQuery::parse(&past, &limits).expect_err("one operator too many");
-    assert_eq!(error.slug(), errors::search::query_operator_limit::SLUG);
+    let deeper = format!("SELECT ?x {{ BIND(({open}1{close}) AS ?x) }}");
+    assert!(structure_refusal(&deeper, &limits).contains("opening brackets"));
+    let longer = format!("SELECT ?x {{ BIND(1{chain}+1 AS ?x) }}");
+    assert!(structure_refusal(&longer, &limits).contains("operator characters"));
+}
+
+#[test]
+fn test_graph_query_parse_counts_brackets_wherever_written() {
+    let limits = GraphLimits::default();
+    let (open, close) = ("(".repeat(5000), ")".repeat(5000));
+    let shapes = [
+        format!("ASK {{ FILTER(?a<{open}1{close}) }}"),
+        format!("ASK {{ ?s :a\\( ?o FILTER({open}1{close}) }}"),
+        format!("ASK {{ ?s <urn:a'b> ?o FILTER({open}1{close}) }}"),
+        format!("ASK {{ ?s :a\\# ?o FILTER({open}1{close}) }}"),
+        format!("ASK {{ FILTER(\"{close}\" = {open}1{close}) }}"),
+    ];
+    for text in &shapes {
+        assert!(
+            structure_refusal(text, &limits).contains("opening brackets"),
+            "{text:.40}"
+        );
+    }
+    let tight = GraphLimits::builder()
+        .brackets_max(3)
+        .build()
+        .expect("nonzero");
+    assert!(structure_refusal("ASK { FILTER(\"((\" = \"\") }", &tight).contains("4 opening"));
+}
+
+#[test]
+fn test_graph_query_parse_refuses_patterns_past_planner_bound() {
+    let limits = GraphLimits::builder()
+        .patterns_max(2)
+        .build()
+        .expect("nonzero");
+    let two = "SELECT * { ?a :calls ?b . ?b :calls ?c }";
+    assert!(GraphQuery::parse(two, &limits).is_ok(), "two patterns fit");
+    let three = "SELECT * { ?a :calls ?b . ?b :calls ?c FILTER EXISTS { ?c :kind ?k } }";
+    assert!(structure_refusal(three, &limits).contains("3 patterns"));
+}
+
+#[test]
+fn test_graph_dataset_evaluate_refuses_computed_strings_past_total_bound() {
+    let limits = GraphLimits::builder()
+        .computed_bytes_max(64)
+        .build()
+        .expect("nonzero");
+    let dataset = GraphDataset::builder(limits).build();
+    let rows_of_ten: Vec<String> = (0..10).map(|row| format!("\"{row:010}\"")).collect();
+    let many = format!(
+        "SELECT ?y {{ VALUES ?v {{ {} }} BIND(CONCAT(?v, ?v) AS ?y) }}",
+        rows_of_ten.join(" ")
+    );
+    let error = answer(&dataset, &many).expect_err("ten values of twenty bytes pass 64 together");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(
+        error.to_string().contains("computed string bytes"),
+        "{error}"
+    );
+    let few = format!(
+        "SELECT ?y {{ VALUES ?v {{ {} }} BIND(CONCAT(?v, ?v) AS ?y) }}",
+        rows_of_ten[..3].join(" ")
+    );
+    assert_eq!(
+        rows(&dataset, &few).len(),
+        3,
+        "three values of twenty bytes fit"
+    );
 }
 
 #[test]

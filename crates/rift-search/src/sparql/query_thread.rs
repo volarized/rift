@@ -9,13 +9,13 @@ use std::time::Duration;
 use rift_error::{RiftError, errors};
 use spareval::CancellationToken;
 
-/// Stack bytes of the query thread, 64 MiB. The parser, the optimizer and the evaluator each
-/// recurse once per bracket level and once per chained operator. A debug build overflowed this
-/// stack parsing a chain of 4,000 `+1` terms and parsed 1,000; the nesting and operator bounds
-/// keep a query well below that, and
-/// `test_graph_query_parse_survives_nesting_and_operators_at_their_bounds` runs both bounds
-/// together on this stack.
-pub(super) const QUERY_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Stack bytes of the query thread, 256 MiB of address space, committed only as touched. The
+/// parser, the optimizer and the evaluator recurse at most once per opening bracket and once per
+/// operator character, and the structure bounds cap both counts. A debug build overflowed a
+/// 64 MiB stack parsing a chain of 4,000 `+1` terms;
+/// `test_graph_query_parse_survives_brackets_and_operators_at_their_bounds` parses and
+/// evaluates both bounds together, nested, on this stack.
+pub(super) const QUERY_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 /// The deadline one evaluation is held to.
 pub(super) struct Watch<'a> {

@@ -110,7 +110,7 @@ impl GraphDataset {
     ) -> Result<GraphAnswer, RiftError> {
         let limits = self.limits();
         let expired = AtomicBool::new(false);
-        let budget = ExpressionBudget::new(limits.expression_bytes_max(), cancellation.0.clone());
+        let budget = ExpressionBudget::new(limits, cancellation.0.clone());
         let watch = Watch {
             timeout: limits.evaluation_timeout(),
             token: &cancellation.0,
@@ -185,7 +185,7 @@ impl Checkpoint<'_> {
         if self.deadline.has_passed() {
             self.expired.store(true, Ordering::Relaxed);
         }
-        if self.expired.load(Ordering::Relaxed) || self.budget.is_crossed() {
+        if self.expired.load(Ordering::Relaxed) || self.budget.crossing().is_some() {
             return Err(Failure::Evaluation(QueryEvaluationError::Cancelled));
         }
         Ok(())
@@ -241,10 +241,10 @@ fn evaluation_failure(
     limits: &GraphLimits,
 ) -> RiftError {
     match error {
-        QueryEvaluationError::Cancelled if budget.is_crossed() => {
+        QueryEvaluationError::Cancelled if let Some((bound, limit)) = budget.crossing() => {
             errors::search::query_answer_limit()
-                .bound("expression bytes")
-                .limit(budget.bytes_max())
+                .bound(bound)
+                .limit(limit)
                 .error()
         }
         QueryEvaluationError::Cancelled if expired.load(Ordering::Relaxed) => {

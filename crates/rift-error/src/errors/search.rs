@@ -160,22 +160,12 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
-    query_nesting_limit,
-    slug = "rift.search.query_nesting_limit",
-    message = "SPARQL query nests brackets {depth} deep, exceeding accepted limit {limit}",
-    action = "flatten the query below {limit} nested brackets and resend the request",
+    query_structure_limit,
+    slug = "rift.search.query_structure_limit",
+    message = "SPARQL query holds {count} {bound}, exceeding accepted limit {limit}",
+    action = "simplify the query below {limit} {bound} and resend the request",
     fields = {
-        depth: required(unsigned),
-        limit: required(unsigned),
-    },
-);
-
-__rift_error_definition!(
-    query_operator_limit,
-    slug = "rift.search.query_operator_limit",
-    message = "SPARQL query writes {count} operator characters, exceeding accepted limit {limit}",
-    action = "split the expression below {limit} operators and resend the request",
-    fields = {
+        bound: required(string),
         count: required(unsigned),
         limit: required(unsigned),
     },

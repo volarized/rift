@@ -837,15 +837,10 @@ message = "SPARQL query of {observed} bytes exceeds accepted limit {limit}"
 action = "shorten the query below {limit} bytes and resend the request"
 fields = { limit = { type = "unsigned" }, observed = { type = "unsigned" } }
 
-[error.search.query_nesting_limit]
-message = "SPARQL query nests brackets {depth} deep, exceeding accepted limit {limit}"
-action = "flatten the query below {limit} nested brackets and resend the request"
-fields = { depth = { type = "unsigned" }, limit = { type = "unsigned" } }
-
-[error.search.query_operator_limit]
-message = "SPARQL query writes {count} operator characters, exceeding accepted limit {limit}"
-action = "split the expression below {limit} operators and resend the request"
-fields = { count = { type = "unsigned" }, limit = { type = "unsigned" } }
+[error.search.query_structure_limit]
+message = "SPARQL query holds {count} {bound}, exceeding accepted limit {limit}"
+action = "simplify the query below {limit} {bound} and resend the request"
+fields = { bound = { type = "string" }, count = { type = "unsigned" }, limit = { type = "unsigned" } }
 
 [error.search.query_syntax_invalid]
 message = "SPARQL query does not parse: {detail}"

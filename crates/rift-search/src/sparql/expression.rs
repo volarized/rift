@@ -8,13 +8,15 @@
 //! function's result is no longer than its arguments.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use oxrdf::vocab::{rdf, xsd};
 use oxrdf::{Literal, NamedNode, Term, Variable};
 use spareval::{AggregateFunctionAccumulator, CancellationToken, QueryEvaluator};
 use spargebra::vocab::sparql;
 use sparopt::algebra::Expression;
+
+use super::limits::GraphLimits;
 
 /// IRI prefix the admitted query renames each `GROUP_CONCAT` to, followed by its index.
 pub(super) const GROUP_CONCAT_PREFIX: &str = "urn:rift:query:groupConcat:";
@@ -39,32 +41,43 @@ const GROWING_FUNCTIONS: [(NamedNode, Growth); 5] = [
     (sparql::LCASE, Growth::Triple),
 ];
 
-/// The string byte bound of one evaluation. Crossing it cancels the evaluation's token and
-/// leaves the crossing recorded for the refusal.
+/// The string byte bounds of one evaluation: each computed value, and every computed value
+/// together, since many rows of values each within the first bound still add up. Crossing
+/// either cancels the evaluation's token and leaves the crossing recorded for the refusal.
 #[derive(Clone)]
 pub(super) struct ExpressionBudget {
     bytes_max: usize,
-    crossed: Arc<AtomicBool>,
+    computed_max: usize,
+    computed: Arc<AtomicUsize>,
+    crossing: Arc<AtomicU8>,
     token: CancellationToken,
 }
 
+/// No bound was crossed.
+const UNCROSSED: u8 = 0;
+/// One value would have passed the value bound.
+const VALUE_CROSSED: u8 = 1;
+/// The values together would have passed the computed bound.
+const COMPUTED_CROSSED: u8 = 2;
+
 impl ExpressionBudget {
-    pub(super) fn new(bytes_max: usize, token: CancellationToken) -> Self {
+    pub(super) fn new(limits: &GraphLimits, token: CancellationToken) -> Self {
         Self {
-            bytes_max,
-            crossed: Arc::new(AtomicBool::new(false)),
+            bytes_max: limits.expression_bytes_max(),
+            computed_max: limits.computed_bytes_max(),
+            computed: Arc::new(AtomicUsize::new(0)),
+            crossing: Arc::new(AtomicU8::new(UNCROSSED)),
             token,
         }
     }
 
-    /// Whether a value would have passed the bound.
-    pub(super) fn is_crossed(&self) -> bool {
-        self.crossed.load(Ordering::Relaxed)
-    }
-
-    /// The bound one string value is held to.
-    pub(super) const fn bytes_max(&self) -> usize {
-        self.bytes_max
+    /// The bound a value crossed and its limit, once one did.
+    pub(super) fn crossing(&self) -> Option<(&'static str, usize)> {
+        match self.crossing.load(Ordering::Relaxed) {
+            VALUE_CROSSED => Some(("expression bytes", self.bytes_max)),
+            COMPUTED_CROSSED => Some(("computed string bytes", self.computed_max)),
+            _ => None,
+        }
     }
 
     /// Registers the bounded functions, and one bounded `GROUP_CONCAT` per separator.
@@ -97,10 +110,11 @@ impl ExpressionBudget {
             })
     }
 
-    /// Calls the built-in `function` when its most bytes fit, through an evaluator without
-    /// overrides.
+    /// Calls the built-in `function` when its most bytes fit both bounds, charging them to the
+    /// evaluation's total first, through an evaluator without overrides.
     fn call(&self, function: &NamedNode, growth: Growth, arguments: &[Term]) -> Option<Term> {
-        if !self.admits(growth.bytes_max(arguments)) {
+        let bytes = growth.bytes_max(arguments);
+        if !self.admits(bytes, bytes) {
             return None;
         }
         let variables: Vec<Variable> = (0..arguments.len())
@@ -118,14 +132,29 @@ impl ExpressionBudget {
         QueryEvaluator::new().evaluate_expression(&call, substitutions)
     }
 
-    /// Admits `bytes`, or records the crossing and cancels the evaluation.
-    fn admits(&self, bytes: usize) -> bool {
-        let fits = bytes <= self.bytes_max;
-        if !fits {
-            self.crossed.store(true, Ordering::Relaxed);
-            self.token.cancel();
-        }
-        fits
+    /// Admits a value of `value` bytes that adds `added` bytes to the evaluation's total, or
+    /// records the crossing and cancels the evaluation.
+    fn admits(&self, value: usize, added: usize) -> bool {
+        let computed = self
+            .computed
+            .fetch_add(added, Ordering::Relaxed)
+            .saturating_add(added);
+        let crossing = if value > self.bytes_max {
+            VALUE_CROSSED
+        } else if computed > self.computed_max {
+            COMPUTED_CROSSED
+        } else {
+            return true;
+        };
+        // The first crossing names the refusal.
+        let _ = self.crossing.compare_exchange(
+            UNCROSSED,
+            crossing,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+        self.token.cancel();
+        false
     }
 }
 
@@ -169,11 +198,11 @@ impl AggregateFunctionAccumulator for GroupConcat {
             }
         };
         let separator = if self.started { &*self.separator } else { "" };
-        let required = concat
-            .len()
-            .saturating_add(separator.len())
-            .saturating_add(value.len());
-        if !self.budget.admits(required) {
+        let added = separator.len().saturating_add(value.len());
+        if !self
+            .budget
+            .admits(concat.len().saturating_add(added), added)
+        {
             self.concat = None;
             return;
         }

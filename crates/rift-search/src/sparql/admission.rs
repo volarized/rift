@@ -10,6 +10,7 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::vocab::sparql;
 
 use super::expression::GROUP_CONCAT_PREFIX;
+use super::limits::GraphLimits;
 use super::query::refused;
 
 /// The feature a join of patterns sharing no variable is refused as.
@@ -26,12 +27,12 @@ enum Visit<'a> {
 ///
 /// spareval's hash join checks no cancellation between the rows it joins in memory, so rows
 /// written inline would join past the deadline: the product of every `VALUES` table's row count
-/// is refused past `inline_rows_max`. Rows read from the dataset reach the token at every read.
+/// is refused past the solution bound. Rows read from the dataset reach the token at every read.
 ///
 /// The walk keeps an explicit stack, so algebra depth never deepens the call stack. Its work
 /// is one step per algebra element, bounded by the query byte bound the parser ran under,
 /// plus one in-scope variable scan of both sides of every join.
-pub(super) fn admit(query: &mut Query, inline_rows_max: usize) -> Result<Vec<String>, RiftError> {
+pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Vec<String>, RiftError> {
     let root = match query {
         Query::Select(select) if select.dataset.is_none() => &mut select.expression,
         Query::Ask(ask) if ask.dataset.is_none() => &mut ask.expression,
@@ -40,24 +41,70 @@ pub(super) fn admit(query: &mut Query, inline_rows_max: usize) -> Result<Vec<Str
         Query::Describe(_) => return refused("DESCRIBE"),
     };
     let mut separators = Vec::new();
-    let mut inline_rows = 1_usize;
+    let mut joined = Joined::default();
     let mut pending = vec![Visit::Pattern(root)];
     while let Some(visit) = pending.pop() {
         match visit {
-            Visit::Pattern(QueryExpression::Values { bindings, .. }) => {
-                inline_rows = inline_rows.saturating_mul(bindings.len().max(1));
+            Visit::Pattern(pattern) => {
+                joined.count(pattern);
+                admit_pattern(pattern, &mut separators, &mut pending)?;
             }
-            Visit::Pattern(pattern) => admit_pattern(pattern, &mut separators, &mut pending)?,
             Visit::Expression(expression) => push_expression_children(expression, &mut pending),
         }
     }
-    if inline_rows > inline_rows_max {
-        return errors::search::query_answer_limit()
-            .bound("joined VALUES rows")
-            .limit(inline_rows_max)
-            .fail();
-    }
+    joined.admit(limits)?;
     Ok(separators)
+}
+
+/// What one query joins: its leaf patterns, and the product of its inline rows.
+struct Joined {
+    patterns: usize,
+    inline_rows: usize,
+}
+
+impl Default for Joined {
+    fn default() -> Self {
+        Self {
+            patterns: 0,
+            inline_rows: 1,
+        }
+    }
+}
+
+impl Joined {
+    /// Counts the triple, path and `VALUES` patterns `pattern` holds itself.
+    fn count(&mut self, pattern: &QueryExpression) {
+        match pattern {
+            QueryExpression::Bgp { patterns } => {
+                self.patterns = self.patterns.saturating_add(patterns.len());
+            }
+            QueryExpression::Path { .. } => self.patterns = self.patterns.saturating_add(1),
+            QueryExpression::Values { bindings, .. } => {
+                self.patterns = self.patterns.saturating_add(1);
+                self.inline_rows = self.inline_rows.saturating_mul(bindings.len().max(1));
+            }
+            _ => {}
+        }
+    }
+
+    /// Refuses more patterns than the planner may order, or inline rows joining past the
+    /// solution bound.
+    fn admit(&self, limits: &GraphLimits) -> Result<(), RiftError> {
+        if self.patterns > limits.patterns_max() {
+            return errors::search::query_structure_limit()
+                .bound("patterns")
+                .count(self.patterns)
+                .limit(limits.patterns_max())
+                .fail();
+        }
+        if self.inline_rows > limits.solutions_max() {
+            return errors::search::query_answer_limit()
+                .bound("joined VALUES rows")
+                .limit(limits.solutions_max())
+                .fail();
+        }
+        Ok(())
+    }
 }
 
 /// Refuses one pattern the graph does not serve, then pushes what it holds.

@@ -15,9 +15,6 @@ const PREDECLARED_PREFIXES: [(&str, &str); 3] = [
     ("xsd", "http://www.w3.org/2001/XMLSchema#"),
 ];
 
-/// Characters an IRI written as `<...>` never holds, so a `<` followed by one is an operator.
-const IRI_EXCLUDED: &[u8] = b"<\"{}|^`\\";
-
 /// One admitted SPARQL 1.1 `SELECT` or `ASK` query over the fixed graph.
 ///
 /// The prefixes `:` (the vocabulary), `rdf:` and `xsd:` are predeclared; a query may redeclare
@@ -31,14 +28,14 @@ pub struct GraphQuery {
 impl GraphQuery {
     /// Parses `text` and refuses what the graph does not serve.
     ///
-    /// Parsing runs on the query thread, after a lexical scan bounds bracket nesting and
-    /// operators: the parser recurses once per bracket level and once per chained operator.
+    /// Parsing runs on the query thread, after a count of every opening bracket and operator
+    /// character bounds how deep the parser can recurse.
     ///
     /// # Errors
     ///
     /// - `query_too_large` when `text` passes the query byte bound, checked before parsing.
-    /// - `query_nesting_limit` when brackets outside literals and IRIs nest past the bound.
-    /// - `query_operator_limit` when operators outside literals and IRIs pass the bound.
+    /// - `query_structure_limit` when the text holds more opening brackets or operator
+    ///   characters than allowed, or the query joins more patterns than allowed.
     /// - `query_syntax_invalid` when `text` is neither a query nor an update.
     /// - `query_feature_refused` naming the feature for an update, `CONSTRUCT`, `DESCRIBE`,
     ///   `FROM`, `FROM NAMED`, any `SERVICE`, `SERVICE SILENT` included, and a join of patterns
@@ -53,19 +50,7 @@ impl GraphQuery {
                 .observed(text.len())
                 .fail();
         }
-        let shape = shape(text.as_bytes());
-        if shape.depth > limits.nesting_depth_max() {
-            return errors::search::query_nesting_limit()
-                .depth(shape.depth)
-                .limit(limits.nesting_depth_max())
-                .fail();
-        }
-        if shape.operators > limits.operators_max() {
-            return errors::search::query_operator_limit()
-                .count(shape.operators)
-                .limit(limits.operators_max())
-                .fail();
-        }
+        Structure::of(text.as_bytes()).admit(limits)?;
         query_thread::run(None, || Self::parsed(text, limits))?
     }
 
@@ -83,7 +68,7 @@ impl GraphQuery {
         let parser = predeclared_parser();
         match parser.parse_query(text) {
             Ok(mut query) => {
-                let separators = admit(&mut query, limits.solutions_max())?;
+                let separators = admit(&mut query, limits)?;
                 Ok(Self { query, separators })
             }
             Err(_) if parser.parse_update(text).is_ok() => refused("an update"),
@@ -115,80 +100,50 @@ fn predeclared_parser() -> SparqlParser {
         })
 }
 
-/// What the lexical scan measured: the parser recurses once per bracket level and once per
-/// operator of a chain.
+/// Bytes that open a bracket, each a level the parser may recurse into.
+const BRACKETS: &[u8] = b"({[";
+/// Bytes that can chain operators, each a level the parser may recurse into.
+const OPERATORS: &[u8] = b"+-*/&|^!";
+
+/// What the scan counted: opening brackets and operator characters, wherever they stand.
+///
+/// The scan reads every byte, string literals, IRIs, escapes and comments included, so it never
+/// depends on where a lexer would draw a token boundary: the counts can only overestimate the
+/// recursion the parser performs. One pass, no allocation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct Shape {
-    /// The deepest nesting of `(`, `{` and `[`.
-    depth: usize,
-    /// The count of `+`, `-`, `*`, `/`, `&` and `|`.
+struct Structure {
+    brackets: usize,
     operators: usize,
 }
 
-/// Measures `text` outside string literals, IRIs and comments.
-///
-/// One pass over the bytes, no allocation. A closing bracket with nothing open counts nothing,
-/// so an unbalanced query reaches the parser and its syntax refusal. A `-` inside a prefixed
-/// name and the `*` of `SELECT *` count as operators too: the count only ever overestimates.
-fn shape(text: &[u8]) -> Shape {
-    let (mut shape, mut depth, mut index) = (Shape::default(), 0_usize, 0_usize);
-    while let Some(&byte) = text.get(index) {
-        index = match byte {
-            b'(' | b'{' | b'[' => {
-                depth += 1;
-                shape.depth = shape.depth.max(depth);
-                index + 1
-            }
-            b')' | b'}' | b']' => {
-                depth = depth.saturating_sub(1);
-                index + 1
-            }
-            b'+' | b'-' | b'*' | b'/' | b'&' | b'|' => {
-                shape.operators += 1;
-                index + 1
-            }
-            b'"' | b'\'' => skip_string(text, index),
-            b'<' => skip_iri(text, index),
-            b'#' => skip_comment(text, index),
-            _ => index + 1,
-        };
-    }
-    shape
-}
-
-/// The index past the string literal starting at `start`, long forms and escapes included.
-fn skip_string(text: &[u8], start: usize) -> usize {
-    let quote = text[start];
-    let long = text.get(start..start + 3) == Some(&[quote; 3][..]);
-    let mut index = if long { start + 3 } else { start + 1 };
-    while let Some(&byte) = text.get(index) {
-        match byte {
-            b'\\' => index += 2,
-            _ if long && text.get(index..index + 3) == Some(&[quote; 3][..]) => return index + 3,
-            _ if !long && byte == quote => return index + 1,
-            _ => index += 1,
+impl Structure {
+    fn of(text: &[u8]) -> Self {
+        let count = |set: &[u8]| text.iter().filter(|byte| set.contains(byte)).count();
+        Self {
+            brackets: count(BRACKETS),
+            operators: count(OPERATORS),
         }
     }
-    text.len()
-}
 
-/// The index past the IRI starting at `start`, or past `<` when it is an operator.
-fn skip_iri(text: &[u8], start: usize) -> usize {
-    let body = text[start + 1..].iter().position(|byte| {
-        byte.is_ascii_whitespace() || IRI_EXCLUDED.contains(byte) || *byte == b'>'
-    });
-    match body.map(|offset| start + 1 + offset) {
-        Some(end) if text[end] == b'>' => end + 1,
-        Some(_) | None => start + 1,
+    /// Refuses a count past its bound, before the parser recurses into it.
+    fn admit(self, limits: &GraphLimits) -> Result<(), RiftError> {
+        let counts = [
+            ("opening brackets", self.brackets, limits.brackets_max()),
+            (
+                "operator characters",
+                self.operators,
+                limits.operators_max(),
+            ),
+        ];
+        match counts.into_iter().find(|(_, count, limit)| count > limit) {
+            Some((bound, count, limit)) => errors::search::query_structure_limit()
+                .bound(bound)
+                .count(count)
+                .limit(limit)
+                .fail(),
+            None => Ok(()),
+        }
     }
-}
-
-/// The index past the comment starting at `start`.
-fn skip_comment(text: &[u8], start: usize) -> usize {
-    text[start..]
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(text.len(), |offset| start + offset + 1)
 }
 
 #[cfg(test)]
