@@ -659,23 +659,21 @@ fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_chang
         .expect("captured nodes");
     assert_eq!(nodes.1, view);
     assert_eq!(nodes.0.view.as_ref(), Some(&view));
+    assert_eq!(nodes.0.symbol.as_ref(), Some(&id));
+    let item = nodes
+        .0
+        .nodes
+        .first()
+        .expect("the captured function holds nodes");
+    assert_eq!(item.index, 0);
     assert!(
-        nodes
-            .0
-            .nodes
-            .iter()
-            .any(|node| node.of.as_ref() == Some(&id))
-    );
-    assert_eq!(
-        nodes.0.nodes.first().map(|node| node.source.as_str()),
-        Some(
-            reads
-                .index
-                .file(&rift_core::ProjectPath::new("index.js").expect("path"))
-                .expect("source")
-                .source()
-        ),
-        "the outermost node spans the whole captured file"
+        reads
+            .index
+            .file(&rift_core::ProjectPath::new("index.js").expect("path"))
+            .expect("source")
+            .source()
+            .contains(item.source.as_str()),
+        "the item node carries captured bytes"
     );
     std::fs::write(
         directory.path().join("index.js"),
@@ -1661,7 +1659,8 @@ fn captured_nodes_list_a_symbol_and_the_file_node_of_a_text_file() {
     )
     .expect("captured text nodes");
 
-    assert_eq!(symbol.nodes[0].of.as_ref(), Some(&id));
+    assert_eq!(symbol.symbol.as_ref(), Some(&id));
+    assert_eq!(symbol.nodes[0].index, 0);
     assert!(symbol.nodes[0].source.contains("function open(path)"));
     assert!(
         symbol
