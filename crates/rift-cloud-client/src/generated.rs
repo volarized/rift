@@ -49,13 +49,6 @@ static REGEX_PACKAGE_SEARCH_REQUEST_VIEW: std::sync::LazyLock<regex::Regex> = st
     regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
         .expect("invalid regex")
 });
-static REGEX_SEARCH_HIT_TARGET_NODE_ID_NODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-{
-    regex::Regex::new(
-            "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-        )
-        .expect("invalid regex")
-});
 static REGEX_SYMBOL_ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
             "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
@@ -658,13 +651,6 @@ pub struct Parameter {
     /// implement.
     pub extensions: Option<serde_json::Value>,
 }
-/// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-/// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-/// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-/// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-/// kind with equal bytes share one identity wherever they are written, so the identity never
-/// locates a node: the `unit` and `range` beside it do.
-pub type NodeId = String;
 /// One type a symbol carries, together with the role it plays for that symbol.
 #[derive(
     Debug,
@@ -2148,8 +2134,8 @@ pub struct PackageDocumentationHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One search hit. Its file, node, symbol, or commit payload carries the canonical identity.
-/// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
+/// One search hit. Its file, symbol, documentation, or commit payload carries the canonical
+/// identity. Dependency and synthetic symbols can have no readable source; file hits cannot.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -2301,8 +2287,6 @@ pub enum SearchHitTarget {
     DocumentationHit(SearchHitTargetDocumentationHit),
     /// A symbol hit: the declaration a provider resolved.
     Symbol(SearchHitTargetSymbol),
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    NodeId(SearchHitTargetNodeId),
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     Object(SearchHitTargetObject),
     /// A commit hit: one commit the history store holds, matched by its message.
@@ -2320,13 +2304,6 @@ impl SearchHitTarget {
     pub fn symbol(symbol: Symbol) -> Self {
         Self::Symbol(SearchHitTargetSymbol {
             symbol,
-            ..Default::default()
-        })
-    }
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    pub fn node_id(node: String) -> Self {
-        Self::NodeId(SearchHitTargetNodeId {
-            node,
             ..Default::default()
         })
     }
@@ -2425,7 +2402,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `relationship` retains source-node evidence and
+/// One auditable step in a search traversal. `relationship` retains its occurrence and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2438,8 +2415,8 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
 )]
 #[serde(deny_unknown_fields)]
 pub struct GraphHop {
-    /// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-    /// its derivation is how much the provider knew when it was read.
+    /// One directed edge between two symbols. Its occurrence is where it was read from, and its
+    /// derivation is how much the provider knew when it was read.
     #[validate(nested)]
     pub relationship: Relationship,
     /// How one path step followed its directed relationship.
@@ -2557,8 +2534,8 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
         }
     }
 }
-/// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-/// its derivation is how much the provider knew when it was read.
+/// One directed edge between two symbols. Its occurrence is where it was read from, and its
+/// derivation is how much the provider knew when it was read.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -2569,7 +2546,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
     validator::Validate,
     oas3_gen_support::Default
 )]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
@@ -2584,10 +2561,6 @@ pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
-    /// Content identities of the nodes this edge was read from, each spanning `occurrence`,
-    /// which is present whenever this list is not empty. Absent when empty.
-    #[default(Some(Default::default()))]
-    pub evidence: Option<Vec<String>>,
     /// One byte range in a source-catalog unit.
     #[validate(nested)]
     pub occurrence: Option<SourceUnitSpan>,
@@ -3450,13 +3423,6 @@ pub struct SymbolDeclaration {
     pub range: TextRange,
     /// One-based line where this declaration begins.
     pub line: u64,
-    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-    /// kind with equal bytes share one identity wherever they are written, so the identity never
-    /// locates a node: the `unit` and `range` beside it do.
-    pub node: Option<String>,
     /// Source excerpt when requested and available.
     pub source: Option<String>,
     /// Whether the supplied excerpt contains this declaration's complete source.
@@ -4902,32 +4868,6 @@ pub struct SearchHitTargetSymbol {
     #[validate(nested)]
     pub symbol: Symbol,
     #[default("symbol".to_string())]
-    pub target: String,
-}
-/// A node hit: one place in a syntax tree, without its enclosing symbol record.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    validator::Validate,
-    oas3_gen_support::Default
-)]
-#[serde(deny_unknown_fields, default)]
-pub struct SearchHitTargetNodeId {
-    /// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-    /// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-    /// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-    /// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-    /// kind with equal bytes share one identity wherever they are written, so the identity never
-    /// locates a node: the `unit` and `range` beside it do.
-    #[validate(
-        length(min = 78u64, max = 206u64),
-        regex(path = "REGEX_SEARCH_HIT_TARGET_NODE_ID_NODE")
-    )]
-    pub node: String,
-    #[default("node".to_string())]
     pub target: String,
 }
 /// A file hit: one entry of the tree, whether or not any provider reads it.

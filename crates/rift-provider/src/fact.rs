@@ -274,7 +274,6 @@ mod tests {
             )
             .expect("unit"),
             SourceRange::new(start, end).expect("range"),
-            None,
         )
     }
 

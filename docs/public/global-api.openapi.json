@@ -2169,16 +2169,6 @@
         ],
         "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list."
       },
-      "NodeId": {
-        "type": "string",
-        "examples": [
-          "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-        ],
-        "minLength": 78,
-        "maxLength": 206,
-        "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-        "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do."
-      },
       "TypeBinding": {
         "type": "object",
         "properties": {
@@ -4063,7 +4053,7 @@
           },
           "hit": {
             "$ref": "#/components/schemas/SearchHitTarget",
-            "description": "What was found. A symbol, a node, a file, a documentation block, or a commit -\nwhichever `target` allowed."
+            "description": "What was found. A symbol, a file, a documentation block, or a commit -\nwhichever `target` allowed."
           },
           "score": {
             "type": "number",
@@ -4124,7 +4114,7 @@
         "required": [
           "hit"
         ],
-        "description": "One search hit. Its file, node, symbol, or commit payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
+        "description": "One search hit. Its file, symbol, documentation, or commit payload carries the canonical\nidentity. Dependency and synthetic symbols can have no readable source; file hits cannot.",
         "allOf": [
           {
             "oneOf": [
@@ -4159,7 +4149,6 @@
                   "properties": {
                     "target": {
                       "enum": [
-                        "node",
                         "file"
                       ]
                     }
@@ -4285,25 +4274,6 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "node": {
-                "$ref": "#/components/schemas/NodeId",
-                "description": "Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`\nlocate it."
-              },
-              "target": {
-                "type": "string",
-                "const": "node"
-              }
-            },
-            "required": [
-              "target",
-              "node"
-            ],
-            "description": "A node hit: one place in a syntax tree, without its enclosing symbol record."
-          },
-          {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
               "size": {
                 "type": "integer",
                 "format": "uint64",
@@ -4393,7 +4363,7 @@
           "relationship",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `relationship` retains source-node evidence and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `relationship` retains its occurrence and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -4493,14 +4463,6 @@
             "$ref": "#/components/schemas/SymbolId",
             "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
           },
-          "evidence": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/NodeId"
-            },
-            "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
-            "default": []
-          },
           "occurrence": {
             "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node.",
             "$ref": "#/components/schemas/SourceUnitSpan"
@@ -4529,7 +4491,7 @@
           "to",
           "derivation"
         ],
-        "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read."
+        "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
       },
       "RelationshipDerivation": {
         "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
@@ -6355,10 +6317,6 @@
             "minimum": 1,
             "description": "One-based line where this declaration begins."
           },
-          "node": {
-            "description": "Content identity of the declaration's syntax node, which spans `range`, when source is\nrequested and the provider names a syntax kind for the declaration.",
-            "$ref": "#/components/schemas/NodeId"
-          },
           "source": {
             "type": "string",
             "description": "Source excerpt when requested and available.",
@@ -7314,195 +7272,288 @@
         ]
       },
       "NodesResult": {
-        "type": "object",
         "additionalProperties": false,
-        "properties": {
-          "nodes": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Node"
-            },
-            "description": "Nodes covering the position, outermost first."
-          },
-          "source": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "One excerpt per node in `nodes`, in the same order, each spanning that node's own\nrange. Empty when `nodes` is empty."
-          },
-          "view": {
-            "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view.",
-            "$ref": "#/components/schemas/CapturedView"
-          },
-          "warnings": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ReadWarning"
-            },
-            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
-            "default": []
-          }
-        },
-        "required": [
-          "nodes",
-          "source"
-        ],
-        "description": "The nodes covering one position, with identities derived from their source bytes.",
         "examples": [
           {
             "nodes": [
               {
-                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "source_file",
-                "range": {
-                  "start": 0,
-                  "end": 356
-                }
-              },
-              {
-                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "function_item",
+                "declaration": 0,
                 "facets": [
                   "declaration",
                   "definition"
                 ],
+                "index": 0,
+                "kind": "struct_item",
+                "language": "rust",
                 "range": {
-                  "start": 218,
-                  "end": 355
+                  "end": 160,
+                  "start": 105
                 },
-                "regions": [
-                  {
-                    "role": "name",
-                    "range": {
-                      "start": 225,
-                      "end": 236
-                    }
-                  },
-                  {
-                    "role": "body",
-                    "range": {
-                      "start": 281,
-                      "end": 355
-                    }
-                  }
-                ],
-                "parent": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961"
+                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}",
+                "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
-                "unit": "rift://file/src/config.rs",
+                "declaration": 0,
+                "index": 1,
+                "kind": "visibility_modifier",
                 "language": "rust",
-                "kind": "block",
+                "parent": 0,
                 "range": {
-                  "start": 281,
-                  "end": 355
+                  "end": 108,
+                  "start": 105
                 },
-                "parent": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
+                "source": "pub",
+                "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
-                "unit": "rift://file/src/config.rs",
+                "declaration": 0,
+                "index": 2,
+                "kind": "type_identifier",
                 "language": "rust",
-                "kind": "call_expression",
+                "parent": 0,
+                "range": {
+                  "end": 122,
+                  "start": 116
+                },
+                "source": "Config",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 3,
+                "kind": "field_declaration_list",
+                "language": "rust",
+                "parent": 0,
+                "range": {
+                  "end": 160,
+                  "start": 123
+                },
+                "source": "{\n    pub root: std::path::PathBuf,\n}",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
                 "facets": [
-                  "expression"
+                  "declaration",
+                  "definition"
                 ],
+                "index": 4,
+                "kind": "field_declaration",
+                "language": "rust",
+                "parent": 3,
                 "range": {
-                  "start": 334,
-                  "end": 353
+                  "end": 157,
+                  "start": 129
                 },
-                "parent": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189"
+                "source": "pub root: std::path::PathBuf",
+                "unit": "rift://file/src/config.rs"
               },
               {
-                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
-                "unit": "rift://file/src/config.rs",
+                "declaration": 0,
+                "index": 5,
+                "kind": "visibility_modifier",
                 "language": "rust",
-                "kind": "identifier",
+                "parent": 4,
                 "range": {
-                  "start": 334,
-                  "end": 346
+                  "end": 132,
+                  "start": 129
                 },
-                "parent": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690"
+                "source": "pub",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 6,
+                "kind": "field_identifier",
+                "language": "rust",
+                "parent": 4,
+                "range": {
+                  "end": 137,
+                  "start": 133
+                },
+                "source": "root",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 7,
+                "kind": "scoped_type_identifier",
+                "language": "rust",
+                "parent": 4,
+                "range": {
+                  "end": 157,
+                  "start": 139
+                },
+                "source": "std::path::PathBuf",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 8,
+                "kind": "scoped_identifier",
+                "language": "rust",
+                "parent": 7,
+                "range": {
+                  "end": 148,
+                  "start": 139
+                },
+                "source": "std::path",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 9,
+                "kind": "identifier",
+                "language": "rust",
+                "parent": 8,
+                "range": {
+                  "end": 142,
+                  "start": 139
+                },
+                "source": "std",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 10,
+                "kind": "identifier",
+                "language": "rust",
+                "parent": 8,
+                "range": {
+                  "end": 148,
+                  "start": 144
+                },
+                "source": "path",
+                "unit": "rift://file/src/config.rs"
+              },
+              {
+                "declaration": 0,
+                "index": 11,
+                "kind": "type_identifier",
+                "language": "rust",
+                "parent": 7,
+                "range": {
+                  "end": 157,
+                  "start": 150
+                },
+                "source": "PathBuf",
+                "unit": "rift://file/src/config.rs"
               }
             ],
-            "source": [
-              "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-              "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-              "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-              "parse_config(&text)",
-              "parse_config"
-            ]
+            "symbol": "rift://symbol/local/rust/app/config/Config"
           }
-        ]
-      },
-      "Node": {
-        "type": "object",
-        "additionalProperties": false,
+        ],
         "properties": {
-          "id": {
-            "$ref": "#/components/schemas/NodeId",
-            "description": "Unique identifier of this source region, and the URI that resolves it."
+          "node_cursor": {
+            "description": "Continuation for the rest of an answer whose nodes crossed its node count or source\nbyte bound. Absent when the answer holds the last node.",
+            "type": "string"
+          },
+          "nodes": {
+            "description": "Nodes the read selected, in pre-order: per declaration, in the order a symbol read\nlists them, or the unit's nodes from its file node on.",
+            "items": {
+              "$ref": "#/components/schemas/Node"
+            },
+            "type": "array"
           },
           "symbol": {
-            "description": "The symbol written at this node. Absent where a node writes no symbol -\npunctuation, a keyword, a comment.",
-            "$ref": "#/components/schemas/SymbolId"
+            "$ref": "#/components/schemas/SymbolId",
+            "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration."
           },
-          "unit": {
-            "$ref": "#/components/schemas/FileId",
-            "description": "The file the node is written in."
+          "view": {
+            "$ref": "#/components/schemas/CapturedView",
+            "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view."
           },
-          "language": {
-            "$ref": "#/components/schemas/Language",
-            "description": "The grammar that produced this node. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
+          "warnings": {
+            "default": [],
+            "description": "Warnings attached to this result. Absent when there is nothing to warn about.",
+            "items": {
+              "$ref": "#/components/schemas/ReadWarning"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "type": "object",
+        "description": "The nodes a read selected, each with its source text and its place inside its symbol or\nunit."
+      },
+      "Node": {
+        "additionalProperties": false,
+        "description": "One node of a source unit's syntax tree, with its source text, addressed by its place inside\na symbol. A node inside a declaration's item subtree is node `index` of declaration\n`declaration` of the symbol the read names; a node outside every declaration is node `index`\nof its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at\nthe unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the\nnested symbol. The address names a place at the read's revision: an edit renumbers the nodes\nafter it.",
+        "properties": {
+          "declaration": {
+            "description": "Ordinal of the declaration holding this node among the declarations of the symbol the\nread names, from 0 in the order a symbol read lists them. Absent for a node outside\nevery declaration: the file node, an import, a top-level statement.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "extensions": {
+            "$ref": "#/components/schemas/Extensions",
+            "default": {},
+            "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty."
+          },
+          "facets": {
+            "default": [],
+            "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
+            "items": {
+              "$ref": "#/components/schemas/NodeFacet"
+            },
+            "type": "array"
+          },
+          "index": {
+            "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
           },
           "kind": {
             "$ref": "#/components/schemas/ExactKind",
             "description": "What the node is in the provider's vocabulary, such as `fn_item`, `mapping.key`, or\n`selector.class`."
           },
-          "facets": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/NodeFacet"
-            },
-            "description": "Portable structural classification, so a query can ask for bodies or imports without\nknowing the grammar that produced them. Absent when empty.",
-            "default": []
+          "language": {
+            "$ref": "#/components/schemas/Language",
+            "description": "The grammar that produced this node. It belongs to the identity because two\nproviders can produce different trees over the same file bytes."
+          },
+          "parent": {
+            "description": "`index` of the node this one is nested inside, in the same declaration or unit. Absent\nfor node 0.",
+            "format": "uint64",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
           },
           "range": {
             "$ref": "#/components/schemas/TextRange",
             "description": "The bytes it spans, as offsets into the file."
           },
           "regions": {
-            "type": "array",
+            "default": [],
+            "description": "The node's named parts, including its function body and documentation. Absent when empty.",
             "items": {
               "$ref": "#/components/schemas/NodeRegion"
             },
-            "description": "The node's named parts, including its function body and documentation. Absent when empty.",
-            "default": []
+            "type": "array"
           },
-          "parent": {
-            "description": "The region this one is nested inside. Absent at the top level of a unit.",
-            "$ref": "#/components/schemas/NodeId"
+          "source": {
+            "description": "The node's exact source text: the bytes `range` spans at the read's revision.",
+            "type": "string"
           },
-          "extensions": {
-            "$ref": "#/components/schemas/Extensions",
-            "description": "Syntax facts the model has no field for, namespaced by the provider that emitted\nthem. Absent when empty.",
-            "default": {}
+          "unit": {
+            "$ref": "#/components/schemas/FileId",
+            "description": "The file the node is written in."
           }
         },
         "required": [
-          "id",
+          "index",
           "unit",
           "language",
           "kind",
-          "range"
+          "range",
+          "source"
         ],
-        "description": "One node of a file's concrete syntax tree. It identifies a source range and\nprovider-local syntax kind. `symbol` connects the node to semantic identity when the\nlanguage supplies one."
+        "type": "object"
       },
       "NodeFacet": {
         "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",

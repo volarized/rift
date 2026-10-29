@@ -20,27 +20,27 @@ Parameters:
 
 ## nodes
 
-Lists syntax nodes with their source text, outermost first: every node of one `symbol`
-(each declaration's item node and the descendants that belong to it), or the nodes
-covering one UTF-8 byte `position` in one file, from the file node inward. A symbol
-read is the way to read a declaration's source. Each node's identity is a digest of
-its language, kind, and bytes, so equal nodes share one identity and an edit elsewhere
-in the file leaves it unchanged; `unit` and `range` locate the node, and `of` names the
-symbol a node declares. A symbol read whose nodes cross the answer's node count or
-source byte bound returns `node_cursor` for the rest. Every file has a file node
-spanning it whole, and a file no syntax provider parses answers that node alone. `rev`
-lists the nodes as of a version-control revision instead of the current tree. If
-discovery is incomplete or a targeted read spends the request's remaining time, the
-result has empty `nodes` and carries `local_index_preparing`. A selected source path
-can answer within that remaining time, with the same warning until the publication
+Lists syntax nodes with their source text: every node of one `symbol`, or, for one
+UTF-8 byte `position` in one file, every node of the symbol whose declaration holds
+it, or the file's unit nodes when no declaration holds it. The answer names `symbol`;
+each node is addressed by its place: node `index` of declaration `declaration` of
+that symbol, or node `index` of its unit, from the file node at 0, with `parent` an
+index in the same declaration or unit. An edit renumbers the nodes after it. A symbol
+read is the way to read a declaration's source. An answer whose nodes cross its node
+count or source byte bound returns `node_cursor` for the rest. A file no syntax
+provider parses answers its file node alone. `rev` lists the nodes as of a
+version-control revision instead of the current tree. If discovery is incomplete or
+a targeted read spends the request's remaining time, the result has empty `nodes`
+and carries `local_index_preparing`. A selected source path can answer within that
+remaining time, with the same warning until the publication
 records the path: workspace byte and declaration bounds remain unchecked.
 
 Parameters:
 
 - `symbol` - The symbol whose nodes the read lists: each declaration's item node, then the descendants that belong to that declaration and not to a declaration nested in it, outermost first per declaration.
 - `path` - Project-relative file to inspect.
-- `position` - UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes themselves carry the spans.
-- `node_cursor` - Continuation a preceding `symbol` read returned, bound to that symbol and the tree revision it read.
+- `position` - UTF-8 byte offset inside the declaration whose nodes the read lists - one position, not a range; the nodes themselves carry the spans.
+- `node_cursor` - Continuation a preceding read returned, bound to the symbol or unit its answer listed and the tree revision it read.
 - `view` - Captured view selected by discovery.
 - `rev` - The version-control revision to read - a branch, tag, or commit id as the workspace's version control spells it.
 

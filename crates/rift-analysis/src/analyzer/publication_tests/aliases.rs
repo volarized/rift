@@ -127,7 +127,6 @@ fn explicit_alias_keeps_defining_object_and_original_export_span() {
         rift_protocol::read::RelationshipDerivation::Syntax
     );
     assert!(edge.confidence.is_none());
-    assert!(edge.evidence.is_empty());
     let occurrence = edge
         .occurrence
         .as_ref()
@@ -236,7 +235,6 @@ fn public_alias_keeps_original_export_binding_and_incoming_target() {
         rift_protocol::read::RelationshipDerivation::Syntax
     );
     assert!(edge.confidence.is_none());
-    assert!(edge.evidence.is_empty());
     let occurrence = edge
         .occurrence
         .as_ref()

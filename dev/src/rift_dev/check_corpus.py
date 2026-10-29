@@ -97,6 +97,8 @@ SDK_DISABLED = "OTEL_SDK_DISABLED"
 # budget can never deliver the answer the contract promises. The read carries the budget
 # plus room for that answer to arrive.
 READINESS_SECONDS = 30.0
+# Pages one sampled symbol read may follow before its declaration must have appeared.
+NODE_PAGES_MAX = 50
 READ_SECONDS = READINESS_SECONDS + 10.0
 # A tool's first read over a large workspace under sustained edits waits for the first
 # index to land, so it gets the whole read budget. Every read after it answers from a
@@ -797,38 +799,24 @@ class Corpus:
             answer = await client.call(
                 "nodes", {"path": str(path.relative_to(self.root)), "position": end - 1}
             )
+            unit = f"rift://file/{path.relative_to(self.root).as_posix()}"
             nodes = objects(answer, "nodes")
-            require(
-                bool(nodes)
-                and nodes[0].get("kind") == "file"
-                and nodes[0].get("range") == {"start": 0, "end": len(content)},
-                f"nodes did not open with the file node of {path}",
-            )
-            for node in nodes:
-                node_span = object_value(node.get("range"), "node range")
-                node_start = number(node_span.get("start"), "node start")
-                node_end = number(node_span.get("end"), "node end")
+            require(bool(nodes), f"nodes listed nothing at {path}:{end - 1}")
+            if answer.get("symbol") is None:
                 require(
-                    0 <= node_start <= node_end <= len(content),
-                    "node range exceeds source",
+                    nodes[0].get("kind") == "file"
+                    and nodes[0].get("range") == {"start": 0, "end": len(content)},
+                    f"a unit answer did not open with the file node of {path}",
                 )
-                excerpt = node.get("source")
-                require(
-                    isinstance(excerpt, str)
-                    and excerpt.encode() == content[node_start:node_end],
-                    f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
-                )
+            self.require_node_sources(nodes, unit, content, path)
             if identity is not None:
-                require(
-                    any(node.get("of") == identity for node in nodes),
-                    f"nodes omitted sampled declaration: {identity} at {end - 1}; "
-                    f"returned {[(node.get('kind'), node.get('range'), node.get('of')) for node in nodes]}",
-                )
+                await self.require_symbol_item(client, identity, unit, end, content, path)
             else:
                 matching = [
                     node
-                    for node in nodes[1:]
-                    if number(
+                    for node in nodes
+                    if node.get("unit") == unit
+                    and number(
                         object_value(node.get("range"), "node range").get("end"),
                         "node end",
                     )
@@ -843,15 +831,78 @@ class Corpus:
                     )
                 ]
                 require(
-                    bool(matching),
+                    bool(matching) or answer.get("symbol") is not None,
                     f"nodes omitted raw declaration at {path}:{start}-{end}",
                 )
                 require(
-                    all(node.get("of") is None for node in matching),
+                    not any(
+                        node.get("index") == 0
+                        and node.get("declaration") is not None
+                        and number(
+                            cast(JsonObject, node["range"]).get("start"), "node start"
+                        )
+                        >= start
+                        and cast(JsonObject, node["range"]).get("end") == end
+                        for node in matching
+                    ),
                     f"raw declaration acquired an unproved identity at {path}:{start}-{end}",
                 )
             require(path.read_bytes() == content, f"read changed {path}")
         self.record("identities", count=len(identities), seed=SEED)
+
+    @staticmethod
+    def require_node_sources(
+        nodes: list[JsonObject], unit: str, content: bytes, path: Path
+    ) -> None:
+        """Require each node of `unit` to carry the bytes its range spans."""
+        for node in nodes:
+            if node.get("unit") != unit:
+                continue
+            node_span = object_value(node.get("range"), "node range")
+            node_start = number(node_span.get("start"), "node start")
+            node_end = number(node_span.get("end"), "node end")
+            require(
+                0 <= node_start <= node_end <= len(content),
+                "node range exceeds source",
+            )
+            excerpt = node.get("source")
+            require(
+                isinstance(excerpt, str)
+                and excerpt.encode() == content[node_start:node_end],
+                f"node source disagrees with captured bytes at {path}:{node_start}-{node_end}",
+            )
+
+    async def require_symbol_item(
+        self,
+        client: Client,
+        identity: str,
+        unit: str,
+        end: int,
+        content: bytes,
+        path: Path,
+    ) -> None:
+        """Require the symbol read of `identity` to list the sampled declaration's item."""
+        arguments: JsonObject = {"symbol": identity}
+        for _ in range(NODE_PAGES_MAX):
+            answer = await client.call("nodes", arguments)
+            require(
+                answer.get("symbol") == identity,
+                f"a symbol read named another symbol: {identity}",
+            )
+            nodes = objects(answer, "nodes")
+            self.require_node_sources(nodes, unit, content, path)
+            if any(
+                node.get("index") == 0
+                and node.get("unit") == unit
+                and cast(JsonObject, node.get("range")).get("end") == end
+                for node in nodes
+            ):
+                return
+            cursor = answer.get("node_cursor")
+            if cursor is None:
+                break
+            arguments = {"symbol": identity, "node_cursor": cursor}
+        require(False, f"nodes omitted sampled declaration: {identity} ending at {path}:{end}")
 
     async def lexical_persistence(self, client: Client) -> None:
         """Preserve unrelated lexical rows after external source creation and removal."""

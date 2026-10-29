@@ -391,7 +391,7 @@ impl TraversalEdge<'_> {
     }
 }
 
-/// Borrows graph edges until the walk selects a new symbol, preserving indexed evidence.
+/// Borrows graph edges until the walk selects a new symbol, preserving indexed occurrences.
 ///
 /// A walk follows the edges of `direction` at `current`: the store's own edges, and the
 /// hops a language engine resolved for this read, incoming references or outgoing calls.
@@ -588,7 +588,6 @@ pub(crate) mod tests {
         rift_core::DeclarationBinding::new(
             graph_source_unit(path),
             rift_core::SourceRange::new(start, end).expect("fixture range"),
-            None,
         )
     }
 
@@ -1059,7 +1058,6 @@ pub(crate) mod tests {
                 kind: ExactKind(RelationshipFacet::References.as_ref().to_owned()),
                 facets: vec![RelationshipFacet::References],
                 to: rift_protocol::read::SymbolId(to.to_owned()),
-                evidence: Vec::new(),
                 occurrence: None,
                 derivation: RelationshipDerivation::Resolution,
                 confidence: None,
@@ -1495,7 +1493,7 @@ pub(crate) mod tests {
         assert_eq!(error.slug().as_str(), "rift.server.read_invalid");
     }
     #[test]
-    fn confirmed_reference_preserves_indexed_evidence_and_one_hit() {
+    fn confirmed_reference_preserves_indexed_occurrence_and_one_hit() {
         let caller = graph_symbol_id(graph_identity("caller").as_str());
         let target = graph_symbol_id(graph_identity("target").as_str());
         let store = RelationshipStore::build(&graph_normalized(vec![
@@ -1511,7 +1509,7 @@ pub(crate) mod tests {
         let edge = &store.incoming(&target)[0];
         let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Incoming);
         let mut confirmed = prior.clone();
-        confirmed.relationship.evidence.clear();
+        confirmed.relationship.occurrence = None;
         let references = crate::EngineReferences::from_incoming(std::collections::BTreeMap::from(
             [(target.clone(), vec![confirmed])],
         ));
@@ -1535,7 +1533,7 @@ pub(crate) mod tests {
     /// An indexed call an engine also names is walked once, forward, as the engine's
     /// confirmation of the indexed edge.
     #[test]
-    fn confirmed_call_preserves_indexed_evidence_and_one_hit() {
+    fn confirmed_call_preserves_indexed_occurrence_and_one_hit() {
         let caller = graph_symbol_id(graph_identity("caller").as_str());
         let target = graph_symbol_id(graph_identity("target").as_str());
         let store = RelationshipStore::build(&graph_normalized(vec![
@@ -1551,7 +1549,7 @@ pub(crate) mod tests {
         let edge = &store.outgoing(&caller)[0];
         let prior = super::graph_hop(edge, rift_protocol::read::HopDirection::Outgoing);
         let mut confirmed = prior.clone();
-        confirmed.relationship.evidence.clear();
+        confirmed.relationship.occurrence = None;
         let references = crate::EngineReferences::from_outgoing(BTreeMap::from([(
             caller.clone(),
             vec![confirmed],
