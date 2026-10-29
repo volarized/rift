@@ -4270,7 +4270,7 @@ fn diagnostics_follow_the_message_and_the_limit_one_compiler_style_line_each() {
 
 #[test]
 fn identities_are_written_whole_and_hashes_are_cut() {
-    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService~2?rev=0000000000000000000000000000000000000000000000000000000000000000";
+    let symbol_id = "rift://symbol/local/rust/rift_server/read/ReadService/nodes";
     let node_id =
         "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28";
     let unit = "rift://source/project/packages/@scope/name/package.json";

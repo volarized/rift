@@ -52,7 +52,7 @@ pub struct DocumentPlacement {
     origin: ContributionOrigin,
     unit: SourceUnitId,
     identity_path: String,
-    identity_anchors: Option<BTreeMap<String, SymbolId>>,
+    identity_anchors: BTreeMap<String, SymbolId>,
     aliases: Vec<PlacedAlias>,
     logical_declarations: BTreeMap<String, LogicalDeclaration>,
 }
@@ -69,7 +69,7 @@ impl DocumentPlacement {
             origin,
             unit,
             identity_path: identity_path.into(),
-            identity_anchors: None,
+            identity_anchors: BTreeMap::new(),
             aliases: Vec::new(),
             logical_declarations: BTreeMap::new(),
         }
@@ -119,10 +119,12 @@ impl DocumentPlacement {
     }
 
     /// Supplies established logical identities separately from physical provider keys.
-    /// An empty map retains all declarations as unresolved facts.
+    ///
+    /// A declaration the map does not name stays an unresolved fact: a physical provider
+    /// key never becomes a public identity.
     #[must_use]
     pub fn with_identity_anchors(mut self, anchors: BTreeMap<String, SymbolId>) -> Self {
-        self.identity_anchors = Some(anchors);
+        self.identity_anchors = anchors;
         self
     }
 
@@ -132,7 +134,7 @@ impl DocumentPlacement {
         self.logical_declarations
             .get(qualified_name)
             .map(|declaration| &declaration.identity)
-            .or_else(|| self.identity_anchors.as_ref()?.get(qualified_name))
+            .or_else(|| self.identity_anchors.get(qualified_name))
     }
 
     /// Supplies source-backed export aliases beside existing declarations.
@@ -257,14 +259,15 @@ impl SyntaxPublicationBuilder {
                 &symbol.qualified_name,
             );
             let provider_symbol = ProviderSymbolId::for_symbol(&identity)?;
-            let anchor = if let Some(logical) = logical {
-                Some(logical.identity.clone())
-            } else {
-                match &placement.identity_anchors {
-                    Some(anchors) => anchors.get(&symbol.qualified_name).cloned(),
-                    None => Some(SymbolId::new(identity)?),
-                }
-            };
+            let anchor = logical.map_or_else(
+                || {
+                    placement
+                        .identity_anchors
+                        .get(&symbol.qualified_name)
+                        .cloned()
+                },
+                |logical| Some(logical.identity.clone()),
+            );
             let language = logical.map_or_else(|| syntax.language(), |logical| &logical.language);
             let mut facts = symbol.facts(language);
             if let Some(container) = &symbol.container {
@@ -423,7 +426,7 @@ impl crate::SyntaxSymbol {
 #[cfg(test)]
 mod tests {
     use crate::provider::SyntaxLimits;
-    use rift_core::{ProjectPath, ProviderRevision, SourceRevision, SymbolId, TreeRevision};
+    use rift_core::{ProjectPath, ProviderRevision, SourceRevision, TreeRevision};
 
     use super::SyntaxPublicationBuilder;
     use crate::{RustSyntaxProvider, SyntaxProvider, SyntaxSource};
@@ -480,9 +483,10 @@ mod tests {
                     .is_some_and(|facts| facts.name() == "run")
             })
             .expect("run");
+        assert_eq!(beacon.identity_anchor(), None);
         assert_eq!(
-            beacon.identity_anchor().map(SymbolId::as_str),
-            Some("rift://symbol/rust/src/lib.rs/Beacon")
+            beacon.key().reference().symbol().as_str(),
+            "rift://symbol/rust/src/lib.rs/Beacon"
         );
         assert_eq!(
             run.facts()
@@ -628,9 +632,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("publication holds {name}"))
         };
         let spawn = named("spawn");
+        assert_eq!(spawn.identity_anchor(), None);
         assert_eq!(
-            spawn.identity_anchor().map(SymbolId::as_str),
-            Some("rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/spawn")
+            spawn.key().reference().symbol().as_str(),
+            "rift://symbol/rust/cargo/tokio@1.53.1/src/lib.rs/spawn"
         );
         assert_eq!(
             spawn.source().map(|binding| binding.unit().to_string()),

@@ -56,14 +56,11 @@ pub(super) fn profile_key(name: &str) -> String {
 }
 
 fn with_owner(identity: &SymbolIdentity, owner: SymbolOwner) -> Result<SymbolId, RiftError> {
-    let mut translated = SymbolIdentity::new(
+    let translated = SymbolIdentity::new(
         owner,
         identity.language().clone(),
         identity.qualified_path().to_vec(),
     )?;
-    if let Some(occurrence) = identity.occurrence() {
-        translated = translated.with_occurrence(occurrence.clone())?;
-    }
     Ok(SymbolId::from_identity(&translated))
 }
 
@@ -242,12 +239,8 @@ mod tests {
     use rift_protocol::symbol_read::GetSymbolResult;
 
     #[test]
-    fn named_identity_roundtrip_preserves_occurrence_revision_and_escaping()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let original = SymbolId::parse(&format!(
-            "rift://symbol/local/rust/app/name%2Fpart~2?rev={}",
-            "a".repeat(64)
-        ))?;
+    fn named_identity_roundtrip_preserves_escaping() -> Result<(), Box<dyn std::error::Error>> {
+        let original = SymbolId::parse("rift://symbol/local/rust/app/name%2Fpart%7E2")?;
         let mut qualified = original.clone();
         qualify_id(&mut qualified, "cloud")?;
         assert!(qualified.as_str().starts_with("rift://symbol/local@cloud/"));
@@ -259,10 +252,7 @@ mod tests {
     #[test]
     fn profile_identity_roundtrip_keeps_extra_with_same_name_distinct()
     -> Result<(), Box<dyn std::error::Error>> {
-        let original = SymbolId::parse(&format!(
-            "rift://symbol/local/rust/app/name%2Fpart~2?rev={}",
-            "a".repeat(64)
-        ))?;
+        let original = SymbolId::parse("rift://symbol/local/rust/app/name%2Fpart%7E2")?;
         let mut profile = original.clone();
         let mut extra = original.clone();
         qualify_id(&mut profile, ":docs")?;

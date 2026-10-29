@@ -70,7 +70,6 @@ fn python_captured_and_uncaptured_digest_keep_identical_unique_identity() {
     assert_eq!(ordinary.len(), 1);
     assert_eq!(anchors(text, text, true), ordinary);
     let identity = SymbolIdentity::parse(ordinary["beacon"].as_str()).expect("canonical identity");
-    assert!(identity.occurrence().is_none());
     assert_eq!(identity.owner(), &SymbolOwner::Local);
 }
 
@@ -84,23 +83,20 @@ fn python_cached_digest_rejects_facts_from_different_bytes() {
 }
 
 #[test]
-fn python_cached_digest_keeps_complete_occurrence_revision() {
+fn python_repeated_declarations_share_one_identity() {
     let text = "def beacon():\n    return 1\ndef beacon():\n    return 2\n";
     let ordinary = anchors(text, text, false);
     let captured = anchors(text, text, true);
     assert_eq!(ordinary, captured);
     assert_eq!(ordinary.len(), 2);
-    let expected = data_encoding::HEXLOWER.encode(&Sha256::digest(text.as_bytes()));
-    let mut occurrences = std::collections::BTreeSet::new();
-    for identity in captured.values() {
-        let parsed = SymbolIdentity::parse(identity.as_str()).expect("canonical identity");
-        if let Some(occurrence) = parsed.occurrence() {
-            occurrences.insert(occurrence.number());
-            assert_eq!(occurrence.revision().len(), 64);
-            assert_eq!(occurrence.revision(), expected);
-        }
-    }
-    assert_eq!(occurrences, [1, 2].into_iter().collect());
+    let identities = captured.values().collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        identities
+            .into_iter()
+            .map(SymbolId::as_str)
+            .collect::<Vec<_>>(),
+        ["rift://symbol/local/python/main/beacon"]
+    );
 }
 
 #[test]

@@ -169,6 +169,39 @@ fn a_symbol_with_several_declarations_lists_each_outermost_first() -> TestResult
 }
 
 #[test]
+fn repeated_definitions_of_one_path_read_as_one_symbol_with_every_declaration() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    fs::write(
+        directory.path().join("Cargo.toml"),
+        "[package]\nname = \"lamp\"\nversion = \"1.0.0\"\n",
+    )?;
+    fs::create_dir(directory.path().join("src"))?;
+    let source = "#[cfg(unix)]\npub fn tick() -> u8 {\n    1\n}\n\n#[cfg(not(unix))]\npub fn tick() -> u8 {\n    2\n}\n";
+    fs::write(directory.path().join("src/lib.rs"), source)?;
+    let service = service(directory.path())?;
+    let tick = identity(&service, "tick")?;
+    assert_eq!(tick.as_str(), "rift://symbol/local/rust/lamp/tick");
+    let key = rift_core::SymbolId::new(tick.as_str())?;
+    let (bindings, total) = service.index().symbols_by_identity_page(&key, 0, 10)?;
+    assert_eq!(total, 2, "one symbol, two declarations");
+
+    let answer = symbol_nodes(&service, &tick)?;
+
+    let items = answer
+        .nodes
+        .iter()
+        .filter(|node| node.of.as_ref() == Some(&tick) && node.kind.0 == "function_item")
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 2, "one item node per declaration: {items:?}");
+    for (item, binding) in items.iter().zip(&bindings) {
+        assert_eq!(item.range.start, binding.symbol.item_range.start);
+    }
+    assert!(items[0].source.contains("    1\n"), "{items:?}");
+    assert!(items[1].source.contains("    2\n"), "{items:?}");
+    Ok(())
+}
+
+#[test]
 fn pages_of_a_symbol_read_resume_through_the_cursor_until_the_last_node() -> TestResult {
     let (_directory, service) = rust_service()?;
     let dim = identity(&service, "dim")?;
