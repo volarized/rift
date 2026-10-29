@@ -185,21 +185,22 @@ async def declaration_node(client: Client, name: str) -> str:
         for entry in array_value(listing.get("nodes"), "nodes.nodes")
     ]
     require(
-        bool(nodes) and nodes[0].get("kind") == "file",
-        f"nodes did not open with the file node: {listing}",
+        listing.get("symbol") == identity,
+        f"nodes did not answer the declaration's symbol: {listing}",
     )
-    matches = [
-        node
-        for node in nodes
-        if node.get("of") == identity and node.get("range") == span
-    ]
-    require(len(matches) == 1, f"nodes omitted the declaration: {listing}")
-    node = matches[0]
+    require(bool(nodes), f"nodes listed nothing: {listing}")
+    node = nodes[0]
+    require(
+        node.get("range") == span
+        and node.get("declaration") == 0
+        and node.get("index") == 0,
+        f"the declaration's item node is not node 0 of its declaration: {listing}",
+    )
     require(
         node.get("source") == hit.get("source"),
         f"nodes changed source: {listing}",
     )
-    return string_value(node.get("id"), "node.id")
+    return identity
 
 
 async def check_agent(binary: Path, version: str | None = None) -> None:

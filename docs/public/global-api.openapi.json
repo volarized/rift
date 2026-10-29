@@ -1175,10 +1175,11 @@
                 "examples": {
                   "symbol": {
                     "value": {
+                      "symbol": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
                       "nodes": [
                         {
-                          "id": "rift://node/rust/822c5120b879aefaf4292665e14f74685b0af62426f7be48abeaa8119617b6f0",
-                          "of": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
+                          "declaration": 0,
+                          "index": 0,
                           "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "function_item",
@@ -1193,7 +1194,8 @@
                           "source": "pub fn beacon() {}"
                         },
                         {
-                          "id": "rift://node/rust/aade2b73ac47e607aac9a232946bfd405bf34b3d50e5568275536355c6e9df47",
+                          "declaration": 0,
+                          "index": 1,
                           "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "visibility_modifier",
@@ -1201,10 +1203,12 @@
                             "start": 26,
                             "end": 29
                           },
-                          "source": "pub"
+                          "source": "pub",
+                          "parent": 0
                         },
                         {
-                          "id": "rift://node/rust/9b04c3deca33e42e8320a198a92e8228c839f6896f7355d628794a903e7e1e65",
+                          "declaration": 0,
+                          "index": 2,
                           "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "identifier",
@@ -1212,10 +1216,12 @@
                             "start": 33,
                             "end": 39
                           },
-                          "source": "beacon"
+                          "source": "beacon",
+                          "parent": 0
                         },
                         {
-                          "id": "rift://node/rust/edfb51c0954ad93ebc6b3d756002deff7e5ad9a2bfbd0c0d98863a1967b36305",
+                          "declaration": 0,
+                          "index": 3,
                           "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "parameters",
@@ -1223,10 +1229,12 @@
                             "start": 39,
                             "end": 41
                           },
-                          "source": "()"
+                          "source": "()",
+                          "parent": 0
                         },
                         {
-                          "id": "rift://node/rust/2d72b267e7fb58ef18e81465a0ac23fa48c5ca8d840ffe88f8e79cc458a14c2e",
+                          "declaration": 0,
+                          "index": 4,
                           "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
                           "language": "rust",
                           "kind": "block",
@@ -1234,7 +1242,8 @@
                             "start": 42,
                             "end": 44
                           },
-                          "source": "{}"
+                          "source": "{}",
+                          "parent": 0
                         }
                       ],
                       "view": {
@@ -2445,16 +2454,6 @@
           "variadic"
         ],
         "description": "One parameter of a `Signature`: what it is called, the types bound to it, and how a call\nmay pass it. A receiver is one of these too, held in its own field because it has no\nposition in the parameter list."
-      },
-      "NodeId": {
-        "type": "string",
-        "examples": [
-          "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-        ],
-        "minLength": 78,
-        "maxLength": 206,
-        "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/[0-9a-f]{64}$",
-        "description": "Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,\n`/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest\ninput is the identity segment and the kind, each preceded by its UTF-8 byte length as a\n64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and\nkind with equal bytes share one identity wherever they are written, so the identity never\nlocates a node: the `unit` and `range` beside it do."
       },
       "TypeBinding": {
         "type": "object",
@@ -4340,7 +4339,7 @@
           },
           "hit": {
             "$ref": "#/components/schemas/SearchHitTarget",
-            "description": "What was found. A symbol, a node, a file, a documentation block, or a commit -\nwhichever `target` allowed."
+            "description": "What was found. A symbol, a file, a documentation block, or a commit -\nwhichever `target` allowed."
           },
           "score": {
             "type": "number",
@@ -4401,7 +4400,7 @@
         "required": [
           "hit"
         ],
-        "description": "One search hit. Its file, node, symbol, or commit payload carries the canonical identity.\nDependency and synthetic symbols can have no readable source; node and file hits cannot.",
+        "description": "One search hit. Its file, symbol, documentation, or commit payload carries the canonical\nidentity. Dependency and synthetic symbols can have no readable source; file hits cannot.",
         "allOf": [
           {
             "oneOf": [
@@ -4436,7 +4435,6 @@
                   "properties": {
                     "target": {
                       "enum": [
-                        "node",
                         "file"
                       ]
                     }
@@ -4562,25 +4560,6 @@
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "node": {
-                "$ref": "#/components/schemas/NodeId",
-                "description": "Content identity of the syntax-tree node; the hit's `path` or `unit` and `range`\nlocate it."
-              },
-              "target": {
-                "type": "string",
-                "const": "node"
-              }
-            },
-            "required": [
-              "target",
-              "node"
-            ],
-            "description": "A node hit: one place in a syntax tree, without its enclosing symbol record."
-          },
-          {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
               "size": {
                 "type": "integer",
                 "format": "uint64",
@@ -4670,7 +4649,7 @@
           "relationship",
           "direction"
         ],
-        "description": "One auditable step in a search traversal. `relationship` retains source-node evidence and\nderivation; `direction` records how the walk followed it."
+        "description": "One auditable step in a search traversal. `relationship` retains its occurrence and\nderivation; `direction` records how the walk followed it."
       },
       "TraversalDirection": {
         "description": "Which edge direction a search traversal walks from each visited symbol. A language\nengine supplies the edges of both: its references for `incoming`, its call hierarchy for\n`outgoing`.",
@@ -4770,14 +4749,6 @@
             "$ref": "#/components/schemas/SymbolId",
             "description": "The symbol the edge points at. One Rift cannot read carries the `external` origin;\nthe edge is the same either way."
           },
-          "evidence": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/NodeId"
-            },
-            "description": "Content identities of the nodes this edge was read from, each spanning `occurrence`,\nwhich is present whenever this list is not empty. Absent when empty.",
-            "default": []
-          },
           "occurrence": {
             "description": "Exact physical occurrence when this edge was read from source, independent of\nwhether the provider supplied a source node.",
             "$ref": "#/components/schemas/SourceUnitSpan"
@@ -4806,7 +4777,7 @@
           "to",
           "derivation"
         ],
-        "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read."
+        "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read."
       },
       "RelationshipDerivation": {
         "description": "How this edge was established. Every edge reaches Rift from a provider, and this field\nrecords whether the provider resolved the edge semantically, read it from syntax, or\ninferred it.",
@@ -7588,12 +7559,12 @@
             "type": "integer",
             "format": "uint64",
             "minimum": 0,
-            "description": "UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes\nthemselves carry the spans. A position inside a multi-byte character is valid and\nanswers with its enclosing nodes; a position at or past the file's byte length\nrefuses.",
+            "description": "UTF-8 byte offset inside the declaration whose nodes the read lists - one position,\nnot a range; the nodes themselves carry the spans. The read lists the nodes of the\ninnermost declaration holding the node at the position, or of the file's unit when no\ndeclaration holds it. A position inside a multi-byte character is valid; a position at\nor past the file's byte length refuses.",
             "maximum": 9007199254740991
           },
           "node_cursor": {
             "type": "string",
-            "description": "Continuation a preceding `symbol` read returned, bound to that symbol and the tree\nrevision it read. The server refuses it beside `path` and once the tree has moved.",
+            "description": "Continuation a preceding read returned, bound to the symbol or unit its answer listed\nand the tree revision it read. The caller MUST send it with the selector of that read;\nthe server refuses it for another symbol or unit and once the tree has moved.",
             "minLength": 1,
             "maxLength": 4096
           },
@@ -7602,11 +7573,11 @@
             "$ref": "#/components/schemas/CapturedViewId"
           },
           "revision": {
-            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's lockfiles pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree.",
+            "description": "The revision to read: a git revision reads that commit, a tree revision the served\nworking tree, and a release revision selects the release of a package or runtime\n`symbol`'s owner. Omitted reads the served working tree, or for a package the version\nthe workspace's dependencies pin, else the newest collected release. The server refuses\na git revision when the workspace has no version-control repository, and a tree\nrevision once the index serves another tree.",
             "$ref": "#/components/schemas/Revision"
           }
         },
-        "description": "Lists syntax nodes with their source, outermost first: every node of one `symbol`, or the\nnodes covering one `position` in one file. Each node carries its kind, range, and source\ntext, including expressions smaller than a declaration.",
+        "description": "Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the\ninnermost declaration holding one `position` in one file, or of that file's unit when no\ndeclaration holds it. Each node carries its kind, range, source text, and place, including\nexpressions smaller than a declaration.",
         "rift:since": "v0.0.4",
         "examples": [
           {
@@ -7652,19 +7623,6 @@
               }
             ],
             "description": "nodes selects a symbol, or a path with a position"
-          },
-          {
-            "if": {
-              "required": [
-                "node_cursor"
-              ]
-            },
-            "then": {
-              "required": [
-                "symbol"
-              ]
-            },
-            "description": "node_cursor continues a symbol read"
           }
         ]
       },
@@ -7672,16 +7630,20 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
+          "symbol": {
+            "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration.",
+            "$ref": "#/components/schemas/SymbolId"
+          },
           "nodes": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/Node"
             },
-            "description": "Nodes the read selected, outermost first: per declaration for a `symbol` read, from\nthe file node inward for a `position` read."
+            "description": "Nodes the read selected, in pre-order: per declaration, in the order a symbol read\nlists them, or the unit's nodes from its file node on."
           },
           "node_cursor": {
             "type": "string",
-            "description": "Continuation for the rest of a `symbol` read whose nodes crossed the answer's node\ncount or source byte bound. Absent when the answer holds the last node."
+            "description": "Continuation for the rest of an answer whose nodes crossed its node count or source\nbyte bound. Absent when the answer holds the last node."
           },
           "revision": {
             "$ref": "#/components/schemas/Revision",
@@ -7704,83 +7666,173 @@
           "nodes",
           "revision"
         ],
-        "description": "The nodes a read selected, each with its source text and identity derived from its bytes.",
+        "description": "The nodes a read selected, each with its source text and its place inside its symbol or\nunit.",
         "examples": [
           {
+            "symbol": "rift://symbol/local/rust/app/config/Config",
             "nodes": [
               {
-                "id": "rift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2",
+                "declaration": 0,
+                "index": 0,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "file",
-                "range": {
-                  "start": 0,
-                  "end": 356
-                },
-                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
-              },
-              {
-                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "source_file",
-                "range": {
-                  "start": 0,
-                  "end": 356
-                },
-                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
-              },
-              {
-                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-                "of": "rift://symbol/local/rust/app/config/load_config",
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "function_item",
+                "kind": "struct_item",
                 "facets": [
                   "declaration",
                   "definition"
                 ],
                 "range": {
-                  "start": 218,
-                  "end": 355
+                  "start": 105,
+                  "end": 160
                 },
-                "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
               },
               {
-                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
+                "declaration": 0,
+                "index": 1,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "block",
+                "kind": "visibility_modifier",
                 "range": {
-                  "start": 281,
-                  "end": 355
+                  "start": 105,
+                  "end": 108
                 },
-                "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                "source": "pub",
+                "parent": 0
               },
               {
-                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
+                "declaration": 0,
+                "index": 2,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "call_expression",
+                "kind": "type_identifier",
+                "range": {
+                  "start": 116,
+                  "end": 122
+                },
+                "source": "Config",
+                "parent": 0
+              },
+              {
+                "declaration": 0,
+                "index": 3,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_declaration_list",
+                "range": {
+                  "start": 123,
+                  "end": 160
+                },
+                "source": "{\n    pub root: std::path::PathBuf,\n}",
+                "parent": 0
+              },
+              {
+                "declaration": 0,
+                "index": 4,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_declaration",
                 "facets": [
-                  "expression"
+                  "declaration",
+                  "definition"
                 ],
                 "range": {
-                  "start": 334,
-                  "end": 353
+                  "start": 129,
+                  "end": 157
                 },
-                "source": "parse_config(&text)"
+                "source": "pub root: std::path::PathBuf",
+                "parent": 3
               },
               {
-                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
+                "declaration": 0,
+                "index": 5,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "visibility_modifier",
+                "range": {
+                  "start": 129,
+                  "end": 132
+                },
+                "source": "pub",
+                "parent": 4
+              },
+              {
+                "declaration": 0,
+                "index": 6,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_identifier",
+                "range": {
+                  "start": 133,
+                  "end": 137
+                },
+                "source": "root",
+                "parent": 4
+              },
+              {
+                "declaration": 0,
+                "index": 7,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "scoped_type_identifier",
+                "range": {
+                  "start": 139,
+                  "end": 157
+                },
+                "source": "std::path::PathBuf",
+                "parent": 4
+              },
+              {
+                "declaration": 0,
+                "index": 8,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "scoped_identifier",
+                "range": {
+                  "start": 139,
+                  "end": 148
+                },
+                "source": "std::path",
+                "parent": 7
+              },
+              {
+                "declaration": 0,
+                "index": 9,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
-                  "start": 334,
-                  "end": 346
+                  "start": 139,
+                  "end": 142
                 },
-                "source": "parse_config"
+                "source": "std",
+                "parent": 8
+              },
+              {
+                "declaration": 0,
+                "index": 10,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "identifier",
+                "range": {
+                  "start": 144,
+                  "end": 148
+                },
+                "source": "path",
+                "parent": 8
+              },
+              {
+                "declaration": 0,
+                "index": 11,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "type_identifier",
+                "range": {
+                  "start": 150,
+                  "end": 157
+                },
+                "source": "PathBuf",
+                "parent": 7
               }
             ],
             "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
@@ -7791,13 +7843,19 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "id": {
-            "$ref": "#/components/schemas/NodeId",
-            "description": "Content identity of this node. Nodes of one language and kind with equal bytes share\nit; `unit` and `range` locate this one."
+          "declaration": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Ordinal of the declaration holding this node among the declarations of the symbol the\nread names, from 0 in the order a symbol read lists them. Absent for a node outside\nevery declaration: the file node, an import, a top-level statement.",
+            "maximum": 9007199254740991
           },
-          "of": {
-            "description": "The symbol this node declares. Absent where a node declares no symbol -\npunctuation, a keyword, a comment, an expression.",
-            "$ref": "#/components/schemas/SymbolId"
+          "index": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0.",
+            "maximum": 9007199254740991
           },
           "unit": {
             "$ref": "#/components/schemas/NodeUnit",
@@ -7836,8 +7894,11 @@
             "default": []
           },
           "parent": {
-            "description": "The region this one is nested inside. Absent at the top level of a unit.",
-            "$ref": "#/components/schemas/NodeId"
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "`index` of the node this one is nested inside, in the same declaration or unit. Absent\nfor node 0.",
+            "maximum": 9007199254740991
           },
           "extensions": {
             "$ref": "#/components/schemas/Extensions",
@@ -7846,14 +7907,14 @@
           }
         },
         "required": [
-          "id",
+          "index",
           "unit",
           "language",
           "kind",
           "range",
           "source"
         ],
-        "description": "One node of a source unit's syntax tree, with its source text. It identifies a source\nrange and provider-local syntax kind. `of` connects the node to the symbol it declares."
+        "description": "One node of a source unit's syntax tree, with its source text, addressed by its place inside\na symbol. A node inside a declaration's item subtree is node `index` of declaration\n`declaration` of the symbol the read names; a node outside every declaration is node `index`\nof its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at\nthe unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the\nnested symbol. The address names a place at the read's revision: an edit renumbers the nodes\nafter it."
       },
       "NodeFacet": {
         "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",

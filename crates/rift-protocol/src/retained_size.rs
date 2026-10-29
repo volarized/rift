@@ -75,9 +75,9 @@ impl GetSize for crate::read::SourceUnitId {
 }
 
 use crate::read::{
-    Documentation, ExactKind, ExtensionKey, Extensions, Language, NodeId, PackageIdentity,
-    Parameter, RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolFacet, SymbolId,
-    SymbolOrigin, TypeBinding, TypeExpression,
+    Documentation, ExactKind, ExtensionKey, Extensions, Language, PackageIdentity, Parameter,
+    RuntimeIdentity, Signature, SignatureLink, Symbol, SymbolFacet, SymbolId, SymbolOrigin,
+    TypeBinding, TypeExpression,
 };
 
 macro_rules! heap_field {
@@ -281,7 +281,6 @@ heap_fields!(Language, name, dialect);
 heap_fields!(Documentation, text);
 heap_fields!(ExactKind, 0);
 heap_fields!(SymbolId, 0);
-heap_fields!(NodeId, 0);
 heap_fields!(ExtensionKey, 0);
 heap_fields!(PackageIdentity, manager, registry, name, version);
 heap_fields!(RuntimeIdentity, runtime, version);
@@ -499,7 +498,7 @@ pub fn btree_material_bytes<K, V>(len: usize) -> usize {
 }
 
 heap_fields!(crate::read::SourceUnitSpan, unit);
-heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, evidence => vector, occurrence, extensions);
+heap_fields!(crate::read::Relationship, from, kind, facets => vector, to, occurrence, extensions);
 heap_fields!(crate::search::GraphHop, relationship);
 
 impl GetSize for crate::read::RelationshipFacet {
@@ -578,14 +577,6 @@ mod tests {
             kind: ExactKind(kind),
             facets,
             to: SymbolId("rift://symbol/local/rust/app/callee".to_owned()),
-            evidence: vec![NodeId::for_content(
-                &Language {
-                    name: "rust".to_owned(),
-                    dialect: None,
-                },
-                "call_expression",
-                b"callee(1, 2)",
-            )],
             occurrence: Some(crate::read::SourceUnitSpan {
                 unit: crate::read::SourceUnitId("rift://source/project/src/lib.rs".to_owned()),
                 range: crate::read::TextRange { start: 0, end: 12 },

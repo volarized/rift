@@ -23,12 +23,12 @@ use rift_protocol::dependencies::{
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
     Digest, ExactKind, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
-    Language, Node, NodesParams, NodesResult, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
+    Language, NodesParams, NodesResult, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
     RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol,
     SymbolId, TextRange,
 };
 use rift_protocol::revision::{Revision, RevisionPoint};
-use rift_syntax::{ByteRange, SyntaxNode, SyntaxProvider, SyntaxSymbol, registry};
+use rift_syntax::{ByteRange, SyntaxProvider, registry};
 
 use crate::history::{StoredHistory, SymbolTimelines};
 
@@ -1026,9 +1026,10 @@ impl ReadService {
         self.index.chunked_text_files()
     }
 
-    /// Reads syntax nodes with their source: every node of one symbol, or the nodes covering
-    /// one UTF-8 byte position. The tree the nodes come from is the one this service holds;
-    /// A git `params.revision` was already honored by building the service at that commit.
+    /// Reads syntax nodes with their source: every node of one symbol, or the nodes of the
+    /// declaration or unit holding one UTF-8 byte position. The tree the nodes come from is
+    /// the one this service holds; a git `params.revision` was already honored by building
+    /// the service at that commit.
     ///
     /// # Errors
     ///
@@ -1044,27 +1045,27 @@ impl ReadService {
         }
         self.accept_revision(params.revision.as_ref())?;
         match nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)? {
-            nodes::NodesSelector::Position { path, position } => {
-                self.position_nodes(&path, position)
-            }
+            nodes::NodesSelector::Position {
+                path,
+                position,
+                cursor,
+            } => self.position_nodes(&path, position, cursor),
             nodes::NodesSelector::Symbol { id, key, offset } => self.symbol_nodes(id, &key, offset),
         }
     }
 
-    /// The nodes covering `position` in the file at `path`, from its file node inward.
+    /// The nodes of the declaration holding `position` in the file at `path`: every node of
+    /// that declaration's symbol, or the unit's nodes when no declaration holds it.
     fn position_nodes(
         &self,
         path: &CoreProjectPath,
         position: u64,
+        cursor: Option<&str>,
     ) -> Result<NodesResult, RiftError> {
         let Some(file) = self.index.file(path) else {
-            return self.text_nodes(path, position);
+            return self.text_nodes(path, position, cursor);
         };
         validate_node_position(file.source(), position)?;
-        let document = self
-            .index
-            .syntax(path)?
-            .ok_or_else(|| self.missing_file_fault(path))?;
         let mut warnings = self.revisions.warnings();
         warnings.extend(
             self.index
@@ -1078,17 +1079,24 @@ impl ReadService {
                 })
                 .map(wire_index_warning),
         );
-        nodes_at_file(
+        let page = nodes::position_page(
             &self.index,
-            file,
-            &document.nodes_at(position),
-            (self.served_revision()?, warnings),
-        )
+            (path, position),
+            (cursor, &self.revisions.index_tree_revision),
+            nodes::PageBounds::served(self.index.limits().results_max()),
+        )?
+        .ok_or_else(|| self.missing_file_fault(path))?;
+        Ok(nodes_result(page, self.served_revision()?, warnings))
     }
 
-    /// The file node of a held text file no syntax provider parses. A file a syntax bound
-    /// left out of the index refuses as the omission it is.
-    fn text_nodes(&self, path: &CoreProjectPath, position: u64) -> Result<NodesResult, RiftError> {
+    /// The file node of a held text file no syntax provider parses: the unit's only node. A
+    /// file a syntax bound left out of the index refuses as the omission it is.
+    fn text_nodes(
+        &self,
+        path: &CoreProjectPath,
+        position: u64,
+        cursor: Option<&str>,
+    ) -> Result<NodesResult, RiftError> {
         let text = self
             .index
             .text_file(path)
@@ -1097,13 +1105,23 @@ impl ReadService {
             return Err(self.missing_file_fault(path));
         };
         validate_node_position(text.content(), position)?;
-        Ok(NodesResult {
-            nodes: vec![nodes::text_file_node(path, text.content())],
-            node_cursor: None,
-            revision: self.served_revision()?,
-            view: None,
-            warnings: self.revisions.warnings(),
-        })
+        let unit = file_id(path);
+        let page = nodes::unit_page(
+            nodes::UnitSource {
+                unit: &unit,
+                language: &Language::text(),
+                source: text.content(),
+            },
+            None,
+            cursor,
+            &self.revisions.index_tree_revision,
+            nodes::PageBounds::served(self.index.limits().results_max()),
+        )?;
+        Ok(nodes_result(
+            page,
+            self.served_revision()?,
+            self.revisions.warnings(),
+        ))
     }
 
     /// One page of `id`'s nodes, over every declaration the index binds to it.
@@ -1114,26 +1132,22 @@ impl ReadService {
         offset: usize,
     ) -> Result<NodesResult, RiftError> {
         let results_max = self.index.limits().results_max();
-        let (declarations, _) = self.index.symbols_by_identity_page(key, 0, results_max)?;
-        if declarations.is_empty() {
+        let Some(page) = nodes::symbol_page(
+            &self.index,
+            (id, key),
+            (offset, &self.revisions.index_tree_revision),
+            nodes::PageBounds::served(results_max),
+        )?
+        else {
             return errors::server::read_symbol_not_found()
                 .id(id.as_str())
                 .fail();
-        }
-        let page = nodes::symbol_page(
-            &declarations,
-            |path| nodes::declared_syntax(path, self.index.syntax(path)),
-            (id, &self.revisions.index_tree_revision),
-            offset,
-            nodes::PageBounds::served(results_max),
-        )?;
-        Ok(NodesResult {
-            nodes: page.nodes,
-            node_cursor: page.node_cursor,
-            revision: self.served_revision()?,
-            view: None,
-            warnings: self.revisions.warnings(),
-        })
+        };
+        Ok(nodes_result(
+            page,
+            self.served_revision()?,
+            self.revisions.warnings(),
+        ))
     }
 
     /// Reads syntax nodes for a path selected by workspace discovery but not yet included in
@@ -1153,8 +1167,11 @@ impl ReadService {
         }
 
         self.accept_revision(params.revision.as_ref())?;
-        let nodes::NodesSelector::Position { path, position } =
-            nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)?
+        let nodes::NodesSelector::Position {
+            path,
+            position,
+            cursor,
+        } = nodes::NodesSelector::of(params, &self.revisions.index_tree_revision)?
         else {
             return self.nodes(params);
         };
@@ -1182,7 +1199,7 @@ impl ReadService {
         let Some(before) = before else {
             return self.nodes(params);
         };
-        let Some(parsed) = self.index.parse_source_file_with_nodes(&path, position)? else {
+        let Some(parsed) = self.index.parse_source_file_with_nodes(&path)? else {
             return self.nodes(params);
         };
         let parsed = match parsed {
@@ -1214,13 +1231,19 @@ impl ReadService {
         validate_node_position(parsed.file.source(), position)?;
         let mut warnings = self.revisions.warnings();
         warnings.extend(parsed.warnings);
-        let covering = parsed.nodes.iter().collect::<Vec<_>>();
-        nodes_at_file(
-            &self.index,
-            &parsed.file,
-            &covering,
-            (self.served_revision()?, warnings),
-        )
+        let unit = file_id(&path);
+        let page = nodes::unit_page(
+            nodes::UnitSource {
+                unit: &unit,
+                language: parsed.file.syntax().language(),
+                source: parsed.file.source(),
+            },
+            Some(&nodes::PlacedDocument::new(parsed.document, Vec::new())),
+            cursor,
+            &self.revisions.index_tree_revision,
+            nodes::PageBounds::served(self.index.limits().results_max()),
+        )?;
+        Ok(nodes_result(page, self.served_revision()?, warnings))
     }
 
     /// The failure for a path the syntax index does not hold: `content_unavailable` when
@@ -1641,21 +1664,21 @@ pub(crate) fn results_truncation_warning(results_max: usize) -> ReadWarning {
     }
 }
 
-/// The wire node of one parsed node in `file`, declaring the symbol the index binds to its
-/// range when the index holds the same bytes.
-fn wire_node(
-    index: &WorkspaceIndex,
-    file: &IndexedFile,
-    node: &SyntaxNode,
-) -> Result<Node, RiftError> {
-    let of = index
-        .file(file.path())
-        .filter(|captured| captured.digest() == file.digest())
-        .and_then(|_| symbol_for_range(file, node.range))
-        .map(|symbol| symbol_id(index, crate::search::declared(file, symbol)))
-        .transpose()?
-        .flatten();
-    Ok(nodes::located_node(file, node.kind, node.range, of))
+/// The wire answer of one page, the revision it was read at, and the warnings the read
+/// carries.
+fn nodes_result(
+    page: nodes::NodesPage,
+    revision: Revision,
+    warnings: Vec<ReadWarning>,
+) -> NodesResult {
+    NodesResult {
+        symbol: page.symbol,
+        nodes: page.nodes,
+        node_cursor: page.node_cursor,
+        revision,
+        view: None,
+        warnings,
+    }
 }
 
 /// Builds one hit's wire symbol, and the `symbol_disagreement` warning its retained
@@ -1960,27 +1983,6 @@ pub(crate) fn symbol_id(
         .map(|identity| SymbolId(identity.as_str().to_owned())))
 }
 
-/// The nodes covering one position in `file`, from its file node inward.
-fn nodes_at_file(
-    index: &WorkspaceIndex,
-    file: &IndexedFile,
-    matched: &[&SyntaxNode],
-    (revision, warnings): (Revision, Vec<ReadWarning>),
-) -> Result<NodesResult, RiftError> {
-    let mut nodes = Vec::with_capacity(matched.len().saturating_add(1));
-    nodes.push(nodes::file_node(file));
-    for node in matched {
-        nodes.push(wire_node(index, file, node)?);
-    }
-    Ok(NodesResult {
-        nodes,
-        node_cursor: None,
-        revision,
-        view: None,
-        warnings,
-    })
-}
-
 fn validate_node_position(source: &str, position: u64) -> Result<(), RiftError> {
     let source_len = source.len() as u64;
     if position >= source_len {
@@ -2128,19 +2130,6 @@ pub fn wire_digest(full: &str) -> Digest {
     Digest(full[..DIGEST_WIRE_CHARS].to_owned())
 }
 
-/// Finds the symbol a syntax node belongs to.
-///
-/// A node's range matches a symbol's declaration range (the whole
-/// declaration, including attached docs and attributes) for most nodes, but
-/// the item node itself only spans its own bytes, so it matches on
-/// `item_range` instead.
-pub(crate) fn symbol_for_range(file: &IndexedFile, range: ByteRange) -> Option<&SyntaxSymbol> {
-    file.syntax()
-        .symbols()
-        .iter()
-        .find(|symbol| symbol.range == range || symbol.item_range == range)
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::error::Error;
@@ -2167,7 +2156,6 @@ pub(crate) mod tests {
         Arc, DependenciesConfiguration, DependencyResolution, HistoryConfiguration,
         REQUESTED_PACKAGES_MAX, ReadService, RequestedPackage, RiftError, WorkspaceIndex,
         WorkspaceIndexLimits, accepted_limit, errors, file_id, validate_requested_packages,
-        wire_node,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn Error>>;
@@ -2509,10 +2497,8 @@ pub(crate) mod tests {
         assert_eq!(file.language, Language::text());
         assert_eq!(file.source, source);
         assert_eq!((file.range.start, file.range.end), (0, source.len() as u64));
-        assert_eq!(
-            file.id,
-            rift_protocol::read::NodeId::for_content(&Language::text(), "file", source.as_bytes())
-        );
+        assert_eq!((file.declaration, file.index, file.parent), (None, 0, None));
+        assert!(answer.symbol.is_none(), "a unit's nodes name no symbol");
         let past = service
             .nodes(&NodesParams::at(
                 ProjectPath("lib.rs".to_owned()),
@@ -2568,10 +2554,10 @@ pub(crate) mod tests {
                 .to_owned(),
         );
         service
-            .nodes(&NodesParams::of(id.clone()))?
+            .nodes(&NodesParams::of(id))?
             .nodes
             .into_iter()
-            .find(|node| node.of.as_ref() == Some(&id))
+            .find(|node| node.index == 0)
             .ok_or_else(|| "the symbol's item node".into())
     }
 
@@ -2743,10 +2729,13 @@ pub fn compute() -> i32 {
                 .is_some_and(|nodes| !nodes.is_empty())
         );
         assert_eq!(value["nodes"][0]["language"], "rust");
-        assert!(
-            value["nodes"][0]["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("rift://node/rust/"))
+        assert_eq!(
+            (
+                &value["nodes"][0]["declaration"],
+                &value["nodes"][0]["index"]
+            ),
+            (&json!(0), &json!(0)),
+            "byte 5 answers the struct, whose item node is node 0"
         );
         assert!(
             value.get("warnings").is_none(),
@@ -2787,11 +2776,8 @@ pub fn compute() -> i32 {
             syntax_limits,
         )?;
         let position = 12;
-        let matched = complete.nodes_at(position);
-        let mut expected_nodes = vec![super::nodes::file_node(file)];
-        for node in &matched {
-            expected_nodes.push(wire_node(service.index(), file, node)?);
-        }
+        let _ = complete;
+        let expected_nodes = expected_position_nodes(&service, &path, position)?;
 
         fs::write(&source_path, "pub fn replacement() {}\n".repeat(40))?;
         let actual = service.nodes(&NodesParams::at(
@@ -2807,6 +2793,23 @@ pub fn compute() -> i32 {
                 .any(|node| node.source.contains("Beacon"))
         );
         Ok(())
+    }
+
+    /// The nodes a position read of the held file at `path` answers, read straight from the
+    /// shared node pages.
+    fn expected_position_nodes(
+        service: &ReadService,
+        path: &rift_core::ProjectPath,
+        position: u64,
+    ) -> TestResult<Vec<rift_protocol::read::Node>> {
+        Ok(super::nodes::position_page(
+            service.index(),
+            (path, position),
+            (None, &service.revisions.index_tree_revision),
+            super::nodes::PageBounds::served(service.index().limits().results_max()),
+        )?
+        .ok_or("the index holds the file")?
+        .nodes)
     }
 
     #[test]
@@ -2839,10 +2842,8 @@ pub fn compute() -> i32 {
             service.index().limits().syntax(),
         )?;
         let position = u64::try_from(source.find("section").ok_or("fixture tag missing")?)?;
-        let mut expected_nodes = vec![super::nodes::file_node(file)];
-        for node in complete.nodes_at(position) {
-            expected_nodes.push(wire_node(service.index(), file, node)?);
-        }
+        let _ = complete;
+        let expected_nodes = expected_position_nodes(&service, &path, position)?;
         let actual = service.nodes(&NodesParams::at(
             ProjectPath(path.as_str().to_owned()),
             position,
@@ -2900,7 +2901,11 @@ pub fn compute() -> i32 {
         let expected = settled.nodes(&params)?;
         assert_eq!(actual.nodes, expected.nodes);
         assert!(!actual.nodes.is_empty());
-        assert!(actual.nodes.iter().all(|node| node.of.is_none()));
+        assert!(
+            actual.symbol.is_none(),
+            "an unpublished file names no symbol"
+        );
+        assert!(actual.nodes.iter().all(|node| node.declaration.is_none()));
         Ok(())
     }
 
@@ -3160,18 +3165,22 @@ pub fn compute() -> i32 {
     }
 
     #[test]
-    fn nodes_carry_their_own_source_from_the_file_node_inward() -> TestResult {
+    fn nodes_of_the_declaration_at_a_position_carry_their_own_source() -> TestResult {
         let (directory, service) = fixture()?;
         let result = service.nodes(&NodesParams::at(ProjectPath("src/lib.rs".to_owned()), 5))?;
-        assert!(
-            result.nodes.len() > 2,
-            "the fixture position must be covered by the file node and grammar nodes"
+        assert_eq!(
+            result.symbol,
+            Some(SymbolId(local_identity("rust", &["beacon", "Beacon"]))),
+            "byte 5 lies inside `pub struct Beacon;`"
         );
+        assert!(result.nodes.len() > 1, "the struct holds its own nodes");
         let text = std::fs::read_to_string(directory.path().join("src/lib.rs"))?;
-        let file = &result.nodes[0];
-        assert_eq!(file.kind.0, rift_protocol::read::FILE_NODE_KIND);
-        assert_eq!((file.range.start, file.range.end), (0, text.len() as u64));
-        assert_eq!(file.of, None);
+        let item = &result.nodes[0];
+        assert_eq!(item.kind.0, "struct_item");
+        assert_eq!(
+            (item.declaration, item.index, item.parent),
+            (Some(0), 0, None)
+        );
         for node in &result.nodes {
             let start = usize::try_from(node.range.start)?;
             let end = usize::try_from(node.range.end)?;
@@ -3373,18 +3382,10 @@ pub fn compute() -> i32 {
         );
 
         let item = item_node(&service, &value["hits"][0])?;
-        let rust = Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        };
         assert_eq!(
-            item.id,
-            rift_protocol::read::NodeId::for_content(
-                &rust,
-                "function_item",
-                item.source.as_bytes()
-            ),
-            "the identity is the digest of the declaration node's language, kind, and bytes"
+            (item.declaration, item.index),
+            (Some(0), 0),
+            "the declaration's item node is node 0 of its declaration"
         );
 
         let top_level: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
@@ -4327,8 +4328,8 @@ pub fn compute() -> i32 {
         }
     }
 
-    /// Two calls of one function, so two nodes with equal bytes in one file.
-    const REPEATED_CALL_SOURCE: &str = "pub fn alpha() -> u8 { seven() }\npub fn beta() -> u8 { seven() }\nfn seven() -> u8 { 7 }\n";
+    /// A module holding a function, then a second function, each documented.
+    const NESTED_SOURCE: &str = "/// Lamp.\npub mod lamp {\n    /// Light.\n    pub fn light() -> u8 {\n        1\n    }\n}\n\npub fn dim() {}\n";
 
     fn service_over(source: &str) -> TestResult<(TempDir, ReadService)> {
         let directory = tempfile::tempdir()?;
@@ -4345,76 +4346,83 @@ pub fn compute() -> i32 {
         Ok((directory, service))
     }
 
-    /// The innermost and outermost nodes covering the `index`th `seven()` call in `source`.
-    fn call_nodes(
-        service: &ReadService,
-        source: &str,
-        index: usize,
-    ) -> TestResult<(rift_protocol::read::Node, rift_protocol::read::Node)> {
-        let (position, _) = source
-            .match_indices("seven()")
-            .nth(index)
-            .ok_or("the fixture holds the call")?;
-        let result = service.nodes(&NodesParams::at(
+    fn nodes_at_text(service: &ReadService, source: &str, text: &str) -> TestResult<NodesResult> {
+        let position = source.find(text).ok_or("the fixture holds the text")?;
+        Ok(service.nodes(&NodesParams::at(
             ProjectPath("src/lib.rs".to_owned()),
             u64::try_from(position)?,
-        ))?;
-        let innermost = result.nodes.last().ok_or("a node covers the call")?.clone();
-        let outermost = result
-            .nodes
-            .first()
-            .ok_or("a node covers the call")?
-            .clone();
-        Ok((innermost, outermost))
+        ))?)
     }
 
-    /// Equal bytes of one language and kind are one node identity, wherever they are written;
-    /// the location of each stays its own.
+    /// A position inside a nested declaration answers that declaration's symbol and its own
+    /// nodes: its item node is index 0 of declaration 0 with no parent, and every parent is
+    /// an index inside the same declaration. A position no declaration holds answers the
+    /// unit, from its file node at 0.
     #[test]
-    fn nodes_with_equal_bytes_share_one_identity_and_keep_their_own_ranges() -> TestResult {
-        let (_directory, service) = service_over(REPEATED_CALL_SOURCE)?;
-        let (first, _) = call_nodes(&service, REPEATED_CALL_SOURCE, 0)?;
-        let (second, _) = call_nodes(&service, REPEATED_CALL_SOURCE, 1)?;
-        assert_eq!(first.kind, second.kind);
-        assert_eq!(first.id, second.id, "equal bytes answer one identity");
-        assert_eq!(first.unit, second.unit);
-        assert_ne!(first.range, second.range, "each node keeps its own range");
-        let start = usize::try_from(first.range.start)?;
-        let end = usize::try_from(first.range.end)?;
-        let bytes = REPEATED_CALL_SOURCE
-            .get(start..end)
-            .ok_or("the range lands in the source")?;
+    fn a_position_answers_the_nodes_of_the_declaration_holding_it() -> TestResult {
+        let (_directory, service) = service_over(NESTED_SOURCE)?;
+        let answer = nodes_at_text(&service, NESTED_SOURCE, "1\n")?;
+        let light = SymbolId(local_identity("rust", &["beacon", "lamp", "light"]));
+        assert_eq!(answer.symbol, Some(light));
+        let item = answer.nodes.first().ok_or("the function holds nodes")?;
+        assert_eq!(item.kind.0, "function_item");
         assert_eq!(
-            first.id,
-            rift_protocol::read::NodeId::for_content(
-                &first.language,
-                &first.kind.0,
-                bytes.as_bytes()
-            )
+            (item.declaration, item.index, item.parent),
+            (Some(0), 0, None)
+        );
+        for (offset, node) in answer.nodes.iter().enumerate() {
+            assert_eq!(
+                node.index,
+                u64::try_from(offset)?,
+                "indexes count in pre-order"
+            );
+            assert_eq!(node.declaration, Some(0));
+            assert!(node.parent.is_none_or(|parent| parent < node.index));
+        }
+        let unit = nodes_at_text(&service, NESTED_SOURCE, "/// Lamp.")?;
+        assert_eq!(
+            unit.symbol, None,
+            "the module's documentation lies outside every item"
+        );
+        let file = unit.nodes.first().ok_or("the unit holds its file node")?;
+        assert_eq!(
+            (file.kind.0.as_str(), file.declaration, file.index),
+            (rift_protocol::read::FILE_NODE_KIND, None, 0)
         );
         Ok(())
     }
 
-    /// An edit elsewhere in the file moves a node without changing its identity, while the
-    /// file node, whose bytes the edit changed, answers another identity.
+    /// An edit inside one declaration renumbers no node of another declaration.
     #[test]
-    fn a_node_identity_survives_an_edit_elsewhere_in_the_file() -> TestResult {
-        let (_before_directory, before) = service_over(REPEATED_CALL_SOURCE)?;
-        let edited = REPEATED_CALL_SOURCE
-            .replace("{ seven() }\npub fn beta", "{ 1 + seven() }\npub fn beta");
+    fn an_edit_in_one_declaration_leaves_another_declarations_indexes() -> TestResult {
+        let (_before_directory, before) = service_over(NESTED_SOURCE)?;
+        let edited = NESTED_SOURCE.replace("        1\n", "        let one = 1;\n        one\n");
         let (_after_directory, after) = service_over(&edited)?;
-        let (call_before, file_before) = call_nodes(&before, REPEATED_CALL_SOURCE, 1)?;
-        let (call_after, file_after) = call_nodes(&after, &edited, 1)?;
+        let address = |node: &rift_protocol::read::Node| {
+            (
+                node.kind.0.clone(),
+                node.declaration,
+                node.index,
+                node.parent,
+            )
+        };
+        let dim_before = nodes_at_text(&before, NESTED_SOURCE, "dim")?;
+        let dim_after = nodes_at_text(&after, &edited, "dim")?;
+        assert_eq!(dim_before.symbol, dim_after.symbol);
         assert_eq!(
-            call_before.id, call_after.id,
-            "the call's own bytes did not change"
+            dim_before.nodes.iter().map(address).collect::<Vec<_>>(),
+            dim_after.nodes.iter().map(address).collect::<Vec<_>>(),
+            "the edit inside `light` leaves `dim`'s addresses"
         );
-        assert_eq!(call_after.range.start, call_before.range.start + 4);
-        assert_ne!(file_before.id, file_after.id, "the file's bytes changed");
+        assert_ne!(
+            dim_before.nodes.first().map(|node| node.range.start),
+            dim_after.nodes.first().map(|node| node.range.start),
+            "the edit moved the bytes"
+        );
         Ok(())
     }
 
-    /// A declaration's node is its item node: the bytes without the attached documentation
+    /// A declaration's item node spans the declaration without the attached documentation
     /// and attributes the declaration's own range covers.
     #[test]
     fn a_documented_declaration_names_its_item_node() -> TestResult {
@@ -4422,13 +4430,9 @@ pub fn compute() -> i32 {
         let params: GetSymbolParams = serde_json::from_value(json!({"name": "Beacon"}))?;
         let value = serde_json::to_value(service.get_symbol(&params)?)?;
         let hit = &value["hits"][0];
-        let rust = Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        };
-        let item =
-            rift_protocol::read::NodeId::for_content(&rust, "struct_item", b"pub struct Beacon;");
-        assert_eq!(item_node(&service, hit)?.id, item);
+        let item = item_node(&service, hit)?;
+        assert_eq!((item.declaration, item.index), (Some(0), 0));
+        assert_eq!(item.source, "pub struct Beacon;");
         assert_eq!(
             declared_text(directory.path(), hit)?,
             DOCUMENTED_SOURCE.trim_end()
@@ -4453,9 +4457,15 @@ pub fn compute() -> i32 {
             .find(|node| node["kind"] == "struct_item")
             .ok_or("fixture must witness the struct_item node")?;
         assert!(
-            item["of"].as_str().is_some_and(|id| id.contains("/Beacon")),
-            "documented struct item must backlink to its symbol, got {:?}",
-            item["of"]
+            value["symbol"]
+                .as_str()
+                .is_some_and(|id| id.contains("/Beacon")),
+            "the documented struct's nodes name its symbol, got {:?}",
+            value["symbol"]
+        );
+        assert_eq!(
+            (&item["declaration"], &item["index"]),
+            (&json!(0), &json!(0))
         );
         Ok(())
     }
@@ -4475,8 +4485,14 @@ pub fn compute() -> i32 {
             .find(|node| node["kind"] == "struct_item")
             .ok_or("fixture must witness the struct_item node")?;
         assert!(
-            item["of"].as_str().is_some_and(|id| id.contains("/Beacon")),
-            "undocumented struct item must still backlink to its symbol"
+            value["symbol"]
+                .as_str()
+                .is_some_and(|id| id.contains("/Beacon")),
+            "the undocumented struct's nodes still name its symbol"
+        );
+        assert_eq!(
+            (&item["declaration"], &item["index"]),
+            (&json!(0), &json!(0))
         );
         Ok(())
     }
@@ -4496,8 +4512,8 @@ pub fn compute() -> i32 {
             .find(|node| node["kind"] == "impl_item")
             .ok_or("fixture must witness the impl_item node")?;
         assert!(
-            impl_node.get("symbol").is_none(),
-            "impl_item is not itself a declared symbol, so the member stays off the wire"
+            value.get("symbol").is_none() && impl_node.get("declaration").is_none(),
+            "impl_item is not itself a declared symbol, so the unit holds it"
         );
         Ok(())
     }
@@ -4645,13 +4661,6 @@ pub fn compute() -> i32 {
             .ok_or("fixture must witness the jsx_element node")?;
         assert_eq!(jsx["language"], json!("typescript:tsx"));
         assert_eq!(jsx["facets"], json!(["expression"]));
-        assert!(
-            jsx["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("rift://node/typescript:tsx/")),
-            "a tsx node address files under the dialect segment: {:?}",
-            jsx["id"]
-        );
         Ok(())
     }
 
@@ -4752,11 +4761,6 @@ pub fn compute() -> i32 {
             .ok_or("position sits inside the heading's section")?;
         assert_eq!(section["language"], json!("markdown"));
         assert_eq!(section["facets"], json!(["declaration"]));
-        let section_id = section["id"].as_str().unwrap_or_default();
-        assert!(
-            section_id.starts_with("rift://node/markdown/"),
-            "a markdown node address files under the markdown segment: {section_id}"
-        );
         assert!(
             nodes.iter().any(|node| node["kind"] == "paragraph"),
             "position sits inside the prose paragraph: {nodes:#?}"
@@ -4904,11 +4908,6 @@ pub fn compute() -> i32 {
             .ok_or("position sits inside the port member's pair")?;
         assert_eq!(pair["language"], json!("json"));
         assert_eq!(pair["facets"], json!(["declaration"]));
-        let pair_id = pair["id"].as_str().unwrap_or_default();
-        assert!(
-            pair_id.starts_with("rift://node/json/"),
-            "a JSON node address files under the json segment: {pair_id}"
-        );
         assert!(
             nodes.iter().any(|node| node["kind"] == "number"),
             "position sits inside the number value: {nodes:#?}"
@@ -4937,11 +4936,6 @@ pub fn compute() -> i32 {
             .ok_or("position sits inside the retries entry's pair")?;
         assert_eq!(pair["language"], json!("yaml"));
         assert_eq!(pair["facets"], json!(["declaration"]));
-        let pair_id = pair["id"].as_str().unwrap_or_default();
-        assert!(
-            pair_id.starts_with("rift://node/yaml/"),
-            "a YAML node address files under the yaml segment: {pair_id}"
-        );
         Ok(())
     }
 
@@ -5666,7 +5660,6 @@ pub fn compute() -> i32 {
                     rift_core::SourceUnitId::parse("rift://source/rift.sources.project/src/lib.rs")
                         .expect("source unit"),
                     rift_core::SourceRange::new(0, 8).expect("range"),
-                    None,
                 ))
                 .identity_anchor(rift_core::SymbolId::new(identity).expect("identity"));
         }

@@ -9,7 +9,6 @@ use crate::dependencies::RequestedPackage;
 use crate::schema;
 use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 
 /// Most characters a public symbol name or declaration lookup name carries.
@@ -87,14 +86,6 @@ macro_rules! project_path_first_segment {
             project_path_class!(),
             "+)?)?)?)"
         )
-    };
-}
-
-/// The language segment a `rift://node/` or `rift://symbol/` identity carries before its path:
-/// one word, or two joined by `:`.
-macro_rules! identity_language_segment {
-    () => {
-        r"[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?"
     };
 }
 
@@ -599,11 +590,10 @@ pub struct Language {
 }
 
 impl Language {
-    /// The segment a `SymbolId` or `NodeId` files this identity under.
+    /// The segment a `SymbolId` files this identity under.
     ///
     /// `name` alone, or `name:dialect` when a dialect is set - the two
-    /// spellings the `SymbolId` and `NodeId` patterns advertise after their
-    /// `rift://symbol/` and `rift://node/` prefixes.
+    /// spellings the `SymbolId` pattern advertises after its `rift://symbol/` prefix.
     #[must_use]
     pub fn identity_segment(&self) -> String {
         match &self.dialect {
@@ -713,19 +703,27 @@ fn is_language_word(word: &str) -> bool {
         })
 }
 
-/// One node of a source unit's syntax tree, with its source text. It identifies a source
-/// range and provider-local syntax kind. `of` connects the node to the symbol it declares.
+/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
+/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
+/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// after it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_node_empty_defaults)]
 pub struct Node {
-    /// Content identity of this node. Nodes of one language and kind with equal bytes share
-    /// it; `unit` and `range` locate this one.
-    pub id: NodeId,
-    /// The symbol this node declares. Absent where a node declares no symbol -
-    /// punctuation, a keyword, a comment, an expression.
+    /// Ordinal of the declaration holding this node among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
+    /// every declaration: the file node, an import, a top-level statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub of: Option<SymbolId>,
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub declaration: Option<u64>,
+    /// Pre-order position of this node inside its declaration's item subtree, or inside its
+    /// unit when `declaration` is absent. The item node and the unit's file node are 0.
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub index: u64,
     /// The source unit the node is written in: a project file, or a package or runtime
     /// source unit for a node of a package or runtime symbol.
     pub unit: NodeUnit,
@@ -746,9 +744,11 @@ pub struct Node {
     /// The node's named parts, including its function body and documentation. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<NodeRegion>,
-    /// The region this one is nested inside. Absent at the top level of a unit.
+    /// `index` of the node this one is nested inside, in the same declaration or unit. Absent
+    /// for node 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent: Option<NodeId>,
+    #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
+    pub parent: Option<u64>,
     /// Syntax facts the model has no field for, namespaced by the provider that emitted
     /// them. Absent when empty.
     #[serde(default, skip_serializing_if = "Extensions::is_empty")]
@@ -800,29 +800,6 @@ pub enum NodeFacet {
     Test,
 }
 
-/// Content identity of one syntax-tree node: `rift://node/`, the language's identity segment,
-/// `/`, then the lowercase hex SHA-256 of the node's language, kind, and exact bytes. The digest
-/// input is the identity segment and the kind, each preceded by its UTF-8 byte length as a
-/// 64-bit little-endian integer, followed by the node's bytes. Two nodes of one language and
-/// kind with equal bytes share one identity wherever they are written, so the identity never
-/// locates a node: the `unit` and `range` beside it do.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(transparent)]
-#[schemars(transparent)]
-pub struct NodeId(
-    #[schemars(
-        example = &"rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28"
-    )]
-    #[schemars(length(min = 78, max = 206))]
-    #[schemars(regex(
-        pattern = concat!(r"^rift://node/", identity_language_segment!(), r"/[0-9a-f]{64}$")
-    ))]
-    pub String,
-);
-
-/// The scheme and kind prefix every [`NodeId`] starts with.
-const NODE_ID_PREFIX: &str = "rift://node/";
-
 /// The kind of the node that spans one whole source unit. Every source unit has one, the
 /// outermost node of its tree, whether or not a syntax provider parses the unit.
 pub const FILE_NODE_KIND: &str = "file";
@@ -842,33 +819,6 @@ impl Language {
     }
 }
 
-impl NodeId {
-    /// Mints the content identity of one syntax node from its language, kind, and bytes.
-    ///
-    /// `kind` is the node's kind in the provider's vocabulary, as `Node.kind` carries it, and
-    /// `bytes` are the node's exact source bytes, never an excerpt cut to a bound. Every
-    /// producer mints through this function, so one node read twice, or read by two
-    /// producers, answers one identity.
-    #[must_use]
-    pub fn for_content(language: &Language, kind: &str, bytes: &[u8]) -> Self {
-        let segment = language.identity_segment();
-        let mut hasher = Sha256::new();
-        hasher.update(length_prefix(segment.len()));
-        hasher.update(segment.as_bytes());
-        hasher.update(length_prefix(kind.len()));
-        hasher.update(kind.as_bytes());
-        hasher.update(bytes);
-        let digest = data_encoding::HEXLOWER.encode(&hasher.finalize());
-        Self(format!("{NODE_ID_PREFIX}{segment}/{digest}"))
-    }
-}
-
-/// The digest input's length field: a byte length as a 64-bit little-endian integer. Every
-/// target Rift builds for has a `usize` of at most 64 bits, so the widening loses nothing.
-fn length_prefix(length: usize) -> [u8; 8] {
-    (length as u64).to_le_bytes()
-}
-
 /// One named part of a node, and the bytes it spans.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -879,9 +829,10 @@ pub struct NodeRegion {
     pub range: TextRange,
 }
 
-/// Lists syntax nodes with their source, outermost first: every node of one `symbol`, or the
-/// nodes covering one `position` in one file. Each node carries its kind, range, and source
-/// text, including expressions smaller than a declaration.
+/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
+/// innermost declaration holding one `position` in one file, or of that file's unit when no
+/// declaration holds it. Each node carries its kind, range, source text, and place, including
+/// expressions smaller than a declaration.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::require_one_node_selector)]
@@ -906,15 +857,17 @@ pub struct NodesParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
     pub path: Option<ProjectPath>,
-    /// UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes
-    /// themselves carry the spans. A position inside a multi-byte character is valid and
-    /// answers with its enclosing nodes; a position at or past the file's byte length
-    /// refuses.
+    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
+    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
+    /// innermost declaration holding the node at the position, or of the file's unit when no
+    /// declaration holds it. A position inside a multi-byte character is valid; a position at
+    /// or past the file's byte length refuses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub position: Option<u64>,
-    /// Continuation a preceding `symbol` read returned, bound to that symbol and the tree
-    /// revision it read. The server refuses it beside `path` and once the tree has moved.
+    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
+    /// and the tree revision it read. The caller MUST send it with the selector of that read;
+    /// the server refuses it for another symbol or unit and once the tree has moved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 4096))]
     pub node_cursor: Option<String>,
@@ -925,7 +878,7 @@ pub struct NodesParams {
     /// The revision to read: a git revision reads that commit, a tree revision the served
     /// working tree, and a release revision selects the release of a package or runtime
     /// `symbol`'s owner. Omitted reads the served working tree, or for a package the version
-    /// the workspace's lockfiles pin, else the newest collected release. The server refuses
+    /// the workspace's dependencies pin, else the newest collected release. The server refuses
     /// a git revision when the workspace has no version-control repository, and a tree
     /// revision once the index serves another tree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -933,7 +886,7 @@ pub struct NodesParams {
 }
 
 impl NodesParams {
-    /// A read of the nodes covering `position` in the file at `path`.
+    /// A read of the nodes of the declaration or unit holding `position` in the file at `path`.
     #[must_use]
     pub fn at(path: ProjectPath, position: u64) -> Self {
         Self {
@@ -958,97 +911,193 @@ impl NodesParams {
 /// least one node, whose own size `[providers.syntax] max_file` bounds.
 pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
 
-/// The nodes a read selected, each with its source text and identity derived from its bytes.
+/// The nodes a read selected, each with its source text and its place inside its symbol or
+/// unit.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_nodes_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
+        "symbol": "rift://symbol/local/rust/app/config/Config",
         "nodes": [
             {
-                "id": "rift://node/rust/4f3a2ff4244049172428833684ab0a81b1a26d0d66c65180205b8614becc53d2",
+                "declaration": 0,
+                "index": 0,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "file",
-                "range": {
-                    "start": 0,
-                    "end": 356
-                },
-                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
-            },
-            {
-                "id": "rift://node/rust/6e4750f1ee0c1c08e020f97ff4a6a94ca2e46ed4010ddd9d48deafb082cd8961",
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "source_file",
-                "range": {
-                    "start": 0,
-                    "end": 356
-                },
-                "source": "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n"
-            },
-            {
-                "id": "rift://node/rust/05f68d7add6106deac3d04d31bbafb9b809631f459a06c3521a69808e9e54e28",
-                "of": "rift://symbol/local/rust/app/config/load_config",
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "function_item",
+                "kind": "struct_item",
                 "facets": [
                     "declaration",
                     "definition"
                 ],
                 "range": {
-                    "start": 218,
-                    "end": 355
+                    "start": 105,
+                    "end": 160
                 },
-                "source": "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
             },
             {
-                "id": "rift://node/rust/848a546c6f7e14e1022a76d60ceed824a252f264dee0a0be0ea40baebde5f189",
+                "declaration": 0,
+                "index": 1,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "block",
+                "kind": "visibility_modifier",
                 "range": {
-                    "start": 281,
-                    "end": 355
+                    "start": 105,
+                    "end": 108
                 },
-                "source": "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}"
+                "source": "pub",
+                "parent": 0
             },
             {
-                "id": "rift://node/rust/cc25da7abf17089ea6bdd9c4ea921317db5cee7c237499b2af3c6966433d0690",
+                "declaration": 0,
+                "index": 2,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "call_expression",
+                "kind": "type_identifier",
+                "range": {
+                    "start": 116,
+                    "end": 122
+                },
+                "source": "Config",
+                "parent": 0
+            },
+            {
+                "declaration": 0,
+                "index": 3,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_declaration_list",
+                "range": {
+                    "start": 123,
+                    "end": 160
+                },
+                "source": "{\n    pub root: std::path::PathBuf,\n}",
+                "parent": 0
+            },
+            {
+                "declaration": 0,
+                "index": 4,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_declaration",
                 "facets": [
-                    "expression"
+                    "declaration",
+                    "definition"
                 ],
                 "range": {
-                    "start": 334,
-                    "end": 353
+                    "start": 129,
+                    "end": 157
                 },
-                "source": "parse_config(&text)"
+                "source": "pub root: std::path::PathBuf",
+                "parent": 3
             },
             {
-                "id": "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
+                "declaration": 0,
+                "index": 5,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "visibility_modifier",
+                "range": {
+                    "start": 129,
+                    "end": 132
+                },
+                "source": "pub",
+                "parent": 4
+            },
+            {
+                "declaration": 0,
+                "index": 6,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_identifier",
+                "range": {
+                    "start": 133,
+                    "end": 137
+                },
+                "source": "root",
+                "parent": 4
+            },
+            {
+                "declaration": 0,
+                "index": 7,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "scoped_type_identifier",
+                "range": {
+                    "start": 139,
+                    "end": 157
+                },
+                "source": "std::path::PathBuf",
+                "parent": 4
+            },
+            {
+                "declaration": 0,
+                "index": 8,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "scoped_identifier",
+                "range": {
+                    "start": 139,
+                    "end": 148
+                },
+                "source": "std::path",
+                "parent": 7
+            },
+            {
+                "declaration": 0,
+                "index": 9,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
-                    "start": 334,
-                    "end": 346
+                    "start": 139,
+                    "end": 142
                 },
-                "source": "parse_config"
+                "source": "std",
+                "parent": 8
+            },
+            {
+                "declaration": 0,
+                "index": 10,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "identifier",
+                "range": {
+                    "start": 144,
+                    "end": 148
+                },
+                "source": "path",
+                "parent": 8
+            },
+            {
+                "declaration": 0,
+                "index": 11,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "type_identifier",
+                "range": {
+                    "start": 150,
+                    "end": 157
+                },
+                "source": "PathBuf",
+                "parent": 7
             }
         ],
         "revision": "rift://revision/tree/4e1b6c1ab5d6ddbdd1d7e3a7e38fc1bf1d2a35c6a1b0a7c8a4e0bd0c7a9b6f11"
     }
 ]))]
 pub struct NodesResult {
-    /// Nodes the read selected, outermost first: per declaration for a `symbol` read, from
-    /// the file node inward for a `position` read.
+    /// The symbol whose declarations hold the listed nodes: the requested one for a `symbol`
+    /// read, the innermost declaration's symbol for a `position` read. Absent when the nodes
+    /// belong to a unit outside every declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<SymbolId>,
+    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
+    /// lists them, or the unit's nodes from its file node on.
     pub nodes: Vec<Node>,
-    /// Continuation for the rest of a `symbol` read whose nodes crossed the answer's node
-    /// count or source byte bound. Absent when the answer holds the last node.
+    /// Continuation for the rest of an answer whose nodes crossed its node count or source
+    /// byte bound. Absent when the answer holds the last node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_cursor: Option<String>,
     /// The revision this answer was read at: a commit, a release, or a working tree.
@@ -1841,8 +1890,8 @@ pub enum RegionRole {
     Enclosing,
 }
 
-/// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-/// its derivation is how much the provider knew when it was read.
+/// One directed edge between two symbols. Its occurrence is where it was read from, and its
+/// derivation is how much the provider knew when it was read.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_relationship_empty_defaults)]
@@ -1859,10 +1908,6 @@ pub struct Relationship {
     /// The symbol the edge points at. One Rift cannot read carries the `external` origin;
     /// the edge is the same either way.
     pub to: SymbolId,
-    /// Content identities of the nodes this edge was read from, each spanning `occurrence`,
-    /// which is present whenever this list is not empty. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub evidence: Vec<NodeId>,
     /// Exact physical occurrence when this edge was read from source, independent of
     /// whether the provider supplied a source node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2871,7 +2916,7 @@ mod tests {
 
     use super::{
         Digest, Duration, FileId, GLOBAL_WARNING_DETAIL_CHARS_MAX, GetSymbolParams,
-        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language, NodeId,
+        GlobalFailureClass, GlobalPageWarningCode, LANGUAGE_IDENTITY_PATTERN, Language,
         PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, PackageIdentity, REVISION_ID_BYTES_MAX, ReadWarning,
         RelationshipFacet, RevisionId, RevisionIdViolation, SOURCE_WARNINGS_MAX, SearchScope,
         SourceUnitId, Symbol, SymbolId,
@@ -3647,77 +3692,6 @@ mod tests {
         }
     }
 
-    fn rust() -> Language {
-        Language {
-            name: "rust".to_owned(),
-            dialect: None,
-        }
-    }
-
-    /// The minted spelling is the one the schema advertises, for a dialect too, and the
-    /// advertised length bounds are the shortest and longest identity a language segment allows.
-    #[test]
-    fn node_id_minting_answers_the_advertised_pattern_and_length_bounds() {
-        let schema = serde_json::to_value(schema_for!(NodeId)).expect("node schema");
-        let validator =
-            jsonschema::validator_for(&schema).expect("the advertised node schema compiles");
-        let tsx = Language {
-            name: "typescript".to_owned(),
-            dialect: Some("tsx".to_owned()),
-        };
-        for minted in [
-            NodeId::for_content(&rust(), "function_item", b"fn a() {}"),
-            NodeId::for_content(&tsx, "jsx_element", b"<a/>"),
-            NodeId::for_content(&rust(), "source_file", b""),
-        ] {
-            assert!(
-                validator.is_valid(&json!(minted.0)),
-                "the schema must accept the minted {}",
-                minted.0
-            );
-        }
-        let digest_chars = 64;
-        let shortest = super::NODE_ID_PREFIX.len() + 1 + 1 + digest_chars;
-        let longest =
-            super::NODE_ID_PREFIX.len() + super::LANGUAGE_IDENTITY_BYTES_MAX + 1 + digest_chars;
-        assert_eq!(schema["minLength"], json!(shortest));
-        assert_eq!(schema["maxLength"], json!(longest));
-        assert!(
-            !validator.is_valid(&json!("rift://node/rust/src/lib.rs@0-9#3f9a1c2e")),
-            "a location-addressed spelling is no node identity"
-        );
-    }
-
-    /// The identity is the digest of language, kind, and bytes: equal triples answer one
-    /// identity, and changing any one of the three answers another.
-    #[test]
-    fn node_id_is_a_digest_of_language_kind_and_bytes() {
-        let json = Language {
-            name: "json".to_owned(),
-            dialect: None,
-        };
-        let minted = NodeId::for_content(&rust(), "block", b"{ x }");
-        assert_eq!(minted, NodeId::for_content(&rust(), "block", b"{ x }"));
-        assert_ne!(minted, NodeId::for_content(&rust(), "block", b"{ y }"));
-        assert_ne!(minted, NodeId::for_content(&rust(), "expression", b"{ x }"));
-        assert_ne!(minted, NodeId::for_content(&json, "block", b"{ x }"));
-        assert_eq!(
-            NodeId::for_content(&rust(), "identifier", b"parse_config").0,
-            "rift://node/rust/e24de7c856d7c5dabfd8fe5a93b24cac2fd4645040f43bf15f88e0b3a32286d2",
-            "the digest input is length-prefixed segment, length-prefixed kind, then bytes"
-        );
-    }
-
-    /// The length prefixes keep the boundary between kind and bytes in the digest input, so a
-    /// byte moved from the end of the kind to the start of the bytes answers another identity.
-    #[test]
-    fn node_id_keeps_the_boundary_between_kind_and_bytes() {
-        assert_ne!(
-            NodeId::for_content(&rust(), "ab", b"c"),
-            NodeId::for_content(&rust(), "a", b"bc"),
-        );
-    }
-
     /// The tier warnings carry the evidence a caller weighs, so each one is pinned to the
     /// `code` its consumers match on and to the members that carry that evidence.
     #[test]
@@ -4331,6 +4305,7 @@ mod captured_nodes_tests {
             expires_at: "2030-01-01T00:15:00Z".to_owned(),
         };
         let result = NodesResult {
+            symbol: None,
             nodes: Vec::new(),
             node_cursor: None,
             revision: crate::revision::Revision::tree(&"0".repeat(64)).expect("tree revision"),

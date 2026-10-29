@@ -672,8 +672,7 @@ const RIFT_RANGE: &str = "rift:range";
 /// The serde tag property of [`SearchHitTarget`](crate::read::SearchHitTarget),
 /// pinned by [`tests::tagged_union_tags_exist_in_generated_schemas`].
 const SEARCH_HIT_TARGET_TAG: &str = "target";
-/// Its node and file tag values, pinned by the same test.
-const SEARCH_HIT_NODE: &str = "node";
+/// Its file tag value, pinned by the same test.
 const SEARCH_HIT_FILE: &str = "file";
 
 /// Appends `clause` to the `composition` array of `schema`, creating the
@@ -1648,16 +1647,6 @@ pub fn require_one_node_selector(schema: &mut Schema) {
             ]),
         ),
     );
-    append(
-        schema,
-        described(
-            "node_cursor continues a symbol read",
-            when(
-                requires(&[property!(NodesParams, node_cursor)]),
-                requires(&[symbol]),
-            ),
-        ),
-    );
 }
 
 /// A [`SearchTraversal`](crate::search::SearchTraversal) names the declaration its walk
@@ -1686,8 +1675,8 @@ pub fn require_traversal_seed(schema: &mut Schema) {
     );
 }
 
-/// A [`SearchHit`] carries `range` and `line` together or not at all, and node
-/// and file hits always carry both.
+/// A [`SearchHit`] carries `range` and `line` together or not at all, and file hits
+/// always carry both.
 pub fn pair_range_with_line(schema: &mut Schema) {
     let range_and_line = [property!(SearchHit, range), property!(SearchHit, line)];
     append(
@@ -1707,7 +1696,7 @@ pub fn pair_range_with_line(schema: &mut Schema) {
                 property!(SearchHit, hit),
                 properties(vec![(
                     SEARCH_HIT_TARGET_TAG,
-                    json!({ keyword::ENUM: [SEARCH_HIT_NODE, SEARCH_HIT_FILE] }),
+                    json!({ keyword::ENUM: [SEARCH_HIT_FILE] }),
                 )]),
             )]),
             requires(&range_and_line),
@@ -1826,12 +1815,10 @@ pub fn declare_parameter_empty_defaults(schema: &mut Schema) {
     declare_empty_object_defaults(schema, &[property!(Parameter, extensions)]);
 }
 
-/// A [`Relationship`](crate::read::Relationship) states `default: []` on `evidence` and
-/// `default: {}` on `extensions`. `facets` carries its own `minItems: 1` and is never
-/// optional, so it states no default.
+/// A [`Relationship`](crate::read::Relationship) states `default: {}` on `extensions`.
+/// `facets` carries its own `minItems: 1` and is never optional, so it states no default.
 pub fn declare_relationship_empty_defaults(schema: &mut Schema) {
     use crate::read::Relationship;
-    declare_empty_array_defaults(schema, &[property!(Relationship, evidence)]);
     declare_empty_object_defaults(schema, &[property!(Relationship, extensions)]);
 }
 
@@ -2726,13 +2713,11 @@ mod tests {
         let hit_target =
             serde_json::to_value(schema_for!(SearchHitTarget)).expect("SearchHitTarget schema");
         let target_tags = tag_values(&hit_target, SEARCH_HIT_TARGET_TAG);
-        for expected in [SEARCH_HIT_NODE, SEARCH_HIT_FILE] {
-            assert!(
-                target_tags.iter().any(|tag| tag == expected),
-                "SearchHitTarget must serve a {expected} variant under tag \
-                 {SEARCH_HIT_TARGET_TAG}, got {target_tags:?}"
-            );
-        }
+        assert!(
+            target_tags.iter().any(|tag| tag == SEARCH_HIT_FILE),
+            "SearchHitTarget must serve a {SEARCH_HIT_FILE} variant under tag \
+             {SEARCH_HIT_TARGET_TAG}, got {target_tags:?}"
+        );
     }
 
     /// The premise every `declare_*_empty_defaults` function is built on: schemars 1.2.2
@@ -2845,7 +2830,7 @@ mod tests {
             (
                 "Relationship",
                 serde_json::to_value(schema_for!(crate::read::Relationship)).expect("schema"),
-                vec![("evidence", array.clone()), ("extensions", object.clone())],
+                vec![("extensions", object.clone())],
             ),
             (
                 "TypeExpression",

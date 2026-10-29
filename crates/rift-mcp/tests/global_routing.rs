@@ -786,8 +786,8 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     Ok(())
 }
 
-/// A package `get_symbol` naming no revision reads the release the workspace's dependencies
-/// pin, and its answer reports that release.
+/// A package `get_symbol` or `nodes` read naming no revision reads the release the
+/// workspace's dependencies pin, and its answer reports that release.
 #[tokio::test]
 async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
@@ -802,15 +802,19 @@ async fn a_package_symbol_read_names_the_release_the_workspace_pins() -> TestRes
     let release = "rift://revision/cargo/crates.io/demo@1.0.0";
     let read = call_tool(&client, "get_symbol", json!({"id": id})).await?;
     assert_eq!(read["revision"], release, "{read:#}");
-    let asked = fixture
-        .requests()
-        .await
-        .into_iter()
-        .filter(|request| request.uri.ends_with("/v1/symbols"))
-        .filter_map(|request| request.body)
-        .map(|body| body["revision"].clone())
-        .collect::<Vec<_>>();
-    assert_eq!(asked, [json!(release)]);
+    let nodes = call_tool(&client, "nodes", json!({"symbol": id})).await?;
+    assert_eq!(nodes["revision"], release, "{nodes:#}");
+    for endpoint in ["/v1/symbols", "/v1/nodes"] {
+        let asked = fixture
+            .requests()
+            .await
+            .into_iter()
+            .filter(|request| request.uri.ends_with(endpoint))
+            .filter_map(|request| request.body)
+            .map(|body| body["revision"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(asked, [json!(release)], "{endpoint}");
+    }
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -854,7 +858,15 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         "{package:#}\n{local:#}"
     );
     for (package_node, local_node) in package_nodes.iter().zip(local_nodes) {
-        for field in ["id", "kind", "language", "source", "facets"] {
+        for field in [
+            "declaration",
+            "index",
+            "parent",
+            "kind",
+            "language",
+            "source",
+            "facets",
+        ] {
             assert_eq!(
                 package_node[field], local_node[field],
                 "{field}: {package:#}"
@@ -863,24 +875,10 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         assert_eq!(package_node["unit"], COLLECTED_UNIT, "{package:#}");
         assert_eq!(local_node["unit"], "rift://file/src/lib.rs", "{local:#}");
     }
-    assert_eq!(package_nodes[0]["of"], json!(id), "{package:#}");
+    assert_eq!(package["symbol"], json!(id), "{package:#}");
     assert_eq!(
         package_nodes[0]["source"], "pub fn beacon() {}",
         "{package:#}"
-    );
-    let asked = fixture
-        .requests()
-        .await
-        .into_iter()
-        .filter(|request| request.uri.ends_with("/v1/nodes"))
-        .map(|request| request.body)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        asked,
-        [Some(
-            json!({"symbol": id, "revision": "rift://revision/cargo/crates.io/demo@1.0.0"})
-        )],
-        "a read naming no revision reads the release the workspace's dependencies pin"
     );
 
     let view = "a".repeat(64);

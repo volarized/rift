@@ -549,7 +549,7 @@ impl SurfaceFixture {
         // No syntax provider claims it; `nodes` names the missing extension.
         fs::write(directory.path().join("justfile"), "default:\n    echo hi\n")?;
         // An npm scoped package directory, so the corpus mints an identity whose path holds the
-        // `@` RFC 3986 keeps literal. The served `NodeId` pattern left `@` out and refused the
+        // `@` RFC 3986 keeps literal. An identity pattern that left `@` out refused the
         // identity the server had just minted.
         fs::create_dir_all(directory.path().join("packages/@scope/name"))?;
         fs::write(
