@@ -94,6 +94,7 @@ EXPECTED_EDGES = {
     "rift-ranking -> rift-error",
     "rift-search -> rift-core",
     "rift-search -> rift-index",
+    "rift-search -> rift-protocol",
     "rift-search -> rift-ranking",
     "rift-search -> rift-error",
     "rift-search -> rift-tracing",
