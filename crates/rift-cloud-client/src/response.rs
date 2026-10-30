@@ -118,25 +118,6 @@ pub(crate) fn exact_symbol(
     )
 }
 
-pub(crate) fn exact_source(
-    response: RawResponse,
-) -> Result<Parsed<rift_protocol::source_read::GetSourceResult>, RiftError> {
-    use rift_protocol::source_read::GetSourceResult;
-    exact_response(
-        response,
-        contract::Endpoint::Source.operation_id(),
-        &[200, 404, 503],
-        |status, value| {
-            matches!(
-                (status, value),
-                (200, GetSourceResult::Found { .. })
-                    | (404, GetSourceResult::Missing { .. })
-                    | (503, GetSourceResult::Unavailable { .. })
-            )
-        },
-    )
-}
-
 pub(crate) fn source_declarations(
     response: RawResponse,
 ) -> Result<Parsed<rift_protocol::source_read::FindDeclarationsResult>, RiftError> {

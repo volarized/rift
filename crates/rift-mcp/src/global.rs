@@ -463,7 +463,7 @@ pub(crate) async fn callee_declarations(
 ) -> Result<CalleeDeclarations, RiftError> {
     use rift_protocol::source_read::DeclarationPositionResult;
     let mut named = HashMap::new();
-    let mut sources = HashMap::new();
+    let mut verified = HashMap::new();
     let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
     for mut request in declaration_requests(callees) {
         request.view = selected.as_ref().map(|view| view.id.clone());
@@ -504,7 +504,8 @@ pub(crate) async fn callee_declarations(
             else {
                 continue;
             };
-            if !captured_callee_source(client, callees, &position, &id, &view, &mut sources).await?
+            if !captured_callee_source(client, callees, &position, &id, &view, &mut verified)
+                .await?
             {
                 continue;
             }
@@ -522,13 +523,19 @@ pub(crate) async fn callee_declarations(
     Ok(CalleeDeclarations { named })
 }
 
+/// Most declarations read to verify one runtime callee against its embedded stub. A callee
+/// whose declarations in the stub's unit fall past this bound stays unnamed.
+const CALLEE_DECLARATION_LIMIT: u64 = 16;
+
+/// Whether the declaration the global API named for a runtime callee carries the same bytes
+/// as the embedded stub the callee was found in. Callees without embedded stub bytes pass.
 async fn captured_callee_source(
     client: &GlobalClient,
     callees: &[PackageCallee],
     position: &rift_protocol::source_read::SourcePosition,
     id: &SymbolId,
     view: &rift_protocol::symbol_read::CapturedView,
-    sources: &mut HashMap<String, bool>,
+    verified: &mut HashMap<String, bool>,
 ) -> Result<bool, RiftError> {
     for callee in callees {
         let Some(held) = callee.captured_source() else {
@@ -554,44 +561,67 @@ async fn captured_callee_source(
         {
             return Ok(false);
         }
-        let request = rift_protocol::source_read::GetSourceParams {
-            unit: position.unit.clone(),
-            range: None,
-            rev: None,
-            view: Some(view.id.clone()),
-        };
-        if let Some(matched) = sources.get(position.unit.as_str()) {
+        if let Some(matched) = verified.get(id.as_str()) {
             return Ok(*matched);
         }
-        let answer = client.get_source(&request).await?;
-        let matched = captured_source_matches(&answer, &position.unit, view, held);
-        sources.insert(position.unit.as_str().to_owned(), matched);
+        let request = rift_protocol::symbol_read::GetSymbolParams {
+            id: id.clone(),
+            include: vec![rift_protocol::read::GetSymbolInclude::Source],
+            rev: None,
+            view: Some(view.id.clone()),
+            declaration_limit: CALLEE_DECLARATION_LIMIT,
+            declaration_cursor: None,
+        };
+        let answer = client.get_symbol(&request).await?;
+        let matched = declared_source_matches(&answer, &position.unit, view, held);
+        verified.insert(id.as_str().to_owned(), matched);
         return Ok(matched);
     }
     Ok(true)
 }
 
-fn captured_source_matches(
-    answer: &rift_protocol::source_read::GetSourceResult,
+/// Whether `answer` holds a declaration in `unit` and every such declaration's complete
+/// source equals `held` at the declaration's byte range, in the captured `view`.
+fn declared_source_matches(
+    answer: &rift_protocol::symbol_read::GetSymbolResult,
     unit: &rift_protocol::read::SourceUnitId,
     view: &rift_protocol::symbol_read::CapturedView,
     held: &str,
 ) -> bool {
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source,
-        source_complete,
+    let rift_protocol::symbol_read::GetSymbolResult::Found {
         view: returned,
+        declarations,
         ..
     } = answer
     else {
         return false;
     };
-    *source_complete
-        && returned == view
-        && source.span.unit == *unit
-        && source.span.range.start == 0
-        && usize::try_from(source.span.range.end).ok() == Some(held.len())
-        && source.text == held
+    let mut in_unit = declarations
+        .iter()
+        .filter(|declaration| declaration.unit.as_ref() == Some(unit))
+        .peekable();
+    returned == view
+        && in_unit.peek().is_some()
+        && in_unit.all(|declaration| declaration_matches(declaration, held))
+}
+
+/// Whether `declaration` carries its complete source and `held` holds the same bytes at its
+/// range.
+fn declaration_matches(
+    declaration: &rift_protocol::symbol_read::SymbolDeclaration,
+    held: &str,
+) -> bool {
+    let (Ok(start), Ok(end)) = (
+        usize::try_from(declaration.range.start),
+        usize::try_from(declaration.range.end),
+    ) else {
+        return false;
+    };
+    declaration.source_complete
+        && declaration
+            .source
+            .as_deref()
+            .is_some_and(|source| held.get(start..end) == Some(source))
 }
 
 /// The requests asking for `callees`' positions: one per position encoding, each within
@@ -3001,54 +3031,97 @@ mod tests {
 
 #[cfg(test)]
 mod captured_runtime_tests {
-    use super::captured_source_matches;
-    use rift_protocol::source_read::GetSourceResult;
-    use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
+    use super::declared_source_matches;
+    use rift_protocol::symbol_read::{CapturedView, GetSymbolResult, SymbolUnavailableReason};
+
+    const UNIT: &str = "rift://source/stdlib/cpython@3.12.3/builtins.pyi";
+    const STUB: &str = "x = 1\ndef len(obj): ...\n";
+
+    fn found(view: &CapturedView, declaration: &serde_json::Value) -> serde_json::Value {
+        let origin = serde_json::json!({
+            "location": "stdlib", "source_kind": "authored",
+            "runtime": {"runtime": "cpython", "version": "3.12.3"}
+        });
+        serde_json::json!({
+            "outcome": "found", "view": view,
+            "symbol": {
+                "id": "rift://symbol/stdlib/cpython@3.12.3/python/builtins/len",
+                "language": "python", "name": "len", "kind": "function", "origin": origin
+            },
+            "declarations": [declaration]
+        })
+    }
+
+    fn declaration() -> serde_json::Value {
+        serde_json::json!({
+            "origin": {
+                "location": "stdlib", "source_kind": "authored",
+                "runtime": {"runtime": "cpython", "version": "3.12.3"}
+            },
+            "unit": UNIT, "range": {"start": 6, "end": 23}, "line": 2,
+            "source": "def len(obj): ...", "source_complete": true,
+            "signature_indices": [], "type_indices": [], "documentation_indices": []
+        })
+    }
+
+    fn answer(value: serde_json::Value) -> GetSymbolResult {
+        serde_json::from_value(value).expect("symbol answer")
+    }
 
     #[test]
-    fn runtime_stub_source_requires_complete_exact_bytes_and_view() {
+    fn runtime_stub_declarations_require_complete_exact_bytes_and_view() {
         let view: CapturedView = serde_json::from_value(serde_json::json!({
             "id": "claims.signature", "expires_at": "2099-01-01T00:00:00Z"
         }))
         .expect("captured view");
-        let unit = serde_json::from_value(serde_json::json!(
-            "rift://source/stdlib/cpython@3.12.3/builtins.pyi"
-        ))
-        .expect("runtime source unit");
-        let mut value = serde_json::json!({
-            "outcome": "found", "source_complete": true, "view": view,
-            "source": {"span": {"unit": unit, "range": {"start": 0, "end": 4}}, "text": "stub"}
-        });
-        let answer: GetSourceResult = serde_json::from_value(value.clone()).expect("source answer");
-        assert!(captured_source_matches(&answer, &unit, &view, "stub"));
-        assert!(!captured_source_matches(&answer, &unit, &view, "other"));
-        let mut wrong = value.clone();
-        wrong["source"]["span"]["unit"] =
-            serde_json::json!("rift://source/stdlib/cpython@3.11.3/builtins.pyi");
-        let answer = serde_json::from_value(wrong).expect("different source owner");
-        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
-        let mut wrong = value.clone();
-        wrong["source"]["span"]["range"] = serde_json::json!({"start": 1, "end": 5});
-        let answer = serde_json::from_value(wrong).expect("different source range");
-        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
-        value["source_complete"] = serde_json::json!(false);
-        let answer = serde_json::from_value(value.clone()).expect("partial source");
-        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
-        value["source_complete"] = serde_json::json!(true);
-        value["view"]["id"] = serde_json::json!("a_B-9.z_Y-0");
-        let answer = serde_json::from_value(value).expect("other view");
-        assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+        let unit = serde_json::from_value(serde_json::json!(UNIT)).expect("runtime source unit");
+        let matching = answer(found(&view, &declaration()));
+        assert!(declared_source_matches(&matching, &unit, &view, STUB));
+        assert!(!declared_source_matches(
+            &matching,
+            &unit,
+            &view,
+            "x = 1\ndef len(arg): ...\n"
+        ));
+        assert!(!declared_source_matches(&matching, &unit, &view, "short"));
+        let mut wrong = declaration();
+        wrong["unit"] = serde_json::json!("rift://source/stdlib/cpython@3.11.3/builtins.pyi");
+        let other_unit = answer(found(&view, &wrong));
+        assert!(!declared_source_matches(&other_unit, &unit, &view, STUB));
+        let mut wrong = declaration();
+        wrong["range"] = serde_json::json!({"start": 5, "end": 22});
+        assert!(!declared_source_matches(
+            &answer(found(&view, &wrong)),
+            &unit,
+            &view,
+            STUB
+        ));
+        let mut wrong = declaration();
+        wrong["source_complete"] = serde_json::json!(false);
+        assert!(!declared_source_matches(
+            &answer(found(&view, &wrong)),
+            &unit,
+            &view,
+            STUB
+        ));
+        let mut other_view = found(&view, &declaration());
+        other_view["view"]["id"] = serde_json::json!("a_B-9.z_Y-0");
+        assert!(!declared_source_matches(
+            &answer(other_view),
+            &unit,
+            &view,
+            STUB
+        ));
         for reason in [
             SymbolUnavailableReason::ViewExpired,
             SymbolUnavailableReason::InsufficientCoverage,
         ] {
-            let answer = GetSourceResult::Unavailable {
-                unit: unit.clone(),
-                view: Some(view.clone()),
-                reason,
-                warnings: Vec::new(),
-            };
-            assert!(!captured_source_matches(&answer, &unit, &view, "stub"));
+            let unavailable = answer(serde_json::json!({
+                "outcome": "unavailable",
+                "id": "rift://symbol/stdlib/cpython@3.12.3/python/builtins/len",
+                "view": view, "reason": reason
+            }));
+            assert!(!declared_source_matches(&unavailable, &unit, &view, STUB));
         }
     }
 }

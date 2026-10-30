@@ -85,7 +85,6 @@ enum FixtureMode {
 enum OperationFixture {
     Valid,
     ExactSymbol(serde_json::Value),
-    ExactSource(serde_json::Value, StatusCode),
     SourceDeclarations(serde_json::Value, StatusCode),
     Documentation {
         search: serde_json::Value,
@@ -414,13 +413,6 @@ fn operation_response(
             return response;
         }
         return json_response(&declaration::declaration_response_json(), None);
-    }
-    if path.ends_with("/source")
-        && let OperationFixture::ExactSource(value, status) = mode
-    {
-        let mut response = json_response(value, None);
-        *response.status_mut() = *status;
-        return response;
     }
     if path.ends_with("/patterns") {
         let mut page = pattern::pattern_page_json(query_cursor(query));
@@ -1650,15 +1642,6 @@ async fn operation_failure(
             .find_declarations(&declaration::declaration_request())
             .await
             .err(),
-        Endpoint::Source => client
-            .get_source(
-                &serde_json::from_value(serde_json::json!({
-                    "unit": "rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py"
-                }))
-                .expect("runtime source request"),
-            )
-            .await
-            .err(),
     }
 }
 
@@ -2244,95 +2227,6 @@ async fn operation_client(mode: OperationFixture) -> (FixtureServer, GlobalClien
     (server, client)
 }
 
-#[tokio::test]
-async fn exact_source_preserves_runtime_owner_view_and_typed_http_outcomes() {
-    use rift_protocol::source_read::GetSourceParams;
-    let unit = "rift://source/stdlib/cpython@3.12.9/Lib/pathlib.py";
-    let request: GetSourceParams =
-        serde_json::from_value(serde_json::json!({"unit":unit,"view":"a".repeat(64)}))
-            .expect("source request");
-    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
-    for (status, value) in [
-        (
-            StatusCode::OK,
-            serde_json::json!({"outcome":"found","source":{"span":{"unit":unit,"range":{"start":0,"end":2}},"text":"é"},"source_complete":true,"view":view,"warnings":[]}),
-        ),
-        (
-            StatusCode::NOT_FOUND,
-            serde_json::json!({"outcome":"missing","unit":unit,"view":view,"warnings":[]}),
-        ),
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            serde_json::json!({"outcome":"unavailable","unit":unit,"view":view,"reason":"insufficient_coverage","warnings":[]}),
-        ),
-    ] {
-        let (server, client) =
-            operation_client(OperationFixture::ExactSource(value.clone(), status)).await;
-        let answer = client
-            .get_source(&request)
-            .await
-            .expect("typed source outcome");
-        assert_eq!(
-            answer,
-            serde_json::from_value(value).expect("source outcome")
-        );
-        let requests = server.state.request_log.lock().await;
-        let sent = requests
-            .iter()
-            .find(|sent| sent.path.ends_with("/source"))
-            .expect("source request");
-        assert_eq!(sent.path, "/rift/rest/v1/source");
-        assert_eq!(sent.method, reqwest::Method::POST);
-        assert_eq!(sent.query, None);
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&sent.body).expect("request JSON"),
-            serde_json::to_value(&request).expect("request")
-        );
-        assert!(
-            !requests
-                .iter()
-                .any(|sent| sent.path.ends_with("/resolutions"))
-        );
-    }
-}
-
-#[tokio::test]
-async fn exact_source_refuses_wrong_http_outcomes_foreign_views_and_utf8_ranges() {
-    use rift_protocol::source_read::GetSourceParams;
-    let unit = "rift://source/npm/npmjs.org/demo@1.0.0/index.js";
-    let request: GetSourceParams = serde_json::from_value(
-        serde_json::json!({"unit":unit,"range":{"start":0,"end":2},"view":"a".repeat(64)}),
-    )
-    .expect("source request");
-    let found = serde_json::json!({"outcome":"found","source":{"span":{"unit":unit,"range":{"start":0,"end":2}},"text":"é"},"source_complete":true,"view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"},"warnings":[]});
-    let mut cases = vec![
-        (found.clone(), StatusCode::NOT_FOUND),
-        (found.clone(), StatusCode::SERVICE_UNAVAILABLE),
-    ];
-    let mut foreign_view = found.clone();
-    foreign_view["view"]["id"] = serde_json::json!("b".repeat(64));
-    cases.push((foreign_view, StatusCode::OK));
-    let mut foreign_unit = found.clone();
-    foreign_unit["source"]["span"]["unit"] =
-        serde_json::json!("rift://source/npm/registry.example/demo@1.0.0/index.js");
-    cases.push((foreign_unit, StatusCode::OK));
-    let mut wrong_bytes = found.clone();
-    wrong_bytes["source"]["span"]["range"]["end"] = serde_json::json!(1);
-    cases.push((wrong_bytes, StatusCode::OK));
-    let mut outside_range = found;
-    outside_range["source"]["span"]["range"]["start"] = serde_json::json!(1);
-    outside_range["source"]["span"]["range"]["end"] = serde_json::json!(3);
-    cases.push((outside_range, StatusCode::OK));
-    for (value, status) in cases {
-        let (_server, client) =
-            operation_client(OperationFixture::ExactSource(value, status)).await;
-        assert!(matches!(
-            client.get_source(&request).await,
-            Err(ref error) if error.slug().as_str() == "rift.client.response_invalid"
-        ));
-    }
-}
-
 #[test]
 fn generated_source_range_preserves_exact_integer_bound() {
     use validator::Validate;
@@ -2364,73 +2258,10 @@ fn generated_source_range_preserves_exact_integer_bound() {
 }
 
 #[tokio::test]
-async fn exact_source_refuses_legacy_and_noncanonical_units_after_http() {
-    use rift_protocol::source_read::GetSourceParams;
-    let request: GetSourceParams = serde_json::from_value(serde_json::json!({
-        "unit":"rift://source/npm/npmjs.org/demo@1.0.0/index.js"
-    }))
-    .expect("canonical source request");
-    for unit in [
-        "rift://source/npm/demo@1.0.0/index.js",
-        "rift://source/npm/npmjs.org/demo@1.0.0/../index.js",
-        "rift://source/npm/npmjs.org/demo@1.0.0/src%2Findex.js",
-        "rift://source/stdlib/cpython@3.12.9/C:/Lib/pathlib.py",
-    ] {
-        let value = serde_json::json!({"outcome":"found","source":{
-            "span":{"unit":unit,"range":{"start":0,"end":0}},"text":""
-        },"source_complete":true,"view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}});
-        let missing = serde_json::json!({"outcome":"missing","unit":unit,
-            "view":{"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"}});
-        for (value, status) in [(value, StatusCode::OK), (missing, StatusCode::NOT_FOUND)] {
-            let (_server, client) =
-                operation_client(OperationFixture::ExactSource(value, status)).await;
-            let error = client
-                .get_source(&request)
-                .await
-                .expect_err("canonical source refusal");
-            assert_registered_field(&error, "rift.client.response_invalid", "body");
-            assert_eq!(
-                error_text_field(&error, "status"),
-                status.as_u16().to_string()
-            );
-            assert!(
-                error
-                    .fields()
-                    .iter()
-                    .any(|field| matches!(field.value(), rift_error::ErrorValue::Source(_)))
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn captured_custom_sources_retain_the_requested_view_and_coverage_refusal() {
-    use rift_protocol::source_read::{FindDeclarationsParams, GetSourceParams};
+async fn captured_custom_positions_retain_the_requested_view_and_coverage_refusal() {
+    use rift_protocol::source_read::FindDeclarationsParams;
     let unit = "rift://source/custom/src/lib.rs";
     let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
-    let value = serde_json::json!({"outcome":"unavailable","unit":unit,"view":view,"reason":"insufficient_coverage"});
-    let request: GetSourceParams =
-        serde_json::from_value(serde_json::json!({"unit":unit,"view":view["id"]}))
-            .expect("captured custom source");
-    let (server, client) = operation_client(OperationFixture::ExactSource(
-        value.clone(),
-        StatusCode::SERVICE_UNAVAILABLE,
-    ))
-    .await;
-    assert_eq!(
-        client.get_source(&request).await.expect("coverage refusal"),
-        serde_json::from_value(value).expect("source result")
-    );
-    assert!(
-        server
-            .state
-            .request_log
-            .lock()
-            .await
-            .iter()
-            .any(|request| request.path.ends_with("/source"))
-    );
-
     let position = serde_json::json!({"unit":unit,"line":0,"character":0});
     let request: FindDeclarationsParams = serde_json::from_value(
         serde_json::json!({"position_encoding":"utf-16","positions":[position],"view":view["id"]}),
@@ -2467,17 +2298,9 @@ async fn captured_custom_sources_retain_the_requested_view_and_coverage_refusal(
 
 #[tokio::test]
 async fn captured_view_does_not_admit_project_sources_to_global_reads() {
-    use rift_protocol::source_read::{FindDeclarationsParams, GetSourceParams};
+    use rift_protocol::source_read::FindDeclarationsParams;
     let (server, client) = operation_client(OperationFixture::Valid).await;
     let unit = "rift://source/project/src/lib.rs";
-    let source: GetSourceParams =
-        serde_json::from_value(serde_json::json!({"unit":unit,"view":"a".repeat(64)}))
-            .expect("project source");
-    assert_registered_field(
-        &(client.get_source(&source).await).expect_err("registered refusal"),
-        "rift.client.request_invalid",
-        "unit",
-    );
     let declarations: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-8","positions":[{"unit":unit,"line":0,"character":0}],"view":"a".repeat(64)})).expect("project position");
     assert_registered_field(
         &(client.find_declarations(&declarations).await).expect_err("registered refusal"),
@@ -2488,17 +2311,19 @@ async fn captured_view_does_not_admit_project_sources_to_global_reads() {
 }
 
 #[tokio::test]
-async fn exact_source_refuses_unproved_global_owners_before_http() {
-    use rift_protocol::source_read::GetSourceParams;
+async fn declaration_positions_refuse_unproved_global_owners_before_http() {
+    use rift_protocol::source_read::FindDeclarationsParams;
     let (server, client) = operation_client(OperationFixture::Valid).await;
     for unit in [
         "rift://source/project/src/lib.rs",
         "rift://source/custom/src/lib.rs",
     ] {
-        let request: GetSourceParams =
-            serde_json::from_value(serde_json::json!({"unit":unit})).expect("valid local source");
+        let request: FindDeclarationsParams = serde_json::from_value(serde_json::json!({
+            "position_encoding":"utf-8","positions":[{"unit":unit,"line":0,"character":0}]
+        }))
+        .expect("valid local position");
         assert!(matches!(
-            client.get_source(&request).await,
+            client.find_declarations(&request).await,
             Err(ref error) if error.slug().as_str() == "rift.client.request_invalid"
                 && error_text_field(error, "field") == "unit"
         ));
@@ -3193,33 +3018,6 @@ fn generated_read_warning_preserves_bound_and_source_evidence() {
     assert_eq!(warning.qualified_name.as_deref(), Some("fs::wide"));
     assert_eq!(warning.field.as_deref(), Some("name"));
     assert_eq!(warning.bound, Some(4096));
-}
-
-#[tokio::test]
-async fn exact_source_preserves_warning_bound_and_source_evidence() {
-    let unit = "rift://source/stdlib/node@22.14.0/lib/fs.js";
-    let request = serde_json::from_value(serde_json::json!({
-        "unit": unit, "view": "a".repeat(64)
-    }))
-    .expect("source request");
-    let value = serde_json::json!({
-        "outcome": "found", "source": {
-            "span": {"unit": unit, "range": {"start": 0, "end": 2}}, "text": "é"
-        }, "source_complete": true,
-        "view": {"id": "a".repeat(64), "expires_at": "2026-10-10T10:05:00Z"},
-        "warnings": [{
-            "code": "object_unavailable", "unit": unit,
-            "range": {"start": 4, "end": 12}, "qualified_name": "fs::wide",
-            "field": "name", "bound": 4096
-        }]
-    });
-    let (_server, client) =
-        operation_client(OperationFixture::ExactSource(value.clone(), StatusCode::OK)).await;
-    let answer = client
-        .get_source(&request)
-        .await
-        .expect("typed source outcome");
-    assert_eq!(serde_json::to_value(answer).expect("source wire"), value);
 }
 
 #[test]

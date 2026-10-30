@@ -1868,23 +1868,22 @@ async fn search_traversal_outgoing_names_a_standard_library_callee_by_its_global
         json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
     );
 
-    let source_requests: Vec<Value> = fixture
+    let runtime_id = global_api::named_identity(&global_api::NAMED_POSITIONS[0]);
+    let stub_requests: Vec<Value> = fixture
         .requests()
         .await
         .into_iter()
-        .filter(|request| request.uri.ends_with("/source"))
+        .filter(|request| request.uri.ends_with("/symbols"))
         .filter_map(|request| request.body)
+        .filter(|body| body["id"] == json!(runtime_id))
         .collect();
     assert_eq!(
-        source_requests.len(),
+        stub_requests.len(),
         1,
-        "one original stub read: {source_requests:?}"
+        "one stub declaration read: {stub_requests:?}"
     );
-    assert_eq!(
-        source_requests[0]["unit"],
-        json!(global_api::named_unit(&global_api::NAMED_POSITIONS[0]))
-    );
-    assert!(source_requests[0]["view"].is_string());
+    assert_eq!(stub_requests[0]["include"], json!(["source"]));
+    assert!(stub_requests[0]["view"].is_string());
 
     client.cancel().await?;
     Ok(())
