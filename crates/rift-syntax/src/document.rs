@@ -8,8 +8,8 @@ use rift_protocol::read::{Documentation, Language, Signature, SymbolFacet};
 
 use crate::markdown::MarkdownFacts;
 
-/// The character a qualified name carries its disambiguating number after,
-/// the `~N` suffix `SymbolId` advertises.
+/// The character a qualified name carries its disambiguating number after, keeping the
+/// provider key of each declaration distinct within one file.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
 mod node_places;
@@ -275,12 +275,13 @@ impl PartialEq for SyntaxDocument {
 
 /// Suffixes every repeated qualified name apart, in source order.
 ///
-/// A qualified name is the address half of a declaration's identity, so two
-/// declarations spelling one name would mint one identity. A name exactly
-/// one declaration spells keeps its spelling. A name several declarations
-/// spell is held by none of them: each takes a `~N` suffix counting from 1
-/// in source order, so a hand-built address carrying the bare name resolves
-/// to nothing rather than silently to the first declaration. Only
+/// A qualified name is the address half of a declaration's provider key, so two
+/// declarations spelling one name would share one key. A name exactly one
+/// declaration spells keeps its spelling. A name several declarations spell is
+/// held by none of them: each takes a `~N` suffix counting from 1 in source
+/// order, so no provider key silently names the first declaration. A logical
+/// symbol identity never carries the suffix: namespace analysis binds every
+/// declaration of one path to one identity. Only
 /// `qualified_name` changes: ranges, containers, and kinds stay as the
 /// provider extracted them. Whole names are compared, never parsed, so a
 /// name the source already spells with a `~` is an ordinary name here.

@@ -1,7 +1,4 @@
-use super::{
-    SYMBOL_ID_BYTES_MAX, SymbolIdentity, SymbolIdentityViolation, SymbolOccurrence, SymbolOwner,
-    source_unit_is_project,
-};
+use super::{SYMBOL_ID_BYTES_MAX, SymbolIdentity, SymbolOwner, source_unit_is_project};
 use crate::read::Language;
 
 const REVISION: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -308,7 +305,6 @@ fn test_canonical_owners_round_trip_without_losing_hierarchy() {
             serde_json::from_str::<SymbolIdentity>(&json).expect("deserialize identity"),
             identity
         );
-        assert!(identity.occurrence().is_none());
     }
     let package = SymbolIdentity::parse(
         "rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
@@ -466,78 +462,37 @@ fn test_component_escaping_preserves_data_and_rejects_alternate_spellings() {
 }
 
 #[test]
-fn test_occurrences_require_complete_revisions_and_canonical_positive_numbers() {
-    let occurrence = SymbolOccurrence::new(2, REVISION.into()).expect("occurrence fixture");
-    let identity = SymbolIdentity::new(
-        SymbolOwner::Local,
-        language(),
-        vec!["app".into(), "anonymous".into()],
-    )
-    .expect("identity fixture")
-    .with_occurrence(occurrence)
-    .expect("bind occurrence");
-    let expected = format!("rift://symbol/local/rust/app/anonymous~2?rev={REVISION}");
-    assert_eq!(identity.wire_identity(), expected);
-    assert_eq!(
-        SymbolIdentity::parse(&expected).expect("parse occurrence"),
-        identity
-    );
-    assert_eq!(identity.occurrence().expect("bound occurrence").number(), 2);
-    assert_eq!(
-        identity.occurrence().expect("bound occurrence").revision(),
-        REVISION
-    );
+fn test_occurrence_suffixes_are_refused_as_noncanonical_names() {
     let literal = SymbolIdentity::new(SymbolOwner::Local, language(), vec!["anonymous~2".into()])
-        .expect("literal suffix");
+        .expect("literal tilde");
     assert_eq!(
         literal.wire_identity(),
         "rift://symbol/local/rust/anonymous%7E2"
     );
-    let literal = literal
-        .with_occurrence(
-            SymbolOccurrence::new(u32::MAX, REVISION.into()).expect("maximum occurrence"),
-        )
-        .expect("literal name occurrence");
     assert_eq!(
-        SymbolIdentity::parse(&literal.wire_identity()).expect("literal name and qualifier"),
+        SymbolIdentity::parse(&literal.wire_identity()).expect("encoded tilde"),
         literal
     );
-    for (suffix, violation) in [
-        ("~0?rev=1234", SymbolIdentityViolation::Occurrence),
-        ("~4294967296?rev=1234", SymbolIdentityViolation::Occurrence),
-        ("~2?rev=1234", SymbolIdentityViolation::Revision),
-        ("?rev=1234", SymbolIdentityViolation::Occurrence),
-        ("~2?rev=", SymbolIdentityViolation::Revision),
-        ("~2/Child?rev=1234", SymbolIdentityViolation::Occurrence),
+    for suffix in [
+        format!("~2?rev={REVISION}"),
+        format!("~1?rev={REVISION}&rev={REVISION}"),
+        "~0?rev=1234".to_owned(),
+        "?rev=1234".to_owned(),
+        "~2".to_owned(),
     ] {
+        let value = format!("rift://symbol/local/rust/app/anonymous{suffix}");
         assert_eq!(
-            SymbolIdentity::parse(&format!("rift://symbol/local/rust/app/anonymous{suffix}"))
+            SymbolIdentity::parse(&value)
                 .err()
                 .map(|error| error_violation(&error)),
-            Some(format!("{violation:?}"))
+            Some("Noncanonical".to_owned()),
+            "{value}"
+        );
+        assert!(
+            serde_json::from_value::<SymbolIdentity>(serde_json::json!(value)).is_err(),
+            "{value}"
         );
     }
-    let leading_zero = format!("rift://symbol/local/rust/app/anonymous~02?rev={REVISION}");
-    assert_eq!(
-        SymbolIdentity::parse(&leading_zero)
-            .err()
-            .map(|error| error_violation(&error)),
-        Some("Noncanonical".to_owned())
-    );
-    let extra_query =
-        format!("rift://symbol/local/rust/app/anonymous~2?rev={REVISION}&rev={REVISION}");
-    assert_eq!(
-        SymbolIdentity::parse(&extra_query)
-            .err()
-            .map(|error| error_violation(&error)),
-        Some("Revision".to_owned())
-    );
-    assert_eq!(
-        SymbolOccurrence::new(2, REVISION.to_uppercase())
-            .err()
-            .map(|error| error_violation(&error)),
-        Some("Revision".to_owned())
-    );
 }
 
 #[test]
@@ -610,14 +565,6 @@ fn test_length_bound_applies_before_decode_and_after_encoding() {
         )
         .err()
         .map(|error| error_violation(&error)),
-        Some("Length".to_owned())
-    );
-    let identity = SymbolIdentity::parse(&exact).expect("exact bound");
-    assert_eq!(
-        identity
-            .with_occurrence(SymbolOccurrence::new(1, REVISION.into()).expect("occurrence"))
-            .err()
-            .map(|error| error_violation(&error)),
         Some("Length".to_owned())
     );
 }

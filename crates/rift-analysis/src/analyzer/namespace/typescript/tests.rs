@@ -315,15 +315,33 @@ fn typescript_overload_signatures_bind_one_function_without_occurrence_suffix() 
 }
 
 #[test]
-fn competing_function_bodies_keep_immutable_occurrence_identity() {
+fn competing_function_bodies_share_one_identity() {
     let source = "export function format() {}\nexport function format() {}";
     let found = one(TYPES, "index.d.ts", source);
     assert_eq!(found.len(), 2);
-    let expected = format!(
-        "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format~2?rev={}",
-        crate::documentation::content_digest(source.as_bytes()).0
+    assert!(found.values().all(|identity| identity.as_str()
+        == "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"));
+}
+
+#[test]
+fn members_of_a_repeated_container_take_its_one_path() {
+    let source = "export namespace Tools { export function a(): void; }\nexport namespace Tools { export function b(): void; }";
+    let found = one(TYPES, "index.d.ts", source);
+    let identities = found
+        .values()
+        .map(SymbolId::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        identities,
+        [
+            "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/Tools",
+            "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/Tools/a",
+            "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/Tools/b",
+        ]
+        .into_iter()
+        .collect(),
+        "{found:?}"
     );
-    assert_eq!(found["format~2"].as_str(), expected);
 }
 
 #[test]
@@ -343,7 +361,7 @@ fn literal_occurrence_spelling_in_source_name_is_not_a_qualifier() {
                 .is_some_and(|name| name.contains("method~2"))
         })
         .expect("literal named method");
-    assert!(!member.as_str().contains("?rev="));
+    assert!(member.as_str().ends_with("/%22method%7E2%22"), "{member:?}");
 }
 
 #[test]
@@ -900,7 +918,7 @@ fn package_ambient_global_unquoted_outside_and_malformed_remain_unknown() {
 }
 
 #[test]
-fn package_ambient_reuses_overload_and_occurrence_identity() {
+fn package_ambient_overloads_and_repeated_bodies_share_one_identity() {
     let metadata = include_str!("../../../../tests/fixtures/types-node-package.json");
     let overloads = "declare module \"node:buffer\" { export function read(value: string): string; export function read(value: number): string; }";
     let (found, _) = ambient_prepared(&types_node_owner(), Some(metadata), overloads);
@@ -920,13 +938,7 @@ fn package_ambient_reuses_overload_and_occurrence_identity() {
         .map(|(_, identity)| identity)
         .collect::<Vec<_>>();
     assert_eq!(identities.len(), 2);
-    assert_ne!(identities[0], identities[1]);
-    assert!(identities[1].as_str().contains("~2?rev="));
-    assert!(
-        identities[1]
-            .as_str()
-            .ends_with(&crate::documentation::content_digest(repeated.as_bytes()).0)
-    );
+    assert_eq!(identities[0], identities[1]);
 }
 
 fn commonjs_prepared(

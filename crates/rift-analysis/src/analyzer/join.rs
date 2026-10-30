@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_declarations_without_overload_proof_do_not_join() {
+    fn test_repeated_declarations_join_as_one_symbol_at_the_last_implementation() {
         let analysis = super::super::fixture::package_result(
             rift_syntax::ShippedLanguage::Python,
             vec![
@@ -357,9 +357,14 @@ mod tests {
             .iter()
             .find(|held| held.file.path().as_str() == "mod.py")
             .expect("retained implementation");
-        for symbol in implementation.file.syntax().symbols() {
-            assert!(implementation.stub_forms(&symbol.qualified_name).is_empty());
-        }
+        let forms = implementation
+            .file
+            .syntax()
+            .symbols()
+            .iter()
+            .map(|symbol| implementation.stub_forms(&symbol.qualified_name).len())
+            .collect::<Vec<_>>();
+        assert_eq!(forms, [0, 2]);
         assert_eq!(analysis.publication().declarations.len(), 4);
         let identities = analysis
             .publication()
@@ -367,6 +372,6 @@ mod tests {
             .iter()
             .map(|declaration| &declaration.symbol)
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(identities.len(), 4);
+        assert_eq!(identities.len(), 1);
     }
 }
