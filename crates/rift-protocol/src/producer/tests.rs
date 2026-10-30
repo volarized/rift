@@ -2,7 +2,8 @@ use serde_json::json;
 
 use super::{
     FactCoverage, FactKind, FactProducer, PRODUCER_NAME_BYTES_MAX, PRODUCER_NAME_PATTERN,
-    PRODUCER_REVISION_BYTES_MAX, PRODUCER_REVISION_PATTERN, ProducerName, ProducerRevision,
+    PRODUCER_REVISION_BYTES_MAX, PRODUCER_REVISION_PATTERN, ProducerName, ProducerRelationship,
+    ProducerRevision,
 };
 
 fn violation(error: &rift_error::RiftError) -> String {
@@ -165,4 +166,39 @@ fn test_producer_schema_agrees_with_the_classifier() {
             "revision {value:?}"
         );
     }
+}
+
+#[test]
+fn producer_relationship_without_extensions_serializes_without_the_field() {
+    let wire = json!({
+        "from": "rift://symbol/pypi/pypi.org/click/python/click/core/shout",
+        "kind": "call",
+        "facets": ["calls"],
+        "to": "rift://symbol/pypi/pypi.org/click/python/click/core/echo",
+        "derivation": "resolution",
+    });
+    let relationship: ProducerRelationship =
+        serde_json::from_value(wire.clone()).expect("deserialize");
+    assert!(relationship.extensions.is_empty());
+    assert_eq!(
+        serde_json::to_value(&relationship).expect("serialize"),
+        wire
+    );
+}
+
+/// The published schema describes fact coverage as the producer of a kind's facts and makes
+/// no claim that a producer found every fact of it.
+#[test]
+fn test_fact_coverage_schema_makes_no_completeness_claim() {
+    let schema: serde_json::Value =
+        serde_json::from_str(&crate::schema::package_index_schema_document()).expect("schema");
+    let prose = |value: &serde_json::Value| {
+        let text = value.as_str().expect("a description");
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+    let coverage = prose(&schema["$defs"]["FactCoverage"]["description"]);
+    assert!(coverage.contains("makes no claim"), "{coverage}");
+    assert!(!coverage.contains("found none"), "{coverage}");
+    let facts = prose(&schema["$defs"]["PackageCoverage"]["properties"]["facts"]["description"]);
+    assert!(facts.contains("no completeness claim"), "{facts}");
 }
