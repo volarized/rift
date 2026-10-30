@@ -2769,12 +2769,9 @@ pub struct FindDeclarationsResult {
 /// One optional `get_symbol` hit field the caller may opt into through `include`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, oas3_gen_support::Default)]
 pub enum GetSymbolInclude {
-    /// The hit's node identity and declaration source excerpt.
-    #[serde(rename = "source")]
-    #[default]
-    Source,
     /// The hit's version-control timeline.
     #[serde(rename = "history")]
+    #[default]
     History,
     /// Bounded documentation referring to the exact declaration.
     #[serde(rename = "documentation")]
@@ -2783,7 +2780,6 @@ pub enum GetSymbolInclude {
 impl core::fmt::Display for GetSymbolInclude {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Source => write!(f, "source"),
             Self::History => write!(f, "history"),
             Self::Documentation => write!(f, "documentation"),
         }
@@ -2796,16 +2792,10 @@ impl<'de> serde::Deserialize<'de> for GetSymbolInclude {
     {
         let s = String::deserialize(deserializer)?;
         match s.to_ascii_lowercase().as_str() {
-            "source" => Ok(GetSymbolInclude::Source),
             "history" => Ok(GetSymbolInclude::History),
             "documentation" => Ok(GetSymbolInclude::Documentation),
             _ => {
-                Err(
-                    serde::de::Error::unknown_variant(
-                        &s,
-                        &["source", "history", "documentation"],
-                    ),
-                )
+                Err(serde::de::Error::unknown_variant(&s, &["history", "documentation"]))
             }
         }
     }
@@ -2825,8 +2815,8 @@ pub struct GetSymbolParams {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub id: String,
-    /// Requested projections. Omitted defaults to source; an empty list requests none.
-    #[default(Some(Default::default()))]
+    /// Requested projections. Omitted or empty requests none. A declaration's source is read
+    /// by `nodes` with `symbol`.
     pub include: Option<Vec<GetSymbolInclude>>,
     /// Identity of one revision in the workspace's version-control history, spelled the way the
     /// version-control system spells it: a branch, tag, or commit id, optionally followed by
@@ -3423,10 +3413,6 @@ pub struct SymbolDeclaration {
     pub range: TextRange,
     /// One-based line where this declaration begins.
     pub line: u64,
-    /// Source excerpt when requested and available.
-    pub source: Option<String>,
-    /// Whether the supplied excerpt contains this declaration's complete source.
-    pub source_complete: bool,
     /// Entries in the result symbol's signature array supplied by this declaration.
     pub signature_indices: Vec<u64>,
     /// Entries in the result symbol's type array supplied by this declaration.

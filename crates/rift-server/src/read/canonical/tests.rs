@@ -54,7 +54,7 @@ fn fixture(metadata: bool) -> (tempfile::TempDir, Arc<ReadService>, SymbolId) {
 fn request(id: SymbolId, view: CapturedViewId) -> GetSymbolParams {
     GetSymbolParams {
         id,
-        include: vec![GetSymbolInclude::Source],
+        include: vec![GetSymbolInclude::Documentation],
         rev: None,
         view: Some(view),
         declaration_limit: 1,
@@ -75,7 +75,7 @@ fn captured_input(reads: &ReadService) -> LocalSymbolViewInput {
             &GetSymbolParams {
                 id: SymbolId::parse("rift://symbol/local/javascript/beacon/open")
                     .expect("fixture identity"),
-                include: vec![GetSymbolInclude::Source],
+                include: Vec::new(),
                 rev: None,
                 view: None,
                 declaration_limit: 1,
@@ -102,7 +102,7 @@ fn search_view_input_retains_nonempty_material_and_truthful_history_coverage() {
         .expect("search view admission")
         .expect("view");
     let mut params = request(id, view.id);
-    params.include = vec![GetSymbolInclude::Source, GetSymbolInclude::Documentation];
+    params.include = vec![GetSymbolInclude::Documentation];
     assert!(matches!(
         store
             .resolve_at(&params, reads.index.root(), reads.index.owner(), now)
@@ -276,11 +276,11 @@ fn captured_nonempty_material_refuses_uncaptured_history_without_live_lookup() {
     assert!(material.index.retained_material_bytes() > material.metadata.len());
     std::fs::remove_file(directory.path().join("index.js")).expect("remove current source");
     let mut params = request(id, view.id);
-    params.include = vec![GetSymbolInclude::Source, GetSymbolInclude::Documentation];
+    params.include = vec![GetSymbolInclude::Documentation];
     assert!(matches!(
         store
             .resolve_at(&params, reads.index.root(), reads.index.owner(), now)
-            .expect("captured source and documentation"),
+            .expect("captured documentation"),
         GetSymbolResult::Found { .. }
     ));
     params.include.push(GetSymbolInclude::History);
@@ -296,7 +296,7 @@ fn captured_nonempty_material_refuses_uncaptured_history_without_live_lookup() {
 }
 
 #[test]
-fn exact_local_view_keeps_original_bindings_sources_and_continuations() {
+fn exact_local_view_keeps_original_bindings_and_continuations() {
     let (directory, reads, id) = fixture(true);
     let store = LocalSymbolViews::new(1 << 20, [1; 32]);
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
@@ -324,13 +324,6 @@ fn exact_local_view_keeps_original_bindings_sources_and_continuations() {
         assert_eq!(symbol.documentation.len(), 3);
         assert_eq!(declarations.len(), 1);
         let declaration = &declarations[0];
-        assert!(declaration.source_complete);
-        assert!(
-            declaration
-                .source
-                .as_ref()
-                .is_some_and(|source| source.contains("open"))
-        );
         assert_eq!(declaration.signature_indices.len(), 1);
         assert_eq!(declaration.documentation_indices.len(), 1);
         assert!(ranges.insert((

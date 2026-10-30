@@ -626,7 +626,7 @@ def churn_answer(
 ) -> tuple[str, str]:
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
-    if tool == "nodes":
+    if tool in {"nodes", "symbol_nodes"}:
         nodes = [
             object_value(node, "probe node")
             for node in array_value(answer.get("nodes"), "probe nodes")
@@ -641,17 +641,12 @@ def churn_answer(
             "nodes lost probe declaration",
         )
         hit = matches[0]
+        require(
+            hit.get("unit") == f"{FILE_PREFIX}{probe_path}",
+            f"{tool} returned another probe path",
+        )
         excerpt = hit.get("source")
         found = string_value(answer.get("symbol"), "probe identity")
-    elif tool == "get_symbol":
-        require(answer.get("outcome") == "found", "get_symbol lost probe declaration")
-        symbol = object_value(answer.get("symbol"), "probe symbol")
-        found = string_value(symbol.get("id"), "probe identity")
-        declarations = array_value(answer.get("declarations"), "probe declarations")
-        require(len(declarations) == 1, "get_symbol lost probe declaration")
-        hit = object_value(declarations[0], "probe declaration")
-        require(hit.get("path") == probe_path, "get_symbol returned another probe path")
-        excerpt = hit.get("source")
     else:
         rows = array_value(answer.get("results"), "probe hits")
         require(len(rows) == 1, f"{tool} lost probe declaration")

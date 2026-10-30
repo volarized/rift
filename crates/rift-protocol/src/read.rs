@@ -333,10 +333,6 @@ pub struct GetSymbolHit {
     /// The 1-based source line where the declaration begins.
     #[schemars(range(min = 1_u64))]
     pub line: u64,
-    /// The declaration source, present when `include` names `source` and the provider
-    /// can read it. Absent for a source-less declaration.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
     /// The symbol's timeline, present when `include` names `history`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<SymbolHistory>,
@@ -351,16 +347,14 @@ pub struct GetSymbolHit {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum GetSymbolInclude {
-    /// The hit's node identity and declaration source excerpt.
-    Source,
     /// The hit's version-control timeline.
     History,
     /// Bounded documentation referring to the exact declaration.
     Documentation,
 }
 
-/// Gets declarations by name and returns them with their bodies inline, so one call replaces
-/// a search followed by paging through the file.
+/// Gets declarations by name, with each declaration's location and the projections
+/// `include` names.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
@@ -368,7 +362,7 @@ pub enum GetSymbolInclude {
     {
         "name": "ReadService",
         "language": "rust",
-        "include": ["source", "history"],
+        "include": ["history"],
         "limit": 5,
         "page_index": 0
     },
@@ -420,9 +414,9 @@ pub struct GetSymbolParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schemars(length(max = 64))]
     pub packages: Vec<RequestedPackage>,
-    /// Optional hit fields to attach: `source`, `history`. Omitted defaults to
-    /// `["source"]`; an explicit empty list carries neither.
-    #[serde(default = "default_get_symbol_params_include")]
+    /// Optional hit fields to attach: `history`, `documentation`. Omitted or empty attaches
+    /// neither. A declaration's source is read by `nodes` with `symbol`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<GetSymbolInclude>,
     /// Most hits to return in one page, at most 10,000; the server refuses a larger
     /// `limit` naming the field. The server's result bound caps the set itself, and an
@@ -440,10 +434,6 @@ pub struct GetSymbolParams {
     /// refuses a revision read when the workspace has no version-control repository.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rev: Option<RevisionId>,
-}
-
-fn default_get_symbol_params_include() -> Vec<GetSymbolInclude> {
-    vec![GetSymbolInclude::Source]
 }
 
 fn default_get_symbol_params_limit() -> u64 {
@@ -538,7 +528,6 @@ fn default_get_symbol_params_page_index() -> u64 {
                     "start": 162,
                     "end": 355
                 },
-                "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
                 "history": {
                     "symbol": "rift://symbol/local/rust/app/config/load_config",
                     "versions": [
@@ -3318,15 +3307,15 @@ mod tests {
         );
     }
 
-    /// The advertised schema states the same default the field's default function
-    /// returns: an omitted `include` implies `["source"]`.
+    /// An omitted `include` attaches no projection: the schema advertises no default list,
+    /// and the decoded request carries none.
     #[test]
-    fn get_symbol_params_schema_include_default_is_source_only() {
+    fn get_symbol_params_include_omitted_attaches_nothing() {
         let schema = serde_json::to_value(schema_for!(GetSymbolParams)).expect("schema");
-        assert_eq!(
-            schema["properties"]["include"]["default"],
-            json!(["source"])
-        );
+        assert_eq!(schema["properties"]["include"].get("default"), None);
+        let params = serde_json::from_value::<GetSymbolParams>(json!({"name": "Beacon"}))
+            .expect("a request naming only `name` decodes");
+        assert!(params.include.is_empty(), "{:?}", params.include);
     }
 
     /// `scope` takes serde's `default`, which reads the enum's own `Default`; this pins
@@ -3341,17 +3330,20 @@ mod tests {
         );
     }
 
-    /// `include: ["body"]` names no `GetSymbolInclude` member; a request naming it is
-    /// refused at deserialization, and the refusal names the accepted values.
+    /// `include: ["source"]` names no `GetSymbolInclude` member: a declaration's source is
+    /// read by `nodes`. A request naming it is refused at deserialization, and the refusal
+    /// names the accepted values.
     #[test]
-    fn get_symbol_include_rejects_an_unknown_entry_and_names_the_accepted_values() {
+    fn get_symbol_include_refuses_source_and_names_the_accepted_values() {
         let error = serde_json::from_value::<GetSymbolParams>(
-            json!({"name": "Beacon", "include": ["body"]}),
+            json!({"name": "Beacon", "include": ["source"]}),
         )
-        .expect_err("an unknown include entry must fail deserialization");
+        .expect_err("`source` is no include entry");
         let message = error.to_string();
         assert!(
-            message.contains("source") && message.contains("history"),
+            message.contains("unknown variant `source`")
+                && message.contains("history")
+                && message.contains("documentation"),
             "{message}"
         );
     }

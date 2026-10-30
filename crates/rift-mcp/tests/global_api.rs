@@ -640,7 +640,7 @@ fn page(items: &[Value], warnings: &Value) -> Value {
 }
 
 /// The exact result for the canonical object named by `request`, retaining its original
-/// source and the collection's captured view.
+/// location and the collection's captured view.
 fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
     let id = request["id"].as_str().unwrap_or_default();
     let declaration = fixture_declarations(fixture)
@@ -649,19 +649,16 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         .find(|name| collected_identity(fixture, name) == id);
     let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
     if id == named_identity(&NAMED_POSITIONS[0]) {
-        return runtime_symbol(request, &view);
+        return runtime_symbol(&view);
     }
     if id == named_identity(&NAMED_POSITIONS[1]) {
-        return greeting_symbol(request, &view);
+        return greeting_symbol(&view);
     }
     let Some(declaration) = declaration else {
         return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view});
     };
-    let hit = collected_hit(fixture, declaration, includes_source(request));
-    let mut binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"source_complete":hit.get("source").is_some(),"signature_indices":[],"type_indices":[],"documentation_indices":[]});
-    if let Some(source) = hit.get("source") {
-        binding["source"] = source.clone();
-    }
+    let hit = collected_hit(fixture, declaration, false);
+    let binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"signature_indices":[],"type_indices":[],"documentation_indices":[]});
     json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
 }
 
@@ -670,6 +667,9 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
 /// and body, in the fixture's view when the request names one. `None` for any other symbol.
 fn symbol_nodes(request: &Value) -> Option<Value> {
     let id = request["symbol"].as_str()?;
+    if id == named_identity(&NAMED_POSITIONS[0]) {
+        return Some(runtime_nodes(request));
+    }
     let name = DECLARATIONS
         .into_iter()
         .find(|name| collected_identity(SymbolFixture::Valid, name) == id)?;
@@ -708,9 +708,8 @@ fn symbol_nodes(request: &Value) -> Option<Value> {
     Some(answer)
 }
 
-/// The runtime `len` declaration, carrying the embedded standard library stub's own bytes
-/// at its range.
-fn runtime_symbol(request: &Value, view: &Value) -> Value {
+/// The byte range of the runtime `len` declaration in the embedded standard library stub.
+fn runtime_declaration() -> (usize, usize) {
     let builtins = python_runtime::builtins();
     let start = builtins
         .find("def len(")
@@ -718,20 +717,41 @@ fn runtime_symbol(request: &Value, view: &Value) -> Value {
     let end = builtins[start..]
         .find('\n')
         .map_or(builtins.len(), |offset| start + offset);
+    (start, end)
+}
+
+/// The item node of the runtime `len` declaration, carrying the embedded standard library
+/// stub's own bytes at its range, in the view the request names.
+fn runtime_nodes(request: &Value) -> Value {
+    let builtins = python_runtime::builtins();
+    let (start, end) = runtime_declaration();
+    let source = &builtins[start..end];
+    let mut answer = json!({"symbol": named_identity(&NAMED_POSITIONS[0]), "nodes": [{
+        "declaration": 0, "index": 0,
+        "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
+        "kind": "function_definition", "facets": ["declaration", "definition"],
+        "range": {"start": start, "end": end}, "source": source,
+    }]});
+    if let Some(view) = request.get("view") {
+        answer["view"] = json!({"id": view, "expires_at": "2099-10-10T10:05:00Z"});
+    }
+    answer
+}
+
+/// The runtime `len` declaration at its range in the embedded standard library stub.
+fn runtime_symbol(view: &Value) -> Value {
+    let builtins = python_runtime::builtins();
+    let (start, end) = runtime_declaration();
     let line = builtins[..start].matches('\n').count() + 1;
     let origin = json!({
         "location":"stdlib", "source_kind":"authored",
         "runtime":{"runtime":PYTHON_STANDARD_LIBRARY.1, "version":PYTHON_STANDARD_LIBRARY.2}
     });
-    let mut declaration = json!({
+    let declaration = json!({
         "origin":origin, "unit":named_unit(&NAMED_POSITIONS[0]),
         "range":{"start":start,"end":end}, "line":line,
-        "source_complete":includes_source(request),
         "signature_indices":[], "type_indices":[], "documentation_indices":[]
     });
-    if includes_source(request) {
-        declaration["source"] = json!(&builtins[start..end]);
-    }
     json!({
         "outcome":"found", "view":view,
         "symbol":{
@@ -742,7 +762,7 @@ fn runtime_symbol(request: &Value, view: &Value) -> Value {
     })
 }
 
-fn greeting_symbol(request: &Value, view: &Value) -> Value {
+fn greeting_symbol(view: &Value) -> Value {
     let source = GREETING_SOURCE
         .split("\n\n")
         .next()
@@ -751,15 +771,11 @@ fn greeting_symbol(request: &Value, view: &Value) -> Value {
         "location":"dependency", "package":package_value(GREETING),
         "source_kind":"authored"
     });
-    let mut declaration = json!({
+    let declaration = json!({
         "origin":origin, "unit":named_unit(&NAMED_POSITIONS[1]),
         "range":{"start":0,"end":source.len()}, "line":1,
-        "source_complete":includes_source(request),
         "signature_indices":[], "type_indices":[], "documentation_indices":[]
     });
-    if includes_source(request) {
-        declaration["source"] = json!(source);
-    }
     json!({
         "outcome":"found", "view":view,
         "symbol":{

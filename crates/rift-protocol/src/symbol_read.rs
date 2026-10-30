@@ -114,15 +114,16 @@ pub struct CapturedView {
 #[serde(deny_unknown_fields)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
 #[schemars(extend("examples" = [
-    {"id": "rift://symbol/local/rust/app/parser/parse", "include": ["source"]}
+    {"id": "rift://symbol/local/rust/app/parser/parse", "include": ["documentation"]}
 ]))]
 pub struct GetSymbolParams {
     /// Canonical identity. Ownership and language come from this address.
     #[serde(deserialize_with = "deserialize_symbol_id")]
     #[schemars(with = "crate::identity::SymbolIdentity")]
     pub id: SymbolId,
-    /// Requested projections. Omitted defaults to source; an empty list requests none.
-    #[serde(default = "default_include")]
+    /// Requested projections. Omitted or empty requests none. A declaration's source is read
+    /// by `nodes` with `symbol`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<GetSymbolInclude>,
     /// A local Git revision. Refused for a package or runtime owner and beside `view`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,10 +149,6 @@ where
     SymbolId::parse(&value).map_err(serde::de::Error::custom)
 }
 
-fn default_include() -> Vec<GetSymbolInclude> {
-    vec![GetSymbolInclude::Source]
-}
-
 fn default_declaration_limit() -> u64 {
     5
 }
@@ -173,12 +170,6 @@ pub struct SymbolDeclaration {
     /// One-based line where this declaration begins.
     #[schemars(range(min = 1_u64))]
     pub line: u64,
-    /// Source excerpt when requested and available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(length(max = 67_108_864))]
-    pub source: Option<String>,
-    /// Whether the supplied excerpt contains this declaration's complete source.
-    pub source_complete: bool,
     /// Entries in the result symbol's signature array supplied by this declaration.
     pub signature_indices: Vec<u64>,
     /// Entries in the result symbol's type array supplied by this declaration.
@@ -194,7 +185,6 @@ impl SymbolDeclaration {
         self.path.is_some() != self.unit.is_some()
             && self.range.start <= self.range.end
             && self.line > 0
-            && (!self.source_complete || self.source.is_some())
             && indices_fit(&self.signature_indices, symbol.signatures.len())
             && indices_fit(&self.type_indices, symbol.types.len())
             && indices_fit(&self.documentation_indices, symbol.documentation.len())

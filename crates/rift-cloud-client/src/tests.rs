@@ -427,6 +427,9 @@ fn operation_response(
                 *response.status_mut() = *status;
                 response
             }
+            OperationFixture::CollectionBounds { source_bytes, .. } => {
+                json_response(&nodes::single_node_response_json(*source_bytes), None)
+            }
             _ => json_response(&nodes::nodes_response_json(), None),
         };
     }
@@ -488,7 +491,7 @@ fn operation_capabilities_response(mode: &OperationFixture) -> Response {
             source_bytes_max, ..
         } => {
             value["supported_features"] =
-                serde_json::json!(["resolutions", "search", "symbols", "patterns"]);
+                serde_json::json!(["resolutions", "search", "symbols", "patterns", "nodes"]);
             value["bounds"]["request_body_bytes_max"] =
                 serde_json::json!(rift_protocol::configuration::GLOBAL_REQUEST_BYTES_MAX);
             value["bounds"]["response_body_bytes_max"] =
@@ -665,16 +668,11 @@ fn paged_search_response(mode: &OperationFixture, cursor: Option<&str>) -> serde
 }
 
 fn operation_symbol_response(mode: &OperationFixture, _query: Option<&str>) -> Response {
-    let mut value = match mode {
+    let value = match mode {
         OperationFixture::Documentation { symbols, .. }
         | OperationFixture::DocumentationBounds { symbols, .. } => symbols.clone(),
         _ => symbol_result_json("demo", "first"),
     };
-    if let OperationFixture::CollectionBounds { source_bytes, .. } = mode {
-        value["declarations"][0]["source"] = serde_json::json!("x".repeat(*source_bytes));
-        value["declarations"][0]["range"]["end"] = serde_json::json!(*source_bytes);
-        value["declarations"][0]["source_complete"] = serde_json::json!(true);
-    }
     json_response(&value, None)
 }
 
@@ -2213,7 +2211,7 @@ fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
         "declarations": [{
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"},
             "unit": format!("rift://source/cargo/crates.io/{package}@1.0.0/src/{suffix}.rs"),
-            "range": {"start": 0, "end": 4}, "line": 1, "source_complete": false,
+            "range": {"start": 0, "end": 4}, "line": 1,
             "signature_indices": [], "type_indices": [], "documentation_indices": []
         }]
     })
@@ -2473,7 +2471,11 @@ async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() 
         let body: serde_json::Value = serde_json::from_slice(&sent.body).expect("JSON request");
         assert_eq!(body["id"], serde_json::to_value(&id).expect("ID"));
         assert_eq!(body["declaration_limit"], 5);
-        assert_eq!(body["include"], serde_json::json!(["source"]));
+        assert_eq!(
+            body.get("include"),
+            None,
+            "an omitted include requests no projection"
+        );
         for removed in [
             "name",
             "packages",
@@ -3052,7 +3054,7 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     use rift_protocol::symbol_read::{GetSymbolParams, GetSymbolResult};
     const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
     let request: GetSymbolParams = serde_json::from_value(json!({
-        "id": ID, "include": ["source", "documentation"], "declaration_limit": 5,
+        "id": ID, "include": ["history", "documentation"], "declaration_limit": 5,
         "view": "a".repeat(64),
     }))
     .expect("shared request");
@@ -3060,7 +3062,7 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     let generated = crate::generated::GetSymbolParams {
         id: request.id.as_str().to_owned(),
         include: Some(vec![
-            crate::generated::GetSymbolInclude::Source,
+            crate::generated::GetSymbolInclude::History,
             crate::generated::GetSymbolInclude::Documentation,
         ]),
         declaration_limit: Some(request.declaration_limit),

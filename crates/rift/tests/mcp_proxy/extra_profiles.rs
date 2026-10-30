@@ -141,12 +141,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
     );
     assert_eq!(all["local"].1.as_deref(), Some(PRIMARY_SOURCE));
 
-    let found = proxied_call(
-        &client,
-        "get_symbol",
-        &json!({"id":profile_id, "include":["source"]}),
-    )
-    .await?;
+    let found = proxied_call(&client, "get_symbol", &json!({"id":profile_id})).await?;
     let found: GetSymbolResult = serde_json::from_value(found)?;
     let GetSymbolResult::Found {
         symbol,
@@ -170,7 +165,7 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
             name: "docs".to_owned(),
         }
     );
-    assert_eq!(declarations[0].source.as_deref(), Some(PROFILE_SOURCE));
+    assert_eq!(declarations.len(), 1);
 
     let nodes = proxied_call(&client, "nodes", &json!({"symbol":profile_id})).await?;
     let item = &nodes["nodes"][0];

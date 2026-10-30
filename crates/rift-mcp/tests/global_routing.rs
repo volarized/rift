@@ -2550,7 +2550,7 @@ async fn assert_identifier_request(
     Ok(())
 }
 
-/// Checks search and symbol lookup spelling, source, and identity on one page.
+/// Checks search and symbol lookup spelling, source, range, and identity on one page.
 async fn assert_original_identifier(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     scope: &str,
@@ -2570,13 +2570,12 @@ async fn assert_original_identifier(
         .as_str()
         .ok_or("symbol carries identity")?;
     assert!(id.ends_with(&format!("/{name}")), "{id}");
-    let args = json!({"id": id, "include": ["source"]});
-    let answer = call_tool(client, "get_symbol", args).await?;
+    let answer = call_tool(client, "get_symbol", json!({"id": id})).await?;
     assert_eq!(answer["outcome"], "found", "{scope}: {answer:#}");
     assert_eq!(answer["symbol"]["id"], id, "{scope}: {answer:#}");
     assert_eq!(answer["symbol"]["name"], name, "{scope}: {answer:#}");
     assert_eq!(
-        answer["declarations"][0]["source"], expected_source,
+        answer["declarations"][0]["range"], hit["range"],
         "{scope}: {answer:#}"
     );
     Ok(())

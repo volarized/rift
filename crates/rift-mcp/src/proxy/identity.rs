@@ -372,7 +372,7 @@ mod tests {
     fn named_symbol_links_change_only_typed_identities() -> Result<(), Box<dyn std::error::Error>> {
         let mut result: GetSymbolResult = serde_json::from_value(serde_json::json!({
             "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function", "container":"rift://symbol/local/rust/app", "documentation":[{"format":"markdown","text":"rift://symbol/local/rust/app/load"}], "signatures":[{"display":"load()", "language":"rust", "links":[{"range":{"start":0,"end":4},"symbol":"rift://symbol/local/rust/app/load"}]}]},
-            "view":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at":"2026-10-11T04:00:00Z"}, "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"source":"fn load() {}", "source_complete":true,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
+            "view":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expires_at":"2026-10-11T04:00:00Z"}, "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
         }))?;
         let original = result.clone();
         qualify_symbol_result(&mut result, "cloud")?;

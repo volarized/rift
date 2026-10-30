@@ -58,7 +58,6 @@ fn stored_pages() -> (Value, Value) {
         .push(current);
 
     let mut symbols = symbol_result_json("demo", "first");
-    symbols["declarations"][0]["source"] = json!("demo");
     let mut old_context = context();
     old_context["documentation_revision"] = json!("abcdef01");
     old_context["references"][0]["documentation"]["documentation_revision"] = json!("abcdef01");
@@ -76,7 +75,7 @@ fn mixed_search_request() -> PackageSearchRequest {
 
 fn mixed_symbol_request() -> GetSymbolParams {
     let mut request = symbol_request();
-    request.include = vec![GetSymbolInclude::Source, GetSymbolInclude::Documentation];
+    request.include = vec![GetSymbolInclude::Documentation];
     request
 }
 
@@ -116,7 +115,7 @@ async fn native_http_reads_preserve_old_and_current_documentation() {
         else {
             panic!("found symbol")
         };
-        assert_eq!(declarations[0].source.as_deref(), Some("demo"));
+        assert_eq!(declarations.len(), 1);
         let context = documentation.expect("requested context");
         assert_eq!(context.references.len(), 1);
         assert_eq!(context.documentation_revision.0, revision);
@@ -377,7 +376,7 @@ async fn symbol_context_matches_requested_symbol_and_revision() {
         .await
         .expect("valid context");
     let mut absent = request.clone();
-    absent.include = vec![GetSymbolInclude::Source];
+    absent.include.clear();
     assert!(
         canonical_symbol_response(value.clone(), &absent, SOURCE_BYTES_MAX)
             .await
@@ -411,19 +410,25 @@ async fn symbol_context_matches_requested_symbol_and_revision() {
 }
 
 #[tokio::test]
-async fn symbol_source_requires_source_include() {
-    let mut value = symbol_result_json("demo", "first");
-    value["declarations"][0]["source"] = json!("demo");
-    let mut request = symbol_request();
-    request.include = vec![GetSymbolInclude::Source];
-    canonical_symbol_response(value.clone(), &request, SOURCE_BYTES_MAX)
-        .await
-        .expect("requested source");
-    request.include.clear();
-    let error = canonical_symbol_response(value, &request, SOURCE_BYTES_MAX)
-        .await
-        .expect_err("unrequested source");
-    assert_registered_field(&error, "rift.client.response_invalid", "body");
+async fn symbol_answer_carrying_declaration_source_is_refused() {
+    let request = symbol_request();
+    canonical_symbol_response(
+        symbol_result_json("demo", "first"),
+        &request,
+        SOURCE_BYTES_MAX,
+    )
+    .await
+    .expect("declaration without source");
+    for field in ["source", "source_complete", "node"] {
+        let mut value = symbol_result_json("demo", "first");
+        value["declarations"][0][field] = json!("demo");
+        assert!(
+            canonical_symbol_response(value, &request, SOURCE_BYTES_MAX)
+                .await
+                .is_err(),
+            "{field}"
+        );
+    }
 }
 
 #[test]

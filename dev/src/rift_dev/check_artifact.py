@@ -75,9 +75,9 @@ def symbol_id(hit: JsonObject) -> str:
 
 
 async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
-    """Read the observed identity and retain its original declaration bytes."""
+    """Read the observed identity and retain its original declaration location."""
     identity = symbol_id(hit)
-    answer = await client.call("get_symbol", {"id": identity, "include": ["source"]})
+    answer = await client.call("get_symbol", {"id": identity})
     require(answer.get("outcome") == "found", f"symbol was not found: {answer}")
     require(
         object_value(answer.get("symbol"), "symbol").get("id") == identity,
@@ -86,11 +86,15 @@ async def symbol_read(client: Client, hit: JsonObject) -> JsonObject:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    for field in ("path", "range", "source"):
+    for field in ("path", "range"):
         require(
             declaration.get(field) == hit.get(field),
             f"symbol declaration changed {field}: {answer}",
         )
+    require(
+        "source" not in declaration,
+        f"symbol declaration carried source: {answer}",
+    )
     return declaration
 
 

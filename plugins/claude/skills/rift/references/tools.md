@@ -7,7 +7,9 @@ Generated from the served tool surface.
 Reads one logical symbol by its canonical `id`. The caller may select a preceding
 immutable `view`; continuations retain that selection and its original expiry.
 A complete exact miss returns `symbol_not_found` and up to three alternatives.
-An unavailable selection returns its typed cause. Use `search` for discovery.
+An unavailable selection returns its typed cause. A found symbol carries its facts and
+each declaration's location; `nodes` with `symbol` reads a declaration's source. Use
+`search` for discovery.
 
 Parameters:
 

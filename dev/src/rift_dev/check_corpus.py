@@ -161,9 +161,12 @@ CHURN_REQUESTS: dict[str, JsonObject] = {
         "include": ["source"],
         "limit": 1,
     },
-    "get_symbol": {"include": ["source"]},
+    "symbol_nodes": {},
     "nodes": {"path": PROBE_PATH, "position": 0},
 }
+# The tool each churn read calls: `symbol_nodes` reads the probe declaration's nodes by its
+# symbol identity, the way an agent reads a declaration's source.
+CHURN_TOOLS = {"symbol_nodes": "nodes"}
 # The convergence loop resends every churn tool until the newest source lands, so it
 # stands outside the reads it repeats: one whole read budget for each of them.
 CONVERGENCE_SECONDS = READ_SECONDS * len(CHURN_REQUESTS)
@@ -1111,7 +1114,7 @@ class Corpus:
                 async with gate_deadline(f"churn {name}", budget):
                     answer = await read_settled_local(
                         client,
-                        name,
+                        CHURN_TOOLS.get(name, name),
                         requests[name],
                         seconds=budget,
                         poll_seconds=POLL_SECONDS,
@@ -1155,7 +1158,7 @@ class Corpus:
         task: asyncio.Task[None] | None = None
         try:
             identity, _revision = await read("search", None)
-            requests["get_symbol"]["id"] = identity
+            requests["symbol_nodes"]["symbol"] = identity
             task = asyncio.create_task(writer())
             reads = 0
             tools = tuple(CHURN_REQUESTS)

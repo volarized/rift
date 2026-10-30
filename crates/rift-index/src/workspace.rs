@@ -4010,8 +4010,6 @@ impl WorkspaceIndex {
                 end: binding.range().end(),
             },
             line: rift_core::line::line_of(starts, binding.range().start()),
-            source: None,
-            source_complete: false,
             signature_indices: rift_core::fact_indices(
                 combined.signatures_slice(),
                 supplied.signatures_slice(),

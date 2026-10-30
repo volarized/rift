@@ -2,7 +2,7 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Reads one logical symbol by its canonical `id`. The caller may select a preceding\nimmutable `view`; continuations retain that selection and its original expiry.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. Use `search` for discovery.",
+      "description": "Reads one logical symbol by its canonical `id`. The caller may select a preceding\nimmutable `view`; continuations retain that selection and its original expiry.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. A found symbol carries its facts and\neach declaration's location; `nodes` with `symbol` reads a declaration's source. Use\n`search` for discovery.",
       "input_schema": {
         "$defs": {
           "CapturedViewId": {
@@ -15,11 +15,6 @@
           "GetSymbolInclude": {
             "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
             "oneOf": [
-              {
-                "const": "source",
-                "description": "The hit's node identity and declaration source excerpt.",
-                "type": "string"
-              },
               {
                 "const": "history",
                 "description": "The hit's version-control timeline.",
@@ -67,7 +62,7 @@
           {
             "id": "rift://symbol/local/rust/app/parser/parse",
             "include": [
-              "source"
+              "documentation"
             ]
           }
         ],
@@ -91,10 +86,7 @@
             "description": "Canonical identity. Ownership and language come from this address."
           },
           "include": {
-            "default": [
-              "source"
-            ],
-            "description": "Requested projections. Omitted defaults to source; an empty list requests none.",
+            "description": "Requested projections. Omitted or empty requests none. A declaration's source is read\nby `nodes` with `symbol`.",
             "items": {
               "$ref": "#/$defs/GetSymbolInclude"
             },
@@ -2779,15 +2771,6 @@
                 },
                 "type": "array"
               },
-              "source": {
-                "description": "Source excerpt when requested and available.",
-                "maxLength": 67108864,
-                "type": "string"
-              },
-              "source_complete": {
-                "description": "Whether the supplied excerpt contains this declaration's complete source.",
-                "type": "boolean"
-              },
               "type_indices": {
                 "description": "Entries in the result symbol's type array supplied by this declaration.",
                 "items": {
@@ -2806,7 +2789,6 @@
               "origin",
               "range",
               "line",
-              "source_complete",
               "signature_indices",
               "type_indices",
               "documentation_indices"

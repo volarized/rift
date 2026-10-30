@@ -569,7 +569,6 @@ fn validate_max_lengths(spec: &Spec) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let expected_max_lengths = [
         ("PackageSearchHit", "source", source_max),
-        ("SymbolDeclaration", "source", source_max),
         ("PackagePatternDeclaration", "source", source_max),
         ("PackagePatternHit", "source", source_max),
         (

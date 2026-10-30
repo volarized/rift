@@ -4219,7 +4219,7 @@ mod tests {
         proxy: &RiftProxy,
     ) {
         assert_eq!(first_value["symbol"]["id"], arguments["id"]);
-        assert_eq!(first_value["declarations"][0]["source"], "fn load() {}");
+        assert!(first_value["declarations"][0].get("source").is_none());
         assert_eq!(first_value["declarations"][0]["path"], "lib.rs");
         assert_eq!(
             proxy.backends["cloud"].owner,
@@ -4301,7 +4301,7 @@ mod tests {
                 let answer = json!({"content":[],"structuredContent":{
                     "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function"},
                     "view":{"id":"claims.original","expires_at":expires_at},
-                    "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"source":"fn load() {}", "source_complete":true,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
+                    "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
                 }});
                 let response = json!({"jsonrpc":"2.0","id":request["id"],"result":answer});
                 writing

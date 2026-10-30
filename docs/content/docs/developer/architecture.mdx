@@ -759,8 +759,8 @@ the other two inputs and says so, rather than waiting for a model to load.
 ### Retrieve symbol
 
 [`get_symbol`](/docs/mcp#tool-get_symbol) reads one logical symbol by its canonical `id`.
-The answer separates the symbol from its declaration bindings and carries requested source
-inline. An immutable `view` keeps a later read and its declaration continuation on the same
+The answer separates the symbol from its declaration bindings; [`nodes`](/docs/mcp#tool-nodes)
+reads a declaration's source. An immutable `view` keeps a later read and its declaration continuation on the same
 selection.
 
 A Symbol carries `id` when the index established one identity for the declaration; a symbol

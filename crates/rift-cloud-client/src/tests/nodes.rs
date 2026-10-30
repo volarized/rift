@@ -44,6 +44,12 @@ pub(super) fn nodes_response_json() -> Value {
     ]})
 }
 
+/// One item node of `beacon` whose source holds `source_bytes` bytes.
+pub(super) fn single_node_response_json(source_bytes: usize) -> Value {
+    let item = node_json(0, "function_item", 0, &"x".repeat(source_bytes));
+    json!({"symbol": SYMBOL, "nodes": [item]})
+}
+
 /// One named change to a valid nodes answer.
 type AnswerMutation = (&'static str, fn(&mut Value));
 
