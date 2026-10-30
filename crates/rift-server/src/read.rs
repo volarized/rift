@@ -22,10 +22,10 @@ use rift_protocol::dependencies::{
 };
 use rift_protocol::map::WorkspaceMap;
 use rift_protocol::read::{
-    Digest, ExactKind, FileId, GetSymbolHit, GetSymbolInclude, GetSymbolParams, GetSymbolResult,
-    Language, NodesParams, NodesResult, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning,
-    RevisionId, SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol,
-    SymbolId, TextRange,
+    Digest, ExactKind, GetSymbolHit, GetSymbolInclude, GetSymbolParams, GetSymbolResult, Language,
+    NodesParams, NodesResult, PAGE_LIMIT_MAX, Pagination, ProjectPath, ReadWarning, RevisionId,
+    SOURCE_WARNINGS_MAX, SearchScope, SourceLocationKind, SourceUnitId, Symbol, SymbolId,
+    TextRange,
 };
 use rift_protocol::revision::{Revision, RevisionPoint};
 use rift_syntax::{ByteRange, SyntaxProvider, registry};
@@ -1837,11 +1837,8 @@ fn extension_capability(path: &CoreProjectPath) -> String {
     }
 }
 
-pub(crate) fn file_id(path: &CoreProjectPath) -> FileId {
-    FileId(format!(
-        "rift://file/{}",
-        rift_core::encode_path(path.as_str())
-    ))
+pub(crate) fn file_id(path: &CoreProjectPath) -> SourceUnitId {
+    SourceUnitId::project(path.as_str())
 }
 
 /// Projects one index-build warning onto its wire form.
@@ -3725,7 +3722,10 @@ pub fn compute() -> i32 {
             .map(|node| (node.kind.0.as_str(), node.source.as_str()))
             .collect::<Vec<_>>();
         assert_eq!(kinds, [("file", "default:\n    echo hi\n")]);
-        assert_eq!(answer.nodes[0].unit.as_str(), "rift://file/justfile");
+        assert_eq!(
+            answer.nodes[0].unit.as_str(),
+            "rift://source/project/justfile"
+        );
         Ok(())
     }
 

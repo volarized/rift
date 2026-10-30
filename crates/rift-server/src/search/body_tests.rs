@@ -331,7 +331,10 @@ async fn an_excluded_lockfile_answers_no_search_and_its_selection_warns() -> Tes
         .ok_or("selecting lockfiles warns")?;
     assert_eq!(
         files,
-        ["rift://file/Cargo.lock", "rift://file/web/deno.lock"]
+        [
+            "rift://source/project/Cargo.lock",
+            "rift://source/project/web/deno.lock"
+        ]
     );
 
     let symbols = search(

@@ -636,10 +636,7 @@ fn declared_nodes_match(
     let mut declared = answer
         .nodes
         .iter()
-        .filter(|node| {
-            node.index == 0
-                && matches!(&node.unit, rift_protocol::read::NodeUnit::Source(source) if source == unit)
-        })
+        .filter(|node| node.index == 0 && &node.unit == unit)
         .peekable();
     answer.view.as_ref() == Some(view)
         && answer.symbol.as_ref() == Some(id)

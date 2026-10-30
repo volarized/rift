@@ -1562,10 +1562,7 @@ fn framework_warnings(
     path: &ProjectPath,
     warnings: &[rift_protocol::read::ReadWarning],
 ) -> Vec<WorkspaceIndexWarning> {
-    let unit = rift_protocol::read::FileId(format!(
-        "rift://file/{}",
-        rift_core::encode_path(path.as_str())
-    ));
+    let unit = rift_protocol::read::SourceUnitId::project(path.as_str());
     warnings
         .iter()
         .filter_map(|warning| match warning {

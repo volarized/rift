@@ -39,7 +39,7 @@ CONTEXT_DEGRADED = "dependency context degraded"
 # `large_files` stays `split`: a file past this many bytes is indexed as whole-line chunks
 # of at most this size, and its text past the first chunk still answers search.
 TEXT_CHUNK_BYTES = 1 << 20
-FILE_PREFIX = "rift://file/"
+FILE_PREFIX = "rift://source/project/"
 # A run of identifier bytes, which a `pattern` matches literally with no escaping.
 PATTERN_TOKEN = re.compile(rb"[A-Za-z_][A-Za-z0-9_]{7,63}")
 # The characters the Rust `regex` crate's syntax reserves, each escaped with a backslash

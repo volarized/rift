@@ -4700,7 +4700,7 @@ mod tests {
             "outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},
             "view":{"id":"claims.docs","expires_at":"2030-01-01T00:00:00Z"},
             "revision":format!("rift://revision/tree/{}", "0".repeat(64)),
-            "warnings":[{"code":"framework_context_unresolved", "unit":"rift://file/a.ts",
+            "warnings":[{"code":"framework_context_unresolved", "unit":"rift://source/project/a.ts",
                 "framework":"tailwind", "detail":"missing version"}]
         }))
         .expect("typed profile answer");

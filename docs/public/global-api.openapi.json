@@ -5024,16 +5024,6 @@
         "pattern": "^(?:0|[1-9][0-9]*)(?:ms|s|m|h|d)$",
         "description": "A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`."
       },
-      "FileId": {
-        "type": "string",
-        "examples": [
-          "rift://file/src/lib.rs"
-        ],
-        "minLength": 13,
-        "maxLength": 8192,
-        "pattern": "^rift://file/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}$",
-        "description": "Identity of one file in the tree a request targets. The path after `rift://file/` is a\n`ProjectPath` in canonical percent-encoding. The server re-validates the decoded path\nwherever a `FileId` arrives, so the `ProjectPath` exclusions hold for every consumer,\nwhatever schema its implementation generated from."
-      },
       "FindDeclarationsParams": {
         "type": "object",
         "additionalProperties": false,
@@ -5408,7 +5398,7 @@
             "additionalProperties": false,
             "properties": {
               "unit": {
-                "$ref": "#/components/schemas/FileId",
+                "$ref": "#/components/schemas/SourceUnitId",
                 "description": "The source whose framework context is unresolved."
               },
               "framework": {
@@ -5731,7 +5721,7 @@
               "files": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/FileId"
+                  "$ref": "#/components/schemas/SourceUnitId"
                 },
                 "description": "The files cut at the bound.",
                 "maxItems": 8
@@ -5788,7 +5778,7 @@
             "properties": {
               "unit": {
                 "description": "The file the warning names. Absent on the one warning that counts the files\npast `SOURCE_WARNINGS_MAX`.",
-                "$ref": "#/components/schemas/FileId"
+                "$ref": "#/components/schemas/SourceUnitId"
               },
               "detail": {
                 "type": "string",
@@ -5840,7 +5830,7 @@
               "files": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/FileId"
+                  "$ref": "#/components/schemas/SourceUnitId"
                 },
                 "description": "The files held as text alone.",
                 "maxItems": 8
@@ -5869,7 +5859,7 @@
               "files": {
                 "type": "array",
                 "items": {
-                  "$ref": "#/components/schemas/FileId"
+                  "$ref": "#/components/schemas/SourceUnitId"
                 },
                 "description": "The selected lockfiles search leaves out.",
                 "maxItems": 8
@@ -7674,7 +7664,7 @@
               {
                 "declaration": 0,
                 "index": 0,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "struct_item",
                 "facets": [
@@ -7690,7 +7680,7 @@
               {
                 "declaration": 0,
                 "index": 1,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "visibility_modifier",
                 "range": {
@@ -7703,7 +7693,7 @@
               {
                 "declaration": 0,
                 "index": 2,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "type_identifier",
                 "range": {
@@ -7716,7 +7706,7 @@
               {
                 "declaration": 0,
                 "index": 3,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "field_declaration_list",
                 "range": {
@@ -7729,7 +7719,7 @@
               {
                 "declaration": 0,
                 "index": 4,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "field_declaration",
                 "facets": [
@@ -7746,7 +7736,7 @@
               {
                 "declaration": 0,
                 "index": 5,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "visibility_modifier",
                 "range": {
@@ -7759,7 +7749,7 @@
               {
                 "declaration": 0,
                 "index": 6,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "field_identifier",
                 "range": {
@@ -7772,7 +7762,7 @@
               {
                 "declaration": 0,
                 "index": 7,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "scoped_type_identifier",
                 "range": {
@@ -7785,7 +7775,7 @@
               {
                 "declaration": 0,
                 "index": 8,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "scoped_identifier",
                 "range": {
@@ -7798,7 +7788,7 @@
               {
                 "declaration": 0,
                 "index": 9,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
@@ -7811,7 +7801,7 @@
               {
                 "declaration": 0,
                 "index": 10,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
@@ -7824,7 +7814,7 @@
               {
                 "declaration": 0,
                 "index": 11,
-                "unit": "rift://file/src/config.rs",
+                "unit": "rift://source/project/src/config.rs",
                 "language": "rust",
                 "kind": "type_identifier",
                 "range": {
@@ -7858,8 +7848,8 @@
             "maximum": 9007199254740991
           },
           "unit": {
-            "$ref": "#/components/schemas/NodeUnit",
-            "description": "The source unit the node is written in: a project file, or a package or runtime\nsource unit for a node of a package or runtime symbol."
+            "$ref": "#/components/schemas/SourceUnitId",
+            "description": "The source unit the node is written in: a project file, as\n`rift://source/project/src/lib.rs`, or a package or runtime source unit for a node of\na package or runtime symbol. It names no revision; the answer's `revision` does."
           },
           "language": {
             "$ref": "#/components/schemas/Language",
@@ -7978,19 +7968,6 @@
           "range"
         ],
         "description": "One named part of a node, and the bytes it spans."
-      },
-      "NodeUnit": {
-        "anyOf": [
-          {
-            "$ref": "#/components/schemas/FileId",
-            "description": "A file of the project tree, as `rift://file/src/lib.rs`."
-          },
-          {
-            "$ref": "#/components/schemas/SourceUnitId",
-            "description": "A source unit of a package or runtime, as `rift://source/cargo/crates.io/demo/src/lib.rs`."
-          }
-        ],
-        "description": "The source unit a [`Node`] is written in: a file of the project tree the read targets, or\na source unit of the package or runtime release that owns the node's symbol."
       },
       "RegionRole": {
         "description": "One named part of a node. A language marks these out inside a declaration, so an\noperation can address the body of a function without addressing its documentation.",

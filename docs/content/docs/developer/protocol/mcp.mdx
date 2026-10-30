@@ -859,6 +859,10 @@ nested declaration count toward the nested symbol.
 for a declaration's item node and for the file node. An address names a place at the read's
 revision, so an edit renumbers the nodes after it.
 
+A node of a project file names that file as a [`SourceUnitId`](/docs/developer/protocol/reference#SourceUnitId),
+such as `rift://source/project/src/config.rs`. The unit names no revision: the answer's
+`revision` names the tree or commit its bytes were read at.
+
 This call lists the nodes of the `Config` struct:
 
 <ReadExample name="symbol-nodes" />
@@ -1073,8 +1077,8 @@ The line of a warning has these parts:
 - `: ` and the `detail`, when the warning carries one, quoted when it holds ` · ` or `: `
 
 The server **MUST** group `framework_context_unresolved` warnings with equal `framework`
-and `detail`. Each group omits `unit` from its heading and lists sorted, distinct file
-identities below `files:`; other equal warning lines appear once. The structured `warnings`
+and `detail`. Each group omits `unit` from its heading and lists sorted, distinct source
+units below `files:`; other equal warning lines appear once. The structured `warnings`
 array retains its original entries.
 
 For canonical `get_symbol`, a proxy suppresses repeated framework warning text when the

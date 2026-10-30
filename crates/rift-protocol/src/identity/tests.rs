@@ -509,7 +509,7 @@ fn test_invalid_structure_names_owners_and_versions_are_refused() {
         "rift://symbol/rust/src/lib.rs/Name",
         "rift://symbol/local/rust",
         "rift://symbol/local//Name",
-        "rift://file/README.md",
+        "rift://source/project/README.md",
         "rift://symbol/local@/rust/app/Name",
         "rift://symbol/local@all/rust/app/Name",
         "rift://symbol/local@Upper/rust/app/Name",

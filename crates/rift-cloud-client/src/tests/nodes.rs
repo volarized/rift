@@ -1,5 +1,5 @@
 use super::*;
-use rift_protocol::read::{NODES_SOURCE_BYTES_MAX, NodeUnit, NodesParams, NodesResult, SymbolId};
+use rift_protocol::read::{NODES_SOURCE_BYTES_MAX, NodesParams, NodesResult, SymbolId};
 use serde_json::{Value, json};
 
 const SYMBOL: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
@@ -77,12 +77,7 @@ async fn test_fixture_nodes_list_a_package_symbol_from_its_symbol_alone() {
     let expected: NodesResult =
         serde_json::from_value(nodes_response_json()).expect("nodes response fixture");
     assert_eq!(answer, expected);
-    assert!(
-        answer
-            .nodes
-            .iter()
-            .all(|node| matches!(&node.unit, NodeUnit::Source(unit) if unit.as_str() == UNIT))
-    );
+    assert!(answer.nodes.iter().all(|node| node.unit.as_str() == UNIT));
     assert_eq!(
         server.state.last_path.lock().await.as_deref(),
         Some("/rift/rest/v1/nodes")
@@ -231,7 +226,7 @@ async fn a_global_api_without_the_nodes_feature_refuses_before_the_read() {
 async fn nodes_breaking_the_contract_refuse_as_invalid_responses() {
     let mutations: [AnswerMutation; 7] = [
         ("project file unit", |answer| {
-            answer["nodes"][1]["unit"] = json!("rift://file/src/lib.rs");
+            answer["nodes"][1]["unit"] = json!("rift://source/project/src/lib.rs");
         }),
         ("unit of another package", |answer| {
             answer["nodes"][1]["unit"] = json!("rift://source/cargo/crates.io/other/src/lib.rs");
