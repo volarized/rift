@@ -283,13 +283,13 @@ mod tests {
         assert_eq!(
             public_facts(&document),
             [
-                ("open~1", true),
+                ("open", true),
                 ("outer", false),
-                ("open~2", false),
-                ("limit~1", false),
+                ("open", false),
+                ("limit", false),
                 ("Router", false),
                 ("Router.open", false),
-                ("limit~2", true),
+                ("limit", true),
             ]
         );
     }
@@ -362,8 +362,8 @@ mod tests {
             [
                 ("helper", false),
                 ("config", false),
-                ("load~1", false),
-                ("load~2", false),
+                ("load", false),
+                ("load", false),
             ]
         );
     }
@@ -568,17 +568,23 @@ mod tests {
     }
 
     /// JavaScript allows redeclaring a function name; the walk emits both
-    /// declarations rather than dropping either, and each takes a `~N`
-    /// suffix so the two address distinct identities.
+    /// declarations rather than dropping either, under the one name and numbered
+    /// apart in source order.
     #[test]
-    fn test_redeclared_function_emits_both_declarations_under_distinct_names() {
+    fn test_redeclared_function_emits_both_declarations_numbered_apart() {
         let document = analyze("function dup() { return 1; }\nfunction dup() { return 2; }\n");
         let names = document
             .symbols()
             .iter()
             .map(|symbol| symbol.qualified_name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["dup~1", "dup~2"]);
+        assert_eq!(names, ["dup", "dup"]);
+        let ordinals = document
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.declaration_ordinal)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 1]);
         assert_ne!(
             document.symbols()[0].range,
             document.symbols()[1].range,
@@ -732,7 +738,14 @@ mod tests {
             .filter(|symbol| symbol.name == "open")
             .collect::<Vec<_>>();
         assert_eq!(symbols.len(), 2);
-        assert_ne!(symbols[0].qualified_name, symbols[1].qualified_name);
+        assert_eq!(symbols[0].qualified_name, symbols[1].qualified_name);
+        assert_eq!(
+            (
+                symbols[0].declaration_ordinal,
+                symbols[1].declaration_ordinal
+            ),
+            (0, 1)
+        );
         assert!(symbols[0].range.end < symbols[1].range.start);
         for symbol in symbols {
             assert_eq!(symbol.node_kind, Some("assignment_expression"));

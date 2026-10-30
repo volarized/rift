@@ -2163,9 +2163,9 @@ pub(crate) mod tests {
             assert!(
                 super::symbol_id(service.index(), crate::search::declared(file, symbol))?.is_none()
             );
-            Ok(crate::history::SymbolState::Present(
+            Ok(crate::history::SymbolState::Present(vec![
                 crate::history::SymbolShape::from_source(file.source(), symbol),
-            ))
+            ]))
         };
         let older = state(&older)?;
         let newer = state(&newer)?;

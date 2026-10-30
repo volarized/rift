@@ -24,7 +24,7 @@ use rift_core::constants::{
 };
 use rift_core::{
     CompositionId, Contribution, LanguageFileSelections, PortableSymbolFacts, ProjectPath,
-    ProviderId, SourceVisibility, SymbolId, TextFileInclusion, symbol_identity,
+    ProviderId, SourceVisibility, SymbolId, TextFileInclusion,
 };
 use rift_error::{ErrorSlug, RiftError, ctx, errors};
 use rift_protocol::configuration::{LargeFileStrategy, SyntaxConfiguration};
@@ -3790,10 +3790,9 @@ impl WorkspaceIndex {
     /// Returns `RiftError` when normalized Contributions do not
     /// supply required portable facts.
     pub fn assembled_symbol(&self, matched: SymbolMatch<'_>) -> Result<ReadableSymbol, RiftError> {
-        let identity = symbol_identity(
+        let identity = matched.symbol.provider_address(
             &matched.file.syntax().language().identity_segment(),
             matched.file.path().as_str(),
-            &matched.symbol.qualified_name,
         );
         ReadableSymbol::assembled_by(&self.semantics, &identity).ok_or_else(|| {
             errors::index::workspace_provider()
@@ -4121,10 +4120,9 @@ impl WorkspaceIndex {
                 let Some(matched) = self.declaration_match(file.path(), index) else {
                     continue;
                 };
-                let provider = symbol_identity(
+                let provider = matched.symbol.provider_address(
                     &file.syntax().language().identity_segment(),
                     file.path().as_str(),
-                    &matched.symbol.qualified_name,
                 );
                 declarations
                     .provider
@@ -6821,10 +6819,9 @@ fn node_address(place: NodePlace, declarations: &[Option<(SymbolId, usize)>]) ->
 /// ranked identity and a read address are one value.
 #[must_use]
 pub fn declaration_identity(matched: SymbolMatch<'_>) -> DocumentIdentity {
-    let identity = symbol_identity(
+    let identity = matched.symbol.provider_address(
         &matched.file.syntax().language().identity_segment(),
         matched.file.path().as_str(),
-        &matched.symbol.qualified_name,
     );
     DocumentIdentity::new(identity).unwrap_or_else(|error| {
         unreachable!("a declaration's rift identity must be non-empty: error={error}")
@@ -6844,10 +6841,9 @@ fn symbol_document(
     symbol: &SyntaxSymbol,
     left_out: &mut LeftOut,
 ) -> Option<IndexDocument> {
-    let identity = rift_core::symbol_identity(
+    let identity = symbol.provider_address(
         &file.syntax().language().identity_segment(),
         file.path().as_str(),
-        &symbol.qualified_name,
     );
     document(
         identity,
@@ -7183,6 +7179,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::*;
+    use rift_core::symbol_identity;
     use rift_ranking::IdentifierMatchClass;
     use rift_syntax::SyntaxDocument;
     use rift_syntax::{RustSyntaxProvider, SyntaxLimits};

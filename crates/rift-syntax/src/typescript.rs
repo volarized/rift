@@ -207,24 +207,24 @@ mod tests {
                     Some("map<U>(callbackfn: (value: T) => U): U[]")
                 ),
                 (
-                    "Array.reduce~1",
+                    "Array.reduce",
                     "method",
                     Some("reduce(callbackfn: (a: T, b: T) => T): T")
                 ),
                 (
-                    "Array.reduce~2",
+                    "Array.reduce",
                     "method",
                     Some("reduce<U>(callbackfn: (a: U, b: T) => U, initial: U): U")
                 ),
                 ("Reader", "class", None),
                 ("Reader.read", "method", Some("read(size?: number): string")),
                 (
-                    "readFile~1",
+                    "readFile",
                     "function",
                     Some("function readFile(path: string): string")
                 ),
                 (
-                    "readFile~2",
+                    "readFile",
                     "function",
                     Some("function readFile(path: string, encoding: null): Uint8Array")
                 ),

@@ -573,6 +573,7 @@ fn utilities(text: &str, range: ByteRange, facts: &mut Collector) {
 fn symbol(name: &str, kind: &'static str, range: ByteRange) -> SyntaxSymbol {
     SyntaxSymbol {
         name: name.to_owned(),
+        declaration_ordinal: 0,
         qualified_name: name.to_owned(),
         container: None,
         kind,

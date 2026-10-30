@@ -450,10 +450,10 @@ fn document_questions() -> [DocumentQuestion<'static>; 4] {
         (
             "records",
             "docs/repeated.md",
-            &["Examples", "Examples > Calibration~2"][..],
-            "f029465cd85732d93c71c1c5529623413a989f85526db2c5f79c9082470b899f",
+            &["Examples", "Examples > Calibration"][..],
+            "0f5ca9f41ba1c7a8f40420030e3efaa8bed47ea567a9631e1d592c24796e7f14",
             &["docs/repeated.md"][..],
-            &["Examples > Calibration~2"][..],
+            &["Examples > Calibration"][..],
         ),
         (
             "orbital_route",

@@ -711,14 +711,6 @@ fn declaration_anchors_with_public(
     module: Option<&str>,
     public: &BTreeSet<String>,
 ) -> BTreeMap<String, SymbolId> {
-    let mut groups: BTreeMap<String, usize> = BTreeMap::new();
-    for symbol in syntax.symbols().iter().filter(|symbol| {
-        symbol.node_kind != Some("assignment_expression")
-            || symbol.facets.contains(&SymbolFacet::Public)
-            || public.contains(&symbol.qualified_name)
-    }) {
-        *groups.entry(defining_name(symbol)).or_default() += 1;
-    }
     let mut paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut anchors = BTreeMap::new();
     for symbol in syntax.symbols().iter().filter(|symbol| {
@@ -737,9 +729,7 @@ fn declaration_anchors_with_public(
         if literal.is_none() {
             path.push(symbol.name.clone());
         }
-        let base = defining_name(symbol);
-        let repeated = groups[&base] > 1;
-        if symbol.qualified_name != base && !repeated {
+        if symbol.qualified_name != defining_name(symbol) {
             continue;
         }
         let Ok(identity) = SymbolIdentity::new(
@@ -750,10 +740,7 @@ fn declaration_anchors_with_public(
             continue;
         };
         if let Ok(identity) = SymbolId::new(identity.wire_identity()) {
-            paths.insert(symbol.qualified_name.clone(), path.clone());
-            if repeated {
-                paths.insert(base, path);
-            }
+            paths.insert(symbol.qualified_name.clone(), path);
             anchors.insert(symbol.qualified_name.clone(), identity);
         }
     }
