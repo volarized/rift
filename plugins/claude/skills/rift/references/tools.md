@@ -21,8 +21,10 @@ Parameters:
 ## nodes
 
 Lists the syntax nodes covering one UTF-8 byte position in one file,
-outermost first. Each identity carries a witness, so an address taken
-from this listing refuses cleanly once the file's bytes drift. `rev`
+outermost first. Each node is addressed by its place: node `index` of
+declaration `declaration` of `symbol`, or node `index` of its unit
+outside every declaration, with `parent` an index in the same holder;
+an edit renumbers the nodes after it. `rev`
 lists the nodes as of a version-control revision instead of the
 current tree. If discovery is incomplete or a targeted read spends the
 request's remaining time, the result has empty `nodes` and `source` and

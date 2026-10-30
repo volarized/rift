@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     documentation::DocumentationContext,
     read::{
-        GetSymbolInclude, NodeId, PAGE_LIMIT_MAX, ProjectPath, ReadWarning, RevisionId,
-        SourceUnitId, Symbol, SymbolHistory, SymbolId, SymbolOrigin, TextRange,
+        GetSymbolInclude, PAGE_LIMIT_MAX, ProjectPath, ReadWarning, RevisionId, SourceUnitId,
+        Symbol, SymbolHistory, SymbolId, SymbolOrigin, TextRange,
     },
 };
 
@@ -173,9 +173,6 @@ pub struct SymbolDeclaration {
     /// One-based line where this declaration begins.
     #[schemars(range(min = 1_u64))]
     pub line: u64,
-    /// Source node when available and requested.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node: Option<NodeId>,
     /// Source excerpt when requested and available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(max = 67_108_864))]

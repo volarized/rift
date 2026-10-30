@@ -12,7 +12,10 @@ use crate::markdown::MarkdownFacts;
 /// the `~N` suffix `SymbolId` advertises.
 const DUPLICATE_SUFFIX_MARKER: char = '~';
 
+mod node_places;
 mod retained_size;
+
+pub use node_places::{NodeHolder, NodePlace};
 pub(crate) mod rust_macros;
 
 /// Half-open UTF-8 byte range.

@@ -355,7 +355,7 @@
     "arguments": {
       "id": "rift://symbol/local/rust/example_project/config/load_config"
     },
-    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\n\t\trift://node/rust/src/config.rs@162-355#3e7a78cf\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
+    "text": "\tpub fn load_config(path: &Path) -> Result<Config, ConfigError>\n\trift://symbol/local/rust/example_project/config/load_config\n\n\tLoads the workspace configuration from `rift.toml`.\n\n\tdeclarations:\n\t\tsrc/config.rs:11\n\t\t218..355\n\t\t/// Loads the workspace configuration from `rift.toml`.\n\t\tpub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n\t\t    let text = std::fs::read_to_string(path)?;\n\t\t    parse_config(&text)\n\t\t}\nview e736fecc6db89146c2b8d8a2cd4ec9b8acdd395d7c948ee0517eb364a5ccf2f3 \u00b7 expires 2026-10-12T15:50:28.711117+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -394,7 +394,6 @@
             "end": 355
           },
           "line": 11,
-          "node": "rift://node/rust/src/config.rs@162-355#3e7a78cf",
           "source": "/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
           "source_complete": true,
           "signature_indices": [0],
@@ -409,7 +408,7 @@
     "arguments": {
       "id": "rift://symbol/local@sdk/rust/docs_sdk/load_config"
     },
-    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\n\t\trift://node/rust/src/lib.rs@0-59#b0b58466\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
+    "text": "\tpub fn load_config() -> u32\n\trift://symbol/local@sdk/rust/docs_sdk/load_config\n\n\tLoads configuration.\n\n\tdeclarations:\n\t\tsrc/lib.rs:2\n\t\t25..59\n\t\t/// Loads configuration.\n\t\tpub fn load_config() -> u32 { 42 }\nview e1c7db5b8bb6eca9c67b20e69cfa0bba919e60b0c522429052ea2147ccbaeebd \u00b7 expires 2026-10-12T16:17:02.916991+00:00\n",
     "json": {
       "outcome": "found",
       "symbol": {
@@ -448,7 +447,6 @@
             "end": 59
           },
           "line": 2,
-          "node": "rift://node/rust/src/lib.rs@0-59#b0b58466",
           "source": "/// Loads configuration.\npub fn load_config() -> u32 { 42 }",
           "source_complete": true,
           "signature_indices": [0],
@@ -642,11 +640,11 @@
       "path": "src/config.rs",
       "position": 338
     },
-    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\trift://node/rust/src/config.rs@0-356#dcbef6dd\n\t[2] function_item \u00b7 4 lines\n\t\trift://node/rust/src/config.rs@218-355#67ecfb36\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\trift://node/rust/src/config.rs@281-355#4e554fa8\n\t[4] call_expression\n\t\trift://node/rust/src/config.rs@334-353#4df4426e\n\t[5] identifier\n\t\trift://node/rust/src/config.rs@334-346#03f22dac\n\n\t\tparse_config\n",
+    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\t0..356\n\t\tindex 0\n\t[2] function_item \u00b7 4 lines\n\t\t218..355\n\t\tdeclaration 0 \u00b7 index 0\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\t281..355\n\t\tdeclaration 0 \u00b7 index 13 \u00b7 parent 0\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[4] call_expression\n\t\t334..353\n\t\tdeclaration 0 \u00b7 index 25 \u00b7 parent 13\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[5] identifier\n\t\t334..346\n\t\tdeclaration 0 \u00b7 index 26 \u00b7 parent 25\n\t\trift://symbol/local/rust/example_project/config/load_config\n\n\t\tparse_config\n",
     "json": {
       "nodes": [
         {
-          "id": "rift://node/rust/src/config.rs@0-356#dcbef6dd",
+          "index": 0,
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "source_file",
@@ -656,8 +654,9 @@
           }
         },
         {
-          "id": "rift://node/rust/src/config.rs@218-355#67ecfb36",
           "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+          "declaration": 0,
+          "index": 0,
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "function_item",
@@ -668,17 +667,22 @@
           }
         },
         {
-          "id": "rift://node/rust/src/config.rs@281-355#4e554fa8",
+          "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+          "declaration": 0,
+          "index": 13,
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "block",
           "range": {
             "start": 281,
             "end": 355
-          }
+          },
+          "parent": 0
         },
         {
-          "id": "rift://node/rust/src/config.rs@334-353#4df4426e",
+          "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+          "declaration": 0,
+          "index": 25,
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "call_expression",
@@ -686,17 +690,21 @@
           "range": {
             "start": 334,
             "end": 353
-          }
+          },
+          "parent": 13
         },
         {
-          "id": "rift://node/rust/src/config.rs@334-346#03f22dac",
+          "symbol": "rift://symbol/local/rust/example_project/config/load_config",
+          "declaration": 0,
+          "index": 26,
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "identifier",
           "range": {
             "start": 334,
             "end": 346
-          }
+          },
+          "parent": 25
         }
       ],
       "source": [

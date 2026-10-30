@@ -849,7 +849,6 @@ impl LocalSymbolMaterial {
         if request.include.contains(&GetSymbolInclude::Source) {
             let (bindings, _) = self.index.symbols_by_identity_page(key, offset, limit)?;
             for (declaration, matched) in declarations.iter_mut().zip(bindings) {
-                declaration.node = Some(super::node_id(matched.file, matched.symbol.range));
                 declaration.source = Some(super::excerpt(matched.file, matched.symbol.range));
                 declaration.source_complete = true;
             }

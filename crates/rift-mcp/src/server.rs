@@ -3222,8 +3222,10 @@ impl RiftMcp {
     }
 
     /// Lists the syntax nodes covering one UTF-8 byte position in one file,
-    /// outermost first. Each identity carries a witness, so an address taken
-    /// from this listing refuses cleanly once the file's bytes drift. `rev`
+    /// outermost first. Each node is addressed by its place: node `index` of
+    /// declaration `declaration` of `symbol`, or node `index` of its unit
+    /// outside every declaration, with `parent` an index in the same holder;
+    /// an edit renumbers the nodes after it. `rev`
     /// lists the nodes as of a version-control revision instead of the
     /// current tree. If discovery is incomplete or a targeted read spends the
     /// request's remaining time, the result has empty `nodes` and `source` and
@@ -7172,26 +7174,25 @@ done
             !listed.is_empty(),
             "position 8 sits inside `pub fn beacon`, so at least one node covers it"
         );
-        let witness_suffix = has_witness_fragment(listed[0]["id"].as_str().unwrap_or_default());
-        assert!(
-            witness_suffix,
-            "every listed node id must end in an eight-hex-character witness: {}",
-            listed[0]["id"]
+        assert_eq!(
+            listed[0]["index"],
+            json!(0),
+            "the outermost node is the unit's root"
         );
+        let item = listed
+            .iter()
+            .find(|node| node["kind"] == "function_item")
+            .ok_or("`pub fn beacon` covers position 8")?;
+        assert_eq!(
+            (&item["declaration"], &item["index"]),
+            (&json!(0), &json!(0)),
+            "a declaration's item node is node 0 of that declaration"
+        );
+        assert!(item["symbol"].is_string(), "{item}");
 
         client.cancel().await?;
         server_task.await?;
         Ok(())
-    }
-
-    /// Reports whether a node id ends in `#` plus eight lowercase hex digits.
-    fn has_witness_fragment(id: &str) -> bool {
-        id.rsplit_once('#').is_some_and(|(_, witness)| {
-            witness.len() == 8
-                && witness
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit() && !character.is_uppercase())
-        })
     }
 
     #[tokio::test]

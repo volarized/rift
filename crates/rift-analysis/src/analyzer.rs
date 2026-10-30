@@ -1612,12 +1612,6 @@ impl Records {
                 })?,
                 kind: rift_protocol::read::ExactKind(facet.as_ref().to_owned()),
                 facets: vec![facet],
-                evidence: edge
-                    .occurrence()
-                    .and_then(rift_core::DeclarationBinding::node)
-                    .cloned()
-                    .into_iter()
-                    .collect(),
                 occurrence,
                 derivation,
                 confidence: None,

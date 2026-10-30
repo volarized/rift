@@ -9,8 +9,7 @@ use std::sync::Arc;
 use rift_error::{RiftError, errors};
 pub use rift_protocol::read::{
     Documentation, DocumentationFormat, ExactKind, ExtensionKey, ExtensionValue, Extensions,
-    Language, NodeId, PackageIdentity, Signature, SourceKind, SourceLocation, SymbolFacet,
-    TypeBinding,
+    Language, PackageIdentity, Signature, SourceKind, SourceLocation, SymbolFacet, TypeBinding,
 };
 
 use crate::{
@@ -165,14 +164,13 @@ impl SourceRange {
 pub struct DeclarationBinding {
     unit: SourceUnitId,
     range: SourceRange,
-    node: Option<NodeId>,
 }
 
 impl DeclarationBinding {
     /// Constructs one source declaration binding.
     #[must_use]
-    pub const fn new(unit: SourceUnitId, range: SourceRange, node: Option<NodeId>) -> Self {
-        Self { unit, range, node }
+    pub const fn new(unit: SourceUnitId, range: SourceRange) -> Self {
+        Self { unit, range }
     }
 
     /// Returns source unit.
@@ -185,12 +183,6 @@ impl DeclarationBinding {
     #[must_use]
     pub const fn range(&self) -> SourceRange {
         self.range
-    }
-
-    /// Returns witnessed syntax node when supplied.
-    #[must_use]
-    pub const fn node(&self) -> Option<&NodeId> {
-        self.node.as_ref()
     }
 }
 
@@ -1181,11 +1173,8 @@ mod tests {
     }
 
     fn contribution() -> Contribution {
-        let binding = super::DeclarationBinding::new(
-            source_unit(),
-            SourceRange::new(0, 12).expect("range"),
-            None,
-        );
+        let binding =
+            super::DeclarationBinding::new(source_unit(), SourceRange::new(0, 12).expect("range"));
         Contribution::builder(
             ContributionKey::new(
                 provider("syntax"),
@@ -1241,7 +1230,6 @@ mod tests {
         assert_eq!(source.unit(), &source_unit());
         assert_eq!(source.range().start(), 0);
         assert_eq!(source.range().end(), 12);
-        assert!(source.node().is_none());
         assert!(contribution.identity_anchor().is_some());
         assert!(contribution.equivalence().is_empty());
         assert!(contribution.namespaced().0.is_empty());
@@ -1318,11 +1306,8 @@ mod tests {
         .expect_err("noncanonical identity anchor");
         assert_eq!(error.slug().as_str(), "rift.core.identity_invalid");
 
-        let source = super::DeclarationBinding::new(
-            source_unit(),
-            SourceRange::new(0, 12).expect("range"),
-            None,
-        );
+        let source =
+            super::DeclarationBinding::new(source_unit(), SourceRange::new(0, 12).expect("range"));
         let error = Contribution::builder(
             ContributionKey::new(
                 provider("syntax"),
@@ -1635,11 +1620,8 @@ mod tests {
     #[test]
     fn references_and_relationships_are_validated_and_retained() {
         let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
-        let binding = super::DeclarationBinding::new(
-            source_unit(),
-            SourceRange::new(20, 26).expect("range"),
-            None,
-        );
+        let binding =
+            super::DeclarationBinding::new(source_unit(), SourceRange::new(20, 26).expect("range"));
         let duplicate = SemanticReference::new(
             binding.clone(),
             ReferenceRole::Read,
@@ -1679,11 +1661,8 @@ mod tests {
     fn reference_and_relationship_counts_accept_the_bound_and_refuse_one_more() {
         // Issue #535: both collections must retain the count-bound refusal evidence.
         let target = ContributionReference::new(provider("syntax"), provider_symbol("Beacon"));
-        let binding = super::DeclarationBinding::new(
-            source_unit(),
-            SourceRange::new(20, 26).expect("range"),
-            None,
-        );
+        let binding =
+            super::DeclarationBinding::new(source_unit(), SourceRange::new(20, 26).expect("range"));
         let reference = SemanticReference::new(binding, ReferenceRole::Call, vec![target.clone()])
             .expect("reference");
         let relationship = ContributionRelationship::new(RelationshipKind::Implementation, target);

@@ -3,7 +3,7 @@
 //! Hits a relationship walk reached are written as a tree by the `walk` module.
 
 use rift_protocol::documentation::DocumentationHit;
-use rift_protocol::read::{NodeId, ProjectPath, SourceUnitId, Symbol, SymbolId, TextRange};
+use rift_protocol::read::{ProjectPath, SourceUnitId, Symbol, SymbolId, TextRange};
 use rift_protocol::search::{
     CommitHit, GraphHop, MatchedField, SearchHit, SearchHitTarget, SymbolChange,
 };
@@ -110,7 +110,6 @@ fn hit(lines: &mut Lines<'_>, hit: &SearchHit) -> Result<(), TextError> {
             size: _,
             languages: _,
         } => file_hit(lines, &view),
-        SearchHitTarget::Node { node } => node_hit(lines, node, &view),
         SearchHitTarget::Documentation { documentation } => {
             documentation_hit(lines, documentation, &view)
         }
@@ -252,15 +251,6 @@ fn file_hit(lines: &mut Lines<'_>, view: &HitView<'_>) -> Result<(), TextError> 
     let place = location(view.path, view.unit, view.line);
     let facts = place_facts(view, &place, &Facts::default())?;
     lines.head(facts.as_str())?;
-    plain_source(lines, view.source)
-}
-
-/// Writes a node hit: its place and matched fields, its identity, then the source.
-fn node_hit(lines: &mut Lines<'_>, node: &NodeId, view: &HitView<'_>) -> Result<(), TextError> {
-    let place = location(view.path, view.unit, view.line);
-    let facts = place_facts(view, &place, &Facts::default())?;
-    lines.head(facts.as_str())?;
-    lines.line(0, &node.0)?;
     plain_source(lines, view.source)
 }
 

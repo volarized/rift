@@ -4,7 +4,7 @@
 
 use crate::dependencies::RequestedPackage;
 use crate::read::{
-    CommitAuthor, Language, NodeId, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath,
+    CommitAuthor, Language, PAGE_INDEX_DEFAULT, PAGE_LIMIT_MAX, Pagination, ProjectPath,
     ReadWarning, Relationship, RelationshipFacet, RevisionId, SearchScope, SourceUnitId, Symbol,
     SymbolId, SymbolVersionKind, TextRange,
 };
@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use strum::VariantArray;
 
-/// One auditable step in a search traversal. `relationship` retains source-node evidence and
+/// One auditable step in a search traversal. `relationship` retains its occurrence and
 /// derivation; `direction` records how the walk followed it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -179,8 +179,8 @@ pub enum ResultOrder {
     Identity,
 }
 
-/// One search hit. Its file, node, symbol, or commit payload carries the canonical identity.
-/// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
+/// One search hit. Its file, symbol, documentation, or commit payload carries the canonical
+/// identity. Dependency and synthetic symbols can have no readable source; file hits cannot.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::pair_range_with_line)]
@@ -191,7 +191,7 @@ pub struct SearchHit {
     /// Absent when the caller selected latest facts without retained serving context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub view: Option<crate::symbol_read::CapturedView>,
-    /// What was found. A symbol, a node, a file, a documentation block, or a commit -
+    /// What was found. A symbol, a file, a documentation block, or a commit -
     /// whichever `target` allowed.
     pub hit: SearchHitTarget,
     /// The ranking value attached to this hit and used to merge duplicate hits.
@@ -258,11 +258,6 @@ pub enum SearchHitTarget {
     Symbol {
         /// The declaration that matched.
         symbol: Box<Symbol>,
-    },
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    Node {
-        /// The syntax-tree node's identity in the captured source revision.
-        node: NodeId,
     },
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     File {

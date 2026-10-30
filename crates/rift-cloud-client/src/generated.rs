@@ -49,13 +49,6 @@ static REGEX_PACKAGE_SEARCH_REQUEST_VIEW: std::sync::LazyLock<regex::Regex> = st
     regex::Regex::new("^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$")
         .expect("invalid regex")
 });
-static REGEX_PARAMETER_NODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
-{
-    regex::Regex::new(
-            "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
-        )
-        .expect("invalid regex")
-});
 static REGEX_SYMBOL_ID: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
             "^rift://symbol/(?:local(?:@[a-z][a-z0-9_-]*)?(?::[a-z][a-z0-9_-]*)?/|stdlib/[a-z][a-z0-9_-]*@[^/?#]+/|[a-z][a-z0-9_-]*/[^/?#]+/(?:@[a-z0-9._-]+/)?[a-z0-9._-]+@[^/?#]+/)[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+(?:/(?:[A-Za-z0-9._!$&'()*+,;=:@-]|%[0-9A-F]{2})+)*(?:~[1-9][0-9]*\\?rev=[0-9a-f]{64})?$",
@@ -642,15 +635,6 @@ pub struct Parameter {
     /// What the parameter is called. Absent where the language allows an unnamed one, as
     /// a positional parameter in a function type.
     pub name: Option<String>,
-    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
-    /// revision the response names.
-    #[validate(
-        length(min = 27u64, max = 8_192u64),
-        regex(path = "REGEX_PARAMETER_NODE")
-    )]
-    pub node: Option<String>,
     /// What it accepts, absent when empty. An array because a declared type and an
     /// inferred one are separate bindings.
     #[validate(nested)]
@@ -667,11 +651,6 @@ pub struct Parameter {
     /// implement.
     pub extensions: Option<serde_json::Value>,
 }
-/// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-/// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-/// of the SHA-256 of the node's source bytes. The identity describes the node in the
-/// revision the response names.
-pub type NodeId = String;
 /// One type a symbol carries, together with the role it plays for that symbol.
 #[derive(
     Debug,
@@ -1429,9 +1408,8 @@ pub struct ProblemDetails {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-/// uses. The full digest is computed and compared internally; only this short form ever
-/// reaches the wire.
+/// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+/// compared internally; only this short form ever reaches the wire.
 pub type Digest = String;
 /// Documentation metadata addressing bytes held by an existing content owner.
 #[serde_with::skip_serializing_none]
@@ -1553,9 +1531,8 @@ pub struct DocumentationContentIdentity {
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct DocumentationContext {
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     pub documentation_revision: String,
     /// References ordered by evidence, source, block range, and identity.
     pub references: Vec<DocumentationReferenceHit>,
@@ -1601,9 +1578,8 @@ pub struct DocumentationHit {
     /// Source facts shared by every block belonging to one content owner.
     #[validate(nested)]
     pub source: DocumentationSource,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     #[validate(
         length(min = 1u64),
         regex(path = "REGEX_DOCUMENTATION_HIT_DOCUMENTATION_REVISION")
@@ -2158,8 +2134,8 @@ pub struct PackageDocumentationHit {
     #[serde(flatten)]
     pub additional_properties: std::collections::HashMap<String, serde_json::Value>,
 }
-/// One search hit. Its file, node, symbol, or commit payload carries the canonical identity.
-/// Dependency and synthetic symbols can have no readable source; node and file hits cannot.
+/// One search hit. Its file, symbol, documentation, or commit payload carries the canonical
+/// identity. Dependency and synthetic symbols can have no readable source; file hits cannot.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -2311,8 +2287,6 @@ pub enum SearchHitTarget {
     DocumentationHit(SearchHitTargetDocumentationHit),
     /// A symbol hit: the declaration a provider resolved.
     Symbol(SearchHitTargetSymbol),
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    NodeId(SearchHitTargetNodeId),
     /// A file hit: one entry of the tree, whether or not any provider reads it.
     Object(SearchHitTargetObject),
     /// A commit hit: one commit the history store holds, matched by its message.
@@ -2330,13 +2304,6 @@ impl SearchHitTarget {
     pub fn symbol(symbol: Symbol) -> Self {
         Self::Symbol(SearchHitTargetSymbol {
             symbol,
-            ..Default::default()
-        })
-    }
-    /// A node hit: one place in a syntax tree, without its enclosing symbol record.
-    pub fn node_id(node: String) -> Self {
-        Self::NodeId(SearchHitTargetNodeId {
-            node,
             ..Default::default()
         })
     }
@@ -2435,7 +2402,7 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
         }
     }
 }
-/// One auditable step in a search traversal. `relationship` retains source-node evidence and
+/// One auditable step in a search traversal. `relationship` retains its occurrence and
 /// derivation; `direction` records how the walk followed it.
 #[derive(
     Debug,
@@ -2448,8 +2415,8 @@ impl<'de> serde::Deserialize<'de> for MatchedField {
 )]
 #[serde(deny_unknown_fields)]
 pub struct GraphHop {
-    /// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-    /// its derivation is how much the provider knew when it was read.
+    /// One directed edge between two symbols. Its occurrence is where it was read from, and its
+    /// derivation is how much the provider knew when it was read.
     #[validate(nested)]
     pub relationship: Relationship,
     /// How one path step followed its directed relationship.
@@ -2567,8 +2534,8 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
         }
     }
 }
-/// One directed edge between two symbols. Its evidence is the nodes it was read from, and
-/// its derivation is how much the provider knew when it was read.
+/// One directed edge between two symbols. Its occurrence is where it was read from, and its
+/// derivation is how much the provider knew when it was read.
 #[serde_with::skip_serializing_none]
 #[derive(
     Debug,
@@ -2579,7 +2546,7 @@ impl<'de> serde::Deserialize<'de> for HopDirection {
     validator::Validate,
     oas3_gen_support::Default
 )]
-#[serde(deny_unknown_fields, default)]
+#[serde(deny_unknown_fields)]
 pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
@@ -2594,9 +2561,6 @@ pub struct Relationship {
     /// Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. The portable codec validates exact versions, UTF-8 and canonical percent-encoding before lookup.
     #[validate(length(min = 1u64, max = 8_192u64), regex(path = "REGEX_SYMBOL_ID"))]
     pub to: String,
-    /// The nodes this edge was read from. Absent when empty.
-    #[default(Some(Default::default()))]
-    pub evidence: Option<Vec<String>>,
     /// One byte range in a source-catalog unit.
     #[validate(nested)]
     pub occurrence: Option<SourceUnitSpan>,
@@ -3094,13 +3058,11 @@ pub struct ReadWarning {
     pub alternatives: Option<Vec<String>>,
     /// One bounded warning with repeated conditions counted per source.
     pub warning: Option<DocumentationWarning>,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     pub index_tree_revision: Option<String>,
-    /// The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`
-    /// uses. The full digest is computed and compared internally; only this short form ever
-    /// reaches the wire.
+    /// The first eight lowercase hex characters of a SHA-256. The full digest is computed and
+    /// compared internally; only this short form ever reaches the wire.
     pub captured_tree_revision: Option<String>,
     /// Declarations of the captured tree that already carry a vector.
     pub prepared: Option<u64>,
@@ -3461,11 +3423,6 @@ pub struct SymbolDeclaration {
     pub range: TextRange,
     /// One-based line where this declaration begins.
     pub line: u64,
-    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
-    /// revision the response names.
-    pub node: Option<String>,
     /// Source excerpt when requested and available.
     pub source: Option<String>,
     /// Whether the supplied excerpt contains this declaration's complete source.
@@ -4911,30 +4868,6 @@ pub struct SearchHitTargetSymbol {
     #[validate(nested)]
     pub symbol: Symbol,
     #[default("symbol".to_string())]
-    pub target: String,
-}
-/// A node hit: one place in a syntax tree, without its enclosing symbol record.
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Serialize,
-    Deserialize,
-    validator::Validate,
-    oas3_gen_support::Default
-)]
-#[serde(deny_unknown_fields, default)]
-pub struct SearchHitTargetNodeId {
-    /// Identity of one syntax-tree node. The byte range locates the node in the tree the request
-    /// targets; the fragment after `#` is its witness - the first eight lowercase hex characters
-    /// of the SHA-256 of the node's source bytes. The identity describes the node in the
-    /// revision the response names.
-    #[validate(
-        length(min = 27u64, max = 8_192u64),
-        regex(path = "REGEX_PARAMETER_NODE")
-    )]
-    pub node: String,
-    #[default("node".to_string())]
     pub target: String,
 }
 /// A file hit: one entry of the tree, whether or not any provider reads it.

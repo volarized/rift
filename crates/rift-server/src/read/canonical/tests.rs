@@ -325,7 +325,6 @@ fn exact_local_view_keeps_original_bindings_sources_and_continuations() {
         assert_eq!(declarations.len(), 1);
         let declaration = &declarations[0];
         assert!(declaration.source_complete);
-        assert!(declaration.node.is_some());
         assert!(
             declaration
                 .source

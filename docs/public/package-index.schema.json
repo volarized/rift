@@ -1,7 +1,7 @@
 {
   "$defs": {
     "Digest": {
-      "description": "The first eight lowercase hex characters of a SHA-256, the same witness convention `NodeId`\nuses. The full digest is computed and compared internally; only this short form ever\nreaches the wire.",
+      "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire.",
       "examples": [
         "3f9a1c2e"
       ],
@@ -903,16 +903,6 @@
       "pattern": "^[a-z][a-z0-9._-]*(?::[a-z][a-z0-9._-]*)?$",
       "type": "string"
     },
-    "NodeId": {
-      "description": "Identity of one syntax-tree node. The byte range locates the node in the tree the request\ntargets; the fragment after `#` is its witness - the first eight lowercase hex characters\nof the SHA-256 of the node's source bytes. The identity describes the node in the\nrevision the response names.",
-      "examples": [
-        "rift://node/rust/lib.rs@220-268#3f9a1c2e"
-      ],
-      "maxLength": 8192,
-      "minLength": 27,
-      "pattern": "^rift://node/[A-Za-z][A-Za-z0-9._-]*(?::[A-Za-z][A-Za-z0-9._-]*)?/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]|%[0-9A-F]{2}){1,1000}@\\d+-\\d+#[0-9a-f]{8}$",
-      "type": "string"
-    },
     "NotebookCell": {
       "additionalProperties": false,
       "description": "A selected cell addressed within its parent notebook.",
@@ -1568,10 +1558,6 @@
           "description": "What the parameter is called. Absent where the language allows an unnamed one, as\na positional parameter in a function type.",
           "type": "string"
         },
-        "node": {
-          "$ref": "#/$defs/NodeId",
-          "description": "Where this parameter is written in the source."
-        },
         "optional": {
           "description": "Whether a call may leave it out.",
           "type": "boolean"
@@ -1606,7 +1592,7 @@
     },
     "Relationship": {
       "additionalProperties": false,
-      "description": "One directed edge between two symbols. Its evidence is the nodes it was read from, and\nits derivation is how much the provider knew when it was read.",
+      "description": "One directed edge between two symbols. Its occurrence is where it was read from, and its\nderivation is how much the provider knew when it was read.",
       "properties": {
         "confidence": {
           "description": "How likely a `heuristic` edge is to hold, from 0 to 1. Absent for any other\nderivation.",
@@ -1618,14 +1604,6 @@
         "derivation": {
           "$ref": "#/$defs/RelationshipDerivation",
           "description": "How this edge was established."
-        },
-        "evidence": {
-          "default": [],
-          "description": "The nodes this edge was read from. Absent when empty.",
-          "items": {
-            "$ref": "#/$defs/NodeId"
-          },
-          "type": "array"
         },
         "extensions": {
           "$ref": "#/$defs/Extensions",

@@ -502,8 +502,11 @@ The response lists enclosing nodes from outermost to innermost, with source exce
 
 In the text response:
 
-- Each node shows its syntax kind and line count, then its node identity, which carries the
-  byte range: `@334-353` is the `parse_config(&text)` call.
+- Each node shows its syntax kind and line count, its byte range, then its address: `334..353`
+  is the `parse_config(&text)` call, node 25 of the `load_config` declaration.
+- A node has no identity of its own. Its address is its place inside the symbol that declares it,
+  or inside the file for a node outside every declaration, so an edit inside another function
+  leaves it unchanged.
 - The function also shows its symbol identity and the ranges of its name and body.
 - The excerpt of the innermost node closes the answer; the structured output carries the excerpt
   of every node.
