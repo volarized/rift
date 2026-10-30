@@ -884,10 +884,17 @@ async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() ->
         "{package:#}"
     );
 
-    let view = "a".repeat(64);
-    let in_view = call_tool(&client, "nodes", json!({"symbol": id, "view": view})).await?;
-    assert_eq!(in_view["view"]["id"], json!(view), "{in_view:#}");
-    assert_eq!(in_view["nodes"], package["nodes"], "{in_view:#}");
+    let at_release = call_tool(
+        &client,
+        "nodes",
+        json!({"symbol": id, "revision": package["revision"]}),
+    )
+    .await?;
+    assert_eq!(
+        at_release["revision"], package["revision"],
+        "{at_release:#}"
+    );
+    assert_eq!(at_release["nodes"], package["nodes"], "{at_release:#}");
 
     let absent = global_api::collected_identity(SymbolFixture::Valid, "absent");
     let refused = failed_call(

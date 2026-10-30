@@ -4,12 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use rift_error::{RiftError, errors};
-use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::read::{GetSymbolInclude, SymbolId};
-use rift_protocol::symbol_read::{
-    CapturedView, CapturedViewId, GetSymbolParams, GetSymbolResult, SymbolNotFound,
-    SymbolUnavailableReason,
-};
+use rift_protocol::identity::SymbolOwner;
+use rift_protocol::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
 use sha2::{Digest as _, Sha256};
 
 use super::ReadService;
@@ -36,8 +32,6 @@ impl LocalSymbolViewInput {
         Ok(local_view_input(
             Arc::new(self.material.index.with_sources(sources)?),
             self.material.metadata.to_vec(),
-            self.material.history.clone(),
-            self.material.traversal.clone(),
             self.ready,
         ))
     }
@@ -71,8 +65,6 @@ impl LocalSymbolViewInput {
         Ok(local_view_input(
             Arc::clone(&self.material.index),
             metadata,
-            self.material.history.clone(),
-            self.material.traversal.clone(),
             self.ready,
         ))
     }
@@ -94,8 +86,6 @@ impl LocalSymbolViewInput {
 struct LocalSymbolMaterial {
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Arc<[u8]>,
-    history: Option<(String, Arc<[u8]>)>,
-    traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -113,36 +103,9 @@ struct HeldView {
     expires: SystemTime,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct Continuation {
-    view: CapturedViewId,
-    id: SymbolId,
-    include: Vec<GetSymbolInclude>,
-    limit: u64,
-    offset: usize,
-}
-
-impl Continuation {
-    fn matches(&self, request: &GetSymbolParams) -> bool {
-        self.id == request.id
-            && self.include == request.include
-            && self.limit == request.declaration_limit
-            && request.view.as_ref().is_none_or(|view| view == &self.view)
-            && request.revision.is_none()
-    }
-
-    fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            .saturating_add(self.view.as_str().len())
-            .saturating_add(self.id.as_str().len())
-            .saturating_add(self.include.capacity() * std::mem::size_of::<GetSymbolInclude>())
-    }
-}
-
 #[derive(Debug, Default)]
 struct State {
     views: BTreeMap<String, HeldView>,
-    cursors: BTreeMap<String, Continuation>,
     expired: BTreeSet<String>,
     serial: u64,
 }
@@ -159,17 +122,6 @@ impl State {
             self.views.remove(&key);
             self.expired.insert(key);
         }
-        while self.expired.len() > VIEW_SLOTS {
-            self.expired.pop_first();
-        }
-        self.cursors.retain(|key, cursor| {
-            if self.views.contains_key(cursor.view.as_str()) {
-                true
-            } else {
-                self.expired.insert(key.clone());
-                false
-            }
-        });
         while self.expired.len() > VIEW_SLOTS {
             self.expired.pop_first();
         }
@@ -191,9 +143,6 @@ impl State {
     fn material_bytes_with_shared_indexes(&self, shared: bool) -> usize {
         use get_size2::{GetSize, GetSizeTracker};
         let mut total = rift_protocol::btree_material_bytes::<String, HeldView>(self.views.len())
-            .saturating_add(rift_protocol::btree_material_bytes::<String, Continuation>(
-                self.cursors.len(),
-            ))
             .saturating_add(rift_protocol::btree_material_bytes::<String, ()>(
                 self.expired.len(),
             ));
@@ -219,11 +168,6 @@ impl State {
             if charged.track(Arc::as_ptr(&held.material)) {
                 total = total.saturating_add(held.retained_bytes);
             }
-        }
-        for (key, cursor) in &self.cursors {
-            total = total
-                .saturating_add(key.capacity())
-                .saturating_add(cursor.retained_bytes());
         }
         self.expired
             .iter()
@@ -309,19 +253,9 @@ impl LocalSymbolViews {
         let index_bytes = input.material.index.retained_material_bytes();
         let ready = input.ready;
         let id = self.next_key(&mut state)?;
-        let mut expires = now
+        let expires = now
             .checked_add(VIEW_LIFETIME)
             .ok_or_else(|| invalid("view", "view expiry exceeds the clock bound"))?;
-        if let Some((_, references)) = &input.material.traversal {
-            for selected in references.package_views() {
-                let selected = chrono::DateTime::parse_from_rfc3339(&selected.expires_at)
-                    .map_err(|error| material_error("read package view expiry", &error))?;
-                expires = expires.min(SystemTime::from(selected));
-            }
-        }
-        if expires <= now {
-            return Ok(None);
-        }
         let view = CapturedView {
             id: CapturedViewId::parse(&id)?,
             expires_at: chrono::DateTime::<chrono::Utc>::from(expires).to_rfc3339(),
@@ -341,7 +275,6 @@ impl LocalSymbolViews {
             rift_tracing::warn!(
                 component = "server",
                 rows = state.views.len(),
-                cursors = state.cursors.len(),
                 views_max = VIEW_SLOTS,
                 material_bytes,
                 incoming_bytes = retained_bytes,
@@ -433,128 +366,6 @@ impl LocalSymbolViews {
         }
         Ok(held.clone())
     }
-
-    /// Reads only an issued view or continuation belonging to the expected root and owner.
-    ///
-    /// # Errors
-    /// Returns registered request or captured provider failures; no failure selects latest.
-    pub fn resolve(
-        &self,
-        request: &GetSymbolParams,
-        root: &Path,
-        owner: &SymbolOwner,
-    ) -> Result<GetSymbolResult, RiftError> {
-        self.resolve_at(request, root, owner, SystemTime::now())
-    }
-
-    fn resolve_at(
-        &self,
-        request: &GetSymbolParams,
-        root: &Path,
-        owner: &SymbolOwner,
-        now: SystemTime,
-    ) -> Result<GetSymbolResult, RiftError> {
-        let identity = SymbolIdentity::parse(request.id.as_str())?;
-        super::accepted_limit(request.declaration_limit)?;
-        if request.revision.is_some()
-            && (request.view.is_some() || request.declaration_cursor.is_some())
-        {
-            return Err(invalid(
-                "revision",
-                "revision cannot accompany a captured view or continuation",
-            ));
-        }
-        let (held, offset) = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expire(now);
-            let continuation = match &request.declaration_cursor {
-                Some(key) => match state.cursors.get(key) {
-                    Some(cursor) if cursor.matches(request) => Some(cursor),
-                    _ => {
-                        let reason = if state.expired.contains(key) {
-                            SymbolUnavailableReason::ViewExpired
-                        } else {
-                            SymbolUnavailableReason::ViewContext
-                        };
-                        return Ok(unavailable(request, None, reason));
-                    }
-                },
-                None => None,
-            };
-            let selected = continuation
-                .map(|cursor| &cursor.view)
-                .or(request.view.as_ref());
-            let Some(selected) = selected else {
-                return Err(invalid(
-                    "view",
-                    "select the view returned by a captured read",
-                ));
-            };
-            let Some(held) = state.views.get(selected.as_str()) else {
-                let reason = if state.expired.contains(selected.as_str()) {
-                    SymbolUnavailableReason::ViewExpired
-                } else {
-                    SymbolUnavailableReason::ViewContext
-                };
-                return Ok(unavailable(request, None, reason));
-            };
-            if held.material.index.root() != root
-                || held.material.index.owner() != owner
-                || identity.owner() != owner
-            {
-                return Ok(unavailable(
-                    request,
-                    Some(held.view.clone()),
-                    SymbolUnavailableReason::ViewContext,
-                ));
-            }
-            (held.clone(), continuation.map_or(0, |cursor| cursor.offset))
-        };
-        if !held.ready {
-            return Ok(unavailable(
-                request,
-                Some(held.view),
-                SymbolUnavailableReason::IndexPreparing,
-            ));
-        }
-        let (mut result, next) = held
-            .material
-            .canonical_symbol(request, &held.view, offset)?;
-        if let Some(offset) = next {
-            let continuation = Continuation {
-                view: held.view.id.clone(),
-                id: request.id.clone(),
-                include: request.include.clone(),
-                limit: request.declaration_limit,
-                offset,
-            };
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.expire(now);
-            let key = self.next_key(&mut state)?;
-            state.cursors.insert(key.clone(), continuation);
-            if state.admitted_material_bytes(self.material_bytes_max) > self.material_bytes_max {
-                state.cursors.remove(&key);
-                return Ok(unavailable(
-                    request,
-                    Some(held.view),
-                    SymbolUnavailableReason::InsufficientCoverage,
-                ));
-            }
-            if let GetSymbolResult::Found {
-                declaration_cursor, ..
-            } = &mut result
-            {
-                *declaration_cursor = Some(key);
-            }
-        }
-        Ok(result)
-    }
 }
 
 fn invalid(field: &'static str, violation: &'static str) -> RiftError {
@@ -564,20 +375,6 @@ fn invalid(field: &'static str, violation: &'static str) -> RiftError {
         .error()
 }
 
-fn unavailable(
-    request: &GetSymbolParams,
-    view: Option<CapturedView>,
-    reason: SymbolUnavailableReason,
-) -> GetSymbolResult {
-    GetSymbolResult::Unavailable {
-        id: request.id.clone(),
-        view,
-        revision: None,
-        reason,
-        warnings: Vec::new(),
-    }
-}
-
 impl ReadService {
     /// Captures immutable search, source, graph and documentation material without history.
     ///
@@ -585,33 +382,7 @@ impl ReadService {
     /// Returns the original captured index or read failure.
     pub fn local_search_view_input(&self, ready: bool) -> Result<LocalSymbolViewInput, RiftError> {
         let (index, metadata) = self.local_view_material()?;
-        Ok(local_view_input(index, metadata, None, None, ready))
-    }
-
-    /// Captures one traversal's engine rows from the same source and index revision.
-    ///
-    /// # Errors
-    /// Returns the original index or read failure, or refuses rows from another revision.
-    pub fn local_traversal_view_input(
-        &self,
-        traversal: &rift_protocol::search::SearchTraversal,
-        references: crate::EngineReferences,
-        ready: bool,
-    ) -> Result<LocalSymbolViewInput, RiftError> {
-        crate::traversal::validate_traversal(traversal)?;
-        if traversal.seed.is_none() {
-            return Err(invalid("seed", "a traversal starts at seed"));
-        }
-        references.validate_revision(self)?;
-        let (index, metadata) = self.local_view_material()?;
-        let traversal = if ready && references.captured_for(self) {
-            let request = serde_json::to_vec(traversal)
-                .map_err(|error| material_error("capture traversal", &error))?;
-            Some((Arc::from(request), Arc::new(references)))
-        } else {
-            None
-        };
-        Ok(local_view_input(index, metadata, None, traversal, ready))
+        Ok(local_view_input(index, metadata, ready))
     }
 
     fn local_view_material(
@@ -625,43 +396,6 @@ impl ReadService {
         .map_err(|error| material_error("capture read metadata", &error))?;
         Ok((index, metadata))
     }
-
-    /// Captures immutable read material and the requested bounded history before admission.
-    ///
-    /// # Errors
-    /// Returns the original captured index, history or read failure.
-    pub fn local_symbol_view_input(
-        &self,
-        request: &GetSymbolParams,
-        ready: bool,
-    ) -> Result<LocalSymbolViewInput, RiftError> {
-        let key = rift_core::SymbolId::new(request.id.as_str())?;
-        let (index, metadata) = self.local_view_material()?;
-        let history = if ready && request.include.contains(&GetSymbolInclude::History) {
-            let (bindings, _) =
-                self.index
-                    .symbols_by_identity_page(&key, 0, self.index.results_max())?;
-            if bindings.is_empty() {
-                None
-            } else {
-                let mut timelines = crate::history::SymbolTimelines::open_captured(
-                    self.index.root(),
-                    self.revision.as_ref(),
-                    &self.history,
-                    self.index.limits().syntax(),
-                    self.stored_history.get(),
-                )?;
-                let history =
-                    timelines.symbol_timeline(&self.index, &bindings, request.id.clone())?;
-                let bytes = serde_json::to_vec(&history)
-                    .map_err(|error| material_error("capture symbol history", &error))?;
-                Some((request.id.as_str().to_owned(), Arc::<[u8]>::from(bytes)))
-            }
-        } else {
-            None
-        };
-        Ok(local_view_input(index, metadata, history, None, ready))
-    }
 }
 
 fn material_error(operation: &str, error: &impl std::fmt::Display) -> RiftError {
@@ -671,240 +405,24 @@ fn material_error(operation: &str, error: &impl std::fmt::Display) -> RiftError 
         .error()
 }
 
-impl LocalSymbolMaterial {
-    fn canonical_symbol(
-        &self,
-        request: &GetSymbolParams,
-        view: &CapturedView,
-        offset: usize,
-    ) -> Result<(GetSymbolResult, Option<usize>), RiftError> {
-        let identity = SymbolIdentity::parse(request.id.as_str())?;
-        let key = rift_core::SymbolId::new(request.id.as_str())?;
-        let metadata: CapturedMetadata = serde_json::from_slice(&self.metadata)
-            .map_err(|error| material_error("decode captured metadata", &error))?;
-        if request
-            .revision
-            .as_ref()
-            .is_some_and(|revision| revision != &metadata.revision)
-        {
-            return Ok((
-                unavailable(
-                    request,
-                    Some(view.clone()),
-                    SymbolUnavailableReason::ViewContext,
-                ),
-                None,
-            ));
-        }
-        let Some(readable) = self.index.object_by_identity(&key)? else {
-            if !self.index.identity_coverage_complete(identity.language()) {
-                return Ok((
-                    unavailable(
-                        request,
-                        Some(view.clone()),
-                        SymbolUnavailableReason::InsufficientCoverage,
-                    ),
-                    None,
-                ));
-            }
-            let (alternatives, detail) = self.symbol_alternatives(&identity)?;
-            return Ok((
-                GetSymbolResult::Missing {
-                    symbol_not_found: SymbolNotFound {
-                        id: request.id.clone(),
-                        alternatives,
-                        detail,
-                    },
-                    view: view.clone(),
-                    revision: metadata.revision,
-                    warnings: metadata.warnings,
-                },
-                None,
-            ));
-        };
-        let symbol = readable.to_protocol_symbol();
-        if !symbol.name_is_public() {
-            return Ok((
-                self.refused_public_symbol(request, view, &key, readable.facts().qualified_name())?,
-                None,
-            ));
-        }
-        let (declarations, total) = self.declarations(request, &key, offset)?;
-        let history = self.captured_history(request)?;
-        if request.include.contains(&GetSymbolInclude::History) && history.is_none() {
-            return Ok((
-                unavailable(
-                    request,
-                    Some(view.clone()),
-                    SymbolUnavailableReason::InsufficientCoverage,
-                ),
-                None,
-            ));
-        }
-        let documentation = request
-            .include
-            .contains(&GetSymbolInclude::Documentation)
-            .then(|| {
-                let mut bytes_left =
-                    rift_protocol::documentation::DOCUMENTATION_EXCERPT_BYTES_MAX as usize;
-                rift_index::documentation_context_with_budget(
-                    self.index.documentation(),
-                    &request.id,
-                    |source| self.index.documentation_content(source),
-                    &mut bytes_left,
-                )
-            });
-        let mut warnings = metadata.warnings;
-        warnings.extend(super::symbol_disagreement_warning(readable.assembled()));
-        let next = offset.saturating_add(declarations.len());
-        Ok((
-            GetSymbolResult::Found {
-                symbol: Box::new(symbol),
-                view: view.clone(),
-                revision: metadata.revision,
-                declarations,
-                declaration_cursor: None,
-                history,
-                documentation,
-                warnings,
-            },
-            (next < total).then_some(next),
-        ))
-    }
-
-    fn symbol_alternatives(
-        &self,
-        identity: &SymbolIdentity,
-    ) -> Result<
-        (
-            Vec<rift_protocol::symbol_read::SymbolAlternative>,
-            Option<String>,
-        ),
-        RiftError,
-    > {
-        use rift_protocol::symbol_read::{SymbolAlternative, SymbolMatchContext};
-        let proposed = crate::alternatives::captured_symbols(&self.index, identity);
-        let keys = match proposed {
-            Ok(keys) => keys,
-            Err(error)
-                if error.slug() == errors::server::read_symbol_alternatives_unavailable::SLUG =>
-            {
-                return Ok((Vec::new(), Some(error.to_string())));
-            }
-            Err(error) => return Err(error),
-        };
-        let mut alternatives = Vec::with_capacity(keys.len());
-        for key in keys {
-            let key_value = rift_core::SymbolId::new(key.as_str())?;
-            let Some(symbol) = self.index.object_by_identity(&key_value)? else {
-                continue;
-            };
-            let name = symbol.facts().qualified_name();
-            if !rift_protocol::read::symbol_name_is_public(name) {
-                continue;
-            }
-            alternatives.push(SymbolAlternative {
-                id: key,
-                name: name.to_owned(),
-                match_context: vec![
-                    SymbolMatchContext::Owner,
-                    SymbolMatchContext::Language,
-                    SymbolMatchContext::Name,
-                ],
-            });
-        }
-        Ok((alternatives, None))
-    }
-
-    fn refused_public_symbol(
-        &self,
-        request: &GetSymbolParams,
-        view: &CapturedView,
-        key: &rift_core::SymbolId,
-        qualified_name: &str,
-    ) -> Result<GetSymbolResult, RiftError> {
-        let mut result = unavailable(
-            request,
-            Some(view.clone()),
-            SymbolUnavailableReason::InsufficientCoverage,
-        );
-        if let GetSymbolResult::Unavailable { warnings, .. } = &mut result {
-            let (bindings, _) = self.index.symbols_by_identity_page(key, 0, 1)?;
-            warnings.push(bindings.first().copied().map_or_else(
-                || super::object_unavailable_at(qualified_name, None, None),
-                super::object_unavailable,
-            ));
-        }
-        Ok(result)
-    }
-
-    fn declarations(
-        &self,
-        request: &GetSymbolParams,
-        key: &rift_core::SymbolId,
-        offset: usize,
-    ) -> Result<(Vec<rift_protocol::symbol_read::SymbolDeclaration>, usize), RiftError> {
-        let limit = super::accepted_limit(request.declaration_limit)?.min(self.index.results_max());
-        self.index.declarations_by_identity_page(key, offset, limit)
-    }
-
-    fn captured_history(
-        &self,
-        request: &GetSymbolParams,
-    ) -> Result<Option<rift_protocol::read::SymbolHistory>, RiftError> {
-        if !request.include.contains(&GetSymbolInclude::History) {
-            return Ok(None);
-        }
-        match &self.history {
-            Some((id, bytes)) if id == request.id.as_str() => serde_json::from_slice(bytes)
-                .map(Some)
-                .map_err(|error| material_error("decode captured history", &error)),
-            _ => Ok(None),
-        }
-    }
-}
-
 fn local_view_input(
     index: Arc<rift_index::WorkspaceSymbolView>,
     metadata: Vec<u8>,
-    history: Option<(String, Arc<[u8]>)>,
-    traversal: Option<(Arc<[u8]>, Arc<crate::EngineReferences>)>,
     ready: bool,
 ) -> LocalSymbolViewInput {
     let material = Arc::new(LocalSymbolMaterial {
         index,
         metadata: Arc::from(metadata),
-        history,
-        traversal,
     });
     let retained_bytes = std::mem::size_of::<LocalSymbolMaterial>()
         .saturating_add(4 * std::mem::size_of::<usize>())
-        .saturating_add(material.metadata.len())
-        .saturating_add(material.history.as_ref().map_or(0, |(id, bytes)| {
-            id.capacity()
-                .saturating_add(bytes.len())
-                .saturating_add(2 * std::mem::size_of::<usize>())
-        }))
-        .saturating_add(
-            material
-                .traversal
-                .as_ref()
-                .map_or(0, |(request, references)| {
-                    request
-                        .len()
-                        .saturating_add(4 * std::mem::size_of::<usize>())
-                        .saturating_add(references.retained_material_bytes())
-                }),
-        );
+        .saturating_add(material.metadata.len());
     LocalSymbolViewInput {
         material,
         ready,
         retained_bytes,
     }
 }
-
-mod nodes;
-mod traversal;
 
 #[cfg(test)]
 mod tests;

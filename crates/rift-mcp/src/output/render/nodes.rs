@@ -23,7 +23,6 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
         nodes,
         node_cursor,
         revision,
-        view,
         warnings,
     } = result;
     layout::title(
@@ -42,14 +41,7 @@ pub(super) fn answer(out: &mut TextWriter, result: &NodesResult) -> Result<(), T
         out.raw_line(0, &format!("node_cursor {cursor}"))?;
     }
     warning::section(out, warnings)?;
-    layout::revision(out, Some(revision))?;
-    if let Some(view) = view {
-        out.raw_line(
-            0,
-            &format!("view {} · expires {}", view.id.as_str(), view.expires_at),
-        )?;
-    }
-    Ok(())
+    layout::revision(out, Some(revision))
 }
 
 /// The nodes whose source the text writes, in answer order: each node no earlier node

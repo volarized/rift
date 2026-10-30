@@ -997,7 +997,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let first = lexical_hit_without_view(first)?;
+    let first = lexical_hit(first)?;
 
     stop_foreground_server(root, &mut child, &stderr)?;
     wait_until_port_refuses(serving.port)?;
@@ -1010,7 +1010,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let second = lexical_hit_without_view(second)?;
+    let second = lexical_hit(second)?;
     assert_eq!(second, first, "reopen must preserve the lexical search hit");
 
     stop_foreground_server(root, &mut child, &stderr)?;
@@ -1019,14 +1019,8 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
     Ok(())
 }
 
-fn lexical_hit_without_view(
-    hit: serde_json::Value,
-) -> TestResult<rift_protocol::search::SearchHit> {
-    let mut hit: rift_protocol::search::SearchHit = serde_json::from_value(hit)?;
-    assert!(
-        hit.view.take().is_some(),
-        "the lexical hit must carry its captured view"
-    );
+fn lexical_hit(hit: serde_json::Value) -> TestResult<rift_protocol::search::SearchHit> {
+    let hit: rift_protocol::search::SearchHit = serde_json::from_value(hit)?;
     assert_eq!(
         serde_json::to_value(&hit.path)?,
         serde_json::json!("notes.md")

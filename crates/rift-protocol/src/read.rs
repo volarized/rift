@@ -827,10 +827,6 @@ pub struct NodesParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1, max = 4096))]
     pub node_cursor: Option<String>,
-    /// Captured view selected by discovery. The server reads nodes from that view and
-    /// refuses an expired or foreign view. The caller MUST omit `revision` beside `view`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<crate::symbol_read::CapturedViewId>,
     /// The revision to read: a git revision reads that commit, a tree revision the served
     /// working tree, and a release revision selects the release of a package or runtime
     /// `symbol`'s owner. Omitted reads the served working tree, or for a package the version
@@ -1058,10 +1054,6 @@ pub struct NodesResult {
     pub node_cursor: Option<String>,
     /// The revision this answer was read at: a commit, a release, or a working tree.
     pub revision: crate::revision::Revision,
-    /// Captured view used for this read, with its original expiry. Absent when the
-    /// request did not select a captured view.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<crate::symbol_read::CapturedView>,
     /// Warnings attached to this result. Absent when there is nothing to warn about.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ReadWarning>,
@@ -4329,68 +4321,5 @@ mod retained_name_tests {
         for name in ["", "bad\0name", "bad\u{000b}name", "bad\u{007f}name"] {
             assert!(!symbol_name_is_retained(name, usize::MAX));
         }
-    }
-}
-
-#[cfg(test)]
-mod captured_nodes_tests {
-    use super::{NodesParams, NodesResult};
-    use crate::symbol_read::{CapturedView, CapturedViewId};
-    use serde_json::json;
-
-    #[test]
-    fn nodes_view_is_optional_and_preserves_selected_authority() {
-        let legacy: NodesParams =
-            serde_json::from_value(json!({"path":"lib.rs","position":2})).expect("legacy request");
-        assert!(legacy.view.is_none());
-        assert!(
-            serde_json::to_value(&legacy)
-                .expect("request")
-                .get("view")
-                .is_none()
-        );
-        let selected: NodesParams =
-            serde_json::from_value(json!({"path":"lib.rs","position":2,"view":"claims.nodes"}))
-                .expect("captured request");
-        assert_eq!(
-            selected.view.as_ref().map(CapturedViewId::as_str),
-            Some("claims.nodes")
-        );
-        let view = CapturedView {
-            id: selected.view.expect("selected view"),
-            expires_at: "2030-01-01T00:15:00Z".to_owned(),
-        };
-        let result = NodesResult {
-            symbol: None,
-            nodes: Vec::new(),
-            node_cursor: None,
-            revision: crate::revision::Revision::tree(&"0".repeat(64)).expect("tree revision"),
-            warnings: Vec::new(),
-            view: Some(view.clone()),
-        };
-        let wire = serde_json::to_value(result).expect("captured result");
-        let decoded: NodesResult = serde_json::from_value(wire).expect("roundtrip");
-        assert_eq!(decoded.view, Some(view));
-    }
-
-    #[test]
-    fn nodes_view_refuses_malformed_keys_and_unknown_fields() {
-        for wire in [
-            json!({"path":"lib.rs","position":2,"view":"latest"}),
-            json!({"path":"lib.rs","position":2,"view":"claims.nodes","owner":"local"}),
-        ] {
-            assert!(serde_json::from_value::<NodesParams>(wire).is_err());
-        }
-        let tree = format!("rift://revision/tree/{}", "0".repeat(64));
-        let latest: NodesResult =
-            serde_json::from_value(json!({"nodes":[], "revision": tree})).expect("latest result");
-        assert!(latest.view.is_none());
-        assert!(serde_json::from_value::<NodesResult>(json!({"nodes":[]})).is_err());
-        assert!(
-            serde_json::to_value(latest)
-                .expect("result")
-                .get("view")
-                .is_none()
-        );
     }
 }

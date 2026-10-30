@@ -157,10 +157,6 @@ fn valid_result(
     });
     let within_source = result.nodes.len() <= 1
         || source_bytes.is_some_and(|total| total <= NODES_SOURCE_BYTES_MAX);
-    let view_valid = request
-        .view
-        .as_ref()
-        .is_none_or(|id| result.view.as_ref().is_some_and(|view| &view.id == id));
     let cursor_valid = result.node_cursor.as_ref().is_none_or(|cursor| {
         !result.nodes.is_empty() && !cursor.is_empty() && cursor.len() <= CURSOR_BYTES_MAX
     });
@@ -173,13 +169,7 @@ fn valid_result(
         .symbol
         .as_ref()
         .is_none_or(|named| named == symbol.id);
-    within_page
-        && nodes_valid
-        && within_source
-        && view_valid
-        && cursor_valid
-        && revision_valid
-        && names_symbol
+    within_page && nodes_valid && within_source && cursor_valid && revision_valid && names_symbol
 }
 
 /// Whether `node` is a node of `symbol`: written in a source unit of the symbol's owner and

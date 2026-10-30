@@ -133,7 +133,6 @@ impl<'a> SearchDocumentation<'a> {
             DocumentationSourceIdentity::Package { unit } => (None, Some(unit.clone())),
         };
         Some(SearchHit {
-            view: None,
             range: Some(documentation.block.range.clone()),
             line: Some(documentation.block.line),
             hit: SearchHitTarget::Documentation {
@@ -214,7 +213,7 @@ pub(super) fn populate_sources(
     })
 }
 
-pub(crate) fn populate_sources_from<'a>(
+fn populate_sources_from<'a>(
     results: &mut [SearchHit],
     mut content: impl FnMut(&DocumentationContentIdentity) -> Option<&'a str>,
 ) -> Vec<ReadWarning> {

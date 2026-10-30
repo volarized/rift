@@ -2,16 +2,9 @@
   "description": "Tools served by the Rift MCP server, with the JSON Schemas derived from the Rust wire models.",
   "tools": [
     {
-      "description": "Reads one logical symbol by its canonical `id`. The caller may select a preceding\nimmutable `view`; continuations retain that selection and its original expiry.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. A found symbol carries its facts and\neach declaration's location; `nodes` with `symbol` reads a declaration's source. Use\n`search` for discovery.",
+      "description": "Reads one logical symbol by its canonical `id` at one `revision`; the answer names the\nrevision it read, and `declaration_cursor` continues its declarations at that revision.\nA complete exact miss returns `symbol_not_found` and up to three alternatives.\nAn unavailable selection returns its typed cause. A found symbol carries its facts and\neach declaration's location; `nodes` with `symbol` reads a declaration's source. Use\n`search` for discovery.",
       "input_schema": {
         "$defs": {
-          "CapturedViewId": {
-            "description": "A service-issued key for one immutable view in one serving context.",
-            "maxLength": 4096,
-            "minLength": 3,
-            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
-            "type": "string"
-          },
           "GetSymbolInclude": {
             "description": "One optional `get_symbol` hit field the caller may opt into through `include`.",
             "oneOf": [
@@ -73,7 +66,7 @@
         ],
         "properties": {
           "declaration_cursor": {
-            "description": "Continuation bound to this exact symbol, projections and serving view.",
+            "description": "Continuation a preceding read returned, bound to this symbol and the revision it read.\nThe server refuses it for another symbol and once that revision is no longer served.",
             "maxLength": 4096,
             "minLength": 1,
             "type": "string"
@@ -99,11 +92,7 @@
           },
           "revision": {
             "$ref": "#/$defs/Revision",
-            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses it beside `view` and once the index no longer serves it."
-          },
-          "view": {
-            "$ref": "#/$defs/CapturedViewId",
-            "description": "A view returned by a preceding read. Expiry never selects latest implicitly."
+            "description": "The revision to read. A git revision reads that commit of a project, a tree\nrevision reads the served working tree, and a release revision selects the release\nof a package or runtime `id`'s owner. Omitted reads the served working tree, or for\na package the version the workspace's dependencies pin, else the newest collected\nrelease. The server refuses a tree revision once the index serves another tree."
           }
         },
         "required": [
@@ -115,33 +104,6 @@
       "name": "get_symbol",
       "output_schema": {
         "$defs": {
-          "CapturedView": {
-            "additionalProperties": false,
-            "description": "The immutable serving view and the expiry promised by its owner.",
-            "properties": {
-              "expires_at": {
-                "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
-                "format": "date-time",
-                "type": "string"
-              },
-              "id": {
-                "$ref": "#/$defs/CapturedViewId",
-                "description": "Selects the same workspace, owner, applicability and accepted index revision."
-              }
-            },
-            "required": [
-              "id",
-              "expires_at"
-            ],
-            "type": "object"
-          },
-          "CapturedViewId": {
-            "description": "A service-issued key for one immutable view in one serving context.",
-            "maxLength": 4096,
-            "minLength": 3,
-            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
-            "type": "string"
-          },
           "CoChangeTruncation": {
             "additionalProperties": false,
             "description": "The co-change edges a symbol history left out, counted per bound.",
@@ -3540,7 +3502,7 @@
             "description": "The exact identity was established, even when it has no source declarations.",
             "properties": {
               "declaration_cursor": {
-                "description": "Continuation for remaining declarations in this exact view.",
+                "description": "Continuation for the remaining declarations at `revision`.",
                 "maxLength": 4096,
                 "minLength": 1,
                 "type": "string"
@@ -3573,10 +3535,6 @@
                 "$ref": "#/$defs/Symbol",
                 "description": "One logical symbol. Its established `id` is required by read validation."
               },
-              "view": {
-                "$ref": "#/$defs/CapturedView",
-                "description": "The immutable context used for this result and its continuations."
-              },
               "warnings": {
                 "description": "Projection cuts and other typed read warnings.",
                 "items": {
@@ -3588,7 +3546,6 @@
             "required": [
               "outcome",
               "symbol",
-              "view",
               "revision",
               "declarations"
             ],
@@ -3610,10 +3567,6 @@
                 "$ref": "#/$defs/SymbolNotFound",
                 "description": "Definite exact miss and its actual structural candidates."
               },
-              "view": {
-                "$ref": "#/$defs/CapturedView",
-                "description": "The exact immutable selection searched."
-              },
               "warnings": {
                 "description": "Warnings, including incomplete candidate work.",
                 "items": {
@@ -3625,7 +3578,6 @@
             "required": [
               "outcome",
               "symbol_not_found",
-              "view",
               "revision"
             ],
             "type": "object"
@@ -3650,10 +3602,6 @@
                 "$ref": "#/$defs/Revision",
                 "description": "The revision the read selected, when it established one."
               },
-              "view": {
-                "$ref": "#/$defs/CapturedView",
-                "description": "The selected view, when one could be captured."
-              },
               "warnings": {
                 "description": "Details and available partial-read warnings.",
                 "items": {
@@ -3677,13 +3625,6 @@
       "description": "Lists syntax nodes with their source text: every node of one `symbol`, or, for one\nUTF-8 byte `position` in one file, every node of the symbol whose declaration holds\nit, or the file's unit nodes when no declaration holds it. A symbol read is the way to\nread a declaration's source, and a package or runtime symbol's nodes come from the\nglobal API, each in a source unit of that symbol's release. The answer names `symbol`;\neach node is addressed by its place: node `index` of declaration `declaration` of\nthat symbol, or node `index` of its unit, from the file node at 0, with `parent` an\nindex in the same declaration or unit. An edit renumbers the nodes after it. An answer\nwhose nodes cross its node count or source byte bound returns `node_cursor` for the\nrest. A file no syntax provider parses answers its file node alone. `revision` lists\nthe nodes at a git commit or pins the served working tree, and the answer names the\nrevision it was read at. If discovery is incomplete or a targeted read spends the\nrequest's remaining time, the result has empty `nodes` and carries\n`local_index_preparing`. A selected source path can answer\nwithin that remaining time, with the same warning until the publication records the\npath: workspace byte and declaration bounds remain unchecked.",
       "input_schema": {
         "$defs": {
-          "CapturedViewId": {
-            "description": "A service-issued key for one immutable view in one serving context.",
-            "maxLength": 4096,
-            "minLength": 3,
-            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
-            "type": "string"
-          },
           "ProjectPath": {
             "description": "One path below the workspace root, using forward slashes and UTF-8 in Unicode NFC - Rift\nnormalizes what it emits and what it accepts, and compares byte-for-byte. The empty path\nnames the root itself. Absolute paths, backslashes, control characters, empty segments,\nand `.` or `..` segments are refused before the filesystem is touched. The limit is 1000\nUTF-8 bytes, not characters. A workspace holding two entries whose NFC forms are equal\nfails the read that touches them with `content_unavailable`.",
             "examples": [
@@ -3800,10 +3741,6 @@
           "symbol": {
             "$ref": "#/$defs/SymbolId",
             "description": "The symbol whose nodes the read lists: each declaration's item node, then the\ndescendants that belong to that declaration and not to a declaration nested in it,\noutermost first per declaration. A package or runtime symbol's nodes come from the\nglobal API. The caller MUST omit `path` and `position` beside it."
-          },
-          "view": {
-            "$ref": "#/$defs/CapturedViewId",
-            "description": "Captured view selected by discovery. The server reads nodes from that view and\nrefuses an expired or foreign view. The caller MUST omit `revision` beside `view`."
           }
         },
         "rift:since": "v0.0.4",
@@ -3812,33 +3749,6 @@
       "name": "nodes",
       "output_schema": {
         "$defs": {
-          "CapturedView": {
-            "additionalProperties": false,
-            "description": "The immutable serving view and the expiry promised by its owner.",
-            "properties": {
-              "expires_at": {
-                "description": "RFC 3339 expiry. The service retains the view's required facts until this time.",
-                "format": "date-time",
-                "type": "string"
-              },
-              "id": {
-                "$ref": "#/$defs/CapturedViewId",
-                "description": "Selects the same workspace, owner, applicability and accepted index revision."
-              }
-            },
-            "required": [
-              "id",
-              "expires_at"
-            ],
-            "type": "object"
-          },
-          "CapturedViewId": {
-            "description": "A service-issued key for one immutable view in one serving context.",
-            "maxLength": 4096,
-            "minLength": 3,
-            "pattern": "^(?:[0-9a-f]{64}|[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+)$",
-            "type": "string"
-          },
           "Digest": {
             "description": "The first eight lowercase hex characters of a SHA-256. The full digest is computed and\ncompared internally; only this short form ever reaches the wire.",
             "examples": [
@@ -6102,10 +6012,6 @@
           "symbol": {
             "$ref": "#/$defs/SymbolId",
             "description": "The symbol whose declarations hold the listed nodes: the requested one for a `symbol`\nread, the innermost declaration's symbol for a `position` read. Absent when the nodes\nbelong to a unit outside every declaration."
-          },
-          "view": {
-            "$ref": "#/$defs/CapturedView",
-            "description": "Captured view used for this read, with its original expiry. Absent when the\nrequest did not select a captured view."
           },
           "warnings": {
             "default": [],
@@ -9447,10 +9353,6 @@
               "unit": {
                 "$ref": "#/$defs/SourceUnitId",
                 "description": "Source-catalog unit of a hit in a dependency or standard-library file: a\ndeclaration, or a `pattern` match. A hit in a file carries exactly one of `path` and\n`unit`; a commit hit carries neither."
-              },
-              "view": {
-                "$ref": "#/$defs/CapturedView",
-                "description": "The immutable view that supplied this hit. The caller passes its `id` to later\nexact, source, declaration, and relationship reads to retain the same context.\nAbsent when the caller selected latest facts without retained serving context."
               }
             },
             "required": [

@@ -18,7 +18,6 @@ fn missing(owner: &str, detail: &str, file: &str) -> CallToolResult {
                 "name":"beacon", "match_context":[]
             }]
         },
-        "view":{"id":"a".repeat(64),"expires_at":"2030-01-01T00:00:00Z"},
         "revision":format!("rift://revision/tree/{}", "0".repeat(64)),
         "warnings":[
             {"code":"framework_context_unresolved", "unit":format!("rift://source/project/{file}"),

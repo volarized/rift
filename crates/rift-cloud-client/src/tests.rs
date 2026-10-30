@@ -2207,7 +2207,6 @@ fn symbol_result_json(package: &str, suffix: &str) -> serde_json::Value {
             "language": "rust", "name": package, "kind": "function",
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"}
         },
-        "view": {"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"},
         "revision": format!("rift://revision/cargo/crates.io/{package}@1.0.0"),
         "declarations": [{
             "origin": {"location": "dependency", "package": package_json(package), "source_kind": "authored"},
@@ -2438,10 +2437,9 @@ async fn exact_symbol_request_carries_one_immutable_id_and_no_query_selectors() 
         .expect("canonical fixture");
     let request: GetSymbolParams =
         serde_json::from_value(serde_json::json!({"id":id})).expect("request");
-    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
     for answer in [
-        serde_json::json!({"outcome":"found","symbol":{"id":id,"language":"rust","name":"Thing","kind":"struct","origin":{"source_kind":"synthetic"}},"view":view,"revision":"rift://revision/cargo/crates.io/demo@1.0.0","declarations":[],"warnings":[]}),
-        serde_json::json!({"outcome":"missing","symbol_not_found":{"id":id,"alternatives":[]},"view":view,"revision":"rift://revision/cargo/crates.io/demo@1.0.0","warnings":[]}),
+        serde_json::json!({"outcome":"found","symbol":{"id":id,"language":"rust","name":"Thing","kind":"struct","origin":{"source_kind":"synthetic"}},"revision":"rift://revision/cargo/crates.io/demo@1.0.0","declarations":[],"warnings":[]}),
+        serde_json::json!({"outcome":"missing","symbol_not_found":{"id":id,"alternatives":[]},"revision":"rift://revision/cargo/crates.io/demo@1.0.0","warnings":[]}),
         serde_json::json!({"outcome":"unavailable","id":id,"reason":"exact_release","warnings":[]}),
     ] {
         let (server, client) = operation_client(OperationFixture::ExactSymbol(answer)).await;
@@ -3056,7 +3054,6 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
     let request: GetSymbolParams = serde_json::from_value(json!({
         "id": ID, "include": ["history", "documentation"], "declaration_limit": 5,
-        "view": "a".repeat(64),
     }))
     .expect("shared request");
     let wire = serde_json::to_value(&request).expect("shared request encoding");
@@ -3069,7 +3066,6 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
         declaration_limit: Some(request.declaration_limit),
         declaration_cursor: request.declaration_cursor.clone(),
         revision: request.revision.as_ref().map(ToString::to_string),
-        view: request.view.as_ref().map(|view| view.as_str().to_owned()),
     };
     assert_eq!(
         serde_json::to_value(&generated).expect("generated request wire"),
@@ -3077,18 +3073,10 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
     );
     assert_eq!(generated.id, request.id.as_str());
     assert_eq!(generated.declaration_limit, Some(5));
-    assert_eq!(
-        generated.view.as_deref(),
-        request
-            .view
-            .as_ref()
-            .map(rift_protocol::symbol_read::CapturedViewId::as_str)
-    );
     assert_eq!(generated.include.expect("requested includes").len(), 2);
-    let view = json!({"id": "a".repeat(64), "expires_at": "2026-10-10T01:00:00Z"});
     for value in [
-        json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "view": view, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0", "declarations": []}),
-        json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "view": view, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0"}),
+        json!({"outcome": "found", "symbol": {"id": ID, "language": "rust", "name": "Beacon", "kind": "struct"}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0", "declarations": []}),
+        json!({"outcome": "missing", "symbol_not_found": {"id": ID, "alternatives": []}, "revision": "rift://revision/cargo/crates.io/tokio@1.50.0"}),
         json!({"outcome": "unavailable", "id": ID, "reason": "exact_release"}),
     ] {
         let shared: GetSymbolResult =
@@ -3098,7 +3086,7 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
             serde_json::from_value(value).expect("generated outcome shape");
         match (shared, generated) {
             (
-                GetSymbolResult::Found { symbol, view, .. },
+                GetSymbolResult::Found { symbol, .. },
                 crate::generated::GetSymbolResult::Object(result),
             ) => {
                 assert_eq!(result.outcome, "found");
@@ -3109,20 +3097,16 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
                         .as_ref()
                         .map(rift_protocol::read::SymbolId::as_str)
                 );
-                assert_eq!(result.view.id, view.id.as_str());
                 assert!(result.declarations.is_empty());
             }
             (
                 GetSymbolResult::Missing {
-                    symbol_not_found,
-                    view,
-                    ..
+                    symbol_not_found, ..
                 },
                 crate::generated::GetSymbolResult::Object2(result),
             ) => {
                 assert_eq!(result.outcome, "missing");
                 assert_eq!(result.symbol_not_found.id, symbol_not_found.id.as_str());
-                assert_eq!(result.view.id, view.id.as_str());
             }
             (
                 GetSymbolResult::Unavailable { id, .. },
@@ -3130,7 +3114,6 @@ fn generated_exact_symbol_shapes_keep_shared_requests_and_typed_outcomes() {
             ) => {
                 assert_eq!(result.outcome, "unavailable");
                 assert_eq!(result.id, id.as_str());
-                assert!(result.view.is_none());
             }
             _ => panic!("generated outcome must keep the shared branch"),
         }

@@ -116,17 +116,12 @@ async fn symbol_read(
     hit: &SearchHit,
 ) -> TestResult<Value> {
     let id = symbol_id(hit)?;
-    let view = hit
-        .view
-        .as_ref()
-        .ok_or_else(|| format!("symbol view absent: {hit:?}"))?;
-    let arguments = json!({"id":id, "view":view.id});
+    let arguments = json!({"id":id});
     let answer = proxied_call(client, "get_symbol", &arguments).await?;
     let result: GetSymbolResult = serde_json::from_value(answer.clone())
         .map_err(|error| format!("invalid symbol result: {error}; {answer}"))?;
     let GetSymbolResult::Found {
         symbol,
-        view: selected,
         declarations,
         ..
     } = result
@@ -134,14 +129,13 @@ async fn symbol_read(
         return Err(format!("symbol not found: request {arguments}; {answer}").into());
     };
     assert_eq!(symbol.id.as_ref(), Some(id), "{answer}");
-    assert_eq!(&selected, view, "{answer}");
     assert_eq!(declarations.len(), 1, "{answer}");
     assert_eq!(
         declarations[0].path.as_ref().map(|path| path.0.as_str()),
         Some("lib.rs"),
         "{answer}"
     );
-    let nodes = proxied_call(client, "nodes", &json!({"symbol":id, "view":view.id})).await?;
+    let nodes = proxied_call(client, "nodes", &json!({"symbol":id})).await?;
     let item = &nodes["nodes"][0];
     assert_eq!(nodes["symbol"].as_str(), Some(id.as_str()), "{nodes}");
     assert_eq!(item["index"].as_u64(), Some(0), "{nodes}");
@@ -162,13 +156,9 @@ async fn named_missing_read(
         identity.language().clone(),
         path,
     )?);
-    let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
     let mut first = None;
     for _ in 0..2 {
-        let mut arguments = json!({"id":missing});
-        if let Some(view) = &selected {
-            arguments["view"] = json!(view.id);
-        }
+        let arguments = json!({"id":missing});
         let response = within(
             "named missing symbol",
             client.call_tool(
@@ -183,9 +173,7 @@ async fn named_missing_read(
             .ok_or("typed missing answer absent")?;
         let result: GetSymbolResult = serde_json::from_value(value.clone())?;
         let GetSymbolResult::Missing {
-            symbol_not_found,
-            view,
-            ..
+            symbol_not_found, ..
         } = result
         else {
             return Err(format!("expected named symbol miss: {value}").into());
@@ -206,11 +194,10 @@ async fn named_missing_read(
             );
         }
         if let Some(previous) = &first {
-            assert_eq!(&value, previous, "held missing answer stays fixed");
+            assert_eq!(&value, previous, "a repeated miss answers the same");
         } else {
             first = Some(value);
         }
-        selected = Some(view);
     }
     Ok(())
 }
@@ -342,7 +329,6 @@ async fn require_profile_pattern(
         },
     );
     assert!(patterned.view.is_none());
-    assert!(patterned.results[0].view.is_none());
     let id = symbol_id(&patterned.results[0])?;
     let found = proxied_call(client, "get_symbol", &json!({"id":id})).await?;
     let found: GetSymbolResult = serde_json::from_value(found)?;
@@ -442,7 +428,6 @@ async fn cli_profiles_combine_search_preserve_views_and_select_each_project_engi
     assert_eq!(held_first, first, "captured source and expiry stay fixed");
     assert_eq!(held_second, second, "both backend views stay fixed");
     for hit in &hits {
-        symbol_read(&client, hit).await?;
         caller_read(&client, hit, logs.path()).await?;
     }
     require_engine_root(logs.path(), "main", root).await?;

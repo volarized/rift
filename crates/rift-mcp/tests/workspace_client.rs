@@ -513,9 +513,5 @@ pub(crate) async fn captured_seed(
         &rift_protocol::identity::SymbolOwner::Local,
         "original owner: {row}"
     );
-    assert_eq!(
-        row["view"], answer["view"],
-        "same captured selection: {answer}"
-    );
     Ok(identity.to_owned())
 }

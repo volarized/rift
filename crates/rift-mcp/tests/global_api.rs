@@ -647,26 +647,25 @@ fn page(items: &[Value], warnings: &Value) -> Value {
 }
 
 /// The exact result for the canonical object named by `request`, retaining its original
-/// location and the collection's captured view.
+/// location.
 fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
     let id = request["id"].as_str().unwrap_or_default();
     let declaration = fixture_declarations(fixture)
         .iter()
         .copied()
         .find(|name| collected_identity(fixture, name) == id);
-    let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
     if id == named_identity(&NAMED_POSITIONS[0]) {
-        return runtime_symbol(&view);
+        return runtime_symbol();
     }
     if id == named_identity(&NAMED_POSITIONS[1]) {
-        return greeting_symbol(&view);
+        return greeting_symbol();
     }
     let Some(declaration) = declaration else {
-        return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view,"revision":release_revision(id)});
+        return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"revision":release_revision(id)});
     };
     let hit = collected_hit(fixture, declaration, false);
     let binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"signature_indices":[],"type_indices":[],"documentation_indices":[]});
-    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view,"revision":release_revision(id)})
+    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"revision":release_revision(id)})
 }
 
 /// The release revision the global API answers a package or runtime symbol `id` at: the one
@@ -735,11 +734,7 @@ fn symbol_nodes(request: &Value) -> Option<Value> {
             node
         })
         .collect::<Vec<_>>();
-    let mut answer = json!({"symbol": id, "nodes": nodes, "revision": release_revision(id)});
-    if request.get("view").is_some() {
-        answer["view"] = Value::Null;
-    }
-    Some(answer)
+    Some(json!({"symbol": id, "nodes": nodes, "revision": release_revision(id)}))
 }
 
 /// The byte range of the runtime `len` declaration in the embedded standard library stub.
@@ -755,7 +750,7 @@ fn runtime_declaration() -> (usize, usize) {
 }
 
 /// The item node of the runtime `len` declaration, carrying the embedded standard library
-/// stub's own bytes at its range, in the view the request names.
+/// stub's own bytes at its range, at the release the request names.
 fn runtime_nodes(request: &Value) -> Value {
     let builtins = python_runtime::builtins();
     let (start, end) = runtime_declaration();
@@ -766,14 +761,14 @@ fn runtime_nodes(request: &Value) -> Value {
         "kind": "function_definition", "facets": ["declaration", "definition"],
         "range": {"start": start, "end": end}, "source": source,
     }], "revision": release_revision(&named_identity(&NAMED_POSITIONS[0]))});
-    if let Some(view) = request.get("view") {
-        answer["view"] = json!({"id": view, "expires_at": "2099-10-10T10:05:00Z"});
+    if let Some(revision) = request.get("revision") {
+        answer["revision"] = revision.clone();
     }
     answer
 }
 
 /// The runtime `len` declaration at its range in the embedded standard library stub.
-fn runtime_symbol(view: &Value) -> Value {
+fn runtime_symbol() -> Value {
     let builtins = python_runtime::builtins();
     let (start, end) = runtime_declaration();
     let line = builtins[..start].matches('\n').count() + 1;
@@ -787,7 +782,7 @@ fn runtime_symbol(view: &Value) -> Value {
         "signature_indices":[], "type_indices":[], "documentation_indices":[]
     });
     json!({
-        "outcome":"found", "view":view,
+        "outcome":"found",
         "revision":release_revision(&named_identity(&NAMED_POSITIONS[0])),
         "symbol":{
             "id":named_identity(&NAMED_POSITIONS[0]), "language":"python",
@@ -797,7 +792,7 @@ fn runtime_symbol(view: &Value) -> Value {
     })
 }
 
-fn greeting_symbol(view: &Value) -> Value {
+fn greeting_symbol() -> Value {
     let source = GREETING_SOURCE
         .split("\n\n")
         .next()
@@ -812,7 +807,7 @@ fn greeting_symbol(view: &Value) -> Value {
         "signature_indices":[], "type_indices":[], "documentation_indices":[]
     });
     json!({
-        "outcome":"found", "view":view,
+        "outcome":"found",
         "revision":release_revision(&named_identity(&NAMED_POSITIONS[1])),
         "symbol":{
             "id":named_identity(&NAMED_POSITIONS[1]), "language":"python",
