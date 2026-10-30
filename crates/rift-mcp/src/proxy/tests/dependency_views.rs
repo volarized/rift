@@ -55,7 +55,8 @@ async fn answer_project(
                     assert_eq!(params["_meta"]["root"], ENDPOINT);
                     assert_eq!(params["_meta"]["view"], remote);
                     json!({"outcome":"missing", "symbol_not_found":{"id":SYMBOL,
-                        "alternatives":[],"detail":project},"view":remote})
+                        "alternatives":[],"detail":project},"view":remote,
+                        "revision":"rift://revision/cargo/crates.io/demo@1.0.0"})
                 }
                 _ => panic!("unexpected dependency request: {request}"),
             };

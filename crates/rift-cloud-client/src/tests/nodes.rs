@@ -4,6 +4,11 @@ use serde_json::{Value, json};
 
 const SYMBOL: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon";
 const UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
+
+fn revision(value: &str) -> rift_protocol::revision::Revision {
+    rift_protocol::revision::Revision::parse(value).expect("revision fixture")
+}
 
 pub(super) fn nodes_request() -> NodesParams {
     NodesParams::of(SymbolId(SYMBOL.to_owned()))
@@ -27,7 +32,7 @@ fn node_json(index: u64, kind: &str, start: u64, source: &str) -> Value {
 pub(super) fn nodes_response_json() -> Value {
     let mut item = node_json(0, "function_item", 26, "pub fn beacon() {}");
     item["facets"] = json!(["declaration", "definition"]);
-    json!({"symbol": SYMBOL, "nodes": [
+    json!({"symbol": SYMBOL, "revision": RELEASE, "nodes": [
         item,
         node_json(
             2,
@@ -47,7 +52,7 @@ pub(super) fn nodes_response_json() -> Value {
 /// One item node of `beacon` whose source holds `source_bytes` bytes.
 pub(super) fn single_node_response_json(source_bytes: usize) -> Value {
     let item = node_json(0, "function_item", 0, &"x".repeat(source_bytes));
-    json!({"symbol": SYMBOL, "nodes": [item]})
+    json!({"symbol": SYMBOL, "revision": RELEASE, "nodes": [item]})
 }
 
 /// One named change to a valid nodes answer.
@@ -120,9 +125,16 @@ async fn nodes_requests_outside_the_served_form_refuse_before_any_request() {
             },
         ),
         (
-            "rev",
+            "revision",
             NodesParams {
-                rev: Some(rift_protocol::read::RevisionId("main".to_owned())),
+                revision: Some(revision("rift://revision/git/main")),
+                ..nodes_request()
+            },
+        ),
+        (
+            "revision",
+            NodesParams {
+                revision: Some(revision("rift://revision/cargo/crates.io/demo@2.0.0")),
                 ..nodes_request()
             },
         ),
@@ -233,7 +245,7 @@ async fn nodes_breaking_the_contract_refuse_as_invalid_responses() {
             answer["nodes"][1]["source"] = json!("beaco");
         }),
         ("cursor beside no nodes", |answer| {
-            *answer = json!({"nodes": [], "node_cursor": "1.ab"});
+            *answer = json!({"revision": RELEASE, "nodes": [], "node_cursor": "1.ab"});
         }),
         ("empty cursor", |answer| {
             answer["node_cursor"] = json!("");
@@ -256,14 +268,12 @@ async fn nodes_breaking_the_contract_refuse_as_invalid_responses() {
 
 #[tokio::test]
 async fn a_node_over_the_source_bound_refuses_and_one_at_it_passes() {
-    let at_bound =
-        json!({"nodes": [node_json(0, "line_comment", 0, &"a".repeat(SOURCE_BYTES_MAX))]});
+    let at_bound = json!({"revision": RELEASE, "nodes": [node_json(0, "line_comment", 0, &"a".repeat(SOURCE_BYTES_MAX))]});
     let answer = nodes_answer(at_bound)
         .await
         .expect("one node at the source bound");
     assert_eq!(answer.nodes.len(), 1);
-    let over =
-        json!({"nodes": [node_json(0, "line_comment", 0, &"a".repeat(SOURCE_BYTES_MAX + 1))]});
+    let over = json!({"revision": RELEASE, "nodes": [node_json(0, "line_comment", 0, &"a".repeat(SOURCE_BYTES_MAX + 1))]});
     let error = nodes_answer(over)
         .await
         .expect_err("node over the source bound");
@@ -284,7 +294,7 @@ async fn a_page_over_the_advertised_node_bound_refuses() {
     let nodes = (0..count)
         .map(|_| node_json(2, "identifier", 33, "beacon"))
         .collect::<Vec<_>>();
-    let error = nodes_answer(json!({"nodes": nodes}))
+    let error = nodes_answer(json!({"revision": RELEASE, "nodes": nodes}))
         .await
         .expect_err("page over the node bound");
     assert_registered_field(&error, "rift.client.response_invalid", "body");

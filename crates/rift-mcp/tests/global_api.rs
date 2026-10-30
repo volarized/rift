@@ -655,11 +655,22 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         return greeting_symbol(&view);
     }
     let Some(declaration) = declaration else {
-        return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view});
+        return json!({"outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},"view":view,"revision":release_revision(id)});
     };
     let hit = collected_hit(fixture, declaration, false);
     let binding = json!({"origin":hit["symbol"]["origin"],"unit":hit["unit"],"range":hit["range"],"line":hit["line"],"signature_indices":[],"type_indices":[],"documentation_indices":[]});
-    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
+    json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view,"revision":release_revision(id)})
+}
+
+/// The release revision the global API answers a package or runtime symbol `id` at.
+fn release_revision(id: &str) -> Value {
+    let revision = rift_protocol::identity::SymbolIdentity::parse(id)
+        .and_then(|identity| rift_protocol::revision::Revision::release(identity.owner()));
+    json!(
+        revision
+            .map(|revision| revision.to_string())
+            .unwrap_or_default()
+    )
 }
 
 /// The nodes of the collected declaration `request` names, as a symbol read of
@@ -701,7 +712,7 @@ fn symbol_nodes(request: &Value) -> Option<Value> {
             node
         })
         .collect::<Vec<_>>();
-    let mut answer = json!({"symbol": id, "nodes": nodes});
+    let mut answer = json!({"symbol": id, "nodes": nodes, "revision": release_revision(id)});
     if request.get("view").is_some() {
         answer["view"] = Value::Null;
     }
@@ -731,7 +742,7 @@ fn runtime_nodes(request: &Value) -> Value {
         "unit": named_unit(&NAMED_POSITIONS[0]), "language": "python",
         "kind": "function_definition", "facets": ["declaration", "definition"],
         "range": {"start": start, "end": end}, "source": source,
-    }]});
+    }], "revision": release_revision(&named_identity(&NAMED_POSITIONS[0]))});
     if let Some(view) = request.get("view") {
         answer["view"] = json!({"id": view, "expires_at": "2099-10-10T10:05:00Z"});
     }
@@ -754,6 +765,7 @@ fn runtime_symbol(view: &Value) -> Value {
     });
     json!({
         "outcome":"found", "view":view,
+        "revision":release_revision(&named_identity(&NAMED_POSITIONS[0])),
         "symbol":{
             "id":named_identity(&NAMED_POSITIONS[0]), "language":"python",
             "name":"len", "kind":"function", "origin":origin
@@ -778,6 +790,7 @@ fn greeting_symbol(view: &Value) -> Value {
     });
     json!({
         "outcome":"found", "view":view,
+        "revision":release_revision(&named_identity(&NAMED_POSITIONS[1])),
         "symbol":{
             "id":named_identity(&NAMED_POSITIONS[1]), "language":"python",
             "name":"greet", "kind":"function", "origin":origin

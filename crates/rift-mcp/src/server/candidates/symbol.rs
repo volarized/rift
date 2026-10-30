@@ -152,14 +152,18 @@ impl RiftMcp {
         ) {
             return self.global_symbol(&params, context).await;
         }
-        let rev = params.rev.clone();
+        let git = params
+            .revision
+            .as_ref()
+            .and_then(rift_protocol::revision::Revision::git_revision);
         let server = self.clone();
         let operation =
             move |reads: &rift_server::ReadService,
                   ready: bool,
                   warnings: Vec<rift_protocol::read::ReadWarning>| {
+                reads.accept_revision(params.revision.as_ref())?;
                 let mut selected = params.clone();
-                selected.rev = None;
+                selected.revision = None;
                 let input = reads
                     .local_symbol_view_input(&selected, ready)?
                     .with_warnings(warnings.clone())?;
@@ -179,6 +183,7 @@ impl RiftMcp {
                     return Ok(GetSymbolResult::Unavailable {
                         id: selected.id,
                         view: None,
+                        revision: None,
                         reason: SymbolUnavailableReason::IndexPreparing,
                         warnings: held_warnings,
                     });
@@ -186,9 +191,9 @@ impl RiftMcp {
                 selected.view = Some(view.id);
                 views.resolve(&selected, &root, &owner)
             };
-        if rev.is_some() {
+        if git.is_some() {
             return self
-                .read_at(rev, move |reads| operation(reads, true, Vec::new()))
+                .read_at(git, move |reads| operation(reads, true, Vec::new()))
                 .await;
         }
         let deadline = self.request_deadline().await;

@@ -495,6 +495,7 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             Retry::Never,
             &[
                 "rift.server.read_not_found",
+                "rift.server.read_revision_unserved",
                 "rift.server.read_symbol_not_found",
             ],
         ),

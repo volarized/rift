@@ -24,6 +24,7 @@ pub mod lock;
 pub mod map;
 pub mod read;
 pub mod retry;
+pub mod revision;
 pub mod schema;
 pub mod search;
 pub mod search_read;

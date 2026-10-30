@@ -170,7 +170,7 @@ impl ReadService {
         store: &StoreAnswer,
         references: &EngineReferences,
     ) -> Result<rift_ranking::ParsedQuery, RiftError> {
-        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        self.accept_search_revision(params)?;
         self.validated_pattern(params, store, references)?;
         search_page_limit(params)?;
         if params.pattern.is_some()

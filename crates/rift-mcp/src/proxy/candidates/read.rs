@@ -177,7 +177,7 @@ impl RiftProxy {
                     .error()
             })?;
         // Revision-addressed reads keep the server's existing scope refusal.
-        if params.rev.is_some() {
+        if params.revision.is_some() {
             return Ok(None);
         }
         let Some(name) = super::super::identity::scope_key(&params.scope) else {

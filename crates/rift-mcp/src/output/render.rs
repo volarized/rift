@@ -84,6 +84,7 @@ impl Render for SearchResult {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         let Self {
             view,
+            revision,
             results,
             pagination,
             warnings,
@@ -93,6 +94,7 @@ impl Render for SearchResult {
             warnings,
         };
         search::answer(out, &page, results)?;
+        layout::revision(out, revision.as_ref())?;
         if let Some(view) = view {
             out.raw_line(
                 0,

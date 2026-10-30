@@ -360,7 +360,7 @@ transport through the same LSP session contract. Its version ships with the Rift
 
 The history source resolver reads the workspace's git objects in place, with no checkout or `git`
 subprocess. That access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` accept
-a `rev`, and the server indexes that commit's tree - the same syntax providers, over committed
+a git `revision`, and the server indexes that commit's tree - the same syntax providers, over committed
 bytes - without touching the working tree.
 
 <VersionBadge

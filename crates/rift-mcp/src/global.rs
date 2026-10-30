@@ -24,8 +24,8 @@ use rift_protocol::configuration::GlobalConfiguration;
 use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, RequestedPackage};
 use rift_protocol::read::{
     DEPENDENCY_WARNINGS_MAX, ExactKind, GlobalFailureClass, GlobalPageWarningCode, PackageIdentity,
-    Pagination, ReadWarning, ResultOrder, RevisionId, SearchHit, SearchHitTarget, SearchInclude,
-    SearchParams, SearchParamsTarget, SearchResult, SearchScope, SymbolId,
+    Pagination, ReadWarning, ResultOrder, SearchHit, SearchHitTarget, SearchInclude, SearchParams,
+    SearchParamsTarget, SearchResult, SearchScope, SymbolId,
 };
 use rift_ranking::{
     DocumentIdentity, FieldSet, ParsedQuery, QueryPhase, RankedIdentity, RankingInput,
@@ -102,7 +102,7 @@ pub(crate) struct ReadContext<'a> {
 }
 
 impl<'a> ReadContext<'a> {
-    /// The context a read of `reads` sends for `requested` under `scope` and `rev`.
+    /// The context a read of `reads` sends for `requested` under `scope` and `revision`.
     ///
     /// # Errors
     ///
@@ -111,11 +111,11 @@ impl<'a> ReadContext<'a> {
     pub(crate) fn accepted(
         reads: &'a ReadService,
         scope: &SearchScope,
-        rev: Option<&RevisionId>,
+        revision: Option<&rift_protocol::revision::Revision>,
         requested: &'a [RequestedPackage],
     ) -> Result<Self, RiftError> {
         Ok(Self {
-            context: reads.read_context(scope, rev, requested)?,
+            context: reads.read_context(scope, revision, requested)?,
             snapshot: reads.dependency_context(),
             requested,
         })
@@ -666,7 +666,6 @@ fn batched_positions(
                 position_encoding: encoding,
                 positions: Vec::new(),
                 view: None,
-                rev: None,
             });
             requests.len() - 1
         });
@@ -1066,6 +1065,7 @@ pub(crate) fn merge_search(
     let (results, pagination) = page_window(ordered, params.page_index, limit);
     Ok(SearchResult {
         view: None,
+        revision: project_revision(params, local.revision),
         results,
         pagination,
         warnings: local.warnings,
@@ -1132,10 +1132,20 @@ pub(crate) fn merge_patterns(
     warnings.extend(remote.warnings);
     SearchResult {
         view: None,
+        revision: project_revision(params, local.revision),
         results,
         pagination,
         warnings,
     }
+}
+
+/// The project revision a merged answer reports: the project read's, unless the `global`
+/// scope read packages alone.
+fn project_revision(
+    params: &SearchParams,
+    local: Option<rift_protocol::revision::Revision>,
+) -> Option<rift_protocol::revision::Revision> {
+    local.filter(|_| params.scope != SearchScope::Global)
 }
 
 fn candidate_fields(hit: &SearchHit) -> FieldSet {
@@ -1980,6 +1990,7 @@ mod tests {
         let limit = rift_server::search_page_limit(&params).expect("an accepted limit");
         let local = SearchResult {
             view: None,
+            revision: None,
             results: hits.to_vec(),
             pagination: example.pagination.clone(),
             warnings: Vec::new(),
@@ -2072,6 +2083,7 @@ mod tests {
         for (hit, label, slug) in cases {
             let local = SearchResult {
                 view: None,
+                revision: None,
                 results: vec![hit],
                 pagination: example.pagination.clone(),
                 warnings: Vec::new(),
@@ -2942,6 +2954,7 @@ mod tests {
             let params: SearchParams = serde_json::from_value(request).expect("search request");
             let local = SearchResult {
                 view: None,
+                revision: None,
                 results: vec![project.clone()],
                 pagination: Pagination {
                     page_index: 0,
@@ -3034,7 +3047,8 @@ mod captured_runtime_tests {
         symbol: Option<&str>,
         nodes: &[serde_json::Value],
     ) -> NodesResult {
-        let mut answer = serde_json::json!({"nodes": nodes, "view": view});
+        let revision = "rift://revision/stdlib/cpython@3.12.3";
+        let mut answer = serde_json::json!({"nodes": nodes, "view": view, "revision": revision});
         if let Some(symbol) = symbol {
             answer["symbol"] = serde_json::json!(symbol);
         }
@@ -3082,9 +3096,11 @@ mod captured_runtime_tests {
         other_view.id = serde_json::from_value(serde_json::json!("a_B-9.z_Y-0")).expect("view id");
         let elsewhere = answer(&other_view, Some(ID), &[node(0, UNIT, 6, DECLARED)]);
         assert!(!declared_nodes_match(&elsewhere, &id, &unit, &view, STUB));
-        let unviewed: NodesResult = serde_json::from_value(
-            serde_json::json!({"symbol": ID, "nodes": [node(0, UNIT, 6, DECLARED)]}),
-        )
+        let unviewed: NodesResult = serde_json::from_value(serde_json::json!({
+            "symbol": ID,
+            "nodes": [node(0, UNIT, 6, DECLARED)],
+            "revision": "rift://revision/stdlib/cpython@3.12.3"
+        }))
         .expect("nodes answer");
         assert!(!declared_nodes_match(&unviewed, &id, &unit, &view, STUB));
     }

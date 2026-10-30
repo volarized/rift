@@ -3830,7 +3830,7 @@ mod tests {
         let context: std::collections::BTreeMap<_, _> = error.context().collect();
         assert_eq!(context.get("field").map(String::as_str), Some("arguments"));
         let revision = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
-            json!({"pattern":"beacon", "scope":"local:docs", "rev":"HEAD"}),
+            json!({"pattern":"beacon", "scope":"local:docs", "revision":"rift://revision/git/HEAD"}),
         )?);
         assert!(proxy.captured_read(&revision).await?.is_none());
         assert_eq!(
@@ -4253,6 +4253,14 @@ mod tests {
         }
     }
 
+    /// The git revision the named initial read selects.
+    #[cfg(unix)]
+    const HEAD: &str = "rift://revision/git/HEAD";
+
+    /// The commit the backend answers the named initial read at.
+    #[cfg(unix)]
+    const COMMIT_REVISION: &str = "rift://revision/git/1f2080e49da12fee4431e6872630509355cd62d1";
+
     #[cfg(unix)]
     #[tokio::test]
     async fn named_initial_get_keeps_typed_ids_and_original_view_after_extra_root_retargets()
@@ -4293,14 +4301,14 @@ mod tests {
                     "rift://symbol/local/rust/app/load"
                 );
                 if count == 0 {
-                    assert_eq!(request["params"]["arguments"]["rev"], "HEAD");
+                    assert_eq!(request["params"]["arguments"]["revision"], HEAD);
                 } else {
-                    assert!(request["params"]["arguments"].get("rev").is_none());
+                    assert!(request["params"]["arguments"].get("revision").is_none());
                     assert_eq!(request["params"]["arguments"]["view"], "claims.original");
                 }
                 let answer = json!({"content":[],"structuredContent":{
                     "outcome":"found", "symbol":{"id":"rift://symbol/local/rust/app/load", "language":"rust", "name":"load", "kind":"function"},
-                    "view":{"id":"claims.original","expires_at":expires_at},
+                    "view":{"id":"claims.original","expires_at":expires_at}, "revision":COMMIT_REVISION,
                     "declarations":[{"origin":{"location":"project","source_kind":"authored"},"path":"lib.rs","range":{"start":0,"end":12},"line":1,"signature_indices":[],"type_indices":[],"documentation_indices":[]}]
                 }});
                 let response = json!({"jsonrpc":"2.0","id":request["id"],"result":answer});
@@ -4311,7 +4319,7 @@ mod tests {
             }
             Ok::<_, std::io::Error>(count)
         });
-        let arguments = json!({"id":"rift://symbol/local@cloud/rust/app/load","rev":"HEAD"});
+        let arguments = json!({"id":"rift://symbol/local@cloud/rust/app/load","revision":HEAD});
         let request = CallToolRequestParams::new("get_symbol")
             .with_arguments(serde_json::from_value(arguments.clone())?);
         let first_response = proxy
@@ -4326,7 +4334,7 @@ mod tests {
         std::fs::remove_file(&registration_path)?;
         symlink(second.path(), &registration_path)?;
         let mut held = arguments;
-        held.as_object_mut().ok_or("request object")?.remove("rev");
+        held.as_object_mut().ok_or("request")?.remove("revision");
         held["view"] = json!("claims.original");
         // The served revision is a backend request selector, not a rewritten identity.
         let initial_revision = first_value["view"].clone();
@@ -4691,6 +4699,7 @@ mod tests {
         let answer: rift_protocol::symbol_read::GetSymbolResult = serde_json::from_value(json!({
             "outcome":"missing", "symbol_not_found":{"id":id,"alternatives":[]},
             "view":{"id":"claims.docs","expires_at":"2030-01-01T00:00:00Z"},
+            "revision":format!("rift://revision/tree/{}", "0".repeat(64)),
             "warnings":[{"code":"framework_context_unresolved", "unit":"rift://file/a.ts",
                 "framework":"tailwind", "detail":"missing version"}]
         }))

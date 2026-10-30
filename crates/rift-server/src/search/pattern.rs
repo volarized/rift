@@ -88,7 +88,7 @@ pub(super) fn pattern_conflict(params: &SearchParams) -> Option<RiftError> {
             "a comparison names committed revisions the trigram index does not hold",
         ),
         (
-            params.rev.is_some(),
+            crate::read::is_git_revision(params.revision.as_ref()),
             "the trigram index holds the current tree alone",
         ),
     ];
@@ -398,7 +398,7 @@ impl ReadService {
         pattern: &Pattern,
         store: &StoreAnswer,
     ) -> Result<SearchResult, RiftError> {
-        self.validate_dependency_scope(&params.scope, params.rev.as_ref())?;
+        self.accept_search_revision(params)?;
         let bounds = store.pattern_bounds();
         let limit = super::search_page_limit(params)?;
         let selected = self.selected_paths(params.paths.as_ref())?;
@@ -431,6 +431,7 @@ impl ReadService {
         populate_symbol_lines(&mut results, self.index(), selected.force_include.as_ref())?;
         Ok(SearchResult {
             view: None,
+            revision: Some(self.served_revision()?),
             results,
             pagination,
             warnings,

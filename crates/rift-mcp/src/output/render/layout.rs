@@ -248,3 +248,18 @@ impl<'a> Sections<'a> {
         warning::section(self.out, warnings)
     }
 }
+
+/// Writes the `revision` line naming the point an answer was read at.
+///
+/// # Errors
+///
+/// Returns the first failure of the writer.
+pub(super) fn revision(
+    out: &mut TextWriter,
+    revision: Option<&rift_protocol::revision::Revision>,
+) -> Result<(), TextError> {
+    match revision {
+        Some(revision) => out.raw_line(0, &format!("revision {revision}")),
+        None => Ok(()),
+    }
+}
