@@ -6670,26 +6670,219 @@
         "properties": {
           "symbol": {
             "$ref": "#/components/schemas/SymbolId",
-            "description": "The symbol the timeline is for."
+            "description": "The symbol the history is for."
           },
-          "versions": {
+          "edges": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/SymbolVersion"
+              "$ref": "#/components/schemas/HistoryEdge"
             },
-            "description": "Revisions that touched the symbol, newest first."
+            "description": "The commit edges newest first, then the `co_changes` edges, most shared commits\nfirst."
           },
           "complete": {
             "type": "boolean",
-            "description": "Whether the timeline reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so revisions older than the listed ones may have touched the symbol."
+            "description": "Whether the history reached the repository's first commit. `false` when the\n`max_revisions` bound, a shallow clone's boundary, or the oldest selected release\nended it first, or while the history store has not yet analyzed the served\nrevision, so commits older than the listed ones may have touched the symbol."
+          },
+          "co_changes_truncated": {
+            "description": "The co-change edges the co-change bounds left out. Absent when they left out none.",
+            "$ref": "#/components/schemas/CoChangeTruncation"
           }
         },
         "required": [
           "symbol",
-          "versions",
+          "edges",
           "complete"
         ],
-        "description": "One symbol's timeline across the workspace's version-control history, newest revision\nfirst. The timeline follows first parents from the served revision, or the selected\nreleases in version order, through the revisions the history store holds, and follows\nthe declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary."
+        "description": "One symbol's history as edges from the symbol to the commits that touched it and to the\nsymbols changed beside it. The history follows first parents from the served revision,\nor the selected releases in version order, through the commits the history store holds,\nand follows the declaration's file across a rename that kept its bytes. It is bounded by\n`[providers.history] max_revisions` and by a shallow clone's boundary."
+      },
+      "HistoryEdge": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "introduced_in"
+              },
+              "commit": {
+                "$ref": "#/components/schemas/HistoryCommit",
+                "description": "The commit and where the declaration lived in it."
+              }
+            },
+            "required": [
+              "edge",
+              "commit"
+            ],
+            "description": "The commit brought the symbol into existence."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "changed_in"
+              },
+              "commit": {
+                "$ref": "#/components/schemas/HistoryCommit",
+                "description": "The commit and where the declaration lived in it."
+              },
+              "change": {
+                "$ref": "#/components/schemas/HistoryChange",
+                "description": "Which part of the declaration the commit changed."
+              }
+            },
+            "required": [
+              "edge",
+              "commit",
+              "change"
+            ],
+            "description": "The commit changed the symbol's declaration in place."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "removed_in"
+              },
+              "commit": {
+                "$ref": "#/components/schemas/HistoryCommit",
+                "description": "The commit and where the declaration lived before it."
+              }
+            },
+            "required": [
+              "edge",
+              "commit"
+            ],
+            "description": "The commit deleted the symbol's declaration."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "renamed_from"
+              },
+              "commit": {
+                "$ref": "#/components/schemas/HistoryCommit",
+                "description": "The commit and the path it moved the declaration to."
+              },
+              "from": {
+                "$ref": "#/components/schemas/ProjectPath",
+                "description": "The path the declaration lived at before the commit."
+              }
+            },
+            "required": [
+              "edge",
+              "commit",
+              "from"
+            ],
+            "description": "The commit moved the symbol's declaration, unchanged, from another path: the file\nmoved with its bytes kept, or the declaration moved into another file. The\ndeclaration at `from` under the same qualified name is the symbol it was renamed\nfrom."
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "edge": {
+                "type": "string",
+                "const": "co_changes"
+              },
+              "symbol": {
+                "$ref": "#/components/schemas/SymbolId",
+                "description": "The other symbol, as the served tree identifies it."
+              },
+              "commits": {
+                "type": "integer",
+                "format": "uint64",
+                "minimum": 0,
+                "description": "How many listed commits changed both symbols."
+              }
+            },
+            "required": [
+              "edge",
+              "symbol",
+              "commits"
+            ],
+            "description": "The symbol and `symbol` changed in the same commits, counted over the commits the\nhistory lists."
+          }
+        ],
+        "description": "One edge from a symbol in its history. Every commit edge names the commit as a\n`rift://revision/git/<commit>` revision."
+      },
+      "HistoryCommit": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revision": {
+            "$ref": "#/components/schemas/Revision",
+            "description": "The commit, as `rift://revision/git/<commit>`."
+          },
+          "path": {
+            "$ref": "#/components/schemas/ProjectPath",
+            "description": "Where the declaration lived at that commit."
+          },
+          "timestamp": {
+            "type": "string",
+            "description": "When the commit was committed, as RFC 3339 date-time carrying the recorded offset:\nthe committer time, not the author time.",
+            "maxLength": 64
+          },
+          "summary": {
+            "type": "string",
+            "description": "The commit's own first summary line, where the version control records one.",
+            "maxLength": 4096
+          },
+          "author": {
+            "$ref": "#/components/schemas/CommitAuthor",
+            "description": "Who authored the commit, as the version control records it."
+          }
+        },
+        "required": [
+          "revision",
+          "path",
+          "timestamp",
+          "author"
+        ],
+        "description": "One commit a history edge names, with where the symbol's declaration lived in it."
+      },
+      "HistoryChange": {
+        "description": "Which part of a declaration a `changed_in` commit changed.",
+        "type": "string",
+        "enum": [
+          "signature_changed",
+          "body_changed",
+          "decorators_changed"
+        ],
+        "x-enum-descriptions": [
+          "The commit changed the declared interface.",
+          "The commit changed the implementation without touching the signature.",
+          "The commit changed the annotations on the declaration."
+        ]
+      },
+      "CoChangeTruncation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "commits_past_bound": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Listed commits that changed too many declarations to count toward any co-change\nedge."
+          },
+          "symbols_past_bound": {
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "description": "Co-changed symbols past the most `co_changes` edges one history answers."
+          }
+        },
+        "required": [
+          "commits_past_bound",
+          "symbols_past_bound"
+        ],
+        "description": "The co-change edges a symbol history left out, counted per bound."
       },
       "SymbolIdentity": {
         "description": "Canonical logical symbol identity with local, profile, registered local, registered local profile, package or runtime ownership. A package or runtime owner names no version: a release revision selects one. The portable codec validates owner coordinates, UTF-8 and canonical percent-encoding before lookup.",
@@ -6780,46 +6973,6 @@
           "The requested captured view expired or was explicitly removed.",
           "The captured view belongs to another workspace or scope mapping."
         ]
-      },
-      "SymbolVersion": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "revision": {
-            "$ref": "#/components/schemas/RevisionId",
-            "description": "The revision that touched the symbol."
-          },
-          "path": {
-            "$ref": "#/components/schemas/ProjectPath",
-            "description": "Where the declaration lived at that revision."
-          },
-          "kind": {
-            "$ref": "#/components/schemas/SymbolVersionKind",
-            "description": "How the revision changed the symbol."
-          },
-          "timestamp": {
-            "type": "string",
-            "description": "When the revision was committed, as RFC 3339 date-time carrying the recorded offset:\nthe committer time, not the author time.",
-            "maxLength": 64
-          },
-          "summary": {
-            "type": "string",
-            "description": "The revision's own first summary line, where the version control records one.",
-            "maxLength": 4096
-          },
-          "author": {
-            "$ref": "#/components/schemas/CommitAuthor",
-            "description": "Who authored the revision, as the version control records it."
-          }
-        },
-        "required": [
-          "revision",
-          "path",
-          "kind",
-          "timestamp",
-          "author"
-        ],
-        "description": "One revision that touched a symbol. The history provider parses the declaration at each\nfirst-parent revision that changed its file and classifies adjacent states; a revision\nwhose source cannot be parsed contributes no version."
       },
       "SymbolVersionKind": {
         "description": "What the revision did to the symbol.",
