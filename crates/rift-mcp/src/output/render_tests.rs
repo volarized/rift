@@ -244,7 +244,6 @@ fn stale_index() -> ReadWarning {
 
 fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
     Node {
-        symbol: None,
         declaration: None,
         index,
         unit: FileId("rift://file/src/lib.rs".to_owned()),
@@ -252,6 +251,7 @@ fn node(index: u64, kind: &str, start: u64, end: u64) -> Node {
         kind: ExactKind(kind.to_owned()),
         facets: Vec::new(),
         range: range(start, end),
+        source: String::new(),
         regions: Vec::new(),
         parent: None,
         extensions: Extensions::default(),
@@ -350,11 +350,17 @@ fn symbol_result(hits: Vec<GetSymbolHit>, page: Pagination) -> GetSymbolResult {
     }
 }
 
-fn nodes_result(nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
+/// A `nodes` answer whose nodes carry `source`, one text per node in order.
+fn nodes_result(mut nodes: Vec<Node>, source: Vec<&str>) -> NodesResult {
+    assert_eq!(nodes.len(), source.len(), "one source per fixture node");
+    for (node, text) in nodes.iter_mut().zip(source) {
+        text.clone_into(&mut node.source);
+    }
     NodesResult {
+        symbol: None,
         view: None,
         nodes,
-        source: source.into_iter().map(str::to_owned).collect(),
+        node_cursor: None,
         warnings: Vec::new(),
     }
 }
@@ -3416,7 +3422,7 @@ fn a_node_kind_holding_a_delimiter_is_quoted_and_others_stay_bare() {
             "\t\t2..7",
             "\t\tindex 2",
             "",
-            "\t\tc",
+            "\t\ta",
         ],
     );
 }
@@ -3657,6 +3663,41 @@ fn outer_and_inner() -> NodesResult {
 }
 
 #[test]
+fn a_symbol_answer_writes_each_declaration_source_then_its_cursor() {
+    let mut first = node(0, "function_item", 0, 9);
+    first.declaration = Some(0);
+    let name = node(1, "identifier", 3, 4);
+    let mut second = node(0, "function_item", 20, 29);
+    second.declaration = Some(1);
+    let mut answer = nodes_result(
+        vec![first, name, second],
+        vec!["fn a() {}", "a", "fn a() {}"],
+    );
+    answer.node_cursor = Some("3.0123456789abcdef".to_owned());
+    answer.symbol = Some(SymbolId(A_ID.to_owned()));
+    golden(
+        &answer,
+        &[
+            "3 nodes · rift://symbol/local/rust/app/a/A",
+            "\t[1] function_item",
+            "\t\t0..9",
+            "\t\tdeclaration 0 · index 0",
+            "\t[2] identifier",
+            "\t\t3..4",
+            "\t\tindex 1",
+            "\t[3] function_item",
+            "\t\t20..29",
+            "\t\tdeclaration 1 · index 0",
+            "",
+            "\t\tfn a() {}",
+            "",
+            "\t\tfn a() {}",
+            "node_cursor 3.0123456789abcdef",
+        ],
+    );
+}
+
+#[test]
 fn an_empty_nodes_answer_writes_only_the_header() {
     let answer = nodes_result(Vec::new(), Vec::new());
     golden(&answer, &["0 nodes"]);
@@ -3679,7 +3720,7 @@ fn one_node_has_no_marker_and_its_excerpt_follows_a_blank_line() {
 }
 
 #[test]
-fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_innermost_excerpt_is_written()
+fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_outermost_excerpt_is_written()
 {
     let answer = outer_and_inner();
     golden(
@@ -3693,19 +3734,20 @@ fn several_nodes_follow_each_other_without_a_blank_line_and_only_the_innermost_e
             "\t\t3..9",
             "\t\tindex 1 · parent 0",
             "",
-            "\t\tname",
+            "\t\tfn name() {}",
+            "\t\t// tail",
         ],
     );
     assert!(
-        !rendered(&answer).contains("tail"),
-        "the outer excerpt is not written"
+        !rendered(&answer).contains("\t\tname\n"),
+        "the enclosed excerpt is not written"
     );
 }
 
 #[test]
 fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
     let mut item = node(0, "function_item", 0, 20);
-    item.symbol = Some(SymbolId(A_ID.to_owned()));
+    item.declaration = Some(0);
     item.facets = vec![
         NodeFacet::Declaration,
         NodeFacet::Test,
@@ -3730,14 +3772,15 @@ fn a_node_names_its_symbol_its_regions_and_its_generated_and_test_facets() {
             "2 nodes",
             "\t[1] function_item · 3 lines · generated · test",
             "\t\t0..20",
-            "\t\tindex 0",
-            "\t\trift://symbol/local/rust/app/a/A",
+            "\t\tdeclaration 0 · index 0",
             "\t\tname 3..4 · body 8..20",
             "\t[2] block",
             "\t\t9..10",
             "\t\tindex 1",
             "",
-            "\t\t{",
+            "\t\tfn a() {",
+            "\t\t    b",
+            "\t\t}",
         ],
     );
 }
@@ -3767,6 +3810,15 @@ fn the_line_count_follows_the_excerpt_lines_and_not_its_trailing_line_feed() {
             "\t\t3..4",
             "\t\tindex 3",
             "",
+            "",
+            "",
+            "\t\tx",
+            "",
+            "",
+            "\t\tx",
+            "\t\ty",
+            "",
+            "",
             "\t\tz",
         ],
     );
@@ -3782,7 +3834,7 @@ fn an_empty_innermost_excerpt_is_one_empty_line_after_the_blank_line() {
 }
 
 #[test]
-fn warnings_follow_the_innermost_excerpt_of_the_nodes() {
+fn warnings_follow_the_outermost_excerpt_of_the_nodes() {
     let mut answer = outer_and_inner();
     answer.warnings = vec![stale_index()];
     golden(
@@ -3796,7 +3848,8 @@ fn warnings_follow_the_innermost_excerpt_of_the_nodes() {
             "\t\t3..9",
             "\t\tindex 1 · parent 0",
             "",
-            "\t\tname",
+            "\t\tfn name() {}",
+            "\t\t// tail",
             "1 warning",
             "\tstale_index · index_tree_revision 3f9a1c2e · captured_tree_revision 3f9a1c2f: index lags the captured tree",
         ],
@@ -3827,7 +3880,7 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
     );
     let two = nodes_result(
         vec![node(0, "a", 0, 9), node(1, "b", 1, 9)],
-        vec!["x", excerpt],
+        vec![excerpt, "x"],
     );
     let output = rendered(&two);
     assert_no_trailing_space(&output);
@@ -3839,23 +3892,6 @@ fn an_excerpt_with_backticks_and_header_lines_stays_verbatim_under_the_node() {
         .collect();
     assert_eq!(recovered.join("\n"), excerpt);
 }
-
-#[test]
-fn nodes_and_excerpts_that_differ_in_length_are_refused() {
-    let one_node = || vec![node(0, "a", 0, 1)];
-    for answer in [
-        nodes_result(one_node(), Vec::new()),
-        nodes_result(Vec::new(), vec!["extra"]),
-        nodes_result(one_node(), vec!["a", "b"]),
-    ] {
-        assert_eq!(
-            text_of(&answer),
-            Err(TextError::Unsupported("nodes and source differ in length"))
-        );
-    }
-}
-
-// Failures.
 
 #[test]
 fn a_failure_without_limit_or_causes_is_one_entry_with_its_message() {
@@ -4129,10 +4165,14 @@ fn identities_are_written_whole_and_hashes_are_cut() {
     );
     let mut node_item = node(0, "function_item", 0, 1);
     node_item.unit = FileId(file.to_owned());
-    node_item.symbol = Some(SymbolId(symbol_id.to_owned()));
-    let nodes = rendered(&nodes_result(vec![node_item], vec!["x"]));
+    let mut node_answer = nodes_result(vec![node_item], vec!["x"]);
+    node_answer.symbol = Some(SymbolId(symbol_id.to_owned()));
+    let nodes = rendered(&node_answer);
     assert!(
-        nodes.lines().any(|line| line == entry(symbol_id)),
+        nodes
+            .lines()
+            .next()
+            .is_some_and(|title| title.ends_with(symbol_id)),
         "{nodes}"
     );
     let mut commit = commit_hit();
@@ -4143,33 +4183,51 @@ fn identities_are_written_whole_and_hashes_are_cut() {
 
 /// The authored `nodes` example, rendered unmodified.
 #[test]
-fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_source() {
+fn the_authored_nodes_example_renders_one_entry_per_node_and_the_outermost_source() {
     golden(
         &example::<NodesResult>(0),
         &[
-            "5 nodes",
-            "\t[1] source_file · 14 lines",
-            "\t\t0..356",
-            "\t\tindex 1 · parent 0",
-            "\t[2] function_item · 4 lines",
-            "\t\t218..355",
+            "12 nodes · rift://symbol/local/rust/app/config/Config",
+            "\t[1] struct_item · 3 lines",
+            "\t\t105..160",
             "\t\tdeclaration 0 · index 0",
-            "\t\trift://symbol/local/rust/app/config/load_config",
-            "\t\tname 225..236 · body 281..355",
-            "\t[3] block · 4 lines",
-            "\t\t281..355",
-            "\t\tdeclaration 0 · index 13 · parent 0",
-            "\t\trift://symbol/local/rust/app/config/load_config",
-            "\t[4] call_expression",
-            "\t\t334..353",
-            "\t\tdeclaration 0 · index 25 · parent 13",
-            "\t\trift://symbol/local/rust/app/config/load_config",
-            "\t[5] identifier",
-            "\t\t334..346",
-            "\t\tdeclaration 0 · index 26 · parent 25",
-            "\t\trift://symbol/local/rust/app/config/load_config",
+            "\t[2] visibility_modifier",
+            "\t\t105..108",
+            "\t\tdeclaration 0 · index 1 · parent 0",
+            "\t[3] type_identifier",
+            "\t\t116..122",
+            "\t\tdeclaration 0 · index 2 · parent 0",
+            "\t[4] field_declaration_list · 3 lines",
+            "\t\t123..160",
+            "\t\tdeclaration 0 · index 3 · parent 0",
+            "\t[5] field_declaration",
+            "\t\t129..157",
+            "\t\tdeclaration 0 · index 4 · parent 3",
+            "\t[6] visibility_modifier",
+            "\t\t129..132",
+            "\t\tdeclaration 0 · index 5 · parent 4",
+            "\t[7] field_identifier",
+            "\t\t133..137",
+            "\t\tdeclaration 0 · index 6 · parent 4",
+            "\t[8] scoped_type_identifier",
+            "\t\t139..157",
+            "\t\tdeclaration 0 · index 7 · parent 4",
+            "\t[9] scoped_identifier",
+            "\t\t139..148",
+            "\t\tdeclaration 0 · index 8 · parent 7",
+            "\t[10] identifier",
+            "\t\t139..142",
+            "\t\tdeclaration 0 · index 9 · parent 8",
+            "\t[11] identifier",
+            "\t\t144..148",
+            "\t\tdeclaration 0 · index 10 · parent 8",
+            "\t[12] type_identifier",
+            "\t\t150..157",
+            "\t\tdeclaration 0 · index 11 · parent 7",
             "",
-            "\t\tparse_config",
+            "\t\tpub struct Config {",
+            "\t\t    pub root: std::path::PathBuf,",
+            "\t\t}",
         ],
     );
 }

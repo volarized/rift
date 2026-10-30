@@ -673,22 +673,20 @@ fn is_language_word(word: &str) -> bool {
         })
 }
 
-/// One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node
-/// inside a declaration's item subtree is node `index` of declaration `declaration` of
-/// `symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in
-/// pre-order from 0 at the declaration's item node, or from 0 at the unit's file node, and
-/// skip the subtrees of nested declarations, whose nodes belong to the nested symbol. The address
-/// names a place at the read's revision: an edit renumbers the nodes after it.
+/// One node of a source unit's syntax tree, with its source text, addressed by its place inside
+/// a symbol. A node inside a declaration's item subtree is node `index` of declaration
+/// `declaration` of the symbol the read names; a node outside every declaration is node `index`
+/// of its `unit`. Indexes count in pre-order from 0 at the declaration's item node, or from 0 at
+/// the unit's file node, and skip the subtrees of nested declarations, whose nodes belong to the
+/// nested symbol. The address names a place at the read's revision: an edit renumbers the nodes
+/// after it.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_node_empty_defaults)]
 pub struct Node {
-    /// The symbol whose declaration holds this node. Absent for a node outside every
-    /// declaration: a file's root, an import, a top-level statement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<SymbolId>,
-    /// Ordinal of the declaration holding this node among the declarations of `symbol`, from
-    /// 0 in the order a symbol read lists them. Present exactly when `symbol` is.
+    /// Ordinal of the declaration holding this node among the declarations of the symbol the
+    /// read names, from 0 in the order a symbol read lists them. Absent for a node outside
+    /// every declaration: the file node, an import, a top-level statement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
     pub declaration: Option<u64>,
@@ -710,6 +708,8 @@ pub struct Node {
     pub facets: Vec<NodeFacet>,
     /// The bytes it spans, as offsets into the file.
     pub range: TextRange,
+    /// The node's exact source text: the bytes `range` spans at the read's revision.
+    pub source: String,
     /// The node's named parts, including its function body and documentation. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<NodeRegion>,
@@ -798,27 +798,47 @@ pub struct NodeRegion {
     pub range: TextRange,
 }
 
-/// Lists the syntax nodes covering one position, outermost first. Each node carries its
-/// source range and kind, including expressions smaller than a declaration.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+/// Lists syntax nodes with their source: every node of one `symbol`, or the nodes of the
+/// innermost declaration holding one `position` in one file, or of that file's unit when no
+/// declaration holds it. Each node carries its kind, range, source text, and place, including
+/// expressions smaller than a declaration.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+#[schemars(transform = schema::require_one_node_selector)]
 #[schemars(extend("rift:since" = "v0.0.4"))]
 #[schemars(extend("examples" = [
+    {
+        "symbol": "rift://symbol/local/rust/app/config/load_config"
+    },
     {
         "path": "src/config.rs",
         "position": 338
     }
 ]))]
 pub struct NodesParams {
-    /// Project-relative file to inspect.
+    /// The symbol whose nodes the read lists: each declaration's item node, then the
+    /// descendants that belong to that declaration and not to a declaration nested in it,
+    /// outermost first per declaration. The caller MUST omit `path` and `position` beside it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<SymbolId>,
+    /// Project-relative file to inspect. The caller MUST send it together with `position`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(length(min = 1))]
-    pub path: ProjectPath,
-    /// UTF-8 byte offset the listed nodes must cover - one position, not a range; the nodes
-    /// themselves carry the spans. A position inside a multi-byte character is valid and
-    /// answers with its enclosing nodes; a position at or past the file's byte length
-    /// refuses.
+    pub path: Option<ProjectPath>,
+    /// UTF-8 byte offset inside the declaration whose nodes the read lists - one position,
+    /// not a range; the nodes themselves carry the spans. The read lists the nodes of the
+    /// innermost declaration holding the node at the position, or of the file's unit when no
+    /// declaration holds it. A position inside a multi-byte character is valid; a position at
+    /// or past the file's byte length refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0_u64, max = 9_007_199_254_740_991_u64))]
-    pub position: u64,
+    pub position: Option<u64>,
+    /// Continuation a preceding read returned, bound to the symbol or unit its answer listed
+    /// and the tree revision it read. The caller MUST send it with the selector of that read;
+    /// the server refuses it for another symbol or unit and once the tree has moved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = 4096))]
+    pub node_cursor: Option<String>,
     /// Captured view selected by discovery. The server reads nodes from that view and
     /// refuses an expired or foreign view. The caller MUST omit `rev` beside `view`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -830,115 +850,220 @@ pub struct NodesParams {
     pub rev: Option<RevisionId>,
 }
 
-/// The nodes covering one position, outermost first, each addressed by its place inside its
-/// symbol or its unit.
+impl NodesParams {
+    /// A read of the nodes of the declaration or unit holding `position` in the file at `path`.
+    #[must_use]
+    pub fn at(path: ProjectPath, position: u64) -> Self {
+        Self {
+            path: Some(path),
+            position: Some(position),
+            ..Self::default()
+        }
+    }
+
+    /// A read of every node of `symbol`.
+    #[must_use]
+    pub fn of(symbol: SymbolId) -> Self {
+        Self {
+            symbol: Some(symbol),
+            ..Self::default()
+        }
+    }
+}
+
+/// Most source bytes the nodes of one `nodes` answer carry together. A symbol read stops
+/// before the node that would cross it and returns `node_cursor`; a page always holds at
+/// least one node, whose own size `[providers.syntax] max_file` bounds.
+pub const NODES_SOURCE_BYTES_MAX: u64 = 1_048_576;
+
+/// The nodes a read selected, each with its source text and its place inside its symbol or
+/// unit.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 #[schemars(transform = schema::declare_nodes_result_empty_defaults)]
 #[schemars(extend("examples" = [
     {
+        "symbol": "rift://symbol/local/rust/app/config/Config",
         "nodes": [
             {
-                "index": 1,
-                "unit": "rift://file/src/config.rs",
-                "language": "rust",
-                "kind": "source_file",
-                "range": {
-                    "start": 0,
-                    "end": 356
-                },
-                "parent": 0
-            },
-            {
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "declaration": 0,
                 "index": 0,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "function_item",
+                "kind": "struct_item",
                 "facets": [
                     "declaration",
                     "definition"
                 ],
                 "range": {
-                    "start": 218,
-                    "end": 355
+                    "start": 105,
+                    "end": 160
                 },
-                "regions": [
-                    {
-                        "role": "name",
-                        "range": {
-                            "start": 225,
-                            "end": 236
-                        }
-                    },
-                    {
-                        "role": "body",
-                        "range": {
-                            "start": 281,
-                            "end": 355
-                        }
-                    }
-                ]
+                "source": "pub struct Config {\n    pub root: std::path::PathBuf,\n}"
             },
             {
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "declaration": 0,
-                "index": 13,
+                "index": 1,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "block",
+                "kind": "visibility_modifier",
                 "range": {
-                    "start": 281,
-                    "end": 355
+                    "start": 105,
+                    "end": 108
                 },
+                "source": "pub",
                 "parent": 0
             },
             {
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "declaration": 0,
-                "index": 25,
+                "index": 2,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
-                "kind": "call_expression",
-                "facets": [
-                    "expression"
-                ],
+                "kind": "type_identifier",
                 "range": {
-                    "start": 334,
-                    "end": 353
+                    "start": 116,
+                    "end": 122
                 },
-                "parent": 13
+                "source": "Config",
+                "parent": 0
             },
             {
-                "symbol": "rift://symbol/local/rust/app/config/load_config",
                 "declaration": 0,
-                "index": 26,
+                "index": 3,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_declaration_list",
+                "range": {
+                    "start": 123,
+                    "end": 160
+                },
+                "source": "{\n    pub root: std::path::PathBuf,\n}",
+                "parent": 0
+            },
+            {
+                "declaration": 0,
+                "index": 4,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_declaration",
+                "facets": [
+                    "declaration",
+                    "definition"
+                ],
+                "range": {
+                    "start": 129,
+                    "end": 157
+                },
+                "source": "pub root: std::path::PathBuf",
+                "parent": 3
+            },
+            {
+                "declaration": 0,
+                "index": 5,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "visibility_modifier",
+                "range": {
+                    "start": 129,
+                    "end": 132
+                },
+                "source": "pub",
+                "parent": 4
+            },
+            {
+                "declaration": 0,
+                "index": 6,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "field_identifier",
+                "range": {
+                    "start": 133,
+                    "end": 137
+                },
+                "source": "root",
+                "parent": 4
+            },
+            {
+                "declaration": 0,
+                "index": 7,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "scoped_type_identifier",
+                "range": {
+                    "start": 139,
+                    "end": 157
+                },
+                "source": "std::path::PathBuf",
+                "parent": 4
+            },
+            {
+                "declaration": 0,
+                "index": 8,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "scoped_identifier",
+                "range": {
+                    "start": 139,
+                    "end": 148
+                },
+                "source": "std::path",
+                "parent": 7
+            },
+            {
+                "declaration": 0,
+                "index": 9,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "identifier",
                 "range": {
-                    "start": 334,
-                    "end": 346
+                    "start": 139,
+                    "end": 142
                 },
-                "parent": 25
+                "source": "std",
+                "parent": 8
+            },
+            {
+                "declaration": 0,
+                "index": 10,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "identifier",
+                "range": {
+                    "start": 144,
+                    "end": 148
+                },
+                "source": "path",
+                "parent": 8
+            },
+            {
+                "declaration": 0,
+                "index": 11,
+                "unit": "rift://file/src/config.rs",
+                "language": "rust",
+                "kind": "type_identifier",
+                "range": {
+                    "start": 150,
+                    "end": 157
+                },
+                "source": "PathBuf",
+                "parent": 7
             }
-        ],
-        "source": [
-            "use std::path::Path;\n\nuse crate::error::ConfigError;\n\n/// Workspace configuration read from `rift.toml`.\npub struct Config {\n    pub root: std::path::PathBuf,\n}\n\n/// Loads the workspace configuration from `rift.toml`.\npub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}\n",
-            "pub fn load_config(path: &Path) -> Result<Config, ConfigError> {\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-            "{\n    let text = std::fs::read_to_string(path)?;\n    parse_config(&text)\n}",
-            "parse_config(&text)",
-            "parse_config"
         ]
     }
 ]))]
 pub struct NodesResult {
-    /// Nodes covering the position, outermost first.
+    /// The symbol whose declarations hold the listed nodes: the requested one for a `symbol`
+    /// read, the innermost declaration's symbol for a `position` read. Absent when the nodes
+    /// belong to a unit outside every declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<SymbolId>,
+    /// Nodes the read selected, in pre-order: per declaration, in the order a symbol read
+    /// lists them, or the unit's nodes from its file node on.
     pub nodes: Vec<Node>,
-    /// One excerpt per node in `nodes`, in the same order, each spanning that node's own
-    /// range. Empty when `nodes` is empty.
-    pub source: Vec<String>,
+    /// Continuation for the rest of an answer whose nodes crossed its node count or source
+    /// byte bound. Absent when the answer holds the last node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_cursor: Option<String>,
     /// Captured view used for this read, with its original expiry. Absent when the
     /// request did not select a captured view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4088,8 +4213,9 @@ mod captured_nodes_tests {
             expires_at: "2030-01-01T00:15:00Z".to_owned(),
         };
         let result = NodesResult {
+            symbol: None,
             nodes: Vec::new(),
-            source: Vec::new(),
+            node_cursor: None,
             warnings: Vec::new(),
             view: Some(view.clone()),
         };
@@ -4107,7 +4233,7 @@ mod captured_nodes_tests {
             assert!(serde_json::from_value::<NodesParams>(wire).is_err());
         }
         let legacy: NodesResult =
-            serde_json::from_value(json!({"nodes":[],"source":[]})).expect("legacy result");
+            serde_json::from_value(json!({"nodes":[]})).expect("legacy result");
         assert!(legacy.view.is_none());
         assert!(
             serde_json::to_value(legacy)

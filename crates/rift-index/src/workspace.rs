@@ -45,8 +45,8 @@ use rift_ranking::{
     identifier_terms,
 };
 use rift_syntax::{
-    ByteRange, NodeMatch, NodePlace, SyntaxDocument, SyntaxLimits, SyntaxNode, SyntaxProvider,
-    SyntaxSource, SyntaxSymbol, registry,
+    ByteRange, NodeMatch, NodePlace, SyntaxDocument, SyntaxLimits, SyntaxProvider, SyntaxSource,
+    SyntaxSymbol, registry,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -1236,16 +1236,14 @@ fn is_syntax_bound(slug: ErrorSlug) -> bool {
     )
 }
 
-/// Indexed file and syntax nodes selected for one source position.
+/// Indexed file and its parse, read for one unpublished source path.
 #[derive(Debug)]
 pub struct IndexedFileNodes {
     /// Parsed file used to validate source identity and position.
     pub file: IndexedFile,
-    /// Nodes that cover the requested position, outermost first.
-    pub nodes: Vec<SyntaxNode>,
-    /// The place of each node in `nodes`, in the same order. The file is not published, so
-    /// no declaration of it has an established identity and the unit holds every node.
-    pub places: Vec<NodePlace>,
+    /// The parse with its complete node table. The file is not published, so no declaration
+    /// of it has an established identity and its unit holds every node.
+    pub document: SyntaxDocument,
     /// Framework context unresolved for these captured source bytes.
     pub warnings: Vec<rift_protocol::read::ReadWarning>,
 }
@@ -4206,7 +4204,7 @@ impl WorkspaceIndex {
         self.files.get(path).map(AsRef::as_ref)
     }
 
-    /// Parses one selected source path and keeps only nodes covering `position` for this read.
+    /// Parses one selected source path for a read, keeping its complete node table.
     ///
     /// Returns `None` when no provider selects `path`, `Skipped` when a catalog or syntax
     /// bound leaves it out, and `Included` when parsing succeeds.
@@ -4218,7 +4216,6 @@ impl WorkspaceIndex {
     pub fn parse_source_file_with_nodes(
         &self,
         path: &ProjectPath,
-        position: u64,
     ) -> Result<Option<IndexRead<IndexedFileNodes>>, RiftError> {
         let absolute = self.root.join(path.as_str());
         let Some(ClassifiedPath::Source(provider)) = self.language.classifies(&absolute)? else {
@@ -4265,13 +4262,7 @@ impl WorkspaceIndex {
                 Err(error) => return error.fail(),
             },
         };
-        let (nodes, places) = syntax
-            .nodes()
-            .iter()
-            .zip(syntax.node_places(|_, _| false))
-            .filter(|(node, _)| node.range.contains(position))
-            .map(|(node, place)| (node.clone(), place))
-            .unzip();
+        let document = syntax.clone();
         let file = IndexedFile::new(
             text_file.path().clone(),
             Arc::clone(&text_file.content),
@@ -4281,8 +4272,7 @@ impl WorkspaceIndex {
         );
         Ok(Some(IndexRead::Included(IndexedFileNodes {
             file,
-            nodes,
-            places,
+            document,
             warnings,
         })))
     }

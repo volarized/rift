@@ -493,7 +493,10 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
         (
             Code::ResourceNotFound,
             Retry::Never,
-            &["rift.server.read_not_found"],
+            &[
+                "rift.server.read_not_found",
+                "rift.server.read_symbol_not_found",
+            ],
         ),
         (
             Code::ResourceNotFound,

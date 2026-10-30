@@ -27,10 +27,12 @@
 //! - Per `get_symbol` hit: the location line, the symbol identity, every history version, the
 //!   `history (incomplete):` label exactly when the history is incomplete, and the source.
 //!   A single-item answer ends its items section with its source.
-//! - Per `nodes` entry: the kind on the head line, ` · <L> lines` exactly when the excerpt has
+//! - Per `nodes` entry: the kind on the head line, ` · <L> lines` exactly when the source has
 //!   more than one line, `generated` and `test` when the facet holds, the node identity on the
-//!   next line, the symbol identity and the regions line when present. The innermost excerpt ends
-//!   the items section, line by line, after one blank line; outer excerpts are not checked.
+//!   next line, the `of` symbol identity and the regions line when present. The written sources
+//!   end the items section, each line by line after one blank line: when the first node declares
+//!   a symbol, the source of each node no earlier node encloses; otherwise the innermost
+//!   node's source. Other sources are not checked.
 
 mod walk;
 
@@ -162,6 +164,7 @@ pub(super) fn text_states(tool: Tool, text: &str, structured: &Value) -> Result<
     } else {
         rest
     };
+    let rest = cursor_states(rest, structured.get("node_cursor"))?;
     warnings_states(rest, structured.get("warnings"))?;
     items_states(tool, &first.entries, items, structured)
 }
@@ -193,24 +196,28 @@ fn items_states(
         match tool {
             Tool::Search => search_hit(&item, hit, &at)?,
             Tool::GetSymbol => symbol_hit(&item, hit, &at)?,
-            Tool::Nodes => node_entry(&item, hit, structured, *index, &at)?,
+            Tool::Nodes => node_entry(&item, hit, &at)?,
         }
     }
     plan.states(&nodes)?;
     match tool {
         Tool::Search => Ok(()),
         Tool::GetSymbol => single_symbol_ends_with_source(entries, items),
-        Tool::Nodes => innermost_ends_section(entries, structured, items.len()),
+        Tool::Nodes => written_sources_end_section(entries, items),
     }
 }
 
 /// Whether the text of item `index` may end in an empty line.
 ///
 /// That is the case when the source the item writes last is empty or ends in a line feed. A
-/// `nodes` answer writes only the innermost excerpt, so only its last item may.
+/// `nodes` answer writes its sources after the last item, so only its last item may.
 fn may_end_blank(tool: Tool, hit: &Value, structured: &Value, index: usize, count: usize) -> bool {
     let source = match tool {
-        Tool::Nodes if index + 1 == count => structured.pointer(&format!("/source/{index}")),
+        Tool::Nodes if index + 1 == count => structured
+            .get("nodes")
+            .and_then(Value::as_array)
+            .and_then(|nodes| written_nodes(nodes).last().map(|(_, node)| *node))
+            .and_then(|node| node.get("source")),
         Tool::Nodes => None,
         Tool::Search | Tool::GetSymbol => hit.get("source"),
     };
@@ -295,10 +302,11 @@ fn title_states(title: &str, count: usize, tool: Tool, structured: &Value) -> Re
         || format!("the title must open with `{counted}`, got `{title}`"),
     )?;
     if tool == Tool::Nodes {
+        let symbol = text_at(structured, "/symbol");
         return require(
-            facts.next().is_none(),
-            &format!("$.{}", tool.items_key()),
-            || format!("a nodes title states no page, got `{title}`"),
+            facts.next() == symbol && facts.next().is_none(),
+            "$.symbol",
+            || format!("a nodes title states its symbol alone, got `{title}`"),
         );
     }
     let number = |name: &str| {
@@ -841,14 +849,8 @@ fn version_states(entry: Option<&str>, version: &Value, at: &str) -> Result<(), 
     Ok(())
 }
 
-/// Checks one `nodes` entry against its lines: head, byte range, address, symbol, and regions.
-fn node_entry(
-    item: &Item<'_>,
-    node: &Value,
-    structured: &Value,
-    index: usize,
-    at: &str,
-) -> Result<(), String> {
+/// Checks one `nodes` entry against its lines: head, byte range, address, and regions.
+fn node_entry(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String> {
     let place = node
         .pointer("/index")
         .and_then(Value::as_u64)
@@ -862,11 +864,9 @@ fn node_entry(
         address.push(format!("parent {parent}"));
     }
     let address = address.join(" · ");
-    let excerpt = structured
-        .pointer(&format!("/source/{index}"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("$.source[{index}]: must be a string"))?;
-    node_head_states(item, node, excerpt, (at, &format!("$.source[{index}]")))?;
+    let excerpt =
+        text_at(node, "/source").ok_or_else(|| format!("{at}.source: must be a string"))?;
+    node_head_states(item, node, excerpt, (at, &format!("{at}.source")))?;
     let range = format!(
         "{}..{}",
         node.pointer("/range/start")
@@ -885,11 +885,6 @@ fn node_entry(
             item.plain(2)
         )
     })?;
-    if let Some(symbol) = text_at(node, "/symbol") {
-        require(item.has_line(symbol), &format!("{at}.symbol"), || {
-            format!("no line equals the symbol `{symbol}`")
-        })?;
-    }
     regions_states(item, node, at)
 }
 
@@ -957,29 +952,71 @@ fn regions_states(item: &Item<'_>, node: &Value, at: &str) -> Result<(), String>
     })
 }
 
-/// Checks that the items section ends with the innermost excerpt, after one blank line.
+/// Checks the `node_cursor CURSOR` line that opens the sections after the items when the answer
+/// carries a cursor, and returns the sections after it.
+fn cursor_states<'text, 'sections>(
+    sections: &'sections [Section<'text>],
+    cursor: Option<&Value>,
+) -> Result<&'sections [Section<'text>], String> {
+    let Some(cursor) = cursor else {
+        return Ok(sections);
+    };
+    let cursor = cursor.as_str().ok_or("$.node_cursor: must be a string")?;
+    match sections.split_first() {
+        Some((first, rest))
+            if first.title == format!("node_cursor {cursor}") && first.entries.is_empty() =>
+        {
+            Ok(rest)
+        }
+        _ => Err("$.node_cursor: the text must state the cursor after the items".to_owned()),
+    }
+}
+
+/// The nodes whose source the text writes: each node no earlier node of the same unit
+/// encloses.
+fn written_nodes(nodes: &[Value]) -> Vec<(usize, &Value)> {
+    fn span(node: &Value) -> (Option<&str>, Option<u64>, Option<u64>) {
+        let number = |name: &str| {
+            node.pointer(&format!("/range/{name}"))
+                .and_then(Value::as_u64)
+        };
+        (text_at(node, "/unit"), number("start"), number("end"))
+    }
+    let mut outermost: Vec<(usize, &Value)> = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let (unit, start, end) = span(node);
+        let enclosed = outermost.iter().any(|(_, outer)| {
+            let (outer_unit, outer_start, outer_end) = span(outer);
+            outer_unit == unit && outer_start <= start && end <= outer_end
+        });
+        if !enclosed {
+            outermost.push((index, node));
+        }
+    }
+    outermost
+}
+
+/// Checks that the items section ends with the written sources, each after one blank line.
 ///
-/// The innermost node is the last. Its lines carry the item indent. An answer without nodes
-/// has no excerpt.
-fn innermost_ends_section(
-    entries: &[&str],
-    structured: &Value,
-    count: usize,
-) -> Result<(), String> {
-    let Some(last) = count.checked_sub(1) else {
+/// The sources carry the item indent. An answer without nodes writes no source.
+fn written_sources_end_section(entries: &[&str], nodes: &[Value]) -> Result<(), String> {
+    let levels = item_indent(nodes.len() > 1);
+    let written = written_nodes(nodes);
+    let Some((last, _)) = written.last() else {
         return Ok(());
     };
-    let at = format!("$.source[{last}]");
-    let excerpt = structured
-        .pointer(&format!("/source/{last}"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{at}: must be a string"))?;
-    let levels = item_indent(count > 1);
-    let mut expected = vec![String::new()];
-    expected.extend(indented_lines(excerpt, levels));
+    let at = format!("$.nodes[{last}].source");
+    let mut expected = Vec::new();
+    for (index, node) in &written {
+        let source = text_at(node, "/source")
+            .ok_or_else(|| format!("$.nodes[{index}].source: must be a string"))?;
+        expected.push(String::new());
+        expected.extend(indented_lines(source, levels));
+    }
     require(ends_with_lines(entries, &expected), &at, || {
         format!(
-            "the items section must end with a blank line and the excerpt indented by {levels} levels"
+            "the items section must end with each written source after a blank line, indented by \
+             {levels} levels"
         )
     })
 }
@@ -2242,11 +2279,12 @@ mod tests {
         json!({
             "nodes": [
                 {
+                    "declaration": 0,
                     "index": 0,
-                    "symbol": "rift://symbol/rust/a.rs/A",
                     "kind": "function_item",
                     "facets": ["declaration", "test", "generated"],
                     "range": { "start": 0, "end": 20 },
+                    "source": "fn a() {\n    b\n}\n// tail",
                     "regions": [
                         { "role": "name", "range": { "start": 3, "end": 4 } },
                         { "role": "body", "range": { "start": 8, "end": 20 } }
@@ -2255,10 +2293,10 @@ mod tests {
                 {
                     "index": 1,
                     "kind": "identifier",
-                    "range": { "start": 3, "end": 9 }
+                    "range": { "start": 21, "end": 29 },
+                    "source": "a\n\nb"
                 }
             ],
-            "source": ["fn a() {\n    b\n}\n// tail", "a\n\nb"],
             "warnings": [{ "code": "stale_index", "detail": "index lags" }]
         })
     }
@@ -2268,12 +2306,16 @@ mod tests {
 2 nodes
 \t[1] function_item · 4 lines · generated · test
 \t\t0..20
-\t\tindex 0
-\t\trift://symbol/rust/a.rs/A
+\t\tdeclaration 0 · index 0
 \t\tname 3..4 · body 8..20
 \t[2] identifier · 3 lines
-\t\t3..9
+\t\t21..29
 \t\tindex 1
+
+\t\tfn a() {
+\t\t    b
+\t\t}
+\t\t// tail
 
 \t\ta
 
@@ -2304,9 +2346,9 @@ mod tests {
             "nodes": [{
                 "index": 1,
                 "kind": "identifier",
-                "range": { "start": 3, "end": 9 }
-            }],
-            "source": ["name"]
+                "range": { "start": 3, "end": 9 },
+                "source": "name"
+            }]
         });
         let text = "1 node\n\tidentifier\n\t3..9\n\tindex 1\n\n\tname\n";
         assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
@@ -2316,7 +2358,7 @@ mod tests {
 
     #[test]
     fn an_empty_nodes_answer_needs_only_its_header() {
-        let answer = json!({ "nodes": [], "source": [] });
+        let answer = json!({ "nodes": [] });
         assert_eq!(text_states(Tool::Nodes, "0 nodes\n", &answer), Ok(()));
         assert!(text_states(Tool::Nodes, "1 node\n", &answer).is_err());
     }
@@ -2333,18 +2375,21 @@ mod tests {
         nodes_refusal("\t\t0..20\n", "\t\t0..21\n", "$.nodes[0].range")?;
         nodes_refusal("index 0\n", "index 2\n", "$.nodes[0].index")?;
         nodes_refusal("[2] identifier", "[2] function_item", "$.nodes[1]")?;
-        nodes_refusal("\t\t3..9\n", "", "$.nodes[1].range")?;
+        nodes_refusal("\t\t21..29\n", "", "$.nodes[1].range")?;
         nodes_refusal("index 1\n", "index 2\n", "$.nodes[1].index")?;
-        nodes_refusal("\t\trift://symbol/rust/a.rs/A\n", "", "$.nodes[0].symbol")?;
         nodes_refusal("\t\tname 3..4 · body 8..20\n", "", "$.nodes[0].regions")?;
         nodes_refusal("name 3..4", "name 3..5", "$.nodes[0].regions")
     }
 
     #[test]
     fn the_line_count_and_the_facets_appear_exactly_when_they_hold() -> Result<(), String> {
-        nodes_refusal(" · 4 lines", "", "$.source[0]")?;
-        nodes_refusal(" · 3 lines", "", "$.source[1]")?;
-        nodes_refusal("function_item · 4 lines", "function_item", "$.source[0]")?;
+        nodes_refusal(" · 4 lines", "", "$.nodes[0].source")?;
+        nodes_refusal(" · 3 lines", "", "$.nodes[1].source")?;
+        nodes_refusal(
+            "function_item · 4 lines",
+            "function_item",
+            "$.nodes[0].source",
+        )?;
         nodes_refusal(" · generated", "", "$.nodes[0].facets")?;
         nodes_refusal(" · test", "", "$.nodes[0].facets")?;
         let answer = with(nodes_answer(), "/nodes/1/kind", json!("block"))?;
@@ -2356,20 +2401,62 @@ mod tests {
             "[2] identifier · 2 lines",
         )?;
         let failure = refused(Tool::Nodes, &spurious, &nodes_answer())?;
-        assert!(failure.contains("$.source[1]"), "{failure}");
+        assert!(failure.contains("$.nodes[1].source"), "{failure}");
         Ok(())
     }
 
     #[test]
-    fn only_the_innermost_excerpt_ends_the_text_and_outer_excerpts_are_not_checked()
-    -> Result<(), String> {
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.source[1]")?;
-        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.source[1]")?;
+    fn each_outermost_source_ends_the_text_after_a_blank_line() -> Result<(), String> {
+        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\tc\n", "$.nodes[1].source")?;
+        nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\n\t\t b\n", "$.nodes[1].source")?;
         nodes_refusal("\t\ta\n\n\t\tb\n", "\t\ta\n\nb\n", "$.warnings")?;
-        let blank = edited(NODES_TEXT, "index 1\n\n\t\ta", "index 1\n\t\ta")?;
+        let blank = edited(NODES_TEXT, "// tail\n\n\t\ta", "// tail\n\t\ta")?;
         let failure = refused(Tool::Nodes, &blank, &nodes_answer())?;
-        assert!(failure.contains("$.source[1]"), "{failure}");
+        assert!(failure.contains("$.nodes[1].source"), "{failure}");
         Ok(())
+    }
+
+    #[test]
+    fn a_symbol_answer_writes_each_outermost_source_then_its_cursor() {
+        let answer = json!({
+            "symbol": "rift://symbol/rust/a.rs/A",
+            "nodes": [
+                {
+                    "declaration": 0,
+                    "index": 0,
+                    "unit": "rift://file/a.rs",
+                    "kind": "function_item",
+                    "range": { "start": 0, "end": 9 },
+                    "source": "fn a() {}"
+                },
+                {
+                    "declaration": 0,
+                    "index": 2,
+                    "parent": 0,
+                    "unit": "rift://file/a.rs",
+                    "kind": "identifier",
+                    "range": { "start": 3, "end": 4 },
+                    "source": "a"
+                },
+                {
+                    "declaration": 1,
+                    "index": 0,
+                    "unit": "rift://file/b.rs",
+                    "kind": "function_item",
+                    "range": { "start": 0, "end": 9 },
+                    "source": "fn a() {}"
+                }
+            ],
+            "node_cursor": "3.0123456789abcdef"
+        });
+        let text = "3 nodes · rift://symbol/rust/a.rs/A\n\t[1] function_item\n\t\t0..9\n\t\tdeclaration 0 · index 0\n\t[2] identifier\n\t\t3..4\n\t\tdeclaration 0 · index 2 · parent 0\n\t[3] function_item\n\t\t0..9\n\t\tdeclaration 1 · index 0\n\n\t\tfn a() {}\n\n\t\tfn a() {}\nnode_cursor 3.0123456789abcdef\n";
+        assert_eq!(text_states(Tool::Nodes, text, &answer), Ok(()));
+        let one_source = text.replace("\n\n\t\tfn a() {}\nnode_cursor", "\nnode_cursor");
+        assert!(text_states(Tool::Nodes, &one_source, &answer).is_err());
+        let without_cursor = text.replace("node_cursor 3.0123456789abcdef\n", "");
+        let failure = text_states(Tool::Nodes, &without_cursor, &answer)
+            .expect_err("the cursor line is required");
+        assert!(failure.contains("$.node_cursor"), "{failure}");
     }
 
     #[test]

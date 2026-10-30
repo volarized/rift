@@ -230,6 +230,41 @@ def number(value: object, context: str) -> int:
     return value
 
 
+def unit_path(node: JsonObject) -> str | None:
+    """The project path a node's file `unit` names, its percent escapes decoded."""
+    unit = node.get("unit")
+    if not isinstance(unit, str) or not unit.startswith(FILE_PREFIX):
+        return None
+    return unquote(unit.removeprefix(FILE_PREFIX), errors="strict")
+
+
+def lists_position(
+    answer: JsonObject, nodes: list[JsonObject], unit: str, position: int
+) -> bool:
+    """Whether `nodes`, a position read's first page, hold every node its check reads.
+
+    A unit answer lists one file's nodes in preorder, so their starts never decrease: a
+    listed node starting past `position` means no later page covers it. A symbol answer
+    lists each declaration from its item node, so the item covering `position` in the
+    file at project path `unit` is the one item node the raw declaration check reads.
+    """
+
+    def span(node: JsonObject) -> tuple[int, int]:
+        bounds = object_value(node.get("range"), "node range")
+        return number(bounds.get("start"), "node start"), number(
+            bounds.get("end"), "node end"
+        )
+
+    if answer.get("symbol") is None:
+        return span(nodes[-1])[0] > position
+    return any(
+        node.get("index") == 0
+        and unit_path(node) == unit
+        and span(node)[0] <= position < span(node)[1]
+        for node in nodes
+    )
+
+
 def warnings(answer: JsonObject) -> list[JsonObject]:
     values = array_value(answer.get("warnings", []), "warnings")
     found = [object_value(value, "warning") for value in values]
@@ -592,20 +627,22 @@ def churn_answer(
     """Require one probe declaration with source from a complete authored revision."""
     warnings(answer)
     if tool == "nodes":
-        nodes = array_value(answer.get("nodes"), "probe nodes")
-        excerpts = array_value(answer.get("source"), "probe node sources")
-        require(len(nodes) == len(excerpts), "nodes lost matching source excerpts")
-        # Every node of the probe's declaration names its symbol; the item node, index 0,
-        # spans the whole declaration.
-        matches = [
-            (object_value(node, "probe node"), excerpt)
-            for node, excerpt in zip(nodes, excerpts, strict=True)
-            if object_value(node, "probe node").get("symbol") == identity
-            and object_value(node, "probe node").get("index") == 0
+        nodes = [
+            object_value(node, "probe node")
+            for node in array_value(answer.get("nodes"), "probe nodes")
         ]
-        require(len(matches) == 1, "nodes lost probe declaration")
-        hit, excerpt = matches[0]
-        found = string_value(hit.get("symbol"), "probe identity")
+        matches = [
+            node
+            for node in nodes
+            if node.get("index") == 0 and node.get("declaration") is not None
+        ]
+        require(
+            answer.get("symbol") is not None and len(matches) == 1,
+            "nodes lost probe declaration",
+        )
+        hit = matches[0]
+        excerpt = hit.get("source")
+        found = string_value(answer.get("symbol"), "probe identity")
     elif tool == "get_symbol":
         require(answer.get("outcome") == "found", "get_symbol lost probe declaration")
         symbol = object_value(answer.get("symbol"), "probe symbol")

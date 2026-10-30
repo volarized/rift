@@ -444,6 +444,7 @@ impl RiftProxy {
         let traversal = arguments.get("traversal");
         let identity_owner = arguments
             .get("id")
+            .or_else(|| arguments.get("symbol"))
             .and_then(serde_json::Value::as_str)
             .or_else(|| {
                 traversal
@@ -3910,7 +3911,7 @@ mod tests {
         );
         assert_eq!(
             context.get("violation").map(String::as_str),
-            Some("search response has no structured result")
+            Some("project response has no structured result")
         );
         assert_eq!(proxy.upstream.lock().await.generation_next, 0);
         upstream.cancel().await?;
@@ -3942,6 +3943,51 @@ mod tests {
             &configuration.server,
             extra,
         ))
+    }
+
+    #[tokio::test]
+    async fn a_nodes_symbol_selects_its_owner_backend_and_dispatches_a_local_identity() -> TestResult
+    {
+        let primary = tempfile::tempdir()?;
+        let extra = tempfile::tempdir()?;
+        let proxy = extra_profile_proxy(primary.path(), extra.path())?;
+        let id = "rift://symbol/local@cloud:docs/rust/app/beacon";
+        let request = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
+            json!({"symbol": id, "node_cursor": "2.ab"}),
+        )?);
+
+        let backend = proxy.call_backend(&request)?;
+        let upstream = super::candidates::dispatch_read_request(&request, "cloud:docs")?;
+
+        assert_eq!(
+            backend.root.as_ref(),
+            extra.path().join("docs").canonicalize()?.as_path()
+        );
+        let arguments = upstream.arguments.ok_or("dispatched arguments")?;
+        assert_eq!(
+            arguments.get("symbol"),
+            Some(&json!("rift://symbol/local/rust/app/beacon"))
+        );
+        assert_eq!(arguments.get("node_cursor"), Some(&json!("2.ab")));
+        let primary_request = CallToolRequestParams::new("nodes").with_arguments(
+            serde_json::from_value(json!({"symbol": "rift://symbol/local/rust/app/beacon"}))?,
+        );
+        assert!(std::ptr::eq(
+            proxy.call_backend(&primary_request)?,
+            &raw const proxy
+        ));
+        let position = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
+            json!({"path": "lib.rs", "position": 0}),
+        )?);
+        assert!(proxy.captured_read(&position).await?.is_none());
+        assert!(proxy.captured_read(&primary_request).await?.is_none());
+        let malformed = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
+            json!({"symbol": id, "position": "zero"}),
+        )?);
+        let error = super::candidates::dispatch_read_request(&malformed, "cloud:docs")
+            .expect_err("arguments outside the nodes form refuse");
+        assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
+        Ok(())
     }
 
     #[tokio::test]

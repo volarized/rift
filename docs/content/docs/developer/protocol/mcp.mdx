@@ -800,8 +800,32 @@ selection failures. A malformed identity is refused before lookup:
 
 <McpTool name="nodes" />
 
-A visible path no syntax provider parses - `justfile`, `.gitignore` - refuses
-`capability_unavailable`, naming the extension, or stating that the path carries none.
+A request selects its nodes through exactly one of `symbol` or `path` with `position`; the server
+**MUST** refuse any other combination with `invalid_request`.
+
+A `symbol` read answers every node of the symbol: per declaration, in the order
+[`get_symbol`](#tool-get_symbol) lists its declarations, the item node, which spans the
+declaration without its attached documentation, then each node of its item subtree in
+pre-order that no declaration nested in it holds. The answer names the symbol in `symbol`, and
+the item node's `source` is the declaration's source. A symbol with no declaration in the index refuses
+`resource_not_found`. The server serves the symbols of the workspace and its accepted extra
+projects; a package or runtime symbol refuses `capability_unavailable`.
+
+One answer holds at most `results_max` nodes and 1 MiB of node source, and at least one node.
+When nodes remain, the answer carries `node_cursor`; the caller **MUST** send it back with the
+same selector to read the next page. A cursor binds the answer's symbol or unit and the tree
+revision the read served, so the server refuses it with `invalid_request` for another symbol or
+unit or once the tree has moved, and the caller restarts the read without it.
+
+A `position` read answers the nodes of the innermost declaration holding one byte: every node of
+that declaration's symbol, as a `symbol` read answers them. A byte no declaration holds answers
+the nodes of the file's unit instead: the file node, then every node no declaration holds, with
+no `symbol`. Every file has a file node: kind `file`, spanning the whole file, with the file's
+source. A visible text
+file no syntax provider parses - `justfile`, `notes.txt` - answers its file node alone, in the
+language `text`. A path the index holds no text for, such as a lockfile, refuses
+`capability_unavailable`, naming the extension or stating that the path carries none, and a file
+a syntax bound left out refuses `content_unavailable`.
 
 During local preparation, the server **MAY** prepare the requested path within the remaining
 [`readiness_timeout`](/docs/developer/configuration#server) budget. An answer for a path outside
@@ -809,20 +833,22 @@ the published prepared files carries [`local_index_preparing`](#reads), includin
 is returned; this read does not advance published progress. Exhausted preparation returns empty
 nodes with that warning.
 
-The first entry of `nodes` is the file's outermost node, and its `source` excerpt carries the
-file's source. A declaration's source is read through the `source` member of its
-[`get_symbol`](#tool-get_symbol) declarations.
-
 A node carries no identity. The server **MUST** address each node by its place: a node inside a
-declaration's item subtree carries `symbol`, the `declaration` ordinal among that symbol's
-declarations, and its pre-order `index` from the item node at 0; a node outside every declaration
-carries its `index` in the `unit` alone, from the unit's file node at 0, so the file's root is
-1. Nodes of a nested declaration
-count toward the nested symbol. `parent` names the `index` of the enclosing node in the same
-declaration or unit, and is absent for node 0. An address names a place at the read's revision,
-so an edit renumbers the nodes after it.
+declaration's item subtree carries the `declaration` ordinal among the declarations of the
+answer's `symbol` and its pre-order `index` from the item node at 0; a node outside every
+declaration carries its `index` in its `unit` alone, from the unit's file node at 0. Nodes of a
+nested declaration count toward the nested symbol.
 
-This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
+`parent` names the `index` of the enclosing node in the same declaration or unit, and is absent
+for a declaration's item node and for the file node. An address names a place at the read's
+revision, so an edit renumbers the nodes after it.
+
+This call lists the nodes of the `Config` struct:
+
+<ReadExample name="symbol-nodes" />
+
+This call reads byte 338 of `src/config.rs`, inside the `parse_config` call, and lists the nodes
+of `load_config`, the declaration holding it:
 
 <ReadExample name="local-nodes" />
 
@@ -834,7 +860,7 @@ Callers read code through these tools:
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
-| [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
+| [`nodes`](#tool-nodes) | the syntax nodes of one symbol, or of the declaration holding one position, with their source |
 
 [Result content](#result-content) defines the representations a tool result carries and the proxy output selection that chooses them.
 
@@ -1127,15 +1153,14 @@ alternatives below `closest matches:` when alternatives exist;
 an unavailable result writes its typed reason and requested identity. A captured selection ends
 with `view ID · expires TIMESTAMP`, followed by warnings when present.
 
-A `nodes` result lists the nodes from the outermost to the innermost. Each node has these lines:
+A `nodes` result lists its nodes outermost first. Each node has these lines:
 
-- the `kind`, then ` · N lines` when its excerpt holds more than one line, then `generated` and `test` when the node has those facets
+- the `kind`, then ` · N lines` when its source holds more than one line, then `generated` and `test` when the node has those facets
 - the byte range as `START..END`
 - the address as `declaration D · index I · parent P`, each part present when the node carries it
-- the symbol identity, when the node has one
 - the regions as `role START..END`, joined by ` · `, when the node has regions
 
-After the last node, the server writes a blank line and the excerpt of the innermost node, indented like the further lines of an item, last in the items section. Each outer excerpt contains the inner ones, so `structuredContent` carries the excerpt of every node in `source`.
+After the last node, the server writes sources, each after a blank line and indented like the further lines of an item, last in the items section. When the first node declares a symbol, as in a `symbol` read, the server writes the source of each node no earlier node encloses, one per declaration; otherwise it writes the source of the innermost node. An outer node's source contains the inner ones, so the text writes each byte once, and `structuredContent` carries the `source` of every node. A `node_cursor` follows on its own line as `node_cursor CURSOR`.
 
 The server **MUST NOT** write a fact in its normal state. The absence of a fact therefore states the normal state, such as a project declaration that is authored, current, not deprecated, and not a test. The exceptional facts are:
 

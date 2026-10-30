@@ -17,6 +17,8 @@ use crate::server::candidates::{
 use super::RiftProxy;
 
 mod read;
+#[cfg(test)]
+pub(in crate::proxy) use read::dispatch_read_request;
 mod reservation;
 
 #[derive(Debug)]
