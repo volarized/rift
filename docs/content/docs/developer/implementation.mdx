@@ -1554,6 +1554,43 @@ The analyzer manifest is generated beside the served schemas and committed at
 that ships without a regenerated manifest fails `just generate-check`. The publication's own schema is
 exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.schema.json).
 
+### External producer facts
+
+<VersionBadge version="v0.0.73" />
+
+The shipped syntax providers see one file at a time, so the relationships package analysis
+finds stop where a language's own resolution would go further. An external producer - an
+extraction program outside Rift that reads one language's source - can add its relationships
+and occurrences to the same `PackagePublication`, and `format_revision` 5 carries them:
+
+- `producer` on a relationship or an occurrence names the program that emitted it: a `name`
+  such as `demo-indexer` and a `revision` such as `0.6.1`. A fact without `producer` came from
+  package analysis itself.
+- `occurrences` lists the places a unit's source names a symbol, each with its `symbol`,
+  `unit`, and byte `range`.
+- `facts` on each `coverage` entry lists the fact kinds produced for that language,
+  `relationships` or `occurrences`, each with its producer. A covered kind with no facts means
+  its producer found none; a kind no entry names was not produced.
+
+Package analysis covers `relationships` for every language it analyzes and no `occurrences`.
+`PackagePublication::validate_facts` refuses a fact whose language, kind, and producer no
+coverage entry names, and an occurrence outside the units the publication carries. A
+relationship keeps its `producer` wherever it is served, and a search traversal writes it
+after the hop: `↳ called · demo-indexer 0.6.1`.
+
+A producer's output enters a publication through `rift_index::accept_producer_facts`, which
+takes one `ProducerFacts` value: the producer, the language, the kinds it covered, and its
+relationships and occurrences. Producers address source by unit and byte range, the way
+their own tools do, and the importer resolves each range with `PublicationNodes::node_at`.
+That call parses the unit's retained source with the shipped provider and answers the node
+address [`nodes`](/docs/mcp#tool-nodes) uses: a declaration of a symbol, counted in publication
+order, and a node index inside it, or a node index of the unit.
+
+A relationship that names only its `occurrence` starts at the symbol whose declaration
+encloses that range. A range that resolves to no node - outside its unit, in a unit the
+publication does not carry, or past a source the analyzer cut - is refused with
+`producer_range_unresolved`.
+
 ## Language engines
 
 The `rift-lsp` crate owns LSP sessions. A session opens source documents, requests references

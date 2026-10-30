@@ -33,8 +33,10 @@
 //! An outgoing hop writes each facet of its relationship as it is spelled on the wire, with
 //! underscores as spaces (`calls`, `depends on`). An incoming hop writes the facet read from the
 //! other end (`called by`, `dependency of`). Several facets are joined by `, `, and a
-//! relationship whose derivation is `heuristic` starts with `probably`. When every facet ends in
-//! `by`, the head line leaves that word out and the declaration line starts with it.
+//! relationship whose derivation is `heuristic` starts with `probably`. A relationship an external
+//! producer emitted ends with ` · ` and the producer's name and revision (`↳ called ·
+//! demo-indexer 0.6.1`). When every facet ends in `by`, the head line leaves that word out and the
+//! declaration line starts with it.
 
 use rift_protocol::read::{Relationship, RelationshipDerivation, RelationshipFacet, SymbolId};
 use rift_protocol::search::{GraphHop, HopDirection, SearchHit};
@@ -56,6 +58,8 @@ const PLACE: &str = "in";
 const IDENTITY: &str = "at";
 /// Word written before the relationship of a heuristic hop.
 const HEURISTIC: &str = "probably ";
+/// Separates a relationship from the external producer that emitted it.
+const PRODUCER_SEPARATOR: &str = " · ";
 /// Text between two facets of one relationship.
 const FACET_SEPARATOR: &str = ", ";
 
@@ -305,6 +309,7 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         occurrence: _,
         derivation,
         confidence: _,
+        producer,
         extensions: _,
     } = relationship;
     let mut phrases = Vec::with_capacity(facets.len());
@@ -327,8 +332,16 @@ fn lead_of(hop: &GraphHop) -> Result<Lead, TextError> {
         Some(cut) if !cut.is_empty() => (cut.join(FACET_SEPARATOR), true),
         Some(_) | None => (phrases.join(FACET_SEPARATOR), false),
     };
+    let produced = producer.as_ref().map_or_else(String::new, |producer| {
+        format!(
+            "{PRODUCER_SEPARATOR}{} {}",
+            producer.name, producer.revision
+        )
+    });
     Ok(Lead {
-        text: format!("{BRANCH} {guess}{words}").trim_end().to_owned(),
+        text: format!("{BRANCH} {guess}{words}{produced}")
+            .trim_end()
+            .to_owned(),
         by,
     })
 }

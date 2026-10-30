@@ -8,6 +8,7 @@ use crate::{
 use rift_core::ProjectPath;
 
 mod aliases;
+mod facts;
 mod graph;
 
 fn publication(
@@ -174,7 +175,7 @@ fn same_module_keeps_implementation_and_stub_bindings_on_one_object() {
         &["click"],
     );
     let id = "rift://symbol/pypi/pypi.org/click/python/click/core/echo";
-    assert_eq!(result.format_revision, 4);
+    assert_eq!(result.format_revision, PACKAGE_PUBLICATION_FORMAT_REVISION);
     assert_eq!(
         result.identity_format,
         rift_protocol::identity::SYMBOL_IDENTITY_FORMAT_REVISION

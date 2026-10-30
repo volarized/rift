@@ -319,6 +319,29 @@ __rift_error_definition!(
 );
 
 __rift_error_definition!(
+    producer_fact_invalid,
+    slug = "rift.analysis.producer_fact_invalid",
+    message = "producer fact does not match the publication: field {field}, violation {violation}",
+    action = "correct the reported field of the producer facts and retry",
+    fields = {
+        field: required(string),
+        violation: required(string),
+    },
+);
+
+__rift_error_definition!(
+    producer_range_unresolved,
+    slug = "rift.analysis.producer_range_unresolved",
+    message = "producer fact range resolves to no node of its source unit: unit {unit}",
+    action = "name a byte range inside a source unit the publication carries and retry",
+    fields = {
+        end: required(unsigned),
+        start: required(unsigned),
+        unit: required(string),
+    },
+);
+
+__rift_error_definition!(
     source_pattern_invalid,
     slug = "rift.analysis.source_pattern_invalid",
     message = "source path pattern is invalid",

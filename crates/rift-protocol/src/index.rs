@@ -22,6 +22,7 @@ pub use artifact::{
 
 use crate::documentation::DocumentationIndex;
 use crate::identity::SymbolOwner;
+use crate::producer::{FactCoverage, FactKind, FactProducer};
 use crate::read::{
     Digest, Language, ProjectPath, Relationship, RelationshipFacet, SourceUnitId, Symbol, SymbolId,
     SymbolOrigin, TextRange,
@@ -36,7 +37,7 @@ use crate::revision::Revision;
 /// It changes only when the publication shape or a record identity changes in a way a
 /// consumer cannot read past: a consumer that meets a higher revision than it knows
 /// refuses the publication rather than reading fields it cannot place.
-pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 4;
+pub const PACKAGE_PUBLICATION_FORMAT_REVISION: u32 = 5;
 
 /// Source units one publication may carry.
 pub const PACKAGE_UNITS_MAX: u32 = 100_000;
@@ -104,8 +105,13 @@ pub struct PackagePublication {
     /// Established source bindings, in symbol, unit and range order.
     #[schemars(length(max = 50_000_000))]
     pub declarations: Vec<PackageSymbol>,
-    /// Normalized relationships, preserving their source occurrences and derivation.
+    /// Normalized relationships, preserving their source occurrences and derivation. A
+    /// relationship an external producer wrote names it in `producer`.
     pub relationships: Vec<Relationship>,
+    /// Places a unit's source names a symbol, in unit, range, and symbol order. Absent when
+    /// no producer covered occurrences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub occurrences: Vec<PackageOccurrence>,
     /// Selected immutable artifact when the caller established its identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<PackageArtifact>,
@@ -138,6 +144,37 @@ pub struct PackageCoverage {
     pub applicability_complete: bool,
     /// Coverage of each relationship facet, independent of identity lookup.
     pub relationships: Vec<RelationshipCoverage>,
+    /// The fact kinds produced for this language, each with its producer. A kind no entry
+    /// names was not produced.
+    pub facts: Vec<FactCoverage>,
+}
+
+impl PackageCoverage {
+    /// Whether `producer` produced facts of `kind` for this language; `None` names the
+    /// built-in analyzer.
+    #[must_use]
+    pub fn covers(&self, kind: FactKind, producer: Option<&FactProducer>) -> bool {
+        self.facts
+            .iter()
+            .any(|fact| fact.kind == kind && fact.producer.as_ref() == producer)
+    }
+}
+
+/// One place a unit's source names a symbol.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageOccurrence {
+    /// The symbol the source names at `range`.
+    pub symbol: SymbolId,
+    /// The unit carrying the occurrence.
+    pub unit: SourceUnitId,
+    /// The occurrence's byte range inside its unit. It resolves to a syntax node of the
+    /// unit.
+    pub range: TextRange,
+    /// The external producer that found the occurrence. Absent when the built-in analyzer
+    /// found it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<FactProducer>,
 }
 
 /// Coverage of one relationship facet within a selected language.
@@ -344,6 +381,8 @@ pub enum PackageAnalysisWarning {
 }
 
 pub(crate) mod warning;
+
+mod facts;
 
 #[cfg(test)]
 mod tests {

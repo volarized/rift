@@ -4764,6 +4764,10 @@
             "minimum": 0,
             "maximum": 1
           },
+          "producer": {
+            "description": "The external producer that emitted the edge, named by a package publication that\ncarries its facts. Absent for an edge Rift's own analysis produced.",
+            "$ref": "#/components/schemas/FactProducer"
+          },
           "extensions": {
             "$ref": "#/components/schemas/Extensions",
             "description": "Edge facts the model has no field for, namespaced by the provider that emitted them.\nAbsent when empty.",
@@ -7989,6 +7993,45 @@
           "The interior of the node without its delimiters.",
           "The doc comment attached to the declaration.",
           "The full extent including what surrounds the node proper."
+        ]
+      },
+      "FactProducer": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "$ref": "#/components/schemas/ProducerName",
+            "description": "The producer's name, stable across its revisions."
+          },
+          "revision": {
+            "$ref": "#/components/schemas/ProducerRevision",
+            "description": "The producer revision that emitted the fact."
+          }
+        },
+        "required": [
+          "name",
+          "revision"
+        ],
+        "description": "The external program that produced a fact, and its revision. A fact without one was\nproduced by Rift's built-in analyzer."
+      },
+      "ProducerName": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64,
+        "pattern": "^[a-z][a-z0-9._-]*$",
+        "description": "Name of one external producer: a lowercase ASCII letter, then lowercase letters, digits, `.`, `_`, or `-`.",
+        "examples": [
+          "demo-indexer"
+        ]
+      },
+      "ProducerRevision": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+        "description": "Revision of one external producer: an ASCII letter or digit, then letters, digits, `.`, `_`, `+`, or `-`.",
+        "examples": [
+          "0.6.1"
         ]
       }
     },

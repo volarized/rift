@@ -2,7 +2,7 @@
 
 use rift_core::SymbolId;
 use rift_protocol::read::FILE_NODE_KIND;
-use rift_syntax::{ByteRange, NodeMatch};
+use rift_syntax::{ByteRange, NodeHolder, NodeMatch, NodePlace, SyntaxDocument};
 
 /// Where one node sits: inside a declaration of a symbol, or inside its unit.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +37,38 @@ pub struct LocatedNode {
 }
 
 impl LocatedNode {
+    /// The node at `range` of `document`: the innermost node spanning it exactly, or under
+    /// [`NodeMatch::Enclosing`] the innermost one containing it, and the file node of
+    /// `source` when no grammar node answers.
+    ///
+    /// `declarations` holds, for each of the document's declarations in its symbol order,
+    /// the symbol it binds and its ordinal among that symbol's declarations; `None` for a
+    /// declaration without an established identity, whose nodes its holder keeps. The
+    /// work is linear in the document's nodes.
+    #[must_use]
+    pub fn in_document(
+        document: &SyntaxDocument,
+        source: &str,
+        declarations: &[Option<(SymbolId, usize)>],
+        range: ByteRange,
+        matching: NodeMatch,
+    ) -> Option<Self> {
+        let places = document
+            .node_places(|position, _| declarations.get(position).is_some_and(Option::is_some));
+        let located = document.node_at(range, matching).and_then(|node| {
+            let position = document
+                .nodes()
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, node))?;
+            Some(Self {
+                address: NodeAddress::of(places[position], declarations),
+                kind: node.kind,
+                range: node.range,
+            })
+        });
+        located.or_else(|| Self::file(source, range, matching))
+    }
+
     /// The file node of `source`, when it answers `range` under `matching`: it spans the
     /// whole unit, so it matches exactly that span or, enclosing, any range inside it. It is
     /// node 0 of the unit.
@@ -52,6 +84,26 @@ impl LocatedNode {
             kind: FILE_NODE_KIND,
             range: whole,
         })
+    }
+}
+
+impl NodeAddress {
+    /// The address `place` names, given the address of each declaration of its file.
+    fn of(place: NodePlace, declarations: &[Option<(SymbolId, usize)>]) -> Self {
+        let held = match place.holder {
+            NodeHolder::Declaration(position) => {
+                declarations.get(position).and_then(Option::as_ref)
+            }
+            NodeHolder::Unit => None,
+        };
+        match held {
+            Some((symbol, declaration)) => Self::Declaration {
+                symbol: symbol.clone(),
+                declaration: *declaration,
+                index: place.index,
+            },
+            None => Self::Unit { index: place.index },
+        }
     }
 }
 
