@@ -1559,9 +1559,10 @@ exported to [`package-index.schema.json`](https://volar.sh/rift/package-index.sc
 <VersionBadge version="v0.0.73" />
 
 The shipped syntax providers see one file at a time, so the relationships package analysis
-finds stop where a language's own resolution would go further. An external producer - an
-extraction program outside Rift that reads one language's source - can add its relationships
-and occurrences to the same `PackagePublication`, and `format_revision` 5 carries them:
+finds stop where a language's own resolution would go further. An external producer - a
+program or script outside Rift, for one language - reads a package's source and writes facts
+Rift imports into the same `PackagePublication`. Rift neither runs nor ships producers, and
+`format_revision` 5 carries what they write:
 
 - `producer` on a relationship or an occurrence names the program that emitted it: a `name`
   such as `demo-indexer` and a `revision` such as `0.6.1`. A fact without `producer` came from
@@ -1569,27 +1570,108 @@ and occurrences to the same `PackagePublication`, and `format_revision` 5 carrie
 - `occurrences` lists the places a unit's source names a symbol, each with its `symbol`,
   `unit`, and byte `range`.
 - `facts` on each `coverage` entry lists the fact kinds produced for that language,
-  `relationships` or `occurrences`, each with its producer. A covered kind with no facts means
-  its producer found none; a kind no entry names was not produced.
+  `relationships` or `occurrences`, each with its producer. An entry states who emitted facts
+  of a kind and makes no claim that they are complete; a kind no entry names was not produced.
 
 Package analysis covers `relationships` for every language it analyzes and no `occurrences`.
+Whether a facet's relationships are complete is stated by `coverage[].relationships` alone,
+which package analysis writes and an import leaves unchanged.
+
 `PackagePublication::validate_facts` refuses a fact whose language, kind, and producer no
 coverage entry names, and an occurrence outside the units the publication carries. A
 relationship keeps its `producer` wherever it is served, and a search traversal writes it
 after the hop: `↳ called · demo-indexer 0.6.1`.
 
-A producer's output enters a publication through `rift_index::accept_producer_facts`, which
-takes one `ProducerFacts` value: the producer, the language, the kinds it covered, and its
-relationships and occurrences. Producers address source by unit and byte range, the way
-their own tools do, and the importer resolves each range with `PublicationNodes::node_at`.
-That call parses the unit's retained source with the shipped provider and answers the node
-address [`nodes`](/docs/mcp#tool-nodes) uses: a declaration of a symbol, counted in publication
-order, and a node index inside it, or a node index of the unit.
+#### Producer input and output
+
+A producer reads the package source tree whose bytes the publication retained, and analyzes
+the publication's `units` of its language. Every range it writes is a UTF-8 byte offset into
+those exact bytes, so a producer whose own tools count positions in another encoding converts
+them before writing. Its output is one `ProducerFacts` JSON value per language:
+
+```json
+{
+  "format": 1,
+  "producer": { "name": "demo-indexer", "revision": "0.6.1" },
+  "language": "python",
+  "kinds": ["relationships", "occurrences"],
+  "relationships": [
+    {
+      "kind": "call",
+      "facets": ["calls"],
+      "to": "rift://symbol/pypi/pypi.org/demo/python/demo/core/echo",
+      "occurrence": {
+        "unit": "rift://source/pypi/pypi.org/demo/demo/core.py",
+        "range": { "start": 64, "end": 68 }
+      },
+      "derivation": "resolution",
+      "extensions": {
+        "dev.demo-indexer.precision": { "version": 1, "data": { "class": "compiler binding" } }
+      }
+    }
+  ],
+  "occurrences": [
+    {
+      "symbol": "rift://symbol/pypi/pypi.org/demo/python/demo/core/echo",
+      "unit": "rift://source/pypi/pypi.org/demo/demo/core.py",
+      "range": { "start": 4, "end": 8 }
+    }
+  ]
+}
+```
+
+- `format` is the input format the producer wrote. The importer accepts
+  `PRODUCER_FACTS_FORMAT_REVISION`, which is `1`, and refuses any other value.
+- `kinds` names the fact kinds the producer emitted for `language`; a kind may carry no fact.
+- A relationship names its `from` symbol, or only its `occurrence`, and its `derivation`. A
+  `heuristic` edge may carry a `confidence` from 0 to 1.
+- `extensions` carries edge evidence the model has no field for, under reverse-domain keys:
+  a producer's own observation id, or a precision class such as `compiler binding`. Rift
+  carries the values to the stored edge and never interprets them.
+
+#### Import
+
+A producer's output enters a publication through `rift_index::accept_producer_facts`. Producers
+address source by unit and byte range, the way their own tools do, and the importer resolves
+each range with `PublicationNodes::node_at`. That call parses the unit's retained source with
+the shipped provider and answers the node address [`nodes`](/docs/mcp#tool-nodes) uses: a
+declaration of a symbol, counted in publication order, and a node index inside it, or a node
+index of the unit.
 
 A relationship that names only its `occurrence` starts at the symbol whose declaration
-encloses that range. A range that resolves to no node - outside its unit, in a unit the
-publication does not carry, or past a source the analyzer cut - is refused with
-`producer_range_unresolved`.
+encloses that range. The importer refuses with `producer_fact_invalid`, naming the field:
+
+- a `format` other than `PRODUCER_FACTS_FORMAT_REVISION`
+- a language the publication has no coverage for
+- a kind the same producer already covers
+- a fact of a kind `kinds` does not name
+- more than `PRODUCER_FACTS_MAX` facts in one call
+- a relationship naming neither `from` nor `occurrence`, or only an `occurrence` outside every
+  declaration
+
+A range that resolves to no node - outside its unit, in a unit the publication does not carry,
+or past a source the analyzer cut - is refused with `producer_range_unresolved`.
+
+Imported relationships follow the built-in ones, sorted by `from`, `to`, `kind`, occurrence,
+`derivation`, `facets`, and `confidence`, and occurrences stay in unit, range, and symbol order.
+Two runs of one producer that find the same facts in another order give byte-identical
+publications, unless two of its edges differ in their `extensions` alone.
+
+`PublicationNodes` numbers nodes with the plain language provider, without framework context.
+A framework-aware read can number the nodes of a framework-enriched unit differently.
+
+#### Extractors
+
+An extractor is the Rust side of a producer: an implementation of the `rift_index::FactExtractor`
+trait for one language-specific program. It names its `producer` and `language` up front, and
+its `extract` method takes an `ExtractionInput`, the publication with its units of that
+language, and answers `ProducerFacts` or the program's own refusal.
+
+Rift defines the contract and ships no extractor; implementations live outside this
+repository. `rift_index::accept_extracted_facts` runs one extractor over a publication and
+imports its output with `accept_producer_facts`. It refuses before the extractor runs when the
+publication has no coverage for its language, and refuses an output naming another producer or
+language with `producer_fact_invalid` and the violation `mismatch`.
 
 ## Language engines
 
