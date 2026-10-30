@@ -640,18 +640,19 @@
       "path": "src/config.rs",
       "position": 338
     },
-    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\t0..356\n\t\tindex 0\n\t[2] function_item \u00b7 4 lines\n\t\t218..355\n\t\tdeclaration 0 \u00b7 index 0\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\t281..355\n\t\tdeclaration 0 \u00b7 index 13 \u00b7 parent 0\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[4] call_expression\n\t\t334..353\n\t\tdeclaration 0 \u00b7 index 25 \u00b7 parent 13\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[5] identifier\n\t\t334..346\n\t\tdeclaration 0 \u00b7 index 26 \u00b7 parent 25\n\t\trift://symbol/local/rust/example_project/config/load_config\n\n\t\tparse_config\n",
+    "text": "5 nodes\n\t[1] source_file \u00b7 14 lines\n\t\t0..356\n\t\tindex 1 \u00b7 parent 0\n\t[2] function_item \u00b7 4 lines\n\t\t218..355\n\t\tdeclaration 0 \u00b7 index 0\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[3] block \u00b7 4 lines\n\t\t281..355\n\t\tdeclaration 0 \u00b7 index 13 \u00b7 parent 0\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[4] call_expression\n\t\t334..353\n\t\tdeclaration 0 \u00b7 index 25 \u00b7 parent 13\n\t\trift://symbol/local/rust/example_project/config/load_config\n\t[5] identifier\n\t\t334..346\n\t\tdeclaration 0 \u00b7 index 26 \u00b7 parent 25\n\t\trift://symbol/local/rust/example_project/config/load_config\n\n\t\tparse_config\n",
     "json": {
       "nodes": [
         {
-          "index": 0,
+          "index": 1,
           "unit": "rift://file/src/config.rs",
           "language": "rust",
           "kind": "source_file",
           "range": {
             "start": 0,
             "end": 356
-          }
+          },
+          "parent": 0
         },
         {
           "symbol": "rift://symbol/local/rust/example_project/config/load_config",

@@ -4150,7 +4150,7 @@ fn the_authored_nodes_example_renders_one_entry_per_node_and_the_innermost_sourc
             "5 nodes",
             "\t[1] source_file · 14 lines",
             "\t\t0..356",
-            "\t\tindex 0",
+            "\t\tindex 1 · parent 0",
             "\t[2] function_item · 4 lines",
             "\t\t218..355",
             "\t\tdeclaration 0 · index 0",

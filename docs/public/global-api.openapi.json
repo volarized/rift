@@ -7311,14 +7311,15 @@
           {
             "nodes": [
               {
-                "index": 0,
+                "index": 1,
                 "unit": "rift://file/src/config.rs",
                 "language": "rust",
                 "kind": "source_file",
                 "range": {
                   "start": 0,
                   "end": 356
-                }
+                },
+                "parent": 0
               },
               {
                 "symbol": "rift://symbol/local/rust/app/config/load_config",
@@ -7425,7 +7426,7 @@
             "format": "uint64",
             "minimum": 0,
             "maximum": 9007199254740991,
-            "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's root node are 0."
+            "description": "Pre-order position of this node inside its declaration's item subtree, or inside its\nunit when `declaration` is absent. The item node and the unit's file node are 0."
           },
           "unit": {
             "$ref": "#/components/schemas/FileId",
@@ -7479,7 +7480,7 @@
           "kind",
           "range"
         ],
-        "description": "One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node\ninside a declaration's item subtree is node `index` of declaration `declaration` of\n`symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in\npre-order from 0 at the declaration's item node, or at the unit's root node, and skip the\nsubtrees of nested declarations, whose nodes belong to the nested symbol. The address\nnames a place at the read's revision: an edit renumbers the nodes after it."
+        "description": "One node of a file's concrete syntax tree, addressed by its place inside a symbol. A node\ninside a declaration's item subtree is node `index` of declaration `declaration` of\n`symbol`; a node outside every declaration is node `index` of its `unit`. Indexes count in\npre-order from 0 at the declaration's item node, or from 0 at the unit's file node, and\nskip the subtrees of nested declarations, whose nodes belong to the nested symbol. The address\nnames a place at the read's revision: an edit renumbers the nodes after it."
       },
       "NodeFacet": {
         "description": "Portable structural facets, so a filter can ask for bodies or imports without knowing the\ngrammar that produced them.",
