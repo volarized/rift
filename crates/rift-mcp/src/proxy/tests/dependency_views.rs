@@ -32,7 +32,7 @@ async fn answer_project(
         };
         let top = json!({"id":key, "expires_at":expiry});
         let remote = json!({"id":"claims.remote", "expires_at":expiry});
-        for _ in 0..4 {
+        for _ in 0..3 {
             let line = lines
                 .next_line()
                 .await?
@@ -50,18 +50,12 @@ async fn answer_project(
                         "symbol":{"id":SYMBOL,"language":"rust","name":"beacon","kind":"function"}},
                         "unit":UNIT,"distance":1}],"pagination":{"page_index":0,"total_pages":1}})
                 }
-                "get_symbol" | "get_source" => {
+                "get_symbol" => {
                     assert_eq!(arguments["view"], remote["id"]);
                     assert_eq!(params["_meta"]["root"], ENDPOINT);
                     assert_eq!(params["_meta"]["view"], remote);
-                    if tool == "get_symbol" {
-                        json!({"outcome":"missing", "symbol_not_found":{"id":SYMBOL,
-                            "alternatives":[],"detail":project},"view":remote})
-                    } else {
-                        json!({"outcome":"found", "source":{"span":{"unit":UNIT,
-                            "range":{"start":0,"end":project.len()}},"text":project},
-                            "source_complete":true,"view":remote})
-                    }
+                    json!({"outcome":"missing", "symbol_not_found":{"id":SYMBOL,
+                        "alternatives":[],"detail":project},"view":remote})
                 }
                 _ => panic!("unexpected dependency request: {request}"),
             };
@@ -135,15 +129,6 @@ async fn interleaved_profiles_keep_dependency_aliases_missing_and_source_views()
         );
         assert_eq!(
             body["symbol_not_found"]["detail"],
-            if *project == "local" { "main" } else { "cloud" }
-        );
-    }
-    for (project, _, view) in &captured {
-        let result = read(&proxy, "get_source", json!({"unit":UNIT,"view":view.id})).await?;
-        let body = result.structured_content.ok_or("source body")?;
-        assert_eq!(body["view"], serde_json::to_value(view)?);
-        assert_eq!(
-            body["source"]["text"],
             if *project == "local" { "main" } else { "cloud" }
         );
     }

@@ -2,19 +2,6 @@
 
 Generated from the served tool surface.
 
-## get_source
-
-Reads a canonical source unit or a half-open UTF-8 byte range. A preceding `view`
-retains its immutable selection and original expiry; `rev` selects a local Git revision.
-The result returns source bytes, definite absence or typed selection unavailability.
-
-Parameters:
-
-- `unit` (required) - Canonical source unit, retaining its physical package or runtime owner.
-- `range` - Requested half-open UTF-8 byte range.
-- `view` - A preceding immutable selection.
-- `rev` - A local Git revision.
-
 ## get_symbol
 
 Reads one logical symbol by its canonical `id`. The caller may select a preceding

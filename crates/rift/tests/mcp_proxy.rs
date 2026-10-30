@@ -87,7 +87,7 @@ use surface_corpus::SurfaceFixture;
 use tokio::sync::Notify;
 
 /// The tools the workspace server advertises, in served order.
-const SERVED_TOOL_NAMES: [&str; 4] = ["get_source", "get_symbol", "nodes", "search"];
+const SERVED_TOOL_NAMES: [&str; 3] = ["get_symbol", "nodes", "search"];
 
 #[test]
 fn proxied_engine_bound_covers_two_retry_sequences_and_election() {
@@ -1079,78 +1079,12 @@ fn proxy_row_views(
     Ok((body, views))
 }
 
-/// Reads a row's physical source through the proxy that advertised its captured view.
-async fn proxy_row_source(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    row: &serde_json::Value,
-    view: &rift_protocol::symbol_read::CapturedView,
-) -> TestResult<String> {
-    let unit = if let Some(unit) = row["unit"].as_str() {
-        rift_protocol::read::SourceUnitId::parse(unit)?
-    } else {
-        let path = row["path"]
-            .as_str()
-            .ok_or("captured row must state its source path")?;
-        rift_protocol::read::SourceUnitId::parse(&format!(
-            "rift://source/project/{}",
-            rift_protocol::identity::encode_source_unit_key(path)
-        ))?
-    };
-    let request = json!({"unit": unit, "range": row["range"], "view": view.id});
-    let response = proxied_result(client, "get_source", &request).await?;
-    assert_ne!(
-        response.is_error,
-        Some(true),
-        "captured row source: {response:?}"
-    );
-    let (body, answered) = proxy_text_view(text_of(&response)?)?;
-    assert_eq!(
-        answered.as_ref(),
-        Some(view),
-        "row source retains the original view and expiry"
-    );
-    if let Some(structured) = &response.structured_content {
-        let result: rift_protocol::source_read::GetSourceResult =
-            serde_json::from_value(structured.clone())?;
-        let rift_protocol::source_read::GetSourceResult::Found {
-            source,
-            source_complete,
-            view: selected,
-            ..
-        } = result
-        else {
-            return Err(format!(
-                "captured row source must remain available: request {request}, response {response:?}"
-            )
-            .into());
-        };
-        assert!(source_complete, "captured row source must be complete");
-        assert_eq!(
-            source.span.unit, unit,
-            "captured row source unit is unchanged"
-        );
-        if !row["range"].is_null() {
-            assert_eq!(
-                serde_json::to_value(source.span.range)?,
-                row["range"],
-                "captured row source range is unchanged"
-            );
-        }
-        assert_eq!(
-            &selected, view,
-            "captured row source retains the original selection"
-        );
-    }
-    Ok(body)
-}
-
-/// Validates each row selection before comparing source bytes between the proxies.
-async fn validated_proxy_rows(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+/// Checks that the text states every captured row view before the proxies' texts are compared.
+fn validated_proxy_rows(
     body: &str,
     result: &CallToolResult,
     reference: &serde_json::Value,
-) -> TestResult<(String, Vec<String>)> {
+) -> TestResult<String> {
     let (body, views) = proxy_row_views(body)?;
     let rows: Vec<_> = reference["results"]
         .as_array()
@@ -1176,11 +1110,7 @@ async fn validated_proxy_rows(
             "text states the exact structured row views and expiries"
         );
     }
-    let mut sources = Vec::new();
-    for (row, view) in rows.into_iter().zip(&views) {
-        sources.push(proxy_row_source(client, row, view).await?);
-    }
-    Ok((body, sources))
+    Ok(body)
 }
 
 /// Reads each advertised view through its owning proxy before comparing the remaining text.
@@ -1190,7 +1120,7 @@ async fn validated_proxy_text(
     request: &serde_json::Value,
     result: &CallToolResult,
     reference: &serde_json::Value,
-) -> TestResult<(String, Vec<String>)> {
+) -> TestResult<String> {
     let original = text_of(result)?;
     let (body, view) = proxy_text_view(original)?;
     if let Some(structured) = &result.structured_content {
@@ -1225,7 +1155,7 @@ async fn validated_proxy_text(
             );
         }
     }
-    validated_proxy_rows(client, &body, result, reference).await
+    validated_proxy_rows(&body, result, reference)
 }
 
 /// The `all` and `text` proxies write the same source and identity text. Each proxy's captured

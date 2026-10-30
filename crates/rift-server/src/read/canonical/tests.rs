@@ -177,48 +177,41 @@ fn force_included_search_retains_original_source_after_mutation_and_removal() {
     );
     let store = LocalSymbolViews::new(1 << 20, [24; 32]);
     let view = store.capture(material).expect("admission").expect("view");
-    let request = rift_protocol::source_read::GetSourceParams {
-        unit: row
-            .hit
-            .unit
-            .clone()
-            .unwrap_or_else(|| crate::read::source_unit_id(&path)),
-        range: row.hit.range.clone(),
-        view: Some(view.id.clone()),
-        rev: None,
+    let held_row_source = || {
+        let held = store
+            .state
+            .lock()
+            .expect("retained material state")
+            .views
+            .get(view.id.as_str())
+            .expect("forced row view remains held")
+            .clone();
+        let range = row.hit.range.as_ref().expect("forced row range");
+        let start = usize::try_from(range.start).expect("row start");
+        let end = usize::try_from(range.end).expect("row end");
+        held.material
+            .index
+            .source(&path)
+            .and_then(|source| source.get(start..end))
+            .map(str::to_owned)
     };
-    let source = store
-        .get_source(&request, reads.index.root(), reads.index.owner())
-        .expect("captured row source");
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source: excerpt,
-        view: answered,
-        source_complete,
-        ..
-    } = &source
-    else {
-        panic!("forced row source must remain available");
-    };
-    assert!(source_complete);
-    assert_eq!(answered, &view);
-    assert_eq!(excerpt.text, "pub fn phantom_signal() {}");
+    assert_eq!(
+        held_row_source().as_deref(),
+        Some("pub fn phantom_signal() {}")
+    );
     std::fs::write(
         directory.path().join("hidden.rs"),
         "pub fn replacement() {}\n",
     )
     .expect("current source mutation");
     assert_eq!(
-        store
-            .get_source(&request, reads.index.root(), reads.index.owner())
-            .expect("held source"),
-        source
+        held_row_source().as_deref(),
+        Some("pub fn phantom_signal() {}")
     );
     std::fs::remove_file(directory.path().join("hidden.rs")).expect("current source removal");
     assert_eq!(
-        store
-            .get_source(&request, reads.index.root(), reads.index.owner())
-            .expect("held source"),
-        source
+        held_row_source().as_deref(),
+        Some("pub fn phantom_signal() {}")
     );
 }
 
@@ -649,48 +642,19 @@ fn captured_view_refuses_unknown_keys_and_preparing_indices() {
 }
 
 #[test]
-fn captured_source_and_nodes_keep_canonical_binding_after_live_source_changes() {
+fn captured_nodes_keep_canonical_binding_and_file_source_after_live_source_changes() {
     let (directory, reads, id) = fixture(true);
     let store = LocalSymbolViews::new(1 << 20, [13; 32]);
     let view = store
         .capture(captured_input(&reads))
         .expect("admission")
         .expect("view");
-    let source_request = rift_protocol::source_read::GetSourceParams {
-        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/index.js")
-            .expect("source identity"),
-        range: None,
-        view: Some(view.id.clone()),
-        rev: None,
-    };
     let node_request = rift_protocol::read::NodesParams {
         path: rift_protocol::read::ProjectPath("index.js".to_owned()),
         position: 40,
         view: Some(view.id.clone()),
         rev: None,
     };
-    let source = store
-        .get_source(&source_request, reads.index.root(), reads.index.owner())
-        .expect("source read");
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source: excerpt,
-        view: answered,
-        source_complete,
-        ..
-    } = &source
-    else {
-        panic!("captured source must remain available");
-    };
-    assert!(source_complete);
-    assert_eq!(answered, &view);
-    assert_eq!(
-        excerpt.text,
-        reads
-            .index
-            .file(&rift_core::ProjectPath::new("index.js").expect("path"))
-            .expect("source")
-            .source()
-    );
     let nodes = store
         .nodes(
             &node_request,
@@ -709,17 +673,22 @@ fn captured_source_and_nodes_keep_canonical_binding_after_live_source_changes() 
             .iter()
             .any(|node| node.symbol.as_ref() == Some(&id))
     );
+    assert_eq!(
+        nodes.0.source.first().map(String::as_str),
+        Some(
+            reads
+                .index
+                .file(&rift_core::ProjectPath::new("index.js").expect("path"))
+                .expect("source")
+                .source()
+        ),
+        "the outermost node spans the whole captured file"
+    );
     std::fs::write(
         directory.path().join("index.js"),
         "export function changed() {}\n",
     )
     .expect("current source change");
-    assert_eq!(
-        store
-            .get_source(&source_request, reads.index.root(), reads.index.owner())
-            .expect("retained source"),
-        source
-    );
     assert_eq!(
         store
             .nodes(
@@ -735,50 +704,13 @@ fn captured_source_and_nodes_keep_canonical_binding_after_live_source_changes() 
 }
 
 #[test]
-fn captured_source_and_nodes_refuse_foreign_selection_and_invalid_byte_ranges() {
+fn captured_nodes_refuse_foreign_selection_and_invalid_positions() {
     let (_directory, reads, _) = fixture(true);
     let store = LocalSymbolViews::new(1 << 20, [14; 32]);
     let view = store
         .capture(captured_input(&reads))
         .expect("admission")
         .expect("view");
-    let mut request = rift_protocol::source_read::GetSourceParams {
-        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/index.js")
-            .expect("source identity"),
-        range: Some(rift_protocol::read::TextRange {
-            start: 0,
-            end: u64::MAX,
-        }),
-        view: Some(view.id.clone()),
-        rev: None,
-    };
-    assert!(
-        store
-            .get_source(&request, reads.index.root(), reads.index.owner())
-            .is_err()
-    );
-    request.range = None;
-    request.unit = rift_protocol::read::SourceUnitId::parse(
-        "rift://source/npm/npmjs.org/beacon@1.0.0/index.js",
-    )
-    .expect("released source identity");
-    assert!(matches!(
-        store
-            .get_source(&request, reads.index.root(), reads.index.owner())
-            .expect("owner refusal"),
-        rift_protocol::source_read::GetSourceResult::Unavailable {
-            reason: SymbolUnavailableReason::ViewContext,
-            ..
-        }
-    ));
-    request.unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/missing.rs")
-        .expect("missing source identity");
-    assert!(matches!(
-        store
-            .get_source(&request, reads.index.root(), reads.index.owner())
-            .expect("source absence"),
-        rift_protocol::source_read::GetSourceResult::Missing { .. }
-    ));
     let nodes = rift_protocol::read::NodesParams {
         path: rift_protocol::read::ProjectPath("index.js".to_owned()),
         position: u64::MAX,
@@ -1426,28 +1358,17 @@ fn distinct_generation_admission_counts_shared_allocations_and_keeps_original_so
     );
     std::fs::write(directory.path().join("a.txt"), "changed current bytes\n")
         .expect("later source");
-    let request = rift_protocol::source_read::GetSourceParams {
-        unit: rift_protocol::read::SourceUnitId::parse("rift://source/project/a.txt")
-            .expect("physical unit"),
-        range: None,
-        view: Some(first.id.clone()),
-        rev: None,
-    };
-    let result = limited
-        .get_source(&request, indexes[0].root(), indexes[0].owner())
-        .expect("held original source");
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source,
-        source_complete,
-        view,
-        ..
-    } = result
-    else {
-        panic!("previously advertised source remains available");
-    };
-    assert!(source_complete);
-    assert_eq!(source.text, original);
-    assert_eq!(view, first);
+    let path = rift_core::ProjectPath::new("a.txt").expect("text path");
+    let held = limited
+        .state
+        .lock()
+        .expect("state")
+        .views
+        .get(first.id.as_str())
+        .expect("previously advertised view remains held")
+        .clone();
+    assert_eq!(held.view, first);
+    assert_eq!(held.material.index.source(&path), Some(original.as_str()));
     let state = limited.state.lock().expect("state");
     assert_eq!(
         state.views.len(),
@@ -1635,12 +1556,6 @@ fn assert_measured_held_source(
     material: &Arc<LocalSymbolMaterial>,
     view: &CapturedView,
 ) {
-    let request = rift_protocol::source_read::GetSourceParams {
-        unit: crate::read::source_unit_id(path),
-        range: None,
-        view: Some(view.id.clone()),
-        rev: None,
-    };
     let held = store
         .state
         .lock()
@@ -1654,44 +1569,11 @@ fn assert_measured_held_source(
     assert_eq!(held.material.index.root(), reads.index.root());
     assert_eq!(held.material.index.owner(), reads.index.owner());
     assert!(Arc::ptr_eq(&held.material, material));
-    let public = store
-        .get_source(&request, reads.index.root(), reads.index.owner())
-        .expect("held public source selection");
     assert_eq!(
         held.material
             .index
             .source(path)
             .expect("held original source"),
         original
-    );
-    if !held.ready {
-        assert_eq!(
-            public,
-            rift_protocol::source_read::GetSourceResult::Unavailable {
-                unit: request.unit.clone(),
-                view: None,
-                reason: SymbolUnavailableReason::IndexPreparing,
-                warnings: Vec::new(),
-            }
-        );
-        return;
-    }
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source,
-        source_complete,
-        view: answered,
-        ..
-    } = public
-    else {
-        panic!("previously advertised original source remains available: {public:?}");
-    };
-    assert!(source_complete);
-    assert_eq!(source.text, original);
-    assert_eq!(answered, *view);
-    assert_eq!(source.span.unit, request.unit);
-    assert_eq!(source.span.range.start, 0);
-    assert_eq!(
-        source.span.range.end,
-        u64::try_from(original.len()).expect("source byte range")
     );
 }
