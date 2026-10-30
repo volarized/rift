@@ -28,8 +28,11 @@ dashes *args:
 conformance *args:
     {{ rift_dev }} conformance {{ args }}
 
+# `rift-analysis` also builds without its default `collector` feature, which the
+# all-features run never compiles.
 clippy:
     {{ rift_dev }} clippy --workspace --all-targets --all-features -- -D warnings
+    {{ rift_dev }} clippy -p rift-analysis --no-default-features --lib --locked -- -D warnings
 
 docs:
     {{ rift_dev }} docs --workspace --all-features --no-deps
