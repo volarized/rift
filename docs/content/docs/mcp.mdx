@@ -414,7 +414,7 @@ Use `include` to select optional projections:
 
 | Include | Adds |
 | --- | --- |
-| `source` | Declaration source and node identity when available |
+| `source` | Declaration source when available |
 | `documentation` | Bounded documentation referring to the exact declaration |
 | `history` | The logical symbol's version-control timeline |
 
@@ -489,6 +489,10 @@ The first node is the declaration itself, and its source is the declaration's so
 after it are the parts inside it, down to each identifier. A symbol with several declarations,
 such as an overloaded function, lists each declaration's nodes in turn. A long answer ends with
 `node_cursor`, which the agent sends back to read the rest.
+
+A package or runtime symbol that `search` returned with `scope: "global"` lists its nodes the same
+way. Rift reads them from the global API, and each node's `unit` names a source unit of that
+package release, such as `rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`.
 
 <Callout type="info">
 

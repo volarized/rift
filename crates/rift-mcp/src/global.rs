@@ -420,6 +420,15 @@ impl GlobalState {
         self.client(configuration).await?.get_symbol(params).await
     }
 
+    /// The nodes of one package or runtime symbol, read from the global API.
+    pub(crate) async fn symbol_nodes(
+        &self,
+        configuration: &GlobalConfiguration,
+        params: &rift_protocol::read::NodesParams,
+    ) -> Result<rift_protocol::read::NodesResult, RiftError> {
+        self.client(configuration).await?.nodes(params).await
+    }
+
     async fn client(&self, configuration: &GlobalConfiguration) -> Result<GlobalClient, RiftError> {
         let mut config = Config::try_from(configuration)?;
         config.telemetry = self.telemetry.clone();

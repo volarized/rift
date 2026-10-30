@@ -215,7 +215,8 @@ async fn request_deadline_bounds_global_resolution() -> TestResult {
 const READ_DELAY: Duration = Duration::from_secs(10);
 
 /// A package read the request deadline cuts short discards the remote lane: symbol and full-text `search` each answer the project hits alone, with the timeout warning, well before
-/// the held page would have arrived.
+/// the held page would have arrived, and `nodes` of a package symbol, which has no project
+/// answer, refuses as temporarily unavailable.
 #[tokio::test]
 async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
     let hold = Some(Hold::Read(READ_DELAY));
@@ -264,6 +265,24 @@ async fn request_deadline_bounds_the_remote_package_read() -> TestResult {
             "{tool}: every hit is a project hit: {answer:#}"
         );
     }
+    let started = tokio::time::Instant::now();
+    let symbol = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let refused = failed_call(
+        client
+            .call_tool(tool_request("nodes", &json!({"symbol": symbol})))
+            .await,
+    )?;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < READ_DELAY,
+        "nodes: the request deadline must end the read wait: elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        refused.code,
+        ErrorCode::TemporarilyUnavailable,
+        "{}",
+        refused.text
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;
@@ -761,6 +780,109 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
         assert!(!rendered.contains("local_beacon"));
         assert!(!rendered.contains("RIFT_TEST_GLOBAL_TOKEN"));
     }
+    drop(directory);
+    client.cancel().await?;
+    server_task.await?;
+    Ok(())
+}
+
+/// The nodes of a package symbol come from the global API in the shape a project symbol's
+/// nodes take: the package's `beacon` and the project's `beacon` share each node's identity,
+/// kind, and source, and differ in the unit and offsets that locate them.
+#[tokio::test]
+async fn package_symbol_nodes_come_from_the_global_api_in_the_project_shape() -> TestResult {
+    let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
+    let configuration = format!(
+        "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
+         request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n{DEMO_PACKAGE}",
+        fixture.endpoint
+    );
+    let workspace = served_dependent_workspace(Some(&configuration)).await?;
+    let (directory, client, server_task) = workspace.served;
+    let id = global_api::collected_identity(SymbolFixture::Valid, "beacon");
+    let package = call_tool(&client, "nodes", json!({"symbol": id})).await?;
+    let found = search_symbols(
+        &client,
+        json!({"query": "beacon", "scope": "local", "target": "symbol"}),
+    )
+    .await?;
+    let local_id = found["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|hit| hit["hit"]["symbol"]["name"] == "beacon")
+        .and_then(|hit| hit["hit"]["symbol"]["id"].as_str())
+        .ok_or("the project declares beacon")?;
+    let local = call_tool(&client, "nodes", json!({"symbol": local_id})).await?;
+
+    let package_nodes = package["nodes"].as_array().ok_or("package nodes")?;
+    let local_nodes = local["nodes"].as_array().ok_or("project nodes")?;
+    assert_eq!(
+        package_nodes.len(),
+        local_nodes.len(),
+        "{package:#}\n{local:#}"
+    );
+    for (package_node, local_node) in package_nodes.iter().zip(local_nodes) {
+        for field in [
+            "declaration",
+            "index",
+            "parent",
+            "kind",
+            "language",
+            "source",
+            "facets",
+        ] {
+            assert_eq!(
+                package_node[field], local_node[field],
+                "{field}: {package:#}"
+            );
+        }
+        assert_eq!(package_node["unit"], COLLECTED_UNIT, "{package:#}");
+        assert_eq!(local_node["unit"], "rift://file/src/lib.rs", "{local:#}");
+    }
+    assert_eq!(package["symbol"], json!(id), "{package:#}");
+    assert_eq!(
+        package_nodes[0]["source"], "pub fn beacon() {}",
+        "{package:#}"
+    );
+    let asked = fixture
+        .requests()
+        .await
+        .into_iter()
+        .filter(|request| request.uri.ends_with("/v1/nodes"))
+        .map(|request| request.body)
+        .collect::<Vec<_>>();
+    assert_eq!(asked, [Some(json!({"symbol": id}))]);
+
+    let view = "a".repeat(64);
+    let in_view = call_tool(&client, "nodes", json!({"symbol": id, "view": view})).await?;
+    assert_eq!(in_view["view"]["id"], json!(view), "{in_view:#}");
+    assert_eq!(in_view["nodes"], package["nodes"], "{in_view:#}");
+
+    let absent = global_api::collected_identity(SymbolFixture::Valid, "absent");
+    let refused = failed_call(
+        client
+            .call_tool(tool_request("nodes", &json!({"symbol": absent})))
+            .await,
+    )?;
+    assert_eq!(
+        refused.code,
+        ErrorCode::ResourceNotFound,
+        "{}",
+        refused.text
+    );
+    assert!(refused.message.contains(&absent), "{}", refused.text);
+    let at_revision = failed_call(
+        client
+            .call_tool(tool_request("nodes", &json!({"symbol": id, "rev": "main"})))
+            .await,
+    )?;
+    assert_eq!(
+        at_revision.code,
+        ErrorCode::InvalidRequest,
+        "{}",
+        at_revision.text
+    );
     drop(directory);
     client.cancel().await?;
     server_task.await?;

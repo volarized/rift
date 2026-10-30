@@ -1,9 +1,10 @@
 //! A fixture global API on a loopback port.
 //!
-//! It answers the capability, resolution, symbol, search, and pattern endpoints
+//! It answers the capability, resolution, symbol, nodes, search, and pattern endpoints
 //! `rift-cloud-client` reads, and records every request it receives. Its collection holds
 //! one package, [`COLLECTED`], whose `src/lib.rs` declares [`DECLARATIONS`]; a symbol
-//! request answers the declaration it names, a search request the declarations its
+//! request answers the declaration it names, a nodes request that declaration's syntax
+//! nodes, a search request the declarations its
 //! identifiers match, and a pattern request the matches of its pattern in that file, so
 //! each answer passes the client's own validation. The
 //! collected release also answers, as the nearest release, an exact `demo` entry at another
@@ -151,7 +152,7 @@ pub(crate) enum SymbolFixture {
 pub(crate) enum Hold {
     /// The resolution endpoint's answer.
     Resolution(Duration),
-    /// The symbol and search endpoints' answers.
+    /// The symbol, nodes, and search endpoints' answers.
     Read(Duration),
     /// The declarations endpoint's answer.
     Declarations(Duration),
@@ -226,7 +227,7 @@ impl FixtureState {
         }
     }
 
-    /// Waits out the read hold, when the fixture holds symbol and search pages.
+    /// Waits out the read hold, when the fixture holds symbol, nodes, and search answers.
     async fn hold_read(&self) {
         if let Some(Hold::Read(delay)) = self.options.hold {
             tokio::time::sleep(delay).await;
@@ -375,6 +376,13 @@ async fn global_handler(
         state.hold_read().await;
         return state.response(symbols(options.symbol, &body));
     }
+    if path.ends_with("/nodes") {
+        state.hold_read().await;
+        return symbol_nodes(&body).map_or_else(
+            || problem_response(StatusCode::NOT_FOUND),
+            |nodes| state.response(nodes),
+        );
+    }
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
@@ -431,6 +439,7 @@ fn capabilities(options: &FixtureOptions) -> Value {
         "symbol_documentation",
         "patterns",
         "declarations",
+        "nodes",
     ]
     .into_iter()
     .filter(|feature| !withheld.contains(feature))
@@ -654,6 +663,49 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
         binding["source"] = source.clone();
     }
     json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view})
+}
+
+/// The nodes of the collected declaration `request` names, as a symbol read of
+/// [`COLLECTED_SOURCE`] lists them: the item node, then its visibility, name, parameters,
+/// and body, in the fixture's view when the request names one. `None` for any other symbol.
+fn symbol_nodes(request: &Value) -> Option<Value> {
+    let id = request["symbol"].as_str()?;
+    let name = DECLARATIONS
+        .into_iter()
+        .find(|name| collected_identity(SymbolFixture::Valid, name) == id)?;
+    let item = format!("pub fn {name}() {{}}");
+    let start = COLLECTED_SOURCE.find(&item)?;
+    let parts = [
+        ("function_item", 0, item.as_str()),
+        ("visibility_modifier", 0, "pub"),
+        ("identifier", "pub fn ".len(), name),
+        ("parameters", "pub fn ".len() + name.len(), "()"),
+        ("block", item.len() - "{}".len(), "{}"),
+    ];
+    let nodes = parts
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, offset, source))| {
+            let node_start = start + offset;
+            let mut node = json!({
+                "declaration": 0, "index": index, "unit": COLLECTED_UNIT, "language": "rust",
+                "kind": kind,
+                "range": {"start": node_start, "end": node_start + source.len()},
+                "source": source,
+            });
+            if index == 0 {
+                node["facets"] = json!(["declaration", "definition"]);
+            } else {
+                node["parent"] = json!(0);
+            }
+            node
+        })
+        .collect::<Vec<_>>();
+    let mut answer = json!({"symbol": id, "nodes": nodes});
+    if request.get("view").is_some() {
+        answer["view"] = Value::Null;
+    }
+    Some(answer)
 }
 
 /// The runtime `len` declaration, carrying the embedded standard library stub's own bytes
