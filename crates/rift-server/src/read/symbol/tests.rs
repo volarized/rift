@@ -179,3 +179,40 @@ fn an_unready_publication_answers_index_preparing() -> TestResult {
     ));
     Ok(())
 }
+
+#[test]
+fn a_symbol_past_the_public_name_bound_answers_unavailable_with_its_warning() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let name = "x".repeat(rift_protocol::read::SYMBOL_NAME_CHARACTERS_MAX + 1);
+    std::fs::write(
+        directory.path().join("package.json"),
+        r#"{"name":"beacon","version":"1.0.0","main":"index.js"}"#,
+    )?;
+    std::fs::write(
+        directory.path().join("index.js"),
+        format!("export function {name}() {{}}\n"),
+    )?;
+    let service = build(directory.path())?;
+    let matched = service.index.symbols(&name, 1)?[0];
+    let assembled = service.index.assembled_symbol(matched)?;
+    let identity = assembled
+        .identity()
+        .ok_or("the long declaration has an established identity")?
+        .as_str()
+        .to_owned();
+    let answer = service.exact_symbol(&request(SymbolId(identity)), true)?;
+    let GetSymbolResult::Unavailable {
+        reason, warnings, ..
+    } = answer
+    else {
+        return Err(format!("a name past the bound is not served: {answer:?}").into());
+    };
+    assert_eq!(reason, SymbolUnavailableReason::InsufficientCoverage);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| matches!(warning, ReadWarning::ObjectUnavailable { .. })),
+        "{warnings:?}"
+    );
+    Ok(())
+}
