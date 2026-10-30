@@ -26,6 +26,7 @@ use crate::read::{
     Digest, Language, ProjectPath, Relationship, RelationshipFacet, SourceUnitId, Symbol, SymbolId,
     SymbolOrigin, TextRange,
 };
+use crate::revision::Revision;
 
 /// The publication shape this revision of the analyzer emits.
 ///
@@ -79,8 +80,12 @@ pub struct PackagePublication {
     /// source the run depended on. Two publications with equal package bytes and equal
     /// `analyzer_revision` are equal.
     pub analyzer_revision: Digest,
-    /// Exact defining package, runtime, or compiler owner.
+    /// Defining package, runtime, or compiler owner. It names no version: every symbol id
+    /// and source unit of the publication carries this owner across releases.
     pub owner: SymbolOwner,
+    /// The one release this publication analyzed, a release revision of `owner`, as
+    /// `rift://revision/cargo/crates.io/demo@1.0.0`.
+    pub revision: Revision,
     /// The digest of the package source this publication was produced from, over every
     /// unit's path and content in unit order.
     pub source_digest: Digest,
@@ -183,6 +188,11 @@ pub struct PackageSymbol {
     pub unit: SourceUnitId,
     /// The declaration's byte range inside its unit.
     pub range: TextRange,
+    /// The grammar kind of the declaration's item node, the syntax node spanning `range`,
+    /// as `function_item`. Absent when the syntax provider names no item node for the
+    /// declaration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_kind: Option<String>,
     /// The one-based line the declaration starts on.
     pub line: u64,
     /// Entries in the logical object's signature array supplied by this binding.
@@ -231,7 +241,7 @@ pub struct PackageDocument {
     pub unit: SourceUnitId,
     /// The language whose provider parsed the unit.
     pub language: Language,
-    /// Exact logical owner of the document.
+    /// Logical owner of the document, across releases.
     pub owner: SymbolOwner,
     /// The digest of the content this document was built from.
     pub content_digest: Digest,

@@ -127,9 +127,10 @@ pub struct GetSymbolParams {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<GetSymbolInclude>,
     /// The revision to read. A git revision reads that commit of a project, a tree
-    /// revision reads the served working tree, and a release revision names the release
-    /// a package or runtime `id` carries. Omitted reads the served working tree. The
-    /// server refuses it beside `view` and once the index no longer serves it.
+    /// revision reads the served working tree, and a release revision selects the release
+    /// of a package or runtime `id`'s owner. Omitted reads the served working tree, or for
+    /// a package the version the workspace's dependencies pin, else the newest collected
+    /// release. The server refuses it beside `view` and once the index no longer serves it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revision: Option<Revision>,
     /// A view returned by a preceding read. Expiry never selects latest implicitly.
@@ -258,7 +259,7 @@ pub struct SymbolNotFound {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolUnavailableReason {
-    /// The encoded exact release has no accepted publication.
+    /// The selected release has no accepted publication.
     ExactRelease,
     /// The selected index is preparing.
     IndexPreparing,

@@ -783,10 +783,14 @@ A `local@name` owner selects an extra project accepted by the connection:
 
 <ReadExample name="named-symbol" />
 
-A package or runtime identity selects its exact served version. Search's `scope` and
-`packages` discover these identities. Requested package substitutions are reported by search;
-the returned identity names the served owner. Exact reads never silently replace that version.
-The declaration's `unit` keeps the physical defining owner even when the logical owner differs.
+A package or runtime identity names its owner across releases, as
+`rift://symbol/cargo/crates.io/demo/rust/demo/beacon`, and `revision` selects the release to read,
+as `rift://revision/cargo/crates.io/demo@1.0.0`. Search's `scope` and `packages` discover these
+identities, and each hit's `origin` names the release it was found in. When the request omits
+`revision`, the server reads a package at the version the workspace's dependencies pin, and otherwise
+the newest release the global index collected. The answer **MUST** carry the release it read as
+its `revision`. The declaration's `unit` keeps the physical defining owner even when the logical
+owner differs.
 
 <ReadExample name="global-search" />
 
@@ -795,8 +799,8 @@ The declaration's `unit` keeps the physical defining owner even when the logical
 <ReadExample name="requested-served" />
 
 `revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
-it was read at. It is refused beside `view`, and for a package or runtime identity it names that
-identity's release alone. Unknown named local projects, expired views, and incomplete coverage are explicit
+it was read at. It is refused beside `view`, and for a package or runtime identity it names a
+release of that identity's owner. Unknown named local projects, expired views, and incomplete coverage are explicit
 selection failures. A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
@@ -815,12 +819,12 @@ pre-order that no declaration nested in it holds. The answer names the symbol in
 the item node's `source` is the declaration's source. A symbol with no declaration in the index
 refuses `resource_not_found`.
 
-The server reads the nodes of a package or runtime symbol from the global API, in the exact
-release the identity names. Each node's `unit` is then a source unit of that release, such as
-`rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs`, and a symbol the release does not declare
-refuses `resource_not_found`. The server **MUST** refuse a `revision` beside such a symbol other
-than the release its identity names with `invalid_request`, since the global API serves that
-release alone, and the answer carries that release as its `revision`.
+The server reads the nodes of a package or runtime symbol from the global API, in the release
+`revision` selects. Each node's `unit` is then a source unit of the symbol's owner, such as
+`rift://source/cargo/crates.io/demo/src/lib.rs`, read at that release, and a symbol the release
+does not declare refuses `resource_not_found`. The server **MUST** refuse a `revision` beside such
+a symbol that is not a release of the symbol's owner with `invalid_request`, and the answer
+carries the release it read as its `revision`.
 
 One answer holds at most `results_max` nodes, or the global API's `page_limit_max` for a package
 or runtime symbol, and 1 MiB of node source, and at least one node.
@@ -1178,7 +1182,7 @@ After the last node, the server writes sources, each after a blank line and inde
 The server **MUST NOT** write a fact in its normal state. The absence of a fact therefore states the normal state, such as a project declaration that is authored, current, not deprecated, and not a test. The exceptional facts are:
 
 - `score` and its value, when the request asked for `score`
-- the origin as its location and `name@version`, when the declaration is not a project declaration without a package; the location is `dependency`, `stdlib`, or `external`
+- the origin as its location and its release revision, such as `dependency rift://revision/cargo/crates.io/serde@1.0.0`, which a later read sends as `revision`, or `name@version` for the project's own package, when the declaration is not a project declaration without a package; the location is `dependency`, `stdlib`, or `external`
 - `generated` or `synthetic`, when `source_kind` is not `authored`
 - `deprecated` and `test`, when the symbol has those facets
 - `document local`, when `document_local` is `true`

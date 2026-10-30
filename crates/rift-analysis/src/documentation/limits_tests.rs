@@ -285,3 +285,38 @@ fn documentation_layer_bounds_accept_exact_and_refuse_one_over() {
     let limits = DocumentationLimits::from_configuration(&lower).expect("lowered mapping bound");
     assert!(DocumentationLayer::borrowed_with_limits(&[&collection], &limits).is_err());
 }
+
+#[test]
+fn a_stored_index_keeps_its_recorded_revision_and_every_other_check() {
+    let configuration = rift_protocol::documentation::DocumentationConfiguration::default();
+    let collection = configured_collection(
+        "[one](https://example.test/one) [two](https://example.test/two)\n",
+        &configuration,
+        None,
+    );
+    let mut stored = collection.index().clone();
+    stored.documentation_revision =
+        rift_protocol::read::Digest("0".repeat(rift_core::constants::DIGEST_WIRE_CHARS));
+    let error = DocumentationCollection::new_with_limits(stored.clone(), None)
+        .expect_err("another build's revision");
+    assert_eq!(
+        error.slug().as_str(),
+        "rift.analysis.documentation_revision_invalid"
+    );
+    let restored = DocumentationCollection::from_stored(stored.clone(), None)
+        .expect("a stored index serves under its recorded revision");
+    assert_eq!(restored.index(), &stored);
+    let selected = rift_protocol::documentation::DocumentationConfiguration {
+        max_references: 1,
+        ..configuration
+    };
+    let limits = DocumentationLimits::from_configuration(&selected).expect("selected bounds");
+    let error = DocumentationCollection::from_stored(stored.clone(), Some(limits))
+        .expect_err("stored index past the selected reference bound");
+    assert_eq!(
+        error.slug().as_str(),
+        "rift.analysis.documentation_limit_exceeded"
+    );
+    stored.selection_digest = content_digest(b"another selection");
+    assert!(DocumentationCollection::from_stored(stored, None).is_err());
+}

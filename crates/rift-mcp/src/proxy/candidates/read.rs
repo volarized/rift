@@ -794,7 +794,6 @@ mod tests {
             manager: "cargo".to_owned(),
             registry: "crates.io".to_owned(),
             name: "demo".to_owned(),
-            version: "1.0.0".to_owned(),
         }
     }
 

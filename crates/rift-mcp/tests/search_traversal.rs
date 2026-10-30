@@ -2238,6 +2238,7 @@ async fn search_traversal_outgoing_asks_a_utf16_engines_dependency_callee_in_utf
         requests[0]["positions"],
         json!([{
             "unit": global_api::named_unit(&global_api::NAMED_POSITIONS[1]),
+            "revision": global_api::named_release(&global_api::NAMED_POSITIONS[1]),
             "line": 0,
             "character": 4
         }])

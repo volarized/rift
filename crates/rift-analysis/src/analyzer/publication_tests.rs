@@ -112,7 +112,7 @@ fn declaration_bound_keeps_original_units_and_reports_incomplete_coverage() {
             ..rift_protocol::configuration::PackageConfiguration::default()
         },
     );
-    let id = "rift://symbol/pypi/pypi.org/click@8.3.3/python/click/core/echo";
+    let id = "rift://symbol/pypi/pypi.org/click/python/click/core/echo";
     assert_eq!(result.objects.len(), 1);
     assert_eq!(
         result.objects[0].id.as_ref().map(SymbolId::as_str),
@@ -173,7 +173,7 @@ fn same_module_keeps_implementation_and_stub_bindings_on_one_object() {
         Some("src"),
         &["click"],
     );
-    let id = "rift://symbol/pypi/pypi.org/click@8.3.3/python/click/core/echo";
+    let id = "rift://symbol/pypi/pypi.org/click/python/click/core/echo";
     assert_eq!(result.format_revision, 4);
     assert_eq!(
         result.identity_format,

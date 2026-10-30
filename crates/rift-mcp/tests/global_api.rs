@@ -35,7 +35,7 @@ use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
 pub(crate) const COLLECTED: (&str, &str, &str) = ("cargo", "demo", "1.0.0");
 
 /// The source unit every collected declaration lives in.
-pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+pub(crate) const COLLECTED_UNIT: &str = "rift://source/cargo/crates.io/demo/src/lib.rs";
 
 /// The collected package's `src/lib.rs`.
 const COLLECTED_SOURCE: &str = "pub fn helper_beacon() {}\npub fn beacon() {}\n";
@@ -548,20 +548,25 @@ fn package_value((manager, name, version): (&str, &str, &str)) -> Value {
 
 fn named_owner(named: &NamedPosition) -> rift_protocol::identity::SymbolOwner {
     use rift_protocol::identity::SymbolOwner;
-    let (manager, name, version) = named.package;
+    let (manager, name, _) = named.package;
     if manager == "stdlib" {
         SymbolOwner::Runtime {
             runtime: name.to_owned(),
-            version: version.to_owned(),
         }
     } else {
         SymbolOwner::Package {
             manager: manager.to_owned(),
             registry: "pypi.org".to_owned(),
             name: name.to_owned(),
-            version: version.to_owned(),
         }
     }
+}
+
+/// The release revision of the package or runtime a named position sits in.
+pub(crate) fn named_release(named: &NamedPosition) -> String {
+    rift_protocol::revision::Revision::release(&named_owner(named), named.package.2)
+        .expect("fixture release")
+        .to_string()
 }
 
 pub(crate) fn named_unit(named: &NamedPosition) -> String {
@@ -602,6 +607,7 @@ fn declarations(request: &Value) -> Value {
         .map(|position| {
             let named = NAMED_POSITIONS.iter().find(|named| {
                 position["unit"] == named_unit(named)
+                    && position["revision"] == named_release(named)
                     && named.line.is_none_or(|line| position["line"] == line)
             });
             let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
@@ -612,6 +618,7 @@ fn declarations(request: &Value) -> Value {
                         "position": position,
                         "id": named_identity(named),
                         "kind": named.kind,
+                        "revision": named_release(named),
                         "view": view
                     })
                 }
@@ -662,12 +669,28 @@ fn symbols(fixture: SymbolFixture, request: &Value) -> Value {
     json!({"outcome":"found", "symbol":hit["symbol"], "declarations":[binding],"view":view,"revision":release_revision(id)})
 }
 
-/// The release revision the global API answers a package or runtime symbol `id` at.
+/// The release revision the global API answers a package or runtime symbol `id` at: the one
+/// release the fixture collected of its owner.
 fn release_revision(id: &str) -> Value {
-    let revision = rift_protocol::identity::SymbolIdentity::parse(id)
-        .and_then(|identity| rift_protocol::revision::Revision::release(identity.owner()));
+    let Ok(identity) = rift_protocol::identity::SymbolIdentity::parse(id) else {
+        return json!("");
+    };
+    let (manager, name, version) = COLLECTED;
+    let collected = rift_protocol::identity::SymbolOwner::Package {
+        manager: manager.to_owned(),
+        registry: "crates.io".to_owned(),
+        name: name.to_owned(),
+    };
+    let release = NAMED_POSITIONS
+        .iter()
+        .map(|named| (named_owner(named), named.package.2))
+        .chain(std::iter::once((collected, version)))
+        .find(|(owner, _)| owner == identity.owner())
+        .and_then(|(owner, version)| {
+            rift_protocol::revision::Revision::release(&owner, version).ok()
+        });
     json!(
-        revision
+        release
             .map(|revision| revision.to_string())
             .unwrap_or_default()
     )
@@ -996,7 +1019,7 @@ const fn class_wire(class: IdentifierMatchClass) -> (&'static str, &'static str)
 }
 
 pub(crate) fn collected_identity(fixture: SymbolFixture, declaration: &str) -> String {
-    let (manager, name, version) = COLLECTED;
+    let (manager, name, _) = COLLECTED;
     let root = if matches!(fixture, SymbolFixture::InvalidIdentity) {
         "other"
     } else {
@@ -1011,7 +1034,6 @@ pub(crate) fn collected_identity(fixture: SymbolFixture, declaration: &str) -> S
             } else {
                 name.to_owned()
             },
-            version: version.to_owned(),
         },
         rift_protocol::read::Language::from_identity_segment("rust")
             .expect("fixture language is supported"),

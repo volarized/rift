@@ -1317,7 +1317,7 @@ fn a_hit_without_a_place_or_matched_field_writes_no_facts_line() {
 
 #[test]
 fn a_dependency_hit_is_placed_by_its_unit() {
-    let unit = "rift://source/cargo/crates.io/serde@1.0.0/lib.rs";
+    let unit = "rift://source/cargo/crates.io/serde/lib.rs";
     let with_line = SearchHit {
         unit: Some(source_unit(unit)),
         line: Some(3),
@@ -1333,10 +1333,10 @@ fn a_dependency_hit_is_placed_by_its_unit() {
         &[
             "2 results",
             "\t[1] struct A",
-            "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · name",
+            "\t\trift://source/cargo/crates.io/serde/lib.rs:3 · name",
             "\t\trift://symbol/local/rust/app/a/A",
             "\t[2] struct B",
-            "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs",
+            "\t\trift://source/cargo/crates.io/serde/lib.rs",
             "\t\trift://symbol/local/rust/app/a/B",
         ],
     );
@@ -1415,9 +1415,7 @@ fn every_exceptional_fact_is_written_in_order() {
     let hit = SearchHit {
         score: Some(1.5),
         distance: Some(1),
-        unit: Some(source_unit(
-            "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
-        )),
+        unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         line: Some(3),
         matched_by: vec![MatchedField::Relationship],
         ..search_hit(SearchHitTarget::Symbol {
@@ -1429,7 +1427,7 @@ fn every_exceptional_fact_is_written_in_order() {
         &[
             "1 result",
             "\tstruct A",
-            "\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · relationship · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
+            "\trift://source/cargo/crates.io/serde/lib.rs:3 · relationship · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
             "\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -1513,7 +1511,20 @@ fn the_origin_is_written_only_when_it_is_not_the_project_default() {
             }),
             source_kind: SourceKind::Authored,
         }),
-        "stdlib rustc@1.98.1"
+        "stdlib rift://revision/stdlib/rustc@1.98.1"
+    );
+    assert_eq!(
+        facts(SymbolOrigin {
+            location: Some(SourceLocationKind::Stdlib),
+            package: None,
+            runtime: Some(rift_protocol::read::RuntimeIdentity {
+                runtime: "rustc".to_owned(),
+                version: "1.98".to_owned(),
+            }),
+            source_kind: SourceKind::Authored,
+        }),
+        "stdlib rustc@1.98",
+        "a version no release revision spells keeps its plain form"
     );
 }
 
@@ -1548,7 +1559,6 @@ fn fixture_symbol_id(at: &str) -> String {
                 manager: "cargo".to_owned(),
                 registry: "crates.io".to_owned(),
                 name: "serde".to_owned(),
-                version: "1.0.0".to_owned(),
             },
             vec!["serde", "Config"],
         ),
@@ -2275,9 +2285,7 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
     let hit = SearchHit {
         score: Some(1.5),
         matched_by: vec![MatchedField::Relationship, MatchedField::Name],
-        unit: Some(source_unit(
-            "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
-        )),
+        unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         line: Some(3),
         source: Some("struct Config {\n\n    a: u8,\n}".to_owned()),
         change: Some(SymbolChange {
@@ -2303,7 +2311,7 @@ fn a_node_writes_every_line_of_a_symbol_hit_at_its_further_line_indent() {
             "",
             "\t\t↳ constructs",
             "\t\t\tstruct Config",
-            "\t\t\tin rift://source/cargo/crates.io/serde@1.0.0/lib.rs:3 · name · score 1.5 · dependency serde@1.0.0 · generated · deprecated · test · document local",
+            "\t\t\tin rift://source/cargo/crates.io/serde/lib.rs:3 · name · score 1.5 · dependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
             "\t\t\tat rift://symbol/pkg/cargo/crates.io/serde@1.0.0/rust/serde/Config",
             "\t\t\tSettings of a run.",
             "\t\t\tmoved · old/lib.rs → new/lib.rs",
@@ -2534,9 +2542,7 @@ fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
     };
     let by_unit = SearchHit {
         matched_by: vec![MatchedField::Path],
-        unit: Some(source_unit(
-            "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
-        )),
+        unit: Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs")),
         ..search_hit(SearchHitTarget::File {
             size: 0,
             languages: Vec::new(),
@@ -2553,7 +2559,7 @@ fn a_file_hit_writes_its_place_and_the_source_directly_under_it() {
             "\t[1] src/lib.rs:7 · content · score 3",
             "\t\tline one",
             "\t\tline two",
-            "\t[2] rift://source/cargo/crates.io/serde@1.0.0/lib.rs · path",
+            "\t[2] rift://source/cargo/crates.io/serde/lib.rs · path",
             "\t[3]",
         ],
     );
@@ -2600,7 +2606,7 @@ fn a_documentation_hit_is_headed_by_its_heading_path() {
 fn a_documentation_hit_in_a_package_is_placed_by_its_source_unit() {
     let mut hit = documentation_hit();
     hit.block.source.source = rift_protocol::documentation::DocumentationSourceIdentity::Package {
-        unit: source_unit("rift://source/cargo/crates.io/serde@1.0.0/README.md"),
+        unit: source_unit("rift://source/cargo/crates.io/serde/README.md"),
     };
     let answer = only_page(vec![SearchHit {
         matched_by: vec![MatchedField::Documentation],
@@ -2613,7 +2619,7 @@ fn a_documentation_hit_in_a_package_is_placed_by_its_source_unit() {
         &[
             "1 result",
             "\tGuide",
-            "\trift://source/cargo/crates.io/serde@1.0.0/README.md:1 · documentation",
+            "\trift://source/cargo/crates.io/serde/README.md:1 · documentation",
         ],
     );
 }
@@ -3087,9 +3093,7 @@ fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() 
     anonymous.symbol.id = None;
     let mut dependency = symbol_hit();
     dependency.path = None;
-    dependency.unit = Some(source_unit(
-        "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
-    ));
+    dependency.unit = Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs"));
     dependency.line = 3;
     golden(
         &symbol_result(vec![anonymous, dependency], pagination(0, 1)),
@@ -3099,7 +3103,7 @@ fn a_symbol_without_an_identity_shows_its_range_and_a_dependency_hit_its_unit() 
             "\t\ta.rs:1",
             "\t\t0..9",
             "\t[2] struct A",
-            "\t\trift://source/cargo/crates.io/serde@1.0.0/lib.rs:3",
+            "\t\trift://source/cargo/crates.io/serde/lib.rs:3",
             "\t\trift://symbol/local/rust/app/a/A",
         ],
     );
@@ -3123,7 +3127,7 @@ fn exceptional_facts_of_a_get_symbol_hit_share_one_line_without_score_and_distan
             "\tpub struct A",
             "\ta.rs:1",
             "\trift://symbol/local/rust/app/a/A",
-            "\tdependency serde@1.0.0 · generated · deprecated · test · document local",
+            "\tdependency rift://revision/cargo/crates.io/serde@1.0.0 · generated · deprecated · test · document local",
         ],
     );
 }
@@ -3501,9 +3505,7 @@ fn a_version_names_its_path_only_when_it_differs_from_the_hit() {
     ));
     let mut dependency = symbol_hit();
     dependency.path = None;
-    dependency.unit = Some(source_unit(
-        "rift://source/cargo/crates.io/serde@1.0.0/lib.rs",
-    ));
+    dependency.unit = Some(source_unit("rift://source/cargo/crates.io/serde/lib.rs"));
     dependency.history = Some(history(
         vec![version(
             "cccccccc33",
@@ -3620,9 +3622,9 @@ fn outer_and_inner() -> NodesResult {
 /// the same items and the item's source.
 #[test]
 fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
-    const PACKAGE_ID: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon";
+    const PACKAGE_ID: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
     let package_unit = rift_protocol::read::SourceUnitId(
-        "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs".to_owned(),
+        "rift://source/cargo/crates.io/demo/src/lib.rs".to_owned(),
     );
     let mut item = node(0, "function_item", 26, 44);
     item.declaration = Some(0);
@@ -3639,7 +3641,7 @@ fn a_package_symbol_answer_writes_like_a_project_symbol_answer() {
     golden(
         &answer,
         &[
-            "2 nodes · rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+            "2 nodes · rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
             "\t[1] function_item",
             "\t\t26..44",
             "\t\tdeclaration 0 · index 0",

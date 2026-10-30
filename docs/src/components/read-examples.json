@@ -11,7 +11,7 @@
         "include": ["src/**"]
       }
     },
-    "text": "4 results\n\t[1] pub fn beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature, content \u00b7 view 185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91 \u00b7 expires 2026-10-12T16:01:30.984578+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/beacon\n\n\t\tpub fn beacon() {}\n\t[2] pub fn beacon()\n\t\tsrc/lib.rs:2 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/beacon\n\n\t\tpub fn beacon() {}\n\t[3] function beacon\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\t\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\t\tpub fn beacon() {}\n\t[4] pub fn local_beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/local_beacon\n\n\t\tpub fn local_beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n",
+    "text": "4 results\n\t[1] pub fn beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature, content \u00b7 view 185188270e125504187d800959068773e250aceb8f3276a1e6cbdb75f28c9a91 \u00b7 expires 2026-10-12T16:01:30.984578+00:00\n\t\trift://symbol/local@sdk/rust/docs_sdk/beacon\n\n\t\tpub fn beacon() {}\n\t[2] pub fn beacon()\n\t\tsrc/lib.rs:2 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/beacon\n\n\t\tpub fn beacon() {}\n\t[3] function beacon\n\t\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency rift://revision/cargo/crates.io/demo@1.0.0\n\t\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\t\tpub fn beacon() {}\n\t[4] pub fn local_beacon()\n\t\tsrc/lib.rs:1 \u00b7 name, signature \u00b7 view cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n\t\trift://symbol/local/rust/docs_global_app/local_beacon\n\n\t\tpub fn local_beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f \u00b7 expires 2026-10-12T16:01:30.980861+00:00\n",
     "json": {
       "view": {
         "id": "cf05414816a1388a288c97ef62ee4c068d7f8d7f1500678ed8cb9354c1db8c6f",
@@ -88,7 +88,7 @@
           "hit": {
             "target": "symbol",
             "symbol": {
-              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
               "language": "rust",
               "name": "beacon",
               "kind": "function",
@@ -111,7 +111,7 @@
             "end": 44
           },
           "line": 2,
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs"
         },
         {
           "view": {
@@ -1669,7 +1669,7 @@
       "target": "symbol",
       "include": ["source"]
     },
-    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\tpub fn beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405 \u00b7 expires 2026-10-12T16:01:30.993123+00:00\n",
+    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency rift://revision/cargo/crates.io/demo@1.0.0\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\tpub fn beacon() {}\n3 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\nview aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405 \u00b7 expires 2026-10-12T16:01:30.993123+00:00\n",
     "json": {
       "view": {
         "id": "aabd1ca9d9cf576674866bdabbe164721917b5640b11be8ede7f2d403ee6e405",
@@ -1684,7 +1684,7 @@
           "hit": {
             "target": "symbol",
             "symbol": {
-              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
               "language": "rust",
               "name": "beacon",
               "kind": "function",
@@ -1707,7 +1707,7 @@
             "end": 44
           },
           "line": 2,
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs"
         }
       ],
       "pagination": {
@@ -1761,7 +1761,7 @@
       "target": "symbol",
       "include": ["source"]
     },
-    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency demo@1.0.0\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\n\tpub fn beacon() {}\n4 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\n\tpackage_substituted \u00b7 entry demo@1.1.0 (cargo) \u00b7 package demo@1.0.0 (cargo)\nview 1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058 \u00b7 expires 2026-10-12T16:01:30.999711+00:00\n",
+    "text": "1 result\n\tfunction beacon\n\trift://source/cargo/crates.io/demo/src/lib.rs:2 \u00b7 name \u00b7 view aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z \u00b7 dependency rift://revision/cargo/crates.io/demo@1.0.0\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\n\tpub fn beacon() {}\n4 warnings\n\tpackage_requirement_absent \u00b7 entry typescript >=0 (npm)\n\tpackage_requirement_absent \u00b7 entry node >=0 (stdlib)\n\tpackage_requirement_absent \u00b7 entry rust >=0 (stdlib)\n\tpackage_substituted \u00b7 entry demo@1.1.0 (cargo) \u00b7 package demo@1.0.0 (cargo)\nview 1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058 \u00b7 expires 2026-10-12T16:01:30.999711+00:00\n",
     "json": {
       "view": {
         "id": "1296f4f78cde6a430d2acafc95b5a618ff90a19e0aefa7470440e6933df26058",
@@ -1776,7 +1776,7 @@
           "hit": {
             "target": "symbol",
             "symbol": {
-              "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
               "language": "rust",
               "name": "beacon",
               "kind": "function",
@@ -1799,7 +1799,7 @@
             "end": 44
           },
           "line": 2,
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs"
+          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs"
         }
       ],
       "pagination": {
@@ -1856,14 +1856,14 @@
   "global-symbol-documentation": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+      "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
       "include": ["documentation"]
     },
-    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon\n\tdependency demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo@1.0.0/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo@1.0.0/src/lib.rs:2\n\t\t26..44\nrevision rift://revision/cargo/crates.io/demo@1.0.0\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction beacon\n\trift://symbol/cargo/crates.io/demo/rust/demo/beacon\n\tdependency rift://revision/cargo/crates.io/demo@1.0.0\n\n\tdocumentation:\n\t\trift://source/cargo/crates.io/demo/README.md:1\n\t\t\tguide\n\n\tdeclarations:\n\t\trift://source/cargo/crates.io/demo/src/lib.rs:2\n\t\t26..44\nrevision rift://revision/cargo/crates.io/demo@1.0.0\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+        "id": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
         "language": "rust",
         "name": "beacon",
         "kind": "function",
@@ -1895,7 +1895,7 @@
             },
             "source_kind": "authored"
           },
-          "unit": "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs",
+          "unit": "rift://source/cargo/crates.io/demo/src/lib.rs",
           "range": {
             "start": 26,
             "end": 44
@@ -1913,7 +1913,7 @@
             "reference": {
               "identity": "5555555555555555555555555555555555555555555555555555555555555555",
               "block": "1111111111111111111111111111111111111111111111111111111111111111",
-              "target": "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
+              "target": "rift://symbol/cargo/crates.io/demo/rust/demo/beacon",
               "range": {
                 "start": 1,
                 "end": 7
@@ -1927,7 +1927,7 @@
                 "source": {
                   "source": {
                     "kind": "package",
-                    "unit": "rift://source/cargo/crates.io/demo@1.0.0/README.md"
+                    "unit": "rift://source/cargo/crates.io/demo/README.md"
                   }
                 },
                 "content_digest": "2222222222222222222222222222222222222222222222222222222222222222",
@@ -1942,7 +1942,7 @@
                 "identity": {
                   "source": {
                     "kind": "package",
-                    "unit": "rift://source/cargo/crates.io/demo@1.0.0/README.md"
+                    "unit": "rift://source/cargo/crates.io/demo/README.md"
                   }
                 },
                 "revision": "3333333333333333333333333333333333333333333333333333333333333333",
@@ -1974,13 +1974,13 @@
   "source-less-runtime": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile"
+      "id": "rift://symbol/stdlib/node/javascript/fs/readFile"
     },
-    "text": "\tfunction readFile\n\trift://symbol/stdlib/node@26.11.1/javascript/fs/readFile\n\tstdlib node@26.11.1\nrevision rift://revision/stdlib/node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction readFile\n\trift://symbol/stdlib/node/javascript/fs/readFile\n\tstdlib rift://revision/stdlib/node@26.11.1\nrevision rift://revision/stdlib/node@26.11.1\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFile",
+        "id": "rift://symbol/stdlib/node/javascript/fs/readFile",
         "language": "javascript",
         "name": "readFile",
         "kind": "function",
@@ -2004,13 +2004,13 @@
   "source-less-builtin": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len"
+      "id": "rift://symbol/stdlib/cpython/python/builtins/len"
     },
-    "text": "\tfunction len\n\trift://symbol/stdlib/cpython@3.12.9/python/builtins/len\n\tsynthetic\nrevision rift://revision/stdlib/cpython@3.12.9\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction len\n\trift://symbol/stdlib/cpython/python/builtins/len\n\tsynthetic\nrevision rift://revision/stdlib/cpython@3.12.9\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
+        "id": "rift://symbol/stdlib/cpython/python/builtins/len",
         "language": "python",
         "name": "len",
         "kind": "function",
@@ -2029,13 +2029,13 @@
   "multi-declaration-full": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format"
+      "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:1\n\t\t0..46\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+        "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
         "language": "typescript",
         "name": "format",
         "kind": "function",
@@ -2067,7 +2067,7 @@
             },
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
           "range": {
             "start": 0,
             "end": 46
@@ -2088,7 +2088,7 @@
             },
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
           "range": {
             "start": 47,
             "end": 93
@@ -2104,14 +2104,14 @@
   "multi-declaration-first": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+      "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
       "declaration_limit": 1
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:1\n\t\t0..46\n\tdeclaration_cursor fixture-next\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+        "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
         "language": "typescript",
         "name": "format",
         "kind": "function",
@@ -2143,7 +2143,7 @@
             },
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
           "range": {
             "start": 0,
             "end": 46
@@ -2160,16 +2160,16 @@
   "multi-declaration-next": {
     "tool": "get_symbol",
     "arguments": {
-      "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+      "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
       "declaration_limit": 1,
       "declaration_cursor": "fixture-next",
       "view": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     },
-    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format\n\tdependency prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
+    "text": "\tfunction format\n\trift://symbol/npm/npmjs.org/prettier/typescript/prettier/format\n\tdependency rift://revision/npm/npmjs.org/prettier@3.8.5\n\n\tdeclarations:\n\t\trift://source/npm/npmjs.org/prettier/index.d.ts:2\n\t\t47..93\nrevision rift://revision/npm/npmjs.org/prettier@3.8.5\nview aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \u00b7 expires 2099-10-10T10:05:00Z\n",
     "json": {
       "outcome": "found",
       "symbol": {
-        "id": "rift://symbol/npm/npmjs.org/prettier@3.8.5/typescript/prettier/format",
+        "id": "rift://symbol/npm/npmjs.org/prettier/typescript/prettier/format",
         "language": "typescript",
         "name": "format",
         "kind": "function",
@@ -2201,7 +2201,7 @@
             },
             "source_kind": "authored"
           },
-          "unit": "rift://source/npm/npmjs.org/prettier@3.8.5/index.d.ts",
+          "unit": "rift://source/npm/npmjs.org/prettier/index.d.ts",
           "range": {
             "start": 47,
             "end": 93

@@ -4,8 +4,8 @@ use rmcp::model::{CallToolRequestParams, CallToolResponse};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-const SYMBOL: &str = "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon";
-const UNIT: &str = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+const SYMBOL: &str = "rift://symbol/cargo/crates.io/demo/rust/demo/beacon";
+const UNIT: &str = "rift://source/cargo/crates.io/demo/src/lib.rs";
 const ENDPOINT: &str = "https://rift.test";
 
 async fn answer_project(
@@ -143,7 +143,7 @@ async fn interleaved_profiles_keep_dependency_aliases_missing_and_source_views()
         assert_eq!(held.structured_content.as_ref(), Some(original));
         let wrong = CallToolRequestParams::new("get_symbol").with_arguments(
             serde_json::from_value(json!({
-                "id":"rift://symbol/cargo/crates.io/other@1.0.0/rust/other/beacon","view":view.id
+                "id":"rift://symbol/cargo/crates.io/other/rust/other/beacon","view":view.id
             }))?,
         );
         assert!(proxy.captured_read(&wrong).await.is_err());

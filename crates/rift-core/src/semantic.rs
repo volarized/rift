@@ -1331,8 +1331,8 @@ mod tests {
     fn test_source_less_identity_anchors_keep_owner_and_language() {
         for address in [
             "rift://symbol/local/rust/Beacon",
-            "rift://symbol/stdlib/rust@1.98.0/rust/core/Beacon",
-            "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+            "rift://symbol/stdlib/rust/rust/core/Beacon",
+            "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
         ] {
             let identity = SymbolId::new(address).expect("canonical identity");
             let contribution = Contribution::builder(

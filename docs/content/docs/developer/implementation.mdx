@@ -1457,8 +1457,9 @@ starts, as beside a distribution's `rustc`, `rustc --version` runs directly.
 
 One package's source reaches the global index through package analysis in `rift-analysis`, which
 holds no I/O: it takes bytes a caller already read, parses them with the shipped syntax
-providers, places each file under `rift://source/<manager>/<name>@<version>/<path>`, assembles
-the declarations, and renders one `PackagePublication`. That publication is the logical package
+providers, places each file under `rift://source/<manager>/<registry>/<name>/<path>`, assembles
+the declarations, and renders one `PackagePublication` that carries the analyzed release as its
+`revision`. That publication is the logical package
 index global ingestion consumes. The local server runs no package analysis; its package facts
 come from the global index.
 

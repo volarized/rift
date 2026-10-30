@@ -47,13 +47,11 @@ fn local_scope_renderer_refuses_released_invalid_and_overbound_owners() {
     for owner in [
         SymbolOwner::Runtime {
             runtime: "rust".to_owned(),
-            version: "1.98.1".to_owned(),
         },
         SymbolOwner::Package {
             manager: "npm".to_owned(),
             registry: "registry.npmjs.org".to_owned(),
             name: "beacon".to_owned(),
-            version: "1.0.0".to_owned(),
         },
         SymbolOwner::NamedLocal {
             name: "Cloud".to_owned(),

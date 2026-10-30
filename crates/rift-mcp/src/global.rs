@@ -450,6 +450,40 @@ impl GlobalState {
     }
 }
 
+/// The release a package read selects when its request names no `revision`: the one exact
+/// version the workspace's dependency context pins for that package, from a lockfile or the
+/// `[dependencies]` package list, the release its own build reads.
+///
+/// Absent for a runtime owner, a package the context pins no version of, and one pinned at
+/// several versions; the global API then answers the newest release it collected.
+pub(crate) fn workspace_release(
+    context: &DependencyContext,
+    owner: &rift_protocol::identity::SymbolOwner,
+) -> Option<rift_protocol::revision::Revision> {
+    let rift_protocol::identity::SymbolOwner::Package {
+        manager,
+        registry,
+        name,
+    } = owner
+    else {
+        return None;
+    };
+    let mut versions = context
+        .entries()
+        .iter()
+        .filter(|entry| {
+            &entry.manager == manager
+                && &entry.name == name
+                && entry.registry.as_ref() == Some(registry)
+        })
+        .filter_map(|entry| entry.version.as_deref());
+    let version = versions.next()?;
+    if versions.any(|other| other != version) {
+        return None;
+    }
+    rift_protocol::revision::Revision::release(owner, version).ok()
+}
+
 /// Asks the global API which declaration holds each callee's position, one request per
 /// position encoding the walk's engines counted in.
 ///
@@ -507,8 +541,8 @@ pub(crate) async fn callee_declarations(
                 position,
                 id,
                 kind,
+                revision,
                 view,
-                ..
             } = result
             else {
                 continue;
@@ -520,10 +554,15 @@ pub(crate) async fn callee_declarations(
             }
             let key = CalleePosition {
                 unit: position.unit.as_str().to_owned(),
+                revision: position
+                    .revision
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
                 line: position.line,
                 character: position.character,
             };
-            named.insert((encoding.clone(), key), (id, kind, view));
+            named.insert((encoding.clone(), key), (id, kind, revision, view));
         }
         if selected.is_none() {
             break;
@@ -546,7 +585,7 @@ async fn captured_callee_source(
         let Some(held) = callee.captured_source() else {
             continue;
         };
-        let Some(origin) = callee_origin(callee) else {
+        let Some((origin, release)) = callee_release(callee) else {
             continue;
         };
         let Ok(unit) = rift_core::SourceUnitId::for_origin(&origin, callee.path()) else {
@@ -560,13 +599,15 @@ async fn captured_callee_source(
         let CalleePackage::Runtime(runtime) = callee.package() else {
             return Ok(false);
         };
-        if parsed
-            .ok()
-            .is_none_or(|identity| runtime.owner().ok().as_ref() != Some(identity.owner()))
+        if position.revision.as_ref() != Some(&release)
+            || parsed
+                .ok()
+                .is_none_or(|identity| runtime.owner().ok().as_ref() != Some(identity.owner()))
         {
             return Ok(false);
         }
-        if let Some(matched) = verified.get(id.as_str()) {
+        let verified_key = format!("{} {release}", id.as_str());
+        if let Some(matched) = verified.get(&verified_key) {
             return Ok(*matched);
         }
         let request = rift_protocol::read::NodesParams {
@@ -574,8 +615,9 @@ async fn captured_callee_source(
             ..rift_protocol::read::NodesParams::of(id.clone())
         };
         let answer = client.nodes(&request).await?;
-        let matched = declared_nodes_match(&answer, id, &position.unit, view, held);
-        verified.insert(id.as_str().to_owned(), matched);
+        let matched = answer.revision == release
+            && declared_nodes_match(&answer, id, &position.unit, view, held);
+        verified.insert(verified_key, matched);
         return Ok(matched);
     }
     Ok(true)
@@ -651,7 +693,10 @@ fn batched_positions(
     let mut requests: Vec<FindDeclarationsParams> = Vec::new();
     let mut asked = HashSet::new();
     for (position_encoding, key) in positions {
-        let Ok(unit) = rift_protocol::read::SourceUnitId::parse(&key.unit) else {
+        let (Ok(unit), Ok(revision)) = (
+            rift_protocol::read::SourceUnitId::parse(&key.unit),
+            rift_protocol::revision::Revision::parse(&key.revision),
+        ) else {
             continue;
         };
         let encoding = match position_encoding {
@@ -677,6 +722,7 @@ fn batched_positions(
         }
         request.positions.push(SourcePosition {
             unit,
+            revision: Some(revision),
             line: key.line,
             character: key.character,
         });
@@ -687,15 +733,30 @@ fn batched_positions(
 /// The exact physical source origin established by the callee's installed root.
 /// Unversioned standard libraries establish no released source identity.
 fn callee_origin(callee: &PackageCallee) -> Option<rift_protocol::read::SourceLocation> {
+    callee_release(callee).map(|(origin, _)| origin)
+}
+
+/// The callee's physical source origin and the release whose bytes hold it; `None` for an
+/// unversioned standard library or a version its ecosystem does not spell canonically.
+fn callee_release(
+    callee: &PackageCallee,
+) -> Option<(
+    rift_protocol::read::SourceLocation,
+    rift_protocol::revision::Revision,
+)> {
     match callee.package() {
-        CalleePackage::Installed(package) => {
-            Some(rift_protocol::read::SourceLocation::Dependency {
+        CalleePackage::Installed(package) => Some((
+            rift_protocol::read::SourceLocation::Dependency {
                 package: package.clone(),
-            })
-        }
-        CalleePackage::Runtime(runtime) => Some(rift_protocol::read::SourceLocation::Stdlib {
-            runtime: Some(runtime.clone()),
-        }),
+            },
+            package.release().ok()?,
+        )),
+        CalleePackage::Runtime(runtime) => Some((
+            rift_protocol::read::SourceLocation::Stdlib {
+                runtime: Some(runtime.clone()),
+            },
+            runtime.release().ok()?,
+        )),
         CalleePackage::StandardLibrary(_) => None,
     }
 }
@@ -714,9 +775,11 @@ fn callee_position(
     if !within_bound {
         return None;
     }
+    let (_, revision) = callee_release(callee)?;
     let unit = rift_core::SourceUnitId::for_origin(origin, callee.path()).ok()?;
     Some(CalleePosition {
         unit: unit.to_string(),
+        revision: revision.to_string(),
         line,
         character,
     })
@@ -935,6 +998,7 @@ pub(crate) struct CalleeDeclarations {
         (
             SymbolId,
             ExactKind,
+            rift_protocol::revision::Revision,
             rift_protocol::symbol_read::CapturedView,
         ),
     >,
@@ -944,6 +1008,7 @@ pub(crate) struct CalleeDeclarations {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CalleePosition {
     unit: String,
+    revision: String,
     line: u64,
     character: u64,
 }
@@ -955,11 +1020,12 @@ impl CalleeDeclarations {
     pub(crate) fn declaration(&self, callee: &PackageCallee) -> Option<CalleeDeclaration> {
         let origin = callee_origin(callee)?;
         let key = (wire_encoding(callee), callee_position(callee, &origin)?);
-        let (id, kind, view) = self.named.get(&key)?;
+        let (id, kind, revision, view) = self.named.get(&key)?;
         Some(CalleeDeclaration {
             id: id.clone(),
             kind: kind.clone(),
             origin,
+            revision: revision.clone(),
             view: view.clone(),
         })
     }
@@ -2528,6 +2594,52 @@ mod tests {
 
     /// A context whose manifest depends on `count` crates by paths outside the workspace,
     /// and whose Rust standard library probe fails.
+    /// A package read naming no revision reads the one release the dependency context pins
+    /// for that package, and names none when the context pins none or several, or the owner is
+    /// a runtime.
+    #[test]
+    fn a_package_read_without_a_revision_selects_the_one_pinned_release() {
+        use rift_protocol::dependencies::RequestedPackage;
+        use rift_protocol::identity::SymbolOwner;
+        let pinned = |packages: &[(&str, Option<&str>)]| {
+            let requested = packages
+                .iter()
+                .map(|(name, version)| RequestedPackage {
+                    manager: "cargo".to_owned(),
+                    registry: Some("crates.io".to_owned()),
+                    name: (*name).to_owned(),
+                    version: version.map(str::to_owned),
+                })
+                .collect::<Vec<_>>();
+            DependencyContext::default().with_requested(&requested, rift_dependency::PACKAGES_MAX)
+        };
+        let owner = SymbolOwner::Package {
+            manager: "cargo".to_owned(),
+            registry: "crates.io".to_owned(),
+            name: "demo".to_owned(),
+        };
+        let release = |context: &DependencyContext, owner: &SymbolOwner| {
+            super::workspace_release(context, owner).map(|revision| revision.to_string())
+        };
+        assert_eq!(
+            release(&pinned(&[("demo", Some("1.0.0"))]), &owner).as_deref(),
+            Some("rift://revision/cargo/crates.io/demo@1.0.0")
+        );
+        let several = pinned(&[("demo", Some("1.0.0")), ("demo", Some("2.0.0"))]);
+        assert_eq!(several.entries().len(), 2, "{:?}", several.entries());
+        for context in [
+            pinned(&[("demo", None)]),
+            pinned(&[("other", Some("1.0.0"))]),
+            several,
+        ] {
+            assert_eq!(release(&context, &owner), None, "{:?}", context.entries());
+        }
+        let runtime = SymbolOwner::Runtime {
+            runtime: "cpython".to_owned(),
+        };
+        assert_eq!(release(&pinned(&[("demo", Some("1.0.0"))]), &runtime), None);
+    }
+
     fn context_with_path_dependencies(count: usize) -> Arc<DependencyContext> {
         use std::fmt::Write as _;
 
@@ -2660,7 +2772,8 @@ mod tests {
 
     fn position(name: &str, line: u64) -> super::CalleePosition {
         super::CalleePosition {
-            unit: format!("rift://source/pypi/pypi.org/{name}@1.0.0/{name}/core.py"),
+            unit: format!("rift://source/pypi/pypi.org/{name}/{name}/core.py"),
+            revision: format!("rift://revision/pypi/pypi.org/{name}@1.0.0"),
             line,
             character: 4,
         }
@@ -2917,7 +3030,7 @@ mod tests {
         use rift_protocol::read::{Pagination, ReadWarning, SearchHit, SearchParams, SearchResult};
         use serde_json::json;
 
-        let unit = "rift://source/cargo/crates.io/demo@1.0.0/src/lib.rs";
+        let unit = "rift://source/cargo/crates.io/demo/src/lib.rs";
         let package = json!({"manager": "cargo", "registry": "crates.io", "name": "demo", "version": "1.0.0"});
         let hit = |value: serde_json::Value| -> SearchHit {
             serde_json::from_value(value).expect("search hit fixture")
@@ -2930,7 +3043,7 @@ mod tests {
         };
         let declaration = hit(json!({
             "hit": {"target": "symbol", "symbol": {
-                "id": "rift://symbol/rust/cargo/demo@1.0.0/src/lib.rs/helper_beacon",
+                "id": "rift://symbol/rust/cargo/demo/src/lib.rs/helper_beacon",
                 "language": "rust", "name": "helper_beacon", "kind": "function",
                 "origin": {"location": "dependency", "package": package, "source_kind": "authored"}
             }},
@@ -3024,8 +3137,8 @@ mod captured_runtime_tests {
     use rift_protocol::read::{NodesResult, SymbolId};
     use rift_protocol::symbol_read::CapturedView;
 
-    const ID: &str = "rift://symbol/stdlib/cpython@3.12.3/python/builtins/len";
-    const UNIT: &str = "rift://source/stdlib/cpython@3.12.3/builtins.pyi";
+    const ID: &str = "rift://symbol/stdlib/cpython/python/builtins/len";
+    const UNIT: &str = "rift://source/stdlib/cpython/builtins.pyi";
     const STUB: &str = "x = 1\ndef len(obj): ...\n";
     const DECLARED: &str = "def len(obj): ...";
 
@@ -3082,7 +3195,7 @@ mod captured_runtime_tests {
             Some(ID),
             &[node(
                 0,
-                "rift://source/stdlib/cpython@3.11.3/builtins.pyi",
+                "rift://source/stdlib/cpython/other.pyi",
                 6,
                 DECLARED,
             )],

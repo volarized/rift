@@ -5647,14 +5647,8 @@ done
     #[test]
     fn package_and_runtime_symbols_are_release_symbols_and_project_symbols_are_not() -> TestResult {
         for (id, released) in [
-            (
-                "rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon",
-                true,
-            ),
-            (
-                "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len",
-                true,
-            ),
+            ("rift://symbol/cargo/crates.io/demo/rust/demo/beacon", true),
+            ("rift://symbol/stdlib/cpython/python/builtins/len", true),
             ("rift://symbol/local@sdk/rust/app/beacon", false),
             ("rift://symbol/local/rust/app/beacon", false),
         ] {

@@ -168,7 +168,7 @@ fn resolved_framework_context_then_reappearing_warning_is_shown_again() {
 #[test]
 fn package_symbol_warnings_keep_originating_project_context() {
     let warnings = FrameworkWarnings::default();
-    let answer = missing("cargo/crates.io/beacon@1.0.0", "missing version", "a.rs");
+    let answer = missing("cargo/crates.io/beacon", "missing version", "a.rs");
     assert!(has_framework(
         &warnings.select_result(answer.clone(), "local")
     ));

@@ -358,6 +358,8 @@ pub struct CalleeDeclaration {
     pub kind: ExactKind,
     /// The defining package or runtime release holding the declaration.
     pub origin: rift_core::SourceLocation,
+    /// The release of the declaration's own owner that `id` answers in.
+    pub revision: rift_protocol::revision::Revision,
     /// Immutable global selection that established this declaration.
     pub view: rift_protocol::symbol_read::CapturedView,
 }
@@ -400,40 +402,45 @@ impl PackageCallee {
     /// The symbol a walk's hit for this callee carries, once the global API named its
     /// `declaration`: the name is the engine's, and the kind the one package analysis
     /// stored, as every other hit carries its provider's kind. The logical origin comes
-    /// from the canonical identity. A mapped stub keeps its physical declaration origin
-    /// separately for source reads. `None` for an invalid or local identity.
+    /// from the canonical identity at its answered release. A mapped stub keeps its physical
+    /// declaration origin separately for source reads. `None` for an invalid or local
+    /// identity, or a release of another owner.
     pub(crate) fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
         let CalleeDeclaration {
             id,
             kind,
             origin: _,
+            revision,
             view: _,
         } = declaration;
         let parsed = rift_protocol::identity::SymbolIdentity::parse(id.as_str()).ok()?;
         let language = parsed.language().clone();
+        let version = revision
+            .release_version()
+            .filter(|_| revision.answers_for(parsed.owner()))?
+            .to_owned();
         let origin = match parsed.owner() {
             rift_protocol::identity::SymbolOwner::Package {
                 manager,
                 registry,
                 name,
-                version,
             } => SymbolOrigin {
                 location: Some(SourceLocationKind::Dependency),
                 package: Some(PackageIdentity {
                     manager: manager.clone(),
                     registry: registry.clone(),
                     name: name.clone(),
-                    version: version.clone(),
+                    version,
                 }),
                 runtime: None,
                 source_kind: SourceKind::Authored,
             },
-            rift_protocol::identity::SymbolOwner::Runtime { runtime, version } => SymbolOrigin {
+            rift_protocol::identity::SymbolOwner::Runtime { runtime } => SymbolOrigin {
                 location: Some(SourceLocationKind::Stdlib),
                 package: None,
                 runtime: Some(rift_protocol::read::RuntimeIdentity {
                     runtime: runtime.clone(),
-                    version: version.clone(),
+                    version,
                 }),
                 source_kind: SourceKind::Authored,
             },
@@ -958,8 +965,13 @@ mod tests {
             origin: rift_core::SourceLocation::Dependency {
                 package: package.clone(),
             },
+            revision: package.release().expect("fixture package release"),
             view: captured_view(),
         }
+    }
+
+    fn release(value: &str) -> rift_protocol::revision::Revision {
+        rift_protocol::revision::Revision::parse(value).expect("fixture release")
     }
 
     fn captured_view() -> rift_protocol::symbol_read::CapturedView {
@@ -978,7 +990,7 @@ mod tests {
             CalleePackage::Installed(greeting.clone()),
             "greeting/core.py",
         );
-        let id = "rift://symbol/pypi/pypi.org/greeting@1.0.0/python/greeting/core/greet";
+        let id = "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet";
         let symbol = held
             .symbol(&declaration(id, "function", &greeting))
             .ok_or("the id names a language")?;
@@ -1002,7 +1014,7 @@ mod tests {
                 package: greeting.clone()
             })
             .map(|unit| unit.0),
-            Some("rift://source/pypi/pypi.org/greeting@1.0.0/greeting/core.py".to_owned())
+            Some("rift://source/pypi/pypi.org/greeting/greeting/core.py".to_owned())
         );
 
         let python = rift_core::SourceLocation::Stdlib {
@@ -1015,12 +1027,13 @@ mod tests {
             CalleePackage::StandardLibrary(StandardLibrary::Python),
             "builtins.pyi",
         );
-        let len = "rift://symbol/stdlib/cpython@3.12.9/python/builtins/len";
+        let len = "rift://symbol/stdlib/cpython/python/builtins/len";
         let symbol = stub
             .symbol(&CalleeDeclaration {
                 id: SymbolId(len.to_owned()),
                 kind: ExactKind("class".to_owned()),
                 origin: python.clone(),
+                revision: release("rift://revision/stdlib/cpython@3.12.9"),
                 view: captured_view(),
             })
             .ok_or("the id names a language")?;
@@ -1047,12 +1060,13 @@ mod tests {
         let physical = rift_core::SourceLocation::Dependency {
             package: package.clone(),
         };
-        let runtime_id = "rift://symbol/stdlib/python@3.14.3/python/sys/getsizeof";
+        let runtime_id = "rift://symbol/stdlib/python/python/sys/getsizeof";
         let symbol = held
             .symbol(&CalleeDeclaration {
                 id: SymbolId(runtime_id.to_owned()),
                 kind: ExactKind("function".to_owned()),
                 origin: physical.clone(),
+                revision: release("rift://revision/stdlib/python@3.14.3"),
                 view: captured_view(),
             })
             .ok_or("canonical runtime identity")?;
@@ -1068,35 +1082,48 @@ mod tests {
         );
         assert_eq!(
             held.unit(&physical).map(|unit| unit.0),
-            Some("rift://source/pypi/pypi.org/runtime-stubs@1.0.0/sys.pyi".to_owned())
+            Some("rift://source/pypi/pypi.org/runtime-stubs/sys.pyi".to_owned())
         );
 
         let runtime = rift_core::SourceLocation::Stdlib {
             runtime: symbol.origin.runtime.clone(),
         };
-        let package_id = "rift://symbol/pypi/pypi.org/runtime-stubs@1.0.0/python/helpers/size";
+        let package_id = "rift://symbol/pypi/pypi.org/runtime-stubs/python/helpers/size";
         let inverse = held
             .symbol(&CalleeDeclaration {
                 id: SymbolId(package_id.to_owned()),
                 kind: ExactKind("function".to_owned()),
                 origin: runtime.clone(),
+                revision: package.release()?,
                 view: captured_view(),
             })
             .ok_or("canonical package identity")?;
-        assert_eq!(inverse.origin.package, Some(package));
+        assert_eq!(inverse.origin.package, Some(package.clone()));
         assert_eq!(inverse.origin.runtime, None);
         assert_eq!(
             held.unit(&runtime).map(|unit| unit.0),
-            Some("rift://source/stdlib/python@3.14.3/sys.pyi".to_owned())
+            Some("rift://source/stdlib/python/sys.pyi".to_owned())
         );
         assert!(
             held.symbol(&CalleeDeclaration {
                 id: SymbolId("rift://symbol/local/python/helpers/size".to_owned()),
                 kind: ExactKind("function".to_owned()),
-                origin: runtime,
+                origin: runtime.clone(),
+                revision: release("rift://revision/stdlib/python@3.14.3"),
                 view: captured_view(),
             })
             .is_none()
+        );
+        assert!(
+            held.symbol(&CalleeDeclaration {
+                id: SymbolId(runtime_id.to_owned()),
+                kind: ExactKind("function".to_owned()),
+                origin: runtime,
+                revision: package.release()?,
+                view: captured_view(),
+            })
+            .is_none(),
+            "an answered release of another owner names no origin"
         );
         Ok(())
     }
@@ -1119,12 +1146,13 @@ mod tests {
             }),
             "std/src/fs.rs",
         );
-        let id = "rift://symbol/stdlib/rustc@1.98.1/rust/std/fs/read_to_string";
+        let id = "rift://symbol/stdlib/rustc/rust/std/fs/read_to_string";
         let symbol = held
             .symbol(&CalleeDeclaration {
                 id: SymbolId(id.to_owned()),
                 kind: ExactKind("function".to_owned()),
                 origin: rust.clone(),
+                revision: release("rift://revision/stdlib/rustc@1.98.1"),
                 view: captured_view(),
             })
             .ok_or("the id names a language")?;
@@ -1136,7 +1164,7 @@ mod tests {
         assert_eq!(wire["language"], "rust");
         assert_eq!(
             held.unit(&rust).map(|unit| unit.0),
-            Some("rift://source/stdlib/rustc@1.98.1/std/src/fs.rs".to_owned())
+            Some("rift://source/stdlib/rustc/std/src/fs.rs".to_owned())
         );
         Ok(())
     }

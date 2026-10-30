@@ -408,7 +408,10 @@ fn starts_with_word(text: &str, word: &str) -> bool {
 
 /// The location kind and package or runtime of an origin that is not the project default.
 ///
-/// The default is a project declaration without a package; its facts are not written.
+/// A dependency or runtime release is written as its release revision, the value a read's
+/// `revision` takes, as `rift://revision/cargo/crates.io/serde@1.0.0`; the project's own
+/// package is written as `name@version`, since no read selects it by release. The default is
+/// a project declaration without a package; its facts are not written.
 fn origin_fact(origin: &SymbolOrigin) -> Result<String, TextError> {
     let SymbolOrigin {
         location,
@@ -424,17 +427,24 @@ fn origin_fact(origin: &SymbolOrigin) -> Result<String, TextError> {
     if let Some(location) = shown_location {
         parts.push(wire_name(location)?);
     }
-    if let Some(PackageIdentity {
-        manager: _,
-        registry: _,
-        name,
-        version,
-    }) = package
-    {
-        parts.push(quoted_value(&format!("{name}@{version}")).into_owned());
+    if let Some(package) = package {
+        let PackageIdentity { name, version, .. } = package;
+        let release = package
+            .release()
+            .ok()
+            .filter(|_| location != &Some(SourceLocationKind::Project))
+            .map_or_else(
+                || format!("{name}@{version}"),
+                |release| release.to_string(),
+            );
+        parts.push(quoted_value(&release).into_owned());
     }
     if let Some(runtime) = runtime {
-        parts.push(quoted_value(&format!("{}@{}", runtime.runtime, runtime.version)).into_owned());
+        let release = runtime.release().map_or_else(
+            |_| format!("{}@{}", runtime.runtime, runtime.version),
+            |release| release.to_string(),
+        );
+        parts.push(quoted_value(&release).into_owned());
     }
     Ok(parts.join(" "))
 }

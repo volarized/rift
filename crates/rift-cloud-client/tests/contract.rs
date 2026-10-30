@@ -421,7 +421,7 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
             let result =
                 serde_json::from_value::<rift_protocol::symbol_read::GetSymbolResult>(value)?;
             let identity = rift_protocol::read::SymbolId::parse(
-                "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon",
+                "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
             )?;
             assert!(result.is_valid_for(&identity));
         }

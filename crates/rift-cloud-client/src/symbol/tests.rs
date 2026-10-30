@@ -6,9 +6,9 @@ use rift_protocol::{
 };
 use serde_json::{Value, json};
 
-const ID: &str = "rift://symbol/cargo/crates.io/tokio@1.50.0/rust/tokio/Beacon";
+const ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon";
 const RELEASE: &str = "rift://revision/cargo/crates.io/tokio@1.50.0";
-const OTHER_ID: &str = "rift://symbol/cargo/crates.io/tokio@1.49.0/rust/tokio/Beacon";
+const OTHER_ID: &str = "rift://symbol/cargo/crates.io/tokio/rust/tokio/Other";
 
 fn error_field<'error>(error: &'error RiftError, key: &str) -> Option<&'error str> {
     error.fields().iter().find_map(|field| {
@@ -59,7 +59,7 @@ fn declaration(end: usize) -> Value {
         "origin": {"location": "dependency", "source_kind": "authored", "package": {
             "manager": "cargo", "registry": "crates.io", "name": "tokio", "version": "1.50.0"
         }},
-        "unit": "rift://source/cargo/crates.io/tokio@1.50.0/src/lib.rs",
+        "unit": "rift://source/cargo/crates.io/tokio/src/lib.rs",
         "range": {"start": 0, "end": end},
         "line": 1,
         "signature_indices": [],
@@ -100,6 +100,20 @@ fn exact_answer_rejects_a_different_release_or_captured_view() {
         symbol.id = Some(rift_protocol::read::SymbolId::parse(OTHER_ID).expect("identity"));
     }
     assert!(!valid_result(&request, &result, 100));
+    request.revision = Some(revision("rift://revision/cargo/crates.io/tokio@1.49.0"));
+    assert!(
+        !valid_result(&request, &found(Vec::new()), 100),
+        "an answer reads the release the request named"
+    );
+    request.revision = Some(revision(RELEASE));
+    assert!(valid_result(&request, &found(Vec::new()), 100));
+    let mut stale = serde_json::to_value(found(Vec::new())).expect("found");
+    stale["symbol"]["origin"]["package"]["version"] = json!("1.49.0");
+    let stale: GetSymbolResult = serde_json::from_value(stale).expect("stale origin");
+    assert!(
+        !valid_result(&request, &stale, 100),
+        "the symbol's origin names the answered release"
+    );
     request.view =
         Some(rift_protocol::symbol_read::CapturedViewId::parse(&"b".repeat(64)).expect("view"));
     assert!(!valid_result(&request, &found(Vec::new()), 100));
@@ -114,7 +128,7 @@ fn exact_answer_enforces_projection_and_declaration_bounds() {
     let result = found(vec![declaration(18)]);
     assert!(valid_result(&request, &result, 100));
     let mut foreign = declaration(18);
-    foreign["unit"] = json!("rift://source/cargo/crates.io/tokio@1.49.0/src/lib.rs");
+    foreign["unit"] = json!("rift://source/cargo/crates.io/other/src/lib.rs");
     assert!(!valid_result(&request, &found(vec![foreign]), 100));
     request.declaration_limit = 1;
     let result = found(vec![declaration(18), declaration(14)]);
@@ -146,13 +160,18 @@ fn request_rejects_local_owners_revision_and_unbound_continuation() {
         &validate_request(&request).expect_err("revision"),
         "revision",
     );
-    request.revision = Some(revision("rift://revision/cargo/crates.io/tokio@1.49.0"));
+    request.revision = Some(revision("rift://revision/cargo/crates.io/serde@1.0.228"));
     assert_request_field(
-        &validate_request(&request).expect_err("release"),
+        &validate_request(&request).expect_err("release of another package"),
         "revision",
     );
-    request.revision = Some(revision("rift://revision/cargo/crates.io/tokio@1.50.0"));
-    assert!(validate_request(&request).is_ok());
+    for release in [
+        "rift://revision/cargo/crates.io/tokio@1.49.0",
+        "rift://revision/cargo/crates.io/tokio@1.50.0",
+    ] {
+        request.revision = Some(revision(release));
+        assert!(validate_request(&request).is_ok(), "{release}");
+    }
 }
 
 #[test]
@@ -259,7 +278,7 @@ fn exact_response_keeps_service_problem_separate_from_unavailable() {
 }
 
 fn documented_result() -> Value {
-    let content = json!({"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/tokio@1.50.0/README.md"}});
+    let content = json!({"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/tokio/README.md"}});
     let mut result = serde_json::to_value(found(vec![declaration(18)])).expect("found");
     result["documentation"] = json!({
         "documentation_revision": "0123abcd", "truncated": false,
@@ -295,6 +314,14 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
     let source_less = serde_json::from_value(source_less).expect("source-less documented symbol");
     assert!(valid_result(&request, &source_less, 5));
     assert!(!valid_result(&request, &source_less, 4));
+    let mut intrinsic = original.clone();
+    intrinsic["declarations"] = json!([]);
+    intrinsic["symbol"]["origin"] = json!({"source_kind": "synthetic"});
+    let intrinsic = serde_json::from_value(intrinsic).expect("synthetic documented symbol");
+    assert!(
+        !valid_result(&request, &intrinsic, 100),
+        "package documentation needs the answered release in the symbol's origin"
+    );
     for (pointer, changed) in [
         (
             "/documentation/references/0/reference/target",
@@ -315,7 +342,7 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
         ),
         (
             "/documentation/references/0/documentation/source/identity/source/unit",
-            json!("rift://source/cargo/crates.io/tokio@1.49.0/README.md"),
+            json!("rift://source/cargo/crates.io/other/README.md"),
         ),
         (
             "/documentation/references/0/documentation/source/revision",
@@ -329,7 +356,7 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
         ("/declarations/0/origin/package/version", json!("1.49.0")),
         (
             "/declarations/0/unit",
-            json!("rift://source/cargo/crates.io/tokio@1.49.0/src/lib.rs"),
+            json!("rift://source/cargo/crates.io/other/src/lib.rs"),
         ),
     ] {
         let mut changed_result = original.clone();
@@ -350,7 +377,7 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
     ));
     let mut warning = original;
     warning["documentation"]["warnings"] = json!([{
-        "source": {"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/tokio@1.49.0/README.md"}},
+        "source": {"source": {"kind": "package", "unit": "rift://source/cargo/crates.io/other/README.md"}},
         "stage": "source", "kind": "source_unavailable", "count": 1
     }]);
     assert!(!valid_result(
@@ -366,8 +393,8 @@ fn canonical_documentation_keeps_original_associations_and_refuses_tampered_fact
 
 #[test]
 fn canonical_runtime_documentation_preserves_exact_runtime_source_owner() {
-    let id = "rift://symbol/stdlib/node@26.11.1/javascript/fs/readFileSync";
-    let unit = "rift://source/stdlib/node@26.11.1/doc/api/fs.md";
+    let id = "rift://symbol/stdlib/node/javascript/fs/readFileSync";
+    let unit = "rift://source/stdlib/node/doc/api/fs.md";
     let mut value = documented_result();
     value["symbol"]["id"] = json!(id);
     value["symbol"]["language"] = json!("javascript");

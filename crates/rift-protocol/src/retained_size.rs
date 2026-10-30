@@ -25,25 +25,16 @@ impl GetSize for crate::identity::SymbolOwner {
                 manager,
                 registry,
                 name,
-                version,
             } => {
                 let (manager, tracker) = manager.get_heap_size_with_tracker(tracker);
                 let (registry, tracker) = registry.get_heap_size_with_tracker(tracker);
                 let (name, tracker) = name.get_heap_size_with_tracker(tracker);
-                let (version, tracker) = version.get_heap_size_with_tracker(tracker);
                 (
-                    manager
-                        .saturating_add(registry)
-                        .saturating_add(name)
-                        .saturating_add(version),
+                    manager.saturating_add(registry).saturating_add(name),
                     tracker,
                 )
             }
-            Self::Runtime { runtime, version } => {
-                let (runtime, tracker) = runtime.get_heap_size_with_tracker(tracker);
-                let (version, tracker) = version.get_heap_size_with_tracker(tracker);
-                (runtime.saturating_add(version), tracker)
-            }
+            Self::Runtime { runtime } => runtime.get_heap_size_with_tracker(tracker),
         }
     }
 }
@@ -552,6 +543,27 @@ mod tests {
         let owner = crate::identity::SymbolOwner::NamedProfileLocal { project, name };
         assert_eq!(owner.get_heap_size(), capacity);
         assert_eq!(owner.get_size(), std::mem::size_of_val(&owner) + capacity);
+    }
+
+    #[test]
+    fn released_owner_material_counts_every_coordinate_capacity() {
+        let held = |text: &str| {
+            let mut value = String::with_capacity(128);
+            value.push_str(text);
+            value
+        };
+        let (manager, registry, name) = (held("cargo"), held("crates.io"), held("demo"));
+        let capacity = manager.capacity() + registry.capacity() + name.capacity();
+        let package = crate::identity::SymbolOwner::Package {
+            manager,
+            registry,
+            name,
+        };
+        assert_eq!(package.get_heap_size(), capacity);
+        let runtime = held("cpython");
+        let capacity = runtime.capacity();
+        let runtime = crate::identity::SymbolOwner::Runtime { runtime };
+        assert_eq!(runtime.get_heap_size(), capacity);
     }
 
     #[test]

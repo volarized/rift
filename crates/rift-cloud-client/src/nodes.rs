@@ -98,7 +98,7 @@ impl GlobalClient {
 
 /// The symbol `request` lists the nodes of, once the request holds the one form the global
 /// API serves: a package or runtime `symbol`, with no `path` or `position`, and no `revision`
-/// other than the release the symbol's identity names.
+/// other than a release of the symbol's owner.
 fn validate_request(request: &NodesParams) -> Result<RequestedSymbol<'_>, RiftError> {
     let invalid =
         |field| failure::request_invalid("validate_request", field, "field failed validation");
@@ -137,9 +137,10 @@ fn is_release_owner(owner: &SymbolOwner) -> bool {
 }
 
 /// Whether `result` answers `request` within `bounds`: every node sits in a source unit of
-/// the symbol's own release and carries the bytes its range spans, the answer reports that
-/// release as its revision and names no other symbol, the page stays within its node and source
-/// bounds, and the view and cursor are the ones the request allows.
+/// the symbol's owner and carries the bytes its range spans, the answer reports a release of
+/// that owner as its revision, the requested one when the request names one, and names no
+/// other symbol, the page stays within its node and source bounds, and the view and cursor
+/// are the ones the request allows.
 fn valid_result(
     request: &NodesParams,
     symbol: &RequestedSymbol<'_>,
@@ -163,7 +164,11 @@ fn valid_result(
     let cursor_valid = result.node_cursor.as_ref().is_none_or(|cursor| {
         !result.nodes.is_empty() && !cursor.is_empty() && cursor.len() <= CURSOR_BYTES_MAX
     });
-    let revision_valid = result.revision.answers_for(&symbol.owner);
+    let revision_valid = result.revision.answers_for(&symbol.owner)
+        && request
+            .revision
+            .as_ref()
+            .is_none_or(|requested| requested == &result.revision);
     let names_symbol = result
         .symbol
         .as_ref()
@@ -177,7 +182,7 @@ fn valid_result(
         && names_symbol
 }
 
-/// Whether `node` is a node of `symbol`: written in a source unit of the symbol's release and
+/// Whether `node` is a node of `symbol`: written in a source unit of the symbol's owner and
 /// carrying exactly as many bytes as its range spans.
 fn valid_node(node: &Node, symbol: &RequestedSymbol<'_>) -> bool {
     let NodeUnit::Source(unit) = &node.unit else {

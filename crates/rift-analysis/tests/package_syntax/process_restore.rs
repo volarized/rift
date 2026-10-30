@@ -328,8 +328,11 @@ fn restored_facts_in_child() {
                 manager: "cargo".into(),
                 registry: "crates.io".into(),
                 name: "beacon".into(),
-                version: "2.0.0".into(),
             }
+        );
+        assert_eq!(
+            restored.publication().revision.to_string(),
+            "rift://revision/cargo/crates.io/beacon@2.0.0"
         );
         assert!(declaration.unit.0.ends_with("/src/moved.rs"));
     }
