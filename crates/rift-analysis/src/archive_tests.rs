@@ -88,9 +88,15 @@ fn identical_zip_members_retain_one_file_after_normalization() -> TestResult {
 fn zip_members_bytes(
     entries: &[(&str, &[u8], tar::EntryType)],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    zip_members_bytes_with_options(entries, zip::write::SimpleFileOptions::default())
+}
+
+fn zip_members_bytes_with_options(
+    entries: &[(&str, &[u8], tar::EntryType)],
+    options: zip::write::SimpleFileOptions,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
     for &(path, content, kind) in entries {
-        let options = zip::write::SimpleFileOptions::default();
         match kind {
             tar::EntryType::Directory => archive.add_directory(path, options)?,
             tar::EntryType::Symlink => archive.add_symlink(path, "target", options)?,
@@ -146,7 +152,7 @@ fn unicode_name_zip(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         extra.extend_from_slice(&0_u32.to_le_bytes());
         extra.extend_from_slice(name.as_bytes());
         let mut options = zip::write::FullFileOptions::default();
-        options.add_extra_data(0x7075, extra, true)?;
+        options.add_extra_field(0x7075, extra, true)?;
         archive.start_file(path, options)?;
         archive.write_all(b"text")?;
     }
@@ -1509,6 +1515,125 @@ fn complete_member_inventory_refuses_file_and_link_parents_in_both_orders() -> T
                 );
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_zip_members_preserve_exact_bytes_for_supported_compression() -> TestResult {
+    let source = "pub fn beacon() { /* λ */ }\r\n".as_bytes();
+    for method in [
+        zip::CompressionMethod::Stored,
+        zip::CompressionMethod::Deflated,
+        zip::CompressionMethod::Zstd,
+    ] {
+        let bytes = zip_members_bytes_with_options(
+            &[("release/src/café.rs", source, tar::EntryType::Regular)],
+            zip::write::SimpleFileOptions::default().compression_method(method),
+        )?;
+        let mut archive = zip::ZipArchive::new(Cursor::new(&bytes))?;
+        assert_eq!(archive.by_index(0)?.compression(), method);
+        let files = read_zip_fixture(&bytes, ArchiveLimits::default())?;
+        assert_eq!(files.files().len(), 1, "{method:?}");
+        assert_eq!(files.files()[&ProjectPath::new("src/café.rs")?], source);
+        assert!(files.skipped_links().is_empty(), "{method:?}");
+        assert_eq!(files.digest(), FileDigest::of(&bytes));
+    }
+    Ok(())
+}
+
+/// One Zstandard frame of `2^(10 + window_exponent)` window bytes around one last raw block.
+///
+/// The descriptor byte sets neither single segment nor a content size, so the window
+/// descriptor alone names the window the decoder allocates.
+fn zstd_frame(window_exponent: u8, content: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x00, window_exponent << 3];
+    let block = (u32::try_from(content.len())? << 3) | 1;
+    frame.extend_from_slice(&block.to_le_bytes()[..3]);
+    frame.extend_from_slice(content);
+    Ok(frame)
+}
+
+/// Stores `frame` under each name, then marks every member Zstandard-compressed with the
+/// CRC-32 and size of `content` in both its local and central headers.
+fn zstd_frame_zip(
+    names: &[&str],
+    frame: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let entries = names
+        .iter()
+        .map(|name| (*name, frame, tar::EntryType::Regular))
+        .collect::<Vec<_>>();
+    let mut bytes = zip_members_bytes_with_options(
+        &entries,
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+    )?;
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes.clone()))?;
+    let crc = rawzip::crc32(content).to_le_bytes();
+    let size = u32::try_from(content.len())?.to_le_bytes();
+    for index in 0..archive.len() {
+        let entry = archive.by_index_raw(index)?;
+        let local = usize::try_from(entry.header_start())?;
+        let central = usize::try_from(entry.central_header_start())?;
+        for (method, crc_offset, size_offset) in [
+            (local + 8, local + 14, local + 22),
+            (central + 10, central + 16, central + 24),
+        ] {
+            bytes[method..method + 2].copy_from_slice(&93_u16.to_le_bytes());
+            bytes[crc_offset..crc_offset + 4].copy_from_slice(&crc);
+            bytes[size_offset..size_offset + 4].copy_from_slice(&size);
+        }
+    }
+    Ok(bytes)
+}
+
+/// Both ZIP readers: one member, and two members whose names repeat after the patch.
+fn zstd_frame_zips(
+    frame: &[u8],
+    content: &[u8],
+) -> Result<[Vec<u8>; 2], Box<dyn std::error::Error>> {
+    let single = zstd_frame_zip(&["release/a"], frame, content)?;
+    let mut repeated = zstd_frame_zip(&["release/a", "release/b"], frame, content)?;
+    replace_zip_name(&mut repeated, b"release/b", b"release/a");
+    Ok([single, repeated])
+}
+
+#[test]
+fn zstd_frames_within_the_member_bound_decode_in_both_zip_readers() -> TestResult {
+    let limits = ArchiveLimits::new(64 * 1024, 64 * 1024, 4096, 16, 200)?;
+    // A 4 KiB window fits the 4 KiB member bound exactly.
+    for bytes in zstd_frame_zips(&zstd_frame(2, b"text")?, b"text")? {
+        let files = read_zip_fixture(&bytes, limits)?;
+        assert_eq!(files.files().len(), 1);
+        assert_eq!(files.files()[&ProjectPath::new("a")?], b"text");
+    }
+    for bytes in zstd_frame_zips(&zstd_frame(2, b"text")?, b"txet")? {
+        assert_eq!(
+            read_zip_fixture(&bytes, limits).expect_err("Zstandard member CRC-32 mismatch"),
+            ArchiveError::InvalidArchive
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn zstd_window_over_the_member_bound_is_refused_before_decoding() -> TestResult {
+    let limits = ArchiveLimits::new(64 * 1024, 64 * 1024, 4096, 16, 200)?;
+    // A 1 MiB window sits under libzstd's default 128 MiB limit and over the 4 KiB bound.
+    for bytes in zstd_frame_zips(&zstd_frame(10, b"text")?, b"text")? {
+        assert_eq!(
+            read_zip_fixture(&bytes, limits).expect_err("Zstandard window over the member bound"),
+            ArchiveError::MemberLimit
+        );
+    }
+    // The default 64 MiB member bound refuses a 1 GiB window the same way.
+    for bytes in zstd_frame_zips(&zstd_frame(20, b"text")?, b"text")? {
+        assert_eq!(
+            read_zip_fixture(&bytes, ArchiveLimits::default())
+                .expect_err("Zstandard window over the default member bound"),
+            ArchiveError::MemberLimit
+        );
     }
     Ok(())
 }

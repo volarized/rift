@@ -5,7 +5,7 @@
 use std::{
     cell::Cell,
     collections::BTreeMap,
-    io::{Cursor, Read, Seek, SeekFrom},
+    io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom},
 };
 
 use crate::input::ArchiveMemberKind;
@@ -413,23 +413,56 @@ fn read_zip(
     }
     let mut output = ArchiveOutput::new(root, limits, expanded_max);
     for index in 0..archive.len() {
-        let mut entry = archive
-            .by_index(index)
-            .map_err(|error| zip_entry_error(&error))?;
+        // zip's own Zstandard decoder accepts libzstd's default window; Zstandard members are
+        // read raw and decoded under the member byte bound instead.
+        let zstd = archive
+            .by_index_raw(index)
+            .map_err(|error| zip_entry_error(&error))?
+            .compression()
+            == zip::CompressionMethod::Zstd;
+        let mut entry = if zstd {
+            archive.by_index_raw(index)
+        } else {
+            archive.by_index(index)
+        }
+        .map_err(|error| zip_entry_error(&error))?;
+        if zstd && entry.encrypted() {
+            return Err(ArchiveError::UnsupportedEntry);
+        }
         let directory = entry.is_dir();
         if zip_member_kind(
             directory,
             entry.is_symlink(),
             entry.unix_mode().unwrap_or(0),
+            entry.external_attributes(),
         )? == ArchiveMemberKind::Link
         {
-            let path = entry.name().to_owned();
+            let path = entry
+                .name()
+                .map_err(|error| zip_entry_error(&error))?
+                .into_owned();
             output.push_skipped_link(&path)?;
             continue;
         }
-        let path = entry.name().to_owned();
+        let path = entry
+            .name()
+            .map_err(|error| zip_entry_error(&error))?
+            .into_owned();
         let size = entry.size();
-        output.push(&path, directory, size, &mut entry)?;
+        if zstd {
+            let expected = entry.crc32();
+            let mut member = ZstdMember::new(BufReader::new(&mut entry), output.limits)?;
+            let mut reader = Crc32Reader {
+                inner: &mut member,
+                crc: rawzip::Crc32::new(),
+                expected,
+            };
+            output
+                .push(&path, directory, size, &mut reader)
+                .map_err(|error| member.refusal(error))?;
+        } else {
+            output.push(&path, directory, size, &mut entry)?;
+        }
     }
     Ok(output.into_files_and_skipped_links())
 }
@@ -549,13 +582,21 @@ fn repeated_zip_member_metadata(
         entry.is_dir(),
         entry.is_symlink(),
         entry.unix_mode().unwrap_or(0),
+        entry.external_attributes(),
     )?;
-    Ok((entry.name().to_owned(), kind))
+    Ok((
+        entry
+            .name()
+            .map_err(|error| zip_entry_error(&error))?
+            .into_owned(),
+        kind,
+    ))
 }
 
 enum ZipCompression {
     Stored,
     Deflate,
+    Zstd,
 }
 
 impl ZipCompression {
@@ -563,6 +604,7 @@ impl ZipCompression {
         match method {
             rawzip::CompressionMethod::STORE => Ok(Self::Stored),
             rawzip::CompressionMethod::DEFLATE => Ok(Self::Deflate),
+            rawzip::CompressionMethod::ZSTD => Ok(Self::Zstd),
             _ => Err(ArchiveError::InvalidArchive),
         }
     }
@@ -591,6 +633,95 @@ fn push_repeated_zip_member(
             let mut reader = local.verifying_reader(decoder);
             output.push(path, directory, size, &mut reader)
         }
+        ZipCompression::Zstd => {
+            let mut member = ZstdMember::new(local.data(), output.limits)?;
+            let mut reader = local.verifying_reader(&mut member);
+            output
+                .push(path, directory, size, &mut reader)
+                .map_err(|error| member.refusal(error))
+        }
+    }
+}
+
+/// `ZSTD_WINDOWLOG_ABSOLUTEMIN`, the smallest window limit libzstd accepts.
+const ZSTD_WINDOW_LOG_MIN: u32 = 10;
+/// `ZSTD_WINDOWLOG_MAX_64`, the largest window limit libzstd accepts on 64-bit targets.
+const ZSTD_WINDOW_LOG_MAX: u32 = 31;
+
+/// Decodes one Zstandard member with a window no wider than the member byte bound.
+///
+/// Each frame header names the window its decoder allocates, and libzstd refuses a header
+/// whose window exceeds `window_log_max` before allocating it. No accepted member needs a
+/// window wider than the member byte bound, so the decoder window stays below twice that bound.
+struct ZstdMember<R: BufRead> {
+    decoder: zstd::stream::read::Decoder<'static, R>,
+    window_refused: bool,
+}
+
+impl<R: BufRead> ZstdMember<R> {
+    fn new(reader: R, limits: ArchiveLimits) -> Result<Self, ArchiveError> {
+        let window_log = limits
+            .member_bytes
+            .checked_next_power_of_two()
+            .map_or(ZSTD_WINDOW_LOG_MAX, usize::trailing_zeros)
+            .clamp(ZSTD_WINDOW_LOG_MIN, ZSTD_WINDOW_LOG_MAX);
+        let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        decoder
+            .window_log_max(window_log)
+            .map_err(|_| ArchiveError::InvalidArchive)?;
+        Ok(Self {
+            decoder,
+            window_refused: false,
+        })
+    }
+
+    /// Names a frame window over the member byte bound as the member limit it is.
+    fn refusal(&self, error: ArchiveError) -> ArchiveError {
+        if self.window_refused {
+            ArchiveError::MemberLimit
+        } else {
+            error
+        }
+    }
+}
+
+impl<R: BufRead> Read for ZstdMember<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.decoder.read(buffer).inspect_err(|error| {
+            self.window_refused |= error.to_string() == zstd_window_refusal();
+        })
+    }
+}
+
+/// libzstd's name for a frame whose window exceeds the decoder's `window_log_max`.
+///
+/// The zstd crate reports a libzstd failure by this name alone. libzstd encodes error `code`
+/// as `(size_t)-code`, the form its name lookup takes.
+fn zstd_window_refusal() -> &'static str {
+    let code = zstd::zstd_safe::zstd_sys::ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge;
+    zstd::zstd_safe::get_error_name(0_usize.wrapping_sub(code as usize))
+}
+
+/// Refuses a member whose decoded bytes end with a CRC-32 other than its recorded one, as
+/// zip's own member reader does.
+struct Crc32Reader<'a, R> {
+    inner: &'a mut R,
+    crc: rawzip::Crc32,
+    expected: u32,
+}
+
+impl<R: Read> Read for Crc32Reader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read == 0 && self.crc.checksum() != self.expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ZIP member CRC-32 mismatch",
+            ));
+        }
+        self.crc.update(buffer.get(..read).unwrap_or_default());
+        Ok(read)
     }
 }
 
@@ -598,8 +729,12 @@ fn zip_member_kind(
     directory: bool,
     symlink: bool,
     mode: u32,
+    external_attributes: u32,
 ) -> Result<ArchiveMemberKind, ArchiveError> {
-    if symlink {
+    // Nonzero high attributes contain Unix mode, including archives created on Windows.
+    let unix_mode = external_attributes >> 16;
+    let mode = if unix_mode == 0 { mode } else { unix_mode };
+    if symlink || mode & 0o120_000 == 0o120_000 {
         return Ok(ArchiveMemberKind::Link);
     }
     let file_type = mode & 0o170_000;
@@ -613,7 +748,7 @@ fn zip_member_kind(
     })
 }
 
-/// zip 8.6 refuses to open an encrypted member without a password before the entry exists, so
+/// zip refuses to open an encrypted member without a password before the entry exists, so
 /// the refusal itself is where an encrypted member is recognized.
 fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
     match error {
@@ -624,7 +759,7 @@ fn zip_entry_error(error: &zip::result::ZipError) -> ArchiveError {
     }
 }
 
-// zip 8.6 allocates its central-directory Vec before exposing `len()`. Its fixed-size
+// zip decodes central-directory members before exposing `len()`. Its fixed-size
 // EOCD reads are 22 bytes (ZIP32) and 56 bytes (ZIP64), including the signature. Refuse
 // declared counts at that read boundary, before the library can reserve member storage.
 // Container interpretation and all field decoding remain in zip; this guard only bounds
