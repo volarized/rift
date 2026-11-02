@@ -6,13 +6,13 @@ requires-python = ">=3.12"
 dependencies = [
     "jsonschema==4.26.0",
     "mcp==2.3.0",
-    "opentelemetry-proto==1.45.1",
+    "opentelemetry-proto==1.45.2",
     "psutil==7.2.2",
     "pywin32==312; sys_platform == 'win32'",
     "typer==0.27.3",
-    "pydantic==2.14.1",
-    "dulwich==1.2.19",
-    "starlette==1.9.0",
+    "pydantic==2.14.2",
+    "dulwich==1.2.20",
+    "starlette==1.10.0",
     "uvicorn==0.54.0",
 ]
 
@@ -28,8 +28,8 @@ packages = ["src/rift_dev"]
 
 [dependency-groups]
 dev = [
-    "ruff==0.17.2",
-    "ty==0.0.91",
+    "ruff==0.17.3",
+    "ty==0.0.95",
     "types-pywin32==312.0.0.20261024",
     "pre-commit==4.7.0",
     "tree-sitter==0.26.0",
