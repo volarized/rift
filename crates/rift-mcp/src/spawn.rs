@@ -41,9 +41,8 @@ pub const START_POLL_ATTEMPT_COUNT: u32 = 300;
 /// A spawned server loses the start election whenever its claim meets any
 /// lock on the election file, a probe's shared lock included: Windows
 /// releases a closed handle's locks lazily, so a probe that already let go
-/// can still hold one. A loss that leaves the election unheld is that case,
-/// and the start spawns again. The count bounds the spawns when something
-/// keeps such a lock for longer; the rest of the start window then passes
+/// can still hold one. A lost child is replaced once a new exclusive claim
+/// can proceed. If the count is spent, the rest of the start window passes
 /// as a wait.
 pub const START_SPAWN_COUNT_MAX: u32 = 4;
 
@@ -503,13 +502,11 @@ pub enum SpawnPollOutcome<Adopted, Failure> {
     /// The spawned server exited before it started serving, for a reason
     /// other than a lost election, and no process holds the election.
     Failed(Failure),
-    /// The spawned server lost the start election, no process holds it, and
-    /// the spawn count is not spent: nothing is left to publish, and the
-    /// caller spawns again.
+    /// The spawned server lost the start election, a new claim can proceed,
+    /// and the caller has a spawn left.
     ElectionUnheld,
     /// Nothing decided yet: the spawned server is still starting, or it
-    /// exited while another process holds the election and may still
-    /// publish.
+    /// exited while a lock still blocks another claim.
     Waiting,
 }
 
@@ -551,6 +548,16 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
         self.spawn_count >= START_SPAWN_COUNT_MAX
     }
 
+    /// Whether this start can replace a child that lost the election.
+    #[must_use]
+    pub fn can_replace_lost_child(&self) -> bool {
+        !self.is_spent()
+            && matches!(
+                self.latest,
+                SpawnWatch::Exited(StartExit::LostElection { .. })
+            )
+    }
+
     /// The latest spawn, while the poll has not seen it exit.
     pub fn running(&mut self) -> Option<&mut Spawned> {
         match &mut self.latest {
@@ -563,14 +570,14 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
     /// otherwise the latest spawn's exit, weighed against the election,
     /// decides.
     ///
-    /// `election_held` is what this iteration's probe found. It decides only
-    /// for an exit an earlier iteration observed, so the probe that ends the
-    /// wait or sends the caller to spawn again was read after the server
+    /// `election_blocked` is what this iteration's probes found. It decides
+    /// only for an exit an earlier iteration observed, so the probe that ends
+    /// the wait or sends the caller to spawn again was read after the server
     /// exited.
     pub fn poll<Adopted>(
         &mut self,
         adopted: Option<Adopted>,
-        election_held: bool,
+        election_blocked: bool,
     ) -> SpawnPollOutcome<Adopted, Spawned::Failure> {
         if let Some(adopted) = adopted {
             return SpawnPollOutcome::Ready(adopted);
@@ -583,7 +590,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
                 };
                 SpawnPollOutcome::Waiting
             }
-            SpawnWatch::Exited(exit) if election_held => {
+            SpawnWatch::Exited(exit) if election_blocked => {
                 self.latest = SpawnWatch::Exited(exit);
                 SpawnPollOutcome::Waiting
             }
@@ -599,7 +606,7 @@ impl<Spawned: StartedServer> StartSpawns<Spawned> {
             SpawnWatch::Exited(StartExit::LostElection { .. }) => {
                 rift_tracing::info!(
                     component = "mcp",
-                    "no process holds the election the spawned server lost; spawning again"
+                    "the election can be claimed after the spawned server lost; spawning again"
                 );
                 SpawnPollOutcome::ElectionUnheld
             }
