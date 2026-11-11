@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lsp_types::{CallHierarchyItem, Location, Position, Range, Uri};
+use lsp_types::{CallHierarchyOutgoingCall, Location, Position, Range, Uri};
 use rift_core::{ProjectPath, SymbolId as CoreSymbolId};
 use rift_error::errors;
 use rift_index::{IndexedFile, RelationshipStore};
@@ -775,7 +775,7 @@ async fn resolve_symbol_callees(
 /// One outgoing calls answer: each callee the engine named, or the count past the
 /// traversal bound.
 struct CalleeReport {
-    calls: Result<Vec<CallHierarchyItem>, usize>,
+    calls: Result<Vec<CallHierarchyOutgoingCall>, usize>,
     encoding: PositionEncoding,
 }
 
@@ -804,7 +804,7 @@ async fn callees_on_engine(
                 let mut calls = Vec::new();
                 for item in items {
                     let answered = session.outgoing_calls(item).await?;
-                    calls.extend(answered.into_iter().map(|call| call.to));
+                    calls.extend(answered);
                     if calls.len() > TRAVERSAL_NODES_MAX {
                         return Ok(Some(CalleeReport {
                             calls: Err(calls.len()),
@@ -855,7 +855,8 @@ fn map_callees(
         held: Vec::new(),
         dropped: 0,
     };
-    for item in &calls {
+    for call in &calls {
+        let item = &call.to;
         let call = NamedCallee {
             uri: &item.uri,
             name: &item.name,
@@ -887,6 +888,111 @@ fn map_callees(
         }
     }
     Ok(mapped)
+}
+
+/// Calls the engine established for one selected local declaration.
+#[derive(Default)]
+pub struct GraphCalls {
+    /// Canonical callees in the current tree.
+    pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
+    /// Callees in admitted dependency sources, awaiting exact identity resolution.
+    pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
+}
+
+/// Reads every outgoing callee and its physical call sites.
+///
+/// # Errors
+/// Refuses missing readiness, an unaddressed callee, or work outside the accepted bounds.
+pub async fn graph_calls(
+    reads: &ReadService,
+    engines: &EnginePool,
+    roots: &CalleeRoots,
+    caller: &SymbolId,
+    deadline: Instant,
+) -> Result<GraphCalls, RiftError> {
+    let unavailable = || {
+        errors::server::search_coverage_unavailable()
+            .operation("graph calls")
+            .error()
+    };
+    let identity = CoreSymbolId::new(caller.as_str().to_owned()).map_err(|_| unavailable())?;
+    let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
+    let [declaration] = declarations.as_slice() else {
+        return Err(unavailable());
+    };
+    if count != 1 {
+        return Err(unavailable());
+    }
+    let file = declaration.file;
+    let slot = engines
+        .engine_for(file.syntax().language())
+        .ok_or_else(unavailable)?;
+    let request = ReferenceTarget::new(
+        slot.workspace_root(),
+        reads.index().root(),
+        file,
+        declaration.symbol,
+    )?;
+    let answered = Box::pin(callees_on_engine(slot, &request, deadline))
+        .await
+        .map_err(|error| {
+            if error.slug() == errors::lsp::engine_capability_absent::SLUG {
+                unavailable()
+            } else {
+                error
+            }
+        })?;
+    let OutgoingAnswer::Ready(report) = answered else {
+        return Err(unavailable());
+    };
+    let trees = [slot.workspace_root(), reads.index().root()];
+    let source = LineIndex::new(file.source());
+    let unit = crate::read::source_unit_id(file.path());
+    let mut result = GraphCalls::default();
+    let mut locations = 0usize;
+    for call in report.calls.map_err(|_| unavailable())? {
+        let item = &call.to;
+        let mut occurrences = Vec::new();
+        for range in call.from_ranges {
+            locations = locations
+                .checked_add(1)
+                .filter(|count| *count <= TRAVERSAL_NODES_MAX)
+                .ok_or_else(unavailable)?;
+            let start = source.byte_offset(report.encoding, range.start)?;
+            let end = source.byte_offset(report.encoding, range.end)?;
+            if file.source().get(start..end).is_none() {
+                return Err(unavailable());
+            }
+            occurrences.push(SourceUnitSpan {
+                unit: unit.clone(),
+                range: TextRange {
+                    start: start as u64,
+                    end: end as u64,
+                },
+            });
+        }
+        let at = NamedCallee {
+            uri: &item.uri,
+            name: &item.name,
+            position: item.selection_range.start,
+            encoding: report.encoding,
+        };
+        match callee_file(roots, &trees, &identity, at)? {
+            CalleeFile::Project(path) => {
+                let target = project_declaration(
+                    reads,
+                    &path,
+                    (item.selection_range, report.encoding),
+                    "graph calls",
+                )?
+                .ok_or_else(unavailable)?;
+                result.local.push((target, occurrences));
+            }
+            CalleeFile::Package(callee) => result.packages.push((callee, occurrences)),
+            CalleeFile::Unaddressed => return Err(unavailable()),
+        }
+    }
+    Ok(result)
 }
 
 async fn resolve_symbol_references(
@@ -1477,16 +1583,19 @@ mod tests {
     }
 
     /// One call hierarchy item naming `name` at `location`.
-    fn item(location: Location, name: &str) -> lsp_types::CallHierarchyItem {
-        lsp_types::CallHierarchyItem {
-            name: name.to_owned(),
-            kind: lsp_types::SymbolKind::FUNCTION,
-            tags: None,
-            detail: None,
-            uri: location.uri,
-            range: location.range,
-            selection_range: location.range,
-            data: None,
+    fn item(location: Location, name: &str) -> lsp_types::CallHierarchyOutgoingCall {
+        lsp_types::CallHierarchyOutgoingCall {
+            to: lsp_types::CallHierarchyItem {
+                name: name.to_owned(),
+                kind: lsp_types::SymbolKind::FUNCTION,
+                tags: None,
+                detail: None,
+                uri: location.uri,
+                range: location.range,
+                selection_range: location.range,
+                data: None,
+            },
+            from_ranges: Vec::new(),
         }
     }
 

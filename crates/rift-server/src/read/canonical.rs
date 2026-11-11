@@ -85,13 +85,11 @@ impl LocalSymbolViewInput {
     pub fn project_symbols(
         &self,
         selection: rift_search::sparql::SymbolSelection<'_>,
-        limits: rift_search::sparql::GraphLimits,
+        dataset: &mut rift_search::sparql::GraphDatasetBuilder,
         cancellation: &rift_search::sparql::QueryCancellation,
         deadline: std::time::Instant,
-    ) -> Result<rift_search::sparql::GraphDataset, RiftError> {
-        use rift_search::sparql::{
-            GraphDataset, GraphFact, RevisionIri, SymbolAddress, SymbolSelection,
-        };
+    ) -> Result<(), RiftError> {
+        use rift_search::sparql::{GraphFact, RevisionIri, SymbolAddress, SymbolSelection};
 
         if !self.ready {
             return errors::server::search_coverage_unavailable()
@@ -101,24 +99,11 @@ impl LocalSymbolViewInput {
         let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
             .map_err(|error| material_error("decode captured metadata", &error))?;
         let revision = RevisionIri::parse(&metadata.revision.to_string())?;
-        let mut dataset = GraphDataset::builder(limits);
         let index = &self.material.index;
-        let check = || {
-            if cancellation.is_cancelled() {
-                return errors::search::query_cancelled().fail();
-            }
-            if std::time::Instant::now() >= deadline {
-                let timeout_ms =
-                    u64::try_from(limits.evaluation_timeout().as_millis()).unwrap_or(u64::MAX);
-                return errors::search::query_deadline_exceeded()
-                    .timeout_ms(timeout_ms)
-                    .fail();
-            }
-            Ok(())
-        };
+        let check = || check_graph_projection(cancellation, deadline);
         let mut write = |symbol: &rift_index::ReadableSymbol, address: SymbolAddress<'_>| {
             let facts = symbol.facts();
-            if matches!(selection, SymbolSelection::Named(name) if name != facts.name()) {
+            if !matches_symbol(selection, address, facts.name()) {
                 return Ok(());
             }
             dataset.insert(GraphFact::SymbolDetails {
@@ -135,6 +120,9 @@ impl LocalSymbolViewInput {
             let identity = rift_protocol::read::SymbolId(identity.as_str().to_owned());
             write(symbol?, SymbolAddress::Established(&identity))?;
         }
+        if matches!(selection, SymbolSelection::Identified(_)) {
+            return check();
+        }
         for symbol in index.unestablished_objects() {
             check()?;
             let symbol = symbol?;
@@ -148,8 +136,72 @@ impl LocalSymbolViewInput {
                 SymbolAddress::Unestablished(contribution.reference()),
             )?;
         }
-        check()?;
-        Ok(dataset.build())
+        check()
+    }
+
+    /// Projects the revision-pinned syntax read of each selected canonical declaration.
+    ///
+    /// # Errors
+    /// Returns a syntax read or graph admission refusal before completing the projection.
+    pub fn project_nodes(
+        &self,
+        reads: &ReadService,
+        selection: rift_search::sparql::NodeSelection<'_>,
+        dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+        cancellation: &rift_search::sparql::QueryCancellation,
+        deadline: std::time::Instant,
+    ) -> Result<(), RiftError> {
+        use rift_protocol::read::{NodesParams, SymbolId};
+        use rift_search::sparql::{GraphFact, NodeAddress, NodeFact, NodeLocation, SymbolAddress};
+
+        self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
+        for (identity, symbol) in self.material.index.objects() {
+            check_graph_projection(cancellation, deadline)?;
+            let id = SymbolId(identity.as_str().to_owned());
+            if !matches_symbol(
+                selection.symbols,
+                SymbolAddress::Established(&id),
+                symbol?.facts().name(),
+            ) {
+                continue;
+            }
+            let mut request = NodesParams::of(id.clone());
+            loop {
+                check_graph_projection(cancellation, deadline)?;
+                let page = reads.nodes(&request)?;
+                for node in page.nodes {
+                    let Some(declaration) = node.declaration else {
+                        continue;
+                    };
+                    let address = |index| NodeAddress::Declaration {
+                        symbol: &id,
+                        declaration,
+                        index,
+                    };
+                    dataset.insert(GraphFact::Node(NodeFact {
+                        address: address(node.index),
+                        kind: &node.kind.0,
+                        language: &node.language,
+                        parent: node.parent.map(address),
+                        location: Some(NodeLocation {
+                            unit: &node.unit,
+                            range: &node.range,
+                        }),
+                        source: selection.source.then_some(node.source.as_str()),
+                    }))?;
+                }
+                let Some(cursor) = page.node_cursor else {
+                    break;
+                };
+                if request.node_cursor.as_ref() == Some(&cursor) {
+                    return errors::server::search_coverage_unavailable()
+                        .operation("graph syntax nodes")
+                        .fail();
+                }
+                request.node_cursor = Some(cursor);
+            }
+        }
+        Ok(())
     }
 
     /// Root of the immutable publication admitted by this input.
@@ -456,6 +508,39 @@ fn invalid(field: &'static str, violation: &'static str) -> RiftError {
         .field(field)
         .violation(violation)
         .error()
+}
+
+fn matches_symbol(
+    selection: rift_search::sparql::SymbolSelection<'_>,
+    address: rift_search::sparql::SymbolAddress<'_>,
+    name: &str,
+) -> bool {
+    use rift_search::sparql::{SymbolAddress, SymbolSelection};
+    match selection {
+        SymbolSelection::All => true,
+        SymbolSelection::Named(selected) => selected == name,
+        SymbolSelection::Identified(selected) => {
+            matches!(address, SymbolAddress::Established(id) if selected == id.as_str())
+        }
+    }
+}
+
+fn check_graph_projection(
+    cancellation: &rift_search::sparql::QueryCancellation,
+    deadline: std::time::Instant,
+) -> Result<(), RiftError> {
+    if cancellation.is_cancelled() {
+        return errors::search::query_cancelled().fail();
+    }
+    if std::time::Instant::now() >= deadline {
+        return errors::search::query_deadline_exceeded()
+            .timeout_ms(
+                u64::try_from(rift_search::sparql::EVALUATION_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX),
+            )
+            .fail();
+    }
+    Ok(())
 }
 
 impl ReadService {

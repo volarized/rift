@@ -44,6 +44,7 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
     if query.dataset().is_some() {
         return refused("a FROM or FROM NAMED clause");
     }
+    let describes = matches!(query, Query::Describe(_));
     let mut joined = Joined::default();
     let root = match query {
         Query::Select(select) => &mut select.expression,
@@ -54,7 +55,10 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
         }
         Query::Describe(describe) => &mut describe.pattern,
     };
-    let mut admission = Admission::default();
+    let mut admission = Admission {
+        reads_base: describes,
+        ..Admission::default()
+    };
     let mut pending = Pending::from(Visit::Pattern(root));
     while let Some(visit) = pending.next(limits)? {
         match visit {

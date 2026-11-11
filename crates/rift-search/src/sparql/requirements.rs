@@ -3,7 +3,9 @@
 use oxrdf::vocab::rdf;
 use rift_protocol::read::{RelationshipFacet, SymbolId, TraversalDirection};
 use spargebra::Query;
-use spargebra::algebra::{Expression, OrderExpression, PropertyPathExpression, QueryExpression};
+use spargebra::algebra::{
+    AggregateExpression, Expression, OrderExpression, PropertyPathExpression, QueryExpression,
+};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
 use super::{GraphQuery, VOCABULARY_NAMESPACE};
@@ -15,6 +17,17 @@ pub enum SymbolSelection<'query> {
     All,
     /// Captured symbols with this exact name.
     Named(&'query str),
+    /// One established canonical identity.
+    Identified(&'query str),
+}
+
+/// Captured syntax nodes for the selected physical declarations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeSelection<'query> {
+    /// The logical symbols whose declarations supply the nodes.
+    pub symbols: SymbolSelection<'query>,
+    /// Whether the pattern requests exact node source text.
+    pub source: bool,
 }
 
 /// The complete adjacency selected by an anchored query.
@@ -40,10 +53,87 @@ impl GraphQuery {
     /// An expression that may inspect other facts requires the full acquisition path.
     #[must_use]
     pub fn symbol_selection(&self) -> Option<SymbolSelection<'_>> {
+        if let Query::Describe(query) = self.query()
+            && let QueryExpression::Extend {
+                inner,
+                expression: Expression::NamedNode(target),
+                ..
+            } = &query.pattern
+            && matches!(inner.as_ref(), QueryExpression::Bgp { patterns } if patterns.is_empty())
+            && rift_protocol::identity::SymbolIdentity::parse(target.as_str())
+                .ok()?
+                .owner()
+                .is_local()
+        {
+            return Some(SymbolSelection::Identified(target.as_str()));
+        }
         let QueryExpression::Bgp { patterns } = query_pattern(self.query())? else {
             return None;
         };
         symbol_patterns(patterns)
+    }
+
+    /// Proves that a graph pattern needs only the syntax nodes of selected declarations.
+    #[must_use]
+    pub fn node_selection(&self) -> Option<NodeSelection<'_>> {
+        let QueryExpression::Bgp { patterns } = query_pattern(self.query())? else {
+            return None;
+        };
+        let owner = patterns
+            .iter()
+            .find(|triple| property(triple) == Some("of"))?;
+        if !patterns.iter().any(|triple| {
+            triple.subject == owner.subject
+                && (property(triple) == Some("index") || is_class(triple, "Node"))
+        }) {
+            return None;
+        }
+        let ranges = patterns
+            .iter()
+            .filter(|triple| triple.subject == owner.subject && property(triple) == Some("range"))
+            .map(|triple| &triple.object)
+            .collect::<Vec<_>>();
+        let mut name = None;
+        let mut source = false;
+        for triple in patterns {
+            let predicate = property(triple);
+            if triple.subject == owner.subject {
+                match predicate {
+                    Some("of") if triple == owner => {}
+                    Some("source") => source = true,
+                    Some("range" | "index" | "declaration" | "kind" | "language") => {}
+                    _ if is_class(triple, "Node") => {}
+                    _ => return None,
+                }
+            } else if triple.subject == owner.object {
+                match predicate {
+                    Some("name") => {
+                        if let TermPattern::Literal(value) = &triple.object {
+                            name = Some(value.value());
+                        }
+                    }
+                    Some("kind" | "language" | "revision") => {}
+                    _ if is_symbol_class(triple) => {}
+                    _ => return None,
+                }
+            } else if !ranges.contains(&&triple.subject)
+                || !matches!(predicate, Some("unit" | "start" | "end"))
+            {
+                return None;
+            }
+        }
+        let symbols = if let TermPattern::NamedNode(node) = &owner.object {
+            let identity = rift_protocol::identity::SymbolIdentity::parse(node.as_str()).ok()?;
+            if !identity.owner().is_local() {
+                return None;
+            }
+            SymbolSelection::Identified(node.as_str())
+        } else if let Some(name) = name {
+            SymbolSelection::Named(name)
+        } else {
+            SymbolSelection::All
+        };
+        Some(NodeSelection { symbols, source })
     }
 
     /// Finds a statically anchored path or physical usage selection.
@@ -66,7 +156,7 @@ impl GraphQuery {
             match expression {
                 QueryExpression::Bgp { patterns } => triples.extend(patterns),
                 QueryExpression::Join { left, right } => {
-                    expressions.extend([left.as_ref(), right.as_ref()])
+                    expressions.extend([left.as_ref(), right.as_ref()]);
                 }
                 QueryExpression::Path { subject, path, .. } => locations.push((subject, path)),
                 _ => return None,
@@ -87,14 +177,34 @@ fn query_pattern(query: &Query) -> Option<&QueryExpression> {
         Query::Select(query) => &query.expression,
         Query::Ask(query) => &query.expression,
         Query::Construct(query) => &query.expression,
-        Query::Describe(_) => return None,
+        Query::Describe(query) => &query.pattern,
     };
     loop {
         expression = match expression {
             QueryExpression::Project { inner, .. }
             | QueryExpression::Distinct { inner }
             | QueryExpression::Reduced { inner }
-            | QueryExpression::Slice { inner, .. } => inner,
+            | QueryExpression::Slice { inner, .. }
+            | QueryExpression::Extend {
+                inner,
+                expression: Expression::Variable(_),
+                ..
+            } => inner,
+            QueryExpression::Group {
+                inner, aggregates, ..
+            } if aggregates.iter().all(|(_, aggregate)| {
+                matches!(
+                    aggregate,
+                    AggregateExpression::CountSolutions { .. }
+                        | AggregateExpression::FunctionCall {
+                            expr: Expression::Variable(_),
+                            ..
+                        }
+                )
+            }) =>
+            {
+                inner
+            }
             QueryExpression::OrderBy { inner, expression }
                 if expression.iter().all(|item| {
                     matches!(
@@ -313,7 +423,7 @@ fn uniform_path(path: &PropertyPathExpression) -> Option<(RelationshipFacet, boo
                     work.extend([Work::Closure, Work::Visit(path, reversed)]);
                 }
                 PropertyPathExpression::ZeroOrOnePath(path) => {
-                    work.push(Work::Visit(path, reversed))
+                    work.push(Work::Visit(path, reversed));
                 }
                 PropertyPathExpression::Nps(_) => return None,
             },
@@ -369,6 +479,10 @@ fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
 }
 
 fn is_symbol_class(pattern: &TriplePattern) -> bool {
+    is_class(pattern, "Symbol")
+}
+
+fn is_class(pattern: &TriplePattern, name: &str) -> bool {
     matches!(&pattern.predicate, NamedNodePattern::NamedNode(predicate) if predicate.as_str() == rdf::TYPE.as_str())
-        && matches!(&pattern.object, TermPattern::NamedNode(class) if class.as_str().strip_prefix(VOCABULARY_NAMESPACE) == Some("Symbol"))
+        && matches!(&pattern.object, TermPattern::NamedNode(class) if class.as_str().strip_prefix(VOCABULARY_NAMESPACE) == Some(name))
 }

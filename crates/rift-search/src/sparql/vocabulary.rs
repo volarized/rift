@@ -165,6 +165,10 @@ impl VocabularyProperty {
 
     /// The table row: what the property connects and what one triple states.
     #[must_use]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "One table defines the domain and range of every predicate."
+    )]
     pub const fn definition(self) -> PropertyDefinition {
         use VocabularyResource::{Range, Statement};
         use VocabularyValue::{Integer, OneOf, Resource, String};

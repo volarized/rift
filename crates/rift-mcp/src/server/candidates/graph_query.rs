@@ -119,7 +119,10 @@ impl RiftMcp {
                 }
                 Err(error) => return Err(read_failure(error)),
             }
-        } else if query.symbol_selection().is_some() || !query.reads_base() {
+        } else if query.symbol_selection().is_some()
+            || query.node_selection().is_some()
+            || !query.reads_base()
+        {
             AcquiredAdjacency::default()
         } else {
             return Ok(Json(query_unavailable(
@@ -165,8 +168,8 @@ impl RiftMcp {
             deadline.at(),
             self.blocking.run("graph query", move || {
                 let input = reads.local_search_view_input(true)?;
-                let dataset = if let Some(selected) = &selected {
-                    let mut dataset = GraphDataset::builder(limits);
+                let mut dataset = GraphDataset::builder(limits);
+                if let Some(selected) = &selected {
                     if let Err(error) = acquired.project(&mut dataset, selected, &input) {
                         if lacks_coverage(&error) {
                             return Ok(query_unavailable(
@@ -175,22 +178,26 @@ impl RiftMcp {
                         }
                         return Err(error);
                     }
-                    dataset.build()
-                } else if !query.reads_base() {
-                    let mut dataset = GraphDataset::builder(limits);
-                    for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
-                        dataset.insert_retrieval(selection, result)?;
-                    }
-                    dataset.build()
-                } else {
-                    let selection = query.symbol_selection().ok_or_else(retention_failure)?;
-                    input.project_symbols(
+                } else if let Some(selection) = query.node_selection() {
+                    input.project_nodes(
+                        &reads,
                         selection,
-                        limits,
+                        &mut dataset,
                         &cancellation,
                         deadline.at().into_std(),
-                    )?
-                };
+                    )?;
+                } else if let Some(selection) = query.symbol_selection() {
+                    input.project_symbols(
+                        selection,
+                        &mut dataset,
+                        &cancellation,
+                        deadline.at().into_std(),
+                    )?;
+                }
+                for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
+                    dataset.insert_retrieval(selection, result)?;
+                }
+                let dataset = dataset.build();
                 let answer: QueryAnswer = dataset.evaluate(&query, &cancellation)?.into();
                 let views = views.get().ok_or_else(retention_failure)?;
                 let root = input.root().to_owned();
@@ -216,21 +223,14 @@ impl RiftMcp {
                     if cancellation.is_cancelled() {
                         return errors::search::query_cancelled().fail();
                     }
-                    let (saved, bytes, page) = SavedQuery::encoded(
+                    response = Some(responses.store_query(
                         &root,
                         &owner,
                         &view,
                         &answer,
                         &configuration,
                         warnings,
-                    )?;
-                    let maximum = usize::try_from(configuration.page_limit.bytes())
-                        .map_err(|_| page_failure())?;
-                    if encoded_size(&page)? > maximum {
-                        return Err(page_failure());
-                    }
-                    responses.save_query(&saved, &bytes)?;
-                    response = Some(page);
+                    )?);
                     Ok(true)
                 })?;
                 response.ok_or_else(retention_failure)
@@ -710,24 +710,58 @@ mod tests {
         assert!(bindings.iter().all(|binding| matches!(
             &binding["text"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "beacon"
         )));
+        let count = server
+            .graph_query(QueryParams {
+                query: format!(
+                    "SELECT (COUNT(?usage) AS ?n) {{ <{}> :usages ?usage }}",
+                    id.as_str()
+                ),
+                language: Default::default(),
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(count, QueryReadResult::Results(ref result)
+            if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "4"))),
+            "{count:?}"
+        );
+
+        let evidence = server.graph_query(QueryParams {
+            query: format!("SELECT ?source ?unit {{ ?node :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
+            language: Default::default(),
+        }).await.map_err(|failure| format!("{failure:?}"))?.0;
+        assert!(
+            matches!(evidence, QueryReadResult::Results(ref result)
+            if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if matches!(&bindings[0]["unit"], rift_protocol::query::RdfTerm::Iri { value } if value == "rift://source/project/helper.py")
+                && matches!(&bindings[0]["source"], rift_protocol::query::RdfTerm::Literal { value, .. } if value.contains("return 7")))),
+            "{evidence:?}"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn graph_query_walks_three_exact_remote_hops_in_one_captured_view() -> TestResult {
+    async fn graph_query_walks_three_hops_across_exact_releases_in_one_captured_view() -> TestResult
+    {
         use axum::routing::{get, post};
         use serde_json::{Value, json};
 
         const ROOT: &str = "rift://symbol/cargo/crates.io/demo/rust/root";
         const A: &str = "rift://symbol/cargo/crates.io/demo/rust/a";
-        const B: &str = "rift://symbol/cargo/crates.io/demo/rust/b";
-        const C: &str = "rift://symbol/cargo/crates.io/demo/rust/c";
+        const B: &str = "rift://symbol/cargo/crates.io/dependency/rust/b";
+        const C: &str = "rift://symbol/cargo/crates.io/dependency/rust/c";
         const VIEW: &str = "7acfa78d70b3a8211b44149026dbab4c5f28bbf93240d7817235d3722481069d";
 
         fn response(value: Value) -> impl axum::response::IntoResponse {
             ([("content-type", "application/json")], value.to_string())
         }
 
+        let expires = jiff::Timestamp::now()
+            .checked_add(jiff::Span::new().minutes(2))?
+            .to_string();
+        let endpoint_expiry = expires.clone();
         let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
         let requests = Arc::clone(&seen);
         let app = axum::Router::new()
@@ -757,6 +791,7 @@ mod tests {
             }))
             .route("/rift/v1/search", post(move |bytes: axum::body::Bytes| {
                 let requests = Arc::clone(&requests);
+                let expires = endpoint_expiry.clone();
                 async move {
                     let request: Value = serde_json::from_slice(&bytes).expect("valid raw relationship request");
                     let seed = request["relationships"]["seeds"][0].as_str().unwrap_or_default();
@@ -777,7 +812,7 @@ mod tests {
                         }]}],
                         "symbols":[symbol(seed),symbol(next)],
                         "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
-                        "view":{"id":VIEW,"expires_at":"2099-01-01T00:00:00Z"}
+                        "view":{"id":VIEW,"expires_at":expires}
                     });
                     requests.lock().await.push(request);
                     response(result)
@@ -792,7 +827,8 @@ mod tests {
             directory.path(),
             &format!(
                 "[global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n\n\
-                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'demo'\nversion = '1.0.0'\n"
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'demo'\nversion = '1.0.0'\n\n\
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'dependency'\nversion = '2.0.0'\n"
             ),
         )?;
         let root = directory.path().canonicalize()?;
@@ -829,6 +865,10 @@ mod tests {
             )
             .into());
         };
+        assert_eq!(
+            result.view.as_ref().map(|view| view.expires_at.as_str()),
+            Some(expires.as_str())
+        );
         let QueryAnswer::Bindings { bindings, .. } = result.answer else {
             return Err("expected call bindings".into());
         };
@@ -840,10 +880,11 @@ mod tests {
         assert_eq!(seen.len(), 3);
         assert!(seen[0].get("view").is_none());
         assert!(seen[1..].iter().all(|request| request["view"] == VIEW));
-        assert!(
-            seen.iter()
-                .all(|request| request["packages"][0]["version"] == "1.0.0")
-        );
+        assert!(seen.iter().all(|request| request["packages"]
+            == json!([
+                {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"},
+                {"manager":"cargo","registry":"crates.io","name":"dependency","version":"2.0.0"}
+            ])));
         Ok(())
     }
 
