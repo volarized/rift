@@ -7,9 +7,11 @@
 //! form for maps to nothing, so the steer lets it through without a deny. Sans-I/O: every
 //! path arrives classified as a [`GrepPath`], which the shell probes.
 
+use std::fmt::Write as _;
+
 use ignore::types::TypesBuilder;
-use rift_protocol::read::{PAGE_LIMIT_MAX, PathPattern, SearchParamsTarget};
-use serde::Serialize;
+use rift_protocol::query::{QueryLanguage, QueryParams};
+use rift_protocol::read::{PAGE_LIMIT_MAX, PathPattern};
 use serde_json::Value;
 
 /// UTF-8 bytes of the caller's own regex a deny reason carries. A longer `Grep` pattern
@@ -190,14 +192,40 @@ impl GrepRequest {
         }
         let include = included(&self.selected_globs()?, paths)?;
         let (limit, page_index) = paging(self.head_limit, self.offset)?;
-        let suggestion = SearchSuggestion {
-            pattern,
-            paths: (!include.is_empty()).then_some(SuggestedPaths { include }),
-            target: self.files_only.then_some(SearchParamsTarget::File),
-            limit,
-            page_index,
+        let pattern = serde_json::to_string(&pattern).ok()?;
+        let mut selection = format!("?hit :pattern {pattern}; :index ?index; :path ?path");
+        if !include.is_empty() {
+            let paths = serde_json::json!({"include": include}).to_string();
+            let paths = paths.replace('\\', "\\\\").replace('\'', "\\'");
+            write!(
+                selection,
+                "; :paths '{paths}'^^<http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON>"
+            )
+            .ok()?;
+        }
+        if let Some(limit) = limit {
+            write!(selection, "; :limit {limit}").ok()?;
+        }
+        if let Some(page_index) = page_index {
+            write!(selection, "; :page_index {page_index}").ok()?;
+        }
+        let projection = if self.files_only {
+            selection.push_str("; :target 'file' .");
+            "?path"
+        } else {
+            selection.push_str(
+                " . OPTIONAL { ?hit :symbol ?symbol } OPTIONAL { ?hit :line ?line } \
+                 OPTIONAL { ?hit :start ?start; :end ?end } OPTIONAL { ?hit :source ?source }",
+            );
+            "?path ?symbol ?line ?start ?end ?source"
         };
-        let rendered = serde_json::to_string(&suggestion).ok()?;
+        let query =
+            format!("SELECT {projection} {{ SERVICE :search {{ {selection} }} }} ORDER BY ?index");
+        let rendered = serde_json::to_string(&QueryParams {
+            query,
+            language: QueryLanguage::Sparql,
+        })
+        .ok()?;
         (rendered.len() <= SUGGESTION_BYTES_MAX).then_some(rendered)
     }
 
@@ -262,26 +290,6 @@ fn paging(head_limit: Option<u64>, offset: Option<u64>) -> Option<(Option<u64>, 
     }
 }
 
-/// The `search` arguments one `Grep` call maps to, in the `search` schema's field order.
-#[derive(Debug, Serialize)]
-struct SearchSuggestion {
-    pattern: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    paths: Option<SuggestedPaths>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target: Option<SearchParamsTarget>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    page_index: Option<u64>,
-}
-
-/// The `paths` selector a suggestion carries: `include` alone.
-#[derive(Debug, Serialize)]
-struct SuggestedPaths {
-    include: Vec<PathPattern>,
-}
-
 /// Splits one `Grep` `glob` as Claude Code 2.1.280 does before passing each piece to
 /// `rg --glob`: on whitespace, then on commas, except that a piece holding both `{` and `}`
 /// stays whole.
@@ -333,7 +341,8 @@ fn count(value: &Value) -> Option<u64> {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use rift_protocol::read::SearchParams;
+    use rift_protocol::query::QueryParams;
+    use rift_search::sparql::{GraphLimits, GraphQuery};
     use serde_json::{Value, json};
 
     use super::{
@@ -341,13 +350,12 @@ pub(super) mod tests {
         SUGGESTION_BYTES_MAX, grep_globs,
     };
 
-    /// Proves one suggestion is a `search` call the server takes: it deserializes into
-    /// `SearchParams`, which refuses an unknown field, and validates against the served
-    /// `search` input schema. Returns the arguments as JSON.
+    /// Validates the served schema and parses the query with the server's admission rules.
+    /// Returns the selected producer's nondefault inputs for comparison.
     pub(in crate::steer) fn served_search_call(suggestion: &str) -> Value {
         let arguments: Value = serde_json::from_str(suggestion).expect("a suggestion is JSON");
-        serde_json::from_value::<SearchParams>(arguments.clone())
-            .unwrap_or_else(|error| panic!("{suggestion} must be SearchParams: {error}"));
+        let parameters = serde_json::from_value::<QueryParams>(arguments.clone())
+            .unwrap_or_else(|error| panic!("{suggestion} must be QueryParams: {error}"));
         let tools = rift_mcp::schema::tool_listing();
         let search = tools
             .iter()
@@ -363,7 +371,28 @@ pub(super) mod tests {
             errors.is_empty(),
             "{suggestion} must validate against the served search schema: {errors:?}"
         );
-        arguments
+        let query = GraphQuery::parse(&parameters.query, &GraphLimits::default())
+            .unwrap_or_else(|error| panic!("{suggestion} must be admitted by the server: {error}"));
+        assert!(!query.reads_base(), "{suggestion}");
+        let [selected] = query.retrieval_requests() else {
+            panic!("{suggestion} must select one retrieval producer");
+        };
+        let mut producer = serde_json::to_value(&selected.request).expect("producer serializes");
+        let fields = producer.as_object_mut().expect("producer is an object");
+        assert_eq!(fields.remove("scope"), Some(json!("local")));
+        assert_eq!(fields.remove("order"), Some(json!("relevance")));
+        if fields["target"] == "all" {
+            fields.remove("target");
+            assert_eq!(fields.remove("include"), Some(json!(["source"])));
+        }
+        if fields["page_index"] == 0 {
+            fields.remove("page_index");
+        }
+        if let Some(paths) = fields.get_mut("paths").and_then(Value::as_object_mut) {
+            assert_eq!(paths.remove("exclude"), Some(json!([])));
+            assert_eq!(paths.remove("force_include"), Some(json!([])));
+        }
+        producer
     }
 
     /// The `search` arguments one `Grep` input maps to at `path`, proven a served call, or
@@ -631,10 +660,10 @@ pub(super) mod tests {
     fn a_glob_maps_to_a_listing_of_the_files_it_selects() {
         let rust = json!({"pattern": "**/*.rs"});
         assert_eq!(listed(&rust, &GrepPath::Root), Some(listing(&["**/*.rs"])));
-        let quoted = json!({"pattern": r#"**/say"hi".rs"#});
+        let quoted = json!({"pattern": r#"**/say'"hi".rs"#});
         assert_eq!(
             listed(&quoted, &GrepPath::Root),
-            Some(listing(&[r#"**/say"hi".rs"#]))
+            Some(listing(&[r#"**/say'"hi".rs"#]))
         );
         let below = json!({"pattern": "*.rs", "path": "src"});
         assert_eq!(
