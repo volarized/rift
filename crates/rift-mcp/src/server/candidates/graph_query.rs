@@ -7,12 +7,12 @@ use rift_error::{RiftError, errors};
 use rift_protocol::query::{
     QueryAnswer, QueryConfiguration, QueryParams, QueryReadResult, QueryResult,
 };
-use rift_protocol::read::{Pagination, ReadWarning};
+use rift_protocol::read::{Pagination, ReadWarning, SearchResult};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    GraphDataset, GraphLimits, GraphQuery, PageForm, PageSelection, QueryCancellation,
-    continuation_query,
+    AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, PageForm, PageSelection,
+    QueryCancellation, continuation_query,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,7 @@ use crate::output::{Json, ToolFailure};
 mod relationships;
 mod retrieval;
 
+use super::super::RequestDeadline;
 use relationships::AcquiredAdjacency;
 
 #[derive(Deserialize, Serialize)]
@@ -66,29 +67,58 @@ impl RiftMcp {
         .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
         .map_err(read_failure)?;
         if let Some(selection) = query.page_selection() {
-            let responses = Arc::clone(&self.candidate_responses);
-            let views = Arc::clone(&self.local_views);
-            return self
-                .blocking
-                .run("retained graph query", move || {
-                    let result = responses.replay_query(&selection)?;
-                    let (saved, answer) = match result {
-                        Ok(result) => result,
-                        Err(reason) => return Ok(query_unavailable(reason)),
-                    };
-                    let views = views.get().ok_or_else(retention_failure)?;
-                    if let Err(reason) =
-                        views.captured_view(selection.view.as_str(), &saved.root, &saved.owner)?
-                    {
-                        return Ok(query_unavailable(reason));
-                    }
-                    saved.response(answer, selection.page)
-                })
-                .await
-                .map(Json)
-                .map_err(read_failure);
+            return self.replay_graph_query(selection).await.map(Json);
         }
+        let graph = match self.prepare_graph(&query, limits, deadline).await? {
+            Ok(graph) => graph,
+            Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable))),
+        };
+        let views = Arc::clone(&self.local_views);
+        let responses = Arc::clone(&self.candidate_responses);
+        let cancellation = QueryCancellation::new();
+        let _guard = QueryGuard(cancellation.clone());
+        tokio::time::timeout_at(
+            deadline.at(),
+            self.blocking.run("graph query", move || {
+                graph.evaluate(&query, limits, deadline, &cancellation, &views, &responses)
+            }),
+        )
+        .await
+        .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
+        .map(Json)
+        .map_err(read_failure)
+    }
 
+    async fn replay_graph_query(
+        &self,
+        selection: PageSelection,
+    ) -> Result<QueryReadResult, ToolFailure> {
+        let responses = Arc::clone(&self.candidate_responses);
+        let views = Arc::clone(&self.local_views);
+        self.blocking
+            .run("retained graph query", move || {
+                let (saved, answer) = match responses.replay_query(&selection)? {
+                    Ok(result) => result,
+                    Err(reason) => return Ok(query_unavailable(reason)),
+                };
+                let views = views.get().ok_or_else(retention_failure)?;
+                if let Err(reason) =
+                    views.captured_view(selection.view.as_str(), &saved.root, &saved.owner)?
+                {
+                    return Ok(query_unavailable(reason));
+                }
+                saved.response(answer, selection.page)
+            })
+            .await
+            .map_err(read_failure)
+    }
+
+    async fn prepare_graph(
+        &self,
+        query: &GraphQuery,
+        limits: GraphLimits,
+        deadline: RequestDeadline,
+    ) -> Result<Result<AcquiredGraph, SearchUnavailable>, ToolFailure> {
         let resolved = self
             .published_workspace(super::super::wire::ErrorPhase::Read, deadline)
             .await?;
@@ -97,9 +127,7 @@ impl RiftMcp {
             .configuration
             .accepted_for_tool(super::super::wire::ErrorPhase::Read)?;
         if resolved.published.preparation.is_some() {
-            return Ok(Json(query_unavailable(
-                SymbolUnavailableReason::IndexPreparing,
-            )));
+            return Ok(Err(unavailable(SymbolUnavailableReason::IndexPreparing)));
         }
         let selected = query.adjacency_selection();
         let mut acquired = if let Some(selected) = &selected {
@@ -111,9 +139,9 @@ impl RiftMcp {
             .map_err(|_| read_failure(deadline_failure(deadline.budget())))?;
             match result {
                 Ok(Ok(acquired)) => acquired,
-                Ok(Err(unavailable)) => return Ok(Json(QueryReadResult::Unavailable(unavailable))),
+                Ok(Err(unavailable)) => return Ok(Err(unavailable)),
                 Err(error) if lacks_coverage(&error) => {
-                    return Ok(Json(query_unavailable(
+                    return Ok(Err(unavailable(
                         SymbolUnavailableReason::InsufficientCoverage,
                     )));
                 }
@@ -125,7 +153,7 @@ impl RiftMcp {
         {
             AcquiredAdjacency::default()
         } else {
-            return Ok(Json(query_unavailable(
+            return Ok(Err(unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         };
@@ -136,12 +164,12 @@ impl RiftMcp {
                     .await
                     .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
             match result {
-                Ok(result) => retrieved.push(result),
-                Err(reason) => return Ok(Json(QueryReadResult::Unavailable(reason))),
+                Ok(result) => retrieved.push(*result),
+                Err(reason) => return Ok(Err(reason)),
             }
         }
         if !retrieved.is_empty() && !self.engine_tree_matches(&resolved.published).await? {
-            return Ok(Json(query_unavailable(
+            return Ok(Err(unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         }
@@ -151,8 +179,6 @@ impl RiftMcp {
             .search_configuration()
             .query;
         let reads = Arc::clone(&resolved.published.reads);
-        let views = Arc::clone(&self.local_views);
-        let responses = Arc::clone(&self.candidate_responses);
         let mut warnings = acquired.take_warnings();
         warnings.extend(resolved.stale);
         for result in &retrieved {
@@ -162,84 +188,110 @@ impl RiftMcp {
                 }
             }
         }
-        let cancellation = QueryCancellation::new();
-        let _guard = QueryGuard(cancellation.clone());
-        let result = tokio::time::timeout_at(
-            deadline.at(),
-            self.blocking.run("graph query", move || {
-                let input = reads.local_search_view_input(true)?;
-                let mut dataset = GraphDataset::builder(limits);
-                if let Some(selected) = &selected {
-                    if let Err(error) = acquired.project(&mut dataset, selected, &input) {
-                        if lacks_coverage(&error) {
-                            return Ok(query_unavailable(
-                                SymbolUnavailableReason::InsufficientCoverage,
-                            ));
-                        }
-                        return Err(error);
-                    }
-                } else if let Some(selection) = query.node_selection() {
-                    input.project_nodes(
-                        &reads,
-                        selection,
-                        &mut dataset,
-                        &cancellation,
-                        deadline.at().into_std(),
-                    )?;
-                } else if let Some(selection) = query.symbol_selection() {
-                    input.project_symbols(
-                        selection,
-                        &mut dataset,
-                        &cancellation,
-                        deadline.at().into_std(),
-                    )?;
+        Ok(Ok(AcquiredGraph {
+            reads,
+            selected,
+            acquired,
+            retrieved,
+            configuration,
+            warnings,
+        }))
+    }
+}
+
+struct AcquiredGraph {
+    reads: Arc<rift_server::ReadService>,
+    selected: Option<AdjacencySelection>,
+    acquired: AcquiredAdjacency,
+    retrieved: Vec<SearchResult>,
+    configuration: QueryConfiguration,
+    warnings: Vec<ReadWarning>,
+}
+
+impl AcquiredGraph {
+    fn evaluate(
+        self,
+        query: &GraphQuery,
+        limits: GraphLimits,
+        deadline: RequestDeadline,
+        cancellation: &QueryCancellation,
+        views: &std::sync::OnceLock<rift_server::LocalSymbolViews>,
+        responses: &CandidateResponses,
+    ) -> Result<QueryReadResult, RiftError> {
+        let Self {
+            reads,
+            selected,
+            acquired,
+            retrieved,
+            configuration,
+            warnings,
+        } = self;
+        let input = reads.local_search_view_input(true)?;
+        let mut dataset = GraphDataset::builder(limits);
+        if let Some(selected) = &selected {
+            if let Err(error) = acquired.project(&mut dataset, selected, &input) {
+                if lacks_coverage(&error) {
+                    return Ok(query_unavailable(
+                        SymbolUnavailableReason::InsufficientCoverage,
+                    ));
                 }
-                for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
-                    dataset.insert_retrieval(selection, result)?;
+                return Err(error);
+            }
+        } else if let Some(selection) = query.node_selection() {
+            input.project_nodes(
+                &reads,
+                selection,
+                &mut dataset,
+                cancellation,
+                deadline.at().into_std(),
+            )?;
+        } else if let Some(selection) = query.symbol_selection() {
+            input.project_symbols(
+                selection,
+                &mut dataset,
+                cancellation,
+                deadline.at().into_std(),
+            )?;
+        }
+        for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
+            dataset.insert_retrieval(selection, result)?;
+        }
+        let dataset = dataset.build();
+        let answer: QueryAnswer = dataset.evaluate(query, cancellation)?.into();
+        let views = views.get().ok_or_else(retention_failure)?;
+        let root = input.root().to_owned();
+        let owner = input.owner().clone();
+        let mut response = None;
+        views.capture_with(input, |view| {
+            let mut view = view.clone();
+            let provider_views = acquired
+                .remote_view()
+                .into_iter()
+                .chain(retrieved.iter().filter_map(|result| result.view.as_ref()));
+            for provider in provider_views {
+                let expiry = crate::proxy::captured_expiry(provider)?;
+                if expiry <= SystemTime::now() {
+                    response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
+                    return Ok(false);
                 }
-                let dataset = dataset.build();
-                let answer: QueryAnswer = dataset.evaluate(&query, &cancellation)?.into();
-                let views = views.get().ok_or_else(retention_failure)?;
-                let root = input.root().to_owned();
-                let owner = input.owner().clone();
-                let mut response = None;
-                views.capture_with(input, |view| {
-                    let mut view = view.clone();
-                    let provider_views = acquired
-                        .remote_view()
-                        .into_iter()
-                        .chain(retrieved.iter().filter_map(|result| result.view.as_ref()));
-                    for provider in provider_views {
-                        let expiry = crate::proxy::captured_expiry(provider)?;
-                        if expiry <= SystemTime::now() {
-                            response =
-                                Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
-                            return Ok(false);
-                        }
-                        if expiry < crate::proxy::captured_expiry(&view)? {
-                            view.expires_at.clone_from(&provider.expires_at);
-                        }
-                    }
-                    if cancellation.is_cancelled() {
-                        return errors::search::query_cancelled().fail();
-                    }
-                    response = Some(responses.store_query(
-                        &root,
-                        &owner,
-                        &view,
-                        &answer,
-                        &configuration,
-                        warnings,
-                    )?);
-                    Ok(true)
-                })?;
-                response.ok_or_else(retention_failure)
-            }),
-        )
-        .await
-        .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
-        .map_err(read_failure)?;
-        Ok(Json(result))
+                if expiry < crate::proxy::captured_expiry(&view)? {
+                    view.expires_at.clone_from(&provider.expires_at);
+                }
+            }
+            if cancellation.is_cancelled() {
+                return errors::search::query_cancelled().fail();
+            }
+            response = Some(responses.store_query(
+                &root,
+                &owner,
+                &view,
+                &answer,
+                &configuration,
+                warnings,
+            )?);
+            Ok(true)
+        })?;
+        response.ok_or_else(retention_failure)
     }
 }
 
@@ -588,12 +640,16 @@ fn lacks_coverage(error: &RiftError) -> bool {
     )
 }
 
-fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
-    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+fn unavailable(reason: SymbolUnavailableReason) -> SearchUnavailable {
+    SearchUnavailable::Unavailable {
         reason,
         view: None,
         warnings: Vec::new(),
-    })
+    }
+}
+
+fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
+    QueryReadResult::Unavailable(unavailable(reason))
 }
 
 #[cfg(test)]
@@ -762,8 +818,8 @@ mod tests {
             .checked_add(jiff::Span::new().minutes(2))?
             .to_string();
         let endpoint_expiry = expires.clone();
-        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
-        let requests = Arc::clone(&seen);
+        let requests_seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let requests = Arc::clone(&requests_seen);
         let app = axum::Router::new()
             .route("/rift/v1/capabilities", get(|| async {
                 response(json!({
@@ -774,12 +830,12 @@ mod tests {
                     "corpus_revision": "corpus-v1",
                     "required_search_fields": ["name","qualified_name","documentation","signature"],
                     "bounds": {
-                        "request_body_bytes_max": 1048576, "response_body_bytes_max": 1048576,
+                        "request_body_bytes_max": 1_048_576, "response_body_bytes_max": 1_048_576,
                         "dependency_entries_max": 100, "query_bytes_max": 4096, "query_terms_max": 32,
                         "query_term_bytes_max": 256, "identifiers_max": 16, "identifier_bytes_max": 4096,
                         "packages_max": 100, "page_limit_min": 1, "page_limit_max": 100,
                         "page_limit_default": 20, "cursor_bytes_max": 4096, "candidate_pool_max": 100,
-                        "warnings_max": 32, "source_bytes_max": 1048576
+                        "warnings_max": 32, "source_bytes_max": 1_048_576
                     },
                     "relationship_capabilities": [{
                         "direction": "outgoing", "facets": ["calls"], "bounds": {
@@ -861,7 +917,7 @@ mod tests {
         let QueryReadResult::Results(result) = result else {
             return Err(format!(
                 "expected captured remote path, received {result:?} after {:?} requests",
-                seen.lock().await.as_slice()
+                requests_seen.lock().await.as_slice()
             )
             .into());
         };
@@ -876,11 +932,15 @@ mod tests {
         assert!(
             matches!(&bindings[0]["callee"], rift_protocol::query::RdfTerm::Iri { value } if value == C)
         );
-        let seen = seen.lock().await;
-        assert_eq!(seen.len(), 3);
-        assert!(seen[0].get("view").is_none());
-        assert!(seen[1..].iter().all(|request| request["view"] == VIEW));
-        assert!(seen.iter().all(|request| request["packages"]
+        let requests_seen = requests_seen.lock().await;
+        assert_eq!(requests_seen.len(), 3);
+        assert!(requests_seen[0].get("view").is_none());
+        assert!(
+            requests_seen[1..]
+                .iter()
+                .all(|request| request["view"] == VIEW)
+        );
+        assert!(requests_seen.iter().all(|request| request["packages"]
             == json!([
                 {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"},
                 {"manager":"cargo","registry":"crates.io","name":"dependency","version":"2.0.0"}
