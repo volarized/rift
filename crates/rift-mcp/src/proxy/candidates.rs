@@ -18,7 +18,7 @@ use super::RiftProxy;
 
 mod read;
 #[cfg(test)]
-pub(in crate::proxy) use read::dispatch_read_request;
+pub(in crate::proxy) use read::dispatch_nodes_request;
 
 #[derive(Debug)]
 pub(super) enum CandidateAnswer {
@@ -270,7 +270,7 @@ fn captured_view(captured: &CapturedCandidates) -> Result<(CapturedView, SystemT
 impl RiftProxy {
     pub(super) fn candidate_backends<'a>(
         &'a self,
-        params: &'a SearchParams,
+        params: &SearchParams,
     ) -> Result<Vec<(&'a str, &'a Self)>, RiftError> {
         match (&params.scope, super::identity::scope_key(&params.scope)) {
             (_, Some(key)) => self
