@@ -326,6 +326,12 @@ impl WorkspaceSymbolView {
             .map(|(identity, object)| (identity, object.as_ref().map_err(Clone::clone)))
     }
 
+    /// Whether the captured object inventory covers all sources selected for indexing.
+    #[must_use]
+    pub const fn objects_complete(&self) -> bool {
+        self.identity_complete
+    }
+
     /// Iterates captured objects with a declaration whose canonical identity is unestablished.
     ///
     /// # Errors

@@ -41,7 +41,7 @@ impl GraphQuery {
     ///   characters than allowed, codepoint escapes counted as the character they name, or the
     ///   parsed query joins more patterns or nests deeper than allowed.
     /// - `query_syntax_invalid` when `text` is neither a query nor an update.
-    /// - `query_feature_refused` naming the feature for an update, `FROM`, `FROM NAMED`, any
+    /// - `query_feature_refused` naming an update, an unselected `FROM` or `FROM NAMED` graph,
     ///   external or variable `SERVICE`, `SERVICE SILENT`, and a join sharing no variable.
     /// - `query_answer_limit` when the product of every `VALUES` table's rows passes the
     ///   solution bound.
@@ -77,6 +77,17 @@ impl GraphQuery {
     #[must_use]
     pub const fn reads_base(&self) -> bool {
         self.admission.reads_base
+    }
+
+    /// Whether the algebra can be answered by the complete local symbol inventory.
+    pub(super) const fn symbol_only(&self) -> bool {
+        self.admission.symbol_only
+    }
+
+    /// Whether the algebra selects the accepted local named graph.
+    #[must_use]
+    pub const fn names_local_graph(&self) -> bool {
+        self.admission.named_local
     }
 
     fn parsed(text: &str, limits: &GraphLimits) -> Result<Self, RiftError> {

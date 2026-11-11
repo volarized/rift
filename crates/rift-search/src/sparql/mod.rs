@@ -53,6 +53,9 @@ mod conformance_tests;
 #[cfg(test)]
 mod tests;
 
+/// The named graph of the accepted local publication.
+pub const LOCAL_GRAPH: &str = "urn:rift:graph:local";
+
 pub use dataset::{
     GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress, NodeFact,
     NodeLocation, RevisionIri, SymbolAddress, SymbolRelation,

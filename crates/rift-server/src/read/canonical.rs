@@ -115,13 +115,37 @@ impl LocalSymbolViewInput {
             })
         };
 
+        if let SymbolSelection::Identified(selected) = selection {
+            let identity = rift_protocol::identity::SymbolIdentity::parse(selected)?;
+            if identity.owner() != self.owner() {
+                return errors::server::search_coverage_unavailable()
+                    .operation("graph symbol acquisition")
+                    .fail();
+            }
+            let key = rift_core::SymbolId::new(selected.to_owned()).map_err(|_| {
+                errors::server::search_coverage_unavailable()
+                    .operation("graph symbol acquisition")
+                    .error()
+            })?;
+            if let Some(symbol) = index.object_by_identity(&key)? {
+                let id = rift_protocol::read::SymbolId(selected.to_owned());
+                write(&symbol, SymbolAddress::Established(&id))?;
+            } else if !index.identity_coverage_complete(identity.language()) {
+                return errors::server::search_coverage_unavailable()
+                    .operation("graph symbol acquisition")
+                    .fail();
+            }
+            return check();
+        }
+        if !index.objects_complete() {
+            return errors::server::search_coverage_unavailable()
+                .operation("graph symbol acquisition")
+                .fail();
+        }
         for (identity, symbol) in index.objects() {
             check()?;
             let identity = rift_protocol::read::SymbolId(identity.as_str().to_owned());
             write(symbol?, SymbolAddress::Established(&identity))?;
-        }
-        if matches!(selection, SymbolSelection::Identified(_)) {
-            return check();
         }
         for symbol in index.unestablished_objects() {
             check()?;

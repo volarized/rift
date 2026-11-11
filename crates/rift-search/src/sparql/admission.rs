@@ -28,6 +28,8 @@ pub(super) struct Admission {
     pub(super) separators: Vec<String>,
     pub(super) retrieval: Vec<RetrievalSelection>,
     pub(super) reads_base: bool,
+    pub(super) symbol_only: bool,
+    pub(super) named_local: bool,
 }
 
 /// Refuses what the graph does not serve, renames each `GROUP_CONCAT` to its bounded form,
@@ -41,8 +43,15 @@ pub(super) struct Admission {
 /// is one step per algebra element, bounded by the query byte bound the parser ran under,
 /// plus one in-scope variable scan of both sides of every join.
 pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission, RiftError> {
-    if query.dataset().is_some() {
-        return refused("a FROM or FROM NAMED clause");
+    let named_local = query.dataset().is_some();
+    if let Some(dataset) = query.dataset()
+        && dataset
+            .default
+            .iter()
+            .chain(dataset.named.iter().flatten())
+            .any(|graph| graph.as_str() != super::LOCAL_GRAPH)
+    {
+        return refused("a FROM or FROM NAMED clause outside the selected local dataset");
     }
     let describes = matches!(query, Query::Describe(_));
     let mut joined = Joined::default();
@@ -57,6 +66,8 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
     };
     let mut admission = Admission {
         reads_base: describes,
+        symbol_only: !describes,
+        named_local,
         ..Admission::default()
     };
     let mut pending = Pending::from(Visit::Pattern(root));
@@ -70,6 +81,9 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
         }
     }
     joined.admit(limits)?;
+    if named_local && !admission.retrieval.is_empty() {
+        return refused("explicit FROM with a retrieval service");
+    }
     Ok(admission)
 }
 
@@ -195,11 +209,22 @@ fn admit_pattern<'a>(
         QueryExpression::Graph { .. } if pending.in_retrieval => {
             return refused("GRAPH inside a retrieval service");
         }
-        QueryExpression::Graph { .. } | QueryExpression::Path { .. } if !pending.in_retrieval => {
+        QueryExpression::Graph { name, .. } if !pending.in_retrieval => {
             admission.reads_base = true;
+            if matches!(name, NamedNodePattern::NamedNode(name) if name.as_str() == super::LOCAL_GRAPH)
+            {
+                admission.named_local = true;
+            } else {
+                admission.symbol_only = false;
+            }
+        }
+        QueryExpression::Path { .. } if !pending.in_retrieval => {
+            admission.reads_base = true;
+            admission.symbol_only = false;
         }
         QueryExpression::Bgp { patterns } if !pending.in_retrieval && !patterns.is_empty() => {
             admission.reads_base = true;
+            admission.symbol_only &= super::requirements::symbol_patterns(patterns).is_some();
             if is_disconnected(patterns) {
                 return refused(CARTESIAN_PRODUCT);
             }

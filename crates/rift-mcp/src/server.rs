@@ -2338,7 +2338,7 @@ impl RiftMcp {
         &self,
         Parameters(params): Parameters<rift_protocol::query::QueryParams>,
     ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
-        self.graph_query(params).await
+        Box::pin(self.graph_query(params)).await
     }
 
     async fn search(
@@ -4233,7 +4233,7 @@ impl ServerHandler for RiftMcp {
                     let result = if request.name == "search_candidates" {
                         self.search_candidates_call(request, &operation).await
                     } else if request.name == "search_retrieval" {
-                        self.search_retrieval_call(request).await
+                        Box::pin(self.search_retrieval_call(request)).await
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
                         match self.tool_router.call(routed).await {

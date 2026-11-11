@@ -306,6 +306,20 @@ impl GraphDatasetBuilder {
         Ok(())
     }
 
+    /// Publishes the default local facts under their named graph.
+    ///
+    /// # Errors
+    /// Refuses a named graph that exceeds the shared dataset bounds.
+    pub fn publish_local_graph(&mut self) -> Result<(), RiftError> {
+        let graph = NamedNode::new_unchecked(super::LOCAL_GRAPH);
+        let triples = self
+            .dataset
+            .quads_for_graph_name(GraphNameRef::DefaultGraph)
+            .map(|quad| Triple::new(quad.subject, quad.predicate, quad.object))
+            .collect();
+        self.insert_triples(triples, (&graph).into())
+    }
+
     /// Accepts the dataset.
     #[must_use]
     pub fn build(self) -> GraphDataset {
