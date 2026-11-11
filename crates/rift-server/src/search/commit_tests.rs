@@ -625,6 +625,44 @@ fn a_filled_store_carries_no_filling_warning() -> TestResult {
 }
 
 #[test]
+fn a_commit_search_reads_messages_after_observing_fill_progress() -> TestResult {
+    let directory = three_commits()?;
+    let folder = tempfile::tempdir()?;
+    let history = HistoryConfiguration::default();
+    let root = directory.path().to_owned();
+    let store_folder = folder.path().to_owned();
+    let store = HistoryStore::open(&StoreLocation::new(&store_folder, "aa"))?;
+    let stored = StoredHistory::new(
+        store.reader(),
+        history.strategy,
+        Arc::new(move || {
+            filled_store(&root, &store_folder, &HistoryConfiguration::default())
+                .expect("the requested fill writes the pending commits");
+        }),
+    );
+    let progress = stored.progress();
+    progress.record_plan(3, 3);
+    let service = service(
+        directory.path(),
+        WorkspaceIndexLimits::default(),
+        history,
+        None,
+    )?;
+    service.attach_history_store(&stored);
+    let query = commit_search("release")?;
+
+    let filling = service.search_commits(&query)?;
+    assert_eq!(summaries(&filling), ["Fix the release notes"]);
+    assert_eq!(filling_counts(&filling), [(0, 3)]);
+
+    progress.record_written(3);
+    let filled = service.search_commits(&query)?;
+    assert_eq!(summaries(&filled), ["Fix the release notes"]);
+    assert!(filled.warnings.is_empty(), "{filled:?}");
+    Ok(())
+}
+
+#[test]
 fn a_store_missing_the_checked_out_head_says_so_and_asks_for_a_fill() -> TestResult {
     let directory = three_commits()?;
     let folder = tempfile::tempdir()?;
