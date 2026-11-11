@@ -30,21 +30,48 @@ pub struct NodeSelection<'query> {
     pub source: bool,
 }
 
+/// One direction and facet acquired at a path position.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AdjacencyStep {
+    /// Required adjacency relative to the current symbol.
+    pub direction: TraversalDirection,
+    /// Required relationship facet.
+    pub facet: RelationshipFacet,
+}
+
 /// The complete adjacency selected by an anchored query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdjacencySelection {
     /// Canonical start of the walk.
     pub seed: SymbolId,
-    /// Required adjacency relative to the seed.
-    pub direction: TraversalDirection,
-    /// Required relationship facet.
-    pub facet: RelationshipFacet,
+    first_step: AdjacencyStep,
+    steps: Vec<AdjacencyStep>,
     /// Maximum number of hops, or a walk to exhaustion.
     pub depth: Option<u32>,
+    /// Whether the pattern projects logical facts about reached symbols.
+    pub symbol_details: bool,
     /// Whether physical usage records must also be projected.
     pub usages: bool,
     /// Whether the physical occurrences require exact source bytes.
     pub source: bool,
+}
+
+impl AdjacencySelection {
+    /// The operation required at this path position.
+    #[must_use]
+    pub fn step(&self, depth: u32) -> AdjacencyStep {
+        usize::try_from(depth)
+            .ok()
+            .and_then(|position| self.steps.get(position))
+            .copied()
+            .unwrap_or(self.first_step)
+    }
+
+    /// Whether path positions require different acquisition operations.
+    #[must_use]
+    pub fn has_distinct_steps(&self) -> bool {
+        !self.steps.is_empty()
+    }
 }
 
 impl GraphQuery {
@@ -150,8 +177,18 @@ impl GraphQuery {
             object,
         } = pattern
         {
-            let (facet, reversed, depth) = uniform_path(path)?;
-            return adjacency(subject, object, facet, reversed, depth);
+            if let Some((facet, reversed, depth)) = uniform_path(path) {
+                return adjacency(subject, object, facet, reversed, depth);
+            }
+            let mut steps = fixed_path(path)?;
+            if let Some(seed) = symbol(subject) {
+                return layered_adjacency(seed, steps);
+            }
+            steps.reverse();
+            for step in &mut steps {
+                step.direction = opposite(step.direction);
+            }
+            return layered_adjacency(symbol(object)?, steps);
         }
         let mut expressions = vec![pattern];
         let mut triples = Vec::new();
@@ -172,7 +209,23 @@ impl GraphQuery {
         if !locations.is_empty() {
             return None;
         }
-        adjacency_patterns(&triples)
+        let (edges, details): (Vec<_>, Vec<_>) = triples
+            .into_iter()
+            .partition(|edge| property(edge).and_then(facet).is_some());
+        if details.iter().any(|detail| {
+            (!matches!(
+                property(detail),
+                Some("name" | "kind" | "language" | "revision")
+            ) && !is_symbol_class(detail))
+                || !edges
+                    .iter()
+                    .any(|edge| edge.subject == detail.subject || edge.object == detail.subject)
+        }) {
+            return None;
+        }
+        let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
+        selected.symbol_details = !details.is_empty();
+        Some(selected)
     }
 }
 
@@ -271,9 +324,10 @@ fn adjacency(
     };
     Some(AdjacencySelection {
         seed,
-        direction,
-        facet,
+        first_step: AdjacencyStep { direction, facet },
+        steps: Vec::new(),
         depth,
+        symbol_details: false,
         usages: false,
         source: false,
     })
@@ -330,13 +384,110 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
             if remaining.is_empty() {
                 return Some(AdjacencySelection {
                     seed,
-                    direction,
-                    facet,
+                    first_step: AdjacencyStep { direction, facet },
+                    steps: Vec::new(),
                     depth: Some(depth),
+                    symbol_details: false,
                     usages: false,
                     source: false,
                 });
             }
+        }
+    }
+    None
+}
+
+fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<AdjacencySelection> {
+    Some(AdjacencySelection {
+        seed,
+        first_step: *steps.first()?,
+        depth: Some(u32::try_from(steps.len()).ok()?),
+        steps,
+        symbol_details: false,
+        usages: false,
+        source: false,
+    })
+}
+
+fn opposite(direction: TraversalDirection) -> TraversalDirection {
+    match direction {
+        TraversalDirection::Incoming => TraversalDirection::Outgoing,
+        TraversalDirection::Outgoing => TraversalDirection::Incoming,
+    }
+}
+
+fn fixed_path(path: &PropertyPathExpression) -> Option<Vec<AdjacencyStep>> {
+    let mut pending = vec![(path, TraversalDirection::Outgoing)];
+    let mut steps = Vec::new();
+    while let Some((path, direction)) = pending.pop() {
+        match path {
+            PropertyPathExpression::Link(predicate) => {
+                let facet = facet(predicate.as_str().strip_prefix(VOCABULARY_NAMESPACE)?)?;
+                steps.push(AdjacencyStep { direction, facet });
+            }
+            PropertyPathExpression::Inv(path) => pending.push((path, opposite(direction))),
+            PropertyPathExpression::Seq(left, right) => {
+                let (start, end) = if direction == TraversalDirection::Outgoing {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+                pending.extend([(end.as_ref(), direction), (start.as_ref(), direction)]);
+            }
+            _ => return None,
+        }
+    }
+    Some(steps)
+}
+
+fn layered_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> {
+    for initial in triples
+        .iter()
+        .flat_map(|edge| [&edge.subject, &edge.object])
+    {
+        let Some(seed) = symbol(initial) else {
+            continue;
+        };
+        let mut current = initial;
+        let mut remaining = triples.to_vec();
+        let mut steps = Vec::new();
+        while !remaining.is_empty() {
+            let mut next = remaining.iter().enumerate().filter_map(|(index, edge)| {
+                let facet = property(edge).and_then(facet)?;
+                if &edge.subject == current {
+                    Some((
+                        index,
+                        &edge.object,
+                        AdjacencyStep {
+                            direction: TraversalDirection::Outgoing,
+                            facet,
+                        },
+                    ))
+                } else if &edge.object == current {
+                    Some((
+                        index,
+                        &edge.subject,
+                        AdjacencyStep {
+                            direction: TraversalDirection::Incoming,
+                            facet,
+                        },
+                    ))
+                } else {
+                    None
+                }
+            });
+            let Some((index, end, step)) = next.next() else {
+                break;
+            };
+            if next.next().is_some() {
+                break;
+            }
+            current = end;
+            steps.push(step);
+            remaining.swap_remove(index);
+        }
+        if remaining.is_empty() {
+            return layered_adjacency(seed, steps);
         }
     }
     None
@@ -387,9 +538,13 @@ fn usage_selection(
     }
     Some(AdjacencySelection {
         seed,
-        direction: TraversalDirection::Incoming,
-        facet: RelationshipFacet::References,
+        first_step: AdjacencyStep {
+            direction: TraversalDirection::Incoming,
+            facet: RelationshipFacet::References,
+        },
+        steps: Vec::new(),
         depth: Some(1),
+        symbol_details: false,
         usages: true,
         source,
     })

@@ -6,7 +6,8 @@ use rift_cloud_client::relationships::RelationshipReadLimits;
 use rift_error::{RiftError, errors};
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
 use rift_protocol::read::{
-    PackageIdentity, ReadWarning, RelationshipFacet, RuntimeIdentity, SymbolId, TraversalDirection,
+    PackageIdentity, ReadWarning, RelationshipFacet, RuntimeIdentity, Symbol, SymbolId,
+    TraversalDirection,
 };
 use rift_protocol::relationship_read::{
     QueryOccurrence, RelationshipInclude, RelationshipSearchPage, RelationshipSearchRequest,
@@ -16,8 +17,8 @@ use rift_protocol::revision::Revision;
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, GraphDatasetBuilder, GraphFact, GraphLimits, RevisionIri, SymbolAddress,
-    SymbolRelation,
+    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits, RevisionIri,
+    SymbolAddress, SymbolRelation,
 };
 
 use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
@@ -28,9 +29,10 @@ const RECORDS_MAX: u64 = 10_000;
 
 #[derive(Default)]
 pub(super) struct AcquiredAdjacency {
-    pages: Vec<RelationshipSearchPage>,
+    pages: Vec<(RelationshipSearchPage, SymbolRelation)>,
     local: Vec<QueryOccurrence>,
-    local_edges: Vec<(SymbolId, SymbolId)>,
+    local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
+    named_package_symbols: Vec<(Symbol, RevisionIri)>,
     revisions: BTreeMap<SymbolOwner, RevisionIri>,
     view: Option<CapturedView>,
     warnings: Vec<ReadWarning>,
@@ -45,22 +47,34 @@ impl AcquiredAdjacency {
         std::mem::take(&mut self.warnings)
     }
 
+    pub(super) fn local_endpoints(&self) -> BTreeSet<&SymbolId> {
+        self.local_edges
+            .iter()
+            .flat_map(|(from, _, to)| [from, to])
+            .collect()
+    }
+
     pub(super) fn project(
         &self,
         dataset: &mut GraphDatasetBuilder,
         selected: &AdjacencySelection,
         input: &rift_server::LocalSymbolViewInput,
     ) -> Result<(), RiftError> {
-        let relation = match selected.facet {
-            RelationshipFacet::Calls => SymbolRelation::Calls,
-            RelationshipFacet::References => SymbolRelation::References,
-            _ => return Err(coverage_failure()),
-        };
-        for (source, target) in &self.local_edges {
+        for (source, relation, target) in &self.local_edges {
             dataset.insert(GraphFact::Relation {
                 source,
-                relation,
+                relation: *relation,
                 target,
+            })?;
+        }
+        for (symbol, revision) in &self.named_package_symbols {
+            let id = symbol.id.as_ref().ok_or_else(coverage_failure)?;
+            dataset.insert(GraphFact::SymbolDetails {
+                address: SymbolAddress::Established(id),
+                name: &symbol.name,
+                kind: &symbol.kind.0,
+                language: &symbol.language,
+                revision,
             })?;
         }
         for occurrence in &self.local {
@@ -90,7 +104,7 @@ impl AcquiredAdjacency {
                 })?;
             }
         }
-        for page in &self.pages {
+        for (page, relation) in &self.pages {
             for item in &page.symbols {
                 if let Some(symbol) = &item.symbol.id {
                     let identity = SymbolIdentity::parse(symbol.as_str())?;
@@ -111,7 +125,7 @@ impl AcquiredAdjacency {
                 for record in &group.relationships {
                     dataset.insert(GraphFact::Relation {
                         source: &record.relationship.from,
-                        relation,
+                        relation: *relation,
                         target: &record.relationship.to,
                     })?;
                 }
@@ -147,6 +161,7 @@ impl AcquiredAdjacency {
     fn admit_remote(
         &mut self,
         mut page: RelationshipSearchPage,
+        step: AdjacencyStep,
         remaining: &mut RelationshipReadLimits,
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<(), RiftError> {
@@ -179,7 +194,7 @@ impl AcquiredAdjacency {
                 self.warnings.push(warning);
             }
         }
-        self.pages.push(page);
+        self.pages.push((page, relation(step.facet)?));
         Ok(())
     }
 }
@@ -196,6 +211,7 @@ impl RiftMcp {
             server: self,
             resolved,
             selected,
+            step: selected.step(0),
             deadline,
             configuration: resolved.published.configuration.global_configuration(),
             remaining: RelationshipReadLimits {
@@ -206,15 +222,28 @@ impl RiftMcp {
             acquired: AcquiredAdjacency::default(),
             remote: None,
             local: None,
+            neighbors: BTreeMap::new(),
         };
         let mut frontier = BTreeSet::from([selected.seed.clone()]);
         let mut visited = BTreeSet::new();
         let mut depth = 0u32;
         while !frontier.is_empty() && selected.depth.is_none_or(|maximum| depth < maximum) {
+            walk.step = selected.step(depth);
             let mut remote_seeds = Vec::new();
             for seed in std::mem::take(&mut frontier) {
+                let key = (seed.clone(), walk.step);
+                if let Some(cached) = walk.neighbors.get(&key) {
+                    frontier.extend(cached.iter().cloned());
+                    continue;
+                }
                 if SymbolIdentity::parse(seed.as_str())?.owner().is_local() {
-                    walk.local_step(&seed, &mut frontier).await?;
+                    let mut reached = BTreeSet::new();
+                    walk.local_step(&seed, &mut reached).await?;
+                    if selected.has_distinct_steps() {
+                        walk.neighbors
+                            .insert(key, reached.iter().cloned().collect());
+                    }
+                    frontier.extend(reached);
                     visited.insert(seed);
                 } else {
                     visited.insert(seed.clone());
@@ -226,7 +255,9 @@ impl RiftMcp {
             {
                 return Ok(Err(unavailable));
             }
-            frontier.retain(|seed| !visited.contains(seed));
+            if !selected.has_distinct_steps() {
+                frontier.retain(|seed| !visited.contains(seed));
+            }
             depth = depth.checked_add(1).ok_or_else(coverage_failure)?;
         }
         if walk.local.is_some()
@@ -245,6 +276,7 @@ struct AdjacencyWalk<'request> {
     server: &'request RiftMcp,
     resolved: &'request ResolvedWorkspace,
     selected: &'request AdjacencySelection,
+    step: AdjacencyStep,
     deadline: RequestDeadline,
     configuration: rift_protocol::configuration::GlobalConfiguration,
     remaining: RelationshipReadLimits,
@@ -254,6 +286,7 @@ struct AdjacencyWalk<'request> {
         std::sync::Arc<rift_server::EnginePool>,
         rift_server::CalleeRoots,
     )>,
+    neighbors: BTreeMap<(SymbolId, AdjacencyStep), Vec<SymbolId>>,
 }
 
 impl AdjacencyWalk<'_> {
@@ -267,10 +300,12 @@ impl AdjacencyWalk<'_> {
         }
         claim_request(&mut self.remaining)?;
         let reads = &self.resolved.published.reads;
-        let direction = self.selected.direction;
+        let direction = self.step.direction;
         if self.local.is_none() {
             let engines = self.server.engine_pool_for(&self.resolved.published).await;
-            let roots = if direction == TraversalDirection::Outgoing {
+            let roots = if self.step.facet == RelationshipFacet::Calls
+                || self.selected.has_distinct_steps()
+            {
                 let reads = std::sync::Arc::clone(reads);
                 let engines = std::sync::Arc::clone(&engines);
                 self.server
@@ -286,7 +321,7 @@ impl AdjacencyWalk<'_> {
         }
         let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
         let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
-        match (direction, self.selected.facet) {
+        match (direction, self.step.facet) {
             (TraversalDirection::Incoming, RelationshipFacet::References) => {
                 let occurrences = Box::pin(rift_server::graph_references(
                     reads, engines, seed, deadline,
@@ -295,32 +330,40 @@ impl AdjacencyWalk<'_> {
                 charge_records(&mut self.remaining, occurrences.len())?;
                 for occurrence in occurrences {
                     if let Some(caller) = &occurrence.enclosing {
-                        self.acquired
-                            .local_edges
-                            .push((caller.clone(), seed.clone()));
+                        self.acquired.local_edges.push((
+                            caller.clone(),
+                            SymbolRelation::References,
+                            seed.clone(),
+                        ));
                         frontier.insert(caller.clone());
                     }
                     self.acquired.local.push(occurrence);
                 }
             }
-            (TraversalDirection::Outgoing, RelationshipFacet::Calls) => {
+            (_, RelationshipFacet::Calls) => {
                 let mut calls = Box::pin(rift_server::graph_calls(
-                    reads, engines, roots, seed, deadline,
+                    reads, engines, roots, seed, direction, deadline,
                 ))
                 .await?;
                 self.name_package_calls(&mut calls).await?;
                 charge_records(&mut self.remaining, calls.local.len())?;
-                for (target, ranges) in calls.local {
+                for (neighbor, ranges) in calls.local {
                     charge_records(&mut self.remaining, ranges.len())?;
-                    self.acquired
-                        .local_edges
-                        .push((seed.clone(), target.clone()));
-                    frontier.insert(target.clone());
+                    let (caller, target) = match direction {
+                        TraversalDirection::Outgoing => (seed, &neighbor),
+                        TraversalDirection::Incoming => (&neighbor, seed),
+                    };
+                    self.acquired.local_edges.push((
+                        caller.clone(),
+                        SymbolRelation::Calls,
+                        target.clone(),
+                    ));
+                    frontier.insert(neighbor.clone());
                     if self.selected.usages {
                         self.acquired.local.extend(ranges.into_iter().map(|source| {
                             QueryOccurrence {
                                 target: target.clone(),
-                                enclosing: Some(seed.clone()),
+                                enclosing: Some(caller.clone()),
                                 source,
                                 facet: RelationshipFacet::Calls,
                             }
@@ -334,7 +377,7 @@ impl AdjacencyWalk<'_> {
     }
 
     async fn name_package_calls(
-        &self,
+        &mut self,
         calls: &mut rift_server::GraphCalls,
     ) -> Result<(), RiftError> {
         if calls.packages.is_empty() {
@@ -361,6 +404,13 @@ impl AdjacencyWalk<'_> {
             {
                 return Err(coverage_failure());
             }
+            if self.selected.symbol_details {
+                let symbol = callee.symbol(&declaration).ok_or_else(coverage_failure)?;
+                self.acquired.named_package_symbols.push((
+                    symbol,
+                    RevisionIri::parse(&declaration.revision.to_string())?,
+                ));
+            }
             calls.local.push((declaration.id, occurrences));
         }
         Ok(())
@@ -372,7 +422,8 @@ impl AdjacencyWalk<'_> {
         frontier: &mut BTreeSet<SymbolId>,
     ) -> Result<Option<SearchUnavailable>, RiftError> {
         let selected = self.selected;
-        if selected.direction != TraversalDirection::Outgoing || !self.configuration.enabled {
+        let step = self.step;
+        if step.direction != TraversalDirection::Outgoing || !self.configuration.enabled {
             return Err(coverage_failure());
         }
         if self.remote.is_none() {
@@ -383,17 +434,21 @@ impl AdjacencyWalk<'_> {
             }
             let client = self.server.global.client(&self.configuration).await?;
             let capabilities = client.get_capabilities().await?;
-            let bounds =
-                client.relationship_bounds(&capabilities, selected.direction, &[selected.facet])?;
             self.acquired.revisions = std::mem::take(&mut domain.revisions);
             self.remote = Some(RemoteSelection {
                 client,
                 domain,
-                seeds_max: usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX),
+                capabilities,
             });
         }
         let remote = self.remote.as_ref().ok_or_else(coverage_failure)?;
-        for seeds in remote_seeds.chunks(remote.seeds_max) {
+        let bounds = remote.client.relationship_bounds(
+            &remote.capabilities,
+            step.direction,
+            &[step.facet],
+        )?;
+        let seeds_max = usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX);
+        for seeds in remote_seeds.chunks(seeds_max) {
             for seed in seeds {
                 if !self
                     .acquired
@@ -406,8 +461,8 @@ impl AdjacencyWalk<'_> {
             let request = RelationshipSearchRequest {
                 relationships: RelationshipSelection {
                     seeds: seeds.to_vec(),
-                    direction: selected.direction,
-                    facets: vec![selected.facet],
+                    direction: step.direction,
+                    facets: vec![step.facet],
                 },
                 packages: remote.domain.packages.clone(),
                 runtimes: remote.domain.runtimes.clone(),
@@ -433,7 +488,7 @@ impl AdjacencyWalk<'_> {
                 .view
                 .as_ref()
                 .is_some_and(|view| view != &page.view)
-                || self.acquired.pages.first().is_some_and(|first| {
+                || self.acquired.pages.first().is_some_and(|(first, _)| {
                     first.analyzer_revision != page.analyzer_revision
                         || first.corpus_revision != page.corpus_revision
                 })
@@ -442,10 +497,28 @@ impl AdjacencyWalk<'_> {
                     SymbolUnavailableReason::ViewContext,
                 )));
             }
+            if selected.has_distinct_steps() {
+                for group in &page.groups {
+                    let reached = group
+                        .relationships
+                        .iter()
+                        .map(|record| record.relationship.to.clone())
+                        .collect();
+                    self.neighbors.insert((group.seed.clone(), step), reached);
+                }
+            }
             self.acquired
-                .admit_remote(page, &mut self.remaining, frontier)?;
+                .admit_remote(page, step, &mut self.remaining, frontier)?;
         }
         Ok(None)
+    }
+}
+
+fn relation(facet: RelationshipFacet) -> Result<SymbolRelation, RiftError> {
+    match facet {
+        RelationshipFacet::Calls => Ok(SymbolRelation::Calls),
+        RelationshipFacet::References => Ok(SymbolRelation::References),
+        _ => Err(coverage_failure()),
     }
 }
 
@@ -460,7 +533,7 @@ fn claim_request(limits: &mut RelationshipReadLimits) -> Result<(), RiftError> {
 struct RemoteSelection {
     client: rift_cloud_client::GlobalClient,
     domain: ExactDomain,
-    seeds_max: usize,
+    capabilities: rift_cloud_client::Capabilities,
 }
 
 #[derive(Default)]

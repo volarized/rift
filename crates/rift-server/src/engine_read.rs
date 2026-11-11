@@ -734,7 +734,13 @@ async fn resolve_symbol_callees(
     };
     let language = file.syntax().language().clone();
     let target = ReferenceTarget::new(slot.workspace_root(), reads.index().root(), file, symbol)?;
-    let answered = Box::pin(callees_on_engine(slot, &target, walk.deadline)).await;
+    let answered = Box::pin(calls_on_engine(
+        slot,
+        &target,
+        TraversalDirection::Outgoing,
+        walk.deadline,
+    ))
+    .await;
     let (report, unconfirmed) = match answered {
         Ok(OutgoingAnswer::Ready(report)) => (report, None),
         Ok(OutgoingAnswer::Unconfirmed(report)) => (report, Some(slot.name().to_owned())),
@@ -779,9 +785,10 @@ struct CalleeReport {
     encoding: PositionEncoding,
 }
 
-async fn callees_on_engine(
+async fn calls_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
+    direction: TraversalDirection,
     deadline: Instant,
 ) -> Result<OutgoingAnswer<CalleeReport>, RiftError> {
     let request_path = target.path.clone();
@@ -803,8 +810,19 @@ async fn callees_on_engine(
                 }
                 let mut calls = Vec::new();
                 for item in items {
-                    let answered = session.outgoing_calls(item).await?;
-                    calls.extend(answered);
+                    match direction {
+                        TraversalDirection::Outgoing => {
+                            calls.extend(session.outgoing_calls(item).await?);
+                        }
+                        TraversalDirection::Incoming => {
+                            calls.extend(session.incoming_calls(item).await?.into_iter().map(
+                                |call| CallHierarchyOutgoingCall {
+                                    to: call.from,
+                                    from_ranges: call.from_ranges,
+                                },
+                            ));
+                        }
+                    }
                     if calls.len() > TRAVERSAL_NODES_MAX {
                         return Ok(Some(CalleeReport {
                             calls: Err(calls.len()),
@@ -893,13 +911,13 @@ fn map_callees(
 /// Calls the engine established for one selected local declaration.
 #[derive(Default)]
 pub struct GraphCalls {
-    /// Canonical callees in the current tree.
+    /// Canonical neighbors in the current tree.
     pub local: Vec<(SymbolId, Vec<SourceUnitSpan>)>,
-    /// Callees in admitted dependency sources, awaiting exact identity resolution.
+    /// Outgoing targets in admitted dependency sources, awaiting exact identity resolution.
     pub packages: Vec<(PackageCallee, Vec<SourceUnitSpan>)>,
 }
 
-/// Reads every outgoing callee and its physical call sites.
+/// Reads every adjacent call and its physical call sites in the selected direction.
 ///
 /// # Errors
 /// Refuses missing readiness, an unaddressed callee, or work outside the accepted bounds.
@@ -907,7 +925,8 @@ pub async fn graph_calls(
     reads: &ReadService,
     engines: &EnginePool,
     roots: &CalleeRoots,
-    caller: &SymbolId,
+    seed: &SymbolId,
+    direction: TraversalDirection,
     deadline: Instant,
 ) -> Result<GraphCalls, RiftError> {
     let unavailable = || {
@@ -915,7 +934,7 @@ pub async fn graph_calls(
             .operation("graph calls")
             .error()
     };
-    let identity = CoreSymbolId::new(caller.as_str().to_owned()).map_err(|_| unavailable())?;
+    let identity = CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| unavailable())?;
     let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
     let [declaration] = declarations.as_slice() else {
         return Err(unavailable());
@@ -933,7 +952,7 @@ pub async fn graph_calls(
         file,
         declaration.symbol,
     )?;
-    let answered = Box::pin(callees_on_engine(slot, &request, deadline))
+    let answered = Box::pin(calls_on_engine(slot, &request, direction, deadline))
         .await
         .map_err(|error| {
             if error.slug() == errors::lsp::engine_capability_absent::SLUG {
@@ -946,12 +965,26 @@ pub async fn graph_calls(
         return Err(unavailable());
     };
     let trees = [slot.workspace_root(), reads.index().root()];
-    let source = LineIndex::new(file.source());
-    let unit = crate::read::source_unit_id(file.path());
     let mut result = GraphCalls::default();
     let mut locations = 0usize;
     for call in report.calls.map_err(|_| unavailable())? {
         let item = &call.to;
+        let at = NamedCallee {
+            uri: &item.uri,
+            name: &item.name,
+            position: item.selection_range.start,
+            encoding: report.encoding,
+        };
+        let neighbor = callee_file(roots, &trees, &identity, at)?;
+        let caller_file = match (&neighbor, direction) {
+            (_, TraversalDirection::Outgoing) => file,
+            (CalleeFile::Project(path), TraversalDirection::Incoming) => {
+                reads.index().file(path).ok_or_else(unavailable)?
+            }
+            _ => return Err(unavailable()),
+        };
+        let source = LineIndex::new(caller_file.source());
+        let unit = crate::read::source_unit_id(caller_file.path());
         let mut occurrences = Vec::new();
         for range in call.from_ranges {
             locations = locations
@@ -960,7 +993,7 @@ pub async fn graph_calls(
                 .ok_or_else(unavailable)?;
             let start = source.byte_offset(report.encoding, range.start)?;
             let end = source.byte_offset(report.encoding, range.end)?;
-            if file.source().get(start..end).is_none() {
+            if caller_file.source().get(start..end).is_none() {
                 return Err(unavailable());
             }
             occurrences.push(SourceUnitSpan {
@@ -971,13 +1004,7 @@ pub async fn graph_calls(
                 },
             });
         }
-        let at = NamedCallee {
-            uri: &item.uri,
-            name: &item.name,
-            position: item.selection_range.start,
-            encoding: report.encoding,
-        };
-        match callee_file(roots, &trees, &identity, at)? {
+        match neighbor {
             CalleeFile::Project(path) => {
                 let target = project_declaration(
                     reads,
