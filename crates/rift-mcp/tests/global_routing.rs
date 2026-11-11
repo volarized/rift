@@ -1936,31 +1936,31 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
     let refused = [
         (
             "search",
-            json!({"query": "beacon", "pattern": "beacon", "scope": "all"}),
-            "pattern",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :pattern 'beacon'; :scope 'all'; :index ?index } }"}),
+            "field pattern",
         ),
         (
             "search",
-            json!({"query": "beacon", "scope": "all", "limit": 0}),
-            "limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
+            "field limit",
         ),
         (
             "search",
-            json!({"query": "beacon", "scope": "all", "traversal": {"depth": 1}}),
-            "seed",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :query 42; :scope 'all'; :index ?index } }"}),
+            "retrieval query and pattern must be string literals",
         ),
         (
             "search",
-            json!({"pattern": "beacon", "scope": "all", "limit": 0}),
-            "limit",
+            json!({"query": "SELECT ?hit { SERVICE :search { ?hit :pattern 'beacon'; :scope 'all'; :limit 0; :index ?index } }"}),
+            "field limit",
         ),
         (
             "get_symbol",
             json!({"id": id, "declaration_limit": 0}),
-            "limit",
+            "field limit",
         ),
     ];
-    for (tool, request, field) in refused {
+    for (tool, request, diagnostic) in refused {
         let failure = failed_call(client.call_tool(tool_request(tool, &request)).await)?;
         assert_eq!(
             failure.code,
@@ -1969,7 +1969,7 @@ async fn a_refused_package_scoped_read_makes_no_global_request() -> TestResult {
             failure.text
         );
         assert!(
-            failure.message.contains(&format!("field {field}")),
+            failure.message.contains(diagnostic),
             "{request}: {}",
             failure.message
         );
