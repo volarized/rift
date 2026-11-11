@@ -729,6 +729,7 @@ where
     Spawned: ChildWatch + StartedServer<Failure = u32>,
     Observation: std::future::Future<Output = ServerPresence>,
 {
+    let state = root.join(rift_core::constants::RIFT_STATE_DIRECTORY);
     let started = tokio::time::Instant::now();
     let deadline = started + poll_window(attempt_count);
     let mut probe_count = 0;
@@ -740,7 +741,11 @@ where
             ServerPresence::Serving(lock) if !leftover_unscrubbed(root, stale_bytes) => Some(*lock),
             _ => None,
         };
-        match spawns.poll(serving, election_held) {
+        let election_blocked = election_held
+            || (serving.is_none()
+                && spawns.can_replace_lost_child()
+                && rift_mcp::election_claim_blocked(&state));
+        match spawns.poll(serving, election_blocked) {
             SpawnPollOutcome::Ready(lock) => {
                 return Ok(ServerOutcome::Listening {
                     port: lock.port,
@@ -2550,20 +2555,35 @@ mod tests {
         Ok(())
     }
 
-    /// The child lost an election nobody holds - a lock no serving process holds met its
-    /// claim - so the wait spawns again, once, and reports the new child starting.
     #[tokio::test(start_paused = true)]
-    async fn await_serving_spawns_again_when_the_child_lost_an_election_nobody_holds() -> TestResult
-    {
+    async fn await_serving_replaces_a_lost_child_after_a_shared_lock_releases() -> TestResult {
         let directory = tempfile::tempdir()?;
+        let state = directory
+            .path()
+            .join(rift_core::constants::RIFT_STATE_DIRECTORY);
+        std::fs::create_dir(&state)?;
+        let shared = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(state.join("server.lock"))?;
+        shared.try_lock_shared()?;
         let mut spawns = spawned(FakeChild::exited(77, FakeExit::LostElection));
         let mut launches = 0_u32;
         let launch = || {
+            assert!(!rift_mcp::election_claim_blocked(&state));
             launches += 1;
             Ok(FakeChild::running(78))
         };
-        let outcome = await_serving(directory.path(), 5, None, &mut spawns, launch).await?;
-        assert_eq!(outcome, ServerOutcome::Starting { pid: Some(78) });
+        let held_rounds = START_SPAWN_COUNT_MAX * 2;
+        let release = async {
+            tokio::time::sleep(PRESENCE_POLL_INTERVAL * held_rounds).await;
+            shared.unlock()
+        };
+        let wait = await_serving(directory.path(), held_rounds + 3, None, &mut spawns, launch);
+        let (outcome, released) = tokio::join!(wait, release);
+        released?;
+        assert_eq!(outcome?, ServerOutcome::Starting { pid: Some(78) });
         assert_eq!(launches, 1, "one respawn replaces the lost child");
         Ok(())
     }
