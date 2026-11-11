@@ -24,13 +24,15 @@ use rift_protocol::configuration::ServerConfiguration;
 use rift_protocol::error as wire;
 use rift_protocol::identity::SymbolOwner;
 use rift_protocol::lock::{ProductIdentity, ServerLock};
+#[cfg(test)]
+use rmcp::model::CallToolRequest;
 use rmcp::model::{
-    CallToolRequest, CallToolRequestParams, CallToolResponse, ClientRequest, Extensions,
-    Implementation, ListResourceTemplatesRequest, ListResourceTemplatesRequestMethod,
-    ListResourceTemplatesResult, ListResourcesRequest, ListResourcesRequestMethod,
-    ListResourcesResult, ListToolsRequest, ListToolsRequestMethod, ListToolsResult,
-    PaginatedRequestParams, ReadResourceRequest, ReadResourceRequestParams, ReadResourceResponse,
-    ServerCapabilities, ServerConfig, ServerPeerInfo, ServerResult,
+    CallToolRequestParams, CallToolResponse, ClientRequest, Extensions, Implementation,
+    ListResourceTemplatesRequest, ListResourceTemplatesRequestMethod, ListResourceTemplatesResult,
+    ListResourcesRequest, ListResourcesRequestMethod, ListResourcesResult, ListToolsRequest,
+    ListToolsRequestMethod, ListToolsResult, PaginatedRequestParams, ReadResourceRequest,
+    ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities, ServerConfig,
+    ServerPeerInfo, ServerResult,
 };
 use rmcp::service::{
     Peer, PeerRequestOptions, QuitReason, RequestContext, RoleClient, RoleServer, RunningService,
@@ -66,6 +68,7 @@ use crate::validation::ConfigurationState;
 
 mod candidates;
 mod identity;
+mod query;
 pub(crate) use candidates::normalized_params;
 mod extra;
 mod http_client;
@@ -216,6 +219,7 @@ struct RiftProxy {
     extra: Arc<extra::Registrations>,
     backends: Arc<BTreeMap<String, RiftProxy>>,
     candidate_views: Arc<candidates::CandidateViews>,
+    query_routes: Arc<query::QueryRoutes>,
     framework_warnings: Arc<crate::output::FrameworkWarnings>,
 }
 
@@ -378,6 +382,7 @@ impl RiftProxy {
             extra: Arc::new(extra::Registrations::default()),
             backends: Arc::new(BTreeMap::new()),
             candidate_views: Arc::new(candidates::CandidateViews::default()),
+            query_routes: Arc::new(query::QueryRoutes::default()),
             framework_warnings: Arc::new(crate::output::FrameworkWarnings::default()),
         }
     }
@@ -1713,31 +1718,9 @@ impl ServerHandler for RiftProxy {
                     let registered: Result<_, RiftError> = match self.routed_read(&request).await {
                         Err(error) => Err(error),
                         Ok(Some(answer)) => Ok(answer),
-                        Ok(None) => match self.captured_search(&request).await {
+                        Ok(None) => match self.call_backend(&request) {
                             Err(refusal) => Err(refusal),
-                            Ok(Some(answer)) => Ok(answer),
-                            Ok(None) => match self.call_backend(&request) {
-                                Err(refusal) => Err(refusal),
-                                Ok(backend) => {
-                                    let request = ClientRequest::CallToolRequest(
-                                        CallToolRequest::new(request),
-                                    );
-                                    backend
-                                        .forward_registered(request, |result| match result {
-                                            ServerResult::CallToolResult(result) => {
-                                                Some(CallToolResponse::Complete(result))
-                                            }
-                                            ServerResult::InputRequiredResult(result) => {
-                                                Some(CallToolResponse::InputRequired(result))
-                                            }
-                                            ServerResult::CreateTaskResult(result) => {
-                                                Some(CallToolResponse::Task(result))
-                                            }
-                                            _ => None,
-                                        })
-                                        .await
-                                }
-                            },
+                            Ok(backend) => backend.forward_read(request).await,
                         },
                     };
                     if let Err(error) = &registered {
@@ -3096,7 +3079,7 @@ mod tests {
         let forwarding = forwarding?;
         let client = client?;
         let params = super::CallToolRequestParams::new("search").with_arguments(
-            serde_json::from_value(json!({"query": "zzdiagnosticsecret", "scope": "local"}))?,
+            serde_json::from_value(json!({"query": "ASK { ?symbol :name 'zzdiagnosticsecret' }"}))?,
         );
         let request = super::ClientRequest::CallToolRequest(super::CallToolRequest::new(params));
         let handle = client
@@ -3130,7 +3113,7 @@ mod tests {
     }
 
     /// Whether `record` was emitted inside the `span` that served `request_id` for the
-    /// internal `search_candidates` tool: its `root_span` member names that span and
+    /// `search` tool: its `root_span` member names that span and
     /// carries both fields.
     ///
     /// The member is the span the record was emitted in, read from the subscriber's span
@@ -3141,7 +3124,7 @@ mod tests {
             let root = &fields["root_span"];
             root["name"] == span
                 && root["fields"]["request_id"] == request_id
-                && root["fields"]["tool"] == "search_candidates"
+                && root["fields"]["tool"] == "search"
         })
     }
 
@@ -3386,7 +3369,7 @@ mod tests {
                     )
                     .into())
                 }
-                "search"
+                "search_retrieval"
                     if request
                         .arguments
                         .as_ref()
@@ -3399,7 +3382,7 @@ mod tests {
                             .into(),
                     )
                 }
-                "search" => {
+                "search_retrieval" => {
                     let arguments = request.arguments.expect("search arguments");
                     assert_eq!(arguments["scope"], "local");
                     assert_eq!(arguments["pattern"], "beacon");
@@ -3417,6 +3400,12 @@ mod tests {
                     .with_meta(Some(meta))
                     .into())
                 }
+                "search" => Ok(CallToolResult::structured(json!({
+                    "answer": {"result":"bindings", "variables":["symbol"], "bindings":[]},
+                    "view": {"id":"claims.primary", "expires_at":"2099-01-01T00:00:00Z"},
+                    "pagination": {"page_index":0, "total_pages":0}
+                }))
+                .into()),
                 "failing" => Ok(CallToolResult::structured_error(json!({"code": "failed"})).into()),
                 other => Err(ErrorData::invalid_params(
                     format!("unknown tool {other}"),
@@ -3668,8 +3657,10 @@ mod tests {
         .wire_identity();
         for (tool, arguments) in [
             ("get_symbol", json!({"id": identity})),
-            ("search", json!({"query": "beacon", "scope": "local@cloud"})),
-            ("search", json!({"query": "beacon", "scope": "local@Cloud"})),
+            (
+                "search",
+                json!({"query": "SELECT ?symbol { SERVICE :search { ?hit :query 'beacon'; :scope 'local@cloud'; :symbol ?symbol } }"}),
+            ),
         ] {
             let request =
                 CallToolRequestParams::new(tool).with_arguments(serde_json::from_value(arguments)?);
@@ -3686,21 +3677,28 @@ mod tests {
             assert_eq!(error.code, wire::ErrorCode::InvalidRequest);
             assert_eq!(error.retry, wire::RetryDirective::Never);
         }
-        let primary =
-            proxied
-                .client
-                .call_tool(CallToolRequestParams::new("search").with_arguments(
-                    serde_json::from_value(json!({"query": "beacon", "scope": "local"}))?,
-                ))
-                .await?;
-        let primary: rift_protocol::search::SearchResult = serde_json::from_value(
+        let primary = proxied
+            .client
+            .call_tool(
+                CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
+                    json!({"query": "SELECT ?symbol { ?symbol :name 'beacon' }"}),
+                )?),
+            )
+            .await?;
+        let primary: rift_protocol::query::QueryResult = serde_json::from_value(
             primary
                 .structured_content
                 .ok_or("primary search returns structured content")?,
         )?;
-        assert!(primary.results.is_empty());
-        assert_eq!(primary.pagination.page_index, 0);
-        assert_eq!(primary.pagination.total_pages, 0);
+        assert_eq!(
+            primary.answer,
+            rift_protocol::query::QueryAnswer::Bindings {
+                variables: vec!["symbol".to_owned()],
+                bindings: Vec::new()
+            }
+        );
+        assert_eq!(primary.pagination.page.page_index, 0);
+        assert_eq!(primary.pagination.page.total_pages, 0);
         let view = primary
             .view
             .ok_or("primary search retains its captured view")?;
@@ -3712,11 +3710,8 @@ mod tests {
             .filter(|record| record.message() == "tool forward completed")
             .map(|record| serde_json::from_str::<serde_json::Value>(record.fields()))
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(completed.len(), 4);
-        for (fields, tool) in completed[..3]
-            .iter()
-            .zip(["get_symbol", "search", "search"])
-        {
+        assert_eq!(completed.len(), 3);
+        for (fields, tool) in completed[..2].iter().zip(["get_symbol", "search"]) {
             let operation = &fields["root_span"];
             assert_eq!(operation["name"], "mcp.forward");
             assert_eq!(operation["fields"]["operation"], "tools/call");
@@ -3728,8 +3723,8 @@ mod tests {
             );
             assert_eq!(fields["is_error"], "true");
         }
-        assert!(completed[3]["root_span"]["fields"]["error.type"].is_null());
-        assert_eq!(completed[3]["is_error"], "false");
+        assert!(completed[2]["root_span"]["fields"]["error.type"].is_null());
+        assert_eq!(completed[2]["is_error"], "false");
         Ok(())
     }
 
@@ -3790,23 +3785,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn selected_pattern_search_refuses_invalid_arguments_before_forwarding() -> TestResult {
+    async fn unregistered_pattern_scope_refuses_before_forwarding() -> TestResult {
         let primary = tempfile::tempdir()?;
         let proxy = profile_proxy(primary.path())?;
-        let invalid = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
-            json!({"pattern":7, "scope":"local:docs"}),
-        )?);
+        let invalid = selected_pattern("beacon", "local:unknown")?;
         let error = proxy
             .routed_read(&invalid)
             .await
-            .expect_err("pattern must be text");
+            .expect_err("unregistered scope");
         assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
-        let context: std::collections::BTreeMap<_, _> = error.context().collect();
-        assert_eq!(context.get("field").map(String::as_str), Some("arguments"));
-        let revision = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
-            json!({"pattern":"beacon", "scope":"local:docs", "revision":"rift://revision/git/HEAD"}),
-        )?);
-        assert!(proxy.routed_read(&revision).await?.is_none());
         assert_eq!(
             proxy.backends[":docs"]
                 .upstream
@@ -3819,16 +3806,44 @@ mod tests {
         Ok(())
     }
 
+    fn selected_pattern(pattern: &str, scope: &str) -> TestResult<CallToolRequestParams> {
+        let statement = format!(
+            "SELECT ?symbol ?source {{ SERVICE :search {{ ?hit :pattern '{pattern}'; :scope '{scope}'; :target 'symbol'; :symbol ?symbol; :source ?source }} }}"
+        );
+        Ok(CallToolRequestParams::new("search")
+            .with_arguments(serde_json::from_value(json!({"query":statement}))?))
+    }
+
+    fn assert_selected_pattern(answer: CallToolResult, identity: &str) -> TestResult {
+        use rift_protocol::query::{QueryAnswer, QueryResult, RdfTerm};
+        let result: QueryResult =
+            serde_json::from_value(answer.structured_content.ok_or("typed query result")?)?;
+        assert!(result.view.is_some());
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected bindings".into());
+        };
+        let [row] = bindings.as_slice() else {
+            return Err(format!("expected one binding: {bindings:?}").into());
+        };
+        assert_eq!(
+            row.get("symbol"),
+            Some(&RdfTerm::Iri {
+                value: identity.to_owned()
+            })
+        );
+        assert!(
+            matches!(row.get("source"), Some(RdfTerm::Literal { value, .. }) if value == "fn beacon() {}")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
-    async fn extra_pattern_search_preserves_identity_source_and_metadata_without_captured_view()
-    -> TestResult {
+    async fn extra_pattern_search_retains_identity_and_source() -> TestResult {
         let primary = tempfile::tempdir()?;
         let extra = tempfile::tempdir()?;
         let proxy = named_proxy(primary.path(), extra.path())?;
         let upstream = connect_selected_upstream(&proxy, "cloud").await?;
-        let request = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
-            json!({"pattern":"beacon", "scope":"local@cloud", "target":"symbol"}),
-        )?);
+        let request = selected_pattern("beacon", "local@cloud")?;
         let CallToolResponse::Complete(answer) = proxy
             .routed_read(&request)
             .await?
@@ -3836,28 +3851,7 @@ mod tests {
         else {
             return Err("complete selected search".into());
         };
-        assert_eq!(
-            answer.meta.as_ref().ok_or("metadata")?["traceparent"],
-            "selected-search"
-        );
-        let result: rift_protocol::search_read::SearchReadResult =
-            serde_json::from_value(answer.structured_content.ok_or("typed result")?)?;
-        let rift_protocol::search_read::SearchReadResult::Results(result) = result else {
-            return Err("search results".into());
-        };
-        assert!(result.view.is_none());
-        assert_eq!(result.results.len(), 1);
-        let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &result.results[0].hit else {
-            return Err("symbol hit".into());
-        };
-        assert_eq!(
-            symbol
-                .id
-                .as_ref()
-                .map(rift_protocol::read::SymbolId::as_str),
-            Some("rift://symbol/local@cloud/rust/app/beacon")
-        );
-        assert_eq!(result.results[0].source.as_deref(), Some("fn beacon() {}"));
+        assert_selected_pattern(answer, "rift://symbol/local@cloud/rust/app/beacon")?;
         assert_eq!(proxy.upstream.lock().await.generation_next, 0);
         upstream.cancel().await?;
         Ok(())
@@ -3870,22 +3864,16 @@ mod tests {
         let extra = tempfile::tempdir()?;
         let proxy = named_proxy(primary.path(), extra.path())?;
         let upstream = connect_selected_upstream(&proxy, "cloud").await?;
-        let request = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
-            json!({"pattern":"plain", "scope":"local@cloud", "target":"symbol"}),
-        )?);
+        let request = selected_pattern("plain", "local@cloud")?;
         let error = proxy
             .routed_read(&request)
             .await
             .expect_err("successful search requires structured content");
-        assert_eq!(error.slug(), errors::server::read_invalid::SLUG);
-        let context: std::collections::BTreeMap<_, _> = error.context().collect();
-        assert_eq!(
-            context.get("field").map(String::as_str),
-            Some("structuredContent")
-        );
-        assert_eq!(
-            context.get("violation").map(String::as_str),
-            Some("project response has no structured result")
+        assert_eq!(error.slug(), errors::server::read_unavailable::SLUG);
+        assert!(
+            error
+                .context()
+                .any(|(_, value)| value.contains("no structured query result"))
         );
         assert_eq!(proxy.upstream.lock().await.generation_next, 0);
         upstream.cancel().await?;
@@ -3939,7 +3927,7 @@ mod tests {
                 &raw const proxy
             ));
             assert!(proxy.routed_read(&request).await?.is_none());
-            let upstream = super::candidates::dispatch_read_request(&request, "global")?;
+            let upstream = super::candidates::dispatch_nodes_request(&request, "global")?;
             assert_eq!(upstream.arguments, request.arguments);
         }
         Ok(())
@@ -3957,7 +3945,7 @@ mod tests {
         )?);
 
         let backend = proxy.call_backend(&request)?;
-        let upstream = super::candidates::dispatch_read_request(&request, "cloud:docs")?;
+        let upstream = super::candidates::dispatch_nodes_request(&request, "cloud:docs")?;
 
         assert_eq!(
             backend.root.as_ref(),
@@ -3984,7 +3972,7 @@ mod tests {
         let malformed = CallToolRequestParams::new("nodes").with_arguments(serde_json::from_value(
             json!({"symbol": id, "position": "zero"}),
         )?);
-        let error = super::candidates::dispatch_read_request(&malformed, "cloud:docs")
+        let error = super::candidates::dispatch_nodes_request(&malformed, "cloud:docs")
             .expect_err("arguments outside the nodes form refuse");
         assert_eq!(error.slug(), errors::mcp::parameter_invalid::SLUG);
         Ok(())
@@ -4071,9 +4059,7 @@ mod tests {
         let extra = tempfile::tempdir()?;
         let proxy = extra_profile_proxy(primary.path(), extra.path())?;
         let upstream = connect_selected_upstream(&proxy, "cloud:docs").await?;
-        let request = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(
-            json!({"pattern":"beacon", "scope":"local@cloud:docs", "target":"symbol"}),
-        )?);
+        let request = selected_pattern("beacon", "local@cloud:docs")?;
         let CallToolResponse::Complete(answer) = proxy
             .routed_read(&request)
             .await?
@@ -4081,21 +4067,7 @@ mod tests {
         else {
             return Err("complete selected search".into());
         };
-        let result: rift_protocol::search_read::SearchReadResult =
-            serde_json::from_value(answer.structured_content.ok_or("typed result")?)?;
-        let rift_protocol::search_read::SearchReadResult::Results(result) = result else {
-            return Err("search results".into());
-        };
-        let rift_protocol::read::SearchHitTarget::Symbol { symbol } = &result.results[0].hit else {
-            return Err("symbol hit".into());
-        };
-        assert_eq!(
-            symbol
-                .id
-                .as_ref()
-                .map(rift_protocol::read::SymbolId::as_str),
-            Some("rift://symbol/local@cloud:docs/rust/app/beacon")
-        );
+        assert_selected_pattern(answer, "rift://symbol/local@cloud:docs/rust/app/beacon")?;
         assert_eq!(proxy.upstream.lock().await.generation_next, 0);
         assert_eq!(
             proxy.backends["cloud"]
@@ -4202,19 +4174,16 @@ mod tests {
     }
 
     fn assert_named_walk(initial: &serde_json::Value) {
-        assert_eq!(initial["results"][0]["hit"]["symbol"]["name"], "zulu");
-        assert_eq!(initial["results"][1]["hit"]["symbol"]["name"], "alpha");
-        for (index, name) in ["zulu", "alpha"].into_iter().enumerate() {
+        let rows = initial["answer"]["bindings"]
+            .as_array()
+            .expect("walk bindings");
+        assert_eq!(rows.len(), 2);
+        for (row, name) in rows.iter().zip(["zulu", "alpha"]) {
+            assert_eq!(row["name"]["value"], name);
             assert_eq!(
-                initial["results"][index]["hit"]["symbol"]["id"],
+                row["symbol"]["value"],
                 format!("rift://symbol/local@cloud/rust/app/{name}")
             );
-            assert_eq!(
-                initial["results"][index]["source"],
-                format!("fn {name}() {{}}")
-            );
-            assert_eq!(initial["results"][index]["path"], "lib.rs");
-            assert!(initial["results"][index].get("view").is_none());
         }
     }
 
@@ -4324,8 +4293,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn named_walk_keeps_order_source_and_the_accepted_root_after_extra_root_retargets()
-    -> TestResult {
+    async fn named_walk_keeps_order_and_the_accepted_root_after_extra_root_retargets() -> TestResult
+    {
         use std::os::unix::fs::symlink;
         use tokio::io::AsyncWriteExt as _;
         let primary = tempfile::tempdir()?;
@@ -4347,33 +4316,34 @@ mod tests {
         let answering = tokio::spawn(async move {
             let (reading, mut writing) = tokio::io::split(upstream);
             let mut lines = tokio::io::BufReader::new(reading).lines();
-            for _ in 0..2 {
+            for page in 0..2 {
                 let line = lines
                     .next_line()
                     .await?
                     .ok_or(std::io::ErrorKind::UnexpectedEof)?;
                 let request: serde_json::Value = serde_json::from_str(&line)?;
-                let arguments = &request["params"]["arguments"];
-                assert_eq!(
-                    arguments["traversal"]["seed"],
-                    "rift://symbol/local/rust/app/load"
-                );
-                assert_eq!(arguments["scope"], "all");
-                assert_eq!(arguments["limit"], 2);
-                assert_eq!(arguments["page_index"], 0);
-                assert!(arguments.get("view").is_none());
-                let hits: Vec<_> = ["zulu", "alpha"]
-                    .into_iter()
-                    .map(|name| {
-                        json!({"hit":{"target":"symbol", "symbol":{
-                        "id":format!("rift://symbol/local/rust/app/{name}"),
-                        "language":"rust", "name":name, "kind":"function"
-                    }}, "source":format!("fn {name}() {{}}"), "path":"lib.rs",
-                    "range":{"start":0,"end":12}, "line":1})
-                    })
-                    .collect();
+                let query = request["params"]["arguments"]["query"]
+                    .as_str()
+                    .expect("forwarded SPARQL");
+                if page == 0 {
+                    assert!(
+                        query.contains("<rift://symbol/local/rust/app/load>"),
+                        "{query}"
+                    );
+                    assert!(!query.contains("local@cloud"), "{query}");
+                } else {
+                    assert!(
+                        query.contains("urn:rift:result:claims.walk?page=0"),
+                        "{query}"
+                    );
+                }
+                let rows: Vec<_> = ["zulu", "alpha"].into_iter().map(|name| json!({
+                    "symbol":{"type":"iri", "value":format!("rift://symbol/local/rust/app/{name}")},
+                    "name":{"type":"literal", "value":name, "datatype":"http://www.w3.org/2001/XMLSchema#string"}
+                })).collect();
                 let answer = json!({"content":[], "structuredContent":{
-                    "results":hits,
+                    "answer":{"result":"bindings", "variables":["symbol", "name"], "bindings":rows},
+                    "view":{"id":"claims.walk", "expires_at":"2099-01-01T00:00:00Z"},
                     "pagination":{"page_index":0, "total_pages":1}
                 }});
                 let response = json!({"jsonrpc":"2.0", "id":request["id"], "result":answer});
@@ -4383,12 +4353,9 @@ mod tests {
             }
             Ok::<_, std::io::Error>(2)
         });
-        let arguments = json!({"scope":"all", "limit":2,
-        "include":["source"], "traversal":{
-            "seed":"rift://symbol/local@cloud/rust/app/load", "direction":"incoming"
-        }});
-        let initial = CallToolRequestParams::new("search")
-            .with_arguments(serde_json::from_value(arguments.clone())?);
+        let initial = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(json!({
+            "query":"SELECT ?symbol ?name { ?symbol :references <rift://symbol/local@cloud/rust/app/load>; :name ?name } ORDER BY DESC(?name)"
+        }))?);
         let CallToolResponse::Complete(initial) = proxy
             .routed_read(&initial)
             .await?
@@ -4402,7 +4369,9 @@ mod tests {
         std::fs::remove_file(&registration_path)?;
         symlink(second.path(), &registration_path)?;
         let held =
-            CallToolRequestParams::new("search").with_arguments(serde_json::from_value(arguments)?);
+            CallToolRequestParams::new("search").with_arguments(serde_json::from_value(json!({
+                "query":"SELECT ?symbol ?name { SERVICE <urn:rift:result:claims.walk?page=0> {} }"
+            }))?);
         let CallToolResponse::Complete(continued) =
             proxy.routed_read(&held).await?.ok_or("held walk")??
         else {
@@ -4607,8 +4576,14 @@ mod tests {
             .structured_content
             .as_ref()
             .ok_or("structured search result")?;
-        let result_view: rift_protocol::read::SearchResult = serde_json::from_value(value.clone())?;
-        assert!(result_view.results.is_empty());
+        let result_view: rift_protocol::query::QueryResult = serde_json::from_value(value.clone())?;
+        assert_eq!(
+            result_view.answer,
+            rift_protocol::query::QueryAnswer::Bindings {
+                variables: vec!["symbol".to_owned()],
+                bindings: Vec::new()
+            }
+        );
         let view = result_view
             .view
             .ok_or("search preserves its captured view")?;
