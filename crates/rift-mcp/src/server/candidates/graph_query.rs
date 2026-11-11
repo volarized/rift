@@ -12,7 +12,7 @@ use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
     AdjacencySelection, GraphDataset, GraphLimits, GraphQuery, PageForm, PageSelection,
-    QueryCancellation, continuation_query,
+    QueryCancellation, SemanticInventory, continuation_query,
 };
 use serde::{Deserialize, Serialize};
 
@@ -131,33 +131,28 @@ impl RiftMcp {
         if resolved.published.preparation.is_some() {
             return Ok(Err(unavailable(SymbolUnavailableReason::IndexPreparing)));
         }
-        let selected = query.adjacency_selection();
-        let mut acquired = if let Some(selected) = &selected {
-            let result = tokio::time::timeout_at(
-                deadline.at(),
-                Box::pin(self.acquire_adjacency(&resolved, selected, limits, deadline)),
-            )
-            .await
-            .map_err(|_| read_failure(deadline_failure(deadline.budget())))?;
-            match result {
-                Ok(Ok(acquired)) => acquired,
-                Ok(Err(unavailable)) => return Ok(Err(unavailable)),
-                Err(error) if lacks_coverage(&error) => {
-                    return Ok(Err(unavailable(
-                        SymbolUnavailableReason::InsufficientCoverage,
-                    )));
-                }
-                Err(error) => return Err(read_failure(error)),
-            }
-        } else if query.symbol_selection().is_some()
-            || query.node_selection().is_some()
-            || !query.reads_base()
-        {
-            AcquiredAdjacency::default()
+        let mut selected = query.adjacency_selection();
+        let local_semantics = if selected.is_none() || query.names_local_graph() {
+            query.semantic_inventory()
         } else {
-            return Ok(Err(unavailable(
-                SymbolUnavailableReason::InsufficientCoverage,
-            )));
+            None
+        };
+        if local_semantics.is_some() {
+            selected = None;
+        }
+        let mut acquired = match self
+            .prepare_relationships(
+                &resolved,
+                query,
+                selected.as_ref(),
+                local_semantics,
+                limits,
+                deadline,
+            )
+            .await?
+        {
+            Ok(acquired) => acquired,
+            Err(reason) => return Ok(Err(reason)),
         };
         let mut exact = match tokio::time::timeout_at(
             deadline.at(),
@@ -212,6 +207,7 @@ impl RiftMcp {
         Ok(Ok(AcquiredGraph {
             reads,
             selected,
+            local_semantics,
             acquired,
             exact,
             retrieved,
@@ -219,11 +215,49 @@ impl RiftMcp {
             warnings,
         }))
     }
+    async fn prepare_relationships(
+        &self,
+        resolved: &super::super::ResolvedWorkspace,
+        query: &GraphQuery,
+        selected: Option<&AdjacencySelection>,
+        local_semantics: Option<SemanticInventory>,
+        limits: GraphLimits,
+        deadline: RequestDeadline,
+    ) -> Result<Result<AcquiredAdjacency, SearchUnavailable>, ToolFailure> {
+        let acquire = async {
+            if let Some(selected) = selected {
+                self.acquire_adjacency(resolved, selected, limits, deadline)
+                    .await
+            } else if let Some(required) = local_semantics {
+                Ok(Ok(self
+                    .acquire_semantic_inventory(resolved, required, deadline)
+                    .await?))
+            } else if query.symbol_selection().is_some()
+                || query.node_selection().is_some()
+                || !query.reads_base()
+            {
+                Ok(Ok(AcquiredAdjacency::default()))
+            } else {
+                Err(relationships::coverage_failure())
+            }
+        };
+        let result = tokio::time::timeout_at(deadline.at(), Box::pin(acquire))
+            .await
+            .map_err(|_| read_failure(deadline_failure(deadline.budget())))?;
+        match result {
+            Ok(acquired) => Ok(acquired),
+            Err(error) if lacks_coverage(&error) => Ok(Err(unavailable(
+                SymbolUnavailableReason::InsufficientCoverage,
+            ))),
+            Err(error) => Err(read_failure(error)),
+        }
+    }
 }
 
 struct AcquiredGraph {
     reads: Arc<rift_server::ReadService>,
     selected: Option<AdjacencySelection>,
+    local_semantics: Option<SemanticInventory>,
     acquired: AcquiredAdjacency,
     exact: Option<exact::ExactFacts>,
     retrieved: Vec<SearchResult>,
@@ -263,6 +297,47 @@ fn project_local_endpoints(
     Ok(())
 }
 
+fn project_semantic_inventory(
+    input: &rift_server::LocalSymbolViewInput,
+    acquired: &AcquiredAdjacency,
+    required: SemanticInventory,
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    cancellation: &QueryCancellation,
+    deadline: std::time::Instant,
+) -> Result<(), RiftError> {
+    input.project_symbols(
+        rift_search::sparql::SymbolSelection::All,
+        dataset,
+        cancellation,
+        deadline,
+    )?;
+    acquired.project_local(
+        dataset,
+        input,
+        required.references || required.calls,
+        required.occurrences,
+    )
+}
+
+fn constrain_provider_expiry<'view>(
+    view: &mut CapturedView,
+    providers: impl Iterator<Item = &'view CapturedView>,
+) -> Result<bool, RiftError> {
+    let now = SystemTime::now();
+    let mut expiry = crate::proxy::captured_expiry(view)?;
+    for provider in providers {
+        let selected = crate::proxy::captured_expiry(provider)?;
+        if selected <= now {
+            return Ok(false);
+        }
+        if selected < expiry {
+            view.expires_at.clone_from(&provider.expires_at);
+            expiry = selected;
+        }
+    }
+    Ok(true)
+}
+
 impl AcquiredGraph {
     fn evaluate(
         self,
@@ -276,6 +351,7 @@ impl AcquiredGraph {
         let Self {
             reads,
             selected,
+            local_semantics,
             acquired,
             exact,
             retrieved,
@@ -298,6 +374,15 @@ impl AcquiredGraph {
                 &reads,
                 &acquired,
                 selected,
+                &mut dataset,
+                cancellation,
+                deadline.at().into_std(),
+            )?;
+        } else if let Some(required) = local_semantics {
+            project_semantic_inventory(
+                &input,
+                &acquired,
+                required,
                 &mut dataset,
                 cancellation,
                 deadline.at().into_std(),
@@ -343,15 +428,9 @@ impl AcquiredGraph {
                 .remote_view()
                 .into_iter()
                 .chain(retrieved.iter().filter_map(|result| result.view.as_ref()));
-            for provider in provider_views {
-                let expiry = crate::proxy::captured_expiry(provider)?;
-                if expiry <= SystemTime::now() {
-                    response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
-                    return Ok(false);
-                }
-                if expiry < crate::proxy::captured_expiry(&view)? {
-                    view.expires_at.clone_from(&provider.expires_at);
-                }
+            if !constrain_provider_expiry(&mut view, provider_views)? {
+                response = Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
+                return Ok(false);
             }
             if cancellation.is_cancelled() {
                 return errors::search::query_cancelled().fail();
@@ -791,6 +870,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn graph_query_acquires_complete_local_semantics_for_general_algebra() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            "[languages.toml]\nenabled = false\n[languages.python]\nstdlib = false\n[languages.python.lsp]\nembedded = 'ty'\n",
+        )?;
+        std::fs::write(
+            directory.path().join("pyproject.toml"),
+            "[project]\nname = 'graph-fixture'\nversion = '0.1.0'\n[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['helper','main']\n",
+        )?;
+        std::fs::write(
+            directory.path().join("helper.py"),
+            "def beacon() -> int:\n    return other()\n\ndef other() -> int:\n    return 0\n",
+        )?;
+        std::fs::write(
+            directory.path().join("main.py"),
+            "from helper import beacon\n\nbeacon()\n\ndef caller() -> int:\n    return beacon() + beacon()\n\ncaller()\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let count = server
+            .graph_query(QueryParams {
+                query: "SELECT ?name (COUNT(?usage) AS ?n) FROM <urn:rift:graph:local> { \
+                        ?symbol :name ?name; :usages ?usage . FILTER (?name = 'beacon') \
+                        } GROUP BY ?name"
+                    .to_owned(),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(&count, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                    if bindings.len() == 1
+                        && matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "4"))),
+            "{count:?}"
+        );
+
+        let negative = server
+            .graph_query(QueryParams {
+                query: "ASK { ?caller a :Symbol; :name 'caller' . \
+                        FILTER NOT EXISTS { ?caller :references ?target . ?target :name 'other' } }"
+                    .to_owned(),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(&negative, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Boolean { value: true })),
+            "{negative:?}"
+        );
+        let mixed = server
+            .graph_query(QueryParams {
+                query: "SELECT DISTINCT ?name { ?start :calls/:references ?end; :name 'caller' . ?end :name ?name }"
+                    .to_owned(),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(&mixed, QueryReadResult::Results(result)
+                if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                    if bindings.len() == 1
+                        && matches!(&bindings[0]["name"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "other"))),
+            "{mixed:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn graph_query_keeps_each_local_usage_and_its_exact_source() -> TestResult {
         let directory = tempfile::tempdir()?;
         crate::server::hermetic_workspace(
@@ -1220,21 +1374,29 @@ mod tests {
         let root = directory.path().canonicalize()?;
         let server =
             RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
-        let result = server
-            .graph_query(QueryParams {
-                query: "ASK { ?a :calls ?b }".to_owned(),
-                language: QueryLanguage::Sparql,
-            })
-            .await
-            .map_err(|failure| format!("{failure:?}"))?
-            .0;
-        assert!(matches!(
-            result,
-            QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
-                reason: SymbolUnavailableReason::InsufficientCoverage,
-                ..
-            })
-        ));
+        for query in [
+            "ASK { ?a :calls ?b }",
+            "SELECT (COUNT(?usage) AS ?n) FROM <urn:rift:graph:local> { ?symbol :usages ?usage }",
+        ] {
+            let result = server
+                .graph_query(QueryParams {
+                    query: query.to_owned(),
+                    language: QueryLanguage::Sparql,
+                })
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0;
+            assert!(
+                matches!(
+                    result,
+                    QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                        reason: SymbolUnavailableReason::InsufficientCoverage,
+                        ..
+                    })
+                ),
+                "{query}: {result:?}"
+            );
+        }
         Ok(())
     }
 }

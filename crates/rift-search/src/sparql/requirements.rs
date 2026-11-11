@@ -8,7 +8,7 @@ use spargebra::algebra::{
 };
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
-use super::{GraphQuery, VOCABULARY_NAMESPACE};
+use super::{GraphQuery, OccurrenceSelection, VOCABULARY_NAMESPACE};
 
 /// The symbol facts needed by a query that does not read other fact families.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,10 +52,8 @@ pub struct AdjacencySelection {
     pub symbol_details: bool,
     /// Whether declaration item nodes and their exact text are selected for reached symbols.
     pub node_source: Option<bool>,
-    /// Whether physical usage records must also be projected.
-    pub usages: bool,
-    /// Whether the physical occurrences require exact source bytes.
-    pub source: bool,
+    /// Whether physical usage records and their evidence must also be projected.
+    pub occurrences: Option<OccurrenceSelection>,
 }
 
 impl AdjacencySelection {
@@ -67,6 +65,12 @@ impl AdjacencySelection {
             .and_then(|position| self.steps.get(position))
             .copied()
             .unwrap_or(self.first_step)
+    }
+
+    /// Whether an occurrence's enclosing symbol is required for the graph result.
+    #[must_use]
+    pub fn requires_enclosing(&self) -> bool {
+        self.occurrences.is_none_or(|usage| usage.enclosing)
     }
 
     /// Whether path positions require different acquisition operations.
@@ -376,8 +380,7 @@ fn adjacency(
         depth,
         symbol_details: false,
         node_source: None,
-        usages: false,
-        source: false,
+        occurrences: None,
     })
 }
 
@@ -437,8 +440,7 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
                     depth: Some(depth),
                     symbol_details: false,
                     node_source: None,
-                    usages: false,
-                    source: false,
+                    occurrences: None,
                 });
             }
         }
@@ -454,8 +456,7 @@ fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<Adjace
         steps,
         symbol_details: false,
         node_source: None,
-        usages: false,
-        source: false,
+        occurrences: None,
     })
 }
 
@@ -557,11 +558,13 @@ fn usage_selection(
         .map(|triple| &triple.object)
         .collect();
     let mut source = false;
+    let mut usage_enclosing = false;
     for &triple in triples {
         match property(triple) {
             Some("usages") if triple == *usage => {}
             Some("source") if triple.subject == usage.object => source = true,
-            Some("of" | "range" | "kind") if triple.subject == usage.object => {}
+            Some("of") if triple.subject == usage.object => usage_enclosing = true,
+            Some("range" | "kind") if triple.subject == usage.object => {}
             Some("unit" | "start" | "end") if ranges.contains(&&triple.subject) => {}
             _ if is_occurrence_class(triple) && triple.subject == usage.object => {}
             _ => return None,
@@ -596,8 +599,10 @@ fn usage_selection(
         depth: Some(1),
         symbol_details: false,
         node_source: None,
-        usages: true,
-        source,
+        occurrences: Some(OccurrenceSelection {
+            source,
+            enclosing: usage_enclosing,
+        }),
     })
 }
 
