@@ -204,6 +204,7 @@ mod tests {
         let accepted = [
             "CONSTRUCT { ?s rdfs:label ?label } WHERE { ?s r:kind ?label }",
             "DESCRIBE <urn:x>",
+            "SELECT ?hit { SERVICE :search { ?hit :query 'parse config' } }",
             "SELECT ?symbol WHERE { ?symbol a :Symbol ; :calls+ ?callee }",
             "ASK { ?node rdf:type :Node ; :start ?start FILTER(?start > \"0\"^^xsd:integer) }",
             "PREFIX : <urn:rift:vocabulary:> SELECT (COUNT(*) AS ?count) { ?s :uses ?r }",
@@ -233,7 +234,7 @@ mod tests {
             "SELECT * FROM NAMED <urn:g> { ?s ?p ?o }",
             "SELECT * { SERVICE <https://example.org/sparql> { ?s ?p ?o } }",
             "SELECT * { ?s ?p ?o OPTIONAL { SERVICE SILENT ?endpoint { ?s ?q ?r } } }",
-            "SELECT * { ?s ?p ?o FILTER EXISTS { SERVICE :search { ?s ?q ?r } } }",
+            "SELECT * { ?s ?p ?o FILTER EXISTS { SERVICE :external { ?s ?q ?r } } }",
             "SELECT (SUM(IF(EXISTS { SERVICE <urn:a> {} }, 1, 0)) AS ?n) { ?s ?p ?o }",
             "SELECT * { ?s ?p ?o } ORDER BY DESC(COALESCE(EXISTS { SERVICE <urn:a> {} }))",
             "SELECT * { BIND(?x IN (1, EXISTS { SERVICE <urn:a> {} }) AS ?y) }",

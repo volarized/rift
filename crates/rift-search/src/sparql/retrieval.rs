@@ -58,9 +58,25 @@ pub(super) fn rewrite(
     {
         return super::query::refused(&format!("SERVICE {name}"));
     }
+    let request = request(inner)?;
+    let graph = NamedNode::new_unchecked(format!("{SEARCH_GRAPH_PREFIX}{index}"));
+    let inner = std::mem::replace(
+        inner,
+        Box::new(QueryExpression::Bgp {
+            patterns: Vec::new(),
+        }),
+    );
+    *expression = QueryExpression::Graph {
+        name: NamedNodePattern::NamedNode(graph.clone()),
+        inner,
+    };
+    Ok(RetrievalSelection { graph, request })
+}
+
+fn request(inner: &mut QueryExpression) -> Result<SearchParams, RiftError> {
     let mut fields = Map::new();
     let mut include = BTreeSet::new();
-    let mut pending = vec![(inner.as_mut(), true)];
+    let mut pending = vec![(inner, true)];
     while let Some((pattern, required)) = pending.pop() {
         match pattern {
             QueryExpression::Bgp { patterns } => {
@@ -99,14 +115,14 @@ pub(super) fn rewrite(
                 }
             }
             QueryExpression::Join { left, right } => {
-                pending.extend([(left.as_mut(), required), (right.as_mut(), required)])
+                pending.extend([(left.as_mut(), required), (right.as_mut(), required)]);
             }
             QueryExpression::LeftJoin { left, right, .. }
             | QueryExpression::Minus { left, right } => {
                 pending.extend([(left.as_mut(), required), (right.as_mut(), false)]);
             }
             QueryExpression::Union { left, right } => {
-                pending.extend([(left.as_mut(), false), (right.as_mut(), false)])
+                pending.extend([(left.as_mut(), false), (right.as_mut(), false)]);
             }
             QueryExpression::Filter { inner, .. }
             | QueryExpression::Extend { inner, .. }
@@ -127,28 +143,10 @@ pub(super) fn rewrite(
     if !include.is_empty() && !fields.contains_key("include") {
         fields.insert(
             "include".to_owned(),
-            Value::Array(
-                include
-                    .into_iter()
-                    .map(|field| Value::String(field.to_owned()))
-                    .collect(),
-            ),
+            Value::Array(include.into_iter().map(Value::String).collect()),
         );
     }
-    let request = serde_json::from_value(Value::Object(fields))
-        .map_err(|error| invalid(&error.to_string()))?;
-    let graph = NamedNode::new_unchecked(format!("{SEARCH_GRAPH_PREFIX}{index}"));
-    let inner = std::mem::replace(
-        inner,
-        Box::new(QueryExpression::Bgp {
-            patterns: Vec::new(),
-        }),
-    );
-    *expression = QueryExpression::Graph {
-        name: NamedNodePattern::NamedNode(graph.clone()),
-        inner,
-    };
-    Ok(RetrievalSelection { graph, request })
+    serde_json::from_value(Value::Object(fields)).map_err(|error| invalid(&error.to_string()))
 }
 
 fn input(key: &str, object: &TermPattern) -> Result<Value, RiftError> {
@@ -175,7 +173,7 @@ fn input(key: &str, object: &TermPattern) -> Result<Value, RiftError> {
                 .unwrap_or(name.as_str())
                 .to_owned(),
         )),
-        _ => Err(invalid("retrieval inputs must be constant")),
+        TermPattern::Variable(_) => Err(invalid("retrieval inputs must be constant")),
     }
 }
 

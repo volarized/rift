@@ -25,7 +25,8 @@ pub use configuration::{
 };
 pub use engine::{EnginePool, EngineSlot, LspProcessKey};
 pub use engine_read::{
-    EngineReferences, graph_references, resolve_engine_references, uses_engine_references,
+    EngineReferences, GraphCalls, graph_calls, graph_references, resolve_engine_references,
+    uses_engine_references,
 };
 pub use history::{FillCounts, FillProgress, StoredHistory};
 pub use history_fill::{
