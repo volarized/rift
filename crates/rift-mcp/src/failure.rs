@@ -267,6 +267,11 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
             ],
         ),
         (
+            Code::ContentUnavailable,
+            Retry::OperatorAction,
+            &["rift.server.search_coverage_unavailable"],
+        ),
+        (
             Code::InternalError,
             Retry::OperatorAction,
             &[
@@ -431,6 +436,8 @@ const WIRE_GUIDANCE: &[(wire::ErrorCode, wire::RetryDirective, &[&str])] = {
                 "rift.search.query_feature_refused",
                 "rift.search.query_syntax_invalid",
                 "rift.server.read_invalid",
+                "rift.server.search_view_expired",
+                "rift.server.search_view_context",
             ],
         ),
         (
@@ -733,6 +740,21 @@ mod tests {
                 "rift.server.search_exact_release_unavailable",
                 Code::ResourceNotFound,
                 Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_coverage_unavailable",
+                Code::ContentUnavailable,
+                Retry::OperatorAction,
+            ),
+            (
+                "rift.server.search_view_expired",
+                Code::InvalidRequest,
+                Retry::Never,
+            ),
+            (
+                "rift.server.search_view_context",
+                Code::InvalidRequest,
+                Retry::Never,
             ),
         ] {
             assert_eq!(super::wire_guidance(slug), Some((code, retry)), "{slug}");
