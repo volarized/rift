@@ -964,7 +964,7 @@ async fn every_tool_result_validates_against_served_output_schema() -> TestResul
     let (_fixture, client, server_task) = served_fixture().await?;
     let warmup =
         workspace_client::query::retrieval(&serde_json::from_value(json!({"query":"beacon"}))?)?;
-    workspace_client::search_after_population(&client, &warmup).await?;
+    workspace_client::query_after_population(&client, &warmup).await?;
     let tools = client.list_all_tools().await?;
     let advertised: BTreeSet<&str> = tools.iter().map(|tool| tool.name.as_ref()).collect();
     let covered: BTreeSet<&str> = corpus().iter().map(|(name, _)| *name).collect();

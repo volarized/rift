@@ -276,47 +276,48 @@ pub(crate) async fn await_workspace_ready(
 /// attempts for acceptance refusals and has no elapsed-time deadline.
 pub(crate) async fn search_after_population(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    arguments: &Value,
+) -> TestResult<Value> {
+    populated_answer(client, "search_retrieval", arguments).await
+}
+
+/// Calls the public SPARQL route once its required local population is ready.
+pub(crate) async fn query_after_population(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
     arguments: &rift_protocol::query::QueryParams,
 ) -> TestResult<Value> {
-    search_after_population_when(client, arguments, |answer| {
-        answer["warnings"]
+    populated_answer(client, "search", &serde_json::to_value(arguments)?).await
+}
+
+async fn populated_answer(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    tool: &'static str,
+    arguments: &Value,
+) -> TestResult<Value> {
+    const ATTEMPTS: usize = 60;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
+    for _attempt in 0..ATTEMPTS {
+        let pending = answer["warnings"]
             .as_array()
             .into_iter()
             .flatten()
             .any(|warning| {
                 matches!(
                     warning["code"].as_str(),
-                    Some("lexical_ranking_unavailable" | "stale_index")
+                    Some("lexical_ranking_unavailable" | "stale_index" | "pattern_index_preparing")
                 )
-            })
-    })
-    .await
-}
-
-/// Calls the current query while the caller's exact population condition holds.
-pub(crate) async fn search_after_population_when(
-    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
-    arguments: &rift_protocol::query::QueryParams,
-    pending: fn(&Value) -> bool,
-) -> TestResult<Value> {
-    const SEARCH_TIER_ATTEMPTS_MAX: usize = 60;
-    const SEARCH_TIER_POLL: std::time::Duration = std::time::Duration::from_millis(50);
-
-    let query = arguments.query.as_str();
-    let arguments = serde_json::to_value(arguments)?;
-    let mut answer = call_retrying_acceptance(client, tool_request("search", &arguments)).await?;
-    for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
-        let population_pending = pending(&answer);
-        if !population_pending {
+            });
+        if !pending {
             return Ok(answer);
         }
-        tokio::time::sleep(SEARCH_TIER_POLL).await;
-        answer = call_retrying_acceptance(client, tool_request("search", &arguments)).await?;
+        tokio::time::sleep(DELAY).await;
+        answer = call_retrying_acceptance(client, tool_request(tool, arguments)).await?;
     }
-    Err(format!(
-        "the population lane never stamped the served tree for query {query}; the last answer was {answer:#}"
+    Err(
+        format!("{tool} population did not settle: request {arguments}; last answer {answer}")
+            .into(),
     )
-    .into())
 }
 
 /// The path from the process working directory to `target`, as one `..`

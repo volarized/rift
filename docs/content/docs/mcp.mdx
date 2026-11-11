@@ -90,7 +90,7 @@ optional `language`, whose default is `sparql`:
 { "query": "SELECT ?symbol ?name { ?symbol a :Symbol; :name ?name } ORDER BY ?name LIMIT 10" }
 ```
 
-The empty prefix names `urn:rift:vocabulary:`. `rdf:` and `xsd:` are also
+The empty prefix names `urn:rift:vocabulary:`. `r:`, `rdf:`, `rdfs:`, and `xsd:` are also
 available. An explicit `PREFIX` declaration can name another namespace.
 
 `SELECT` returns typed bindings, `ASK` returns a boolean, and `CONSTRUCT` and `DESCRIBE`
@@ -120,10 +120,11 @@ or to `nodes` for its syntax and source at a selected revision.
 SELECT ?symbol ?name ?source {
   SERVICE :search {
     ?hit :query "load project settings"; :target "symbol";
-         :symbol ?symbol; :source ?source .
+         :symbol ?symbol; :source ?source; :index ?index .
     ?symbol :name ?name
   }
 }
+ORDER BY ?index
 LIMIT 5
 ```
 
@@ -285,19 +286,15 @@ A named local identity selects an extra project accepted by the connection:
 
 <ReadExample name="named-symbol" />
 
-A package or runtime identity selects that exact owner and served version. `get_symbol`
-takes neither `scope` nor `packages`; use those fields on search to discover the identity.
-The global search first names the actual served owner; optional documentation remains
-bound to that exact symbol:
-
-<ReadExample name="global-search" />
+A package or runtime identity names an owner across releases. Discover it with
+`:scope "global"` and `:packages` inside `SERVICE :search`, then pass the identity and selected
+`revision` to `get_symbol`.
 
 <ReadExample name="global-symbol-documentation" />
 
-A requested release can differ from the served release. Search reports the substitution
-and returns the served identity:
-
-<ReadExample name="requested-served" />
+If the requested release has no complete coverage, `search` can return an unavailable
+answer with package warnings. Use the release named by the warning when that is the release
+you want to query.
 
 Several declaration bindings share one identity. `declaration_limit` and its returned cursor
 continue those bindings at the same revision:

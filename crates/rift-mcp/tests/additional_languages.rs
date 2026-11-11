@@ -166,64 +166,74 @@ async fn assert_workspace_nodes(client: &Client, case: &SourceCase) -> TestResul
 }
 
 async fn assert_workspace_search(client: &Client, case: &SourceCase) -> TestResult {
-    use workspace_client::query;
-    let request = query::retrieval(&serde_json::from_value(json!({
-        "pattern":"灯", "target":"file", "paths":{"include":[case.path]},
-        "include":["source"],
-    }))?)?;
-    let output = search_after_population(client, &request).await?;
-    let hit = query::rows(&output)?
+    let output = search_after_population(
+        client,
+        &json!({
+            "pattern":"灯", "target":"file", "paths":{"include":[case.path]},
+            "include":["source"],
+        }),
+    )
+    .await?;
+    let hits = output["results"].as_array().ok_or("search results")?;
+    let hit = hits
         .iter()
-        .find(|row| query::literal(row, "path").ok() == Some(case.path))
+        .find(|hit| hit["path"] == case.path)
         .ok_or_else(|| format!("{} missing from search: {output}", case.path))?;
-    assert!(query::literal(hit, "source")?.contains('灯'));
+    assert!(
+        hit["source"]
+            .as_str()
+            .is_some_and(|source| source.contains('灯'))
+    );
     Ok(())
 }
 
 async fn assert_workspace_symbol(client: &Client, case: &SourceCase, name: &str) -> TestResult {
-    use workspace_client::query;
-    let mut selector = json!({
-        "query":name, "target":"symbol", "paths":{"include":[case.path]},
-        "include":["source"],
-    });
-    let request = query::retrieval(&serde_json::from_value(selector.clone())?)?;
-    let output = search_after_population(client, &request).await?;
-    let matching = query::rows(&output)?
+    let output = search_after_population(
+        client,
+        &json!({
+            "query":name, "target":"symbol", "paths":{"include":[case.path]},
+            "include":["source"],
+        }),
+    )
+    .await?;
+    let results = output["results"]
+        .as_array()
+        .ok_or("symbol search results")?;
+    let matching = results
         .iter()
-        .filter(|hit| {
-            query::literal(hit, "path").ok() == Some(case.path)
-                && query::literal(hit, "name").ok() == Some(name)
-        })
+        .filter(|hit| hit["path"] == case.path && hit["hit"]["symbol"]["name"] == name)
         .collect::<Vec<_>>();
     assert_eq!(matching.len(), 1, "{name} physical declaration: {output}");
     let hit = matching[0];
+    let symbol = &hit["hit"]["symbol"];
     assert!(
-        query::iri(hit, "symbol").is_err(),
+        symbol["id"].is_null(),
         "fixture has no captured namespace context: {hit}"
     );
-    assert_eq!(query::literal(hit, "language")?, case.language, "{hit}");
+    assert_eq!(symbol["language"], case.language, "{hit}");
     if case.path == "default.h" {
-        assert_eq!(
-            query::literal(hit, "kind")?,
-            "function",
-            "C function prototype: {hit}"
-        );
+        assert_eq!(symbol["kind"], "function", "C function prototype: {hit}");
     }
-    let start = query::literal(hit, "start")?.parse::<usize>()?;
-    let end = query::literal(hit, "end")?.parse::<usize>()?;
-    assert_eq!(query::literal(hit, "source")?, &case.text[start..end]);
+    let start = usize::try_from(hit["range"]["start"].as_u64().ok_or("range start")?)?;
+    let end = usize::try_from(hit["range"]["end"].as_u64().ok_or("range end")?)?;
+    assert_eq!(hit["source"], Value::from(&case.text[start..end]));
     assert_workspace_symbol_node(client, case, name, start, end).await?;
-    selector
-        .as_object_mut()
-        .expect("selector object")
-        .remove("include");
-    let request = query::retrieval(&serde_json::from_value(selector)?)?;
-    let search = search_after_population(client, &request).await?;
+    let search = search_after_population(
+        client,
+        &json!({
+            "query":name, "target":"symbol", "paths":{"include":[case.path]},
+        }),
+    )
+    .await?;
+    let results = search["results"]
+        .as_array()
+        .ok_or("symbol search results")?;
     assert!(
-        query::rows(&search)?.iter().any(|row| {
-            ["path", "name", "symbol", "start", "end"]
-                .into_iter()
-                .all(|field| row[field] == hit[field])
+        results.iter().any(|result| {
+            result["path"] == case.path
+                && result["hit"]["symbol"]["name"] == name
+                && result["hit"]["symbol"]["id"] == symbol["id"]
+                && result["range"] == hit["range"]
         }),
         "{name} declaration missing from search: {search}"
     );

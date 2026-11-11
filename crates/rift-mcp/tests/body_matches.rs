@@ -16,7 +16,7 @@ use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use workspace_client::{await_workspace_ready, query, search_after_population};
+use workspace_client::{await_workspace_ready, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -37,15 +37,21 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
 
 /// Each hit's declared name, or its path for a file hit, in answer order.
 fn named(answer: &Value) -> Vec<String> {
-    query::rows(answer)
+    answer["results"]
+        .as_array()
+        .map(|results| {
+            results
+                .iter()
+                .map(|hit| {
+                    hit["hit"]["symbol"]["name"]
+                        .as_str()
+                        .or_else(|| hit["path"].as_str())
+                        .unwrap_or_default()
+                        .to_owned()
+                })
+                .collect()
+        })
         .unwrap_or_default()
-        .iter()
-        .map(|hit| query::literal(hit, "name").or_else(|_| query::literal(hit, "path")))
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_default()
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
 }
 
 fn workspace() -> TestResult<tempfile::TempDir> {
@@ -69,22 +75,16 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
     let directory = workspace()?;
     let client = client_for(directory.path()).await?;
 
-    let symbol_arguments = query::projected_retrieval(
-        &serde_json::from_value(json!({ "query": "quokka", "target": "symbol" }))?,
-        "?matched",
-        "?hit :matched_by/:value ?matched .",
-    )?;
+    let symbol_arguments = json!({ "query": "quokka", "target": "symbol" });
     let symbols = search_after_population(&client, &symbol_arguments).await?;
     assert_eq!(named(&symbols), ["alpha"], "{symbols:#}");
     assert_eq!(
-        query::literal(&query::rows(&symbols)?[0], "matched")?,
-        "content",
+        symbols["results"][0]["matched_by"],
+        json!(["content"]),
         "a declaration its body placed answers through its content: {symbols:#}"
     );
 
-    let file_arguments = query::retrieval(&serde_json::from_value(
-        json!({ "query": "quokka", "target": "file" }),
-    )?)?;
+    let file_arguments = json!({ "query": "quokka", "target": "file" });
     let files = search_after_population(&client, &file_arguments).await?;
     assert_eq!(
         named(&files),
@@ -92,9 +92,7 @@ async fn a_body_term_reaches_its_declaration_and_a_lockfile_answers_nothing() ->
         "no lockfile answers: {files:#}"
     );
 
-    let selected_arguments = query::retrieval(&serde_json::from_value(
-        json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } }),
-    )?)?;
+    let selected_arguments = json!({ "query": "quokka", "paths": { "include": ["Cargo.lock"] } });
     let selected = search_after_population(&client, &selected_arguments).await?;
     assert!(named(&selected).is_empty(), "{selected:#}");
     let warning = selected["warnings"]

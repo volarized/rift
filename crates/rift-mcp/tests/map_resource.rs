@@ -251,8 +251,8 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
     // A tool call captures the tree and waits for the publication that indexes it; the
     // map is computed for that same publication.
     let request = workspace_client::tool_request(
-        "search",
-        &serde_json::json!({ "query": "SELECT ?symbol { ?symbol a :Symbol; :name \"beacon\" }" }),
+        "search_retrieval",
+        &serde_json::json!({ "query": "beacon", "target": "symbol" }),
     );
     let lookup = client.call_tool(request).await?;
     assert_ne!(lookup.is_error, Some(true), "{lookup:#?}");

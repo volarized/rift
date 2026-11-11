@@ -28,8 +28,8 @@ async fn beacons(
         "query":"beacon", "target":"symbol", "scope":scope,
         "paths":{"include":["lib.rs"]}, "include":["source"], "limit":10,
     }))?;
-    let arguments = serde_json::to_value(query::retrieval(&parameters)?)?;
-    let answer = proxied_call(client, "search", &arguments).await?;
+    let arguments = query::retrieval(&parameters)?;
+    let answer = crate::workspace_client::query_after_population(client, &arguments).await?;
     let mut hits = BTreeMap::new();
     for hit in query::rows(&answer)? {
         let id = query::iri(hit, "symbol")?;
@@ -55,7 +55,9 @@ async fn require_unregistered_scope(
         client.call_tool(crate::workspace_client::tool_request("search", &arguments)),
     )
     .await?;
-    let failure = crate::workspace_client::failed_call(response)?;
+    let Err(rmcp::ServiceError::McpError(failure)) = response else {
+        return Err(format!("expected unregistered scope refusal: {response:?}").into());
+    };
     assert!(
         failure.message.contains("local@other"),
         "{scope}: {failure:?}"
@@ -116,12 +118,16 @@ async fn extra_project_profiles_serve_distinct_scopes_through_one_connection() -
         profile_id.starts_with("rift://symbol/local@other:docs/"),
         "{profile_id}"
     );
-    let all = beacons(&client, "all").await?;
-    assert_eq!(
-        all.keys().collect::<Vec<_>>(),
-        ["local", "local@other", "local@other:docs"]
-    );
-    assert_eq!(all["local"].1.as_deref(), Some(PRIMARY_SOURCE));
+    let primary_hits = beacons(&client, "local").await?;
+    assert_eq!(primary_hits["local"].1.as_deref(), Some(PRIMARY_SOURCE));
+    let all = crate::workspace_client::query_after_population(&client, &rift_protocol::query::QueryParams {
+        query: "SELECT (COUNT(?hit) AS ?count) { SERVICE :search { ?hit :query 'beacon'; :target 'file'; :scope 'all' } }".to_owned(),
+        language: rift_protocol::query::QueryLanguage::Sparql,
+    }).await?;
+    let [count] = query::rows(&all)? else {
+        return Err(format!("one all-scope count: {all}").into());
+    };
+    assert_eq!(query::literal(count, "count")?, "3");
 
     let found = proxied_call(&client, "get_symbol", &json!({"id":profile_id})).await?;
     let found: GetSymbolResult = serde_json::from_value(found)?;

@@ -20,8 +20,6 @@
 //! The serving helper is local rather than `workspace_client`'s, because every
 //! fixture that helper lays out carries the table this suite must not have.
 
-#[path = "query/mod.rs"]
-mod query;
 mod search_live_gate;
 
 use std::error::Error;
@@ -118,13 +116,11 @@ fn workspace() -> [(&'static str, &'static str); 2] {
 
 /// Runs one `search` and returns its structured result.
 async fn search(client: &RunningService<RoleClient, ()>, query: &str) -> TestResult<Value> {
-    let producer = serde_json::from_value(json!({ "query": query }))?;
-    let request = query::retrieval(&producer)?;
-    let arguments = serde_json::to_value(request)?
+    let arguments = json!({ "query": query })
         .as_object()
         .cloned()
         .ok_or("search arguments are an object")?;
-    let request = CallToolRequestParams::new("search").with_arguments(arguments);
+    let request = CallToolRequestParams::new("search_retrieval").with_arguments(arguments);
     let result = client.peer().call_tool(request).await?;
     result
         .structured_content
@@ -203,10 +199,9 @@ fn assert_shares_no_token(query: &str, sources: &[(&str, &str)]) {
 
 /// Whether one answer carries a hit at `path`.
 fn reaches(answer: &Value, path: &str) -> bool {
-    query::rows(answer).is_ok_and(|rows| {
-        rows.iter()
-            .any(|row| query::literal(row, "path").ok() == Some(path))
-    })
+    answer["results"]
+        .as_array()
+        .is_some_and(|results| results.iter().any(|hit| hit["path"] == json!(path)))
 }
 
 /// The control's table: the same files, served with the tier the suite is about

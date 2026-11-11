@@ -4179,7 +4179,6 @@ mod tests {
             .expect("walk bindings");
         assert_eq!(rows.len(), 2);
         for (row, name) in rows.iter().zip(["zulu", "alpha"]) {
-            assert_eq!(row["name"]["value"], name);
             assert_eq!(
                 row["symbol"]["value"],
                 format!("rift://symbol/local@cloud/rust/app/{name}")
@@ -4338,11 +4337,10 @@ mod tests {
                     );
                 }
                 let rows: Vec<_> = ["zulu", "alpha"].into_iter().map(|name| json!({
-                    "symbol":{"type":"iri", "value":format!("rift://symbol/local/rust/app/{name}")},
-                    "name":{"type":"literal", "value":name, "datatype":"http://www.w3.org/2001/XMLSchema#string"}
+                    "symbol":{"type":"iri", "value":format!("rift://symbol/local/rust/app/{name}")}
                 })).collect();
                 let answer = json!({"content":[], "structuredContent":{
-                    "answer":{"result":"bindings", "variables":["symbol", "name"], "bindings":rows},
+                    "answer":{"result":"bindings", "variables":["symbol"], "bindings":rows},
                     "view":{"id":"claims.walk", "expires_at":"2099-01-01T00:00:00Z"},
                     "pagination":{"page_index":0, "total_pages":1}
                 }});
@@ -4354,7 +4352,7 @@ mod tests {
             Ok::<_, std::io::Error>(2)
         });
         let initial = CallToolRequestParams::new("search").with_arguments(serde_json::from_value(json!({
-            "query":"SELECT ?symbol ?name { ?symbol :references <rift://symbol/local@cloud/rust/app/load>; :name ?name } ORDER BY DESC(?name)"
+            "query":"SELECT ?symbol { ?symbol :references <rift://symbol/local@cloud/rust/app/load> } ORDER BY DESC(?symbol)"
         }))?);
         let CallToolResponse::Complete(initial) = proxy
             .routed_read(&initial)
@@ -4370,7 +4368,7 @@ mod tests {
         symlink(second.path(), &registration_path)?;
         let held =
             CallToolRequestParams::new("search").with_arguments(serde_json::from_value(json!({
-                "query":"SELECT ?symbol ?name { SERVICE <urn:rift:result:claims.walk?page=0> {} }"
+                "query":"SELECT ?symbol { SERVICE <urn:rift:result:claims.walk?page=0> {} }"
             }))?);
         let CallToolResponse::Complete(continued) =
             proxy.routed_read(&held).await?.ok_or("held walk")??

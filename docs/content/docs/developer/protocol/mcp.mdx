@@ -371,18 +371,14 @@ A `local@name` owner selects an extra project accepted by the connection:
 
 A package or runtime identity names its owner across releases, as
 `rift://symbol/cargo/crates.io/demo/rust/demo/beacon`, and `revision` selects the release to read,
-as `rift://revision/cargo/crates.io/demo@1.0.0`. Search's `scope` and `packages` discover these
-identities, and each hit's `origin` names the release it was found in. When the request omits
+as `rift://revision/cargo/crates.io/demo@1.0.0`. Discover these identities through
+`SERVICE :search` using `:scope "global"` and `:packages`. When the request omits
 `revision`, the server reads a package at the version the workspace's dependencies pin, and otherwise
 the newest release the global index collected. The answer **MUST** carry the release it read as
 its `revision`. The declaration's `unit` keeps the physical defining owner even when the logical
 owner differs.
 
-<ReadExample name="global-search" />
-
 <ReadExample name="global-symbol-documentation" />
-
-<ReadExample name="requested-served" />
 
 `revision` selects the [revision](#revision-reads) to read, and the answer carries the revision
 it was read at. For a package or runtime identity it names a release of that identity's owner.

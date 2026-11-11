@@ -47,23 +47,25 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
             json!({ "query": "beacon", "paths": { "include": ["[unclosed"] } }),
         ),
         ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
-        ("nodes", json!({ "query": 42 })),
+        ("nodes", json!({ "path": "missing.rs", "position": 0 })),
         (
             "get_symbol",
             json!({ "name": "beacon", "include": ["history"] }),
         ),
-        ("get_symbol", json!({ "name": "beacon", "rev": "main" })),
-        ("search", json!({ "query": "beacon", "rev": "main" })),
-        ("nodes", json!({ "query": "ASK {", "language": "sparql" })),
+        (
+            "get_symbol",
+            json!({ "name": "beacon", "revision": "rift://revision/git/main" }),
+        ),
+        (
+            "search",
+            json!({ "query": "beacon", "revision": "rift://revision/git/main" }),
+        ),
+        (
+            "nodes",
+            json!({ "path": "lib.rs", "position": 0, "revision": "rift://revision/git/HEAD~1" }),
+        ),
     ];
-    for (tool, producer) in failing_requests {
-        let request = if tool == "search" && producer["query"] != "" {
-            serde_json::to_value(workspace_client::query::retrieval(
-                &serde_json::from_value(producer)?,
-            )?)?
-        } else {
-            producer
-        };
+    for (tool, request) in failing_requests {
         let arguments = request
             .as_object()
             .cloned()
@@ -123,27 +125,25 @@ async fn failing_observed_symbol_error(
         "[package]\nname = \"history-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[lib]\npath = \"lib.rs\"\n",
     )?;
     let (client, server_task) = workspace_client::served_root(root).await?;
-    let answer = workspace_client::call_retrying_acceptance(
+    let answer = workspace_client::search_after_population(
         &client,
-        workspace_client::tool_request(
-            "search",
-            &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
-        ),
+        &json!({"query": "beacon", "target": "symbol", "include": ["source"]}),
     )
     .await?;
-    let results = workspace_client::query::rows(&answer)?;
+    let results = answer["results"]
+        .as_array()
+        .ok_or("fixture symbol results")?;
     let mut exact = results.iter().filter(|row| {
-        workspace_client::query::literal(row, "name").ok() == Some("beacon")
-            && workspace_client::query::literal(row, "language").ok() == Some("rust")
-            && workspace_client::query::literal(row, "path").ok() == Some("lib.rs")
+        row["hit"]["symbol"]["name"] == "beacon"
+            && row["hit"]["symbol"]["language"] == "rust"
+            && row["path"] == "lib.rs"
     });
     let declaration = exact.next().ok_or("original beacon declaration")?;
     assert!(exact.next().is_none(), "one fixture declaration: {answer}");
-    assert_eq!(
-        workspace_client::query::literal(declaration, "kind")?,
-        "function"
-    );
-    let identity = workspace_client::query::iri(declaration, "symbol")?;
+    assert_eq!(declaration["hit"]["symbol"]["kind"], "function");
+    let identity = declaration["hit"]["symbol"]["id"]
+        .as_str()
+        .ok_or("original beacon identity")?;
     let parsed = rift_protocol::identity::SymbolIdentity::parse(identity)?;
     assert_eq!(parsed.owner(), &rift_protocol::identity::SymbolOwner::Local);
     assert_eq!(parsed.wire_identity(), identity);
@@ -287,14 +287,8 @@ async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure = failing_tool_error(
-        directory.path(),
-        "search",
-        serde_json::to_value(workspace_client::query::retrieval(
-            &serde_json::from_value(json!({ "query": "\"beacon" }))?,
-        )?)?,
-    )
-    .await?;
+    let failure =
+        failing_tool_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;
     assert_eq!(failure.code, ErrorCode::InvalidRequest);
     assert_eq!(failure.retry, RetryDirective::Never);
     let message = &failure.message;
