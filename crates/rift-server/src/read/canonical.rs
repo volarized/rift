@@ -78,6 +78,41 @@ impl LocalSymbolViewInput {
         self.material.index.file(&path)?.source().get(start..end)
     }
 
+    /// Collects the complete canonical seed inventory for a bounded local semantic read.
+    ///
+    /// # Errors
+    /// Refuses incomplete source or identity coverage and a seed inventory above the bound.
+    pub fn semantic_seeds(
+        &self,
+        mut remaining: usize,
+    ) -> Result<Vec<rift_protocol::read::SymbolId>, RiftError> {
+        let unavailable = || {
+            errors::server::search_coverage_unavailable()
+                .operation("local semantic inventory")
+                .error()
+        };
+        let index = &self.material.index;
+        if !self.ready
+            || !index.objects_complete()
+            || index.unestablished_objects().next().is_some()
+        {
+            return Err(unavailable());
+        }
+        let mut seeds = Vec::new();
+        for (id, object) in index.objects() {
+            let object = object?;
+            let declarations = object.assembled().contributions().len().max(1);
+            remaining = remaining
+                .checked_sub(declarations)
+                .ok_or_else(unavailable)?;
+            if !index.identity_coverage_complete(object.facts().language()) {
+                return Err(unavailable());
+            }
+            seeds.push(rift_protocol::read::SymbolId(id.as_str().to_owned()));
+        }
+        Ok(seeds)
+    }
+
     /// Projects captured symbol facts for a query whose algebra requires only symbols.
     ///
     /// # Errors

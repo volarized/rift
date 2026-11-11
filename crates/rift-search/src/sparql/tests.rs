@@ -593,6 +593,30 @@ fn structure_refusal(text: &str, limits: &GraphLimits) -> String {
 }
 
 #[test]
+fn anchored_acquisition_keeps_row_expressions_and_refuses_graph_subqueries() {
+    let limits = GraphLimits::default();
+    let anchor = "<rift://symbol/local/python/fixture/beacon>";
+    let rows_only = GraphQuery::parse(
+        &format!(
+            "SELECT (COUNT(?usage) AS ?n) {{ {anchor} :usages ?usage FILTER (ISBLANK(?usage)) }}"
+        ),
+        &limits,
+    )
+    .expect("anchored count");
+    assert!(rows_only.adjacency_selection().is_some());
+
+    let reads_other_facts = GraphQuery::parse(
+        &format!(
+            "ASK {{ {anchor} :usages ?usage FILTER NOT EXISTS {{ ?caller :references {anchor} }} }}"
+        ),
+        &limits,
+    )
+    .expect("correlated absence");
+    assert!(reads_other_facts.adjacency_selection().is_none());
+    assert!(reads_other_facts.semantic_inventory().is_some());
+}
+
+#[test]
 fn test_graph_query_parse_survives_brackets_and_operators_at_their_bounds() {
     let limits = GraphLimits::default();
     let open = "(".repeat(limits.brackets_max() - 2);

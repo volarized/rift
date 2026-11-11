@@ -10,6 +10,7 @@ use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use spargebra::vocab::sparql;
 
 use super::expression::GROUP_CONCAT_PREFIX;
+use super::inventory::SemanticInventory;
 use super::limits::GraphLimits;
 use super::query::refused;
 use super::retrieval::{self, RetrievalSelection};
@@ -30,6 +31,8 @@ pub(super) struct Admission {
     pub(super) reads_base: bool,
     pub(super) symbol_only: bool,
     pub(super) named_local: bool,
+    pub(super) embedded_patterns: usize,
+    pub(super) semantics: Option<SemanticInventory>,
 }
 
 /// Refuses what the graph does not serve, renames each `GROUP_CONCAT` to its bounded form,
@@ -67,6 +70,7 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
     let mut admission = Admission {
         reads_base: describes,
         symbol_only: !describes,
+        semantics: (!describes).then(SemanticInventory::default),
         named_local,
         ..Admission::default()
     };
@@ -77,7 +81,11 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
                 joined.count(pattern);
                 admit_pattern(pattern, &mut admission, &mut pending)?;
             }
-            Visit::Expression(expression) => push_expression_children(expression, &mut pending),
+            Visit::Expression(expression) => {
+                admission.embedded_patterns +=
+                    usize::from(matches!(expression, Expression::Exists(_)));
+                push_expression_children(expression, &mut pending);
+            }
         }
     }
     joined.admit(limits)?;
@@ -216,14 +224,23 @@ fn admit_pattern<'a>(
                 admission.named_local = true;
             } else {
                 admission.symbol_only = false;
+                admission.semantics = None;
             }
         }
-        QueryExpression::Path { .. } if !pending.in_retrieval => {
+        QueryExpression::Path { path, .. } if !pending.in_retrieval => {
             admission.reads_base = true;
             admission.symbol_only = false;
+            admission.semantics = admission.semantics.and_then(|mut requirements| {
+                requirements.include_path(path)?;
+                Some(requirements)
+            });
         }
         QueryExpression::Bgp { patterns } if !pending.in_retrieval && !patterns.is_empty() => {
             admission.reads_base = true;
+            admission.semantics = admission.semantics.and_then(|mut requirements| {
+                requirements.include_patterns(patterns)?;
+                Some(requirements)
+            });
             admission.symbol_only &=
                 super::requirements::symbol_patterns(patterns).is_some_and(|selection| {
                     if let super::SymbolSelection::Identified(id) = selection {

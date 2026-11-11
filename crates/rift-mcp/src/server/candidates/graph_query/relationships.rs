@@ -18,8 +18,8 @@ use rift_protocol::revision::Revision;
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits, RevisionIri,
-    SymbolAddress, SymbolRelation,
+    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits,
+    OccurrenceSelection, RevisionIri, SymbolAddress, SymbolRelation,
 };
 
 use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
@@ -63,13 +63,7 @@ impl AcquiredAdjacency {
         selected: &AdjacencySelection,
         input: &rift_server::LocalSymbolViewInput,
     ) -> Result<(), RiftError> {
-        for (source, relation, target) in &self.local_edges {
-            dataset.insert(GraphFact::Relation {
-                source,
-                relation: *relation,
-                target,
-            })?;
-        }
+        self.project_local(dataset, input, true, selected.occurrences)?;
         for (id, (symbol, revision)) in &self.named_package_symbols {
             dataset.insert(GraphFact::SymbolDetails {
                 address: SymbolAddress::Established(id),
@@ -87,7 +81,26 @@ impl AcquiredAdjacency {
         {
             return Err(coverage_failure());
         }
-        if selected.usages {
+        self.project_remote(dataset, selected)
+    }
+
+    pub(super) fn project_local(
+        &self,
+        dataset: &mut GraphDatasetBuilder,
+        input: &rift_server::LocalSymbolViewInput,
+        relationships: bool,
+        occurrences: Option<OccurrenceSelection>,
+    ) -> Result<(), RiftError> {
+        if relationships {
+            for (source, relation, target) in &self.local_edges {
+                dataset.insert(GraphFact::Relation {
+                    source,
+                    relation: *relation,
+                    target,
+                })?;
+            }
+        }
+        if let Some(required) = occurrences {
             for occurrence in &self.local {
                 let range = &occurrence.source.range;
                 let unit = &occurrence.source.unit;
@@ -98,7 +111,7 @@ impl AcquiredAdjacency {
                     range.start,
                     range.end
                 );
-                let source = if selected.source {
+                let source = if required.source {
                     let text = if let Some(installed) = occurrence
                         .enclosing
                         .as_ref()
@@ -124,7 +137,7 @@ impl AcquiredAdjacency {
                 })?;
             }
         }
-        self.project_remote(dataset, selected)
+        Ok(())
     }
 
     fn project_remote(
@@ -157,7 +170,7 @@ impl AcquiredAdjacency {
                         target: &record.relationship.to,
                     })?;
                 }
-                if selected.usages {
+                if let Some(usage) = selected.occurrences {
                     let sources: std::collections::BTreeMap<_, _> = page
                         .sources
                         .iter()
@@ -165,7 +178,7 @@ impl AcquiredAdjacency {
                         .collect();
                     for record in &group.occurrences {
                         let occurrence = &record.occurrence;
-                        let source = if selected.source {
+                        let source = if usage.source {
                             let text = sources
                                 .get(&occurrence.source.unit)
                                 .copied()
@@ -186,6 +199,16 @@ impl AcquiredAdjacency {
         }
         Ok(())
     }
+    fn admit_references(&mut self, seed: &SymbolId, occurrences: Vec<QueryOccurrence>) {
+        for occurrence in occurrences {
+            if let Some(caller) = &occurrence.enclosing {
+                self.local_edges
+                    .push((caller.clone(), SymbolRelation::References, seed.clone()));
+            }
+            self.local.push(occurrence);
+        }
+    }
+
     fn admit_remote(
         &mut self,
         mut page: RelationshipSearchPage,
@@ -228,6 +251,80 @@ impl AcquiredAdjacency {
 }
 
 impl RiftMcp {
+    pub(super) async fn acquire_semantic_inventory(
+        &self,
+        resolved: &ResolvedWorkspace,
+        required: rift_search::sparql::SemanticInventory,
+        deadline: RequestDeadline,
+    ) -> Result<AcquiredAdjacency, RiftError> {
+        let reads = &resolved.published.reads;
+        let context = reads.dependency_context();
+        if resolved.stale.is_some() || context.is_degraded() || !context.entries().is_empty() {
+            return Err(coverage_failure());
+        }
+        let references = required.references || required.occurrences.is_some();
+        let enclosing =
+            required.references || required.occurrences.is_some_and(|usage| usage.enclosing);
+        let operations = u64::from(required.calls) + u64::from(references);
+        let maximum = usize::try_from(REQUESTS_MAX / operations.max(1)).unwrap_or(usize::MAX);
+        let capture = Arc::clone(reads);
+        let seeds = self
+            .blocking
+            .run("semantic inventory seeds", move || {
+                capture
+                    .local_search_view_input(true)?
+                    .semantic_seeds(maximum)
+            })
+            .await?;
+        let engines = self.engine_pool_for(&resolved.published).await;
+        let end = deadline.walk_end(resolved.capture_elapsed);
+        let mut acquired = AcquiredAdjacency::default();
+        let mut remaining = usize::try_from(RECORDS_MAX).unwrap_or(usize::MAX);
+        let roots = rift_server::CalleeRoots::default();
+        for seed in seeds {
+            if references {
+                let occurrences = Box::pin(rift_server::graph_references(
+                    reads, &engines, &seed, enclosing, end,
+                ))
+                .await?;
+                remaining = remaining
+                    .checked_sub(occurrences.len())
+                    .ok_or_else(coverage_failure)?;
+                acquired.admit_references(&seed, occurrences);
+            }
+            if required.calls {
+                let calls = Box::pin(rift_server::graph_calls(
+                    reads,
+                    &engines,
+                    &roots,
+                    &seed,
+                    TraversalDirection::Outgoing,
+                    end,
+                ))
+                .await?;
+                if !calls.packages.is_empty() {
+                    return Err(coverage_failure());
+                }
+                for (target, occurrences) in calls.local {
+                    remaining = remaining
+                        .checked_sub(1 + occurrences.len())
+                        .ok_or_else(coverage_failure)?;
+                    acquired
+                        .local_edges
+                        .push((seed.clone(), SymbolRelation::Calls, target));
+                }
+            }
+        }
+        if !self
+            .engine_tree_matches(&resolved.published)
+            .await
+            .map_err(|_| coverage_failure())?
+        {
+            return Err(coverage_failure());
+        }
+        Ok(acquired)
+    }
+
     pub(super) async fn acquire_adjacency(
         &self,
         resolved: &ResolvedWorkspace,
@@ -357,21 +454,16 @@ impl AdjacencyWalk<'_> {
         match (direction, self.step.facet) {
             (TraversalDirection::Incoming, RelationshipFacet::References) => {
                 let occurrences = Box::pin(rift_server::graph_references(
-                    reads, engines, seed, deadline,
+                    reads,
+                    engines,
+                    seed,
+                    self.selected.requires_enclosing(),
+                    deadline,
                 ))
                 .await?;
                 charge_records(&mut self.remaining, occurrences.len())?;
-                for occurrence in occurrences {
-                    if let Some(caller) = &occurrence.enclosing {
-                        self.acquired.local_edges.push((
-                            caller.clone(),
-                            SymbolRelation::References,
-                            seed.clone(),
-                        ));
-                        frontier.insert(caller.clone());
-                    }
-                    self.acquired.local.push(occurrence);
-                }
+                frontier.extend(occurrences.iter().filter_map(|item| item.enclosing.clone()));
+                self.acquired.admit_references(seed, occurrences);
             }
             (_, RelationshipFacet::Calls) => {
                 let mut calls = if let Some(target) = self.acquired.installed.get(seed) {
@@ -423,7 +515,7 @@ impl AdjacencyWalk<'_> {
                 .local_edges
                 .push((caller.clone(), SymbolRelation::Calls, target.clone()));
             frontier.insert(neighbor.clone());
-            if self.selected.usages {
+            if self.selected.occurrences.is_some() {
                 self.acquired
                     .local
                     .extend(ranges.into_iter().map(|source| QueryOccurrence {
@@ -644,7 +736,7 @@ impl AdjacencyWalk<'_> {
                 },
                 packages: remote.domain.packages.clone(),
                 runtimes: remote.domain.runtimes.clone(),
-                include: if selected.source {
+                include: if selected.occurrences.is_some_and(|usage| usage.source) {
                     vec![RelationshipInclude::Source]
                 } else {
                     Vec::new()

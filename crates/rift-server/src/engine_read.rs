@@ -738,6 +738,7 @@ async fn resolve_symbol_callees(
         slot,
         &target,
         TraversalDirection::Outgoing,
+        false,
         walk.deadline,
     ))
     .await;
@@ -789,15 +790,20 @@ async fn calls_on_engine(
     slot: &EngineSlot,
     target: &ReferenceTarget,
     direction: TraversalDirection,
+    exact_seed: bool,
     deadline: Instant,
 ) -> Result<OutgoingAnswer<CalleeReport>, RiftError> {
     let request_path = target.path.clone();
     let utf8 = target.utf8;
     let utf16 = target.utf16;
+    let uri = target.uri.clone();
+    let canonical_uri = target.canonical_uri.clone();
     slot.request_outgoing(
         target.opening(),
         move |session: &mut EngineSession| {
             let path = request_path.clone();
+            let uri = uri.clone();
+            let canonical_uri = canonical_uri.clone();
             Box::pin(async move {
                 let encoding = session.capabilities().position_encoding;
                 let position = match encoding {
@@ -810,6 +816,13 @@ async fn calls_on_engine(
                 }
                 let mut calls = Vec::new();
                 for item in items {
+                    if exact_seed
+                        && (!(item.uri == uri || item.uri == canonical_uri)
+                            || !(item.selection_range.start <= position
+                                && position < item.selection_range.end))
+                    {
+                        return Err(graph_call_coverage());
+                    }
                     match direction {
                         TraversalDirection::Outgoing => {
                             calls.extend(session.outgoing_calls(item).await?);
@@ -952,7 +965,7 @@ pub async fn graph_calls(
         file,
         declaration.symbol,
     )?;
-    let answered = Box::pin(calls_on_engine(slot, &request, direction, deadline))
+    let answered = Box::pin(calls_on_engine(slot, &request, direction, true, deadline))
         .await
         .map_err(|error| {
             if error.slug() == errors::lsp::engine_capability_absent::SLUG {
@@ -1387,6 +1400,7 @@ pub async fn graph_references(
     reads: &ReadService,
     engines: &EnginePool,
     target: &SymbolId,
+    require_caller: bool,
     deadline: Instant,
 ) -> Result<Vec<QueryOccurrence>, RiftError> {
     let unavailable = || {
@@ -1462,11 +1476,15 @@ pub async fn graph_references(
             if found.len() == TRAVERSAL_NODES_MAX {
                 return Err(unavailable());
             }
-            let enclosing = file
-                .enclosing_symbol(key.1, key.2)
-                .map(|symbol| symbol_id(reads.index(), crate::search::declared(file, symbol)))
-                .transpose()?
-                .flatten();
+            let enclosing = if let Some(symbol) = file.enclosing_symbol(key.1, key.2) {
+                let id = symbol_id(reads.index(), crate::search::declared(file, symbol))?;
+                if require_caller && id.is_none() {
+                    return Err(unavailable());
+                }
+                id
+            } else {
+                None
+            };
             let occurrence = QueryOccurrence {
                 target: target.clone(),
                 enclosing,

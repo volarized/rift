@@ -41,6 +41,7 @@ mod dataset;
 mod dispatch;
 mod evaluation;
 mod expression;
+mod inventory;
 mod limits;
 mod page;
 mod query;
@@ -62,6 +63,7 @@ pub use dataset::{
     NodeLocation, RevisionIri, SymbolAddress, SymbolRelation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
+pub use inventory::{OccurrenceSelection, SemanticInventory};
 pub use limits::{
     ALGEBRA_DEPTH_MAX, ANSWER_BYTES_MAX, BRACKETS_MAX, COMPUTED_BYTES_MAX, EVALUATION_TIMEOUT,
     EXPRESSION_BYTES_MAX, GraphLimits, GraphLimitsBuilder, LITERAL_BYTES_MAX, OPERATORS_MAX,

@@ -3,12 +3,10 @@
 use oxrdf::vocab::rdf;
 use rift_protocol::read::{RelationshipFacet, SymbolId, TraversalDirection};
 use spargebra::Query;
-use spargebra::algebra::{
-    AggregateExpression, Expression, OrderExpression, PropertyPathExpression, QueryExpression,
-};
+use spargebra::algebra::{Expression, PropertyPathExpression, QueryExpression};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 
-use super::{GraphQuery, VOCABULARY_NAMESPACE};
+use super::{GraphQuery, OccurrenceSelection, VOCABULARY_NAMESPACE};
 
 /// The symbol facts needed by a query that does not read other fact families.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -52,10 +50,8 @@ pub struct AdjacencySelection {
     pub symbol_details: bool,
     /// Whether declaration item nodes and their exact text are selected for reached symbols.
     pub node_source: Option<bool>,
-    /// Whether physical usage records must also be projected.
-    pub usages: bool,
-    /// Whether the physical occurrences require exact source bytes.
-    pub source: bool,
+    /// Whether physical usage records and their evidence must also be projected.
+    pub occurrences: Option<OccurrenceSelection>,
 }
 
 impl AdjacencySelection {
@@ -67,6 +63,12 @@ impl AdjacencySelection {
             .and_then(|position| self.steps.get(position))
             .copied()
             .unwrap_or(self.first_step)
+    }
+
+    /// Whether an occurrence's enclosing symbol is required for the graph result.
+    #[must_use]
+    pub fn requires_enclosing(&self) -> bool {
+        self.occurrences.is_none_or(|usage| usage.enclosing)
     }
 
     /// Whether path positions require different acquisition operations.
@@ -96,7 +98,7 @@ impl GraphQuery {
         {
             return Some(SymbolSelection::Identified(target.as_str()));
         }
-        let selection = match query_pattern(self.query())? {
+        let selection = match query_pattern(self) {
             QueryExpression::Bgp { patterns } => symbol_patterns(patterns),
             _ => None,
         };
@@ -106,7 +108,7 @@ impl GraphQuery {
     /// Proves that a graph pattern needs only the syntax nodes of selected declarations.
     #[must_use]
     pub fn node_selection(&self) -> Option<NodeSelection<'_>> {
-        let QueryExpression::Bgp { patterns } = query_pattern(self.query())? else {
+        let QueryExpression::Bgp { patterns } = query_pattern(self) else {
             return None;
         };
         let owner = patterns
@@ -166,7 +168,7 @@ impl GraphQuery {
     /// Finds a statically anchored path or physical usage selection.
     #[must_use]
     pub fn adjacency_selection(&self) -> Option<AdjacencySelection> {
-        let pattern = query_pattern(self.query())?;
+        let pattern = query_pattern(self);
         if let QueryExpression::Path {
             subject,
             path,
@@ -216,8 +218,9 @@ impl GraphQuery {
     }
 }
 
-fn query_pattern(query: &Query) -> Option<&QueryExpression> {
-    let mut expression = match query {
+fn query_pattern(query: &GraphQuery) -> &QueryExpression {
+    let row_expressions_only = query.admission().embedded_patterns == 0;
+    let mut expression = match query.query() {
         Query::Select(query) => &query.expression,
         Query::Ask(query) => &query.expression,
         Query::Construct(query) => &query.expression,
@@ -230,41 +233,18 @@ fn query_pattern(query: &Query) -> Option<&QueryExpression> {
                 inner,
             } if name.as_str() == super::LOCAL_GRAPH => inner,
             QueryExpression::Project { inner, .. }
-            | QueryExpression::Distinct { inner }
-            | QueryExpression::Reduced { inner }
-            | QueryExpression::Slice { inner, .. }
-            | QueryExpression::Extend {
-                inner,
-                expression: Expression::Variable(_),
-                ..
-            } => inner,
-            QueryExpression::Group {
-                inner, aggregates, ..
-            } if aggregates.iter().all(|(_, aggregate)| {
-                matches!(
-                    aggregate,
-                    AggregateExpression::CountSolutions { .. }
-                        | AggregateExpression::FunctionCall {
-                            expr: Expression::Variable(_),
-                            ..
-                        }
-                )
-            }) =>
+            | QueryExpression::Distinct { inner, .. }
+            | QueryExpression::Reduced { inner, .. }
+            | QueryExpression::Slice { inner, .. } => inner,
+            QueryExpression::Filter { inner, .. }
+            | QueryExpression::Extend { inner, .. }
+            | QueryExpression::Group { inner, .. }
+            | QueryExpression::OrderBy { inner, .. }
+                if row_expressions_only =>
             {
                 inner
             }
-            QueryExpression::OrderBy { inner, expression }
-                if expression.iter().all(|item| {
-                    matches!(
-                        item,
-                        OrderExpression::Asc(Expression::Variable(_))
-                            | OrderExpression::Desc(Expression::Variable(_))
-                    )
-                }) =>
-            {
-                inner
-            }
-            _ => return Some(expression),
+            _ => return expression,
         };
     }
 }
@@ -376,8 +356,7 @@ fn adjacency(
         depth,
         symbol_details: false,
         node_source: None,
-        usages: false,
-        source: false,
+        occurrences: None,
     })
 }
 
@@ -437,8 +416,7 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
                     depth: Some(depth),
                     symbol_details: false,
                     node_source: None,
-                    usages: false,
-                    source: false,
+                    occurrences: None,
                 });
             }
         }
@@ -454,8 +432,7 @@ fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<Adjace
         steps,
         symbol_details: false,
         node_source: None,
-        usages: false,
-        source: false,
+        occurrences: None,
     })
 }
 
@@ -557,11 +534,13 @@ fn usage_selection(
         .map(|triple| &triple.object)
         .collect();
     let mut source = false;
+    let mut usage_enclosing = false;
     for &triple in triples {
         match property(triple) {
             Some("usages") if triple == *usage => {}
             Some("source") if triple.subject == usage.object => source = true,
-            Some("of" | "range" | "kind") if triple.subject == usage.object => {}
+            Some("of") if triple.subject == usage.object => usage_enclosing = true,
+            Some("range" | "kind") if triple.subject == usage.object => {}
             Some("unit" | "start" | "end") if ranges.contains(&&triple.subject) => {}
             _ if is_occurrence_class(triple) && triple.subject == usage.object => {}
             _ => return None,
@@ -596,8 +575,10 @@ fn usage_selection(
         depth: Some(1),
         symbol_details: false,
         node_source: None,
-        usages: true,
-        source,
+        occurrences: Some(OccurrenceSelection {
+            source,
+            enclosing: usage_enclosing,
+        }),
     })
 }
 

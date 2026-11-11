@@ -62,6 +62,10 @@ impl GraphQuery {
         &self.query
     }
 
+    pub(super) const fn admission(&self) -> &Admission {
+        &self.admission
+    }
+
     /// The separator of each bounded `GROUP_CONCAT`, by its index.
     pub(super) fn separators(&self) -> &[String] {
         &self.admission.separators
