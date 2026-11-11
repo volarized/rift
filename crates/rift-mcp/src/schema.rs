@@ -111,13 +111,12 @@ mod tests {
                 .expect("declared output")
                 .clone();
             rift_protocol::schema::strip_optional_null_arms(&mut expected);
-            assert!(!expected.contains_key("type"));
-            let mut actual = current
+            expected.entry("type").or_insert(json!("object"));
+            let actual = current
                 .output_schema
                 .as_deref()
                 .expect("served output")
                 .clone();
-            assert_eq!(actual.remove("type"), Some(json!("object")));
             assert_eq!(
                 actual, expected,
                 "{name} keeps every original union constraint"

@@ -5204,7 +5204,7 @@ done
             service.waiting().await.expect("server stops")
         });
         let client = ().serve(client_transport).await?;
-        let request = CallToolRequestParams::new("search").with_arguments(arguments(
+        let request = CallToolRequestParams::new("search_retrieval").with_arguments(arguments(
             &json!({"pattern": "beacon", "target": "symbol", "scope": "local"}),
         )?);
         assert_answers_before_discovery(&client, &request).await?;
@@ -5346,9 +5346,10 @@ done
             service.waiting().await.expect("server stops")
         });
         let client = ().serve(client_transport).await?;
-        let request = CallToolRequestParams::new("search").with_arguments(arguments(&json!({
-            "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
-        }))?);
+        let request =
+            CallToolRequestParams::new("search_retrieval").with_arguments(arguments(&json!({
+                "pattern": "beacon", "target": "symbol", "scope": "local", "include": ["source"]
+            }))?);
         let answer = client.call_tool(request.clone()).await?;
         let partial: SearchResult = serde_json::from_value(
             answer
@@ -7170,17 +7171,18 @@ done
 
         let search = client
             .call_tool(
-                CallToolRequestParams::new("search")
-                    .with_arguments(arguments(&json!({"query": "beacon"}))?),
+                CallToolRequestParams::new("search").with_arguments(arguments(&json!({
+                    "query": "SELECT ?symbol { ?symbol a :Symbol ; :name 'beacon' }"
+                }))?),
             )
             .await?;
-        assert!(
-            !search
-                .structured_content
-                .ok_or("search must return structured content")?["results"]
-                .as_array()
-                .ok_or("search results must be an array")?
-                .is_empty()
+        let structured = search
+            .structured_content
+            .ok_or("search must return structured content")?;
+        assert_eq!(structured["answer"]["result"], "bindings");
+        assert_eq!(
+            structured["answer"]["bindings"],
+            json!([{"symbol": {"type":"iri", "value":id}}])
         );
 
         let nodes = client
@@ -7271,7 +7273,7 @@ done
     /// is not identifier-shaped and none of its tokens splits into words, so that
     /// ranking extracts no candidate at all.
     #[tokio::test]
-    async fn client_search_matched_by_names_the_column_that_placed_each_hit() -> TestResult {
+    async fn retrieval_matched_by_names_the_column_that_placed_each_hit() -> TestResult {
         let directory = tempfile::tempdir()?;
         let lib_rs = "/// Converts a raw measurement into base units.\npub fn scale_value(value: f64) -> f64 {\n    value * 2.0\n}\n";
         fs::write(directory.path().join("lib.rs"), lib_rs)?;
@@ -7550,14 +7552,7 @@ done
     async fn client_rejects_empty_search_query_with_typed_wire_error() -> TestResult {
         let result = failing_call(&json!({"query": ""}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert_eq!(
-            text,
-            "1 error\n\tinvalid_request · retry never\n\
-             \t\tthe request does not match the documented form: field query, \
-             violation query is empty: subject query; \
-             correct the reported field and resend the request\n\
-             \t\trift.server.read_invalid\n"
-        );
+        assert!(text.contains("rift.search.query_syntax_invalid"), "{text}");
         Ok(())
     }
 
@@ -7591,69 +7586,46 @@ done
         Ok(())
     }
 
-    /// A member sent in the wrong shape is refused by the member's own name,
-    /// with an example of the value it takes.
-    ///
-    /// The refusal never names a Rust type: `PathSelector` is a name only this
-    /// repository holds, and a caller reading it has nothing to look up. The
-    /// example comes from the same schema the caller lists, so it can be sent
-    /// back verbatim.
+    /// A member sent in the wrong shape names its field and an accepted example.
     #[tokio::test]
     async fn a_member_in_the_wrong_shape_is_refused_by_name_with_an_example() -> TestResult {
-        let result = failing_call(
-            &json!({"query": "beacon", "paths": ["crates/rift-server/src/read.rs"]}),
-            "search",
-        )
-        .await?;
+        let result = failing_call(&json!({"query": ["ASK {}"]}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
+        assert!(text.contains("field query"), "{text}");
         assert!(
-            text.contains(
-                "tool arguments do not match the served schema: accepted exclude, force_include, \
-                 include, example {\"include\":[\"src/**\"],\"exclude\":[\"src/generated/**\"]}, \
-                 field paths, tool search; \
-                 correct the reported field and resend the request"
-            ),
+            text.contains("example ") && text.contains("SELECT"),
             "{text}"
         );
+        assert!(text.contains("tool search"), "{text}");
         Ok(())
     }
 
-    /// A member the tool does not serve is refused by naming the members it
-    /// does, and an example of the whole request.
+    /// A member the tool does not serve names the accepted fields and a complete example.
     #[tokio::test]
     async fn an_unserved_member_is_refused_by_naming_the_served_ones() -> TestResult {
         let result =
-            failing_call(&json!({"query": "beacon", "path": "src/lib.rs"}), "search").await?;
+            failing_call(&json!({"query": "ASK {}", "path": "src/lib.rs"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(
-            text.contains("tool arguments do not match the served schema: accepted "),
-            "{text}"
-        );
+        assert!(text.contains("accepted language, query"), "{text}");
         assert!(text.contains("tool search"), "{text}");
-        assert!(text.contains("paths"), "{text}");
         assert!(text.contains("example {"), "{text}");
         assert!(
             !text.contains("unknown field") && !text.contains("struct"),
-            "a refusal never speaks serde's grammar: {text}"
+            "{text}"
         );
         Ok(())
     }
 
-    /// A closed set's member is refused by listing the values it takes.
+    /// A closed set's member names the values it takes.
     #[tokio::test]
     async fn a_value_outside_a_closed_set_is_refused_by_listing_the_set() -> TestResult {
-        let result = failing_call(&json!({"query": "beacon", "target": "nodes"}), "search").await?;
+        let result =
+            failing_call(&json!({"query": "ASK {}", "language": "cypher"}), "search").await?;
         let text = assert_error_result(&result, "invalid_request")?;
-        assert!(
-            text.contains("accepted all, commit, documentation, file, symbol"),
-            "{text}"
-        );
-        assert!(text.contains("field target"), "{text}");
+        assert!(text.contains("example \"sparql\""), "{text}");
+        assert!(text.contains("field language"), "{text}");
         assert!(text.contains("tool search"), "{text}");
-        assert!(
-            !text.contains("unknown variant"),
-            "a refusal never speaks serde's grammar: {text}"
-        );
+        assert!(!text.contains("unknown variant"), "{text}");
         Ok(())
     }
 
@@ -11899,7 +11871,7 @@ done
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {
             let answer = peer
                 .call_tool(
-                    CallToolRequestParams::new("search")
+                    CallToolRequestParams::new("search_retrieval")
                         .with_arguments(arguments(&json!({"query": query}))?),
                 )
                 .await?;

@@ -101,7 +101,13 @@ impl GraphQuery {
                 };
                 Ok(Self { query, admission })
             }
-            Err(_) if parser.parse_update(text).is_ok() => refused("an update"),
+            Err(_)
+                if parser
+                    .parse_update(text)
+                    .is_ok_and(|update| !update.operations.is_empty()) =>
+            {
+                refused("an update")
+            }
             Err(error) => errors::search::query_syntax_invalid()
                 .detail(error.to_string())
                 .fail(),
