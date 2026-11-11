@@ -337,6 +337,37 @@ impl GraphDatasetBuilder {
         }))
     }
 
+    /// Adds the item extent and optional excerpt of a captured physical declaration.
+    ///
+    /// The record position distinguishes declarations within this captured publication.
+    ///
+    /// # Errors
+    /// Returns an identity or graph admission refusal.
+    pub fn insert_declaration_excerpt(
+        &mut self,
+        id: &SymbolId,
+        position: usize,
+        location: NodeLocation<'_>,
+        source: Option<&str>,
+    ) -> Result<(), RiftError> {
+        use VocabularyProperty as Property;
+
+        let mut out = TripleWriter::default();
+        let symbol = out.symbol(id)?;
+        let position = position.to_string();
+        let node = out.typed(
+            content_blank_node(&[symbol.as_str(), "captured-declaration", &position]),
+            VocabularyClass::Node,
+        );
+        out.link(&node, Property::Of, symbol);
+        out.link(&node, Property::Index, Literal::from(0_u64));
+        out.location(&node, location.unit, location.range)?;
+        if let Some(source) = source {
+            out.literal(&node, Property::Source, source);
+        }
+        self.insert_triples(out.0, GraphNameRef::DefaultGraph)
+    }
+
     /// Publishes the default local facts under their named graph.
     ///
     /// # Errors

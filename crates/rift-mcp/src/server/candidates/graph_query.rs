@@ -274,17 +274,20 @@ fn project_local_endpoints(
     cancellation: &QueryCancellation,
     deadline: std::time::Instant,
 ) -> Result<(), RiftError> {
-    if !selected.symbol_details && selected.node_source.is_none() {
+    if !selected.symbol_details && selected.nodes.is_none() {
         return Ok(());
     }
     for endpoint in acquired.local_endpoints() {
         let identity = rift_protocol::identity::SymbolIdentity::parse(endpoint.as_str())?;
         if identity.owner().is_local() {
             let symbols = rift_search::sparql::SymbolSelection::Identified(endpoint.as_str());
-            if let Some(source) = selected.node_source {
+            if let Some(nodes) = selected.nodes {
                 input.project_nodes(
                     reads,
-                    rift_search::sparql::NodeSelection { symbols, source },
+                    rift_search::sparql::NodeSelection {
+                        symbols,
+                        source: nodes.source,
+                    },
                     dataset,
                     cancellation,
                     deadline,
@@ -1085,6 +1088,44 @@ mod tests {
         })
     }
 
+    fn graph_fixture_symbol(id: &str, source: bool) -> (Value, Option<Value>) {
+        let name = id.rsplit('/').next().expect("name in symbol identity");
+        if !source {
+            return (
+                json!({
+                    "symbol":{"id":id,"name":name,"language":"rust","kind":"function",
+                        "origin":{"source_kind":"synthetic"}},
+                    "declarations":[]
+                }),
+                None,
+            );
+        }
+        let (package, version) = if id == ROOT || id == A {
+            ("demo", "1.0.0")
+        } else {
+            ("dependency", "2.0.0")
+        };
+        let origin = json!({
+            "source_kind":"authored","location":"dependency",
+            "package":{"manager":"cargo","registry":"crates.io","name":package,"version":version}
+        });
+        let prefix = "// header\n";
+        let text = format!("{prefix}fn {name}() {{ \"café\"; }}");
+        let unit = format!("rift://source/cargo/crates.io/{package}/src/{name}.rs");
+        let digest =
+            data_encoding::HEXLOWER.encode(rift_core::FileDigest::of(text.as_bytes()).as_bytes());
+        (
+            json!({
+                "symbol":{"id":id,"name":name,"language":"rust","kind":"function","origin":origin},
+                "declarations":[{
+                    "origin":origin,"unit":unit,"range":{"start":prefix.len(),"end":text.len()},"line":2,
+                    "signature_indices":[],"type_indices":[],"documentation_indices":[]
+                }]
+            }),
+            Some(json!({"unit":unit,"digest":digest,"text":text})),
+        )
+    }
+
     fn remote_graph_routes(
         requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
         endpoint_expiry: String,
@@ -1111,16 +1152,17 @@ mod tests {
                         B => (C, 3),
                         _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
                     };
-                    let symbol = |id: &str| json!({
-                        "symbol": {"id":id,"name":id.rsplit('/').next(),"language":"rust","kind":"function",
-                            "origin":{"source_kind":"synthetic"}}, "declarations":[]
-                    });
+                    let source = request["include"] == json!(["source"]);
+                    let (seed_symbol, seed_source) = graph_fixture_symbol(seed, source);
+                    let (next_symbol, next_source) = graph_fixture_symbol(next, source);
+                    let sources = seed_source.into_iter().chain(next_source).collect::<Vec<_>>();
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"relationships":[{
                             "id": format!("{number:064x}"),
                             "relationship":{"from":seed,"to":next,"kind":facet,"facets":[facet],"derivation":"resolution"}
                         }]}],
-                        "symbols":[symbol(seed),symbol(next)],
+                        "symbols":[seed_symbol,next_symbol],
+                        "sources":sources,
                         "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
                         "view":{"id":VIEW,"expires_at":expires}
                     });
@@ -1404,6 +1446,76 @@ mod tests {
                 {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"},
                 {"manager":"cargo","registry":"crates.io","name":"dependency","version":"2.0.0"}
             ])));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_reads_captured_declaration_excerpts_without_an_exact_node_read()
+    -> TestResult {
+        let requests = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = remote_graph_routes(Arc::clone(&requests), "2099-01-01T00:00:00Z".to_owned());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = listener.local_addr()?;
+        let service = tokio::spawn(async move { axum::serve(listener, app).await });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        crate::server::hermetic_workspace(
+            &root,
+            &format!(
+                "[global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n\n\
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'demo'\nversion = '1.0.0'\n"
+            ),
+        )?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let statement = format!(
+            "SELECT ?source ?unit ?start ?end {{ <{ROOT}> :calls ?target . \
+             ?node :of ?target; :index 0; :source ?source; :range [ :unit ?unit; :start ?start; :end ?end ] }}"
+        );
+        let response = server
+            .graph_query(QueryParams {
+                query: statement,
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(result) = response else {
+            return Err(
+                format!("expected captured declaration excerpt, received {response:?}").into(),
+            );
+        };
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected declaration bindings".into());
+        };
+        assert_eq!(bindings.len(), 1);
+        let row = serde_json::to_value(&bindings[0])?;
+        assert_eq!(row["source"]["value"], "fn a() { \"café\"; }");
+        assert_eq!(
+            row["unit"]["value"],
+            "rift://source/cargo/crates.io/demo/src/a.rs"
+        );
+        assert_eq!(row["start"]["value"], "10");
+        assert_eq!(row["end"]["value"], "29");
+
+        let metadata = server.graph_query(QueryParams {
+            query: format!("SELECT ?kind {{ <{ROOT}> :calls ?target . ?node :of ?target; :index 0; :kind ?kind }}"),
+            language: QueryLanguage::Sparql,
+        }).await.map_err(|failure| format!("{failure:?}"))?.0;
+        assert!(
+            matches!(
+                metadata,
+                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason: SymbolUnavailableReason::InsufficientCoverage,
+                    ..
+                })
+            ),
+            "{metadata:?}"
+        );
+        let requests = requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["include"], json!(["source"]));
+        service.abort();
         Ok(())
     }
 
