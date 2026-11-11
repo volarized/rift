@@ -38,6 +38,7 @@
 
 mod admission;
 mod dataset;
+mod dispatch;
 mod evaluation;
 mod expression;
 mod limits;
@@ -45,6 +46,7 @@ mod page;
 mod query;
 mod query_thread;
 mod requirements;
+mod retrieval;
 mod vocabulary;
 
 #[cfg(test)]
@@ -64,7 +66,8 @@ pub use limits::{
 };
 pub use page::{PageForm, PageSelection, continuation_query};
 pub use query::GraphQuery;
-pub use requirements::SymbolSelection;
+pub use requirements::{AdjacencySelection, NodeSelection, SymbolSelection};
+pub use retrieval::RetrievalSelection;
 pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,
     VocabularyResource, VocabularyValue,

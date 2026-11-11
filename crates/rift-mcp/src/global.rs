@@ -429,7 +429,10 @@ impl GlobalState {
         self.client(configuration).await?.nodes(params).await
     }
 
-    async fn client(&self, configuration: &GlobalConfiguration) -> Result<GlobalClient, RiftError> {
+    pub(crate) async fn client(
+        &self,
+        configuration: &GlobalConfiguration,
+    ) -> Result<GlobalClient, RiftError> {
         let mut config = Config::try_from(configuration)?;
         config.telemetry = self.telemetry.clone();
         let credential = std::env::var_os(&config.token_env);

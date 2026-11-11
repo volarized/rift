@@ -3,9 +3,10 @@
 use rift_error::{RiftError, errors};
 use spargebra::{Query, SparqlParser};
 
-use super::admission::admit;
+use super::admission::{Admission, admit};
 use super::limits::GraphLimits;
 use super::query_thread;
+use super::retrieval::RetrievalSelection;
 use super::vocabulary::VOCABULARY_NAMESPACE;
 
 /// Prefixes every query may use without declaring them.
@@ -24,7 +25,7 @@ const PREDECLARED_PREFIXES: [(&str, &str); 5] = [
 #[derive(Clone, Debug)]
 pub struct GraphQuery {
     query: Query,
-    separators: Vec<String>,
+    admission: Admission,
 }
 
 impl GraphQuery {
@@ -41,7 +42,7 @@ impl GraphQuery {
     ///   parsed query joins more patterns or nests deeper than allowed.
     /// - `query_syntax_invalid` when `text` is neither a query nor an update.
     /// - `query_feature_refused` naming the feature for an update, `FROM`, `FROM NAMED`, any
-    ///   `SERVICE`, `SERVICE SILENT` included, and a join of patterns sharing no variable.
+    ///   external or variable `SERVICE`, `SERVICE SILENT`, and a join sharing no variable.
     /// - `query_answer_limit` when the product of every `VALUES` table's rows passes the
     ///   solution bound.
     /// - `query_evaluation_failed` when the query thread cannot start.
@@ -63,19 +64,31 @@ impl GraphQuery {
 
     /// The separator of each bounded `GROUP_CONCAT`, by its index.
     pub(super) fn separators(&self) -> &[String] {
-        &self.separators
+        &self.admission.separators
+    }
+
+    /// The local retrieval calls statically selected by this query.
+    #[must_use]
+    pub fn retrieval_requests(&self) -> &[RetrievalSelection] {
+        &self.admission.retrieval
+    }
+
+    /// Whether evaluation requires code facts outside its retrieval services.
+    #[must_use]
+    pub const fn reads_base(&self) -> bool {
+        self.admission.reads_base
     }
 
     fn parsed(text: &str, limits: &GraphLimits) -> Result<Self, RiftError> {
         let parser = predeclared_parser();
         match parser.parse_query(text) {
             Ok(mut query) => {
-                let separators = if super::page::selection(&query).is_some() {
-                    Vec::new()
+                let admission = if super::page::selection(&query).is_some() {
+                    Admission::default()
                 } else {
                     admit(&mut query, limits)?
                 };
-                Ok(Self { query, separators })
+                Ok(Self { query, admission })
             }
             Err(_) if parser.parse_update(text).is_ok() => refused("an update"),
             Err(error) => errors::search::query_syntax_invalid()
@@ -191,6 +204,7 @@ mod tests {
         let accepted = [
             "CONSTRUCT { ?s rdfs:label ?label } WHERE { ?s r:kind ?label }",
             "DESCRIBE <urn:x>",
+            "SELECT ?hit { SERVICE :search { ?hit :query 'parse config' } }",
             "SELECT ?symbol WHERE { ?symbol a :Symbol ; :calls+ ?callee }",
             "ASK { ?node rdf:type :Node ; :start ?start FILTER(?start > \"0\"^^xsd:integer) }",
             "PREFIX : <urn:rift:vocabulary:> SELECT (COUNT(*) AS ?count) { ?s :uses ?r }",
@@ -220,7 +234,7 @@ mod tests {
             "SELECT * FROM NAMED <urn:g> { ?s ?p ?o }",
             "SELECT * { SERVICE <https://example.org/sparql> { ?s ?p ?o } }",
             "SELECT * { ?s ?p ?o OPTIONAL { SERVICE SILENT ?endpoint { ?s ?q ?r } } }",
-            "SELECT * { ?s ?p ?o FILTER EXISTS { SERVICE :search { ?s ?q ?r } } }",
+            "SELECT * { ?s ?p ?o FILTER EXISTS { SERVICE :external { ?s ?q ?r } } }",
             "SELECT (SUM(IF(EXISTS { SERVICE <urn:a> {} }, 1, 0)) AS ?n) { ?s ?p ?o }",
             "SELECT * { ?s ?p ?o } ORDER BY DESC(COALESCE(EXISTS { SERVICE <urn:a> {} }))",
             "SELECT * { BIND(?x IN (1, EXISTS { SERVICE <urn:a> {} }) AS ?y) }",

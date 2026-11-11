@@ -11,12 +11,18 @@ use rift_protocol::read::{Pagination, ReadWarning};
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    GraphLimits, GraphQuery, PageForm, PageSelection, QueryCancellation, continuation_query,
+    GraphDataset, GraphLimits, GraphQuery, PageForm, PageSelection, QueryCancellation,
+    continuation_query,
 };
 use serde::{Deserialize, Serialize};
 
 use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure};
 use crate::output::{Json, ToolFailure};
+
+mod relationships;
+pub(crate) mod retrieval;
+
+use relationships::AcquiredAdjacency;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -95,7 +101,46 @@ impl RiftMcp {
                 SymbolUnavailableReason::IndexPreparing,
             )));
         }
-        if query.symbol_selection().is_none() {
+        let selected = query.adjacency_selection();
+        let mut acquired = if let Some(selected) = &selected {
+            let result = tokio::time::timeout_at(
+                deadline.at(),
+                self.acquire_adjacency(&resolved, selected, limits, deadline),
+            )
+            .await
+            .map_err(|_| read_failure(deadline_failure(deadline.budget())))?;
+            match result {
+                Ok(Ok(acquired)) => acquired,
+                Ok(Err(unavailable)) => return Ok(Json(QueryReadResult::Unavailable(unavailable))),
+                Err(error) if lacks_coverage(&error) => {
+                    return Ok(Json(query_unavailable(
+                        SymbolUnavailableReason::InsufficientCoverage,
+                    )));
+                }
+                Err(error) => return Err(read_failure(error)),
+            }
+        } else if query.symbol_selection().is_some()
+            || query.node_selection().is_some()
+            || !query.reads_base()
+        {
+            AcquiredAdjacency::default()
+        } else {
+            return Ok(Json(query_unavailable(
+                SymbolUnavailableReason::InsufficientCoverage,
+            )));
+        };
+        let mut retrieved = Vec::new();
+        for selection in query.retrieval_requests() {
+            let result =
+                tokio::time::timeout_at(deadline.at(), self.query_retrieval(selection, limits))
+                    .await
+                    .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
+            match result {
+                Ok(result) => retrieved.push(result),
+                Err(reason) => return Ok(Json(QueryReadResult::Unavailable(reason))),
+            }
+        }
+        if !retrieved.is_empty() && !self.engine_tree_matches(&resolved.published).await? {
             return Ok(Json(query_unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
@@ -108,44 +153,84 @@ impl RiftMcp {
         let reads = Arc::clone(&resolved.published.reads);
         let views = Arc::clone(&self.local_views);
         let responses = Arc::clone(&self.candidate_responses);
-        let warnings = resolved.stale.into_iter().collect();
+        let mut warnings = acquired.take_warnings();
+        warnings.extend(resolved.stale);
+        for result in &retrieved {
+            for warning in &result.warnings {
+                if !warnings.contains(warning) {
+                    warnings.push(warning.clone());
+                }
+            }
+        }
         let cancellation = QueryCancellation::new();
         let _guard = QueryGuard(cancellation.clone());
         let result = tokio::time::timeout_at(
             deadline.at(),
             self.blocking.run("graph query", move || {
                 let input = reads.local_search_view_input(true)?;
-                let selection = query.symbol_selection().ok_or_else(retention_failure)?;
-                let dataset = input.project_symbols(
-                    selection,
-                    limits,
-                    &cancellation,
-                    deadline.at().into_std(),
-                )?;
+                let mut dataset = GraphDataset::builder(limits);
+                if let Some(selected) = &selected {
+                    if let Err(error) = acquired.project(&mut dataset, selected, &input) {
+                        if lacks_coverage(&error) {
+                            return Ok(query_unavailable(
+                                SymbolUnavailableReason::InsufficientCoverage,
+                            ));
+                        }
+                        return Err(error);
+                    }
+                } else if let Some(selection) = query.node_selection() {
+                    input.project_nodes(
+                        &reads,
+                        selection,
+                        &mut dataset,
+                        &cancellation,
+                        deadline.at().into_std(),
+                    )?;
+                } else if let Some(selection) = query.symbol_selection() {
+                    input.project_symbols(
+                        selection,
+                        &mut dataset,
+                        &cancellation,
+                        deadline.at().into_std(),
+                    )?;
+                }
+                for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
+                    dataset.insert_retrieval(selection, result)?;
+                }
+                let dataset = dataset.build();
                 let answer: QueryAnswer = dataset.evaluate(&query, &cancellation)?.into();
                 let views = views.get().ok_or_else(retention_failure)?;
                 let root = input.root().to_owned();
                 let owner = input.owner().clone();
                 let mut response = None;
                 views.capture_with(input, |view| {
+                    let mut view = view.clone();
+                    let provider_views = acquired
+                        .remote_view()
+                        .into_iter()
+                        .chain(retrieved.iter().filter_map(|result| result.view.as_ref()));
+                    for provider in provider_views {
+                        let expiry = crate::proxy::captured_expiry(provider)?;
+                        if expiry <= SystemTime::now() {
+                            response =
+                                Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
+                            return Ok(false);
+                        }
+                        if expiry < crate::proxy::captured_expiry(&view)? {
+                            view.expires_at.clone_from(&provider.expires_at);
+                        }
+                    }
                     if cancellation.is_cancelled() {
                         return errors::search::query_cancelled().fail();
                     }
-                    let (saved, bytes, page) = SavedQuery::encoded(
+                    response = Some(responses.store_query(
                         &root,
                         &owner,
-                        view,
+                        &view,
                         &answer,
                         &configuration,
                         warnings,
-                    )?;
-                    let maximum = usize::try_from(configuration.page_limit.bytes())
-                        .map_err(|_| page_failure())?;
-                    if encoded_size(&page)? > maximum {
-                        return Err(page_failure());
-                    }
-                    responses.save_query(&saved, &bytes)?;
-                    response = Some(page);
+                    )?);
                     Ok(true)
                 })?;
                 response.ok_or_else(retention_failure)
@@ -159,6 +244,44 @@ impl RiftMcp {
 }
 
 impl CandidateResponses {
+    /// Retains one evaluated query and returns its first transport page.
+    pub(crate) fn store_query(
+        &self,
+        root: &std::path::Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+        view: &CapturedView,
+        answer: &QueryAnswer,
+        configuration: &QueryConfiguration,
+        warnings: Vec<ReadWarning>,
+    ) -> Result<QueryReadResult, RiftError> {
+        let (saved, bytes, first) =
+            SavedQuery::encoded(root, owner, view, answer, configuration, warnings)?;
+        let maximum =
+            usize::try_from(configuration.page_limit.bytes()).map_err(|_| page_failure())?;
+        if encoded_size(&first)? > maximum {
+            return Err(page_failure());
+        }
+        self.save_query(&saved, &bytes)?;
+        Ok(first)
+    }
+
+    /// Replays a query owned by the original proxy connection without reacquiring facts.
+    pub(crate) fn retained_proxy_query(
+        &self,
+        selection: &PageSelection,
+        root: &std::path::Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+    ) -> Result<QueryReadResult, RiftError> {
+        let (saved, answer) = match self.replay_query(selection)? {
+            Ok(found) => found,
+            Err(reason) => return Ok(query_unavailable(reason)),
+        };
+        if saved.root != root || &saved.owner != owner {
+            return Ok(query_unavailable(SymbolUnavailableReason::ViewContext));
+        }
+        saved.response(answer, selection.page)
+    }
+
     fn save_query(&self, saved: &SavedQuery, bytes: &[u8]) -> Result<(), RiftError> {
         let mut encoded =
             crate::proxy::encode_bounded(saved, BYTES_MAX).map_err(encoding_failure)?;
@@ -458,6 +581,13 @@ fn retention_failure() -> RiftError {
         .detail("retained query material is unavailable; repeat the original query")
         .error()
 }
+fn lacks_coverage(error: &RiftError) -> bool {
+    matches!(
+        error.slug(),
+        errors::server::search_coverage_unavailable::SLUG | errors::server::read_unsupported::SLUG
+    )
+}
+
 fn query_unavailable(reason: SymbolUnavailableReason) -> QueryReadResult {
     QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
         reason,
@@ -524,6 +654,275 @@ mod tests {
         assert!(
             matches!(&bindings[0]["name"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "beta")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_keeps_each_local_usage_and_its_exact_source() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            "[languages.python.lsp]\nembedded = 'ty'\n",
+        )?;
+        std::fs::write(
+            directory.path().join("pyproject.toml"),
+            "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['helper','main']\n",
+        )?;
+        std::fs::write(
+            directory.path().join("helper.py"),
+            "def beacon() -> int:\n    return 7\n",
+        )?;
+        std::fs::write(
+            directory.path().join("main.py"),
+            "from helper import beacon\n\nresult = beacon()\n\ndef caller() -> int:\n    return beacon() + beacon()\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let published = Arc::clone(&server.published.read().await.current);
+        let params = serde_json::from_value(serde_json::json!({"name": "beacon"}))?;
+        let id = published
+            .reads
+            .get_symbol(&params)?
+            .hits
+            .into_iter()
+            .find_map(|hit| hit.symbol.id)
+            .ok_or("canonical beacon declaration")?;
+        let params = QueryParams {
+            query: format!(
+                "SELECT ?start ?text {{ <{}> :usages ?usage . ?usage :range/:start ?start ; :source ?text }} ORDER BY ?start",
+                id.as_str()
+            ),
+            language: Default::default(),
+        };
+        let result = server
+            .graph_query(params)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!("expected captured usages, received {result:?}").into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected usage bindings".into());
+        };
+        assert_eq!(bindings.len(), 4, "{bindings:?}");
+        assert!(bindings.iter().all(|binding| matches!(
+            &binding["text"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "beacon"
+        )));
+        let count = server
+            .graph_query(QueryParams {
+                query: format!(
+                    "SELECT (COUNT(?usage) AS ?n) {{ <{}> :usages ?usage }}",
+                    id.as_str()
+                ),
+                language: Default::default(),
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(count, QueryReadResult::Results(ref result)
+            if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if matches!(&bindings[0]["n"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "4"))),
+            "{count:?}"
+        );
+
+        let evidence = server.graph_query(QueryParams {
+            query: format!("SELECT ?source ?unit {{ ?node :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
+            language: Default::default(),
+        }).await.map_err(|failure| format!("{failure:?}"))?.0;
+        assert!(
+            matches!(evidence, QueryReadResult::Results(ref result)
+            if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if matches!(&bindings[0]["unit"], rift_protocol::query::RdfTerm::Iri { value } if value == "rift://source/project/helper.py")
+                && matches!(&bindings[0]["source"], rift_protocol::query::RdfTerm::Literal { value, .. } if value.contains("return 7")))),
+            "{evidence:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_walks_three_hops_across_exact_releases_in_one_captured_view() -> TestResult
+    {
+        use axum::routing::{get, post};
+        use serde_json::{Value, json};
+
+        const ROOT: &str = "rift://symbol/cargo/crates.io/demo/rust/root";
+        const A: &str = "rift://symbol/cargo/crates.io/demo/rust/a";
+        const B: &str = "rift://symbol/cargo/crates.io/dependency/rust/b";
+        const C: &str = "rift://symbol/cargo/crates.io/dependency/rust/c";
+        const VIEW: &str = "7acfa78d70b3a8211b44149026dbab4c5f28bbf93240d7817235d3722481069d";
+
+        fn response(value: Value) -> impl axum::response::IntoResponse {
+            ([("content-type", "application/json")], value.to_string())
+        }
+
+        let expires = jiff::Timestamp::now()
+            .checked_add(jiff::Span::new().minutes(2))?
+            .to_string();
+        let endpoint_expiry = expires.clone();
+        let seen = Arc::new(tokio::sync::Mutex::new(Vec::<Value>::new()));
+        let requests = Arc::clone(&seen);
+        let app = axum::Router::new()
+            .route("/rift/v1/capabilities", get(|| async {
+                response(json!({
+                    "supported_package_managers": ["cargo"],
+                    "supported_features": ["resolutions", "search", "symbols", "relationships"],
+                    "publication_format": "rift-package-index-v2",
+                    "analyzer_revision": "analyzer-v1",
+                    "corpus_revision": "corpus-v1",
+                    "required_search_fields": ["name","qualified_name","documentation","signature"],
+                    "bounds": {
+                        "request_body_bytes_max": 1048576, "response_body_bytes_max": 1048576,
+                        "dependency_entries_max": 100, "query_bytes_max": 4096, "query_terms_max": 32,
+                        "query_term_bytes_max": 256, "identifiers_max": 16, "identifier_bytes_max": 4096,
+                        "packages_max": 100, "page_limit_min": 1, "page_limit_max": 100,
+                        "page_limit_default": 20, "cursor_bytes_max": 4096, "candidate_pool_max": 100,
+                        "warnings_max": 32, "source_bytes_max": 1048576
+                    },
+                    "relationship_capabilities": [{
+                        "direction": "outgoing", "facets": ["calls"], "bounds": {
+                            "max_seeds": 8, "max_facets": 4, "max_relationships": 100,
+                            "max_occurrences": 100, "max_symbols": 100, "max_sources": 100
+                        }
+                    }]
+                }))
+            }))
+            .route("/rift/v1/search", post(move |bytes: axum::body::Bytes| {
+                let requests = Arc::clone(&requests);
+                let expires = endpoint_expiry.clone();
+                async move {
+                    let request: Value = serde_json::from_slice(&bytes).expect("valid raw relationship request");
+                    let seed = request["relationships"]["seeds"][0].as_str().unwrap_or_default();
+                    let (next, number) = match seed {
+                        ROOT => (A, 1_u64),
+                        A => (B, 2),
+                        B => (C, 3),
+                        _ => return response(json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
+                    };
+                    let symbol = |id: &str| json!({
+                        "symbol": {"id":id,"name":id.rsplit('/').next(),"language":"rust","kind":"function",
+                            "origin":{"source_kind":"synthetic"}}, "declarations":[]
+                    });
+                    let result = json!({
+                        "groups": [{"seed":seed,"complete":true,"relationships":[{
+                            "id": format!("{number:064x}"),
+                            "relationship":{"from":seed,"to":next,"kind":"call","facets":["calls"],"derivation":"resolution"}
+                        }]}],
+                        "symbols":[symbol(seed),symbol(next)],
+                        "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
+                        "view":{"id":VIEW,"expires_at":expires}
+                    });
+                    requests.lock().await.push(request);
+                    response(result)
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = listener.local_addr()?;
+        let service = tokio::spawn(async move { axum::serve(listener, app).await });
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            &format!(
+                "[global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n\n\
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'demo'\nversion = '1.0.0'\n\n\
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'dependency'\nversion = '2.0.0'\n"
+            ),
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let published = Arc::clone(&server.published.read().await.current);
+        let identity = rift_protocol::identity::SymbolIdentity::parse(ROOT)?;
+        assert!(
+            crate::global::workspace_release(
+                published.reads.dependency_context(),
+                identity.owner()
+            )
+            .is_some(),
+            "expected exact release in {:?}",
+            published.reads.dependency_context().entries()
+        );
+        assert!(published.configuration.global_configuration().enabled);
+        let query = format!("SELECT ?callee {{ <{ROOT}> :calls/:calls/:calls ?callee }}");
+        let graph = GraphQuery::parse(&query, &GraphLimits::default())?;
+        assert!(graph.adjacency_selection().is_some(), "{graph:?}");
+        let result = server
+            .graph_query(QueryParams {
+                query,
+                language: Default::default(),
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        service.abort();
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!(
+                "expected captured remote path, received {result:?} after {:?} requests",
+                seen.lock().await.as_slice()
+            )
+            .into());
+        };
+        assert_eq!(
+            result.view.as_ref().map(|view| view.expires_at.as_str()),
+            Some(expires.as_str())
+        );
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected call bindings".into());
+        };
+        assert_eq!(bindings.len(), 1, "{bindings:?}");
+        assert!(
+            matches!(&bindings[0]["callee"], rift_protocol::query::RdfTerm::Iri { value } if value == C)
+        );
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].get("view").is_none());
+        assert!(seen[1..].iter().all(|request| request["view"] == VIEW));
+        assert!(seen.iter().all(|request| request["packages"]
+            == json!([
+                {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"},
+                {"manager":"cargo","registry":"crates.io","name":"dependency","version":"2.0.0"}
+            ])));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_projects_regex_occurrences_from_the_original_producer() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "fn a() { /* signal signal */ }\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let params = QueryParams {
+            query: "SELECT ?start ?path { SERVICE :search { ?hit :pattern 'signal'; :target 'file'; :path ?path; :start ?start; :matched_by/:value 'content' } } ORDER BY ?start".to_owned(),
+            language: Default::default(),
+        };
+        let result = server
+            .graph_query(params)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!("expected producer regex results, received {result:?}").into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected regex bindings".into());
+        };
+        assert_eq!(bindings.len(), 2, "{bindings:?}");
+        let positions = bindings
+            .iter()
+            .filter_map(|binding| match binding.get("start") {
+                Some(rift_protocol::query::RdfTerm::Literal { value, .. }) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions, ["12", "19"]);
         Ok(())
     }
 

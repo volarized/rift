@@ -37,6 +37,7 @@ mod facts;
 mod inline;
 mod layout;
 mod nodes;
+mod query;
 mod search;
 mod symbol;
 mod walk;
