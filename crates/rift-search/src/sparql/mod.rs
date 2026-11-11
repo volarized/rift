@@ -38,6 +38,7 @@
 
 mod admission;
 mod dataset;
+mod dispatch;
 mod evaluation;
 mod expression;
 mod limits;
