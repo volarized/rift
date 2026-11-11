@@ -146,6 +146,67 @@ impl CalleeRoots {
         }
         Ok(None)
     }
+    /// Captures a package call's admitted file without following a path outside its root.
+    ///
+    /// # Errors
+    /// Refuses an unadmitted source, changed owner, unreadable bytes or a file over the bound.
+    pub fn capture_package_call(
+        &self,
+        callee: &PackageCallee,
+        trees: &[&Path],
+        bytes_max: u64,
+    ) -> Result<(rift_lsp::uri::PackageFile, String), RiftError> {
+        use std::io::Read as _;
+        let unavailable = || {
+            rift_error::errors::server::search_coverage_unavailable()
+                .operation("installed dependency source")
+                .error()
+        };
+        let uri = callee.document().ok_or_else(unavailable)?;
+        let Some(EngineAddress::Package(file)) = self.address(trees, uri)? else {
+            return Err(unavailable());
+        };
+        let CalleePackage::Installed(package) = callee.package() else {
+            return Err(unavailable());
+        };
+        if file.origin()
+            != &(rift_core::SourceLocation::Dependency {
+                package: package.clone(),
+            })
+            || file.path() != callee.path()
+        {
+            return Err(unavailable());
+        }
+        let relative = file.root().project_path(uri)?;
+        let root = file
+            .root()
+            .filesystem_path()
+            .canonicalize()
+            .map_err(|_| unavailable())?;
+        let path = file
+            .root()
+            .filesystem_path()
+            .join(relative.as_str())
+            .canonicalize()
+            .map_err(|_| unavailable())?;
+        if path == root || !path.starts_with(&root) {
+            return Err(unavailable());
+        }
+        let mut bytes = Vec::new();
+        let source = fs::File::open(path).map_err(|_| unavailable())?;
+        if !source.metadata().map_err(|_| unavailable())?.is_file() {
+            return Err(unavailable());
+        }
+        source
+            .take(bytes_max.checked_add(1).ok_or_else(unavailable)?)
+            .read_to_end(&mut bytes)
+            .map_err(|_| unavailable())?;
+        if u64::try_from(bytes.len()).map_or(true, |length| length > bytes_max) {
+            return Err(unavailable());
+        }
+        let text = String::from_utf8(bytes).map_err(|_| unavailable())?;
+        Ok((*file, text))
+    }
 }
 
 /// The order source roots keep: root, then defining origin.
@@ -346,6 +407,7 @@ pub struct PackageCallee {
     encoding: PositionEncoding,
     name: String,
     captured_source: Option<Arc<str>>,
+    document: Option<Arc<Uri>>,
 }
 
 /// The declaration the global API named at one package callee's position.
@@ -363,6 +425,12 @@ pub struct CalleeDeclaration {
 }
 
 impl PackageCallee {
+    /// The original document addressed by this engine result, when observed.
+    #[must_use]
+    pub fn document(&self) -> Option<&Uri> {
+        self.document.as_deref()
+    }
+
     /// Complete embedded stub bytes held with the observed runtime owner.
     #[must_use]
     pub fn captured_source(&self) -> Option<&str> {
@@ -372,6 +440,14 @@ impl PackageCallee {
     #[must_use]
     pub const fn package(&self) -> &CalleePackage {
         &self.package
+    }
+
+    /// The observed declaration position converted against captured exact bytes.
+    ///
+    /// # Errors
+    /// Refuses a position outside the captured source.
+    pub fn byte_offset(&self, text: &str) -> Result<usize, RiftError> {
+        rift_lsp::position::LineIndex::new(text).byte_offset(self.encoding, self.position)
     }
 
     /// The callee's file, below the package's root, such as `src/lib.rs`.
@@ -403,8 +479,7 @@ impl PackageCallee {
     /// from the canonical identity at its answered release. A mapped stub keeps its physical
     /// declaration origin separately for source reads. `None` for an invalid or local
     /// identity, or a release of another owner.
-    #[must_use]
-    pub fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
+    pub(crate) fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
         let CalleeDeclaration {
             id,
             kind,
@@ -511,6 +586,7 @@ pub(crate) fn callee_file(
             encoding: call.encoding,
             name: call.name.to_owned(),
             captured_source: None,
+            document: Some(Arc::new(call.uri.clone())),
         })
     };
     if let Some(stub) = call.uri.as_str().strip_prefix(VENDORED_STDLIB_PREFIX) {
@@ -953,6 +1029,7 @@ mod tests {
             encoding: PositionEncoding::Utf16,
             name: "greet".to_owned(),
             captured_source: None,
+            document: None,
         }
     }
 

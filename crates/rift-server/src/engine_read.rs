@@ -964,7 +964,35 @@ pub async fn graph_calls(
     let OutgoingAnswer::Ready(report) = answered else {
         return Err(unavailable());
     };
-    let trees = [slot.workspace_root(), reads.index().root()];
+    map_graph_calls(
+        reads,
+        roots,
+        &identity,
+        report,
+        &CallGraphSource {
+            trees: [slot.workspace_root(), reads.index().root()],
+            source: file.source(),
+            unit: crate::read::source_unit_id(file.path()),
+            direction,
+        },
+    )
+}
+
+struct CallGraphSource<'source> {
+    trees: [&'source std::path::Path; 2],
+    source: &'source str,
+    unit: SourceUnitId,
+    direction: TraversalDirection,
+}
+
+fn map_graph_calls(
+    reads: &ReadService,
+    roots: &CalleeRoots,
+    identity: &CoreSymbolId,
+    report: CalleeReport,
+    held: &CallGraphSource<'_>,
+) -> Result<GraphCalls, RiftError> {
+    let unavailable = graph_call_coverage;
     let mut result = GraphCalls::default();
     let mut locations = 0usize;
     for call in report.calls.map_err(|_| unavailable())? {
@@ -975,25 +1003,25 @@ pub async fn graph_calls(
             position: item.selection_range.start,
             encoding: report.encoding,
         };
-        let neighbor = callee_file(roots, &trees, &identity, at)?;
-        let caller_file = match (&neighbor, direction) {
-            (_, TraversalDirection::Outgoing) => file,
+        let neighbor = callee_file(roots, &held.trees, identity, at)?;
+        let (source, unit) = match (&neighbor, held.direction) {
+            (_, TraversalDirection::Outgoing) => (held.source, held.unit.clone()),
             (CalleeFile::Project(path), TraversalDirection::Incoming) => {
-                reads.index().file(path).ok_or_else(unavailable)?
+                let file = reads.index().file(path).ok_or_else(unavailable)?;
+                (file.source(), crate::read::source_unit_id(file.path()))
             }
             _ => return Err(unavailable()),
         };
-        let source = LineIndex::new(caller_file.source());
-        let unit = crate::read::source_unit_id(caller_file.path());
+        let index = LineIndex::new(source);
         let mut occurrences = Vec::new();
         for range in call.from_ranges {
             locations = locations
                 .checked_add(1)
                 .filter(|count| *count <= TRAVERSAL_NODES_MAX)
                 .ok_or_else(unavailable)?;
-            let start = source.byte_offset(report.encoding, range.start)?;
-            let end = source.byte_offset(report.encoding, range.end)?;
-            if caller_file.source().get(start..end).is_none() {
+            let start = index.byte_offset(report.encoding, range.start)?;
+            let end = index.byte_offset(report.encoding, range.end)?;
+            if source.get(start..end).is_none() {
                 return Err(unavailable());
             }
             occurrences.push(SourceUnitSpan {
@@ -1020,6 +1048,95 @@ pub async fn graph_calls(
         }
     }
     Ok(result)
+}
+
+fn graph_call_coverage() -> RiftError {
+    errors::server::search_coverage_unavailable()
+        .operation("graph calls")
+        .error()
+}
+
+/// Reprepares and reads a call target from the same admitted installed bytes.
+///
+/// # Errors
+/// Refuses missing readiness, a different prepared position or an unaddressed callee.
+pub async fn installed_graph_calls(
+    reads: &ReadService,
+    engines: &EnginePool,
+    roots: &CalleeRoots,
+    seed: &SymbolId,
+    target: (&PackageCallee, &Language, &SourceUnitId, &str),
+    deadline: Instant,
+) -> Result<GraphCalls, RiftError> {
+    let (callee, language, unit, text) = target;
+    let slot = engines
+        .engine_for(language)
+        .ok_or_else(graph_call_coverage)?;
+    let uri = callee.document().ok_or_else(graph_call_coverage)?.clone();
+    let offset = callee.byte_offset(text)?;
+    let index = LineIndex::new(text);
+    let utf8 = index.position(PositionEncoding::Utf8, offset)?;
+    let utf16 = index.position(PositionEncoding::Utf16, offset)?;
+    let source: std::sync::Arc<str> = text.into();
+    let open_uri = uri.clone();
+    let close_uri = uri.clone();
+    let language_id = language.name.clone();
+    let result = slot.request_outgoing(
+        move |session| {
+            let uri = open_uri.clone();
+            let source = std::sync::Arc::clone(&source);
+            let language_id = language_id.clone();
+            Box::pin(async move { session.open_uri(uri, &language_id, source.to_string()).await })
+        },
+        move |session| {
+            let uri = uri.clone();
+            Box::pin(async move {
+                let encoding = session.capabilities().position_encoding;
+                let position = match encoding {
+                    PositionEncoding::Utf8 => utf8,
+                    PositionEncoding::Utf16 => utf16,
+                };
+                let items = session.prepare_call_hierarchy_uri(uri.clone(), position).await?;
+                let [item] = items.as_slice() else {
+                    return Err(graph_call_coverage());
+                };
+                if item.uri != uri || !(item.selection_range.start <= position && position < item.selection_range.end) {
+                    return Err(graph_call_coverage());
+                }
+                let calls = session.outgoing_calls(item.clone()).await?;
+                if calls.len() > TRAVERSAL_NODES_MAX {
+                    return Err(graph_call_coverage());
+                }
+                Ok(Some(CalleeReport { calls: Ok(calls), encoding }))
+            })
+        },
+        move |session| {
+            let uri = close_uri.clone();
+            Box::pin(async move {
+                if let Err(error) = session.close_uri(&uri).await {
+                    rift_tracing::warn!(component = "engine", error = %error, "engine document close failed");
+                }
+            })
+        },
+        deadline,
+    ).await?;
+    let OutgoingAnswer::Ready(report) = result else {
+        return Err(graph_call_coverage());
+    };
+    let identity =
+        CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| graph_call_coverage())?;
+    map_graph_calls(
+        reads,
+        roots,
+        &identity,
+        report,
+        &CallGraphSource {
+            trees: [slot.workspace_root(), reads.index().root()],
+            source: text,
+            unit: unit.clone(),
+            direction: TraversalDirection::Outgoing,
+        },
+    )
 }
 
 async fn resolve_symbol_references(

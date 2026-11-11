@@ -85,6 +85,12 @@ impl TreeRoot {
         Ok(Self { slash_form })
     }
 
+    /// The admitted filesystem root in platform path form.
+    #[must_use]
+    pub fn filesystem_path(&self) -> &Path {
+        Path::new(&self.slash_form)
+    }
+
     /// The file URI addressing the root itself.
     ///
     /// # Errors
@@ -344,6 +350,8 @@ impl EngineRoots {
                 let unit = SourceUnitId::for_origin(&package.origin, &path)?;
                 Ok(EngineAddress::Package(Box::new(PackageFile {
                     origin: package.origin.clone(),
+                    root: package.root.clone(),
+                    import_root: package.within.clone(),
                     path,
                     unit,
                 })))
@@ -378,11 +386,25 @@ pub enum EngineAddress {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackageFile {
     origin: SourceLocation,
+    root: TreeRoot,
+    import_root: Option<ProjectPath>,
     path: ProjectPath,
     unit: SourceUnitId,
 }
 
 impl PackageFile {
+    /// The admitted filesystem root that holds this physical file.
+    #[must_use]
+    pub const fn root(&self) -> &TreeRoot {
+        &self.root
+    }
+
+    /// The import root established by installed package metadata, when present.
+    #[must_use]
+    pub const fn import_root(&self) -> Option<&ProjectPath> {
+        self.import_root.as_ref()
+    }
+
     /// The defining package or runtime origin that holds the file.
     #[must_use]
     pub const fn origin(&self) -> &SourceLocation {

@@ -224,7 +224,15 @@ fn admit_pattern<'a>(
         }
         QueryExpression::Bgp { patterns } if !pending.in_retrieval && !patterns.is_empty() => {
             admission.reads_base = true;
-            admission.symbol_only &= super::requirements::symbol_patterns(patterns).is_some();
+            admission.symbol_only &=
+                super::requirements::symbol_patterns(patterns).is_some_and(|selection| {
+                    if let super::SymbolSelection::Identified(id) = selection {
+                        rift_protocol::identity::SymbolIdentity::parse(id)
+                            .is_ok_and(|id| id.owner().is_local())
+                    } else {
+                        true
+                    }
+                });
             if is_disconnected(patterns) {
                 return refused(CARTESIAN_PRODUCT);
             }

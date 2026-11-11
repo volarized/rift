@@ -306,6 +306,37 @@ impl GraphDatasetBuilder {
         Ok(())
     }
 
+    /// Adds one node from the existing revision-pinned syntax read.
+    ///
+    /// # Errors
+    /// Returns a graph admission refusal for an invalid or oversized node.
+    pub fn insert_declared_node(
+        &mut self,
+        symbol: &SymbolId,
+        node: &rift_protocol::read::Node,
+        include_source: bool,
+    ) -> Result<(), RiftError> {
+        let Some(declaration) = node.declaration else {
+            return Ok(());
+        };
+        let address = |index| NodeAddress::Declaration {
+            symbol,
+            declaration,
+            index,
+        };
+        self.insert(GraphFact::Node(NodeFact {
+            address: address(node.index),
+            kind: &node.kind.0,
+            language: &node.language,
+            parent: node.parent.map(address),
+            location: Some(NodeLocation {
+                unit: &node.unit,
+                range: &node.range,
+            }),
+            source: include_source.then_some(node.source.as_str()),
+        }))
+    }
+
     /// Publishes the default local facts under their named graph.
     ///
     /// # Errors
