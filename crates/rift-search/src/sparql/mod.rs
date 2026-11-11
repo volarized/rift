@@ -45,6 +45,7 @@ mod page;
 mod query;
 mod query_thread;
 mod requirements;
+mod retrieval;
 mod vocabulary;
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ pub use limits::{
 pub use page::{PageForm, PageSelection, continuation_query};
 pub use query::GraphQuery;
 pub use requirements::{AdjacencySelection, SymbolSelection};
+pub use retrieval::RetrievalSelection;
 pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,
     VocabularyResource, VocabularyValue,

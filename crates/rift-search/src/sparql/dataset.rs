@@ -11,6 +11,8 @@ use sha2::{Digest as _, Sha256};
 use super::limits::GraphLimits;
 use super::vocabulary::{VocabularyClass, VocabularyProperty};
 
+mod retrieval;
+
 /// IRI prefix of a symbol identity.
 const SYMBOL_PREFIX: &str = "rift://symbol/";
 /// IRI prefix of a source unit identity.
@@ -277,11 +279,17 @@ impl GraphDatasetBuilder {
     pub fn insert(&mut self, fact: GraphFact<'_>) -> Result<(), RiftError> {
         let mut written = TripleWriter::default();
         fact.write_triples(&mut written)?;
+        self.insert_triples(written.0, GraphNameRef::DefaultGraph)
+    }
+
+    fn insert_triples(
+        &mut self,
+        triples: Vec<Triple>,
+        graph: GraphNameRef<'_>,
+    ) -> Result<(), RiftError> {
         let mut added = Graph::new();
-        for triple in written.0 {
-            let held = self
-                .dataset
-                .contains(triple.as_ref().in_graph(GraphNameRef::DefaultGraph));
+        for triple in triples {
+            let held = self.dataset.contains(triple.as_ref().in_graph(graph));
             if !held {
                 added.insert(triple);
             }
@@ -293,8 +301,7 @@ impl GraphDatasetBuilder {
         self.admit(added.len(), literal_bytes)?;
         self.literal_bytes += literal_bytes;
         for triple in &added {
-            self.dataset
-                .insert(triple.in_graph(oxrdf::GraphName::DefaultGraph));
+            self.dataset.insert(triple.in_graph(graph));
         }
         Ok(())
     }
