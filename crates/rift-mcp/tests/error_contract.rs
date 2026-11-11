@@ -4,7 +4,6 @@
 //! sets.
 
 mod hermetic_search;
-mod query;
 #[allow(dead_code)]
 mod workspace_client;
 
@@ -17,7 +16,7 @@ use rift_protocol::error::{ErrorCode, RetryDirective};
 use rmcp::ServiceExt as _;
 use rmcp::model::CallToolRequestParams;
 use serde_json::json;
-use workspace_client::{ToolFailure, failed_call};
+use workspace_client::{ToolFailure, failed_call, query};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 

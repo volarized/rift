@@ -8,7 +8,6 @@
 //! the key lands, and `exclude` still decides over it.
 
 mod hermetic_search;
-mod query;
 #[allow(dead_code)]
 mod workspace_client;
 
@@ -21,7 +20,9 @@ use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use workspace_client::{await_workspace_ready, query_after_population, search_after_population};
+use workspace_client::{
+    await_workspace_ready, query, query_after_population, search_after_population,
+};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
