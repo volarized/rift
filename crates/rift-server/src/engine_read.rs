@@ -988,7 +988,7 @@ pub async fn graph_calls(
                 .ok_or_else(unavailable)?;
                 result.local.push((target, occurrences));
             }
-            CalleeFile::Package(callee) => result.packages.push((callee, occurrences)),
+            CalleeFile::Package(target) => result.packages.push((target, occurrences)),
             CalleeFile::Unaddressed => return Err(unavailable()),
         }
     }

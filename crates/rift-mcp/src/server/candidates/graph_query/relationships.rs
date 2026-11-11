@@ -192,15 +192,20 @@ impl RiftMcp {
         limits: GraphLimits,
         deadline: RequestDeadline,
     ) -> Result<Result<AcquiredAdjacency, SearchUnavailable>, RiftError> {
-        let reads = &resolved.published.reads;
-        let configuration = resolved.published.configuration.global_configuration();
-        let mut acquired = AcquiredAdjacency::default();
-        let mut remote = None;
-        let mut local = None;
-        let mut remaining = RelationshipReadLimits {
-            requests_max: REQUESTS_MAX,
-            records_max: RECORDS_MAX,
-            bytes_max: u64::try_from(limits.literal_bytes_max()).unwrap_or(u64::MAX),
+        let mut walk = AdjacencyWalk {
+            server: self,
+            resolved,
+            selected,
+            deadline,
+            configuration: resolved.published.configuration.global_configuration(),
+            remaining: RelationshipReadLimits {
+                requests_max: REQUESTS_MAX,
+                records_max: RECORDS_MAX,
+                bytes_max: u64::try_from(limits.literal_bytes_max()).unwrap_or(u64::MAX),
+            },
+            acquired: AcquiredAdjacency::default(),
+            remote: None,
+            local: None,
         };
         let mut frontier = BTreeSet::from([selected.seed.clone()]);
         let mut visited = BTreeSet::new();
@@ -208,222 +213,248 @@ impl RiftMcp {
         while !frontier.is_empty() && selected.depth.is_none_or(|maximum| depth < maximum) {
             let mut remote_seeds = Vec::new();
             for seed in std::mem::take(&mut frontier) {
-                let identity = SymbolIdentity::parse(seed.as_str())?;
-                if !identity.owner().is_local() {
-                    if selected.direction != TraversalDirection::Outgoing || !configuration.enabled
-                    {
-                        return Ok(Err(unavailable(
-                            SymbolUnavailableReason::InsufficientCoverage,
-                        )));
-                    }
+                if SymbolIdentity::parse(seed.as_str())?.owner().is_local() {
+                    walk.local_step(&seed, &mut frontier).await?;
+                    visited.insert(seed);
+                } else {
+                    visited.insert(seed.clone());
                     remote_seeds.push(seed);
-                    continue;
-                }
-                if resolved.stale.is_some() {
-                    return Ok(Err(unavailable(
-                        SymbolUnavailableReason::InsufficientCoverage,
-                    )));
-                }
-                remaining.requests_max = remaining
-                    .requests_max
-                    .checked_sub(1)
-                    .ok_or_else(coverage_failure)?;
-                let (engines, roots) = match &local {
-                    Some(value) => value,
-                    None => {
-                        let engines = self.engine_pool_for(&resolved.published).await;
-                        let roots = if selected.direction == TraversalDirection::Outgoing {
-                            let reads = std::sync::Arc::clone(reads);
-                            let engines = std::sync::Arc::clone(&engines);
-                            self.blocking
-                                .run("graph callee package roots", move || {
-                                    Ok(rift_server::CalleeRoots::read(&reads, &engines))
-                                })
-                                .await?
-                        } else {
-                            rift_server::CalleeRoots::default()
-                        };
-                        local.insert((engines, roots))
-                    }
-                };
-                let walk_deadline = deadline.walk_end(resolved.capture_elapsed);
-                visited.insert(seed.clone());
-                match (selected.direction, selected.facet) {
-                    (TraversalDirection::Incoming, RelationshipFacet::References) => {
-                        let occurrences = Box::pin(rift_server::graph_references(
-                            reads,
-                            engines,
-                            &seed,
-                            walk_deadline,
-                        ))
-                        .await?;
-                        charge_records(&mut remaining, occurrences.len())?;
-                        for occurrence in occurrences {
-                            if let Some(caller) = &occurrence.enclosing {
-                                acquired.local_edges.push((caller.clone(), seed.clone()));
-                                frontier.insert(caller.clone());
-                            }
-                            acquired.local.push(occurrence);
-                        }
-                    }
-                    (TraversalDirection::Outgoing, RelationshipFacet::Calls) => {
-                        let mut calls = Box::pin(rift_server::graph_calls(
-                            reads,
-                            engines,
-                            roots,
-                            &seed,
-                            walk_deadline,
-                        ))
-                        .await?;
-                        if !calls.packages.is_empty() {
-                            if !configuration.enabled {
-                                return Ok(Err(unavailable(
-                                    SymbolUnavailableReason::InsufficientCoverage,
-                                )));
-                            }
-                            let callees: Vec<_> = calls
-                                .packages
-                                .iter()
-                                .map(|(callee, _)| callee.clone())
-                                .collect();
-                            let client = self.global.client(&configuration).await?;
-                            let declarations =
-                                crate::global::callee_declarations(&client, &callees, &[]).await?;
-                            for (callee, occurrences) in calls.packages {
-                                let declaration = declarations
-                                    .declaration(&callee)
-                                    .ok_or_else(coverage_failure)?;
-                                let identity = SymbolIdentity::parse(declaration.id.as_str())?;
-                                let exact =
-                                    workspace_release(reads.dependency_context(), identity.owner());
-                                if exact.as_ref() != Some(&declaration.revision) {
-                                    return Ok(Err(unavailable(
-                                        SymbolUnavailableReason::InsufficientCoverage,
-                                    )));
-                                }
-                                calls.local.push((declaration.id, occurrences));
-                            }
-                        }
-                        charge_records(&mut remaining, calls.local.len())?;
-                        for (target, ranges) in calls.local {
-                            charge_records(&mut remaining, ranges.len())?;
-                            acquired.local_edges.push((seed.clone(), target.clone()));
-                            frontier.insert(target.clone());
-                            if selected.usages {
-                                for source in ranges {
-                                    acquired.local.push(QueryOccurrence {
-                                        target: target.clone(),
-                                        enclosing: Some(seed.clone()),
-                                        source,
-                                        facet: RelationshipFacet::Calls,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        return Ok(Err(unavailable(
-                            SymbolUnavailableReason::InsufficientCoverage,
-                        )));
-                    }
                 }
             }
-
-            if !remote_seeds.is_empty() {
-                let remote = match &remote {
-                    Some(remote) => remote,
-                    None => {
-                        let mut domain = exact_domain(reads.dependency_context())?;
-                        if domain.packages.is_empty() && domain.runtimes.is_empty() {
-                            return Ok(Err(unavailable(
-                                SymbolUnavailableReason::InsufficientCoverage,
-                            )));
-                        }
-                        let client = self.global.client(&configuration).await?;
-                        let capabilities = client.get_capabilities().await?;
-                        let bounds = client.relationship_bounds(
-                            &capabilities,
-                            selected.direction,
-                            &[selected.facet],
-                        )?;
-                        acquired.revisions = std::mem::take(&mut domain.revisions);
-                        remote.insert(RemoteSelection {
-                            client,
-                            domain,
-                            seeds_max: usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX),
-                        })
-                    }
-                };
-                for seeds in remote_seeds.chunks(remote.seeds_max) {
-                    for seed in seeds {
-                        if !acquired
-                            .revisions
-                            .contains_key(SymbolIdentity::parse(seed.as_str())?.owner())
-                        {
-                            return Ok(Err(unavailable(
-                                SymbolUnavailableReason::InsufficientCoverage,
-                            )));
-                        }
-                        visited.insert(seed.clone());
-                    }
-                    let request = RelationshipSearchRequest {
-                        relationships: RelationshipSelection {
-                            seeds: seeds.to_vec(),
-                            direction: selected.direction,
-                            facets: vec![selected.facet],
-                        },
-                        packages: remote.domain.packages.clone(),
-                        runtimes: remote.domain.runtimes.clone(),
-                        include: if selected.source {
-                            vec![RelationshipInclude::Source]
-                        } else {
-                            Vec::new()
-                        },
-                        view: acquired.view.as_ref().map(|view| view.id.clone()),
-                    };
-                    let page = remote
-                        .client
-                        .relationship_pages_with_admission(&request, remaining, || {
-                            remaining.requests_max = remaining
-                                .requests_max
-                                .checked_sub(1)
-                                .ok_or_else(coverage_failure)?;
-                            Ok(())
-                        })
-                        .await?;
-                    let page = match page {
-                        RelationshipSearchResult::Page(page) => page,
-                        RelationshipSearchResult::Unavailable(reason) => return Ok(Err(reason)),
-                    };
-                    if acquired
-                        .view
-                        .as_ref()
-                        .is_some_and(|view| view != &page.view)
-                        || acquired.pages.first().is_some_and(|first| {
-                            first.analyzer_revision != page.analyzer_revision
-                                || first.corpus_revision != page.corpus_revision
-                        })
-                    {
-                        return Ok(Err(unavailable(SymbolUnavailableReason::ViewContext)));
-                    }
-                    acquired.admit_remote(page, &mut remaining, &mut frontier)?;
-                }
+            if !remote_seeds.is_empty()
+                && let Some(unavailable) = walk.remote_steps(&remote_seeds, &mut frontier).await?
+            {
+                return Ok(Err(unavailable));
             }
             frontier.retain(|seed| !visited.contains(seed));
             depth = depth.checked_add(1).ok_or_else(coverage_failure)?;
         }
-        if local.is_some()
+        if walk.local.is_some()
             && !self
                 .engine_tree_matches(&resolved.published)
                 .await
                 .map_err(|_| coverage_failure())?
         {
-            return Ok(Err(unavailable(
-                SymbolUnavailableReason::InsufficientCoverage,
-            )));
+            return Err(coverage_failure());
         }
-        Ok(Ok(acquired))
+        Ok(Ok(walk.acquired))
     }
+}
+
+struct AdjacencyWalk<'request> {
+    server: &'request RiftMcp,
+    resolved: &'request ResolvedWorkspace,
+    selected: &'request AdjacencySelection,
+    deadline: RequestDeadline,
+    configuration: rift_protocol::configuration::GlobalConfiguration,
+    remaining: RelationshipReadLimits,
+    acquired: AcquiredAdjacency,
+    remote: Option<RemoteSelection>,
+    local: Option<(
+        std::sync::Arc<rift_server::EnginePool>,
+        rift_server::CalleeRoots,
+    )>,
+}
+
+impl AdjacencyWalk<'_> {
+    async fn local_step(
+        &mut self,
+        seed: &SymbolId,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        if self.resolved.stale.is_some() {
+            return Err(coverage_failure());
+        }
+        claim_request(&mut self.remaining)?;
+        let reads = &self.resolved.published.reads;
+        let direction = self.selected.direction;
+        if self.local.is_none() {
+            let engines = self.server.engine_pool_for(&self.resolved.published).await;
+            let roots = if direction == TraversalDirection::Outgoing {
+                let reads = std::sync::Arc::clone(reads);
+                let engines = std::sync::Arc::clone(&engines);
+                self.server
+                    .blocking
+                    .run("graph callee package roots", move || {
+                        Ok(rift_server::CalleeRoots::read(&reads, &engines))
+                    })
+                    .await?
+            } else {
+                rift_server::CalleeRoots::default()
+            };
+            self.local = Some((engines, roots));
+        }
+        let (engines, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
+        let deadline = self.deadline.walk_end(self.resolved.capture_elapsed);
+        match (direction, self.selected.facet) {
+            (TraversalDirection::Incoming, RelationshipFacet::References) => {
+                let occurrences = Box::pin(rift_server::graph_references(
+                    reads, engines, seed, deadline,
+                ))
+                .await?;
+                charge_records(&mut self.remaining, occurrences.len())?;
+                for occurrence in occurrences {
+                    if let Some(caller) = &occurrence.enclosing {
+                        self.acquired
+                            .local_edges
+                            .push((caller.clone(), seed.clone()));
+                        frontier.insert(caller.clone());
+                    }
+                    self.acquired.local.push(occurrence);
+                }
+            }
+            (TraversalDirection::Outgoing, RelationshipFacet::Calls) => {
+                let mut calls = Box::pin(rift_server::graph_calls(
+                    reads, engines, roots, seed, deadline,
+                ))
+                .await?;
+                self.name_package_calls(&mut calls).await?;
+                charge_records(&mut self.remaining, calls.local.len())?;
+                for (target, ranges) in calls.local {
+                    charge_records(&mut self.remaining, ranges.len())?;
+                    self.acquired
+                        .local_edges
+                        .push((seed.clone(), target.clone()));
+                    frontier.insert(target.clone());
+                    if self.selected.usages {
+                        self.acquired.local.extend(ranges.into_iter().map(|source| {
+                            QueryOccurrence {
+                                target: target.clone(),
+                                enclosing: Some(seed.clone()),
+                                source,
+                                facet: RelationshipFacet::Calls,
+                            }
+                        }));
+                    }
+                }
+            }
+            _ => return Err(coverage_failure()),
+        }
+        Ok(())
+    }
+
+    async fn name_package_calls(
+        &self,
+        calls: &mut rift_server::GraphCalls,
+    ) -> Result<(), RiftError> {
+        if calls.packages.is_empty() {
+            return Ok(());
+        }
+        if !self.configuration.enabled {
+            return Err(coverage_failure());
+        }
+        let callees: Vec<_> = calls
+            .packages
+            .iter()
+            .map(|(callee, _)| callee.clone())
+            .collect();
+        let client = self.server.global.client(&self.configuration).await?;
+        let declarations = crate::global::callee_declarations(&client, &callees, &[]).await?;
+        let dependencies = self.resolved.published.reads.dependency_context();
+        for (callee, occurrences) in std::mem::take(&mut calls.packages) {
+            let declaration = declarations
+                .declaration(&callee)
+                .ok_or_else(coverage_failure)?;
+            let identity = SymbolIdentity::parse(declaration.id.as_str())?;
+            if workspace_release(dependencies, identity.owner()).as_ref()
+                != Some(&declaration.revision)
+            {
+                return Err(coverage_failure());
+            }
+            calls.local.push((declaration.id, occurrences));
+        }
+        Ok(())
+    }
+
+    async fn remote_steps(
+        &mut self,
+        remote_seeds: &[SymbolId],
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<Option<SearchUnavailable>, RiftError> {
+        let selected = self.selected;
+        if selected.direction != TraversalDirection::Outgoing || !self.configuration.enabled {
+            return Err(coverage_failure());
+        }
+        if self.remote.is_none() {
+            let reads = &self.resolved.published.reads;
+            let mut domain = exact_domain(reads.dependency_context())?;
+            if domain.packages.is_empty() && domain.runtimes.is_empty() {
+                return Err(coverage_failure());
+            }
+            let client = self.server.global.client(&self.configuration).await?;
+            let capabilities = client.get_capabilities().await?;
+            let bounds =
+                client.relationship_bounds(&capabilities, selected.direction, &[selected.facet])?;
+            self.acquired.revisions = std::mem::take(&mut domain.revisions);
+            self.remote = Some(RemoteSelection {
+                client,
+                domain,
+                seeds_max: usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX),
+            });
+        }
+        let remote = self.remote.as_ref().ok_or_else(coverage_failure)?;
+        for seeds in remote_seeds.chunks(remote.seeds_max) {
+            for seed in seeds {
+                if !self
+                    .acquired
+                    .revisions
+                    .contains_key(SymbolIdentity::parse(seed.as_str())?.owner())
+                {
+                    return Err(coverage_failure());
+                }
+            }
+            let request = RelationshipSearchRequest {
+                relationships: RelationshipSelection {
+                    seeds: seeds.to_vec(),
+                    direction: selected.direction,
+                    facets: vec![selected.facet],
+                },
+                packages: remote.domain.packages.clone(),
+                runtimes: remote.domain.runtimes.clone(),
+                include: if selected.source {
+                    vec![RelationshipInclude::Source]
+                } else {
+                    Vec::new()
+                },
+                view: self.acquired.view.as_ref().map(|view| view.id.clone()),
+            };
+            let page = remote
+                .client
+                .relationship_pages_with_admission(&request, self.remaining, || {
+                    claim_request(&mut self.remaining)
+                })
+                .await?;
+            let page = match page {
+                RelationshipSearchResult::Page(page) => page,
+                RelationshipSearchResult::Unavailable(reason) => return Ok(Some(reason)),
+            };
+            if self
+                .acquired
+                .view
+                .as_ref()
+                .is_some_and(|view| view != &page.view)
+                || self.acquired.pages.first().is_some_and(|first| {
+                    first.analyzer_revision != page.analyzer_revision
+                        || first.corpus_revision != page.corpus_revision
+                })
+            {
+                return Ok(Some(super::unavailable(
+                    SymbolUnavailableReason::ViewContext,
+                )));
+            }
+            self.acquired
+                .admit_remote(page, &mut self.remaining, frontier)?;
+        }
+        Ok(None)
+    }
+}
+
+fn claim_request(limits: &mut RelationshipReadLimits) -> Result<(), RiftError> {
+    limits.requests_max = limits
+        .requests_max
+        .checked_sub(1)
+        .ok_or_else(coverage_failure)?;
+    Ok(())
 }
 
 struct RemoteSelection {
@@ -522,12 +553,4 @@ pub(super) fn coverage_failure() -> RiftError {
     errors::server::search_coverage_unavailable()
         .operation("graph query adjacency")
         .error()
-}
-
-fn unavailable(reason: SymbolUnavailableReason) -> SearchUnavailable {
-    SearchUnavailable::Unavailable {
-        reason,
-        view: None,
-        warnings: Vec::new(),
-    }
 }

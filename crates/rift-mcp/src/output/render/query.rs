@@ -17,7 +17,7 @@ impl Render for QueryResult {
     fn render(&self, out: &mut TextWriter) -> Result<(), TextError> {
         match &self.answer {
             QueryAnswer::Boolean { value } => {
-                out.raw_line(0, if *value { "true" } else { "false" })?
+                out.raw_line(0, if *value { "true" } else { "false" })?;
             }
             QueryAnswer::Bindings {
                 variables,
