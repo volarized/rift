@@ -18,8 +18,8 @@ use rift_protocol::revision::Revision;
 use rift_protocol::search_read::SearchUnavailable;
 use rift_protocol::symbol_read::{CapturedView, SymbolUnavailableReason};
 use rift_search::sparql::{
-    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits,
-    OccurrenceSelection, RevisionIri, SymbolAddress, SymbolRelation,
+    AdjacencySelection, AdjacencyStep, GraphDatasetBuilder, GraphFact, GraphLimits, NodeLocation,
+    OccurrenceSelection, ReachedNodes, RevisionIri, SymbolAddress, SymbolRelation,
 };
 
 use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
@@ -73,13 +73,22 @@ impl AcquiredAdjacency {
                 revision,
             })?;
         }
-        for target in self.installed.values() {
-            target.project(dataset, selected.node_source)?;
+        let mut captured = BTreeSet::new();
+        if let Some(nodes) = selected.nodes {
+            captured = self.project_captured_declarations(dataset, nodes)?;
+            for endpoint in self.local_endpoints() {
+                if !SymbolIdentity::parse(endpoint.as_str())?.owner().is_local()
+                    && !captured.contains(endpoint)
+                    && !self.installed.contains_key(endpoint)
+                {
+                    return Err(coverage_failure());
+                }
+            }
         }
-        if selected.node_source.is_some()
-            && (!self.pages.is_empty() || !self.named_package_symbols.is_empty())
-        {
-            return Err(coverage_failure());
+        for (id, target) in &self.installed {
+            if !captured.contains(id) {
+                target.project(dataset, selected.nodes.map(|nodes| nodes.source))?;
+            }
         }
         self.project_remote(dataset, selected)
     }
@@ -138,6 +147,71 @@ impl AcquiredAdjacency {
             }
         }
         Ok(())
+    }
+
+    fn project_captured_declarations(
+        &self,
+        dataset: &mut GraphDatasetBuilder,
+        nodes: ReachedNodes,
+    ) -> Result<BTreeSet<&SymbolId>, RiftError> {
+        if nodes.syntax_metadata && !self.pages.is_empty() {
+            return Err(coverage_failure());
+        }
+        let mut symbols = BTreeMap::new();
+        let mut sources = BTreeMap::new();
+        for (page, _) in &self.pages {
+            for item in &page.symbols {
+                let id = item.symbol.id.as_ref().ok_or_else(coverage_failure)?;
+                if symbols
+                    .insert(id, item)
+                    .is_some_and(|previous| previous != item)
+                {
+                    return Err(coverage_failure());
+                }
+            }
+            for item in &page.sources {
+                if sources
+                    .insert(&item.unit, item)
+                    .is_some_and(|previous| previous != item)
+                {
+                    return Err(coverage_failure());
+                }
+            }
+        }
+        for (id, item) in &symbols {
+            if let Some(installed) = self.installed.get(*id) {
+                let source = sources
+                    .get(&installed.unit)
+                    .and_then(|source| source.text.as_deref())
+                    .ok_or_else(coverage_failure)?;
+                if source != installed.source.as_ref() {
+                    return Err(coverage_failure());
+                }
+            }
+            if item.declarations.is_empty()
+                && item.symbol.origin.source_kind != rift_protocol::read::SourceKind::Synthetic
+            {
+                return Err(coverage_failure());
+            }
+            for (position, declaration) in item.declarations.iter().enumerate() {
+                let unit = declaration.unit.as_ref().ok_or_else(coverage_failure)?;
+                let text = sources
+                    .get(unit)
+                    .and_then(|source| source.text.as_deref())
+                    .ok_or_else(coverage_failure)?;
+                let excerpt = source_slice(text, &declaration.range)?;
+                dataset.insert_declaration_excerpt(
+                    id,
+                    position,
+                    NodeLocation {
+                        unit,
+                        range: &declaration.range,
+                    },
+                    nodes.source.then_some(excerpt),
+                )?;
+            }
+        }
+        Ok(symbols.into_keys().collect())
     }
 
     fn project_remote(
@@ -805,6 +879,29 @@ impl AdjacencyWalk<'_> {
         Ok(())
     }
 
+    fn remember_remote_neighbors(&mut self, step: AdjacencyStep) -> Result<(), RiftError> {
+        let incoming = step.direction == TraversalDirection::Incoming;
+        let (page, _) = self.acquired.pages.last().ok_or_else(coverage_failure)?;
+        for group in &page.groups {
+            let local = self
+                .local_reverse
+                .as_ref()
+                .and_then(|callers| callers.get(&group.seed))
+                .into_iter()
+                .flatten()
+                .filter(|_| incoming);
+            let reached = group
+                .relationships
+                .iter()
+                .map(|record| endpoint(&record.relationship, step.direction))
+                .chain(local)
+                .cloned()
+                .collect();
+            self.neighbors.insert((group.seed.clone(), step), reached);
+        }
+        Ok(())
+    }
+
     async fn remote_steps(
         &mut self,
         remote_seeds: &[SymbolId],
@@ -813,7 +910,10 @@ impl AdjacencyWalk<'_> {
         let selected = self.selected;
         let step = self.step;
         let incoming = step.direction == TraversalDirection::Incoming;
-        if !self.configuration.enabled || (incoming && step.facet != RelationshipFacet::Calls) {
+        if !self.configuration.enabled
+            || (incoming && step.facet != RelationshipFacet::Calls)
+            || selected.nodes.is_some_and(|nodes| nodes.syntax_metadata)
+        {
             return Err(coverage_failure());
         }
         self.ensure_remote().await?;
@@ -826,6 +926,12 @@ impl AdjacencyWalk<'_> {
             step.direction,
             &[step.facet],
         )?;
+        let needs_source =
+            selected.nodes.is_some() || selected.occurrences.is_some_and(|usage| usage.source);
+        let include: Vec<_> = needs_source
+            .then_some(RelationshipInclude::Source)
+            .into_iter()
+            .collect();
         let seeds_max = usize::try_from(bounds.max_seeds).unwrap_or(usize::MAX);
         for seeds in remote_seeds.chunks(seeds_max) {
             let remote = self.remote.as_ref().ok_or_else(coverage_failure)?;
@@ -846,11 +952,7 @@ impl AdjacencyWalk<'_> {
                 },
                 packages: remote.domain.packages.clone(),
                 runtimes: remote.domain.runtimes.clone(),
-                include: if selected.occurrences.is_some_and(|usage| usage.source) {
-                    vec![RelationshipInclude::Source]
-                } else {
-                    Vec::new()
-                },
+                include: include.clone(),
                 view: self.acquired.view.as_ref().map(|view| view.id.clone()),
             };
             let page = remote
@@ -884,24 +986,7 @@ impl AdjacencyWalk<'_> {
                 self.admit_local_reverse(seeds, frontier)?;
             }
             if selected.has_distinct_steps() {
-                let (page, _) = self.acquired.pages.last().ok_or_else(coverage_failure)?;
-                for group in &page.groups {
-                    let local = self
-                        .local_reverse
-                        .as_ref()
-                        .and_then(|callers| callers.get(&group.seed))
-                        .into_iter()
-                        .flatten()
-                        .filter(|_| incoming);
-                    let reached = group
-                        .relationships
-                        .iter()
-                        .map(|record| endpoint(&record.relationship, step.direction))
-                        .chain(local)
-                        .cloned()
-                        .collect();
-                    self.neighbors.insert((group.seed.clone(), step), reached);
-                }
+                self.remember_remote_neighbors(step)?;
             }
         }
         Ok(None)

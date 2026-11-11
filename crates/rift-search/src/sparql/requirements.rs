@@ -37,6 +37,15 @@ pub struct AdjacencyStep {
     pub facet: RelationshipFacet,
 }
 
+/// The declaration item facts required by a reached-symbol pattern.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReachedNodes {
+    /// The query can inspect the exact declaration excerpt.
+    pub source: bool,
+    /// The query can inspect grammar facts or the exact node declaration ordinal.
+    pub syntax_metadata: bool,
+}
+
 /// The complete adjacency selected by an anchored query.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AdjacencySelection {
@@ -48,8 +57,8 @@ pub struct AdjacencySelection {
     pub depth: Option<u32>,
     /// Whether the pattern projects logical facts about reached symbols.
     pub symbol_details: bool,
-    /// Whether declaration item nodes and their exact text are selected for reached symbols.
-    pub node_source: Option<bool>,
+    /// Declaration item facts selected for reached symbols.
+    pub nodes: Option<ReachedNodes>,
     /// Whether physical usage records and their evidence must also be projected.
     pub occurrences: Option<OccurrenceSelection>,
 }
@@ -210,10 +219,10 @@ impl GraphQuery {
         let (edges, details): (Vec<_>, Vec<_>) = triples
             .into_iter()
             .partition(|edge| property(edge).and_then(facet).is_some());
-        let (symbol_details, node_source) = endpoint_details(&edges, &details)?;
+        let (symbol_details, nodes) = endpoint_details(&edges, &details)?;
         let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
         selected.symbol_details = symbol_details;
-        selected.node_source = node_source;
+        selected.nodes = nodes;
         Some(selected)
     }
 }
@@ -252,7 +261,7 @@ fn query_pattern(query: &GraphQuery) -> &QueryExpression {
 fn endpoint_details(
     edges: &[&TriplePattern],
     details: &[&TriplePattern],
-) -> Option<(bool, Option<bool>)> {
+) -> Option<(bool, Option<ReachedNodes>)> {
     let endpoint = |term: &TermPattern| {
         edges
             .iter()
@@ -284,7 +293,7 @@ fn endpoint_details(
         );
     }
     let mut symbols = false;
-    let mut source = false;
+    let mut nodes = ReachedNodes::default();
     for &detail in details {
         let predicate = property(detail);
         if endpoint(&detail.subject)
@@ -295,8 +304,9 @@ fn endpoint_details(
         } else if let Some(owner) = owner.filter(|owner| detail.subject == owner.subject) {
             match predicate {
                 Some("of") if detail == owner => {}
-                Some("source") => source = true,
-                Some("range" | "index" | "declaration" | "kind" | "language") => {}
+                Some("source") => nodes.source = true,
+                Some("declaration" | "kind" | "language") => nodes.syntax_metadata = true,
+                Some("range" | "index") => {}
                 _ if is_class(detail, "Node") => {}
                 _ => return None,
             }
@@ -306,7 +316,7 @@ fn endpoint_details(
             return None;
         }
     }
-    Some((symbols, owner.map(|_| source)))
+    Some((symbols, owner.map(|_| nodes)))
 }
 
 fn property(pattern: &TriplePattern) -> Option<&str> {
@@ -355,7 +365,7 @@ fn adjacency(
         steps: Vec::new(),
         depth,
         symbol_details: false,
-        node_source: None,
+        nodes: None,
         occurrences: None,
     })
 }
@@ -415,7 +425,7 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
                     steps: Vec::new(),
                     depth: Some(depth),
                     symbol_details: false,
-                    node_source: None,
+                    nodes: None,
                     occurrences: None,
                 });
             }
@@ -431,7 +441,7 @@ fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<Adjace
         depth: Some(u32::try_from(steps.len()).ok()?),
         steps,
         symbol_details: false,
-        node_source: None,
+        nodes: None,
         occurrences: None,
     })
 }
@@ -574,7 +584,7 @@ fn usage_selection(
         steps: Vec::new(),
         depth: Some(1),
         symbol_details: false,
-        node_source: None,
+        nodes: None,
         occurrences: Some(OccurrenceSelection {
             source,
             enclosing: usage_enclosing,
