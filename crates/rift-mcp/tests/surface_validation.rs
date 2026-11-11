@@ -1277,10 +1277,10 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         &structured,
         "an unconfirmed engine's walk",
     );
+    assert_eq!(structured["outcome"], "unavailable", "{structured}");
     assert_eq!(
-        warning_count(&structured, "engine_readiness_unconfirmed"),
-        1,
-        "{structured:#}"
+        structured["reason"], "insufficient_coverage",
+        "{structured}"
     );
     client.cancel().await?;
     Ok(())
