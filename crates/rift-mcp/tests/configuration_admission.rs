@@ -7,7 +7,7 @@ mod hermetic_search;
 mod workspace_client;
 
 use workspace_client::{
-    ToolFailure, await_workspace_ready, call_retrying_acceptance, failed_call, tool_request,
+    ToolFailure, await_workspace_ready, failed_call, query_after_population, tool_request,
 };
 
 use std::error::Error;
@@ -17,8 +17,8 @@ use std::path::Path;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rift_protocol::error::{ErrorCode, RetryDirective};
+use rift_protocol::query::{QueryLanguage, QueryParams};
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::json;
 
@@ -87,24 +87,29 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
     Ok(().serve(client_transport).await?)
 }
 
-fn arguments(value: &serde_json::Value) -> TestResult<serde_json::Map<String, serde_json::Value>> {
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "tool arguments must be an object".into())
-}
+const BEACON_QUERY: &str = "SELECT ?name { SERVICE :search { ?hit :query 'beacon'; :target 'symbol'; :symbol ?symbol . ?symbol :name ?name } }";
 
-/// Calls one tool and returns the failure it must complete with.
-async fn refused_call(
-    client: &RunningService<RoleClient, ()>,
-    tool: &'static str,
-    tool_arguments: serde_json::Value,
-) -> TestResult<ToolFailure> {
+/// Calls the public search with valid arguments and returns its refusal.
+async fn refused_search(client: &RunningService<RoleClient, ()>) -> TestResult<ToolFailure> {
     failed_call(
         client
-            .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(&tool_arguments)?))
+            .call_tool(tool_request("search", &json!({"query": BEACON_QUERY})))
             .await,
     )
+}
+
+/// Confirms the accepted configuration serves the workspace declaration through search.
+async fn served_search(client: &RunningService<RoleClient, ()>) -> TestResult {
+    let query = QueryParams {
+        query: BEACON_QUERY.to_owned(),
+        language: QueryLanguage::Sparql,
+    };
+    let answer = query_after_population(client, &query).await?;
+    assert_eq!(
+        answer["answer"]["bindings"][0]["name"]["value"], "beacon",
+        "{answer}"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -112,27 +117,13 @@ async fn fixing_the_file_recovers_without_a_restart() -> TestResult {
     let directory = workspace_with(Some(INVALID_CONFIGURATION))?;
     let client = client_for(directory.path()).await?;
 
-    refused_call(
-        &client,
-        "search",
-        json!({"query": "beacon", "target": "symbol"}),
-    )
-    .await?;
+    let refused = refused_search(&client).await?;
+    assert_eq!(refused.code, ErrorCode::ConfigurationInvalid);
     let contents = format!("{}{VALID_CONFIGURATION}", hermetic_search::HERMETIC_TABLES);
     fs::write(directory.path().join("rift.toml"), contents)?;
 
-    let recovered = call_retrying_acceptance(
-        &client,
-        tool_request(
-            "search_retrieval",
-            &json!({"query": "beacon", "target": "symbol"}),
-        ),
-    )
-    .await?;
-    assert_eq!(
-        recovered["results"][0]["hit"]["symbol"]["name"],
-        json!("beacon")
-    );
+    await_workspace_ready(&client).await?;
+    served_search(&client).await?;
 
     client.cancel().await?;
     Ok(())
@@ -144,25 +135,14 @@ async fn breaking_the_file_after_boot_gates_the_next_request() -> TestResult {
     let client = client_for(directory.path()).await?;
     await_workspace_ready(&client).await?;
 
-    let served = client
-        .call_tool(
-            CallToolRequestParams::new("search_retrieval")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
-        )
-        .await?;
-    assert!(served.structured_content.is_some());
+    served_search(&client).await?;
 
     let contents = format!(
         "{}{INVALID_CONFIGURATION}",
         hermetic_search::HERMETIC_TABLES
     );
     fs::write(directory.path().join("rift.toml"), contents)?;
-    let refused = refused_call(
-        &client,
-        "search",
-        json!({"query": "beacon", "target": "symbol"}),
-    )
-    .await?;
+    let refused = refused_search(&client).await?;
     assert_eq!(refused.code, ErrorCode::ConfigurationInvalid);
     assert!(
         refused
@@ -184,12 +164,7 @@ async fn retired_binding_table_fails_reads_typed() -> TestResult {
     let directory = workspace_with(Some("[providers.binding]\nenabled = true\n"))?;
     let client = client_for(directory.path()).await?;
 
-    let refused = refused_call(
-        &client,
-        "search",
-        json!({"query": "beacon", "target": "symbol"}),
-    )
-    .await?;
+    let refused = refused_search(&client).await?;
     assert_eq!(refused.code, ErrorCode::ConfigurationInvalid);
     assert_eq!(refused.retry, RetryDirective::OperatorAction);
 
@@ -215,12 +190,7 @@ async fn removed_dependencies_bound_keys_fail_reads_as_unknown_keys() -> TestRes
         fs::write(directory.path().join("rift.toml"), contents)?;
         let client = client_for(directory.path()).await?;
 
-        let read = refused_call(
-            &client,
-            "search",
-            json!({"query": "beacon", "target": "symbol"}),
-        )
-        .await?;
+        let read = refused_search(&client).await?;
         assert_eq!(
             read.code,
             ErrorCode::ConfigurationInvalid,
@@ -242,12 +212,7 @@ async fn invalid_search_text_configuration_fails_reads_typed() -> TestResult {
     let directory = workspace_with(Some(INVALID_TEXT_CONFIGURATION))?;
     let client = client_for(directory.path()).await?;
 
-    let read = refused_call(
-        &client,
-        "search",
-        json!({"query": "beacon", "target": "symbol"}),
-    )
-    .await?;
+    let read = refused_search(&client).await?;
     assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
     assert_eq!(read.retry, RetryDirective::OperatorAction);
     let message = &read.message;
@@ -267,16 +232,7 @@ async fn valid_search_text_configuration_serves_normally() -> TestResult {
     let client = client_for(directory.path()).await?;
     await_workspace_ready(&client).await?;
 
-    let served = client
-        .call_tool(
-            CallToolRequestParams::new("search_retrieval")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
-        )
-        .await?;
-    assert_eq!(
-        served.structured_content.ok_or("structured content")?["results"][0]["hit"]["symbol"]["name"],
-        json!("beacon")
-    );
+    served_search(&client).await?;
 
     client.cancel().await?;
     Ok(())
@@ -288,16 +244,7 @@ async fn valid_global_configuration_reaches_published_workspace() -> TestResult 
     let client = client_for(directory.path()).await?;
     await_workspace_ready(&client).await?;
 
-    let served = client
-        .call_tool(
-            CallToolRequestParams::new("search_retrieval")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
-        )
-        .await?;
-    assert_eq!(
-        served.structured_content.ok_or("structured content")?["results"][0]["hit"]["symbol"]["name"],
-        json!("beacon")
-    );
+    served_search(&client).await?;
 
     client.cancel().await?;
     Ok(())
@@ -344,12 +291,7 @@ async fn out_of_range_global_values_refuse_with_exact_evidence() -> TestResult {
         let directory = workspace_with(Some(&configuration))?;
         let client = client_for(directory.path()).await?;
 
-        let read = refused_call(
-            &client,
-            "search",
-            json!({"query": "beacon", "target": "symbol"}),
-        )
-        .await?;
+        let read = refused_search(&client).await?;
         assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
         let message = &read.message;
         assert!(
@@ -370,13 +312,7 @@ async fn missing_and_valid_files_serve_normally() -> TestResult {
         if configuration.is_none() || configuration == Some(VALID_CONFIGURATION) {
             await_workspace_ready(&client).await?;
         }
-        let served = client
-            .call_tool(
-                CallToolRequestParams::new("search_retrieval")
-                    .with_arguments(arguments(&json!({"query": "beacon"}))?),
-            )
-            .await?;
-        assert!(served.structured_content.is_some());
+        served_search(&client).await?;
         client.cancel().await?;
     }
     Ok(())
@@ -388,12 +324,7 @@ async fn out_of_range_source_files_fails_reads_naming_the_field() -> TestResult 
         let directory = workspace_with(Some(configuration))?;
         let client = client_for(directory.path()).await?;
 
-        let read = refused_call(
-            &client,
-            "search",
-            json!({"query": "beacon", "target": "symbol"}),
-        )
-        .await?;
+        let read = refused_search(&client).await?;
         assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
         let message = &read.message;
         assert!(
@@ -415,12 +346,7 @@ async fn out_of_range_source_declarations_fails_reads_naming_the_field() -> Test
         let directory = workspace_with(Some(configuration))?;
         let client = client_for(directory.path()).await?;
 
-        let read = refused_call(
-            &client,
-            "search",
-            json!({"query": "beacon", "target": "symbol"}),
-        )
-        .await?;
+        let read = refused_search(&client).await?;
         assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
         let message = &read.message;
         assert!(
@@ -441,16 +367,7 @@ async fn a_declaration_bound_the_workspace_fits_inside_serves_every_read() -> Te
     let client = client_for(directory.path()).await?;
     await_workspace_ready(&client).await?;
 
-    let answer = client
-        .call_tool(
-            CallToolRequestParams::new("search_retrieval")
-                .with_arguments(arguments(&json!({"query": "beacon", "target": "symbol"}))?),
-        )
-        .await?;
-    assert_eq!(
-        answer.structured_content.ok_or("structured content")?["results"][0]["hit"]["symbol"]["name"],
-        json!("beacon")
-    );
+    served_search(&client).await?;
 
     client.cancel().await?;
     Ok(())
@@ -465,12 +382,7 @@ async fn out_of_range_source_workspace_size_fails_reads_naming_the_field() -> Te
         let directory = workspace_with(Some(configuration))?;
         let client = client_for(directory.path()).await?;
 
-        let read = refused_call(
-            &client,
-            "search",
-            json!({"query": "beacon", "target": "symbol"}),
-        )
-        .await?;
+        let read = refused_search(&client).await?;
         assert_eq!(read.code, ErrorCode::ConfigurationInvalid);
         let message = &read.message;
         assert!(

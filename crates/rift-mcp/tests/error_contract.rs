@@ -4,6 +4,7 @@
 //! sets.
 
 mod hermetic_search;
+mod query;
 #[allow(dead_code)]
 mod workspace_client;
 
@@ -44,7 +45,9 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
         ("search", json!({ "query": "" })),
         (
             "search",
-            json!({ "query": "beacon", "paths": { "include": ["[unclosed"] } }),
+            serde_json::to_value(query::retrieval(&serde_json::from_value(json!({
+                "query": "beacon", "paths": { "include": ["[unclosed"] }
+            }))?)?)?,
         ),
         ("get_symbol", json!({ "name": "beacon", "limit": 0 })),
         ("nodes", json!({ "path": "missing.rs", "position": 0 })),
@@ -58,7 +61,9 @@ async fn served_tool_failures_are_completed_error_results() -> TestResult {
         ),
         (
             "search",
-            json!({ "query": "beacon", "revision": "rift://revision/git/main" }),
+            serde_json::to_value(query::retrieval(&serde_json::from_value(json!({
+                "query": "beacon", "revision": "rift://revision/git/main"
+            }))?)?)?,
         ),
         (
             "nodes",
@@ -276,25 +281,28 @@ async fn revision_read_with_history_disabled_is_refused() -> TestResult {
     Ok(())
 }
 
-/// The bounded query parser refuses a quote that opens and never closes, and the refusal
-/// reaches the caller as this request's own `invalid_request` naming `query` - never a
-/// degraded ranking that answers as though the query had parsed.
+/// The SPARQL parser refuses a quote that opens and never closes. The refusal reaches the
+/// caller as `invalid_request` with the syntax error's position.
 #[tokio::test]
-async fn an_unterminated_quote_refuses_the_search_naming_query() -> TestResult {
+async fn an_unterminated_quote_refuses_the_search_with_a_position() -> TestResult {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("lib.rs"), "pub fn beacon() {}\n")?;
     fs::write(
         directory.path().join("rift.toml"),
         hermetic_search::HERMETIC_TABLES,
     )?;
-    let failure =
-        failing_tool_error(directory.path(), "search", json!({ "query": "\"beacon" })).await?;
+    let failure = failing_tool_error(
+        directory.path(),
+        "search",
+        json!({ "query": "ASK { ?symbol :name \"beacon }" }),
+    )
+    .await?;
     assert_eq!(failure.code, ErrorCode::InvalidRequest);
     assert_eq!(failure.retry, RetryDirective::Never);
     let message = &failure.message;
     assert!(
-        message.contains("field query"),
-        "the refusal must name the parameter at fault: {message}"
+        message.contains("SPARQL query does not parse") && message.contains("line 1"),
+        "the refusal must name the query syntax error and its position: {message}"
     );
     Ok(())
 }

@@ -8,6 +8,7 @@
 //! the key lands, and `exclude` still decides over it.
 
 mod hermetic_search;
+mod query;
 #[allow(dead_code)]
 mod workspace_client;
 
@@ -18,10 +19,9 @@ use std::path::Path;
 use rift_index::WorkspaceIndexLimits;
 use rift_mcp::RiftMcp;
 use rmcp::ServiceExt as _;
-use rmcp::model::CallToolRequestParams;
 use rmcp::service::{RoleClient, RunningService};
 use serde_json::{Value, json};
-use workspace_client::{await_workspace_ready, search_after_population};
+use workspace_client::{await_workspace_ready, query_after_population, search_after_population};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -40,24 +40,9 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
     Ok(client)
 }
 
-fn arguments(value: &Value) -> TestResult<serde_json::Map<String, Value>> {
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "tool arguments must be an object".into())
-}
-
-async fn call(
-    client: &RunningService<RoleClient, ()>,
-    tool: &'static str,
-    tool_arguments: Value,
-) -> TestResult<Value> {
-    let result = client
-        .call_tool(CallToolRequestParams::new(tool).with_arguments(arguments(&tool_arguments)?))
-        .await?;
-    result
-        .structured_content
-        .ok_or_else(|| format!("{tool} must return structured content").into())
+async fn search(client: &RunningService<RoleClient, ()>, parameters: Value) -> TestResult<Value> {
+    let query = query::retrieval(&serde_json::from_value(parameters)?)?;
+    query_after_population(client, &query).await
 }
 
 /// A Rust source file's declaration reaches symbol search with its original source range.
@@ -161,22 +146,20 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
     fs::write(directory.path().join("rift.toml"), excluded_configuration)?;
     let client = client_for(directory.path()).await?;
 
-    let plain = call(
+    let plain = search(
         &client,
-        "search",
         json!({ "query": "phantom_generated", "target": "symbol" }),
     )
     .await?;
     assert!(
-        plain["results"].as_array().is_some_and(|results| !results
+        !query::rows(&plain)?
             .iter()
-            .any(|hit| hit["path"] == json!("phantom_symbol.rs"))),
+            .any(|hit| hit["path"]["value"] == "phantom_symbol.rs"),
         "an excluded file must not answer a plain search: {plain:#}"
     );
 
-    let forced = call(
+    let forced = search(
         &client,
-        "search",
         json!({
             "query": "phantom_generated",
             "target": "symbol",
@@ -185,9 +168,9 @@ async fn force_include_still_reaches_a_file_source_exclude_dropped() -> TestResu
     )
     .await?;
     assert!(
-        forced["results"].as_array().is_some_and(|results| results
+        query::rows(&forced)?
             .iter()
-            .any(|hit| hit["path"] == json!("phantom_symbol.rs"))),
+            .any(|hit| hit["path"]["value"] == "phantom_symbol.rs"),
         "force_include must still reach a source-excluded file: {forced:#}"
     );
 
@@ -263,16 +246,11 @@ async fn source_exclude_wins_over_source_force_include() -> TestResult {
     fs::write(directory.path().join("rift.toml"), configuration)?;
     let client = client_for(directory.path()).await?;
 
-    let answer = call(
-        &client,
-        "search",
-        json!({ "query": "wandering falcon migrations" }),
-    )
-    .await?;
+    let answer = search(&client, json!({ "query": "wandering falcon migrations" })).await?;
     assert!(
-        answer["results"].as_array().is_some_and(|results| !results
+        !query::rows(&answer)?
             .iter()
-            .any(|hit| hit["path"] == json!("notes/plan.txt"))),
+            .any(|hit| hit["path"]["value"] == "notes/plan.txt"),
         "an excluded path stays out although force_include also names it: {answer:#}"
     );
 
