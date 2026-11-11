@@ -1271,6 +1271,9 @@ pub struct PackageSearchHit {
     /// and is connected through Relationship.
     #[validate(nested)]
     pub symbol: Symbol,
+    /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
+    #[validate(length(min = 1u64, max = 8_192u64))]
+    pub qualified_name: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     #[validate(
         length(min = 17u64, max = 8_192u64),
@@ -5728,6 +5731,8 @@ pub struct PackageSearchItemVariant0 {
     /// Readable Symbol assembled from normalized Contributions. Source structure lives in Node
     /// and is connected through Relationship.
     pub symbol: Symbol,
+    /// The provider's qualified declaration name used for identifier ranking, with its original spelling.
+    pub qualified_name: String,
     /// Physical source identity with a defining package or runtime owner, or a source resolver and canonical unit key. It names no revision: a read selects the revision whose bytes it answers. The codec validates decoded paths, UTF-8 and canonical percent-encoding before lookup.
     pub unit: String,
     /// Half-open UTF-8 byte offsets over authoritative UTF-8 source. Every provider converts

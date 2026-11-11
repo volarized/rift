@@ -2,7 +2,7 @@
 
 use rift_error::RiftError;
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use serde_json::Value;
@@ -145,17 +145,31 @@ impl TryFrom<&PackageSearchHit> for PackageSearchCandidate {
     type Error = RiftError;
 
     fn try_from(value: &PackageSearchHit) -> Result<Self, Self::Error> {
-        let (qualified_name, unit, line) = validate_location(
+        let source_bytes_max =
+            usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
+                .map_err(|source| invalid_source("source", source))?;
+        crate::validate_canonical_hit(
             &value.package,
             &value.symbol,
-            &value.unit,
-            &value.range,
-            value.line,
-            value.source.as_deref(),
+            HitLocation {
+                unit: &value.unit,
+                range: &value.range,
+                line: value.line,
+                source: value.source.as_deref(),
+            },
+            None,
+            source_bytes_max,
         )?;
+        crate::validate_ranked_qualified_name(&value.qualified_name)?;
+        let line =
+            u64::try_from(value.line).map_err(|source| invalid_source("location", source))?;
         let package = package_identity(&value.package);
         let symbol = convert_symbol(&value.symbol)?;
-        let identity = rift_ranking::DocumentIdentity::for_unit(&unit, &qualified_name)
+        let id = symbol
+            .id
+            .as_ref()
+            .ok_or_else(|| invalid("symbol_identity"))?;
+        let identity = rift_ranking::DocumentIdentity::new(id.0.clone())
             .map_err(|source| invalid_source("symbol_identity", source))?;
         let match_class = crate::search_match_class(&value.match_class)?;
         let hit = rift_protocol::read::SearchHit {
@@ -514,35 +528,6 @@ fn validate_package_content_identity(
     };
     package_source_unit_prefix(package, unit)?;
     Ok(())
-}
-
-fn validate_location(
-    package: &PackageIdentity,
-    symbol: &Symbol,
-    unit: &str,
-    range: &TextRange,
-    line: i64,
-    source: Option<&str>,
-) -> Result<(String, rift_core::SourceUnitId, u64), RiftError> {
-    let packages = HashSet::from([crate::package_key(package)]);
-    let source_bytes_max = usize::try_from(rift_protocol::configuration::GLOBAL_SOURCE_BYTES_MAX)
-        .map_err(|source| invalid_source("source", source))?;
-    let qualified_name = crate::validate_hit_common(
-        package,
-        symbol,
-        HitLocation {
-            unit,
-            range,
-            line,
-            source,
-        },
-        Some(&packages),
-        source_bytes_max,
-    )?;
-    let source_unit = rift_core::SourceUnitId::parse(unit)
-        .map_err(|source| invalid_source("source_identity", source))?;
-    let line = u64::try_from(line).map_err(|source| invalid_source("location", source))?;
-    Ok((qualified_name, source_unit, line))
 }
 
 pub(crate) fn package_identity(value: &PackageIdentity) -> rift_protocol::read::PackageIdentity {
@@ -944,7 +929,7 @@ mod tests {
     }
 
     fn symbol(package: &PackageIdentity) -> Symbol {
-        let id = rift_core::symbol_identity("rust", "cargo/helper/src/lib.rs", "helper_beacon");
+        let id = "rift://symbol/cargo/crates.io/helper/rust/helper/helper_beacon".to_owned();
         Symbol {
             id: Some(id),
             language: "rust".to_owned(),
@@ -1168,6 +1153,7 @@ mod tests {
     fn search_candidate_maps_protocol_fields_and_identity() {
         let package = package();
         let hit = PackageSearchHit {
+            qualified_name: "helper_beacon".to_owned(),
             package: package.clone(),
             symbol: symbol(&package),
             unit: unit(),
@@ -1191,8 +1177,8 @@ mod tests {
             Some(rift_ranking::IdentifierMatchClass::NameExact)
         );
         assert_eq!(
-            candidate.identity.as_unit(),
-            Some((unit().as_str(), "helper_beacon"))
+            candidate.identity.as_str(),
+            "rift://symbol/cargo/crates.io/helper/rust/helper/helper_beacon"
         );
         assert_eq!(candidate.hit.line, Some(3));
         assert_eq!(candidate.hit.matched_by.len(), 2);
@@ -1208,6 +1194,7 @@ mod tests {
     fn search_candidate_maps_a_body_match_to_content() {
         let package = package();
         let hit = PackageSearchHit {
+            qualified_name: "helper_beacon".to_owned(),
             package: package.clone(),
             symbol: symbol(&package),
             unit: unit(),
@@ -1245,6 +1232,7 @@ mod tests {
             ..Default::default()
         }]);
         let hit = PackageSearchHit {
+            qualified_name: "helper_beacon".to_owned(),
             package,
             symbol,
             unit: unit(),
@@ -1265,7 +1253,7 @@ mod tests {
         };
         assert_eq!(
             symbol.id.as_ref().expect("id").0,
-            rift_core::symbol_identity("rust", "cargo/helper/src/lib.rs", "helper_beacon")
+            "rift://symbol/cargo/crates.io/helper/rust/helper/helper_beacon"
         );
         assert_eq!(symbol.documentation[0].text, "Beacon docs");
         assert_eq!(
@@ -1322,6 +1310,7 @@ mod tests {
         let mut symbol = symbol(&package);
         symbol.kind = "9struct".to_owned();
         let hit = PackageSearchHit {
+            qualified_name: "helper_beacon".to_owned(),
             package,
             symbol,
             unit: unit(),
@@ -1342,6 +1331,7 @@ mod tests {
     fn candidate_rejects_invalid_source_identity() {
         let package = package();
         let mut hit = PackageSearchHit {
+            qualified_name: "helper_beacon".to_owned(),
             package: package.clone(),
             symbol: symbol(&package),
             unit: unit(),
