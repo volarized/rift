@@ -873,7 +873,11 @@ async fn connect_upstream_for_owner_with<Asking: Future<Output = RepositoryAsk>>
             awaiting_release = false;
             spawn_for_owner(&mut spawns, root, owner)?;
         }
-        match spawns.poll(adopted, election_held) {
+        let election_blocked = election_held
+            || (adopted.is_none()
+                && spawns.can_replace_lost_child()
+                && replacement_claim_blocked(root, owner).await?);
+        match spawns.poll(adopted, election_blocked) {
             SpawnPollOutcome::Ready(running) => {
                 closing.record_answered(started.elapsed());
                 return Ok(running);
@@ -924,6 +928,17 @@ fn spawn_for_owner(
         return Ok(());
     }
     spawns.spawn_captured_with_owner(root, owner)
+}
+
+async fn replacement_claim_blocked(root: &Path, owner: &SymbolOwner) -> Result<bool, RiftError> {
+    let root = root.to_path_buf();
+    let owner = owner.clone();
+    tokio::task::spawn_blocking(move || {
+        let state = crate::storage::workspace_state_directory(&root, &owner)?;
+        Ok(crate::election::election_claim_blocked(&state))
+    })
+    .await
+    .map_err(|error| errors::mcp::proxy_task_failed().source(error).error())?
 }
 
 async fn observed_for_owner(
