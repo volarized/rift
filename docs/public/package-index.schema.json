@@ -896,7 +896,7 @@
     },
     "FactCoverage": {
       "additionalProperties": false,
-      "description": "One fact kind a publication covers for one language, and the producer of those facts.\n\nA covered kind with no facts means its producer found none. A kind no entry names was\nnot produced, so its absence says nothing about the source. Two producers of one kind\ntake two entries.",
+      "description": "One fact kind a publication carries for one language, and the producer of those facts.\n\nAn entry states that its producer emitted facts of this kind for this language. It makes\nno claim that the producer found every fact of the kind, for any producer: whether a\nlanguage's relationships are complete is stated by the coverage entry's `relationships`\nalone. A kind no entry names was not produced. Two producers of one kind take two entries.",
       "properties": {
         "kind": {
           "$ref": "#/$defs/FactKind",
@@ -1306,7 +1306,7 @@
           "type": "boolean"
         },
         "facts": {
-          "description": "The fact kinds produced for this language, each with its producer. A kind no entry\nnames was not produced.",
+          "description": "The fact kinds produced for this language, each with its producer. An entry makes no\ncompleteness claim, and a kind no entry names was not produced.",
           "items": {
             "$ref": "#/$defs/FactCoverage"
           },
