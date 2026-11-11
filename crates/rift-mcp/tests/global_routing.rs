@@ -533,8 +533,8 @@ async fn unversioned_python_runtime_positions_remain_unasked() -> TestResult {
 
 /// A path dependency outside the workspace reaches no index: the package hits come from
 /// the global index alone, and the answer names the path entry with the capability Rift
-/// does not have yet, the exact package the collection lacks, and each requirement it
-/// cannot resolve, the standard library entry the Rust source names included.
+/// does not have yet, the exact package the collection lacks, and the package requirement
+/// it cannot resolve.
 #[tokio::test]
 async fn successful_resolution_reports_unserved_entries_and_missing_packages() -> TestResult {
     let fixture = GlobalFixture::start(SymbolFixture::Valid).await?;
@@ -574,7 +574,6 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
             "package_unavailable",
             "package_absent",
             "package_requirement_absent",
-            "package_requirement_absent"
         ],
         "{answer:#}"
     );
@@ -604,26 +603,14 @@ async fn successful_resolution_reports_unserved_entries_and_missing_packages() -
         warnings[1]["package"],
         json!({"manager":"cargo", "registry": "crates.io","name":"absent","version":"1.0.0"})
     );
-    let requirements: Vec<&Value> = warnings[2..4]
-        .iter()
-        .map(|warning| &warning["entry"])
-        .collect();
     assert_eq!(
-        requirements,
-        [
-            &json!({
-                "manager":"cargo", "registry": "crates.io",
-                "name":"wanted",
-                "requirement":"^1",
-                "availability":"canonical"
-            }),
-            &json!({
-                "manager":"stdlib",
-                "name":"rust",
-                "requirement":">=0",
-                "availability":"canonical"
-            }),
-        ]
+        warnings[2]["entry"],
+        json!({
+            "manager":"cargo", "registry": "crates.io",
+            "name":"wanted",
+            "requirement":"^1",
+            "availability":"canonical"
+        })
     );
     drop(directory);
     client.cancel().await?;
@@ -748,7 +735,10 @@ async fn successful_search_uses_remote_phases_without_local_request_fields() -> 
     let resolution_text = resolution.to_string();
     assert!(resolution_text.contains("demo"));
     assert!(resolution_text.contains("absent"));
-    assert!(resolution_text.contains("stdlib"));
+    assert!(
+        !resolution_text.contains("stdlib"),
+        "runtime entries do not reach package resolution: {resolution_text}"
+    );
     assert!(
         !resolution_text.contains("helper"),
         "a path entry reaches no index: {resolution_text}"
@@ -1789,7 +1779,8 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
     let configuration = format!(
         "[global]\nenabled = true\nendpoint = \"{}\"\nattempts = 1\n\
          request_timeout = \"1s\"\nconnect_timeout = \"100ms\"\n\n\
-         [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"0.9.0\"\n",
+         [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"demo\"\nversion = \"0.9.0\"\n\n\
+         [[dependencies.packages]]\nmanager = \"cargo\"\nregistry = \"crates.io\"\nname = \"absent\"\nversion = \"1.0.0\"\n",
         fixture.endpoint
     );
     let (directory, client, server_task) = served_probe_workspace(configuration).await?;
@@ -1842,10 +1833,14 @@ async fn the_package_argument_replaces_a_context_version_for_one_read() -> TestR
         ],
         "the read sends the requested version in place of the pinned one"
     );
+    let unrelated = json!({
+        "manager":"cargo", "registry":"crates.io", "name":"absent",
+        "version":"1.0.0", "availability":"canonical"
+    });
     assert!(
-        resolutions[1]
+        resolutions
             .iter()
-            .any(|entry| entry["manager"] == "stdlib" && entry["name"] == "rust"),
+            .all(|entries| entries.contains(&unrelated)),
         "the entries the request names nothing about stand: {resolutions:#?}"
     );
 
