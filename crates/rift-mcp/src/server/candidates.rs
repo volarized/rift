@@ -47,7 +47,7 @@ pub(crate) enum SearchCandidateResult {
 }
 
 #[derive(Debug)]
-pub(super) struct CandidateResponses {
+pub(crate) struct CandidateResponses {
     bytes: Mutex<Vec<SavedCandidateBytes>>,
 }
 

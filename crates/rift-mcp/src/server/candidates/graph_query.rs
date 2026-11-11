@@ -210,6 +210,44 @@ impl RiftMcp {
 }
 
 impl CandidateResponses {
+    /// Retains one evaluated query and returns its first transport page.
+    pub(crate) fn store_query(
+        &self,
+        root: &std::path::Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+        view: &CapturedView,
+        answer: &QueryAnswer,
+        configuration: &QueryConfiguration,
+        warnings: Vec<ReadWarning>,
+    ) -> Result<QueryReadResult, RiftError> {
+        let (saved, bytes, first) =
+            SavedQuery::encoded(root, owner, view, answer, configuration, warnings)?;
+        let maximum =
+            usize::try_from(configuration.page_limit.bytes()).map_err(|_| page_failure())?;
+        if encoded_size(&first)? > maximum {
+            return Err(page_failure());
+        }
+        self.save_query(&saved, &bytes)?;
+        Ok(first)
+    }
+
+    /// Replays a query owned by the original proxy connection without reacquiring facts.
+    pub(crate) fn retained_proxy_query(
+        &self,
+        selection: &PageSelection,
+        root: &std::path::Path,
+        owner: &rift_protocol::identity::SymbolOwner,
+    ) -> Result<QueryReadResult, RiftError> {
+        let (saved, answer) = match self.replay_query(selection)? {
+            Ok(found) => found,
+            Err(reason) => return Ok(query_unavailable(reason)),
+        };
+        if saved.root != root || &saved.owner != owner {
+            return Ok(query_unavailable(SymbolUnavailableReason::ViewContext));
+        }
+        saved.response(answer, selection.page)
+    }
+
     fn save_query(&self, saved: &SavedQuery, bytes: &[u8]) -> Result<(), RiftError> {
         let mut encoded =
             crate::proxy::encode_bounded(saved, BYTES_MAX).map_err(encoding_failure)?;
