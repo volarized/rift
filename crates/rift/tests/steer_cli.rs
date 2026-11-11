@@ -13,6 +13,10 @@ use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use rift_protocol::query::QueryParams;
+use rift_protocol::read::{PathPattern, SearchParams, SearchParamsTarget};
+use rift_search::sparql::{GraphLimits, GraphQuery};
+
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// Mirrors `steer::HOOK_STDIN_BYTES_MAX`; not importable across the
@@ -75,7 +79,7 @@ fn tool_payload(
 
 /// The `search` arguments a deny reason suggests: the one JSON object
 /// following `tool: `.
-fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
+fn suggested_call(output: &Output) -> TestResult<SearchParams> {
     let decision = decision(output)?;
     assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
     let reason = decision["hookSpecificOutput"]["permissionDecisionReason"]
@@ -85,11 +89,17 @@ fn suggested_call(output: &Output) -> TestResult<serde_json::Value> {
         .split_once("tool: ")
         .and_then(|(_, rest)| {
             serde_json::Deserializer::from_str(rest)
-                .into_iter::<serde_json::Value>()
+                .into_iter::<QueryParams>()
                 .next()
         })
         .ok_or_else(|| format!("the reason names no call: {reason}"))?;
-    Ok(call?)
+    let parameters = call?;
+    let graph = GraphQuery::parse(&parameters.query, &GraphLimits::default())?;
+    assert!(!graph.reads_base());
+    let [selected] = graph.retrieval_requests() else {
+        return Err("the hook must select one retrieval producer".into());
+    };
+    Ok(selected.request.clone())
 }
 
 fn indexed_workspace(root: &Path) -> TestResult {
@@ -244,10 +254,10 @@ fn a_grep_pattern_holding_a_quote_and_a_backslash_suggests_valid_json() -> TestR
 
     let output = run_steer(root, &payload, &[])?;
     assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        suggested_call(&output)?,
-        serde_json::json!({"pattern": pattern})
-    );
+    let selected = suggested_call(&output)?;
+    assert_eq!(selected.pattern.as_deref(), Some(pattern));
+    assert_eq!(selected.target, SearchParamsTarget::All);
+    assert!(selected.paths.is_none());
     Ok(())
 }
 
@@ -281,9 +291,15 @@ fn a_bash_grep_from_a_subdirectory_denies_with_its_search_call() -> TestResult {
 
     let output = run_steer(root, &payload, &[])?;
     assert_eq!(output.status.code(), Some(0));
+    let selected = suggested_call(&output)?;
+    assert_eq!(selected.pattern.as_deref(), Some(r"cfg\(test\)"));
+    assert_eq!(selected.target, SearchParamsTarget::All);
     assert_eq!(
-        suggested_call(&output)?,
-        serde_json::json!({"pattern": r"cfg\(test\)", "paths": {"include": ["src/**"]}})
+        selected
+            .paths
+            .ok_or("the Bash search scopes paths")?
+            .include,
+        [PathPattern("src/**".to_owned())]
     );
     assert!(
         root.join(".rift")
@@ -306,13 +322,15 @@ fn a_glob_call_from_a_subdirectory_denies_with_the_listing_call() -> TestResult 
 
     let output = run_steer(root, &payload, &[])?;
     assert_eq!(output.status.code(), Some(0));
+    let selected = suggested_call(&output)?;
+    assert_eq!(selected.pattern.as_deref(), Some(r"\A"));
+    assert_eq!(selected.target, SearchParamsTarget::File);
     assert_eq!(
-        suggested_call(&output)?,
-        serde_json::json!({
-            "pattern": r"\A",
-            "paths": {"include": ["src/**/*.rs"]},
-            "target": "file"
-        })
+        selected
+            .paths
+            .ok_or("the file listing scopes paths")?
+            .include,
+        [PathPattern("src/**/*.rs".to_owned())]
     );
     Ok(())
 }

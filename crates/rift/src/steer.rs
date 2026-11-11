@@ -508,8 +508,8 @@ mod tests {
 
     use serde_json::{Value, json};
 
-    use super::suggestion::GrepPath;
     use super::suggestion::tests::served_search_call;
+    use super::suggestion::{GrepPath, GrepRequest};
     use super::{
         Decision, EnvironmentFacts, HookCall, KernelInput, QualifyingTool, RIFT_STATE_DIRECTORY,
         STEER_MARKERS_MAX, STEER_STATE_DIRECTORY, WORKSPACE_ROOT_WALK_DEPTH_MAX, claim_marker,
@@ -533,7 +533,7 @@ mod tests {
     fn grep_input(session_id: Option<&str>) -> KernelInput<'_> {
         KernelInput {
             tool: Some(&QualifyingTool::Grep),
-            suggestion: Some(r#"{"pattern":"TODO","target":"file"}"#.to_owned()),
+            suggestion: GrepRequest::lines("TODO".to_owned()).suggestion(&[GrepPath::Root]),
             session_id,
         }
     }
@@ -809,16 +809,21 @@ mod tests {
                 "the served surface must carry {name}"
             );
         }
-        let grep_reason = deny_reason(&QualifyingTool::Grep, r#"{"pattern":"TODO"}"#);
-        let listing = r#"{"pattern":"\\A","paths":{"include":["**/*.rs"]},"target":"file"}"#;
-        let glob_reason = deny_reason(&QualifyingTool::Glob, listing);
+        let grep = GrepRequest::lines("TODO".to_owned())
+            .suggestion(&[GrepPath::Root])
+            .expect("text search maps");
+        let grep_reason = deny_reason(&QualifyingTool::Grep, &grep);
+        let listing = GrepRequest::files(vec!["**/*.rs".to_owned()])
+            .suggestion(&[GrepPath::Root])
+            .expect("file listing maps");
+        let glob_reason = deny_reason(&QualifyingTool::Glob, &listing);
         for reason in [&grep_reason, &glob_reason] {
             assert!(reason.contains("search"), "{reason}");
             assert!(reason.contains("get_symbol"), "{reason}");
             assert!(reason.contains("rift://map"), "{reason}");
         }
         assert!(
-            grep_reason.contains(r#"tool: {"pattern":"TODO"} finds"#),
+            grep_reason.contains(&format!("tool: {grep} finds")),
             "{grep_reason}"
         );
         assert!(
