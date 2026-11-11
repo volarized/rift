@@ -818,6 +818,28 @@ fn election_state_in(state_directory: &Path) -> (ElectionState, Option<ReadFailu
     }
 }
 
+/// Checks whether an existing lock blocks an exclusive election claim.
+///
+/// A shared presence probe succeeds alongside another shared lock. A starter
+/// whose child lost the election checks for that conflict before replacing it.
+/// The check releases any lock it takes immediately. The next claimant reports
+/// errors opening or locking the file.
+#[must_use]
+pub fn election_claim_blocked(state_directory: &Path) -> bool {
+    let path = state_directory.join(SERVER_ELECTION_FILE_NAME);
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            release_election_lock(&file);
+            false
+        }
+        Err(TryLockError::WouldBlock) => true,
+        Err(TryLockError::Error(_)) => false,
+    }
+}
+
 /// Records a free election's shared probe lock as a hold of the lock `server.election`,
 /// then releases it ahead of the handle's close; dropping the hold records its time.
 fn release_free_probe(election_file: &std::fs::File) {
@@ -1237,9 +1259,9 @@ mod tests {
     use crate::metrics::tests::recorded;
 
     use super::{
-        SERVER_ELECTION_FILE_NAME, SERVER_ELECTION_LOCK, ServerPresence, StaleReason, claim, probe,
-        read_serving, serve_elected, serve_elected_at, serve_http, served_document,
-        shut_down_unpublished,
+        SERVER_ELECTION_FILE_NAME, SERVER_ELECTION_LOCK, ServerPresence, StaleReason, claim,
+        claim_state_directory, election_claim_blocked, probe, probe_state_directory, read_serving,
+        serve_elected, serve_elected_at, serve_http, served_document, shut_down_unpublished,
     };
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
@@ -1678,6 +1700,33 @@ mod tests {
             !document_path(directory.path()).exists(),
             "a refused publish must write nothing"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_shared_lock_blocks_a_claim_while_presence_is_absent() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let state = directory.path();
+        assert!(!election_claim_blocked(state));
+        let election_path = state.join(SERVER_ELECTION_FILE_NAME);
+        assert!(!election_path.exists());
+
+        let file = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(election_path)?;
+        file.try_lock_shared()?;
+        assert!(matches!(
+            probe_state_directory(state),
+            ServerPresence::Absent
+        ));
+        assert!(election_claim_blocked(state));
+        file.unlock()?;
+        assert!(!election_claim_blocked(state));
+        let owner = claim_state_directory(state)?;
+        assert!(election_claim_blocked(state));
+        drop(owner);
         Ok(())
     }
 
