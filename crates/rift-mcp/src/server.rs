@@ -2331,30 +2331,16 @@ impl RiftMcp {
         result
     }
 
-    /// Searches indexed declarations and source lines by lexical `query`, merged with
-    /// full-text matches from included `[search.text]` files and declaration bodies, and by a
-    /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
-    /// declarations referencing it, `outgoing` the declarations it calls. `pattern` matches a
-    /// regex against the text of every indexed file, line by line as ripgrep reads it, and
-    /// answers each match and each declaration holding one, in place of `query` and
-    /// `traversal`. `change` answers the declarations a committed revision and another
-    /// revision, or the working tree, hold differently, in place of `query` and `traversal`.
-    /// A git `revision` searches that commit instead of the served working tree, and never
-    /// combines with `pattern`, `traversal`, or `change`. `scope` reaches past the project
-    /// tree: `global` answers collected package and runtime facts selected by the project's
-    /// dependency context. Explicit `packages` replaces versions of named packages or adds
-    /// packages the context lacks. `local@name` selects an accepted extra project; `local:name` selects a root-defined profile;
-    /// `local@name:profile` selects a profile defined in that extra project's own `rift.toml`.
-    /// `all` merges the primary project, profiles, accepted extra projects with their profiles, and global results. `target: "commit"` matches
-    /// `query` alone against the messages of the commits the history store holds.
-    /// Use `get_symbol` with an exact canonical identity returned by search.
-    ///
-    /// For a current-tree search, the published workspace is resolved exactly once and
-    /// threaded through both the search index's revision check and the executed
-    /// `ReadService::search` call: a concurrent rebuild between two separate resolutions
-    /// could otherwise validate ranked units against one snapshot and merge them into
-    /// results computed from another.
-    #[tool]
+    /// Evaluate SPARQL over captured code facts. Use `SERVICE :search` for ranked text and
+    /// regex retrieval. Continue a paged answer with its `next_query`.
+    #[tool(name = "search")]
+    async fn search_query(
+        &self,
+        Parameters(params): Parameters<rift_protocol::query::QueryParams>,
+    ) -> Result<Json<rift_protocol::query::QueryReadResult>, ToolFailure> {
+        self.graph_query(params).await
+    }
+
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -2367,6 +2353,28 @@ impl RiftMcp {
                 Box::new(answer),
             ))
         })
+    }
+
+    async fn search_retrieval_call(
+        &self,
+        request: CallToolRequestParams,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let params: SearchParams =
+            match serde_json::from_value(request.arguments.unwrap_or_default().into()) {
+                Ok(params) => params,
+                Err(source) => {
+                    return errors::mcp::parameter_invalid()
+                        .tool("search")
+                        .field("arguments")
+                        .accepted(source.to_string())
+                        .mcp()
+                        .tool_failure(wire::ErrorPhase::Read)
+                        .into_call_tool_result();
+                }
+            };
+        self.search(Parameters(params))
+            .await
+            .into_call_tool_result()
     }
 
     async fn search_result(&self, params: SearchParams) -> Result<Json<SearchResult>, ToolFailure> {
@@ -4224,6 +4232,8 @@ impl ServerHandler for RiftMcp {
                     }
                     let result = if request.name == "search_candidates" {
                         self.search_candidates_call(request, &operation).await
+                    } else if request.name == "search_retrieval" {
+                        self.search_retrieval_call(request).await
                     } else {
                         let routed = ToolCallContext::new(self, request, context);
                         match self.tool_router.call(routed).await {
@@ -8387,32 +8397,16 @@ done
         Ok(())
     }
 
-    /// One commit search for `beacon`, validated against the output schema the router serves
-    /// for `search`.
+    /// One internal commit search for `beacon`.
     async fn beacon_commits(server: &RiftMcp) -> TestResult<SearchResult> {
         let params = serde_json::from_value(json!({"target": "commit", "query": "beacon"}))?;
-        let answer = tokio::time::timeout(
+        Ok(tokio::time::timeout(
             UNWAITED_READ_MAX,
             server.answered_search(Parameters(params)),
         )
         .await
         .map_err(|_| "a commit search waits on no fill")??
-        .0;
-        let output_schema = RiftMcp::tool_router()
-            .list_all()
-            .into_iter()
-            .find(|tool| tool.name == "search")
-            .and_then(|tool| tool.output_schema)
-            .ok_or("search serves an output schema")?;
-        let validator =
-            jsonschema::validator_for(&serde_json::Value::Object(output_schema.as_ref().clone()))?;
-        let wire = serde_json::to_value(&answer)?;
-        let errors: Vec<String> = validator
-            .iter_errors(&wire)
-            .map(|error| error.to_string())
-            .collect();
-        assert!(errors.is_empty(), "{errors:?}: {wire:#}");
-        Ok(answer)
+        .0)
     }
 
     /// While the history task is held before its first commit, a commit search answers
@@ -9861,26 +9855,6 @@ done
             "the index holds no row to verify: {:?}",
             held.results
         );
-        let tools = RiftMcp::tool_router().list_all();
-        let search = tools
-            .iter()
-            .find(|tool| tool.name == "search")
-            .ok_or("search is served")?;
-        let schema = serde_json::Value::Object(
-            search
-                .output_schema
-                .as_deref()
-                .ok_or("search declares an output schema")?
-                .clone(),
-        );
-        let validator = jsonschema::validator_for(&schema)?;
-        let instance = serde_json::to_value(&held)?;
-        let failures: Vec<String> = validator
-            .iter_errors(&instance)
-            .map(|failure| failure.to_string())
-            .collect();
-        assert!(failures.is_empty(), "{failures:#?}\n{instance:#}");
-
         double.release_trigrams();
         let mut settled = server.answered_search(Parameters(params.clone())).await?.0;
         for _attempt in 0..SEARCH_TIER_ATTEMPTS_MAX {

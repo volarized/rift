@@ -20,6 +20,7 @@ use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure};
 use crate::output::{Json, ToolFailure};
 
 mod relationships;
+mod retrieval;
 
 use relationships::AcquiredAdjacency;
 
@@ -118,13 +119,29 @@ impl RiftMcp {
                 }
                 Err(error) => return Err(read_failure(error)),
             }
-        } else if query.symbol_selection().is_some() {
+        } else if query.symbol_selection().is_some() || !query.reads_base() {
             AcquiredAdjacency::default()
         } else {
             return Ok(Json(query_unavailable(
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         };
+        let mut retrieved = Vec::new();
+        for selection in query.retrieval_requests() {
+            let result =
+                tokio::time::timeout_at(deadline.at(), self.query_retrieval(selection, limits))
+                    .await
+                    .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
+            match result {
+                Ok(result) => retrieved.push(result),
+                Err(reason) => return Ok(Json(QueryReadResult::Unavailable(reason))),
+            }
+        }
+        if !retrieved.is_empty() && !self.engine_tree_matches(&resolved.published).await? {
+            return Ok(Json(query_unavailable(
+                SymbolUnavailableReason::InsufficientCoverage,
+            )));
+        }
         let configuration = resolved
             .published
             .configuration
@@ -135,6 +152,13 @@ impl RiftMcp {
         let responses = Arc::clone(&self.candidate_responses);
         let mut warnings = acquired.take_warnings();
         warnings.extend(resolved.stale);
+        for result in &retrieved {
+            for warning in &result.warnings {
+                if !warnings.contains(warning) {
+                    warnings.push(warning.clone());
+                }
+            }
+        }
         let cancellation = QueryCancellation::new();
         let _guard = QueryGuard(cancellation.clone());
         let result = tokio::time::timeout_at(
@@ -150,6 +174,12 @@ impl RiftMcp {
                             ));
                         }
                         return Err(error);
+                    }
+                    dataset.build()
+                } else if !query.reads_base() {
+                    let mut dataset = GraphDataset::builder(limits);
+                    for (selection, result) in query.retrieval_requests().iter().zip(&retrieved) {
+                        dataset.insert_retrieval(selection, result)?;
                     }
                     dataset.build()
                 } else {
@@ -168,15 +198,19 @@ impl RiftMcp {
                 let mut response = None;
                 views.capture_with(input, |view| {
                     let mut view = view.clone();
-                    if let Some(remote) = acquired.remote_view() {
-                        let expiry = crate::proxy::captured_expiry(remote)?;
+                    let provider_views = acquired
+                        .remote_view()
+                        .into_iter()
+                        .chain(retrieved.iter().filter_map(|result| result.view.as_ref()));
+                    for provider in provider_views {
+                        let expiry = crate::proxy::captured_expiry(provider)?;
                         if expiry <= SystemTime::now() {
                             response =
                                 Some(query_unavailable(SymbolUnavailableReason::ViewExpired));
                             return Ok(false);
                         }
                         if expiry < crate::proxy::captured_expiry(&view)? {
-                            view.expires_at.clone_from(&remote.expires_at);
+                            view.expires_at.clone_from(&provider.expires_at);
                         }
                     }
                     if cancellation.is_cancelled() {
@@ -810,6 +844,44 @@ mod tests {
             seen.iter()
                 .all(|request| request["packages"][0]["version"] == "1.0.0")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_projects_regex_occurrences_from_the_original_producer() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(directory.path(), "")?;
+        std::fs::write(
+            directory.path().join("lib.rs"),
+            "fn a() { /* signal signal */ }\n",
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let params = QueryParams {
+            query: "SELECT ?start ?path { SERVICE :search { ?hit :pattern 'signal'; :target 'file'; :path ?path; :start ?start; :matched_by/:value 'content' } } ORDER BY ?start".to_owned(),
+            language: Default::default(),
+        };
+        let result = server
+            .graph_query(params)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!("expected producer regex results, received {result:?}").into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected regex bindings".into());
+        };
+        assert_eq!(bindings.len(), 2, "{bindings:?}");
+        let positions = bindings
+            .iter()
+            .filter_map(|binding| match binding.get("start") {
+                Some(rift_protocol::query::RdfTerm::Literal { value, .. }) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(positions, ["12", "19"]);
         Ok(())
     }
 
