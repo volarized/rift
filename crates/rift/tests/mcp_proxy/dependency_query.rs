@@ -6,11 +6,12 @@ use serde_json::{Value, json};
 use super::global_api::{FixtureOptions, GlobalFixture};
 use super::harness::{
     FailureWindow, StopOnDrop, TestResult, await_workspace_ready, laid_out_workspace, proxied_call,
-    proxy_client,
+    proxy_client, require_success, run_rift,
 };
 
 const SOURCE: &str = "def greet(name: str) -> str:\n    return _helper(name)\n\ndef _helper(name: str) -> str:\n    return _inner(name)\n\ndef _inner(name: str) -> str:\n    return name\n";
 const SOURCE_PATH: &str = ".venv/lib/python3.12/site-packages/greeting/core.py";
+const RECORD_PATH: &str = ".venv/lib/python3.12/site-packages/greeting-1.0.0.dist-info/RECORD";
 const FILES: &[(&str, &str)] = &[
     (
         "pyproject.toml",
@@ -26,7 +27,7 @@ const FILES: &[(&str, &str)] = &[
         "from greeting.core import greet\n",
     ),
     (
-        ".venv/lib/python3.12/site-packages/greeting-1.0.0.dist-info/RECORD",
+        RECORD_PATH,
         "greeting/__init__.py,,\ngreeting/core.py,,\ngreeting-1.0.0.dist-info/RECORD,,\n",
     ),
     (SOURCE_PATH, SOURCE),
@@ -106,6 +107,24 @@ async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestRe
     assert_eq!(held["view"], answer["view"]);
     let changed = proxied_call(&client, "search", &json!({"query":statement})).await?;
     assert_eq!(row(&changed)?["name"]["value"], "_changed");
+    client.cancel().await?;
+    require_success(
+        &run_rift(root, &["server", "stop"]).await?,
+        "restart package fixture",
+    )?;
+    std::fs::remove_file(root.join(RECORD_PATH))?;
+    assert!(root.join(SOURCE_PATH).is_file(), "source remains installed");
+    let client = proxy_client(root).await?;
+    await_workspace_ready(&client).await?;
+    let expired = proxied_call(&client, "search", &json!({"query":replay})).await?;
+    assert_eq!(expired["outcome"], "unavailable", "{expired}");
+    assert_eq!(expired["reason"], "view_expired", "{expired}");
+    let unadmitted = proxied_call(&client, "search", &json!({"query":statement})).await?;
+    assert_eq!(unadmitted["outcome"], "unavailable", "{unadmitted}");
+    assert_eq!(
+        unadmitted["reason"], "insufficient_coverage",
+        "{unadmitted}"
+    );
     assert!(
         !fixture
             .requests()
