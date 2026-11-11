@@ -1618,6 +1618,26 @@
       },
       "type": "object"
     },
+    "QueryConfiguration": {
+      "additionalProperties": false,
+      "description": "Bounds on one transport page of a retained query result.",
+      "properties": {
+        "page_limit": {
+          "$ref": "#/$defs/ByteSize",
+          "default": "4mb",
+          "description": "Most encoded bytes on one page, from 1 KiB to 4 MiB."
+        },
+        "page_size": {
+          "default": 1000,
+          "description": "Most bindings or triples on one page, from 1 to 1000.",
+          "format": "uint64",
+          "maximum": 1000,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "RankingConfiguration": {
       "additionalProperties": false,
       "description": "The `[search.ranking]` table: what each ranking input contributes to a\nfused score, and how sharply a top rank counts.\n\nThe three weights need not sum to 1. The executor normalizes the weights\nof the inputs that answered, so an unavailable vector ranking does not\nrescale what identifier matching and the lexical ranking returned.",
@@ -1790,6 +1810,14 @@
           "maximum": 16,
           "minimum": 1,
           "type": "integer"
+        },
+        "query": {
+          "$ref": "#/$defs/QueryConfiguration",
+          "default": {
+            "page_limit": "4mb",
+            "page_size": 1000
+          },
+          "description": "Transport bounds for retained graph query answers."
         },
         "ranking": {
           "$ref": "#/$defs/RankingConfiguration",
@@ -2465,6 +2493,10 @@
         "pattern_matches_per_file": 1000,
         "pattern_verified_size": "128mb",
         "pool_slots": 4,
+        "query": {
+          "page_limit": "4mb",
+          "page_size": 1000
+        },
         "ranking": {
           "fusion_k": 60,
           "identifier_weight": 0.35,

@@ -69,6 +69,15 @@ impl LocalSymbolViewInput {
         ))
     }
 
+    /// Reads the exact bytes of a physical occurrence in this publication.
+    #[must_use]
+    pub fn occurrence_source(&self, source: &rift_protocol::read::SourceUnitSpan) -> Option<&str> {
+        let path = rift_core::ProjectPath::new(source.unit.project_path()?).ok()?;
+        let start = usize::try_from(source.range.start).ok()?;
+        let end = usize::try_from(source.range.end).ok()?;
+        self.material.index.file(&path)?.source().get(start..end)
+    }
+
     /// Projects captured symbol facts for a query whose algebra requires only symbols.
     ///
     /// # Errors

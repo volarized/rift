@@ -171,6 +171,15 @@ pub enum GraphFact<'a> {
         /// The node using it.
         node: NodeAddress<'a>,
     },
+    /// One physical usage, preserving the identity the provider gave this occurrence.
+    Occurrence {
+        /// The original record key within the selected provider and revision.
+        key: &'a str,
+        /// Target, enclosing symbol and source span.
+        occurrence: &'a rift_protocol::relationship_read::QueryOccurrence,
+        /// Exact source bytes at this occurrence, when acquired.
+        source: Option<&'a str>,
+    },
     /// A revision's effect on a symbol.
     History {
         /// The symbol.
@@ -378,6 +387,27 @@ impl GraphFact<'_> {
                 let (symbol, node) = (out.symbol(symbol)?, out.node(node)?);
                 out.link(&symbol, Property::Usages, node);
             }
+            Self::Occurrence {
+                key,
+                occurrence,
+                source,
+            } => {
+                let target = out.symbol(&occurrence.target)?;
+                let usage = out.typed(
+                    content_blank_node(&["occurrence", key]),
+                    VocabularyClass::Occurrence,
+                );
+                out.link(&target, Property::Usages, usage.clone());
+                out.literal(&usage, Property::Kind, occurrence.facet.as_ref());
+                out.location(&usage, &occurrence.source.unit, &occurrence.source.range)?;
+                if let Some(source) = source {
+                    out.literal(&usage, Property::Source, source);
+                }
+                if let Some(enclosing) = &occurrence.enclosing {
+                    let enclosing = out.symbol(enclosing)?;
+                    out.link(&usage, Property::Of, enclosing);
+                }
+            }
             Self::History {
                 symbol,
                 event,
@@ -421,13 +451,7 @@ impl NodeFact<'_> {
             out.literal(&node, Property::Source, source);
         }
         if let Some(NodeLocation { unit, range }) = self.location {
-            let unit = out.unit(unit)?;
-            let (start, end) = (range.start.to_string(), range.end.to_string());
-            let location = content_blank_node(&[node.as_str(), unit.as_str(), &start, &end]);
-            out.link(&node, Property::Range, location.clone());
-            out.link(&location, Property::Unit, unit);
-            out.link(&location, Property::Start, Literal::from(range.start));
-            out.link(&location, Property::End, Literal::from(range.end));
+            out.location(&node, unit, range)?;
         }
         Ok(())
     }
@@ -507,6 +531,23 @@ impl TripleWriter {
         }
         self.link(&node, Property::Index, Literal::from(index));
         Ok(node)
+    }
+
+    fn location(
+        &mut self,
+        subject: &BlankNode,
+        unit: &SourceUnitId,
+        range: &TextRange,
+    ) -> Result<(), RiftError> {
+        use VocabularyProperty as Property;
+        let unit = self.unit(unit)?;
+        let (start, end) = (range.start.to_string(), range.end.to_string());
+        let location = content_blank_node(&[subject.as_str(), unit.as_str(), &start, &end]);
+        self.link(subject, Property::Range, location.clone());
+        self.link(&location, Property::Unit, unit);
+        self.link(&location, Property::Start, Literal::from(range.start));
+        self.link(&location, Property::End, Literal::from(range.end));
+        Ok(())
     }
 
     /// Types a revision `Revision`, and `Commit` when it is a git commit.

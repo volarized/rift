@@ -14,8 +14,9 @@ use rift_lsp::uri::TreeRoot;
 use rift_protocol::read::{
     ExactKind, Extensions, GraphHop, HopDirection, Language, ReadWarning, Relationship,
     RelationshipDerivation, RelationshipFacet, SearchParams, SearchParamsTarget, SearchTraversal,
-    SourceUnitId, Symbol, SymbolId, TraversalDirection,
+    SourceUnitId, SourceUnitSpan, Symbol, SymbolId, TextRange, TraversalDirection,
 };
+use rift_protocol::relationship_read::QueryOccurrence;
 use rift_syntax::SyntaxSymbol;
 use tokio::time::Instant;
 
@@ -1126,6 +1127,112 @@ async fn references_on_engine(
         deadline,
     )
     .await
+}
+
+/// Complete physical usages from configured engines for one local declaration.
+///
+/// # Errors
+/// Refuses missing readiness, an uncovered source location, or a response above the engine bound.
+pub async fn graph_references(
+    reads: &ReadService,
+    engines: &EnginePool,
+    target: &SymbolId,
+    deadline: Instant,
+) -> Result<Vec<QueryOccurrence>, RiftError> {
+    let unavailable = || {
+        errors::server::search_coverage_unavailable()
+            .operation("graph references")
+            .error()
+    };
+    let identity = CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| unavailable())?;
+    let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
+    let [_] = declarations.as_slice() else {
+        return Err(unavailable());
+    };
+    let (declarations, total) = if count == 1 {
+        (declarations, count)
+    } else {
+        reads
+            .index()
+            .symbols_by_identity_page(&identity, 0, count.min(TRAVERSAL_NODES_MAX))?
+    };
+    if total == 0 || declarations.len() != total {
+        return Err(unavailable());
+    }
+    let excluded: BTreeSet<_> = declarations
+        .iter()
+        .map(|declaration| {
+            let range = declaration.symbol.name_range.ok_or_else(unavailable)?;
+            Ok((declaration.file.path().clone(), range.start, range.end))
+        })
+        .collect::<Result<_, RiftError>>()?;
+    let mut found = BTreeMap::new();
+    for declaration in declarations {
+        let file = declaration.file;
+        let slot = engines
+            .engine_for(file.syntax().language())
+            .ok_or_else(unavailable)?;
+        let request = ReferenceTarget::new(
+            slot.workspace_root(),
+            reads.index().root(),
+            file,
+            declaration.symbol,
+        )?;
+        let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, deadline))
+            .await
+            .map_err(|error| match error.slug() {
+                errors::lsp::engine_capability_absent::SLUG
+                | errors::lsp::engine_analyzing::SLUG => unavailable(),
+                _ => error,
+            })?;
+        if unconfirmed || !report.full {
+            return Err(unavailable());
+        }
+        let root = TreeRoot::new(slot.workspace_root())?;
+        let canonical = TreeRoot::new(reads.index().root())?;
+        let mut positions = BTreeMap::new();
+        for location in report.locations.map_err(|_| unavailable())? {
+            let path = root
+                .project_path(&location.uri)
+                .or_else(|_| canonical.project_path(&location.uri))
+                .map_err(|_| unavailable())?;
+            let file = reads.index().file(&path).ok_or_else(unavailable)?;
+            let positions = positions
+                .entry(file.path())
+                .or_insert_with(|| LineIndex::new(file.source()));
+            let start = positions.byte_offset(report.encoding, location.range.start)?;
+            let end = positions.byte_offset(report.encoding, location.range.end)?;
+            if file.source().get(start..end).is_none() {
+                return Err(unavailable());
+            }
+            let key = (path, start as u64, end as u64);
+            if excluded.contains(&key) || found.contains_key(&key) {
+                continue;
+            }
+            if found.len() == TRAVERSAL_NODES_MAX {
+                return Err(unavailable());
+            }
+            let enclosing = file
+                .enclosing_symbol(key.1, key.2)
+                .map(|symbol| symbol_id(reads.index(), crate::search::declared(file, symbol)))
+                .transpose()?
+                .flatten();
+            let occurrence = QueryOccurrence {
+                target: target.clone(),
+                enclosing,
+                source: SourceUnitSpan {
+                    unit: crate::read::source_unit_id(file.path()),
+                    range: TextRange {
+                        start: key.1,
+                        end: key.2,
+                    },
+                },
+                facet: RelationshipFacet::References,
+            };
+            found.insert(key, occurrence);
+        }
+    }
+    Ok(found.into_values().collect())
 }
 
 fn map_references(

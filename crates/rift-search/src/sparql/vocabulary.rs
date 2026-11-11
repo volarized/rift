@@ -18,6 +18,8 @@ pub enum VocabularyClass {
     Symbol,
     /// A physical part of a symbol, addressed by its content.
     Node,
+    /// One physical usage of a symbol.
+    Occurrence,
     /// A point on the history axis.
     Revision,
     /// A physical file whose bytes are read at a revision.
@@ -92,6 +94,8 @@ pub enum VocabularyResource {
 /// The value a vocabulary property points at.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VocabularyValue {
+    /// One resource from the listed alternatives.
+    OneOf(&'static [VocabularyResource]),
     /// A resource.
     Resource(VocabularyResource),
     /// An `xsd:string` literal.
@@ -113,6 +117,7 @@ pub struct PropertyDefinition {
 
 const SYMBOL: VocabularyResource = VocabularyResource::Class(VocabularyClass::Symbol);
 const NODE: VocabularyResource = VocabularyResource::Class(VocabularyClass::Node);
+const OCCURRENCE: VocabularyResource = VocabularyResource::Class(VocabularyClass::Occurrence);
 const REVISION: VocabularyResource = VocabularyResource::Class(VocabularyClass::Revision);
 const SOURCE_UNIT: VocabularyResource = VocabularyResource::Class(VocabularyClass::SourceUnit);
 
@@ -133,6 +138,9 @@ impl VocabularyClass {
             }
             Self::Node => {
                 "A syntax node, written as a blank node: inside a declaration it carries `of`, `declaration` and `index`, outside every declaration `unit` and `index`. It has one `range` at the read's revision."
+            }
+            Self::Occurrence => {
+                "One physical usage of a symbol. An occurrence names its source range and, when known, its enclosing symbol."
             }
             Self::Revision => {
                 "A point on the history axis: `rift://revision/git/<commit sha>`, a package or runtime release such as `rift://revision/cargo/crates.io/demo@1.0.0`, or a served working tree `rift://revision/tree/<digest>`."
@@ -159,7 +167,7 @@ impl VocabularyProperty {
     #[must_use]
     pub const fn definition(self) -> PropertyDefinition {
         use VocabularyResource::{Range, Statement};
-        use VocabularyValue::{Integer, Resource, String};
+        use VocabularyValue::{Integer, OneOf, Resource, String};
         let (subjects, object, description): (&'static [VocabularyResource], _, _) = match self {
             Self::Name => (
                 &[SYMBOL],
@@ -172,7 +180,7 @@ impl VocabularyProperty {
                 "The revision at which the server read the symbol's facts.",
             ),
             Self::Kind => (
-                &[SYMBOL, NODE],
+                &[SYMBOL, NODE, OCCURRENCE],
                 String,
                 "The declaration kind of a symbol, or the syntax kind of a node, as its language's provider names it.",
             ),
@@ -182,7 +190,7 @@ impl VocabularyProperty {
                 "The language identity segment, such as `rust`.",
             ),
             Self::Of => (
-                &[NODE],
+                &[NODE, OCCURRENCE],
                 Resource(SYMBOL),
                 "The symbol whose declaration holds the node.",
             ),
@@ -198,7 +206,7 @@ impl VocabularyProperty {
             ),
             Self::Parent => (&[NODE], Resource(NODE), "The node enclosing this node."),
             Self::Range => (
-                &[NODE],
+                &[NODE, OCCURRENCE],
                 Resource(Range),
                 "The place the node is written at the read's revision.",
             ),
@@ -209,7 +217,11 @@ impl VocabularyProperty {
             ),
             Self::Start => (&[Range], Integer, "The first UTF-8 byte of the range."),
             Self::End => (&[Range], Integer, "One past the last byte of the range."),
-            Self::Source => (&[NODE], String, "The exact source text of the node."),
+            Self::Source => (
+                &[NODE, OCCURRENCE],
+                String,
+                "The exact source text at the selected range.",
+            ),
             Self::Calls => (
                 &[SYMBOL],
                 Resource(SYMBOL),
@@ -222,8 +234,8 @@ impl VocabularyProperty {
             ),
             Self::Usages => (
                 &[SYMBOL],
-                Resource(NODE),
-                "A node that uses the symbol, the evidence an incoming `calls` or `references` edge was read from; its `of` names the using symbol and its `range` the place.",
+                OneOf(&[NODE, OCCURRENCE]),
+                "A node or occurrence that uses the symbol, the evidence an incoming `calls` or `references` edge was read from; its `of` names the using symbol and its `range` the place.",
             ),
             Self::IntroducedIn => (&[SYMBOL], Resource(REVISION), "The revision that added it."),
             Self::ChangedIn => (&[SYMBOL], Resource(REVISION), "A revision that changed it."),
