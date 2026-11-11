@@ -150,7 +150,7 @@ pub(crate) fn source_declarations(
     )
 }
 
-fn exact_response<T: serde::de::DeserializeOwned>(
+pub(crate) fn exact_response<T: serde::de::DeserializeOwned>(
     response: RawResponse,
     operation: &'static str,
     statuses: &[u16],
