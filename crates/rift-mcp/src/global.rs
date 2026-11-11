@@ -339,6 +339,13 @@ impl GlobalState {
                 );
             }
         };
+        if !context.entries().iter().any(registry_resolution_entry) {
+            return GlobalRoute::unanswered(
+                context,
+                RouteState::Available,
+                Arc::clone(&self.observation),
+            );
+        }
         let capabilities = match client.get_capabilities().await {
             Ok(capabilities) => capabilities,
             Err(error) => {
@@ -1548,10 +1555,14 @@ fn resolution_request(context: &DependencyContext) -> PackageResolutionRequest {
         entries: context
             .entries()
             .iter()
-            .filter(|entry| entry.availability == PackageAvailability::Canonical)
+            .filter(|entry| registry_resolution_entry(entry))
             .map(wire_context_entry)
             .collect(),
     }
+}
+
+fn registry_resolution_entry(entry: &PackageContextEntry) -> bool {
+    entry.availability == PackageAvailability::Canonical && entry.registry.is_some()
 }
 
 fn wire_context_entry(entry: &PackageContextEntry) -> WireContextEntry {
@@ -2470,7 +2481,7 @@ mod tests {
     }
 
     #[test]
-    fn resolution_request_carries_one_standard_library_entry_per_package() {
+    fn package_resolution_keeps_runtime_entries_in_the_workspace_context() {
         use rift_dependency::{StandardLibrary, StandardLibraryRequest, standard_library_answer};
         use rift_protocol::dependencies::ConfiguredPackage;
 
@@ -2513,20 +2524,22 @@ mod tests {
                 )
             })
             .collect();
-        let any = Some(">=0".to_owned());
         assert_eq!(
             sent,
-            [
-                (
-                    "npm".to_owned(),
-                    "typescript".to_owned(),
-                    Some("5.9.3".to_owned()),
-                    None
-                ),
-                ("stdlib".to_owned(), "node".to_owned(), None, any.clone()),
-                ("stdlib".to_owned(), "rust".to_owned(), None, any),
-            ]
+            [(
+                "npm".to_owned(),
+                "typescript".to_owned(),
+                Some("5.9.3".to_owned()),
+                None
+            )]
         );
+        let runtimes: Vec<_> = context
+            .entries()
+            .iter()
+            .filter(|entry| entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER)
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(runtimes, ["node", "rust"]);
         let degraded: Vec<&str> = context
             .degradations()
             .iter()
