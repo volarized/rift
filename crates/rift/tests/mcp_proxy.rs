@@ -196,12 +196,12 @@ fn ranked_symbol(name: &str) -> TestResult<serde_json::Value> {
     )?)?)
 }
 
-/// One proxied search round trip for the fixture's `beacon` symbol.
+/// Reads the fixture's `beacon` symbol from the settled ranking.
 async fn beacon_lookup(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<serde_json::Value> {
     await_workspace_ready(client).await?;
-    proxied_call(client, "search", &ranked_symbol("beacon")?).await
+    await_search_population(client, &ranked_symbol("beacon")?).await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
@@ -314,7 +314,7 @@ async fn repository_workspace_reads(
         .as_str()
         .ok_or("map carries its revision")?
         .to_owned();
-    let lookup = proxied_call(client, "search", &ranked_symbol(name)?)
+    let lookup = await_search_population(client, &ranked_symbol(name)?)
         .await
         .map_err(|error| format!("positive search: {error:?}"))?;
     assert_eq!(
@@ -325,7 +325,7 @@ async fn repository_workspace_reads(
         .iter()
         .find(|other| **other != name)
         .ok_or("fixture has another symbol")?;
-    let absent = proxied_call(client, "search", &ranked_symbol(other)?)
+    let absent = await_search_population(client, &ranked_symbol(other)?)
         .await
         .map_err(|error| format!("negative search: {error:?}"))?;
     assert!(
@@ -335,7 +335,7 @@ async fn repository_workspace_reads(
             .is_empty(),
         "{absent}"
     );
-    let search = proxied_call(client, "search", &ranked_symbol(name)?)
+    let search = await_search_population(client, &ranked_symbol(name)?)
         .await
         .map_err(|error| format!("search: {error:?}"))?;
     assert!(
@@ -632,7 +632,7 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let changed = fs::read_to_string(main.path().join("rift.toml"))?
         .replace("[server]\n", "[server]\nnum_workers = 2\n");
     fs::write(main.path().join("rift.toml"), &changed)?;
-    let pinned = proxied_call(&clients[3], "search", &ranked_symbol("quartz")?)
+    let pinned = await_search_population(&clients[3], &ranked_symbol("quartz")?)
         .await
         .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
     assert_eq!(
@@ -901,6 +901,8 @@ async fn all_and_text_proxies_share_one_server_and_keep_their_own_shape() -> Tes
     );
     let (all, text) = (all?, text?);
     let (all_tools, text_tools) = (listed_tools(&all).await?, listed_tools(&text).await?);
+    await_workspace_ready(&all).await?;
+    await_search_population(&all, &ranked_symbol("beacon")?).await?;
     let (all_result, text_result) = tokio::join!(beacon_result(&all), beacon_result(&text));
     let (all_result, text_result) = (all_result?, text_result?);
     assert_all_shape(&all_tools, &all_result);
@@ -937,26 +939,30 @@ const SEARCH_POPULATION_POLLS_MAX: usize = 60;
 const COMMIT_POPULATION_TIMEOUT_SECONDS: u64 = 30;
 const COMMIT_POPULATION_POLL_MILLISECONDS: u64 = 50;
 
-/// Calls `search` until its warnings no longer report a lexical pass still catching up, so
-/// two later calls answer from one settled index.
+/// Reads a search after its lexical commit has landed and its captured index is current.
 async fn await_search_population(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     request: &serde_json::Value,
-) -> TestResult {
+) -> TestResult<serde_json::Value> {
     for _poll in 0..SEARCH_POPULATION_POLLS_MAX {
         let answer = proxied_call(client, "search", request).await?;
+        let coverage_pending =
+            answer["outcome"] == "unavailable" && answer["reason"] == "insufficient_coverage";
         let pending = answer["warnings"]
             .as_array()
             .into_iter()
             .flatten()
             .any(|warning| {
-                matches!(
-                    warning["code"].as_str(),
-                    Some("lexical_ranking_unavailable" | "stale_index")
-                )
+                warning["code"] == "stale_index"
+                    || (coverage_pending
+                        && warning["code"] == "lexical_ranking_unavailable"
+                        && warning["detail"].as_str().is_some_and(|detail| {
+                            detail
+                                .starts_with("the lexical index is still committing tree revision ")
+                        }))
             });
         if !pending {
-            return Ok(());
+            return Ok(answer);
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
