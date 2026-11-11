@@ -4,9 +4,11 @@ use std::collections::HashSet;
 
 use rift_error::RiftError;
 use rift_protocol::identity::SymbolIdentity;
+use rift_protocol::read::ReadWarning;
 use rift_protocol::relationship_read::{
-    RELATIONSHIPS_FEATURE, RelationshipBounds, RelationshipCapability, RelationshipSearchPage,
-    RelationshipSearchRequest, RelationshipSearchResult,
+    RELATIONSHIPS_FEATURE, RelationshipBounds, RelationshipCapability, RelationshipGroup,
+    RelationshipSearchPage, RelationshipSearchRequest, RelationshipSearchResult,
+    RelationshipSelection,
 };
 
 use crate::{GlobalClient, SearchPackagesRequestQuery, contract, failure, response};
@@ -548,7 +550,6 @@ fn validate_page(
             "relationship page metadata or requested groups differ",
         ));
     }
-    use rift_protocol::read::ReadWarning;
     if page.warnings.iter().any(|warning| {
         matches!(
             warning,
@@ -573,53 +574,7 @@ fn validate_page(
         {
             return Err(invalid("relationship projections exceed their page bound"));
         }
-        for record in &group.occurrences {
-            let occurrence = &record.occurrence;
-            SymbolIdentity::parse(occurrence.target.as_str())?;
-            if let Some(enclosing) = &occurrence.enclosing {
-                SymbolIdentity::parse(enclosing.as_str())?;
-            }
-            rift_core::SourceUnitId::parse(occurrence.source.unit.as_str())?;
-            let matches = match request.relationships.direction {
-                rift_protocol::read::TraversalDirection::Incoming => &occurrence.target == seed,
-                rift_protocol::read::TraversalDirection::Outgoing => {
-                    occurrence.enclosing.as_ref() == Some(seed)
-                }
-            };
-            if !matches
-                || occurrence.source.range.start > occurrence.source.range.end
-                || occurrence.source.range.end > 9_007_199_254_740_991
-                || (!request.relationships.facets.is_empty()
-                    && !request.relationships.facets.contains(&occurrence.facet))
-            {
-                return Err(invalid(
-                    "occurrence does not match the selected subject or source range",
-                ));
-            }
-        }
-        for record in &group.relationships {
-            let relationship = &record.relationship;
-            SymbolIdentity::parse(relationship.from.as_str())
-                .map_err(|_| invalid("relationship endpoint is not canonical"))?;
-            SymbolIdentity::parse(relationship.to.as_str())
-                .map_err(|_| invalid("relationship endpoint is not canonical"))?;
-            let matches = match request.relationships.direction {
-                rift_protocol::read::TraversalDirection::Incoming => &relationship.to == seed,
-                rift_protocol::read::TraversalDirection::Outgoing => &relationship.from == seed,
-            };
-            if !matches
-                || relationship.facets.is_empty()
-                || (!request.relationships.facets.is_empty()
-                    && !relationship
-                        .facets
-                        .iter()
-                        .any(|facet| request.relationships.facets.contains(facet)))
-            {
-                return Err(invalid(
-                    "relationship record does not match the selected subject, direction or facets",
-                ));
-            }
-        }
+        validate_group(group, &request.relationships)?;
     }
     if i64::try_from(count).map_or(true, |count| count > limit)
         || (page.next_cursor.is_none() && page.groups.iter().any(|group| !group.complete))
@@ -644,6 +599,60 @@ fn validate_page(
         return Err(invalid(
             "relationship view expired before acquisition completed",
         ));
+    }
+    Ok(())
+}
+
+fn validate_group(
+    group: &RelationshipGroup,
+    selection: &RelationshipSelection,
+) -> Result<(), RiftError> {
+    let seed = &group.seed;
+    for record in &group.occurrences {
+        let occurrence = &record.occurrence;
+        SymbolIdentity::parse(occurrence.target.as_str())?;
+        if let Some(enclosing) = &occurrence.enclosing {
+            SymbolIdentity::parse(enclosing.as_str())?;
+        }
+        rift_core::SourceUnitId::parse(occurrence.source.unit.as_str())?;
+        let matches = match selection.direction {
+            rift_protocol::read::TraversalDirection::Incoming => &occurrence.target == seed,
+            rift_protocol::read::TraversalDirection::Outgoing => {
+                occurrence.enclosing.as_ref() == Some(seed)
+            }
+        };
+        if !matches
+            || occurrence.source.range.start > occurrence.source.range.end
+            || occurrence.source.range.end > 9_007_199_254_740_991
+            || (!selection.facets.is_empty() && !selection.facets.contains(&occurrence.facet))
+        {
+            return Err(invalid(
+                "occurrence does not match the selected subject or source range",
+            ));
+        }
+    }
+    for record in &group.relationships {
+        let relationship = &record.relationship;
+        SymbolIdentity::parse(relationship.from.as_str())
+            .map_err(|_| invalid("relationship endpoint is not canonical"))?;
+        SymbolIdentity::parse(relationship.to.as_str())
+            .map_err(|_| invalid("relationship endpoint is not canonical"))?;
+        let matches = match selection.direction {
+            rift_protocol::read::TraversalDirection::Incoming => &relationship.to == seed,
+            rift_protocol::read::TraversalDirection::Outgoing => &relationship.from == seed,
+        };
+        if !matches
+            || relationship.facets.is_empty()
+            || (!selection.facets.is_empty()
+                && !relationship
+                    .facets
+                    .iter()
+                    .any(|facet| selection.facets.contains(facet)))
+        {
+            return Err(invalid(
+                "relationship record does not match the selected subject, direction or facets",
+            ));
+        }
     }
     Ok(())
 }
