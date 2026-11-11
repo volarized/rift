@@ -1,22 +1,11 @@
 import "@/app/global.css";
+import "@fontsource/geist-mono/400.css";
+import "@fontsource/geist-mono/500.css";
+import "@fontsource/inter/300.css";
+import "@fontsource/inter/400.css";
+import "@fontsource/inter/500.css";
 import { RootProvider } from "fumadocs-ui/provider/next";
 import type { Metadata } from "next";
-import { Geist_Mono, Inter } from "next/font/google";
-import { cn } from "@/lib/utils";
-
-// Two families, per the design system: Geist Mono for display, section
-// labels and code; Inter 300 for lead and body copy.
-const geistMono = Geist_Mono({
-  subsets: ["latin"],
-  weight: ["400", "500"],
-  variable: "--font-geist-mono",
-});
-
-const inter = Inter({
-  subsets: ["latin"],
-  weight: ["300", "400", "500"],
-  variable: "--font-inter",
-});
 
 const TITLE = "rift - agentic development toolkit";
 const DESCRIPTION = "Agentic development toolkit for reading and discovering codebases.";
@@ -52,7 +41,7 @@ export const metadata: Metadata = {
 
 export default function Layout({ children }: LayoutProps<"/">) {
   return (
-    <html lang="en" className={cn(inter.variable, geistMono.variable)} suppressHydrationWarning>
+    <html lang="en" suppressHydrationWarning>
       <body className="flex flex-col min-h-screen">
         {/*
           `type: "static"` because `output: "export"` has no server to answer a
