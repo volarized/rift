@@ -977,7 +977,7 @@ mod tests {
             .ok_or("canonical beacon declaration")?;
         let params = QueryParams {
             query: format!(
-                "SELECT ?start ?text {{ <{}> :usages ?usage . ?usage :range/:start ?start ; :source ?text }} ORDER BY ?start",
+                "SELECT ?start ?text {{ <{}> :usages ?usage . ?usage :range/:start ?start ; :source ?text . FILTER (?text = 'beacon') }} ORDER BY DESC(?start + 1)",
                 id.as_str()
             ),
             language: QueryLanguage::Sparql,

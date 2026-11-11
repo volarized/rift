@@ -31,6 +31,7 @@ pub(super) struct Admission {
     pub(super) reads_base: bool,
     pub(super) symbol_only: bool,
     pub(super) named_local: bool,
+    pub(super) embedded_patterns: usize,
     pub(super) semantics: Option<SemanticInventory>,
 }
 
@@ -80,7 +81,11 @@ pub(super) fn admit(query: &mut Query, limits: &GraphLimits) -> Result<Admission
                 joined.count(pattern);
                 admit_pattern(pattern, &mut admission, &mut pending)?;
             }
-            Visit::Expression(expression) => push_expression_children(expression, &mut pending),
+            Visit::Expression(expression) => {
+                admission.embedded_patterns +=
+                    usize::from(matches!(expression, Expression::Exists(_)));
+                push_expression_children(expression, &mut pending);
+            }
         }
     }
     joined.admit(limits)?;
