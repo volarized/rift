@@ -118,6 +118,15 @@ pub enum HistoryEvent {
     Removed,
 }
 
+/// The address of a logical symbol in one captured publication.
+#[derive(Clone, Copy, Debug)]
+pub enum SymbolAddress<'a> {
+    /// An established canonical symbol address.
+    Established(&'a SymbolId),
+    /// The original contribution of a symbol without an established identity.
+    Unestablished(&'a rift_core::ContributionReference),
+}
+
 /// One fact a graph dataset holds. Every resource a fact names is typed with its class, so a
 /// query reaches it through `rdf:type` whichever fact introduced it.
 #[derive(Clone, Copy, Debug)]
@@ -130,6 +139,19 @@ pub enum GraphFact<'a> {
         kind: &'a str,
         /// The symbol's language.
         language: &'a Language,
+    },
+    /// The portable presentation of a captured logical symbol.
+    SymbolDetails {
+        /// The symbol's address in this selection.
+        address: SymbolAddress<'a>,
+        /// The symbol's name, as written in source.
+        name: &'a str,
+        /// The declaration kind.
+        kind: &'a str,
+        /// The symbol's language.
+        language: &'a Language,
+        /// The original selected revision.
+        revision: &'a RevisionIri,
     },
     /// A syntax node.
     Node(NodeFact<'a>),
@@ -316,6 +338,32 @@ impl GraphFact<'_> {
                 let symbol = out.symbol(symbol)?;
                 out.literal(&symbol, Property::Kind, kind);
                 out.literal(&symbol, Property::Language, &language.identity_segment());
+            }
+            Self::SymbolDetails {
+                address,
+                name,
+                kind,
+                language,
+                revision,
+            } => {
+                let subject: NamedOrBlankNode = match address {
+                    SymbolAddress::Established(symbol) => out.symbol(symbol)?.into(),
+                    SymbolAddress::Unestablished(reference) => out
+                        .typed(
+                            content_blank_node(&[
+                                "symbol",
+                                reference.provider().as_str(),
+                                reference.symbol().as_str(),
+                            ]),
+                            VocabularyClass::Symbol,
+                        )
+                        .into(),
+                };
+                out.literal(&subject, Property::Name, name);
+                out.literal(&subject, Property::Kind, kind);
+                out.literal(&subject, Property::Language, &language.identity_segment());
+                let revision = out.revision(revision);
+                out.link(&subject, Property::Revision, revision);
             }
             Self::Node(node) => node.write_triples(out)?,
             Self::Relation {

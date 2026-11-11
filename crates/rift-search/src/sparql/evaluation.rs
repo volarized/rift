@@ -88,6 +88,61 @@ pub enum GraphAnswer {
     Graph(Vec<Triple>),
 }
 
+impl From<GraphAnswer> for rift_protocol::query::QueryAnswer {
+    fn from(answer: GraphAnswer) -> Self {
+        match answer {
+            GraphAnswer::Solutions(table) => {
+                let bindings = table
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        table
+                            .variables
+                            .iter()
+                            .zip(row)
+                            .filter_map(|(name, term)| term.map(|term| (name.clone(), term.into())))
+                            .collect()
+                    })
+                    .collect();
+                Self::Bindings {
+                    variables: table.variables,
+                    bindings,
+                }
+            }
+            GraphAnswer::Boolean(value) => Self::Boolean { value },
+            GraphAnswer::Graph(graph) => Self::Graph {
+                triples: graph
+                    .into_iter()
+                    .map(|triple| rift_protocol::query::RdfTriple {
+                        subject: GraphTerm::from(&Term::from(triple.subject)).into(),
+                        predicate: rift_protocol::query::RdfTerm::Iri {
+                            value: triple.predicate.as_str().to_owned(),
+                        },
+                        object: GraphTerm::from(&triple.object).into(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+}
+
+impl From<GraphTerm> for rift_protocol::query::RdfTerm {
+    fn from(term: GraphTerm) -> Self {
+        match term {
+            GraphTerm::Iri(value) => Self::Iri { value },
+            GraphTerm::BlankNode(value) => Self::BlankNode { value },
+            GraphTerm::Literal {
+                value,
+                datatype,
+                language,
+            } => match language {
+                Some(language) => Self::LanguageLiteral { value, language },
+                None => Self::Literal { value, datatype },
+            },
+        }
+    }
+}
+
 impl GraphDataset {
     /// Evaluates `query` within this dataset's bounds.
     ///

@@ -70,7 +70,11 @@ impl GraphQuery {
         let parser = predeclared_parser();
         match parser.parse_query(text) {
             Ok(mut query) => {
-                let separators = admit(&mut query, limits)?;
+                let separators = if super::page::selection(&query).is_some() {
+                    Vec::new()
+                } else {
+                    admit(&mut query, limits)?
+                };
                 Ok(Self { query, separators })
             }
             Err(_) if parser.parse_update(text).is_ok() => refused("an update"),

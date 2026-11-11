@@ -318,6 +318,33 @@ impl WorkspaceSymbolView {
             .transpose()
     }
 
+    /// Iterates established objects without cloning their captured presentation.
+    pub fn objects(&self) -> impl Iterator<Item = (&SymbolId, Result<&ReadableSymbol, RiftError>)> {
+        self.declarations
+            .assembled
+            .iter()
+            .map(|(identity, object)| (identity, object.as_ref().map_err(Clone::clone)))
+    }
+
+    /// Iterates captured objects with a declaration whose canonical identity is unestablished.
+    ///
+    /// # Errors
+    /// Returns the original provider failure when captured facts cannot be assembled.
+    pub fn unestablished_objects(&self) -> impl Iterator<Item = Result<ReadableSymbol, RiftError>> {
+        self.declarations
+            .provider
+            .iter()
+            .filter(|(_, bindings)| {
+                bindings
+                    .iter()
+                    .any(|binding| !self.identities.contains_key(binding))
+            })
+            .map(|(provider, _)| {
+                ReadableSymbol::assembled_by(&self.semantics, provider)
+                    .ok_or_else(|| errors::index::workspace_provider().error())
+            })
+    }
+
     /// Whether the captured facts establish exact absence for this language.
     #[must_use]
     pub fn identity_coverage_complete(&self, language: &Language) -> bool {

@@ -69,6 +69,80 @@ impl LocalSymbolViewInput {
         ))
     }
 
+    /// Projects captured symbol facts for a query whose algebra requires only symbols.
+    ///
+    /// # Errors
+    /// Returns the captured publication failure or a graph admission refusal.
+    pub fn project_symbols(
+        &self,
+        selection: rift_search::sparql::SymbolSelection<'_>,
+        limits: rift_search::sparql::GraphLimits,
+        cancellation: &rift_search::sparql::QueryCancellation,
+        deadline: std::time::Instant,
+    ) -> Result<rift_search::sparql::GraphDataset, RiftError> {
+        use rift_search::sparql::{
+            GraphDataset, GraphFact, RevisionIri, SymbolAddress, SymbolSelection,
+        };
+
+        if !self.ready {
+            return errors::server::search_coverage_unavailable()
+                .operation("graph query acquisition")
+                .fail();
+        }
+        let metadata: CapturedMetadata = serde_json::from_slice(&self.material.metadata)
+            .map_err(|error| material_error("decode captured metadata", &error))?;
+        let revision = RevisionIri::parse(&metadata.revision.to_string())?;
+        let mut dataset = GraphDataset::builder(limits);
+        let index = &self.material.index;
+        let check = || {
+            if cancellation.is_cancelled() {
+                return errors::search::query_cancelled().fail();
+            }
+            if std::time::Instant::now() >= deadline {
+                let timeout_ms =
+                    u64::try_from(limits.evaluation_timeout().as_millis()).unwrap_or(u64::MAX);
+                return errors::search::query_deadline_exceeded()
+                    .timeout_ms(timeout_ms)
+                    .fail();
+            }
+            Ok(())
+        };
+        let mut write = |symbol: &rift_index::ReadableSymbol, address: SymbolAddress<'_>| {
+            let facts = symbol.facts();
+            if matches!(selection, SymbolSelection::Named(name) if name != facts.name()) {
+                return Ok(());
+            }
+            dataset.insert(GraphFact::SymbolDetails {
+                address,
+                name: facts.name(),
+                kind: &facts.kind().0,
+                language: facts.language(),
+                revision: &revision,
+            })
+        };
+
+        for (identity, symbol) in index.objects() {
+            check()?;
+            let identity = rift_protocol::read::SymbolId(identity.as_str().to_owned());
+            write(symbol?, SymbolAddress::Established(&identity))?;
+        }
+        for symbol in index.unestablished_objects() {
+            check()?;
+            let symbol = symbol?;
+            let contribution = symbol.assembled().contributions().first().ok_or_else(|| {
+                errors::server::search_coverage_unavailable()
+                    .operation("graph query acquisition")
+                    .error()
+            })?;
+            write(
+                &symbol,
+                SymbolAddress::Unestablished(contribution.reference()),
+            )?;
+        }
+        check()?;
+        Ok(dataset.build())
+    }
+
     /// Root of the immutable publication admitted by this input.
     #[must_use]
     pub fn root(&self) -> &Path {

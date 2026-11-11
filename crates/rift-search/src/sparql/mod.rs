@@ -41,8 +41,10 @@ mod dataset;
 mod evaluation;
 mod expression;
 mod limits;
+mod page;
 mod query;
 mod query_thread;
+mod requirements;
 mod vocabulary;
 
 #[cfg(test)]
@@ -52,7 +54,7 @@ mod tests;
 
 pub use dataset::{
     GraphDataset, GraphDatasetBuilder, GraphFact, HistoryEvent, NodeAddress, NodeFact,
-    NodeLocation, RevisionIri, SymbolRelation,
+    NodeLocation, RevisionIri, SymbolAddress, SymbolRelation,
 };
 pub use evaluation::{GraphAnswer, GraphTerm, QueryCancellation, SolutionTable};
 pub use limits::{
@@ -60,7 +62,9 @@ pub use limits::{
     EXPRESSION_BYTES_MAX, GraphLimits, GraphLimitsBuilder, LITERAL_BYTES_MAX, OPERATORS_MAX,
     PATTERNS_MAX, QUERY_BYTES_MAX, SOLUTIONS_MAX, TRIPLES_MAX,
 };
+pub use page::{PageForm, PageSelection, continuation_query};
 pub use query::GraphQuery;
+pub use requirements::SymbolSelection;
 pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,
     VocabularyResource, VocabularyValue,

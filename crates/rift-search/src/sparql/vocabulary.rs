@@ -30,6 +30,10 @@ pub enum VocabularyClass {
 #[derive(Clone, Copy, Debug, Eq, Hash, IntoStaticStr, PartialEq, VariantArray)]
 #[strum(serialize_all = "camelCase")]
 pub enum VocabularyProperty {
+    /// The name of a symbol, as written in source.
+    Name,
+    /// The selected revision of a symbol.
+    Revision,
     /// The declaration or syntax kind.
     Kind,
     /// The language identity segment.
@@ -157,6 +161,16 @@ impl VocabularyProperty {
         use VocabularyResource::{Range, Statement};
         use VocabularyValue::{Integer, Resource, String};
         let (subjects, object, description): (&'static [VocabularyResource], _, _) = match self {
+            Self::Name => (
+                &[SYMBOL],
+                String,
+                "The name of the symbol, as written in source.",
+            ),
+            Self::Revision => (
+                &[SYMBOL],
+                Resource(REVISION),
+                "The revision at which the server read the symbol's facts.",
+            ),
             Self::Kind => (
                 &[SYMBOL, NODE],
                 String,

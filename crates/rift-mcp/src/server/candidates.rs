@@ -1,3 +1,4 @@
+mod graph_query;
 mod symbol;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
