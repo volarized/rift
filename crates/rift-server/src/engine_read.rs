@@ -942,11 +942,7 @@ pub async fn graph_calls(
     direction: TraversalDirection,
     deadline: Instant,
 ) -> Result<GraphCalls, RiftError> {
-    let unavailable = || {
-        errors::server::search_coverage_unavailable()
-            .operation("graph calls")
-            .error()
-    };
+    let unavailable = graph_call_coverage;
     let identity = CoreSymbolId::new(seed.as_str().to_owned()).map_err(|_| unavailable())?;
     let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
     let [declaration] = declarations.as_slice() else {
@@ -968,7 +964,7 @@ pub async fn graph_calls(
     let answered = Box::pin(calls_on_engine(slot, &request, direction, true, deadline))
         .await
         .map_err(|error| {
-            if error.slug() == errors::lsp::engine_capability_absent::SLUG {
+            if graph_engine_method_missing(&error) {
                 unavailable()
             } else {
                 error
@@ -1061,6 +1057,15 @@ fn map_graph_calls(
         }
     }
     Ok(result)
+}
+
+fn graph_engine_method_missing(error: &RiftError) -> bool {
+    error.slug() == errors::lsp::engine_capability_absent::SLUG
+        || (error.slug() == errors::lsp::engine_refused_terminal::SLUG
+            && error.context().any(|(key, value)| {
+                key == "code"
+                    && value.parse::<i64>() == Ok(rift_lsp::correlation::METHOD_NOT_FOUND_CODE)
+            }))
 }
 
 fn graph_call_coverage() -> RiftError {
@@ -1403,11 +1408,7 @@ pub async fn graph_references(
     require_caller: bool,
     deadline: Instant,
 ) -> Result<Vec<QueryOccurrence>, RiftError> {
-    let unavailable = || {
-        errors::server::search_coverage_unavailable()
-            .operation("graph references")
-            .error()
-    };
+    let unavailable = graph_reference_coverage;
     let identity = CoreSymbolId::new(target.as_str().to_owned()).map_err(|_| unavailable())?;
     let (declarations, count) = reads.index().symbols_by_identity_page(&identity, 0, 1)?;
     let [_] = declarations.as_slice() else {
@@ -1444,10 +1445,14 @@ pub async fn graph_references(
         )?;
         let (report, unconfirmed) = Box::pin(references_on_engine(slot, &request, deadline))
             .await
-            .map_err(|error| match error.slug() {
-                errors::lsp::engine_capability_absent::SLUG
-                | errors::lsp::engine_analyzing::SLUG => unavailable(),
-                _ => error,
+            .map_err(|error| {
+                if graph_engine_method_missing(&error)
+                    || error.slug() == errors::lsp::engine_analyzing::SLUG
+                {
+                    unavailable()
+                } else {
+                    error
+                }
             })?;
         if unconfirmed || !report.full {
             return Err(unavailable());
@@ -1501,6 +1506,12 @@ pub async fn graph_references(
         }
     }
     Ok(found.into_values().collect())
+}
+
+fn graph_reference_coverage() -> RiftError {
+    errors::server::search_coverage_unavailable()
+        .operation("graph references")
+        .error()
 }
 
 fn map_references(

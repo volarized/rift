@@ -1056,16 +1056,9 @@ mod tests {
         ([("content-type", "application/json")], value.to_string())
     }
 
-    fn remote_graph_routes(
-        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
-        endpoint_expiry: String,
-    ) -> axum::Router {
-        use axum::routing::{get, post};
-
-        axum::Router::new()
-            .route("/rift/v1/capabilities", get(|| async {
-                json_response(&json!({
-                    "supported_package_managers": ["cargo"],
+    fn graph_capabilities(managers: &[&str], relationships: &[Value]) -> Value {
+        json!({
+            "supported_package_managers": managers,
                     "supported_features": ["resolutions", "search", "symbols", "relationships", "nodes"],
                     "publication_format": "rift-package-index-v2",
                     "analyzer_revision": "analyzer-v1",
@@ -1079,13 +1072,31 @@ mod tests {
                         "page_limit_default": 20, "cursor_bytes_max": 4096, "candidate_pool_max": 100,
                         "warnings_max": 32, "source_bytes_max": 1_048_576
                     },
-                    "relationship_capabilities": [{
-                        "direction": "outgoing", "facets": ["calls", "references"], "bounds": {
-                            "max_seeds": 8, "max_facets": 4, "max_relationships": 100,
-                            "max_occurrences": 100, "max_symbols": 100, "max_sources": 100
-                        }
-                    }]
-                }))
+                    "relationship_capabilities": relationships
+        })
+    }
+
+    fn graph_adjacency_capability(direction: &str, facets: &[&str]) -> Value {
+        json!({
+            "direction": direction, "facets": facets, "bounds": {
+                "max_seeds": 8, "max_facets": 4, "max_relationships": 100,
+                "max_occurrences": 100, "max_symbols": 100, "max_sources": 100
+            }
+        })
+    }
+
+    fn remote_graph_routes(
+        requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+        endpoint_expiry: String,
+    ) -> axum::Router {
+        use axum::routing::{get, post};
+
+        axum::Router::new()
+            .route("/rift/v1/capabilities", get(|| async {
+                json_response(&graph_capabilities(
+                    &["cargo"],
+                    &[graph_adjacency_capability("outgoing", &["calls", "references"])],
+                ))
             }))
             .route("/rift/v1/search", post(move |bytes: axum::body::Bytes| {
                 let requests = Arc::clone(&requests);
@@ -1117,6 +1128,197 @@ mod tests {
                     json_response(&result)
                 }
             }))
+    }
+
+    const PACKAGE_GREETING: &str =
+        "rift://symbol/pypi/pypi.org/greeting/python/greeting/core/greet";
+    const PACKAGE_BRIDGE: &str = "rift://symbol/pypi/pypi.org/otherpkg/python/otherpkg/bridge";
+    const PACKAGE_ENTRY: &str = "rift://symbol/pypi/pypi.org/otherpkg/python/otherpkg/entry";
+    const PACKAGE_OUTER: &str = "rift://symbol/pypi/pypi.org/otherpkg/python/otherpkg/outer";
+
+    fn reverse_graph_routes() -> axum::Router {
+        use axum::routing::{get, post};
+
+        axum::Router::new()
+            .route("/rift/v1/capabilities", get(|| async {
+                json_response(&graph_capabilities(
+                    &["pypi"],
+                    &[graph_adjacency_capability("incoming", &["calls"])],
+                ))
+            }))
+            .route("/rift/v1/search", post(|bytes: axum::body::Bytes| async move {
+                let request: Value = serde_json::from_slice(&bytes).expect("valid reverse request");
+                assert_eq!(request["relationships"]["direction"], "incoming");
+                assert_eq!(request["relationships"]["facets"], json!(["calls"]));
+                assert_eq!(request["packages"].as_array().expect("exact domain").len(), 2);
+                let (seed, caller, id) = match request["relationships"]["seeds"][0].as_str() {
+                    Some(PACKAGE_GREETING) => (PACKAGE_GREETING, PACKAGE_BRIDGE, 1),
+                    Some(PACKAGE_BRIDGE) => (PACKAGE_BRIDGE, PACKAGE_ENTRY, 2),
+                    Some(PACKAGE_ENTRY) => {
+                        assert_eq!(request["view"], VIEW);
+                        (PACKAGE_ENTRY, PACKAGE_OUTER, 3)
+                    }
+                    _ => return json_response(&json!({"outcome":"unavailable","reason":"insufficient_coverage"})),
+                };
+                let symbol = |id: &str| json!({
+                    "symbol": {"id":id,"name":id.rsplit('/').next(),"language":"python",
+                        "kind":"function","origin":{"source_kind":"synthetic"}}, "declarations":[]
+                });
+                json_response(&json!({
+                    "groups": [{"seed":seed,"complete":true,"relationships":[{
+                        "id": format!("{id:064x}"),
+                        "relationship":{"from":caller,"to":seed,"kind":"calls",
+                            "facets":["calls"],"derivation":"resolution"}
+                    }]}],
+                    "symbols":[symbol(seed),symbol(caller)],
+                    "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
+                    "view":{"id":VIEW,"expires_at":"2099-01-01T00:00:00Z"}
+                }))
+            }))
+    }
+
+    fn reverse_graph_workspace(
+        root: &std::path::Path,
+        endpoint: std::net::SocketAddr,
+    ) -> TestResult {
+        crate::server::hermetic_workspace(
+            root,
+            &format!(
+                "[source]\nexclude = ['.venv/**']\n\
+                 [languages.toml]\nenabled = false\n\
+                 [languages.python]\nstdlib = false\n\
+                 [languages.python.lsp]\nembedded = 'ty'\n\
+                 [global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n"
+            ),
+        )?;
+        let files = [
+            (
+                "pyproject.toml",
+                "[project]\nname = 'app'\nversion = '0.1.0'\ndependencies = ['greeting', 'otherpkg']\n\
+              [build-system]\nrequires = ['setuptools==80.9.0']\nbuild-backend = 'setuptools.build_meta'\n\
+              [tool.setuptools]\npy-modules = ['app']\n",
+            ),
+            (
+                "uv.lock",
+                "version = 1\n[[package]]\nname = 'app'\nversion = '0.1.0'\nsource = {editable='.'}\n\
+              [[package]]\nname = 'greeting'\nversion = '1.0.0'\nsource = {registry='https://pypi.org/simple'}\n\
+              [[package]]\nname = 'otherpkg'\nversion = '2.0.0'\nsource = {registry='https://pypi.org/simple'}\n",
+            ),
+            (
+                "app.py",
+                "from greeting.core import greet\n\ndef hello() -> str:\n    return greet('rift')\n\ndef entry() -> str:\n    return hello()\n",
+            ),
+            (".venv/pyvenv.cfg", "home=/usr/bin\nversion_info=3.12.4\n"),
+            (
+                ".venv/lib/python3.12/site-packages/greeting/__init__.py",
+                "from greeting.core import greet\n",
+            ),
+            (
+                ".venv/lib/python3.12/site-packages/greeting/core.py",
+                "def greet(name: str) -> str:\n    return name\n",
+            ),
+            (
+                ".venv/lib/python3.12/site-packages/greeting-1.0.0.dist-info/RECORD",
+                "greeting/__init__.py,,\ngreeting/core.py,,\ngreeting-1.0.0.dist-info/RECORD,,\n",
+            ),
+        ];
+        for (name, source) in files {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().ok_or("fixture file parent")?)?;
+            std::fs::write(path, source)?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_combines_package_and_local_incoming_calls() -> TestResult {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = listener.local_addr()?;
+        let service =
+            tokio::spawn(async move { axum::serve(listener, reverse_graph_routes()).await });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().canonicalize()?;
+        reverse_graph_workspace(&root, endpoint)?;
+        let limits = rift_index::WorkspaceIndexLimits::default();
+        let server = RiftMcp::build_settled(&root, limits).await?;
+        let query = QueryParams {
+            query: format!("SELECT DISTINCT ?caller {{ ?caller :calls <{PACKAGE_GREETING}> }}"),
+            language: QueryLanguage::Sparql,
+        };
+        let inverse = QueryParams {
+            query: format!(
+                "SELECT DISTINCT ?caller {{ <{PACKAGE_BRIDGE}> ^:calls/^:calls ?caller }}"
+            ),
+            language: QueryLanguage::Sparql,
+        };
+        for (query, expected) in [
+            (
+                query.clone(),
+                ["rift://symbol/local/python/app/hello", PACKAGE_BRIDGE].as_slice(),
+            ),
+            (inverse, [PACKAGE_OUTER].as_slice()),
+        ] {
+            let response = server
+                .graph_query(query)
+                .await
+                .map_err(|failure| format!("{failure:?}"))?
+                .0;
+            let QueryReadResult::Results(result) = response else {
+                return Err(
+                    format!("expected complete local and package callers: {response:?}").into(),
+                );
+            };
+            let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+                return Err("expected caller bindings".into());
+            };
+            let ids = bindings
+                .iter()
+                .filter_map(|row| match &row["caller"] {
+                    rift_protocol::query::RdfTerm::Iri { value } => Some(value.as_str()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(ids, expected.iter().copied().collect());
+        }
+
+        let unsupported = server
+            .graph_query(QueryParams {
+                query: format!("ASK {{ <{PACKAGE_GREETING}> ^:calls/^:calls ?caller }}"),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(
+                unsupported,
+                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason: SymbolUnavailableReason::InsufficientCoverage,
+                    ..
+                })
+            ),
+            "{unsupported:?}"
+        );
+
+        std::fs::write(root.join("unestablished.py"), "def might_call(): pass\n")?;
+        let incomplete = RiftMcp::build_settled(&root, limits).await?;
+        let response = incomplete
+            .graph_query(query)
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(
+                response,
+                QueryReadResult::Unavailable(SearchUnavailable::Unavailable {
+                    reason: SymbolUnavailableReason::InsufficientCoverage,
+                    ..
+                })
+            ),
+            "{response:?}"
+        );
+        service.abort();
+        Ok(())
     }
 
     #[tokio::test]
