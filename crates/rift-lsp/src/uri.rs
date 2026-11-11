@@ -50,6 +50,7 @@ pub struct TreeRoot {
 
 impl TreeRoot {
     /// Converts an absolute filesystem root into its forward-slash form.
+    /// Windows verbatim drive paths use the same `C:/` form as ordinary drive paths.
     ///
     /// # Errors
     ///
@@ -58,6 +59,10 @@ impl TreeRoot {
         let text = root
             .to_str()
             .ok_or_else(|| errors::lsp::uri_root_not_unicode().error())?;
+        let text = text
+            .strip_prefix(r"\\?\")
+            .filter(|path| matches!(path.as_bytes(), [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic()))
+            .unwrap_or(text);
         Self::from_slash_form(text.replace('\\', "/"))
     }
 
@@ -519,6 +524,20 @@ mod tests {
                 "{spelling}"
             );
         }
+    }
+
+    #[test]
+    fn windows_verbatim_drive_roots_emit_hostless_file_uris() {
+        let tree = TreeRoot::new(Path::new(r"\\?\c:\work space\ws")).expect("verbatim root");
+        assert_eq!(tree, root("C:/work space/ws"));
+        assert_eq!(
+            tree.root_uri().expect("root URI").as_str(),
+            "file:///C:/work%20space/ws"
+        );
+        let document = path("src/lib.rs");
+        let uri = tree.document_uri(&document).expect("document URI");
+        assert_eq!(uri.as_str(), "file:///C:/work%20space/ws/src/lib.rs");
+        assert_eq!(tree.project_path(&uri).expect("project path"), document);
     }
 
     #[test]

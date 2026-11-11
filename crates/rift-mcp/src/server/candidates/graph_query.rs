@@ -1233,39 +1233,46 @@ mod tests {
                  [global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n"
             ),
         )?;
+        let site_packages = root.join(if cfg!(windows) {
+            ".venv/Lib/site-packages"
+        } else {
+            ".venv/lib/python3.12/site-packages"
+        });
         let files = [
             (
-                "pyproject.toml",
+                root.join("pyproject.toml"),
                 "[project]\nname = 'app'\nversion = '0.1.0'\ndependencies = ['greeting', 'otherpkg']\n\
               [build-system]\nrequires = ['setuptools==80.9.0']\nbuild-backend = 'setuptools.build_meta'\n\
               [tool.setuptools]\npy-modules = ['app']\n",
             ),
             (
-                "uv.lock",
+                root.join("uv.lock"),
                 "version = 1\n[[package]]\nname = 'app'\nversion = '0.1.0'\nsource = {editable='.'}\n\
               [[package]]\nname = 'greeting'\nversion = '1.0.0'\nsource = {registry='https://pypi.org/simple'}\n\
               [[package]]\nname = 'otherpkg'\nversion = '2.0.0'\nsource = {registry='https://pypi.org/simple'}\n",
             ),
             (
-                "app.py",
+                root.join("app.py"),
                 "from greeting.core import greet\n\ndef hello() -> str:\n    return greet('rift')\n\ndef entry() -> str:\n    return hello()\n",
             ),
-            (".venv/pyvenv.cfg", "home=/usr/bin\nversion_info=3.12.4\n"),
             (
-                ".venv/lib/python3.12/site-packages/greeting/__init__.py",
+                root.join(".venv/pyvenv.cfg"),
+                "home=/usr/bin\nversion_info=3.12.4\n",
+            ),
+            (
+                site_packages.join("greeting/__init__.py"),
                 "from greeting.core import greet\n",
             ),
             (
-                ".venv/lib/python3.12/site-packages/greeting/core.py",
+                site_packages.join("greeting/core.py"),
                 "def greet(name: str) -> str:\n    return name\n",
             ),
             (
-                ".venv/lib/python3.12/site-packages/greeting-1.0.0.dist-info/RECORD",
+                site_packages.join("greeting-1.0.0.dist-info/RECORD"),
                 "greeting/__init__.py,,\ngreeting/core.py,,\ngreeting-1.0.0.dist-info/RECORD,,\n",
             ),
         ];
-        for (name, source) in files {
-            let path = root.join(name);
+        for (path, source) in files {
             std::fs::create_dir_all(path.parent().ok_or("fixture file parent")?)?;
             std::fs::write(path, source)?;
         }
