@@ -115,6 +115,9 @@ fn unavailable(reason: SymbolUnavailableReason, page: Box<SearchResult>) -> Sear
 }
 
 fn incomplete_retrieval(warning: &ReadWarning) -> bool {
+    if let ReadWarning::PackageContextDegraded { resolver, .. } = warning {
+        return resolver.split('/').next() != Some(rift_dependency::STANDARD_LIBRARY_MANAGER);
+    }
     matches!(
         warning,
         ReadWarning::StaleIndex { .. }
@@ -137,6 +140,21 @@ fn incomplete_retrieval(warning: &ReadWarning) -> bool {
             | ReadWarning::PackageAbsent { .. }
             | ReadWarning::PackageRequirementAbsent { .. }
             | ReadWarning::PackageSubstituted { .. }
-            | ReadWarning::PackageContextDegraded { .. }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReadWarning, incomplete_retrieval};
+
+    #[test]
+    fn runtime_probe_does_not_invalidate_ranked_package_coverage() {
+        for (resolver, incomplete) in [("stdlib/python", false), ("stdlib", false), ("uv", true)] {
+            let warning = ReadWarning::PackageContextDegraded {
+                resolver: resolver.to_owned(),
+                reason: "fixture context unavailable".to_owned(),
+            };
+            assert_eq!(incomplete_retrieval(&warning), incomplete, "{resolver}");
+        }
+    }
 }
