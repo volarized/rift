@@ -2711,15 +2711,23 @@ pub enum DeclarationPositionResult {
     /// An established declaration holds this exact position.
     #[default]
     Object(DeclarationPositionResultObject),
-    /// Complete captured coverage contains no declaration at this position.
-    Object2(DeclarationPositionResultObject2),
+    /// The complete facts of the position's release hold no declaration at this position.
+    SourcePosition(DeclarationPositionResultSourcePosition),
     /// Presence or absence cannot be established at this exact position.
-    Object3(DeclarationPositionResultObject3),
+    Object2(DeclarationPositionResultObject2),
+}
+impl DeclarationPositionResult {
+    /// The complete facts of the position's release hold no declaration at this position.
+    pub fn source(position: SourcePosition) -> Self {
+        Self::SourcePosition(DeclarationPositionResultSourcePosition {
+            position,
+            ..Default::default()
+        })
+    }
 }
 /// A duration: an integer magnitude with a required unit suffix `ms`, `s`, `m`, `h`, or `d`.
 pub type Duration = String;
-/// Finds declarations holding positions in one immutable selection.
-#[serde_with::skip_serializing_none]
+/// Finds the declarations holding source positions at the releases the positions name.
 #[derive(
     Debug,
     Clone,
@@ -2735,14 +2743,8 @@ pub struct FindDeclarationsParams {
     /// Positions to answer once, retaining request order.
     #[validate(length(min = 1u64, max = 1_000u64), nested)]
     pub positions: Vec<SourcePosition>,
-    /// A service-issued key for one immutable view in one serving context.
-    #[validate(
-        length(min = 3u64, max = 4_096u64),
-        regex(path = "REGEX_PACKAGE_SEARCH_REQUEST_VIEW")
-    )]
-    pub view: Option<String>,
 }
-/// One answer per submitted position, retaining one shared captured selection.
+/// One answer per submitted position, in request order.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields)]
 pub struct FindDeclarationsResult {
@@ -4963,10 +4965,10 @@ pub enum SearchPackagePatternsResponse {
     ///default: Unknown response
     Unknown,
 }
-/// Finds declarations holding source positions in one immutable selection. Answers each position once, retaining request order and one shared captured view. A position in a type stub may name a declaration with a proved runtime or package owner. Complete captured coverage with no declaration returns missing; unavailable coverage returns unavailable. The server MUST NOT answer from another version, and MUST NOT move a position past its line or the text, or one inside a character, to a neighboring one.
+/// Finds declarations holding source positions at the releases the positions name. Answers each position once, retaining request order. A position in a type stub may name a declaration with a proved runtime or package owner. Complete facts of a position's release with no declaration there return missing; unavailable coverage returns unavailable. The server MUST NOT answer from another version, and MUST NOT move a position past its line or the text, or one inside a character, to a neighboring one.
 #[derive(Debug, Clone, validator::Validate, oas3_gen_support::Default)]
 pub struct FindDeclarationsRequest {
-    /// Source positions to answer in one captured selection.
+    /// Source positions to answer, each at the release it names.
     #[validate(nested)]
     pub body: FindDeclarationsParams,
 }
@@ -5067,7 +5069,7 @@ impl FindDeclarationsRequest {
 /// Response types for findDeclarations
 #[derive(Debug, Clone)]
 pub enum FindDeclarationsResponse {
-    ///200: Ordered outcomes for every submitted position in one captured view.
+    ///200: Ordered outcomes for every submitted position.
     Ok(FindDeclarationsResult),
     ///400: Request JSON, query parameters, or field relationships are invalid.
     BadRequest(ProblemDetails),
@@ -5553,30 +5555,24 @@ pub struct DeclarationPositionResultObject {
     pub kind: String,
     /// One point on the history axis. `rift://revision/git/<commit>` names a complete git commit id, and `rift://revision/git/<reference>` a branch, tag, or `HEAD` with optional `~N` suffixes that the server resolves to a commit. `rift://revision/<manager>/<registry>/<name>@<version>` names a package release, `rift://revision/stdlib/<runtime>@<version>` a runtime release, and `rift://revision/tree/<digest>` one served working tree. An answer names a commit, a release, or a tree, never a reference.
     pub revision: String,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: CapturedView,
     #[default("found".to_string())]
     pub outcome: String,
 }
-/// Complete captured coverage contains no declaration at this position.
+/// The complete facts of the position's release hold no declaration at this position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct DeclarationPositionResultObject2 {
+pub struct DeclarationPositionResultSourcePosition {
     /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: CapturedView,
     #[default("missing".to_string())]
     pub outcome: String,
 }
 /// Presence or absence cannot be established at this exact position.
 #[derive(Debug, Clone, PartialEq, Deserialize, oas3_gen_support::Default)]
 #[serde(deny_unknown_fields, default)]
-pub struct DeclarationPositionResultObject3 {
+pub struct DeclarationPositionResultObject2 {
     /// One exact position in a source unit, at the release of a package or runtime unit.
     pub position: SourcePosition,
-    /// The immutable serving view and the expiry promised by its owner.
-    pub view: Option<CapturedView>,
     /// Why an exact selection cannot establish presence or definite absence.
     pub reason: SymbolUnavailableReason,
     #[default("unavailable".to_string())]

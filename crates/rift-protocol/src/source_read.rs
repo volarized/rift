@@ -1,11 +1,11 @@
-//! Declaration positions in an immutable selection.
+//! Declaration positions in the released sources a position names.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::read::{ExactKind, ReadWarning, SourceUnitId, SymbolId};
 use crate::revision::Revision;
-use crate::symbol_read::{CapturedView, CapturedViewId, SymbolUnavailableReason};
+use crate::symbol_read::SymbolUnavailableReason;
 
 /// Most positions submitted to one declaration-position read.
 pub const SOURCE_POSITIONS_MAX: usize = 1000;
@@ -42,7 +42,7 @@ pub struct SourcePosition {
     pub character: u64,
 }
 
-/// Finds declarations holding positions in one immutable selection.
+/// Finds the declarations holding source positions at the releases the positions name.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindDeclarationsParams {
@@ -52,9 +52,6 @@ pub struct FindDeclarationsParams {
     #[schemars(length(min = 1, max = SOURCE_POSITIONS_MAX))]
     #[schemars(extend("uniqueItems" = true))]
     pub positions: Vec<SourcePosition>,
-    /// A preceding immutable selection shared by the whole batch.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub view: Option<CapturedViewId>,
 }
 
 /// One submitted source position and its exact declaration outcome.
@@ -74,29 +71,22 @@ pub enum DeclarationPositionResult {
         /// The release of the declaration's owner that `id` answers in. It differs from
         /// the position's release when a proved stub mapping names a runtime declaration.
         revision: Revision,
-        /// Immutable selection supplying this declaration.
-        view: CapturedView,
     },
-    /// Complete captured coverage contains no declaration at this position.
+    /// The complete facts of the position's release hold no declaration at this position.
     Missing {
         /// Submitted position, unchanged.
         position: SourcePosition,
-        /// Complete immutable selection searched.
-        view: CapturedView,
     },
     /// Presence or absence cannot be established at this exact position.
     Unavailable {
         /// Submitted position, unchanged.
         position: SourcePosition,
-        /// Selected view, when one could be captured.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        view: Option<CapturedView>,
         /// Typed cause of unavailability.
         reason: SymbolUnavailableReason,
     },
 }
 
-/// One answer per submitted position, retaining one shared captured selection.
+/// One answer per submitted position, in request order.
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FindDeclarationsResult {
@@ -148,36 +138,21 @@ impl DeclarationPositionResult {
             | Self::Unavailable { position, .. } => position,
         }
     }
-
-    /// Captured view, absent only when a selection could not be admitted.
-    #[must_use]
-    pub const fn view(&self) -> Option<&CapturedView> {
-        match self {
-            Self::Found { view, .. } | Self::Missing { view, .. } => Some(view),
-            Self::Unavailable { view, .. } => view.as_ref(),
-        }
-    }
 }
 
 impl FindDeclarationsResult {
-    /// Checks one ordered outcome per position and a single shared captured view.
+    /// Checks one ordered outcome per position, each found identity answering for its
+    /// release.
     #[must_use]
     pub fn is_valid_for(&self, request: &FindDeclarationsParams) -> bool {
         if !request.is_valid() || self.results.len() != request.positions.len() {
             return false;
         }
-        let selected = self
-            .results
-            .iter()
-            .find_map(DeclarationPositionResult::view);
         self.results
             .iter()
             .zip(&request.positions)
             .all(|(result, position)| {
                 result.position() == position
-                    && result.view().is_none_or(|view| {
-                        Some(view) == selected && view_matches(view, request.view.as_ref())
-                    })
                     && match result {
                         DeclarationPositionResult::Found {
                             id, kind, revision, ..
@@ -190,10 +165,6 @@ impl FindDeclarationsResult {
                     }
             })
     }
-}
-
-fn view_matches(view: &CapturedView, requested: Option<&CapturedViewId>) -> bool {
-    requested.is_none_or(|requested| view.id == *requested)
 }
 
 #[cfg(test)]

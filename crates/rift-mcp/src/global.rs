@@ -490,9 +490,8 @@ pub(crate) fn workspace_release(
 /// A callee in an installed package is asked at the exact version its install folder
 /// names, since a position belongs to one version of a file. A runtime callee is asked
 /// only when its source root establishes an exact runtime version. Unversioned standard
-/// library positions remain unasked. Each encoding batch reuses the preceding captured
-/// view; conflicting views discard the answer. Past
-/// [`DECLARATION_POSITIONS_MAX`] distinct positions in one encoding the rest are left
+/// library positions remain unasked. Each position is answered at the release it names.
+/// Past [`DECLARATION_POSITIONS_MAX`] distinct positions in one encoding the rest are left
 /// unasked too.
 ///
 /// # Errors
@@ -507,27 +506,8 @@ pub(crate) async fn callee_declarations(
     use rift_protocol::source_read::DeclarationPositionResult;
     let mut named = HashMap::new();
     let mut verified = HashMap::new();
-    let mut selected: Option<rift_protocol::symbol_read::CapturedView> = None;
-    for mut request in declaration_requests(callees) {
-        request.view = selected.as_ref().map(|view| view.id.clone());
+    for request in declaration_requests(callees) {
         let answer = client.find_declarations(&request).await?;
-        let next_view = answer
-            .results
-            .iter()
-            .find_map(DeclarationPositionResult::view);
-        if selected
-            .as_ref()
-            .is_some_and(|view| next_view.is_some_and(|next| next != view))
-        {
-            return errors::client::response_invalid()
-                .operation("callee declarations")
-                .field("view")
-                .violation("declaration pages returned different captured views")
-                .fail();
-        }
-        if selected.is_none() {
-            selected = next_view.cloned();
-        }
         let encoding = match request.position_encoding {
             rift_protocol::source_read::PositionEncoding::Utf8 => {
                 PackageDeclarationRequestPositionEncoding::Utf8
@@ -561,9 +541,6 @@ pub(crate) async fn callee_declarations(
                 character: position.character,
             };
             named.insert((encoding.clone(), key), (id, kind, revision));
-        }
-        if selected.is_none() {
-            break;
         }
     }
     Ok(CalleeDeclarations { named })
@@ -701,7 +678,6 @@ fn batched_positions(
             requests.push(FindDeclarationsParams {
                 position_encoding: encoding,
                 positions: Vec::new(),
-                view: None,
             });
             requests.len() - 1
         });

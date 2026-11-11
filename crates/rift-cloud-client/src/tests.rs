@@ -2283,59 +2283,6 @@ fn generated_source_range_preserves_exact_integer_bound() {
 }
 
 #[tokio::test]
-async fn captured_custom_positions_retain_the_requested_view_and_coverage_refusal() {
-    use rift_protocol::source_read::FindDeclarationsParams;
-    let unit = "rift://source/custom/src/lib.rs";
-    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
-    let position = serde_json::json!({"unit":unit,"line":0,"character":0});
-    let request: FindDeclarationsParams = serde_json::from_value(
-        serde_json::json!({"position_encoding":"utf-16","positions":[position],"view":view["id"]}),
-    )
-    .expect("captured custom position");
-    let value = serde_json::json!({"results":[{"outcome":"unavailable","position":position,"view":view,"reason":"insufficient_coverage"}]});
-    let (server, client) = operation_client(OperationFixture::SourceDeclarations(
-        value.clone(),
-        StatusCode::OK,
-    ))
-    .await;
-    assert_eq!(
-        client
-            .find_declarations(&request)
-            .await
-            .expect("coverage refusal"),
-        serde_json::from_value(value).expect("position result")
-    );
-    let requests = server.state.request_log.lock().await;
-    let sent = requests
-        .iter()
-        .find(|request| request.path.ends_with("/declarations"))
-        .expect("custom position request");
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&sent.body).expect("body")["view"],
-        view["id"]
-    );
-    assert!(
-        !requests
-            .iter()
-            .any(|request| request.path.ends_with("/resolutions"))
-    );
-}
-
-#[tokio::test]
-async fn captured_view_does_not_admit_project_sources_to_global_reads() {
-    use rift_protocol::source_read::FindDeclarationsParams;
-    let (server, client) = operation_client(OperationFixture::Valid).await;
-    let unit = "rift://source/project/src/lib.rs";
-    let declarations: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-8","positions":[{"unit":unit,"line":0,"character":0}],"view":"a".repeat(64)})).expect("project position");
-    assert_registered_field(
-        &(client.find_declarations(&declarations).await).expect_err("registered refusal"),
-        "rift.client.request_invalid",
-        "unit",
-    );
-    assert!(server.state.request_log.lock().await.is_empty());
-}
-
-#[tokio::test]
 async fn declaration_positions_refuse_unproved_global_owners_before_http() {
     use rift_protocol::source_read::FindDeclarationsParams;
     let (server, client) = operation_client(OperationFixture::Valid).await;
@@ -2357,17 +2304,19 @@ async fn declaration_positions_refuse_unproved_global_owners_before_http() {
 }
 
 #[tokio::test]
-async fn source_declaration_batch_preserves_runtime_and_stub_owners_with_one_view() {
+async fn source_declaration_batch_preserves_runtime_and_stub_owners_in_request_order() {
     use rift_protocol::source_read::FindDeclarationsParams;
     let positions = serde_json::json!([
         {"unit":"rift://source/stdlib/cpython/Lib/pathlib.py","revision":"rift://revision/stdlib/cpython@3.12.9","line":0,"character":0},
         {"unit":"rift://source/pypi/pypi.org/types-pathlib/pathlib.pyi","revision":"rift://revision/pypi/pypi.org/types-pathlib@1.0.0","line":2,"character":3}
     ]);
-    let request: FindDeclarationsParams = serde_json::from_value(serde_json::json!({"position_encoding":"utf-16","positions":positions,"view":"a".repeat(64)})).expect("position request");
-    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
+    let request: FindDeclarationsParams = serde_json::from_value(
+        serde_json::json!({"position_encoding":"utf-16","positions":positions}),
+    )
+    .expect("position request");
     let value = serde_json::json!({"results":[
-        {"outcome":"found","position":positions[0],"id":"rift://symbol/stdlib/cpython/python/pathlib/Path","kind":"class","revision":"rift://revision/stdlib/cpython@3.12.9","view":view},
-        {"outcome":"unavailable","position":positions[1],"reason":"insufficient_coverage","view":view}
+        {"outcome":"found","position":positions[0],"id":"rift://symbol/stdlib/cpython/python/pathlib/Path","kind":"class","revision":"rift://revision/stdlib/cpython@3.12.9"},
+        {"outcome":"unavailable","position":positions[1],"reason":"insufficient_coverage"}
     ],"warnings":[]});
     let (server, client) = operation_client(OperationFixture::SourceDeclarations(
         value.clone(),
@@ -2399,7 +2348,7 @@ async fn source_declaration_batch_preserves_runtime_and_stub_owners_with_one_vie
 }
 
 #[tokio::test]
-async fn source_declaration_batch_refuses_reordering_foreign_views_and_whole_batch_missing() {
+async fn source_declaration_batch_refuses_reordering_views_and_whole_batch_missing() {
     use rift_protocol::source_read::FindDeclarationsParams;
     let positions = serde_json::json!([
         {"unit":"rift://source/stdlib/cpython/Lib/pathlib.py","revision":"rift://revision/stdlib/cpython@3.12.9","line":0,"character":0},
@@ -2409,18 +2358,18 @@ async fn source_declaration_batch_refuses_reordering_foreign_views_and_whole_bat
         serde_json::json!({"position_encoding":"utf-8","positions":positions}),
     )
     .expect("position request");
-    let view = serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
-    let value = serde_json::json!({"results":[{"outcome":"missing","position":positions[0],"view":view},{"outcome":"missing","position":positions[1],"view":view}],"warnings":[]});
+    let value = serde_json::json!({"results":[{"outcome":"missing","position":positions[0]},{"outcome":"missing","position":positions[1]}],"warnings":[]});
     let mut reordered = value.clone();
     reordered["results"]
         .as_array_mut()
         .expect("results")
         .swap(0, 1);
-    let mut foreign_view = value.clone();
-    foreign_view["results"][1]["view"]["id"] = serde_json::json!("b".repeat(64));
+    let mut viewed = value.clone();
+    viewed["results"][1]["view"] =
+        serde_json::json!({"id":"a".repeat(64),"expires_at":"2026-10-10T10:05:00Z"});
     for (value, status) in [
         (reordered, StatusCode::OK),
-        (foreign_view, StatusCode::OK),
+        (viewed, StatusCode::OK),
         (value, StatusCode::NOT_FOUND),
     ] {
         let (_server, client) =
