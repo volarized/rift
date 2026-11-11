@@ -835,7 +835,7 @@ fn package_json(name: &str) -> serde_json::Value {
 
 fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "id":format!("rift://symbol/rust/cargo/{package}/src/{suffix}.rs/demo"),
+        "id":format!("rift://symbol/cargo/crates.io/{package}/rust/{package}/{suffix}/demo"),
         "kind":"function",
         "language":"rust",
         "name":"demo",
@@ -845,7 +845,7 @@ fn symbol_json(package: &str, suffix: &str) -> serde_json::Value {
 
 fn search_hit_json(package: &str, suffix: &str) -> serde_json::Value {
     serde_json::json!({
-        "package":package_json(package), "symbol":symbol_json(package, suffix),
+        "package":package_json(package), "symbol":symbol_json(package, suffix), "qualified_name":"demo",
         "unit":format!("rift://source/cargo/crates.io/{package}/src/{suffix}.rs"), "range":{"start":0,"end":4}, "line":1,
         "contributing_fields":["qualified_name"], "match_class":"qualified_exact"
     })
@@ -2784,14 +2784,14 @@ fn test_search_match_class_uses_original_spelling_before_class() {
     request.query = Some("module::searchhit SearchHit".to_owned());
     let mut value = search_hit_json("demo", "first");
     value["symbol"]["name"] = serde_json::json!("SearchHit");
+    value["qualified_name"] = serde_json::json!("Module::SearchHit");
     value["match_class"] = serde_json::json!("name_exact");
     let hit: PackageSearchHit = serde_json::from_value(value).expect("search hit fixture");
     request.identifiers = Some(vec!["module::searchhit".to_owned(), "SearchHit".to_owned()]);
-    assert!((super::validate_search_match_class(&request, &hit, "Module::SearchHit")).is_ok());
+    assert!((super::validate_search_match_class(&request, &hit)).is_ok());
     request.identifiers = Some(Vec::new());
     assert_registered_field(
-        &(super::validate_search_match_class(&request, &hit, "Module::SearchHit"))
-            .expect_err("registered refusal"),
+        &(super::validate_search_match_class(&request, &hit)).expect_err("registered refusal"),
         "rift.client.response_invalid",
         "match_class",
     );
@@ -2866,10 +2866,7 @@ async fn test_symbol_lookup_refuses_discovery_match_class() {
     );
 }
 
-/// Package analysis mints a package declaration's identity over its package and path, so
-/// a hit carries `rift://symbol/rust/cargo/demo/src/first.rs/demo` beside the unit
-/// `rift://source/cargo/crates.io/demo/src/first.rs`. The package-relative spelling names a
-/// project file, and no producer mints it for a package declaration, so it is refused.
+/// A flat ranked declaration keeps its canonical owner independently of its source path.
 #[tokio::test]
 async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
     let hit = |id: &str| {
@@ -2877,15 +2874,15 @@ async fn test_hits_accept_the_symbol_identity_package_analysis_mints() {
         value["symbol"]["id"] = serde_json::json!(id);
         serde_json::from_value::<PackageSearchHit>(value).expect("search hit fixture")
     };
-    let minted = rift_core::symbol_identity("rust", "cargo/demo/src/first.rs", "demo");
-    let candidate = PackageSearchCandidate::try_from(&hit(&minted));
+    let minted = "rift://symbol/cargo/crates.io/demo/rust/demo/surface/demo";
+    let candidate = PackageSearchCandidate::try_from(&hit(minted));
     assert!(candidate.is_ok(), "{minted}: {candidate:?}");
     let refused = [
-        "rift://symbol/rust/src/first.rs/demo",
-        "rift://symbol/rust/cargo/other/src/first.rs/demo",
-        "rift://symbol/rust/npm/demo/src/first.rs/demo",
-        "rift://symbol/rust/cargo/demo/src/second.rs/demo",
-        "rift://symbol/rust/cargo/demo/demo",
+        "rift://symbol/local/rust/demo/demo",
+        "rift://symbol/cargo/crates.io/other/rust/demo/demo",
+        "rift://symbol/npm/npmjs.org/demo/typescript/demo/demo",
+        "rift://symbol/cargo/crates.io/demo/python/demo/demo",
+        "rift://symbol/rust/cargo/demo/src/first.rs/demo",
     ];
     for id in refused {
         let error = PackageSearchCandidate::try_from(&hit(id)).expect_err("identity refusal");

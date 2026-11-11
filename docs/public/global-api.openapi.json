@@ -678,7 +678,7 @@
                             "registry": "crates.io"
                           },
                           "symbol": {
-                            "id": "rift://symbol/rust/cargo/serde/src/de.rs/ReadService",
+                            "id": "rift://symbol/cargo/crates.io/serde/rust/serde/de/ReadService",
                             "language": "rust",
                             "name": "ReadService",
                             "kind": "struct",
@@ -702,6 +702,7 @@
                           "contributing_fields": [
                             "name"
                           ],
+                          "qualified_name": "de::ReadService",
                           "match_class": "name_exact"
                         }
                       ],
@@ -3275,6 +3276,12 @@
           "symbol": {
             "$ref": "#/components/schemas/Symbol"
           },
+          "qualified_name": {
+            "description": "The provider's qualified declaration name used for identifier ranking, with its original spelling.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
           "unit": {
             "$ref": "#/components/schemas/SourceUnitId"
           },
@@ -3316,6 +3323,7 @@
         "required": [
           "package",
           "symbol",
+          "qualified_name",
           "unit",
           "range",
           "line",
