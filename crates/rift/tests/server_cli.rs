@@ -2579,7 +2579,7 @@ fn debug_lingering_lock(stage: &str, path: &Path) {
 // Leaked handles: https://github.com/volarized/rift/issues/484
 #[test]
 fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
-    let directory = workspace()?;
+    let directory = workspace_on_the_default_range()?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = harness::FailureWindow::begin(root);

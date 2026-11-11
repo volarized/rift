@@ -1564,7 +1564,7 @@ const RECORD_READ_ATTEMPT_COUNT: u32 = 50;
 // Startup refusal observation: https://github.com/volarized/rift/issues/490
 #[tokio::test]
 async fn a_start_lost_to_a_lingering_shared_lock_spawns_again() -> TestResult {
-    let directory = workspace()?;
+    let directory = harness::laid_out_workspace(&[("lib.rs", harness::LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
