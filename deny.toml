@@ -8,12 +8,6 @@ ignore = [
   # gemm, candle-core's CPU matrix kernel, uses paste for its macro expansion. No candle
   # release drops it, and the crate is a build-time proc macro with no runtime surface.
   { id = "RUSTSEC-2024-0436", reason = "paste is a build-time proc macro reached only through gemm <- candle-core" },
-  # zip 8.6.0 remains affected, but the pinned consumers do not call the affected
-  # filesystem extraction APIs. See .cargo/audit.toml for the consumer review,
-  # advisory links, upstream version constraints, and review/removal conditions.
-  { id = "RUSTSEC-2026-0367", reason = "pinned zip consumers do not use filesystem extraction that preserves privileged permission bits" },
-  { id = "RUSTSEC-2026-0368", reason = "pinned zip consumers do not use filesystem extraction that creates archive symbolic links" },
-  { id = "RUSTSEC-2026-0369", reason = "pinned zip consumers do not use filesystem extraction that changes archive permissions through symbolic links" },
 ]
 
 [licenses]
@@ -32,8 +26,7 @@ allow = [
   # beside MIT.
   "MPL-2.0",
   "Unicode-3.0",
-  # Unicode-DFS-2016 covers `unicode_names2`'s bundled Unicode data tables,
-  # reached through `ruff_python_parser`.
+  # Unicode-DFS-2016 covers the bundled Unicode data tables in Ruff's parser.
   "Unicode-DFS-2016",
   "Zlib",
 ]
@@ -53,15 +46,13 @@ allow-wildcard-paths = true
 # bitflags 1 while the rest of the graph is on 2.
 #
 # The entries below the blank line are the candle embedding stack's. Every one is
-# reached only through candle-core or the tokenizers copy candle-core requires, and
-# none can be aligned from this workspace: candle 0.11 pins them itself.
+# reached through the embedding stack's pinned dependencies.
 # spm_precompiled, tokenizers' precompiled-charsmap reader, is on base64 0.13.
 # tokenizers builds its own types with derive_builder, which is on darling 0.20 while
 # rmcp-macros is on 0.24. candle-core is on rand 0.10 and tokenizers on rand 0.9, and
 # rand_core, getrandom and r-efi follow that split. candle-core and candle-nn are on
-# thiserror 1 while the rest of the graph is on 2. fancy-regex 0.18, which
-# candle-transformers pins, uses bit-set 0.8 and bit-vec 0.8 beside toasty's
-# bit-set 0.11 and bit-vec 0.10.
+# thiserror 1 while the rest of the graph is on 2. fancy-regex uses bit-set 0.8
+# and bit-vec 0.8 beside Toasty's bit-set 0.11 and bit-vec 0.10.
 skip = [
   # Rig 0.45 still requires sha2 0.10 and its digest 0.10
   # stack. Rift uses sha2 0.11, whose ARM and x86 backends detect CPU features
@@ -71,9 +62,9 @@ skip = [
   { name = "block-buffer", version = "0.10.4" },
   { name = "crypto-common", version = "0.1.7" },
 
-  # Candle 0.11 requires tokenizers ^0.22.0. Rift's encoder uses 0.23 and
-  # passes token ids into candle tensors, without sharing tokenizer types.
-  { name = "tokenizers", version = "0.22.2" },
+  # Tokenizers 0.23 pins fancy-regex 0.17 for its WebAssembly backend.
+  # Candle and the schema validator use 0.19.
+  { name = "fancy-regex", version = "=0.17.0" },
 
   { name = "syn", version = "2.0.119" },
   { name = "fluent-uri", version = "0.1.4" },
@@ -125,9 +116,6 @@ skip = [
   { name = "hashbrown", version = "0.14.5" },
   { name = "itertools", version = "0.14.0" },
   { name = "matchit", version = "0.8.4" },
-  { name = "rand", version = "0.8.8" },
-  { name = "rand_chacha", version = "0.3.1" },
-  { name = "rand_core", version = "0.6.4" },
 ]
 
 [sources]
