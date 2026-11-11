@@ -139,9 +139,7 @@ impl RiftProxy {
         let Ok(query) = parsed else {
             return self.forward_read(request.clone()).await;
         };
-        tokio::time::timeout_at(deadline, self.query_plan(request, query, limits))
-            .await
-            .map_err(|_| query_failure("query forwarding exceeded its request deadline"))?
+        self.query_plan(request, query, limits, deadline).await
     }
 
     async fn query_plan(
@@ -149,9 +147,10 @@ impl RiftProxy {
         request: &CallToolRequestParams,
         query: GraphQuery,
         limits: GraphLimits,
+        deadline: tokio::time::Instant,
     ) -> Result<Response, RiftError> {
         if let Some(selection) = query.page_selection() {
-            return self.query_page(request, &selection).await;
+            return self.query_page(request, &selection, deadline).await;
         }
         if let Some(adjacency) = query.adjacency_selection() {
             let owner = SymbolIdentity::parse(adjacency.seed.as_str())?
@@ -181,23 +180,29 @@ impl RiftProxy {
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         }
-        self.evaluate_retrieval(query, limits).await
+        tokio::time::timeout_at(deadline, self.evaluate_retrieval(query, limits))
+            .await
+            .map_err(|_| query_failure("combined retrieval exceeded its request deadline"))?
     }
 
     async fn query_page(
         &self,
         request: &CallToolRequestParams,
         selection: &PageSelection,
+        deadline: tokio::time::Instant,
     ) -> Result<Response, RiftError> {
         if selection.view.as_str().starts_with(VIEW_PREFIX) {
             let store = Arc::clone(&self.query_routes.evaluated);
             let root = Arc::clone(&self.root);
             let owner = self.owner.clone();
             let selection = selection.clone();
-            let answer = self
-                .query_routes
-                .work(move || store.retained_proxy_query(&selection, &root, &owner))
-                .await?;
+            let answer = tokio::time::timeout_at(
+                deadline,
+                self.query_routes
+                    .work(move || store.retained_proxy_query(&selection, &root, &owner)),
+            )
+            .await
+            .map_err(|_| query_failure("query replay exceeded its request deadline"))??;
             return Ok(render(answer));
         }
         if let Some(backend) = self.query_routes.backend(&selection.view) {

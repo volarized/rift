@@ -189,17 +189,19 @@ async fn wait_for<T>(
     Err(format!("timed out waiting for {what}").into())
 }
 
+fn ranked_symbol(name: &str) -> TestResult<serde_json::Value> {
+    let parameters = serde_json::from_value(json!({"query":name,"target":"symbol"}))?;
+    Ok(serde_json::to_value(workspace_client::query::retrieval(
+        &parameters,
+    )?)?)
+}
+
 /// One proxied search round trip for the fixture's `beacon` symbol.
 async fn beacon_lookup(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<serde_json::Value> {
     await_workspace_ready(client).await?;
-    proxied_call(
-        client,
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
-    )
-    .await
+    proxied_call(client, "search", &ranked_symbol("beacon")?).await
 }
 
 fn assert_beacon(lookup: &serde_json::Value) {
@@ -312,13 +314,9 @@ async fn repository_workspace_reads(
         .as_str()
         .ok_or("map carries its revision")?
         .to_owned();
-    let lookup = proxied_call(
-        client,
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration(name, "lib.rs"))?,
-    )
-    .await
-    .map_err(|error| format!("positive search: {error:?}"))?;
+    let lookup = proxied_call(client, "search", &ranked_symbol(name)?)
+        .await
+        .map_err(|error| format!("positive search: {error:?}"))?;
     assert_eq!(
         lookup["answer"]["bindings"][0]["name"]["value"], name,
         "{lookup}"
@@ -327,13 +325,9 @@ async fn repository_workspace_reads(
         .iter()
         .find(|other| **other != name)
         .ok_or("fixture has another symbol")?;
-    let absent = proxied_call(
-        client,
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration(other, "lib.rs"))?,
-    )
-    .await
-    .map_err(|error| format!("negative search: {error:?}"))?;
+    let absent = proxied_call(client, "search", &ranked_symbol(other)?)
+        .await
+        .map_err(|error| format!("negative search: {error:?}"))?;
     assert!(
         absent["answer"]["bindings"]
             .as_array()
@@ -341,13 +335,9 @@ async fn repository_workspace_reads(
             .is_empty(),
         "{absent}"
     );
-    let search = proxied_call(
-        client,
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration(name, "lib.rs"))?,
-    )
-    .await
-    .map_err(|error| format!("search: {error:?}"))?;
+    let search = proxied_call(client, "search", &ranked_symbol(name)?)
+        .await
+        .map_err(|error| format!("search: {error:?}"))?;
     assert!(
         search["answer"]["bindings"]
             .as_array()
@@ -356,28 +346,19 @@ async fn repository_workspace_reads(
             .any(|hit| hit["name"]["value"] == name),
         "{search}"
     );
-    let unit = rift_core::SourceUnitId::new(
-        rift_core::SourceResolverId::new("project")?,
-        rift_core::SourcePath::new("lib.rs")?,
-    )?;
-    let nodes = proxied_call(
-        client,
-        "nodes",
-        &json!({
-            "query": format!("SELECT ?node ?start ?end ?text {{ ?node a :Node; :unit <{unit}>; :range [ :start ?start; :end ?end ] . <{unit}> :source ?text . FILTER(?start <= 8 && 8 < ?end) }}"),
-            "language": "sparql"
-        }),
-    )
-    .await
-    .map_err(|error| format!("nodes: {error:?}"))?;
-    let rows = workspace_client::query::rows(&nodes)?;
-    assert!(!rows.is_empty(), "position 8 has captured nodes: {nodes}");
-    for row in rows {
-        assert!(
-            workspace_client::query::literal(row, "text")?.contains(name),
-            "{nodes}"
-        );
-    }
+    let nodes = proxied_call(client, "nodes", &json!({"path":"lib.rs","position":8}))
+        .await
+        .map_err(|error| format!("nodes: {error:?}"))?;
+    assert!(
+        nodes["nodes"]
+            .as_array()
+            .ok_or("nodes carries nodes")?
+            .iter()
+            .any(|node| node["source"]
+                .as_str()
+                .is_some_and(|source| source.contains(name))),
+        "{nodes}"
+    );
     Ok(revision)
 }
 
@@ -651,13 +632,9 @@ async fn repository_foreground_routes_four_linked_workspaces_and_restarts_change
     let changed = fs::read_to_string(main.path().join("rift.toml"))?
         .replace("[server]\n", "[server]\nnum_workers = 2\n");
     fs::write(main.path().join("rift.toml"), &changed)?;
-    let pinned = proxied_call(
-        &clients[3],
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration("quartz", "lib.rs"))?,
-    )
-    .await
-    .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
+    let pinned = proxied_call(&clients[3], "search", &ranked_symbol("quartz")?)
+        .await
+        .map_err(|error| format!("workspace quartz after settings change search: {error:?}"))?;
     assert_eq!(
         pinned["answer"]["bindings"][0]["name"]["value"], "quartz",
         "{pinned}"
@@ -775,12 +752,7 @@ async fn beacon_result(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
 ) -> TestResult<CallToolResult> {
     await_workspace_ready(client).await?;
-    proxied_result(
-        client,
-        "search",
-        &serde_json::to_value(workspace_client::query::declaration("beacon", "lib.rs"))?,
-    )
-    .await
+    proxied_result(client, "search", &ranked_symbol("beacon")?).await
 }
 
 /// Every tool one proxy lists, within the proxied-call bound.
