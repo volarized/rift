@@ -176,7 +176,7 @@ impl LocalSymbolViewInput {
         deadline: std::time::Instant,
     ) -> Result<(), RiftError> {
         use rift_protocol::read::{NodesParams, SymbolId};
-        use rift_search::sparql::{GraphFact, NodeAddress, NodeFact, NodeLocation, SymbolAddress};
+        use rift_search::sparql::SymbolAddress;
 
         self.project_symbols(selection.symbols, dataset, cancellation, deadline)?;
         for (identity, symbol) in self.material.index.objects() {
@@ -194,25 +194,7 @@ impl LocalSymbolViewInput {
                 check_graph_projection(cancellation, deadline)?;
                 let page = reads.nodes(&request)?;
                 for node in page.nodes {
-                    let Some(declaration) = node.declaration else {
-                        continue;
-                    };
-                    let address = |index| NodeAddress::Declaration {
-                        symbol: &id,
-                        declaration,
-                        index,
-                    };
-                    dataset.insert(GraphFact::Node(NodeFact {
-                        address: address(node.index),
-                        kind: &node.kind.0,
-                        language: &node.language,
-                        parent: node.parent.map(address),
-                        location: Some(NodeLocation {
-                            unit: &node.unit,
-                            range: &node.range,
-                        }),
-                        source: selection.source.then_some(node.source.as_str()),
-                    }))?;
+                    dataset.insert_declared_node(&id, &node, selection.source)?;
                 }
                 let Some(cursor) = page.node_cursor else {
                     break;

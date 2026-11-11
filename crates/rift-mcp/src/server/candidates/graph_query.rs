@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure};
 use crate::output::{Json, ToolFailure};
 
+mod exact;
+mod installed;
 mod relationships;
 pub(crate) mod retrieval;
 
@@ -157,6 +159,22 @@ impl RiftMcp {
                 SymbolUnavailableReason::InsufficientCoverage,
             )));
         };
+        let mut exact = match tokio::time::timeout_at(
+            deadline.at(),
+            Box::pin(self.acquire_exact_graph(&resolved, query, limits)),
+        )
+        .await
+        .map_err(|_| read_failure(deadline_failure(deadline.budget())))?
+        {
+            Ok(Ok(exact)) => exact,
+            Ok(Err(reason)) => return Ok(Err(reason)),
+            Err(error) if lacks_coverage(&error) => {
+                return Ok(Err(unavailable(
+                    SymbolUnavailableReason::InsufficientCoverage,
+                )));
+            }
+            Err(error) => return Err(read_failure(error)),
+        };
         let mut retrieved = Vec::new();
         for selection in query.retrieval_requests() {
             let result = tokio::time::timeout_at(
@@ -183,17 +201,19 @@ impl RiftMcp {
         let reads = Arc::clone(&resolved.published.reads);
         let mut warnings = acquired.take_warnings();
         warnings.extend(resolved.stale);
-        for result in &retrieved {
-            for warning in &result.warnings {
-                if !warnings.contains(warning) {
-                    warnings.push(warning.clone());
-                }
+        if let Some(exact) = &mut exact {
+            warnings.extend(exact.take_warnings());
+        }
+        for warning in retrieved.iter().flat_map(|result| &result.warnings) {
+            if !warnings.contains(warning) {
+                warnings.push(warning.clone());
             }
         }
         Ok(Ok(AcquiredGraph {
             reads,
             selected,
             acquired,
+            exact,
             retrieved,
             configuration,
             warnings,
@@ -205,9 +225,42 @@ struct AcquiredGraph {
     reads: Arc<rift_server::ReadService>,
     selected: Option<AdjacencySelection>,
     acquired: AcquiredAdjacency,
+    exact: Option<exact::ExactFacts>,
     retrieved: Vec<SearchResult>,
     configuration: QueryConfiguration,
     warnings: Vec<ReadWarning>,
+}
+
+fn project_local_endpoints(
+    input: &rift_server::LocalSymbolViewInput,
+    reads: &rift_server::ReadService,
+    acquired: &relationships::AcquiredAdjacency,
+    selected: &rift_search::sparql::AdjacencySelection,
+    dataset: &mut rift_search::sparql::GraphDatasetBuilder,
+    cancellation: &QueryCancellation,
+    deadline: std::time::Instant,
+) -> Result<(), RiftError> {
+    if !selected.symbol_details && selected.node_source.is_none() {
+        return Ok(());
+    }
+    for endpoint in acquired.local_endpoints() {
+        let identity = rift_protocol::identity::SymbolIdentity::parse(endpoint.as_str())?;
+        if identity.owner().is_local() {
+            let symbols = rift_search::sparql::SymbolSelection::Identified(endpoint.as_str());
+            if let Some(source) = selected.node_source {
+                input.project_nodes(
+                    reads,
+                    rift_search::sparql::NodeSelection { symbols, source },
+                    dataset,
+                    cancellation,
+                    deadline,
+                )?;
+            } else {
+                input.project_symbols(symbols, dataset, cancellation, deadline)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 impl AcquiredGraph {
@@ -224,6 +277,7 @@ impl AcquiredGraph {
             reads,
             selected,
             acquired,
+            exact,
             retrieved,
             configuration,
             warnings,
@@ -239,20 +293,17 @@ impl AcquiredGraph {
                 }
                 return Err(error);
             }
-            if selected.symbol_details {
-                for endpoint in acquired.local_endpoints() {
-                    let identity =
-                        rift_protocol::identity::SymbolIdentity::parse(endpoint.as_str())?;
-                    if identity.owner().is_local() {
-                        input.project_symbols(
-                            rift_search::sparql::SymbolSelection::Identified(endpoint.as_str()),
-                            &mut dataset,
-                            cancellation,
-                            deadline.at().into_std(),
-                        )?;
-                    }
-                }
-            }
+            project_local_endpoints(
+                &input,
+                &reads,
+                &acquired,
+                selected,
+                &mut dataset,
+                cancellation,
+                deadline.at().into_std(),
+            )?;
+        } else if let Some(exact) = &exact {
+            exact.project(&mut dataset)?;
         } else if let Some(selection) = query.node_selection() {
             input.project_nodes(
                 &reads,
@@ -861,7 +912,7 @@ mod tests {
             .route("/rift/v1/capabilities", get(|| async {
                 json_response(&json!({
                     "supported_package_managers": ["cargo"],
-                    "supported_features": ["resolutions", "search", "symbols", "relationships"],
+                    "supported_features": ["resolutions", "search", "symbols", "relationships", "nodes"],
                     "publication_format": "rift-package-index-v2",
                     "analyzer_revision": "analyzer-v1",
                     "corpus_revision": "corpus-v1",
@@ -997,6 +1048,96 @@ mod tests {
                 {"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"},
                 {"manager":"cargo","registry":"crates.io","name":"dependency","version":"2.0.0"}
             ])));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn graph_query_reads_remote_node_pages_at_the_selected_release() -> TestResult {
+        const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
+        const UNIT: &str = "rift://source/cargo/crates.io/demo/src/lib.rs";
+        let pages = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = Arc::clone(&pages);
+        let app = remote_graph_routes(
+            Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            "2099-01-01T00:00:00Z".to_owned(),
+        )
+        .route("/rift/v1/symbols", axum::routing::post(|bytes: axum::body::Bytes| async move {
+            let request: Value = serde_json::from_slice(&bytes).expect("exact symbol request");
+            assert_eq!(request["id"], ROOT);
+            assert_eq!(request["revision"], RELEASE);
+            let origin = json!({
+                "source_kind":"authored", "location":"dependency",
+                "package":{"manager":"cargo","registry":"crates.io","name":"demo","version":"1.0.0"}
+            });
+            json_response(&json!({
+                "outcome":"found", "revision":RELEASE,
+                "symbol":{"id":ROOT,"name":"root","language":"rust","kind":"function","origin":origin},
+                "declarations":[{"origin":origin,"unit":UNIT,"range":{"start":0,"end":12},"line":1,
+                    "signature_indices":[],"type_indices":[],"documentation_indices":[]}]
+            }))
+        }))
+        .route("/rift/v1/nodes", axum::routing::post(move |bytes: axum::body::Bytes| {
+            let observed = Arc::clone(&observed);
+            async move {
+                let request: Value = serde_json::from_slice(&bytes).expect("exact node request");
+                assert_eq!(request["symbol"], ROOT);
+                assert_eq!(request["revision"], RELEASE);
+                observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let page = if let Some(cursor) = request["node_cursor"].as_str() {
+                    assert_eq!(cursor, "next-node");
+                    json!({"symbol":ROOT,"revision":RELEASE,"nodes":[{
+                        "declaration":0,"index":1,"unit":UNIT,"language":"rust","kind":"identifier",
+                        "range":{"start":3,"end":7},"source":"root","parent":0
+                    }]})
+                } else {
+                    json!({"symbol":ROOT,"revision":RELEASE,"node_cursor":"next-node","nodes":[{
+                        "declaration":0,"index":0,"unit":UNIT,"language":"rust","kind":"function_item",
+                        "range":{"start":0,"end":12},"source":"fn root() {}"
+                    }]})
+                };
+                json_response(&page)
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = listener.local_addr()?;
+        let service = tokio::spawn(async move { axum::serve(listener, app).await });
+        let directory = tempfile::tempdir()?;
+        crate::server::hermetic_workspace(
+            directory.path(),
+            &format!(
+                "[global]\nenabled = true\nendpoint = 'http://{endpoint}/rift'\nattempts = 1\n\n\
+                 [[dependencies.packages]]\nmanager = 'cargo'\nregistry = 'crates.io'\nname = 'demo'\nversion = '1.0.0'\n"
+            ),
+        )?;
+        let root = directory.path().canonicalize()?;
+        let server =
+            RiftMcp::build_settled(&root, rift_index::WorkspaceIndexLimits::default()).await?;
+        let result = server
+            .graph_query(QueryParams {
+                query: format!(
+                    "SELECT ?i ?text {{ ?node :of <{ROOT}>; :index ?i; :source ?text }} ORDER BY ?i"
+                ),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        service.abort();
+        let QueryReadResult::Results(result) = result else {
+            return Err(format!("expected exact node rows, received {result:?}").into());
+        };
+        let QueryAnswer::Bindings { bindings, .. } = result.answer else {
+            return Err("expected exact node bindings".into());
+        };
+        assert_eq!(pages.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let sources = bindings
+            .iter()
+            .map(|row| match &row["text"] {
+                rift_protocol::query::RdfTerm::Literal { value, .. } => value.as_str(),
+                _ => "",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sources, ["fn root() {}", "root"]);
         Ok(())
     }
 

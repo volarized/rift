@@ -1,6 +1,7 @@
 //! Acquisition of complete adjacency from the selected providers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use rift_cloud_client::relationships::RelationshipReadLimits;
 use rift_error::{RiftError, errors};
@@ -22,7 +23,8 @@ use rift_search::sparql::{
 };
 
 use super::super::super::{RequestDeadline, ResolvedWorkspace, RiftMcp};
-use crate::global::workspace_release;
+use super::exact::{exact_request, selected_release};
+use super::installed::InstalledTarget;
 
 const REQUESTS_MAX: u64 = 64;
 const RECORDS_MAX: u64 = 10_000;
@@ -32,7 +34,8 @@ pub(super) struct AcquiredAdjacency {
     pages: Vec<(RelationshipSearchPage, SymbolRelation)>,
     local: Vec<QueryOccurrence>,
     local_edges: Vec<(SymbolId, SymbolRelation, SymbolId)>,
-    named_package_symbols: Vec<(Symbol, RevisionIri)>,
+    named_package_symbols: BTreeMap<SymbolId, (Symbol, RevisionIri)>,
+    installed: BTreeMap<SymbolId, Arc<InstalledTarget>>,
     revisions: BTreeMap<SymbolOwner, RevisionIri>,
     view: Option<CapturedView>,
     warnings: Vec<ReadWarning>,
@@ -67,8 +70,7 @@ impl AcquiredAdjacency {
                 target,
             })?;
         }
-        for (symbol, revision) in &self.named_package_symbols {
-            let id = symbol.id.as_ref().ok_or_else(coverage_failure)?;
+        for (id, (symbol, revision)) in &self.named_package_symbols {
             dataset.insert(GraphFact::SymbolDetails {
                 address: SymbolAddress::Established(id),
                 name: &symbol.name,
@@ -77,8 +79,16 @@ impl AcquiredAdjacency {
                 revision,
             })?;
         }
-        for occurrence in &self.local {
-            if selected.usages {
+        for target in self.installed.values() {
+            target.project(dataset, selected.node_source)?;
+        }
+        if selected.node_source.is_some()
+            && (!self.pages.is_empty() || !self.named_package_symbols.is_empty())
+        {
+            return Err(coverage_failure());
+        }
+        if selected.usages {
+            for occurrence in &self.local {
                 let range = &occurrence.source.range;
                 let unit = &occurrence.source.unit;
                 let key = format!(
@@ -89,11 +99,21 @@ impl AcquiredAdjacency {
                     range.end
                 );
                 let source = if selected.source {
-                    Some(
+                    let text = if let Some(installed) = occurrence
+                        .enclosing
+                        .as_ref()
+                        .and_then(|id| self.installed.get(id))
+                    {
+                        if installed.unit != *unit {
+                            return Err(coverage_failure());
+                        }
+                        source_slice(&installed.source, range)?
+                    } else {
                         input
                             .occurrence_source(&occurrence.source)
-                            .ok_or_else(coverage_failure)?,
-                    )
+                            .ok_or_else(coverage_failure)?
+                    };
+                    Some(text)
                 } else {
                     None
                 };
@@ -104,6 +124,14 @@ impl AcquiredAdjacency {
                 })?;
             }
         }
+        self.project_remote(dataset, selected)
+    }
+
+    fn project_remote(
+        &self,
+        dataset: &mut GraphDatasetBuilder,
+        selected: &AdjacencySelection,
+    ) -> Result<(), RiftError> {
         for (page, relation) in &self.pages {
             for item in &page.symbols {
                 if let Some(symbol) = &item.symbol.id {
@@ -223,6 +251,7 @@ impl RiftMcp {
             remote: None,
             local: None,
             neighbors: BTreeMap::new(),
+            use_installed: None,
         };
         let mut frontier = BTreeSet::from([selected.seed.clone()]);
         let mut visited = BTreeSet::new();
@@ -236,7 +265,9 @@ impl RiftMcp {
                     frontier.extend(cached.iter().cloned());
                     continue;
                 }
-                if SymbolIdentity::parse(seed.as_str())?.owner().is_local() {
+                if SymbolIdentity::parse(seed.as_str())?.owner().is_local()
+                    || walk.acquired.installed.contains_key(&seed)
+                {
                     let mut reached = BTreeSet::new();
                     walk.local_step(&seed, &mut reached).await?;
                     if selected.has_distinct_steps() {
@@ -268,6 +299,7 @@ impl RiftMcp {
         {
             return Err(coverage_failure());
         }
+        walk.verify_installed().await?;
         Ok(Ok(walk.acquired))
     }
 }
@@ -287,6 +319,7 @@ struct AdjacencyWalk<'request> {
         rift_server::CalleeRoots,
     )>,
     neighbors: BTreeMap<(SymbolId, AdjacencyStep), Vec<SymbolId>>,
+    use_installed: Option<bool>,
 }
 
 impl AdjacencyWalk<'_> {
@@ -341,37 +374,65 @@ impl AdjacencyWalk<'_> {
                 }
             }
             (_, RelationshipFacet::Calls) => {
-                let mut calls = Box::pin(rift_server::graph_calls(
-                    reads, engines, roots, seed, direction, deadline,
-                ))
-                .await?;
-                self.name_package_calls(&mut calls).await?;
-                charge_records(&mut self.remaining, calls.local.len())?;
-                for (neighbor, ranges) in calls.local {
-                    charge_records(&mut self.remaining, ranges.len())?;
-                    let (caller, target) = match direction {
-                        TraversalDirection::Outgoing => (seed, &neighbor),
-                        TraversalDirection::Incoming => (&neighbor, seed),
-                    };
-                    self.acquired.local_edges.push((
-                        caller.clone(),
-                        SymbolRelation::Calls,
-                        target.clone(),
-                    ));
-                    frontier.insert(neighbor.clone());
-                    if self.selected.usages {
-                        self.acquired.local.extend(ranges.into_iter().map(|source| {
-                            QueryOccurrence {
-                                target: target.clone(),
-                                enclosing: Some(caller.clone()),
-                                source,
-                                facet: RelationshipFacet::Calls,
-                            }
-                        }));
+                let mut calls = if let Some(target) = self.acquired.installed.get(seed) {
+                    if direction != TraversalDirection::Outgoing {
+                        return Err(coverage_failure());
                     }
-                }
+                    Box::pin(rift_server::installed_graph_calls(
+                        reads,
+                        engines,
+                        roots,
+                        seed,
+                        (
+                            &target.callee,
+                            &target.symbol.language,
+                            &target.unit,
+                            &target.source,
+                        ),
+                        deadline,
+                    ))
+                    .await?
+                } else {
+                    Box::pin(rift_server::graph_calls(
+                        reads, engines, roots, seed, direction, deadline,
+                    ))
+                    .await?
+                };
+                self.name_package_calls(&mut calls).await?;
+                self.admit_local_calls(seed, calls, frontier)?;
             }
             _ => return Err(coverage_failure()),
+        }
+        Ok(())
+    }
+
+    fn admit_local_calls(
+        &mut self,
+        seed: &SymbolId,
+        calls: rift_server::GraphCalls,
+        frontier: &mut BTreeSet<SymbolId>,
+    ) -> Result<(), RiftError> {
+        charge_records(&mut self.remaining, calls.local.len())?;
+        for (neighbor, ranges) in calls.local {
+            charge_records(&mut self.remaining, ranges.len())?;
+            let (caller, target) = match self.step.direction {
+                TraversalDirection::Outgoing => (seed, &neighbor),
+                TraversalDirection::Incoming => (&neighbor, seed),
+            };
+            self.acquired
+                .local_edges
+                .push((caller.clone(), SymbolRelation::Calls, target.clone()));
+            frontier.insert(neighbor.clone());
+            if self.selected.usages {
+                self.acquired
+                    .local
+                    .extend(ranges.into_iter().map(|source| QueryOccurrence {
+                        target: target.clone(),
+                        enclosing: Some(caller.clone()),
+                        source,
+                        facet: RelationshipFacet::Calls,
+                    }));
+            }
         }
         Ok(())
     }
@@ -383,8 +444,27 @@ impl AdjacencyWalk<'_> {
         if calls.packages.is_empty() {
             return Ok(());
         }
-        if !self.configuration.enabled {
-            return Err(coverage_failure());
+        let installed = if let Some(installed) = self.use_installed {
+            installed
+        } else {
+            let installed = if self.configuration.enabled {
+                let client = self.server.global.client(&self.configuration).await?;
+                let capabilities = client.get_capabilities().await?;
+                let operations =
+                    rift_cloud_client::GlobalClient::relationship_capabilities(&capabilities)?;
+                !operations.iter().any(|operation| {
+                    operation.direction == TraversalDirection::Outgoing
+                        && operation.facets.contains(&RelationshipFacet::Calls)
+                        && operation.bounds.is_some()
+                })
+            } else {
+                true
+            };
+            self.use_installed = Some(installed);
+            installed
+        };
+        if installed {
+            return self.capture_installed_calls(calls).await;
         }
         let callees: Vec<_> = calls
             .packages
@@ -399,21 +479,119 @@ impl AdjacencyWalk<'_> {
                 .declaration(&callee)
                 .ok_or_else(coverage_failure)?;
             let identity = SymbolIdentity::parse(declaration.id.as_str())?;
-            if workspace_release(dependencies, identity.owner()).as_ref()
+            if selected_release(dependencies, identity.owner()).as_ref()
                 != Some(&declaration.revision)
             {
                 return Err(coverage_failure());
             }
-            if self.selected.symbol_details {
-                let symbol = callee.symbol(&declaration).ok_or_else(coverage_failure)?;
-                self.acquired.named_package_symbols.push((
-                    symbol,
-                    RevisionIri::parse(&declaration.revision.to_string())?,
-                ));
+            if self.selected.symbol_details
+                && !self
+                    .acquired
+                    .named_package_symbols
+                    .contains_key(&declaration.id)
+            {
+                claim_request(&mut self.remaining)?;
+                let answer = client
+                    .get_symbol(&exact_request(&declaration.id, &declaration.revision))
+                    .await?;
+                let rift_protocol::symbol_read::GetSymbolResult::Found {
+                    symbol, revision, ..
+                } = answer
+                else {
+                    return Err(coverage_failure());
+                };
+                if revision != declaration.revision {
+                    return Err(coverage_failure());
+                }
+                self.acquired.named_package_symbols.insert(
+                    declaration.id.clone(),
+                    (*symbol, RevisionIri::parse(&revision.to_string())?),
+                );
             }
             calls.local.push((declaration.id, occurrences));
         }
         Ok(())
+    }
+
+    async fn capture_installed_calls(
+        &mut self,
+        calls: &mut rift_server::GraphCalls,
+    ) -> Result<(), RiftError> {
+        let (_, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
+        let roots = roots.clone();
+        let tree = self.server.root.clone();
+        let configuration = self
+            .resolved
+            .published
+            .configuration
+            .accepted_for_tool(super::super::super::wire::ErrorPhase::Read)
+            .map_err(|_| coverage_failure())?;
+        let packages = std::mem::take(&mut calls.packages);
+        let maximum = usize::try_from(self.remaining.bytes_max).unwrap_or(usize::MAX);
+        let targets = self
+            .server
+            .blocking
+            .run("capture installed dependency targets", move || {
+                let mut retained = 0usize;
+                let mut targets = Vec::new();
+                for (callee, occurrences) in packages {
+                    let target = InstalledTarget::capture(callee, &roots, &tree, &configuration)?;
+                    retained = retained
+                        .checked_add(target.source.len())
+                        .filter(|size| *size <= maximum)
+                        .ok_or_else(coverage_failure)?;
+                    targets.push((target, occurrences));
+                }
+                Ok(targets)
+            })
+            .await?;
+        for (target, occurrences) in targets {
+            let identity = target.id()?.clone();
+            let owner = SymbolIdentity::parse(identity.as_str())?;
+            if selected_release(
+                self.resolved.published.reads.dependency_context(),
+                owner.owner(),
+            )
+            .as_ref()
+                != Some(&target.revision)
+            {
+                return Err(coverage_failure());
+            }
+            self.remaining.bytes_max = self
+                .remaining
+                .bytes_max
+                .checked_sub(u64::try_from(target.source.len()).map_err(|_| coverage_failure())?)
+                .ok_or_else(coverage_failure)?;
+            if let Some(held) = self.acquired.installed.get(&identity)
+                && (held.unit != target.unit || held.source != target.source)
+            {
+                return Err(coverage_failure());
+            }
+            self.acquired
+                .installed
+                .insert(identity.clone(), Arc::new(target));
+            calls.local.push((identity, occurrences));
+        }
+        Ok(())
+    }
+
+    async fn verify_installed(&self) -> Result<(), RiftError> {
+        if self.acquired.installed.is_empty() {
+            return Ok(());
+        }
+        let (_, roots) = self.local.as_ref().ok_or_else(coverage_failure)?;
+        let roots = roots.clone();
+        let tree = self.server.root.clone();
+        let targets: Vec<_> = self.acquired.installed.values().cloned().collect();
+        self.server
+            .blocking
+            .run("verify installed dependency sources", move || {
+                for target in targets {
+                    target.verify(&roots, &tree)?;
+                }
+                Ok(())
+            })
+            .await
     }
 
     async fn remote_steps(

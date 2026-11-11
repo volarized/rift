@@ -50,6 +50,8 @@ pub struct AdjacencySelection {
     pub depth: Option<u32>,
     /// Whether the pattern projects logical facts about reached symbols.
     pub symbol_details: bool,
+    /// Whether declaration item nodes and their exact text are selected for reached symbols.
+    pub node_source: Option<bool>,
     /// Whether physical usage records must also be projected.
     pub usages: bool,
     /// Whether the physical occurrences require exact source bytes.
@@ -90,10 +92,7 @@ impl GraphQuery {
                 ..
             } = &query.pattern
             && matches!(inner.as_ref(), QueryExpression::Bgp { patterns } if patterns.is_empty())
-            && rift_protocol::identity::SymbolIdentity::parse(target.as_str())
-                .ok()?
-                .owner()
-                .is_local()
+            && rift_protocol::identity::SymbolIdentity::parse(target.as_str()).is_ok()
         {
             return Some(SymbolSelection::Identified(target.as_str()));
         }
@@ -154,10 +153,7 @@ impl GraphQuery {
             }
         }
         let symbols = if let TermPattern::NamedNode(node) = &owner.object {
-            let identity = rift_protocol::identity::SymbolIdentity::parse(node.as_str()).ok()?;
-            if !identity.owner().is_local() {
-                return None;
-            }
+            rift_protocol::identity::SymbolIdentity::parse(node.as_str()).ok()?;
             SymbolSelection::Identified(node.as_str())
         } else if let Some(name) = name {
             SymbolSelection::Named(name)
@@ -212,19 +208,10 @@ impl GraphQuery {
         let (edges, details): (Vec<_>, Vec<_>) = triples
             .into_iter()
             .partition(|edge| property(edge).and_then(facet).is_some());
-        if details.iter().any(|detail| {
-            (!matches!(
-                property(detail),
-                Some("name" | "kind" | "language" | "revision")
-            ) && !is_symbol_class(detail))
-                || !edges
-                    .iter()
-                    .any(|edge| edge.subject == detail.subject || edge.object == detail.subject)
-        }) {
-            return None;
-        }
+        let (symbol_details, node_source) = endpoint_details(&edges, &details)?;
         let mut selected = adjacency_patterns(&edges).or_else(|| layered_patterns(&edges))?;
-        selected.symbol_details = !details.is_empty();
+        selected.symbol_details = symbol_details;
+        selected.node_source = node_source;
         Some(selected)
     }
 }
@@ -282,6 +269,66 @@ fn query_pattern(query: &Query) -> Option<&QueryExpression> {
     }
 }
 
+fn endpoint_details(
+    edges: &[&TriplePattern],
+    details: &[&TriplePattern],
+) -> Option<(bool, Option<bool>)> {
+    let endpoint = |term: &TermPattern| {
+        edges
+            .iter()
+            .any(|edge| &edge.subject == term || &edge.object == term)
+    };
+    let mut node_owner = details
+        .iter()
+        .filter(|detail| property(detail) == Some("of") && endpoint(&detail.object));
+    let owner = node_owner.next().copied();
+    if node_owner.next().is_some() {
+        return None;
+    }
+    let mut ranges = Vec::new();
+    if let Some(owner) = owner {
+        if !details.iter().any(|detail| {
+            detail.subject == owner.subject
+                && property(detail) == Some("index")
+                && matches!(&detail.object, TermPattern::Literal(value) if value.value() == "0")
+        }) {
+            return None;
+        }
+        ranges.extend(
+            details
+                .iter()
+                .filter(|detail| {
+                    detail.subject == owner.subject && property(detail) == Some("range")
+                })
+                .map(|detail| &detail.object),
+        );
+    }
+    let mut symbols = false;
+    let mut source = false;
+    for &detail in details {
+        let predicate = property(detail);
+        if endpoint(&detail.subject)
+            && (matches!(predicate, Some("name" | "kind" | "language" | "revision"))
+                || is_symbol_class(detail))
+        {
+            symbols = true;
+        } else if let Some(owner) = owner.filter(|owner| detail.subject == owner.subject) {
+            match predicate {
+                Some("of") if detail == owner => {}
+                Some("source") => source = true,
+                Some("range" | "index" | "declaration" | "kind" | "language") => {}
+                _ if is_class(detail, "Node") => {}
+                _ => return None,
+            }
+        } else if !ranges.contains(&&detail.subject)
+            || !matches!(predicate, Some("unit" | "start" | "end"))
+        {
+            return None;
+        }
+    }
+    Some((symbols, owner.map(|_| source)))
+}
+
 fn property(pattern: &TriplePattern) -> Option<&str> {
     let NamedNodePattern::NamedNode(predicate) = &pattern.predicate else {
         return None;
@@ -328,6 +375,7 @@ fn adjacency(
         steps: Vec::new(),
         depth,
         symbol_details: false,
+        node_source: None,
         usages: false,
         source: false,
     })
@@ -388,6 +436,7 @@ fn adjacency_patterns(triples: &[&TriplePattern]) -> Option<AdjacencySelection> 
                     steps: Vec::new(),
                     depth: Some(depth),
                     symbol_details: false,
+                    node_source: None,
                     usages: false,
                     source: false,
                 });
@@ -404,6 +453,7 @@ fn layered_adjacency(seed: SymbolId, steps: Vec<AdjacencyStep>) -> Option<Adjace
         depth: Some(u32::try_from(steps.len()).ok()?),
         steps,
         symbol_details: false,
+        node_source: None,
         usages: false,
         source: false,
     })
@@ -545,6 +595,7 @@ fn usage_selection(
         steps: Vec::new(),
         depth: Some(1),
         symbol_details: false,
+        node_source: None,
         usages: true,
         source,
     })
@@ -611,6 +662,7 @@ fn uniform_path(path: &PropertyPathExpression) -> Option<(RelationshipFacet, boo
 
 pub(super) fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelection<'_>> {
     let mut identity = None;
+    let mut released = false;
     let mut name = None;
     let single_subject = patterns.first().is_some_and(|first| {
         patterns
@@ -621,9 +673,7 @@ pub(super) fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelect
         if let TermPattern::NamedNode(subject) = &pattern.subject
             && let Ok(parsed) = rift_protocol::identity::SymbolIdentity::parse(subject.as_str())
         {
-            if !parsed.owner().is_local() {
-                return None;
-            }
+            released |= !parsed.owner().is_local();
             identity = Some(subject.as_str());
         }
         let NamedNodePattern::NamedNode(predicate) = &pattern.predicate else {
@@ -646,6 +696,9 @@ pub(super) fn symbol_patterns(patterns: &[TriplePattern]) -> Option<SymbolSelect
     }
     if let Some(identity) = identity.filter(|_| single_subject) {
         return Some(SymbolSelection::Identified(identity));
+    }
+    if released {
+        return None;
     }
     Some(match name.filter(|_| single_subject) {
         Some(name) => SymbolSelection::Named(name),
