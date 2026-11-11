@@ -1,7 +1,8 @@
+use rift_core::SourceUnitId;
 use rift_error::RiftError;
 
 use rift_protocol::{
-    identity::{SymbolIdentity, SymbolOwner, parse_source_unit_identity},
+    identity::{SymbolIdentity, SymbolOwner},
     read::{NODES_SOURCE_BYTES_MAX, Node, NodesParams, NodesResult, SymbolId},
 };
 
@@ -24,7 +25,7 @@ struct NodesPageBounds {
 /// The symbol a nodes request lists, and the package or runtime release its identity names.
 struct RequestedSymbol<'request> {
     id: &'request SymbolId,
-    owner: SymbolOwner,
+    identity: SymbolIdentity,
 }
 
 impl GlobalClient {
@@ -103,14 +104,15 @@ fn validate_request(request: &NodesParams) -> Result<RequestedSymbol<'_>, RiftEr
     let invalid =
         |field| failure::request_invalid("validate_request", field, "field failed validation");
     let id = request.symbol.as_ref().ok_or_else(|| invalid("symbol"))?;
-    let owner = SymbolIdentity::parse(id.as_str())?.owner().clone();
-    if !is_release_owner(&owner) {
+    let identity = SymbolIdentity::parse(id.as_str())?;
+    let owner = identity.owner();
+    if !is_release_owner(owner) {
         return Err(invalid("symbol"));
     }
     let other_revision = request
         .revision
         .as_ref()
-        .is_some_and(|revision| !revision.answers_for(&owner));
+        .is_some_and(|revision| !revision.answers_for(owner));
     let unserved = [
         ("path", request.path.is_some()),
         ("position", request.position.is_some()),
@@ -126,7 +128,7 @@ fn validate_request(request: &NodesParams) -> Result<RequestedSymbol<'_>, RiftEr
     {
         return Err(invalid("node_cursor"));
     }
-    Ok(RequestedSymbol { id, owner })
+    Ok(RequestedSymbol { id, identity })
 }
 
 fn is_release_owner(owner: &SymbolOwner) -> bool {
@@ -136,11 +138,7 @@ fn is_release_owner(owner: &SymbolOwner) -> bool {
     )
 }
 
-/// Whether `result` answers `request` within `bounds`: every node sits in a source unit of
-/// the symbol's owner and carries the bytes its range spans, the answer reports a release of
-/// that owner as its revision, the requested one when the request names one, and names no
-/// other symbol, the page stays within its node and source bounds, and the view and cursor
-/// are the ones the request allows.
+/// Validates the selected symbol, exact release, node sources, page bounds and continuation.
 fn valid_result(
     request: &NodesParams,
     symbol: &RequestedSymbol<'_>,
@@ -160,7 +158,7 @@ fn valid_result(
     let cursor_valid = result.node_cursor.as_ref().is_none_or(|cursor| {
         !result.nodes.is_empty() && !cursor.is_empty() && cursor.len() <= CURSOR_BYTES_MAX
     });
-    let revision_valid = result.revision.answers_for(&symbol.owner)
+    let revision_valid = result.revision.answers_for(symbol.identity.owner())
         && request
             .revision
             .as_ref()
@@ -172,12 +170,15 @@ fn valid_result(
     within_page && nodes_valid && within_source && cursor_valid && revision_valid && names_symbol
 }
 
-/// Whether `node` is a node of `symbol`: written in a source unit of the symbol's owner and
-/// carrying exactly as many bytes as its range spans.
+/// Checks the node's source identity and the exact number of bytes its range spans.
 fn valid_node(node: &Node, symbol: &RequestedSymbol<'_>) -> bool {
-    let unit = &node.unit;
-    let in_release = parse_source_unit_identity(unit.as_str())
-        .is_ok_and(|(unit_owner, _)| unit_owner.as_ref() == Some(&symbol.owner));
+    let identity = &symbol.identity;
+    let owner = identity.owner();
+    let in_release = SourceUnitId::parse(node.unit.as_str()).is_ok_and(|unit| {
+        unit.source_owner() == Some(owner)
+            || (&node.language == identity.language()
+                && crate::symbol::typeshed_stdlib_unit(&unit, owner, identity.language()))
+    });
     let spans_source = node
         .range
         .end
