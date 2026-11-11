@@ -343,10 +343,9 @@ one named or inline process for an exact language identity: rust-analyzer for `r
 select the same named process. [LSP profiles](/docs/developer/configuration#lsp-profiles) register
 directories as separate projects, each with its own configuration and language processes.
 
-[`search`](/docs/mcp#search-engine-references) uses the engine for relationship traversal: the
-engine is the one source of the references an incoming walk follows and of the calls an outgoing
-walk follows. Source and configuration must match the captured index before and after the engine
-request.
+[`search`](/docs/mcp#search-engine-references) can acquire local call and reference facts
+from the configured engine before evaluating a SPARQL query. Source and configuration must match
+the captured index before and after the engine request.
 
 Before a running engine's next request, the server sends it each publication's changed files
 that match a file watcher the engine registered, as one `workspace/didChangeWatchedFiles`
@@ -359,9 +358,9 @@ transport through the same LSP session contract. Its version ships with the Rift
 ### History
 
 The history source resolver reads the workspace's git objects in place, with no checkout or `git`
-subprocess. That access serves revision-addressed reads: `get_symbol`, `search`, and `nodes` accept
-a git `revision`, and the server indexes that commit's tree - the same syntax providers, over committed
-bytes - without touching the working tree.
+subprocess. That access serves revision-addressed reads. `get_symbol`, `nodes`, and `SERVICE :search`
+can select a git revision. The server indexes that commit's tree with the same syntax providers
+and leaves the working tree untouched.
 
 <VersionBadge
   version="v0.0.13"

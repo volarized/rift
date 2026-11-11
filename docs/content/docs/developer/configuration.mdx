@@ -795,7 +795,7 @@ each source once.
 
 Search selects the profile with `scope: "local:docs"`. Its symbol identities carry the
 `local:docs` owner, for example `rift://symbol/local:docs/typescript/page/beacon`.
-The primary project's symbols keep the `local` owner. A `query` search with `scope: "all"`
+The primary project's symbols keep the `local` owner. A ranked search with `:scope "all"` in `SERVICE :search`
 includes the primary project, profiles, registered [extra projects](#extra-projects) with their
 profiles, and global facts.
 
@@ -1021,7 +1021,7 @@ cpu_share = 0.25
 ```
 
 `enabled = false` turns the history provider off: the server refuses a revision-addressed read -
-a git `revision` on [`get_symbol`](/docs/mcp#tool-get_symbol), `search`, or `nodes` - a
+a git `revision` on [`get_symbol`](/docs/mcp#tool-get_symbol) or `nodes`, or a git revision selected by `SERVICE :search` - a
 [change comparison](/docs/mcp#search-change), and a [commit search](/docs/mcp#search-commits)
 with `capability_unavailable`. A workspace without version control cannot serve those reads
 whatever this table says.
@@ -1115,11 +1115,18 @@ in `warnings` naming the two tree revision digests.
 
 <VersionBadge version="v0.0.9" />
 
-[`search`](/docs/mcp#tool-search) runs on a lexical index. `[search.text]` selects the
+[`search`](/docs/mcp#tool-search) evaluates SPARQL. Its `SERVICE :search` reads the lexical
+index for ranked queries. `[search.text]` selects the
 plain-text files that join it through `include` and bounds their chunks. The lexical index
 lives in the index database at `.rift/index`, and the vector ranking's rows in the vectors
 database at `.rift/vectors`. `pool_slots`, `busy_timeout`, and `journal_size_limit` bound each
 of the two on its own, and writes to one wait for that database's turn alone.
+
+<VersionBadge version="v0.0.73" />
+
+`[search.query]` bounds a transport page. `page_size` accepts 1 to 1000 bindings or triples
+and defaults to 1000. `page_limit` accepts 1 KiB to 4 MiB of encoded response and defaults to
+4 MiB. Follow `pagination.next_query` to read the remaining pages from the same execution.
 
 <VersionBadge version="v0.0.25" />
 

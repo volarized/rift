@@ -252,7 +252,7 @@ async fn the_map_lists_context_packages_and_follows_the_lockfile() -> TestResult
     // map is computed for that same publication.
     let request = workspace_client::tool_request(
         "search",
-        &serde_json::json!({ "query": "beacon", "target": "symbol" }),
+        &serde_json::json!({ "query": "SELECT ?symbol { ?symbol a :Symbol; :name \"beacon\" }" }),
     );
     let lookup = client.call_tool(request).await?;
     assert_ne!(lookup.is_error, Some(true), "{lookup:#?}");

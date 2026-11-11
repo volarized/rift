@@ -7,7 +7,6 @@ mod hermetic_search;
 )]
 mod workspace_client;
 
-use serde_json::json;
 use workspace_client::{
     TestResult, call_retrying_acceptance, served_relative_workspace, tool_request,
 };
@@ -16,6 +15,7 @@ const SERVICE: &str = "def serve(port: int) -> int:\n    return port\n";
 const CALLER: &str = "from service import serve\n\ndef caller() -> int:\n    return serve(8080)\n";
 const PYPROJECT: &str = "[build-system]\nrequires=['setuptools==80.9.0']\nbuild-backend='setuptools.build_meta'\n[tool.setuptools]\npy-modules=['service','main']\n";
 const CONFIGURATION: &str = "\
+[source]\nexclude = [\"rift.toml\", \"pyproject.toml\"]\n\n\
 [languages.python.lsp]\nembedded = \"ty\"\n\
 retry = { attempts = 2, delay = \"1ms\", delay_limit = \"1ms\" }\n";
 
@@ -30,39 +30,41 @@ async fn incoming_references_resolve_cross_file_callers_without_writes() -> Test
         Some(CONFIGURATION.to_owned()),
     )
     .await?;
-    let seed = workspace_client::captured_seed(&client, "serve", "service.py").await?;
     let answer = call_retrying_acceptance(
         &client,
         tool_request(
             "search",
-            &json!({"target":"symbol", "traversal":{
-                "seed":seed, "direction":"incoming", "facets":["references"]
-            }}),
+            &serde_json::json!({"query":
+                "SELECT DISTINCT ?caller ?name ?path ?derivation ?facet { \
+                 ?target a :Symbol; :name 'serve'; :path 'service.py' . \
+                 ?caller :references ?target; :name ?name; :path ?path . \
+                 ?relationship a :Relationship; :from ?caller; :to ?target; \
+                 :derivation ?derivation; :facets ?facet . FILTER(?facet = :references) } ORDER BY ?caller"
+            }),
         ),
     )
     .await?;
-    let results = answer["results"]
-        .as_array()
-        .ok_or("search must return results")?;
+    let results = workspace_client::query::rows(&answer)?;
     assert_eq!(results.len(), 1, "{answer:#}");
     let hit = &results[0];
-    assert_eq!(hit["path"], json!("main.py"), "{answer:#}");
-    assert_eq!(hit["hit"]["symbol"]["name"], json!("caller"), "{answer:#}");
-    let path = hit["traversal_path"]
-        .as_array()
-        .ok_or("caller must carry its traversal path")?;
-    assert_eq!(path.len(), 1, "{answer:#}");
-    assert_eq!(path[0]["direction"], json!("incoming"), "{answer:#}");
-    let relationship = &path[0]["relationship"];
     assert_eq!(
-        relationship["from"], hit["hit"]["symbol"]["id"],
+        workspace_client::query::literal(hit, "path")?,
+        "main.py",
         "{answer:#}"
     );
-    assert_eq!(relationship["to"], json!(seed), "{answer:#}");
-    assert_eq!(relationship["facets"], json!(["references"]), "{answer:#}");
     assert_eq!(
-        relationship["derivation"],
-        json!("resolution"),
+        workspace_client::query::literal(hit, "name")?,
+        "caller",
+        "{answer:#}"
+    );
+    assert_eq!(
+        workspace_client::query::iri(hit, "facet")?,
+        "urn:rift:vocabulary:references",
+        "{answer:#}"
+    );
+    assert_eq!(
+        workspace_client::query::iri(hit, "derivation")?,
+        "urn:rift:vocabulary:resolution",
         "{answer:#}"
     );
     assert_eq!(

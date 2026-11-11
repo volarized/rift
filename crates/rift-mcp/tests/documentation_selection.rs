@@ -37,14 +37,15 @@ async fn client_for(root: &Path) -> TestResult<RunningService<RoleClient, ()>> {
 
 /// The paths of the documentation hits a `lighthouse` query answers, sorted.
 async fn documentation_paths(client: &RunningService<RoleClient, ()>) -> TestResult<Vec<String>> {
-    let arguments = json!({ "query": "lighthouse", "target": "documentation", "limit": 50 });
+    use workspace_client::query;
+    let arguments = query::retrieval(&serde_json::from_value(json!({
+        "query": "lighthouse", "target": "documentation", "limit": 50
+    }))?)?;
     let answer = search_after_population(client, &arguments).await?;
-    let mut paths: Vec<String> = answer["results"]
-        .as_array()
-        .ok_or_else(|| format!("search must answer results: {answer:#}"))?
+    let mut paths: Vec<String> = query::rows(&answer)?
         .iter()
-        .filter_map(|hit| hit["path"].as_str().map(str::to_owned))
-        .collect();
+        .map(|hit| query::literal(hit, "path").map(str::to_owned))
+        .collect::<Result<_, _>>()?;
     paths.sort();
     paths.dedup();
     Ok(paths)

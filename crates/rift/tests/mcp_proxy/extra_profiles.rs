@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 
 use rift_protocol::identity::{SymbolIdentity, SymbolOwner};
-use rift_protocol::search::SearchHitTarget;
-use rift_protocol::search_read::SearchReadResult;
 use rift_protocol::symbol_read::GetSymbolResult;
-use serde_json::{Value, json};
+use serde_json::json;
+
+use crate::workspace_client::query;
 
 use crate::harness::{
     StopOnDrop, TestResult, await_workspace_ready, laid_out_workspace, proxied_call, proxy_client,
@@ -24,27 +24,18 @@ async fn beacons(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     scope: &str,
 ) -> TestResult<BTreeMap<String, (String, Option<String>)>> {
-    let arguments = json!({
+    let parameters = serde_json::from_value(json!({
         "query":"beacon", "target":"symbol", "scope":scope,
         "paths":{"include":["lib.rs"]}, "include":["source"], "limit":10,
-    });
+    }))?;
+    let arguments = serde_json::to_value(query::retrieval(&parameters)?)?;
     let answer = proxied_call(client, "search", &arguments).await?;
-    let result: SearchReadResult = serde_json::from_value(answer.clone())
-        .map_err(|error| format!("invalid search result: {error}; {answer}"))?;
-    let SearchReadResult::Results(result) = result else {
-        return Err(format!("search unavailable for {scope}: {answer}").into());
-    };
     let mut hits = BTreeMap::new();
-    for hit in result.results {
-        let SearchHitTarget::Symbol { symbol } = &hit.hit else {
-            return Err(format!("expected symbol hit: {answer}").into());
-        };
-        let id = symbol
-            .id
-            .as_ref()
-            .ok_or_else(|| format!("canonical symbol absent for {scope}: {answer}"))?;
-        let owner = SymbolIdentity::parse(id.as_str())?.owner().local_scope()?;
-        let previous = hits.insert(owner, (id.as_str().to_owned(), hit.source));
+    for hit in query::rows(&answer)? {
+        let id = query::iri(hit, "symbol")?;
+        let owner = SymbolIdentity::parse(id)?.owner().local_scope()?;
+        let source = query::literal(hit, "source").ok().map(str::to_owned);
+        let previous = hits.insert(owner, (id.to_owned(), source));
         assert!(previous.is_none(), "each project answers once: {answer}");
     }
     Ok(hits)
@@ -55,32 +46,23 @@ async fn require_unregistered_scope(
     client: &rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
     scope: &str,
 ) -> TestResult {
-    let refused = within(
+    let scope = oxrdf::Literal::from(scope);
+    let arguments = json!({"query": format!(
+        "SELECT ?hit {{ SERVICE :search {{ ?hit :query 'beacon'; :target 'symbol'; :scope {scope}; :index ?index }} }}"
+    )});
+    let response = within(
         "unregistered profile scope",
-        client.call_tool(
-            rmcp::model::CallToolRequestParams::new("search").with_arguments(
-                serde_json::from_value::<serde_json::Map<String, Value>>(json!({
-                    "query":"beacon", "target":"symbol", "scope":scope,
-                }))?,
-            ),
-        ),
+        client.call_tool(crate::workspace_client::tool_request("search", &arguments)),
     )
-    .await?
-    .expect_err("a scope naming no registered profile is refused");
-    let rmcp::ServiceError::McpError(data) = refused else {
-        return Err(format!("expected a protocol-level refusal, got {refused:?}").into());
-    };
+    .await?;
+    let failure = crate::workspace_client::failed_call(response)?;
     assert!(
-        data.message
-            .starts_with("tool arguments do not match the served schema"),
-        "{scope}: {}",
-        data.message
+        failure.message.contains("local@other"),
+        "{scope}: {failure:?}"
     );
     assert!(
-        data.message
-            .contains("accepted local@other, local@other:docs"),
-        "{scope}: {}",
-        data.message
+        failure.message.contains("local@other:docs"),
+        "{scope}: {failure:?}"
     );
     Ok(())
 }

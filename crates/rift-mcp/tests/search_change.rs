@@ -1,4 +1,4 @@
-//! Drives `search`'s `change` block through a live rmcp client over a committed fixture
+//! Drives change comparisons through SPARQL through a live rmcp client over a committed fixture
 //! workspace: an introduced declaration, a removed one, a signature change, a comparison
 //! against the working tree's uncommitted edits, and the refusals a comparison answers.
 
@@ -82,27 +82,28 @@ fn write_all(root: &std::path::Path, files: &[(&str, &str)]) -> TestResult {
     Ok(())
 }
 
-fn results(structured: &Value) -> &[Value] {
-    structured["results"].as_array().map_or(&[], Vec::as_slice)
+fn results(structured: &Value) -> TestResult<&[Value]> {
+    workspace_client::query::rows(structured)
 }
 
 /// Each hit's declaration name, its change kind, and the paths it names on both sides.
-fn changes(structured: &Value) -> Vec<(String, String, Value, Value)> {
-    results(structured)
+fn changes(structured: &Value) -> TestResult<Vec<(String, String, Value, Value)>> {
+    results(structured)?
         .iter()
-        .map(|hit| {
-            (
-                hit["hit"]["symbol"]["name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                hit["change"]["kind"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                hit["change"]["base_path"].clone(),
-                hit["change"]["head_path"].clone(),
-            )
+        .map(|row| {
+            let optional = |field| {
+                if row.get(field).is_some() {
+                    workspace_client::query::literal(row, field).map(|value| json!(value))
+                } else {
+                    Ok(Value::Null)
+                }
+            };
+            Ok((
+                workspace_client::query::literal(row, "name")?.to_owned(),
+                workspace_client::query::literal(row, "change_kind")?.to_owned(),
+                optional("base_path")?,
+                optional("head_path")?,
+            ))
         })
         .collect()
 }
@@ -115,16 +116,16 @@ async fn search_change_answers_every_declaration_the_two_revisions_differ_in() -
         &client,
         tool_request(
             "search",
-            &json!({
+            &change_request(&json!({
                 "change": {"base": "baseline", "head": "HEAD"},
                 "include": ["source"]
-            }),
+            }))?,
         ),
     )
     .await?;
 
     assert_eq!(
-        changes(&structured),
+        changes(&structured)?,
         [
             (
                 "added".to_owned(),
@@ -147,17 +148,25 @@ async fn search_change_answers_every_declaration_the_two_revisions_differ_in() -
         ],
         "{structured}"
     );
-    for hit in results(&structured) {
-        assert_eq!(hit["matched_by"], json!(["change"]), "{hit}");
+    for hit in results(&structured)? {
+        assert_eq!(
+            workspace_client::query::literal(hit, "matched_by")?,
+            "change",
+            "{hit}"
+        );
         assert!(hit["score"].is_null(), "a comparison ranks nothing: {hit}");
     }
-    let removed = &results(&structured)[1];
+    let removed = &results(&structured)?[1];
     assert_eq!(
-        removed["source"],
-        json!("pub fn gone() {}"),
+        workspace_client::query::literal(removed, "source")?,
+        "pub fn gone() {}",
         "a removed declaration keeps its base-side source: {removed}"
     );
-    assert_eq!(removed["path"], json!("src/gone.rs"), "{removed}");
+    assert_eq!(
+        workspace_client::query::literal(removed, "path")?,
+        "src/gone.rs",
+        "{removed}"
+    );
 
     client.cancel().await?;
     Ok(())
@@ -184,13 +193,15 @@ async fn search_change_against_the_working_tree_answers_uncommitted_edits() -> T
         &client,
         tool_request(
             "search",
-            &json!({"change": {"base": "baseline", "head": {"kind": "working_tree"}}}),
+            &change_request(
+                &json!({"change": {"base": "baseline", "head": {"kind": "working_tree"}}}),
+            )?,
         ),
     )
     .await?;
 
     assert_eq!(
-        changes(&structured),
+        changes(&structured)?,
         [
             (
                 "added".to_owned(),
@@ -229,11 +240,14 @@ async fn search_change_with_base_alone_compares_against_head() -> TestResult {
 
     let structured = call_retrying_acceptance(
         &client,
-        tool_request("search", &json!({"change": {"base": "baseline"}})),
+        tool_request(
+            "search",
+            &change_request(&json!({"change": {"base": "baseline"}}))?,
+        ),
     )
     .await?;
 
-    let names: Vec<String> = changes(&structured).into_iter().map(|hit| hit.0).collect();
+    let names: Vec<String> = changes(&structured)?.into_iter().map(|hit| hit.0).collect();
     assert_eq!(names, ["added", "gone", "shifted"], "{structured}");
 
     client.cancel().await?;
@@ -249,12 +263,12 @@ async fn search_change_with_a_file_target_answers_an_empty_page() -> TestResult 
         &client,
         tool_request(
             "search",
-            &json!({"change": {"base": "baseline"}, "target": "file"}),
+            &change_request(&json!({"change": {"base": "baseline"}, "target": "file"}))?,
         ),
     )
     .await?;
 
-    assert!(results(&structured).is_empty(), "{structured}");
+    assert!(results(&structured)?.is_empty(), "{structured}");
 
     client.cancel().await?;
     Ok(())
@@ -277,10 +291,7 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
             ErrorCode::InvalidRequest,
         ),
         (
-            json!({
-                "change": {"base": "baseline"},
-                "traversal": {"seed": seed}
-            }),
+            json!({"language":"sparql", "query":format!("SELECT ?symbol {{ SERVICE :search {{ ?hit :change '{{\"base\":\"baseline\"}}'^^rdf:JSON; :symbol ?symbol }} <{seed}> :calls ?symbol }}")}),
             ErrorCode::CapabilityUnavailable,
         ),
         (
@@ -293,7 +304,12 @@ async fn search_change_refuses_the_requests_it_cannot_answer() -> TestResult {
         ),
     ];
 
-    for (arguments, code) in refusals {
+    for (producer, code) in refusals {
+        let arguments = if producer.get("language").is_some() {
+            producer
+        } else {
+            change_request(&producer)?
+        };
         let failure = failed_call(client.call_tool(tool_request("search", &arguments)).await)?;
         assert_eq!(
             failure.code, code,
@@ -327,7 +343,7 @@ async fn search_change_refuses_a_workspace_with_history_disabled() -> TestResult
         client
             .call_tool(tool_request(
                 "search",
-                &json!({"change": {"base": "baseline"}}),
+                &change_request(&json!({"change": {"base": "baseline"}}))?,
             ))
             .await,
     )?;
@@ -364,7 +380,10 @@ async fn search_change_refuses_a_workspace_with_no_repository() -> TestResult {
 
     let failure = failed_call(
         client
-            .call_tool(tool_request("search", &json!({"change": {"base": "main"}})))
+            .call_tool(tool_request(
+                "search",
+                &change_request(&json!({"change": {"base": "main"}}))?,
+            ))
             .await,
     )?;
     assert_eq!(
@@ -411,12 +430,15 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
 
     let structured = call_retrying_acceptance(
         &client,
-        tool_request("search", &json!({"change": {"base": "baseline"}})),
+        tool_request(
+            "search",
+            &change_request(&json!({"change": {"base": "baseline"}}))?,
+        ),
     )
     .await?;
 
     assert_eq!(
-        changes(&structured),
+        changes(&structured)?,
         [(
             "travelled".to_owned(),
             "moved".to_owned(),
@@ -426,11 +448,23 @@ async fn search_change_pairs_a_declaration_moved_between_paths() -> TestResult {
         "{structured}"
     );
     assert_eq!(
-        results(&structured)[0]["hit"]["symbol"]["id"],
-        json!(captured_seed(&client, "travelled", "src/to.rs").await?),
+        workspace_client::query::iri(&results(&structured)?[0], "symbol")?,
+        captured_seed(&client, "travelled", "src/to.rs").await?,
         "{structured}"
     );
 
     client.cancel().await?;
     Ok(())
+}
+
+/// Change records remain typed projected fields on the public query answer.
+fn change_request(parameters: &Value) -> TestResult<Value> {
+    let parameters = serde_json::from_value(parameters.clone())?;
+    Ok(serde_json::to_value(
+        workspace_client::query::projected_retrieval(
+            &parameters,
+            "?change_kind ?base_path ?head_path ?matched_by",
+            "OPTIONAL { ?hit :change ?change . ?change :kind ?change_kind . OPTIONAL { ?change :base_path ?base_path } OPTIONAL { ?change :head_path ?head_path } } OPTIONAL { ?hit :matched_by ?match . ?match :value ?matched_by } ",
+        )?,
+    )?)
 }

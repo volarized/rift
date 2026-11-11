@@ -69,8 +69,8 @@ its situation:
 - [`get_symbol`](/docs/mcp#tool-get_symbol) reads one exact symbol identity returned by search.
 - [`nodes`](/docs/mcp#tool-nodes) answers a symbol's source, every syntax node of its
   declarations, or the nodes of the declaration at one position.
-- `search` with a `traversal` block answers a symbol's neighbors, its impact (who breaks when it
-  changes), or a path between two symbols.
+- `search` with SPARQL property paths follows references and calls. `:usages` selects
+  physical occurrences.
 
 The skill also points the agent at [`rift://map`](/docs/mcp#resource-map) as the first
 read in an unfamiliar repository, and at [`rift server logs`](/docs/developer/implementation#server-logs)

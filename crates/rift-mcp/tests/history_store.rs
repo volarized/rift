@@ -57,28 +57,15 @@ fn moved_workspace(root: &Path) -> TestResult {
 async fn travelled_history(
     client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
 ) -> TestResult<Value> {
-    let search = search_after_population(
-        client,
-        &json!({"query": "travelled", "target": "symbol", "include": ["source"]}),
-    )
-    .await?;
-    let mut rows = search["results"]
-        .as_array()
-        .ok_or("search results are an array")?
-        .iter()
-        .filter(|row| {
-            row["hit"]["symbol"]["name"] == "travelled"
-                && row["hit"]["symbol"]["language"] == "rust"
-                && row["path"] == "after.rs"
-        });
-    let row = rows
-        .next()
-        .ok_or("the original travelled declaration is present")?;
-    assert!(rows.next().is_none(), "travelled is unique: {search}");
-    assert_eq!(row["hit"]["symbol"]["kind"], "function");
-    let id = row["hit"]["symbol"]["id"]
-        .as_str()
-        .ok_or("travelled has an established identity")?;
+    use workspace_client::query;
+    let request = query::declaration("travelled", "after.rs");
+    let search = search_after_population(client, &request).await?;
+    let [row] = query::rows(&search)? else {
+        return Err(format!("one original travelled declaration: {search}").into());
+    };
+    assert_eq!(query::literal(row, "language")?, "rust");
+    assert_eq!(query::literal(row, "kind")?, "function");
+    let id = query::iri(row, "symbol")?;
     let identity = rift_protocol::identity::SymbolIdentity::parse(id)?;
     assert!(matches!(
         identity.owner(),
