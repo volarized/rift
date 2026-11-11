@@ -69,7 +69,7 @@ impl RiftMcp {
         if let Some(selection) = query.page_selection() {
             return self.replay_graph_query(selection).await.map(Json);
         }
-        let graph = match self.prepare_graph(&query, limits, deadline).await? {
+        let graph = match Box::pin(self.prepare_graph(&query, limits, deadline)).await? {
             Ok(graph) => graph,
             Err(unavailable) => return Ok(Json(QueryReadResult::Unavailable(unavailable))),
         };
@@ -133,7 +133,7 @@ impl RiftMcp {
         let mut acquired = if let Some(selected) = &selected {
             let result = tokio::time::timeout_at(
                 deadline.at(),
-                self.acquire_adjacency(&resolved, selected, limits, deadline),
+                Box::pin(self.acquire_adjacency(&resolved, selected, limits, deadline)),
             )
             .await
             .map_err(|_| read_failure(deadline_failure(deadline.budget())))?;
@@ -159,10 +159,12 @@ impl RiftMcp {
         };
         let mut retrieved = Vec::new();
         for selection in query.retrieval_requests() {
-            let result =
-                tokio::time::timeout_at(deadline.at(), self.query_retrieval(selection, limits))
-                    .await
-                    .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
+            let result = tokio::time::timeout_at(
+                deadline.at(),
+                Box::pin(self.query_retrieval(selection, limits)),
+            )
+            .await
+            .map_err(|_| read_failure(deadline_failure(deadline.budget())))??;
             match result {
                 Ok(result) => retrieved.push(*result),
                 Err(reason) => return Ok(Err(reason)),
