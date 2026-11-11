@@ -23,13 +23,14 @@ use lsp_types::notification::{
     Notification, Progress, PublishDiagnostics,
 };
 use lsp_types::request::{
-    CallHierarchyOutgoingCalls, CallHierarchyPrepare, DocumentDiagnosticRequest, Initialize,
-    References, RegisterCapability, Request, Shutdown, WorkDoneProgressCreate,
-    WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
+    CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
+    DocumentDiagnosticRequest, Initialize, References, RegisterCapability, Request, Shutdown,
+    WorkDoneProgressCreate, WorkspaceConfiguration, WorkspaceDiagnosticRefresh,
 };
 use lsp_types::{
-    CallHierarchyItem, CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams,
-    CallHierarchyPrepareParams, ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
+    ConfigurationParams, Diagnostic, DidChangeWatchedFilesParams,
     DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReport,
     DocumentDiagnosticReportResult, FileChangeType, FileEvent, FileSystemWatcher, GlobPattern,
@@ -923,6 +924,29 @@ impl EngineSession {
         };
         let items = self.request::<CallHierarchyPrepare>(params).await?;
         Ok(items.unwrap_or_default())
+    }
+
+    /// The callers the engine names for one prepared item, with each caller's ranges.
+    ///
+    /// # Errors
+    /// Returns the same capability and exchange failures as the outgoing call read.
+    pub async fn incoming_calls(
+        &mut self,
+        item: CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyIncomingCall>, RiftError> {
+        require(
+            self.capabilities.call_hierarchy,
+            CallHierarchyIncomingCalls::METHOD,
+        )?;
+        let params = CallHierarchyIncomingCallsParams {
+            item,
+            work_done_progress_params: WorkDoneProgressParams::default(),
+            partial_result_params: PartialResultParams::default(),
+        };
+        Ok(self
+            .request::<CallHierarchyIncomingCalls>(params)
+            .await?
+            .unwrap_or_default())
     }
 
     /// The calls one prepared item makes: each callee, and the ranges of its

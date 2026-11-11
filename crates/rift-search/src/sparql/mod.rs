@@ -69,7 +69,7 @@ pub use limits::{
 };
 pub use page::{PageForm, PageSelection, continuation_query};
 pub use query::GraphQuery;
-pub use requirements::{AdjacencySelection, NodeSelection, SymbolSelection};
+pub use requirements::{AdjacencySelection, AdjacencyStep, NodeSelection, SymbolSelection};
 pub use retrieval::RetrievalSelection;
 pub use vocabulary::{
     PropertyDefinition, VOCABULARY_NAMESPACE, VocabularyClass, VocabularyProperty,

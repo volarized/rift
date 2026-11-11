@@ -403,7 +403,8 @@ impl PackageCallee {
     /// from the canonical identity at its answered release. A mapped stub keeps its physical
     /// declaration origin separately for source reads. `None` for an invalid or local
     /// identity, or a release of another owner.
-    pub(crate) fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
+    #[must_use]
+    pub fn symbol(&self, declaration: &CalleeDeclaration) -> Option<Symbol> {
         let CalleeDeclaration {
             id,
             kind,

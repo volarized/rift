@@ -239,6 +239,20 @@ impl AcquiredGraph {
                 }
                 return Err(error);
             }
+            if selected.symbol_details {
+                for endpoint in acquired.local_endpoints() {
+                    let identity =
+                        rift_protocol::identity::SymbolIdentity::parse(endpoint.as_str())?;
+                    if identity.owner().is_local() {
+                        input.project_symbols(
+                            rift_search::sparql::SymbolSelection::Identified(endpoint.as_str()),
+                            &mut dataset,
+                            cancellation,
+                            deadline.at().into_std(),
+                        )?;
+                    }
+                }
+            }
         } else if let Some(selection) = query.node_selection() {
             input.project_nodes(
                 &reads,
@@ -796,6 +810,23 @@ mod tests {
             "{count:?}"
         );
 
+        let metadata = server
+            .graph_query(QueryParams {
+                query: format!(
+                    "SELECT DISTINCT ?name {{ ?caller :references <{}>; :name ?name }}",
+                    id.as_str()
+                ),
+                language: QueryLanguage::Sparql,
+            })
+            .await
+            .map_err(|failure| format!("{failure:?}"))?
+            .0;
+        assert!(
+            matches!(metadata, QueryReadResult::Results(ref result)
+            if matches!(&result.answer, QueryAnswer::Bindings { bindings, .. }
+                if bindings.iter().any(|row| matches!(&row["name"], rift_protocol::query::RdfTerm::Literal { value, .. } if value == "caller")))),
+            "{metadata:?}"
+        );
         let evidence = server.graph_query(QueryParams {
             query: format!("SELECT ?source ?unit {{ ?node :of <{}> ; :index 0 ; :source ?source ; :range [ :unit ?unit ; :start ?start ; :end ?end ] }}", id.as_str()),
             language: QueryLanguage::Sparql,
@@ -844,7 +875,7 @@ mod tests {
                         "warnings_max": 32, "source_bytes_max": 1_048_576
                     },
                     "relationship_capabilities": [{
-                        "direction": "outgoing", "facets": ["calls"], "bounds": {
+                        "direction": "outgoing", "facets": ["calls", "references"], "bounds": {
                             "max_seeds": 8, "max_facets": 4, "max_relationships": 100,
                             "max_occurrences": 100, "max_symbols": 100, "max_sources": 100
                         }
@@ -856,6 +887,7 @@ mod tests {
                 let expires = endpoint_expiry.clone();
                 async move {
                     let request: Value = serde_json::from_slice(&bytes).expect("valid raw relationship request");
+                    let facet = request["relationships"]["facets"][0].as_str().unwrap_or_default();
                     let seed = request["relationships"]["seeds"][0].as_str().unwrap_or_default();
                     let (next, number) = match seed {
                         ROOT => (A, 1_u64),
@@ -870,7 +902,7 @@ mod tests {
                     let result = json!({
                         "groups": [{"seed":seed,"complete":true,"relationships":[{
                             "id": format!("{number:064x}"),
-                            "relationship":{"from":seed,"to":next,"kind":"call","facets":["calls"],"derivation":"resolution"}
+                            "relationship":{"from":seed,"to":next,"kind":facet,"facets":[facet],"derivation":"resolution"}
                         }]}],
                         "symbols":[symbol(seed),symbol(next)],
                         "analyzer_revision":"analyzer-v1","corpus_revision":"corpus-v1",
@@ -883,7 +915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn graph_query_walks_three_hops_across_exact_releases_in_one_captured_view() -> TestResult
+    async fn graph_query_walks_mixed_hops_across_exact_releases_in_one_captured_view() -> TestResult
     {
         let expires = jiff::Timestamp::now()
             .checked_add(jiff::Span::new().minutes(2))?
@@ -918,7 +950,7 @@ mod tests {
             published.reads.dependency_context().entries()
         );
         assert!(published.configuration.global_configuration().enabled);
-        let query = format!("SELECT ?callee {{ <{ROOT}> :calls/:calls/:calls ?callee }}");
+        let query = format!("SELECT ?callee {{ <{ROOT}> :calls/:references/:calls ?callee }}");
         let graph = GraphQuery::parse(&query, &GraphLimits::default())?;
         assert!(graph.adjacency_selection().is_some(), "{graph:?}");
         let result = server
@@ -949,6 +981,10 @@ mod tests {
             matches!(&bindings[0]["callee"], rift_protocol::query::RdfTerm::Iri { value } if value == C)
         );
         let requests_seen = requests_seen.lock().await;
+        assert_eq!(
+            requests_seen[1]["relationships"]["facets"],
+            json!(["references"])
+        );
         assert_eq!(requests_seen.len(), 3);
         assert!(requests_seen[0].get("view").is_none());
         assert!(
