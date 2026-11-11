@@ -196,7 +196,10 @@ pub(super) fn selected_release(
         .entries()
         .iter()
         .filter(|entry| {
-            entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER && entry.name == *runtime
+            entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER
+                && entry.availability == rift_protocol::dependencies::PackageAvailability::Canonical
+                && rift_dependency::StandardLibrary::from_name(&entry.name)
+                    .is_some_and(|library| library.runtime() == runtime)
         })
         .filter_map(|entry| entry.version.as_deref())
         .collect();
@@ -204,4 +207,55 @@ pub(super) fn selected_release(
         return None;
     }
     Revision::release(owner, versions.first()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use rift_dependency::{DependencyContext, StandardLibraryAnswer};
+    use rift_protocol::dependencies::{PackageAvailability, PackageContextEntry, PackageSelector};
+
+    use super::*;
+
+    #[test]
+    fn runtime_owner_reads_only_an_exact_standard_library_version() {
+        let runtime = SymbolOwner::Runtime {
+            runtime: "cpython".to_owned(),
+        };
+        let mut context = DependencyContext::default();
+        let entry = |name, selector| {
+            PackageContextEntry::new(
+                rift_dependency::STANDARD_LIBRARY_MANAGER,
+                name,
+                selector,
+                PackageAvailability::Canonical,
+            )
+        };
+        context.add_standard_libraries(StandardLibraryAnswer {
+            entries: vec![
+                entry("python", PackageSelector::Version("3.12.9".to_owned())),
+                entry("node", PackageSelector::Requirement(">=0".to_owned())),
+            ],
+            ..StandardLibraryAnswer::default()
+        });
+        let release = selected_release(&context, &runtime).expect("exact CPython pin");
+        assert_eq!(release.to_string(), "rift://revision/stdlib/cpython@3.12.9");
+        assert!(
+            selected_release(
+                &context,
+                &SymbolOwner::Runtime {
+                    runtime: "node".to_owned()
+                }
+            )
+            .is_none()
+        );
+        assert!(
+            selected_release(
+                &context,
+                &SymbolOwner::Runtime {
+                    runtime: "python".to_owned()
+                }
+            )
+            .is_none()
+        );
+    }
 }

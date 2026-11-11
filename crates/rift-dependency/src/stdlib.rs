@@ -99,6 +99,27 @@ impl StandardLibrary {
         }
     }
 
+    /// Recognizes a standard library entry name from the workspace dependency context.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "rust" => Some(Self::Rust),
+            "node" => Some(Self::Node),
+            "python" => Some(Self::Python),
+            _ => None,
+        }
+    }
+
+    /// The canonical runtime owner of this library's exact published releases.
+    #[must_use]
+    pub const fn runtime(self) -> &'static str {
+        match self {
+            Self::Rust => "rustc",
+            Self::Node => "node",
+            Self::Python => "cpython",
+        }
+    }
+
     /// The name a degradation carries: `stdlib/<name>`.
     const fn resolver(self) -> ResolverName {
         match self {
@@ -166,12 +187,7 @@ pub fn standard_library_answer(
             answer.install_folders.push(InstallFolder {
                 origin: rift_protocol::read::SourceLocation::Stdlib {
                     runtime: Some(rift_protocol::read::RuntimeIdentity {
-                        runtime: match library {
-                            StandardLibrary::Rust => "rustc",
-                            StandardLibrary::Node => "node",
-                            StandardLibrary::Python => "cpython",
-                        }
-                        .to_owned(),
+                        runtime: library.runtime().to_owned(),
                         version: version.clone(),
                     }),
                 },
