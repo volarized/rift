@@ -103,13 +103,13 @@ jobs:
           shared-key: checks
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: |
             dev/uv.lock
             tools/rift-release/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,oas3-gen@0.28.0,cargo-audit,cargo-deny,sccache@0.18.0
       - run: >-
@@ -197,11 +197,11 @@ jobs:
           shared-key: rust-build
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145,sccache@0.18.0
       - run: >-
@@ -258,11 +258,11 @@ jobs:
         with:
           name: fast-build
           path: target
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145
 
@@ -369,11 +369,11 @@ jobs:
         with:
           name: fast-build
           path: target
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,cargo-nextest@0.9.145
       - run: >-
@@ -425,11 +425,11 @@ jobs:
         with:
           name: native-live
           path: target
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,cargo-nextest@0.9.145
       - run: >-
@@ -472,7 +472,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: |
@@ -538,11 +538,11 @@ jobs:
           shared-key: native-${{ matrix.target }}
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: cargo-nextest@0.9.145,sccache@0.18.0
       # Each runner builds for its own host, so the build passes no
@@ -656,11 +656,11 @@ jobs:
           shared-key: integration
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145,sccache@0.18.0
       # The archive carries test binaries compiled from these exact Rust
@@ -716,11 +716,11 @@ jobs:
           shared-key: integration-cli
           cache-targets: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,sccache@0.18.0
       # Keyed like the corpus archive: the same Rust inputs produce the same CLI.
@@ -791,7 +791,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
@@ -799,7 +799,7 @@ jobs:
         with:
           name: integration-archive
           path: target
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just,cargo-llvm-cov@0.8.7,cargo-nextest@0.9.145
       - run: rustup component add llvm-tools-preview
@@ -872,11 +872,11 @@ jobs:
         with:
           name: integration-cli
           path: target
-      - uses: astral-sh/setup-uv@v10.3.2
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: dev/uv.lock
-      - uses: taiki-e/install-action@v2.87.31
+      - uses: taiki-e/install-action@v2.90.2
         with:
           tool: just
       # The conformance runner is a Bun package; the checks around it drive the
