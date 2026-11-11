@@ -20,7 +20,7 @@ use super::{BYTES_MAX, CandidateResponses, RiftMcp, read_failure};
 use crate::output::{Json, ToolFailure};
 
 mod relationships;
-mod retrieval;
+pub(crate) mod retrieval;
 
 use relationships::AcquiredAdjacency;
 

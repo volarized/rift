@@ -1,4 +1,5 @@
 mod graph_query;
+pub(crate) use graph_query::retrieval::collect_retrieval;
 mod symbol;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
