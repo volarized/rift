@@ -1,0 +1,736 @@
+use std::time::Duration;
+
+use rift_error::{ErrorSlug, RiftError, errors};
+use rift_protocol::read::{Language, SourceUnitId, SymbolId, TextRange};
+
+use super::{
+    GraphAnswer, GraphDataset, GraphDatasetBuilder, GraphFact, GraphLimits, GraphQuery, GraphTerm,
+    HistoryEvent, NodeAddress, NodeFact, NodeLocation, QueryCancellation, RevisionIri,
+    SymbolRelation,
+};
+
+const MAIN: &str = "rift://symbol/local/rust/app/main";
+const PARSE: &str = "rift://symbol/local/rust/app/parser/parse";
+const LOAD: &str = "rift://symbol/local/rust/app/config/load";
+const UNIT: &str = "rift://source/project/src/main.rs";
+const COMMIT: &str = "rift://revision/git/0123456789abcdef0123456789abcdef01234567";
+const RELEASE: &str = "rift://revision/cargo/crates.io/demo@1.0.0";
+const TREE: &str =
+    "rift://revision/tree/9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+fn symbol(id: &str) -> SymbolId {
+    SymbolId(id.to_owned())
+}
+
+fn rust() -> Language {
+    Language {
+        name: "rust".to_owned(),
+        dialect: None,
+    }
+}
+
+fn revision(iri: &str) -> RevisionIri {
+    RevisionIri::parse(iri).expect("revision IRI is valid")
+}
+
+/// A dataset holding every fact kind once.
+fn model(limits: GraphLimits) -> Result<GraphDataset, RiftError> {
+    let (main, parse, load) = (symbol(MAIN), symbol(PARSE), symbol(LOAD));
+    let unit = SourceUnitId(UNIT.to_owned());
+    let (commit, release, tree) = (revision(COMMIT), revision(RELEASE), revision(TREE));
+    let language = rust();
+    let facts = [
+        GraphFact::Symbol {
+            symbol: &main,
+            kind: "function",
+            language: &language,
+        },
+        GraphFact::Relation {
+            source: &main,
+            relation: SymbolRelation::Calls,
+            target: &parse,
+        },
+        GraphFact::Relation {
+            source: &parse,
+            relation: SymbolRelation::References,
+            target: &load,
+        },
+        GraphFact::Relation {
+            source: &load,
+            relation: SymbolRelation::RenamedFrom,
+            target: &parse,
+        },
+        GraphFact::History {
+            symbol: &main,
+            event: HistoryEvent::Introduced,
+            revision: &commit,
+        },
+        GraphFact::History {
+            symbol: &parse,
+            event: HistoryEvent::Changed,
+            revision: &commit,
+        },
+        GraphFact::History {
+            symbol: &load,
+            event: HistoryEvent::Removed,
+            revision: &commit,
+        },
+        GraphFact::CoChange {
+            symbol: &main,
+            other: &parse,
+            commit_count: 3,
+        },
+        GraphFact::Uses {
+            revision: &tree,
+            dependency: &release,
+        },
+    ];
+    let mut graph = GraphDataset::builder(limits);
+    insert_nodes(&mut graph, &main, &unit, &language)?;
+    for fact in facts {
+        graph.insert(fact)?;
+    }
+    Ok(graph.build())
+}
+
+/// A file node holding `main`'s declaration node, which holds a call that uses `parse`.
+fn insert_nodes(
+    graph: &mut GraphDatasetBuilder,
+    main: &SymbolId,
+    unit: &SourceUnitId,
+    language: &Language,
+) -> Result<(), RiftError> {
+    let file = NodeAddress::Unit { unit, index: 0 };
+    let declaration = NodeAddress::Declaration {
+        symbol: main,
+        declaration: 0,
+        index: 0,
+    };
+    let call = NodeAddress::Declaration {
+        symbol: main,
+        declaration: 0,
+        index: 3,
+    };
+    let (file_range, declaration_range, call_range) = (
+        TextRange { start: 0, end: 30 },
+        TextRange { start: 4, end: 30 },
+        TextRange { start: 16, end: 23 },
+    );
+    let node = |address, kind, parent, range, source| NodeFact {
+        address,
+        kind,
+        language,
+        parent,
+        location: Some(NodeLocation { unit, range }),
+        source: Some(source),
+    };
+    let nodes = [
+        node(
+            file,
+            "source_file",
+            None,
+            &file_range,
+            "\n\n\n\nfn main() { parse(); }",
+        ),
+        node(
+            declaration,
+            "function_item",
+            Some(file),
+            &declaration_range,
+            "fn main() { parse(); }",
+        ),
+        node(
+            call,
+            "call_expression",
+            Some(declaration),
+            &call_range,
+            "parse()",
+        ),
+    ];
+    for fact in nodes.into_iter().map(GraphFact::Node) {
+        graph.insert(fact)?;
+    }
+    let parse = symbol(PARSE);
+    graph.insert(GraphFact::Usage {
+        symbol: &parse,
+        node: call,
+    })
+}
+
+fn answer(dataset: &GraphDataset, text: &str) -> Result<GraphAnswer, RiftError> {
+    let query = GraphQuery::parse(text, dataset.limits())?;
+    dataset.evaluate(&query, &QueryCancellation::new())
+}
+
+/// The rows of a `SELECT`, each value rendered as its IRI or lexical form.
+fn rows(dataset: &GraphDataset, text: &str) -> Vec<Vec<String>> {
+    let GraphAnswer::Solutions(table) = answer(dataset, text).expect("query answers") else {
+        panic!("a SELECT must answer solutions: {text}");
+    };
+    let render = |term: Option<GraphTerm>| match term {
+        Some(GraphTerm::Iri(text) | GraphTerm::BlankNode(text)) => text,
+        Some(GraphTerm::Literal { value, .. }) => value,
+        None => "unbound".to_owned(),
+    };
+    let mut rendered: Vec<Vec<String>> = table
+        .rows
+        .into_iter()
+        .map(|row| row.into_iter().map(render).collect())
+        .collect();
+    rendered.sort();
+    rendered
+}
+
+fn refusal(result: Result<impl std::fmt::Debug, RiftError>) -> ErrorSlug {
+    result.expect_err("the call is refused").slug()
+}
+
+#[test]
+fn test_graph_dataset_answers_symbol_node_and_edge_vocabulary() {
+    let dataset = model(GraphLimits::default()).expect("model builds");
+    assert_eq!(
+        rows(
+            &dataset,
+            "SELECT ?callee { ?s a :Symbol ; :kind \"function\" ; :language \"rust\" ; :calls ?callee }"
+        ),
+        vec![vec![PARSE.to_owned()]]
+    );
+    assert_eq!(
+        rows(
+            &dataset,
+            "SELECT ?target { <rift://symbol/local/rust/app/main> (:calls/:references) ?target }"
+        ),
+        vec![vec![LOAD.to_owned()]]
+    );
+    let declared = "SELECT ?symbol ?declaration ?index ?kind ?parent ?source { ?n a :Node ; :of ?symbol ; :declaration ?declaration ; :index ?index ; :kind ?kind ; :source ?source ; :parent/:kind ?parent }";
+    assert_eq!(
+        rows(&dataset, declared),
+        vec![
+            vec![
+                MAIN,
+                "0",
+                "0",
+                "function_item",
+                "source_file",
+                "fn main() { parse(); }"
+            ],
+            vec![
+                MAIN,
+                "0",
+                "3",
+                "call_expression",
+                "function_item",
+                "parse()"
+            ],
+        ]
+    );
+    let outside =
+        "SELECT ?unit ?index ?kind { ?n a :Node ; :unit ?unit ; :index ?index ; :kind ?kind }";
+    assert_eq!(
+        rows(&dataset, outside),
+        vec![vec![UNIT, "0", "source_file"]]
+    );
+    let ranges = "SELECT ?kind ?start ?end { ?n :kind ?kind ; :range ?r . ?r :unit ?unit ; :start ?start ; :end ?end . ?unit a :SourceUnit }";
+    assert_eq!(
+        rows(&dataset, ranges),
+        vec![
+            vec!["call_expression", "16", "23"],
+            vec!["function_item", "4", "30"],
+            vec!["source_file", "0", "30"],
+        ]
+    );
+    let usages = "SELECT ?user ?start { <rift://symbol/local/rust/app/parser/parse> :usages ?n . ?n :of ?user ; :range/:start ?start }";
+    assert_eq!(rows(&dataset, usages), vec![vec![MAIN, "16"]]);
+    assert_eq!(
+        rows(
+            &dataset,
+            "SELECT ?from { <rift://symbol/local/rust/app/config/load> :renamedFrom ?from }"
+        ),
+        vec![vec![PARSE.to_owned()]]
+    );
+}
+
+#[test]
+fn test_graph_dataset_answers_history_and_revision_vocabulary() {
+    let dataset = model(GraphLimits::default()).expect("model builds");
+    assert_eq!(
+        rows(
+            &dataset,
+            "SELECT ?event ?s { ?s ?event ?r . ?r a :Commit, :Revision . VALUES ?event { :introducedIn :changedIn :removedIn } }"
+        ),
+        vec![
+            vec!["urn:rift:vocabulary:changedIn".to_owned(), PARSE.to_owned()],
+            vec![
+                "urn:rift:vocabulary:introducedIn".to_owned(),
+                MAIN.to_owned()
+            ],
+            vec!["urn:rift:vocabulary:removedIn".to_owned(), LOAD.to_owned()],
+        ]
+    );
+    assert_eq!(
+        rows(
+            &dataset,
+            "SELECT ?other ?count { ?a :coChanges ?other . ?st rdf:subject ?a ; rdf:predicate :coChanges ; rdf:object ?other ; :commitCount ?count }"
+        ),
+        vec![vec![PARSE.to_owned(), "3".to_owned()]]
+    );
+    assert_eq!(
+        rows(
+            &dataset,
+            "SELECT ?tree ?release { ?tree :uses ?release . ?release a :Revision FILTER NOT EXISTS { ?release a :Commit } }"
+        ),
+        vec![vec![TREE.to_owned(), RELEASE.to_owned()]]
+    );
+    assert_eq!(
+        answer(&dataset, "ASK { ?s :removedIn ?r }").ok(),
+        Some(GraphAnswer::Boolean(true))
+    );
+    assert_eq!(
+        answer(&dataset, "ASK { ?s :calls ?s }").ok(),
+        Some(GraphAnswer::Boolean(false))
+    );
+}
+
+#[test]
+fn test_graph_dataset_construct_and_describe_preserve_rdf_terms() {
+    let dataset = model(GraphLimits::default()).expect("model builds");
+    let construct = format!(
+        "CONSTRUCT {{ _:node :of ?callee ; rdfs:label 'callee'@en }} WHERE {{ <{MAIN}> :calls ?callee }} LIMIT 1"
+    );
+    let GraphAnswer::Graph(triples) = answer(&dataset, &construct).expect("construct answers")
+    else {
+        panic!("CONSTRUCT returns triples");
+    };
+    assert_eq!(triples.len(), 2);
+    let subject = &triples[0].subject;
+    assert!(subject.is_blank_node());
+    assert!(triples.iter().all(|triple| &triple.subject == subject));
+    assert!(triples.iter().any(|triple| {
+        triple.predicate.as_str() == "urn:rift:vocabulary:of" && triple.object.is_named_node()
+    }));
+    assert!(triples.iter().any(|triple| {
+        triple.predicate.as_str() == "http://www.w3.org/2000/01/rdf-schema#label"
+            && matches!(&triple.object, oxrdf::Term::Literal(label)
+                if label.value() == "callee" && label.language() == Some("en"))
+    }));
+
+    let describe = format!("DESCRIBE ?s WHERE {{ VALUES ?s {{ <{MAIN}> }} }}");
+    let GraphAnswer::Graph(triples) = answer(&dataset, &describe).expect("describe answers") else {
+        panic!("DESCRIBE returns triples");
+    };
+    assert!(triples.iter().any(|triple| {
+        matches!(&triple.subject, oxrdf::NamedOrBlankNode::NamedNode(subject) if subject.as_str() == MAIN)
+            && triple.predicate.as_str() == "urn:rift:vocabulary:calls"
+            && matches!(&triple.object, oxrdf::Term::NamedNode(target) if target.as_str() == PARSE)
+    }));
+}
+
+#[test]
+fn test_graph_dataset_refuses_graph_past_answer_bounds() {
+    let narrow = GraphLimits::builder()
+        .solutions_max(1)
+        .build()
+        .expect("nonzero");
+    let dataset = model(narrow).expect("model builds");
+    let error = answer(
+        &dataset,
+        "CONSTRUCT { ?s a r:Symbol } WHERE { ?s a :Symbol }",
+    )
+    .expect_err("three symbols exceed one triple");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(error.to_string().contains("triples"), "{error}");
+
+    let narrow = GraphLimits::builder()
+        .answer_bytes_max(16)
+        .build()
+        .expect("nonzero");
+    let dataset = model(narrow).expect("model builds");
+    let error =
+        answer(&dataset, &format!("DESCRIBE <{MAIN}>")).expect_err("terms exceed sixteen bytes");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(error.to_string().contains("answer bytes"), "{error}");
+}
+
+#[test]
+fn test_graph_dataset_repeated_fact_costs_no_triples() {
+    let dataset = model(GraphLimits::default()).expect("model builds");
+    let count = dataset.triple_count();
+    let limits = GraphLimits::builder()
+        .triples_max(count)
+        .build()
+        .expect("nonzero");
+    let exact = model(limits).expect("a model of exactly the bound builds");
+    assert_eq!(
+        exact.triple_count(),
+        count,
+        "repeated nodes and types add no triple"
+    );
+}
+
+#[test]
+fn test_graph_dataset_refuses_fact_past_triple_bound_without_partial_insert() {
+    let limits = GraphLimits::builder()
+        .triples_max(4)
+        .build()
+        .expect("nonzero");
+    let (main, parse) = (symbol(MAIN), symbol(PARSE));
+    let mut graph: GraphDatasetBuilder = GraphDataset::builder(limits);
+    let language = rust();
+    graph
+        .insert(GraphFact::Symbol {
+            symbol: &main,
+            kind: "function",
+            language: &language,
+        })
+        .expect("three triples fit");
+    let relation = GraphFact::Relation {
+        source: &main,
+        relation: SymbolRelation::Calls,
+        target: &parse,
+    };
+    let error = graph
+        .insert(relation)
+        .expect_err("two new triples pass four");
+    assert_eq!(error.slug(), errors::search::graph_dataset_limit::SLUG);
+    assert!(error.to_string().contains("needs 5 triples"), "{error}");
+    assert_eq!(
+        graph.build().triple_count(),
+        3,
+        "a refused fact inserts nothing"
+    );
+}
+
+#[test]
+fn test_graph_dataset_refuses_fact_past_literal_byte_bound() {
+    let limits = GraphLimits::builder()
+        .literal_bytes_max(8)
+        .build()
+        .expect("nonzero");
+    let main = symbol(MAIN);
+    let language = rust();
+    let mut graph = GraphDataset::builder(limits);
+    let fact = GraphFact::Symbol {
+        symbol: &main,
+        kind: "function",
+        language: &language,
+    };
+    let error = graph
+        .insert(fact)
+        .expect_err("twelve literal bytes pass eight");
+    assert_eq!(error.slug(), errors::search::graph_dataset_limit::SLUG);
+    assert!(error.to_string().contains("literal bytes"), "{error}");
+}
+
+#[test]
+fn test_graph_dataset_refuses_identity_outside_its_form() {
+    let language = rust();
+    let mut graph = GraphDataset::builder(GraphLimits::default());
+    let cases = [
+        SymbolId("rift://node/rust/x".to_owned()),
+        SymbolId("rift://symbol/".to_owned()),
+        SymbolId("not an iri".to_owned()),
+    ];
+    for case in &cases {
+        let fact = GraphFact::Symbol {
+            symbol: case,
+            kind: "function",
+            language: &language,
+        };
+        assert_eq!(
+            refusal(graph.insert(fact)),
+            errors::search::graph_identity_invalid::SLUG,
+            "{case:?}"
+        );
+    }
+    assert_eq!(
+        refusal(RevisionIri::parse(UNIT)),
+        errors::search::graph_identity_invalid::SLUG
+    );
+    assert!(revision(COMMIT).is_commit() && !revision(RELEASE).is_commit());
+    assert_eq!(revision(TREE).as_str(), TREE);
+}
+
+#[test]
+fn test_graph_dataset_evaluate_refuses_answer_past_solution_and_byte_bounds() {
+    let narrow = GraphLimits::builder()
+        .solutions_max(2)
+        .build()
+        .expect("nonzero");
+    let dataset = model(narrow).expect("model builds");
+    let three = "SELECT ?s { ?s a :Symbol }";
+    let error = answer(&dataset, three).expect_err("three symbols pass two solutions");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(error.to_string().contains("solutions"), "{error}");
+    let limited = "SELECT ?s { ?s a :Symbol } LIMIT 2";
+    assert_eq!(rows(&dataset, limited).len(), 2, "two solutions fit");
+
+    let narrow = GraphDataset::builder(
+        GraphLimits::builder()
+            .answer_bytes_max(16)
+            .build()
+            .expect("nonzero"),
+    )
+    .build();
+    let error = answer(&narrow, "SELECT ?x { BIND(\"0123456789abcdef\" AS ?x) }")
+        .expect_err("bytes pass sixteen");
+    assert!(error.to_string().contains("answer bytes"), "{error}");
+}
+
+#[test]
+fn test_graph_dataset_evaluate_refuses_past_deadline_and_on_cancellation() {
+    let expired = GraphLimits::builder()
+        .evaluation_timeout(Duration::ZERO)
+        .build()
+        .expect("nonzero");
+    let dataset = model(expired).expect("model builds");
+    let reads = "SELECT ?s { ?s ?p ?o }";
+    assert_eq!(
+        refusal(answer(&dataset, reads)),
+        errors::search::query_deadline_exceeded::SLUG
+    );
+    let no_reads = "SELECT ?x { BIND(1 AS ?x) }";
+    assert_eq!(
+        refusal(answer(&dataset, no_reads)),
+        errors::search::query_deadline_exceeded::SLUG
+    );
+
+    let dataset = model(GraphLimits::default()).expect("model builds");
+    let query = GraphQuery::parse(reads, dataset.limits()).expect("query parses");
+    let cancellation = QueryCancellation::new();
+    cancellation.cancel();
+    assert!(cancellation.is_cancelled(), "{cancellation:?}");
+    assert_eq!(
+        refusal(dataset.evaluate(&query, &cancellation)),
+        errors::search::query_cancelled::SLUG
+    );
+}
+
+#[test]
+fn test_graph_dataset_evaluate_reports_evaluation_failure() {
+    let dataset = model(GraphLimits::default()).expect("model builds");
+    let unknown = "SELECT ?x { BIND(<urn:rift:unknown>(1) AS ?x) }";
+    assert_eq!(
+        refusal(answer(&dataset, unknown)),
+        errors::search::query_evaluation_failed::SLUG
+    );
+}
+
+/// A dataset of `callers` symbols that all call one target.
+fn fan_in(callers: usize, limits: GraphLimits) -> GraphDataset {
+    let target = symbol(PARSE);
+    let mut graph = GraphDataset::builder(limits);
+    for caller in 0..callers {
+        let source = symbol(&format!("{MAIN}{caller}"));
+        let fact = GraphFact::Relation {
+            source: &source,
+            relation: SymbolRelation::Calls,
+            target: &target,
+        };
+        graph.insert(fact).expect("the fan-in fits");
+    }
+    graph.build()
+}
+
+#[test]
+fn test_graph_dataset_evaluate_timer_stops_join_between_reads() {
+    let timeout = Duration::from_millis(50);
+    let limits = GraphLimits::builder()
+        .evaluation_timeout(timeout)
+        .build()
+        .expect("nonzero");
+    let dataset = fan_in(60, limits);
+    let joined =
+        "SELECT (COUNT(*) AS ?n) { ?a :calls ?t . ?b :calls ?t . ?c :calls ?t . ?d :calls ?t }";
+    let started = std::time::Instant::now();
+    let error = answer(&dataset, joined).expect_err("13 million joined rows outlast 50 ms");
+    let elapsed = started.elapsed();
+    assert_eq!(
+        error.slug(),
+        errors::search::query_deadline_exceeded::SLUG,
+        "{error}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the timer cancels the join: elapsed={elapsed:?}"
+    );
+}
+
+#[test]
+fn test_graph_dataset_evaluate_refuses_string_past_expression_bound() {
+    let limits = GraphLimits::builder()
+        .expression_bytes_max(64)
+        .build()
+        .expect("nonzero");
+    let dataset = GraphDataset::builder(limits).build();
+    let doubling = "SELECT ?d { BIND(\"0123456789abcdef\" AS ?a) BIND(CONCAT(?a, ?a) AS ?b) BIND(CONCAT(?b, ?b) AS ?c) BIND(CONCAT(?c, ?c) AS ?d) }";
+    let replace = "SELECT ?x { BIND(REPLACE(\"aaaa\", \"a\", \"bbbbbbbbbbbbbbbbbbbb\") AS ?x) }";
+    let ucase = "SELECT ?x { BIND(UCASE(\"aaaaaaaaaaaaaaaaaaaaaaa\") AS ?x) }";
+    let grouped = "SELECT (GROUP_CONCAT(?v) AS ?x) { VALUES ?v { \"0123456789\" \"0123456789\" \"0123456789\" \"0123456789\" \"0123456789\" \"0123456789\" } }";
+    for text in [doubling, replace, ucase, grouped] {
+        let error = answer(&dataset, text).expect_err("the computed string passes 64 bytes");
+        assert_eq!(
+            error.slug(),
+            errors::search::query_answer_limit::SLUG,
+            "{text}"
+        );
+        assert!(error.to_string().contains("expression bytes"), "{error}");
+    }
+    let fits = "SELECT ?x ?y { BIND(CONCAT(\"ab\", \"cd\") AS ?x) { SELECT (GROUP_CONCAT(DISTINCT ?v; SEPARATOR=\"|\") AS ?y) { VALUES ?v { \"\" \"b\" \"\" } } } }";
+    assert_eq!(
+        rows(&dataset, fits),
+        vec![vec!["abcd".to_owned(), "|b".to_owned()]]
+    );
+}
+
+fn structure_refusal(text: &str, limits: &GraphLimits) -> String {
+    let error = GraphQuery::parse(text, limits).expect_err("the structure passes its bound");
+    assert_eq!(
+        error.slug(),
+        errors::search::query_structure_limit::SLUG,
+        "{error}"
+    );
+    error.to_string()
+}
+
+#[test]
+fn test_graph_query_parse_survives_brackets_and_operators_at_their_bounds() {
+    let limits = GraphLimits::default();
+    let open = "(".repeat(limits.brackets_max() - 2);
+    let close = ")".repeat(limits.brackets_max() - 2);
+    let chain = "+1".repeat(limits.operators_max());
+    let text = format!("SELECT ?x {{ BIND({open}1{chain}{close} AS ?x) }}");
+    let dataset = GraphDataset::builder(limits).build();
+    let expected = (limits.operators_max() + 1).to_string();
+    assert_eq!(rows(&dataset, &text), vec![vec![expected]]);
+    let deeper = format!("SELECT ?x {{ BIND(({open}1{close}) AS ?x) }}");
+    assert!(structure_refusal(&deeper, &limits).contains("opening brackets"));
+    let longer = format!("SELECT ?x {{ BIND(1{chain}+1 AS ?x) }}");
+    assert!(structure_refusal(&longer, &limits).contains("operator characters"));
+}
+
+#[test]
+fn test_graph_query_parse_counts_brackets_wherever_written() {
+    let limits = GraphLimits::default();
+    let (open, close) = ("(".repeat(5000), ")".repeat(5000));
+    let shapes = [
+        format!("ASK {{ FILTER(?a<{open}1{close}) }}"),
+        format!("ASK {{ ?s :a\\( ?o FILTER({open}1{close}) }}"),
+        format!("ASK {{ ?s <urn:a'b> ?o FILTER({open}1{close}) }}"),
+        format!("ASK {{ ?s :a\\# ?o FILTER({open}1{close}) }}"),
+        format!("ASK {{ FILTER(\"{close}\" = {open}1{close}) }}"),
+    ];
+    for text in &shapes {
+        assert!(
+            structure_refusal(text, &limits).contains("opening brackets"),
+            "{text:.40}"
+        );
+    }
+    let tight = GraphLimits::builder()
+        .brackets_max(3)
+        .build()
+        .expect("nonzero");
+    assert!(structure_refusal("ASK { FILTER(\"((\" = \"\") }", &tight).contains("4 opening"));
+}
+
+#[test]
+fn test_graph_query_parse_counts_codepoint_escapes_as_their_characters() {
+    let limits = GraphLimits::default();
+    let (open, close) = (
+        "\\u0028".repeat(limits.brackets_max()),
+        "\\u0029".repeat(limits.brackets_max()),
+    );
+    let escaped = format!("SELECT ?x {{ BIND({open}1{close} AS ?x) }}");
+    assert!(structure_refusal(&escaped, &limits).contains("opening brackets"));
+    let chained = format!(
+        "SELECT ?x {{ BIND(1{} AS ?x) }}",
+        "\\u002b1".repeat(limits.operators_max() + 1)
+    );
+    assert!(structure_refusal(&chained, &limits).contains("operator characters"));
+    let letters = "SELECT ?x { BIND(\"\\u00e9\\u0041\" AS ?x) }";
+    assert!(
+        GraphQuery::parse(letters, &limits).is_ok(),
+        "escapes of other characters count nothing"
+    );
+}
+
+#[test]
+fn test_graph_query_parse_refuses_algebra_past_depth_bound() {
+    let limits = GraphLimits::builder()
+        .algebra_depth_max(8)
+        .build()
+        .expect("nonzero");
+    let shallow = "SELECT ?x { BIND(1 + 1 AS ?x) }";
+    assert!(
+        GraphQuery::parse(shallow, &limits).is_ok(),
+        "a shallow query fits"
+    );
+    let deep = format!("SELECT ?x {{ BIND(1{} AS ?x) }}", "+1".repeat(8));
+    assert!(structure_refusal(&deep, &limits).contains("algebra levels"));
+}
+
+#[test]
+fn test_graph_query_parse_refuses_patterns_past_planner_bound() {
+    let limits = GraphLimits::builder()
+        .patterns_max(2)
+        .build()
+        .expect("nonzero");
+    let two = "SELECT * { ?a :calls ?b . ?b :calls ?c }";
+    assert!(GraphQuery::parse(two, &limits).is_ok(), "two patterns fit");
+    let three = "SELECT * { ?a :calls ?b . ?b :calls ?c FILTER EXISTS { ?c :kind ?k } }";
+    assert!(structure_refusal(three, &limits).contains("3 patterns"));
+}
+
+#[test]
+fn test_graph_dataset_evaluate_refuses_computed_strings_past_total_bound() {
+    let limits = GraphLimits::builder()
+        .computed_bytes_max(64)
+        .build()
+        .expect("nonzero");
+    let dataset = GraphDataset::builder(limits).build();
+    let rows_of_ten: Vec<String> = (0..10).map(|row| format!("\"{row:010}\"")).collect();
+    let many = format!(
+        "SELECT ?y {{ VALUES ?v {{ {} }} BIND(CONCAT(?v, ?v) AS ?y) }}",
+        rows_of_ten.join(" ")
+    );
+    let error = answer(&dataset, &many).expect_err("ten values of twenty bytes pass 64 together");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(
+        error.to_string().contains("computed string bytes"),
+        "{error}"
+    );
+    let few = format!(
+        "SELECT ?y {{ VALUES ?v {{ {} }} BIND(CONCAT(?v, ?v) AS ?y) }}",
+        rows_of_ten[..3].join(" ")
+    );
+    assert_eq!(
+        rows(&dataset, &few).len(),
+        3,
+        "three values of twenty bytes fit"
+    );
+}
+
+#[test]
+fn test_graph_query_parse_refuses_inline_rows_joining_past_solution_bound() {
+    let limits = GraphLimits::builder()
+        .solutions_max(100)
+        .build()
+        .expect("nonzero");
+    let block = |name: &str| {
+        format!(
+            "VALUES (?{name} ?t) {{ {} }}",
+            (0..11)
+                .map(|row| format!("({row} 0)"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let fits = format!("SELECT * {{ {} }}", block("a"));
+    assert!(
+        GraphQuery::parse(&fits, &limits).is_ok(),
+        "eleven inline rows fit"
+    );
+    let joined = format!("SELECT * {{ {} {} }}", block("a"), block("b"));
+    let error = GraphQuery::parse(&joined, &limits).expect_err("121 joined inline rows pass 100");
+    assert_eq!(error.slug(), errors::search::query_answer_limit::SLUG);
+    assert!(error.to_string().contains("joined VALUES rows"), "{error}");
+}
