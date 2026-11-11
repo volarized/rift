@@ -215,6 +215,7 @@ pub fn validate(path: &Path) -> Result<(), ContractError> {
     validate_operations(&spec).map_err(&invalid)?;
     validate_symbol_contract(&document).map_err(&invalid)?;
     validate_nodes_contract(&document).map_err(&invalid)?;
+    validate_search_contract(&document).map_err(&invalid)?;
     validate_bounds(&spec).map_err(&invalid)?;
     validate_optional_properties_omit_null(&document).map_err(&invalid)?;
     validate_patterns(&document).map_err(&invalid)?;
@@ -338,7 +339,9 @@ fn validate_response_media(
             }
             continue;
         }
-        if endpoint == Endpoint::Symbols && *status == StatusCode::SERVICE_UNAVAILABLE {
+        if matches!(endpoint, Endpoint::Symbols | Endpoint::Search)
+            && *status == StatusCode::SERVICE_UNAVAILABLE
+        {
             if response.content.len() != 2
                 || !response.content.contains_key("application/json")
                 || !response.content.contains_key("application/problem+json")
@@ -385,6 +388,37 @@ fn validate_request(spec: &Spec, endpoint: Endpoint, operation: &Operation) -> R
         return Err(format!(
             "{method} {path} request body must declare only `application/json`"
         ));
+    }
+    Ok(())
+}
+
+fn validate_search_contract(document: &Value) -> Result<(), String> {
+    let operation = &document["paths"]["/v1/search"]["post"];
+    for (schema, expected) in [
+        (
+            &operation["requestBody"]["content"]["application/json"]["schema"],
+            json!({"oneOf": [
+                {"$ref": "#/components/schemas/PackageSearchRequest"},
+                {"$ref": "#/components/schemas/RelationshipSearchRequest"}
+            ]}),
+        ),
+        (
+            &operation["responses"]["200"]["content"]["application/json"]["schema"],
+            json!({"oneOf": [
+                {"$ref": "#/components/schemas/PackageSearchPage"},
+                {"$ref": "#/components/schemas/RelationshipSearchPage"}
+            ]}),
+        ),
+        (
+            &operation["responses"]["503"]["content"]["application/json"]["schema"],
+            json!({"$ref": "#/components/schemas/SearchUnavailable"}),
+        ),
+    ] {
+        if schema != &expected {
+            return Err(
+                "POST /v1/search must declare ranked and raw relationship reads".to_owned(),
+            );
+        }
     }
     Ok(())
 }
@@ -794,6 +828,21 @@ fn validate_patterns(document: &Value) -> Result<(), String> {
 /// Compares each shared schema with its Rust model's, in the form the MCP surface serves:
 /// with the `null` arm stripped from every optional property.
 fn validate_shared_schemas(document: &Value) -> Result<(), String> {
+    let components = component_schemas(document)?;
+    for (name, expected) in shared_schemas() {
+        let actual = components
+            .get(&name)
+            .ok_or_else(|| format!("shared schema `{name}` is missing"))?;
+        if actual != &expected {
+            return Err(format!(
+                "shared schema `{name}` differs from its Rust model"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn shared_schemas() -> serde_json::Map<String, Value> {
     let mut settings = SchemaSettings::draft2020_12();
     settings.definitions_path = "/components/schemas".into();
     settings.meta_schema = None;
@@ -814,24 +863,25 @@ fn validate_shared_schemas(document: &Value) -> Result<(), String> {
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsParams>();
     let _ = generator.subschema_for::<rift_protocol::source_read::FindDeclarationsResult>();
 
+    let _ =
+        generator.subschema_for::<rift_protocol::relationship_read::RelationshipSearchRequest>();
+    let _ = generator.subschema_for::<rift_protocol::relationship_read::RelationshipSearchPage>();
+    let _ = generator.subschema_for::<rift_protocol::relationship_read::RelationshipCapability>();
+    let _ = generator.subschema_for::<rift_protocol::search_read::SearchUnavailable>();
+
     // oas3 0.22 omits JSON Schema keywords used by shared models, including
     // patternProperties. Compare those schemas as JSON to retain their exact shape.
-    let components = component_schemas(document)?;
-    for (name, mut expected) in generator.take_definitions(true) {
-        normalize_shared_string_enum(&mut expected);
-        if let Some(schema) = expected.as_object_mut() {
-            rift_protocol::schema::strip_optional_null_arms(schema);
-        }
-        let actual = components
-            .get(&name)
-            .ok_or_else(|| format!("shared schema `{name}` is missing"))?;
-        if actual != &expected {
-            return Err(format!(
-                "shared schema `{name}` differs from its Rust model"
-            ));
-        }
-    }
-    Ok(())
+    generator
+        .take_definitions(true)
+        .into_iter()
+        .map(|(name, mut schema)| {
+            normalize_shared_string_enum(&mut schema);
+            if let Some(object) = schema.as_object_mut() {
+                rift_protocol::schema::strip_optional_null_arms(object);
+            }
+            (name, schema)
+        })
+        .collect()
 }
 
 fn normalize_shared_string_enum(schema: &mut Value) {

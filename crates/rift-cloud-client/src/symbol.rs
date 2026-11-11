@@ -191,7 +191,11 @@ fn valid_result(
 }
 
 /// Whether `origin` names `owner` at the answered release `version`.
-fn valid_origin(origin: &SymbolOrigin, owner: &SymbolOwner, version: Option<&str>) -> bool {
+pub(crate) fn valid_origin(
+    origin: &SymbolOrigin,
+    owner: &SymbolOwner,
+    version: Option<&str>,
+) -> bool {
     if origin.source_kind == SourceKind::Synthetic {
         return false;
     }

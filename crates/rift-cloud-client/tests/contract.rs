@@ -352,7 +352,7 @@ fn every_contract_example_validates_against_its_schema() -> TestResult {
     let mut checked = 0_usize;
     validate_examples(&document, components, &mut checked)?;
     assert_eq!(
-        checked, 17,
+        checked, 20,
         "each request and success response carries an example"
     );
     Ok(())
@@ -364,7 +364,7 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
     let mut checked = 0_usize;
     decode_examples(&document, &mut checked)?;
     assert_eq!(
-        checked, 9,
+        checked, 11,
         "each success response carries a generated response type"
     );
     Ok(())
@@ -373,18 +373,44 @@ fn every_contract_response_example_decodes_through_generated_types() -> TestResu
 fn decode_examples(node: &Value, checked: &mut usize) -> TestResult {
     match node {
         Value::Object(object) => {
-            if let (Some(reference), Some(examples)) = (
-                object
-                    .get("schema")
-                    .and_then(|schema| schema.get("$ref"))
-                    .and_then(Value::as_str),
+            if let (Some(schema), Some(examples)) = (
+                object.get("schema"),
                 object.get("examples").and_then(Value::as_object),
             ) {
                 for example in examples.values() {
                     let value = example
                         .get("value")
                         .ok_or("a contract example must carry a value")?;
-                    if decode_generated_response_example(reference, value.clone())? {
+                    let decoded = if let Some(reference) =
+                        schema.get("$ref").and_then(Value::as_str)
+                    {
+                        decode_generated_response_example(reference, value.clone())?
+                    } else if schema
+                        == &json!({"oneOf":[
+                            {"$ref":"#/components/schemas/PackageSearchPage"},
+                            {"$ref":"#/components/schemas/RelationshipSearchPage"}
+                        ]})
+                    {
+                        let generated: rift_cloud_client::Search200Response =
+                            serde_json::from_value(value.clone())?;
+                        match generated {
+                            rift_cloud_client::Search200Response::Package(_) => {
+                                decode_generated_response_example(
+                                    "#/components/schemas/PackageSearchPage",
+                                    value.clone(),
+                                )?;
+                            }
+                            rift_cloud_client::Search200Response::Relationship(_) => {
+                                let page: rift_protocol::relationship_read::RelationshipSearchPage =
+                                    serde_json::from_value(value.clone())?;
+                                assert!(page.groups.iter().all(|group| group.complete));
+                            }
+                        }
+                        true
+                    } else {
+                        false
+                    };
+                    if decoded {
                         *checked += 1;
                     }
                 }
@@ -424,6 +450,9 @@ fn decode_generated_response_example(reference: &str, value: Value) -> TestResul
                 "rift://symbol/cargo/crates.io/tokio/rust/tokio/Beacon",
             )?;
             assert!(result.is_valid_for(&identity));
+        }
+        "#/components/schemas/SearchUnavailable" => {
+            serde_json::from_value::<rift_cloud_client::SearchUnavailable>(value)?;
         }
         "#/components/schemas/PackagePatternPage" => {
             serde_json::from_value::<PackagePatternPage>(value)?;
