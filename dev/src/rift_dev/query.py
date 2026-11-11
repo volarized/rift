@@ -149,7 +149,7 @@ def incoming_references_request(symbol: str) -> JsonObject:
     """Select distinct enclosing symbols that refer to a canonical target."""
     _identity(symbol)
     return {
-        "query": f"SELECT DISTINCT ?caller ?name {{ ?caller :references <{symbol}>; :name ?name }} ORDER BY ?name"
+        "query": f"SELECT DISTINCT ?caller {{ ?caller :references <{symbol}> }} ORDER BY ?caller"
     }
 
 

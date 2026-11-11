@@ -158,22 +158,9 @@ pub(crate) enum Hold {
     Declarations(Duration),
 }
 
-/// Whether pattern pages carry the captured serving context.
-#[derive(Clone, Copy)]
-pub(crate) enum PatternView {
-    /// Pages carry the original view.
-    Captured,
-    /// Pages omit the view.
-    Missing,
-}
-
 /// How the fixture answers, beyond the collection it holds.
 #[derive(Clone, Copy)]
 pub(crate) struct FixtureOptions {
-    /// How long the fixture retains its original view.
-    pub(crate) view_lifetime: Duration,
-    /// Whether pattern pages carry their original captured view.
-    pub(crate) pattern_view: PatternView,
     /// What the symbol and search endpoints answer.
     pub(crate) symbol: SymbolFixture,
     /// The answer the fixture holds before it sends it, and for how long.
@@ -199,8 +186,6 @@ pub(crate) struct FixtureOptions {
 impl Default for FixtureOptions {
     fn default() -> Self {
         Self {
-            view_lifetime: Duration::from_mins(15),
-            pattern_view: PatternView::Captured,
             symbol: SymbolFixture::Valid,
             hold: None,
             page_limit_max: PAGE_LIMIT_ADVERTISED,
@@ -268,11 +253,6 @@ pub(crate) struct ObservedRequest {
 }
 
 impl GlobalFixture {
-    /// Original view issued by this fixture.
-    pub(crate) fn captured_view(&self) -> &Value {
-        &self.state.view
-    }
-
     pub(crate) async fn start(symbol: SymbolFixture) -> Result<Self, std::io::Error> {
         Self::start_with(FixtureOptions {
             symbol,
@@ -298,7 +278,7 @@ impl GlobalFixture {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let expires = std::time::SystemTime::now()
-            .checked_add(options.view_lifetime)
+            .checked_add(Duration::from_mins(15))
             .expect("fixture view expiry fits the clock bound");
         let view = json!({
             "id": "a".repeat(64),
@@ -414,14 +394,7 @@ async fn global_handler(
     if path.ends_with("/patterns") {
         return pattern_page(&body).map_or_else(
             || StatusCode::BAD_REQUEST.into_response(),
-            |mut page| {
-                if matches!(options.pattern_view, PatternView::Missing) {
-                    page.as_object_mut()
-                        .expect("pattern page object")
-                        .remove("view");
-                }
-                state.response(page)
-            },
+            |page| state.response(page),
         );
     }
     StatusCode::NOT_FOUND.into_response()

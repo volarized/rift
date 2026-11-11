@@ -861,16 +861,6 @@ impl CorpusArms {
     }
 }
 
-/// How many of one answer's warnings carry `code`.
-fn warning_count(structured: &Value, code: &str) -> usize {
-    structured["warnings"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|warning| warning["code"] == json!(code))
-        .count()
-}
-
 /// Every file identity one answer's nodes carry under `unit`: the identity whose path the
 /// server encodes, since a node's own identity is a content digest with no path.
 fn node_units(structured: &Value) -> Vec<String> {

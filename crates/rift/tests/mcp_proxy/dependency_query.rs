@@ -91,7 +91,7 @@ async fn proxy_keeps_dependency_call_paths_and_original_source_bytes() -> TestRe
     let unit = query::iri(projected, "unit")?;
     let (owner, path) = rift_protocol::identity::parse_source_unit_identity(unit)?;
     assert_eq!(owner.as_ref(), Some(parsed.owner()));
-    assert_eq!(path.as_str(), "core.py");
+    assert_eq!(path.as_str(), "greeting/core.py");
     let start = query::literal(projected, "start")?.parse::<usize>()?;
     let end = query::literal(projected, "end")?.parse::<usize>()?;
     let selected_bytes = SOURCE.get(start..end).ok_or("admitted package range")?;

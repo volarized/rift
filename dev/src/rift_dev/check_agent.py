@@ -23,6 +23,7 @@ from rift_dev.query import (
     bindings,
     iri,
     literal,
+    project_source_unit,
     usage_request,
 )
 from rift_dev.rift_test_client import (
@@ -105,7 +106,7 @@ async def check_python_references(
     with Repo.init(root):
         pass
     (root / "rift.toml").write_text(
-        CONFIGURATION + "[source]\ninclude=['service.py']\n" + PYTHON_CONFIGURATION,
+        CONFIGURATION + "[source]\ninclude=['service.py','pyproject.toml']\n" + PYTHON_CONFIGURATION,
         encoding="utf-8",
         newline="",
     )
@@ -168,7 +169,8 @@ async def declaration_node(client: Client, name: str) -> str:
     declarations = array_value(answer.get("declarations"), "symbol declarations")
     require(len(declarations) == 1, f"expected one declaration: {answer}")
     declaration = object_value(declarations[0], "declaration")
-    require(declaration.get("path") == literal(hit, "path"), f"changed path: {answer}")
+    path = string_value(declaration.get("path"), "declaration.path")
+    require(project_source_unit(path) == iri(hit, "unit"), f"changed unit: {answer}")
     require(
         declaration.get("range")
         == {"start": int(literal(hit, "start")), "end": int(literal(hit, "end"))},
@@ -188,7 +190,7 @@ async def declaration_node(client: Client, name: str) -> str:
     listing = await client.call(
         "nodes",
         {
-            "path": string_value(declaration.get("path"), "declaration.path"),
+            "path": path,
             "position": cast(int, end) - 1,
             "revision": revision,
         },
@@ -276,5 +278,4 @@ async def check_agent(binary: Path, version: str | None = None) -> None:
                 raise
             finally:
                 retain_collector(base, telemetry)
-            print(collector_line(telemetry), flush=True)
             print(collector_line(telemetry), flush=True)

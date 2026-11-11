@@ -63,6 +63,7 @@ mod text_complete;
 )]
 mod workspace_client;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
@@ -1023,7 +1024,10 @@ fn stated_identities<'value>(
     if name == "get_symbol" {
         return structured["symbol"]["id"].as_str().into_iter().collect();
     }
-    if matches!(name, "search" | "nodes") {
+    if name == "nodes" {
+        return structured["symbol"].as_str().into_iter().collect();
+    }
+    if name == "search" {
         return structured["answer"]["bindings"]
             .as_array()
             .into_iter()
@@ -1194,8 +1198,8 @@ fn assert_stated_identities<'answer>(
         .ok_or_else(|| format!("{name}: the all proxy must return structured content"))?;
     for identity in stated_identities(name, structured) {
         assert!(
-            (if matches!(name, "search" | "nodes") {
-                text.contains(&serde_json::to_string(identity)?)
+            (if name == "search" {
+                text.contains(&format!("<{identity}>"))
             } else {
                 text.split_whitespace().any(|token| token == identity)
             }),
@@ -1203,33 +1207,6 @@ fn assert_stated_identities<'answer>(
         );
     }
     Ok(structured)
-}
-
-/// Configures the view count for the fixed corpus and its bounded readiness reads.
-async fn surface_proxy_fixture() -> TestResult<SurfaceFixture> {
-    let entries = u64::try_from(surface_corpus::corpus().len())?;
-    let polls = u64::try_from(SEARCH_POPULATION_POLLS_MAX)?;
-    let attempts = u64::try_from(harness::ACCEPTANCE_ATTEMPTS_MAX)?;
-    let commit_polls =
-        COMMIT_POPULATION_TIMEOUT_SECONDS * 1_000 / COMMIT_POPULATION_POLL_MILLISECONDS + 1;
-    // An entry has two discovery seeds, two output forms and one population pass.
-    // Each fixed request has at most two local source owners. Allow producer,
-    // fact and query captures for each owner on every acceptance attempt.
-    let calls = entries
-        .checked_mul(polls.checked_add(4).ok_or("surface call count overflow")?)
-        .and_then(|count| count.checked_add(polls))
-        .and_then(|count| count.checked_add(commit_polls))
-        .ok_or("surface call count overflow")?;
-    let views = calls
-        .checked_mul(attempts)
-        .and_then(|count| count.checked_mul(6))
-        .ok_or("surface view count overflow")?;
-    SurfaceFixture::start_with_configuration(move |configuration| {
-        let mut document = configuration.parse::<toml_edit::DocumentMut>()?;
-        document["server"]["retained_views"] = toml_edit::value(i64::try_from(views)?);
-        Ok(document.to_string())
-    })
-    .await
 }
 
 /// The `all` and `text` proxies write the same source and identity text. Each proxy's captured
@@ -1241,7 +1218,7 @@ async fn surface_proxy_fixture() -> TestResult<SurfaceFixture> {
 /// there.
 #[tokio::test]
 async fn both_proxies_write_the_same_text_and_the_text_states_every_identity() -> TestResult {
-    let fixture = surface_proxy_fixture().await?;
+    let fixture = SurfaceFixture::start_with_configuration(Ok).await?;
     let root = fixture.root();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
@@ -1402,7 +1379,6 @@ fn assert_paged_index_text(
                 datatype: "http://www.w3.org/2001/XMLSchema#integer".to_owned(),
             })
         );
-        use std::fmt::Write as _;
         writeln!(
             expected,
             "\"{index}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
@@ -2137,6 +2113,8 @@ async fn proxy_stderr_carries_lifecycle_lines_and_never_the_token() -> TestResul
 /// Incoming references use the configured engine through the real CLI proxy.
 #[tokio::test]
 async fn live_proxied_read_resolves_incoming_references() -> TestResult {
+    use workspace_client::query;
+
     if !live_engine_gate::engine_live() {
         return Ok(());
     }
@@ -2147,7 +2125,6 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    use workspace_client::query;
     let target = proxied_call(
         &client,
         "search",
