@@ -824,9 +824,12 @@ fn exact_domain(context: &rift_dependency::DependencyContext) -> Result<ExactDom
         let Some(version) = &entry.version else {
             continue;
         };
-        let (owner, package) = if entry.manager == "stdlib" {
+        let (owner, package) = if entry.manager == rift_dependency::STANDARD_LIBRARY_MANAGER {
+            let Some(library) = rift_dependency::StandardLibrary::from_name(&entry.name) else {
+                continue;
+            };
             let owner = SymbolOwner::Runtime {
-                runtime: entry.name.clone(),
+                runtime: library.runtime().to_owned(),
             };
             (owner, None)
         } else {
