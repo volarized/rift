@@ -1623,7 +1623,7 @@ impl RecordedServer {
 /// an existing `.rift/` meets after an upgrade.
 #[tokio::test]
 async fn an_older_server_is_replaced_and_the_request_served() -> TestResult {
-    let directory = workspace()?;
+    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
@@ -1649,7 +1649,7 @@ async fn an_older_server_is_replaced_and_the_request_served() -> TestResult {
 /// starts a server from its own binary, and serves the request.
 #[tokio::test]
 async fn a_stop_reset_by_a_leaving_older_server_still_ends_with_a_new_server() -> TestResult {
-    let directory = workspace()?;
+    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
@@ -1736,7 +1736,7 @@ async fn another_build_of_this_version_is_refused_with_operator_guidance() -> Te
 /// served by it.
 #[tokio::test]
 async fn two_proxies_replacing_one_older_server_end_with_one_new_server() -> TestResult {
-    let directory = workspace()?;
+    let directory = laid_out_workspace(&[("lib.rs", LIBRARY)], "")?;
     let root = directory.path();
     let _cleanup = StopOnDrop::new(root);
     let failure_window = FailureWindow::begin(root);
