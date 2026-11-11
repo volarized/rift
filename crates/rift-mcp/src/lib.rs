@@ -26,9 +26,9 @@ mod validation;
 
 pub use election::{
     ElectedServer, ElectionGuard, ServerPresence, StaleReason, claim, claim_with_owner,
-    document_path, probe, probe_state_directory, probe_with_owner, read_serving, serve_elected,
-    serve_elected_with_storage, serve_elected_with_storage_for_owner, serve_repository_elected,
-    validate_workspace_lock,
+    document_path, election_claim_blocked, probe, probe_state_directory, probe_with_owner,
+    read_serving, serve_elected, serve_elected_with_storage, serve_elected_with_storage_for_owner,
+    serve_repository_elected, validate_workspace_lock,
 };
 pub use failure::{McpErrorExt, McpErrorFailExt, McpFailure};
 pub use http::{
