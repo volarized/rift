@@ -65,10 +65,12 @@ async function pack() {
  */
 async function findUnprefixedRefs() {
   const pattern = /(?:href|src)="(\/[^"]*)"/g;
+  // Next uses this hint to open a connection to the current origin.
+  const originHint = /<link rel="preconnect" href="\/" crossorigin=""\/>/g;
   const offenders = [];
 
   for await (const file of walk(siteDir, (f) => f.endsWith(".html"))) {
-    const html = await readFile(file, "utf8");
+    const html = (await readFile(file, "utf8")).replaceAll(originHint, "");
     for (const [, url] of html.matchAll(pattern)) {
       if (url === basePath || url.startsWith(`${basePath}/`)) continue;
       offenders.push({ file: path.relative(distDir, file), url });
