@@ -2147,64 +2147,50 @@ async fn live_proxied_read_resolves_incoming_references() -> TestResult {
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
+    use workspace_client::query;
+    let target = proxied_call(
+        &client,
+        "search",
+        &serde_json::to_value(query::declaration("beacon", "hub.rs"))?,
+    )
+    .await?;
+    let [target] = query::rows(&target)? else {
+        return Err(format!("one beacon declaration: {target}").into());
+    };
+    let seed = query::iri(target, "symbol")?;
     let result = proxied_engine_call(
         &client,
         "search",
-        &json!({"query":
-            "SELECT DISTINCT ?target ?caller ?name ?path ?source ?start ?end ?targetSource ?targetStart ?targetEnd ?derivation ?facet { \
-             ?target a :Symbol; :name 'beacon'; :language 'rust'; :declarations ?targetDeclaration . \
-             ?targetDeclaration :path 'hub.rs'; :source ?targetSource; :range ?targetRange . \
-             ?targetRange :start ?targetStart; :end ?targetEnd . \
-             ?caller :references ?target; :name ?name; :declarations ?declaration . \
-             ?declaration :path ?path; :source ?source; :range ?range . \
-             ?range :start ?start; :end ?end . \
-             ?relationship a :Relationship; :from ?caller; :to ?target; :derivation ?derivation; :facets ?facet . \
-             FILTER(?facet = :references) } ORDER BY ?caller"
-        }),
+        &json!({"query":format!("SELECT DISTINCT ?caller {{ ?caller :references <{seed}> }}")}),
     )
     .await?;
-    let caller = result["answer"]["bindings"]
-        .as_array()
-        .ok_or("search must return its results")?
+    let caller = query::rows(&result)?
         .iter()
-        .find(|hit| hit["name"]["value"] == "total")
-        .ok_or_else(|| format!("incoming references must reach the caller: {result:#}"))?;
-    for field in ["target", "caller"] {
-        assert!(
-            matches!(caller[field]["type"].as_str(), Some("iri" | "blank_node")),
-            "original reference endpoint: {caller}"
-        );
-    }
-    for (source, start, end, original) in [
-        (
-            "targetSource",
-            "targetStart",
-            "targetEnd",
-            harness::RUST_PROJECT_HUB,
-        ),
-        ("source", "start", "end", harness::RUST_PROJECT_CALLER),
-    ] {
-        let start = workspace_client::query::literal(caller, start)?.parse::<usize>()?;
-        let end = workspace_client::query::literal(caller, end)?.parse::<usize>()?;
-        assert_eq!(
-            original
-                .get(start..end)
-                .ok_or("original declaration range")?,
-            workspace_client::query::literal(caller, source)?
-        );
-    }
-    assert_eq!(
-        workspace_client::query::literal(caller, "path")?,
-        "caller.rs"
-    );
-    assert_eq!(
-        workspace_client::query::iri(caller, "facet")?,
-        format!("{}references", rift_search::sparql::VOCABULARY_NAMESPACE)
-    );
-    assert_eq!(
-        workspace_client::query::iri(caller, "derivation")?,
-        format!("{}resolution", rift_search::sparql::VOCABULARY_NAMESPACE)
-    );
+        .find_map(|row| {
+            query::iri(row, "caller")
+                .ok()
+                .filter(|id| id.ends_with("/total"))
+        })
+        .ok_or_else(|| format!("incoming references must reach total: {result}"))?;
+    let exact = proxied_call(&client, "get_symbol", &json!({"id":caller})).await?;
+    let nodes = proxied_call(
+        &client,
+        "nodes",
+        &json!({"symbol":caller,"revision":exact["revision"]}),
+    )
+    .await?;
+    let declaration = &exact["declarations"][0];
+    assert_eq!(declaration["path"], "caller.rs");
+    let start = usize::try_from(
+        declaration["range"]["start"]
+            .as_u64()
+            .ok_or("caller start")?,
+    )?;
+    let end = usize::try_from(declaration["range"]["end"].as_u64().ok_or("caller end")?)?;
+    let original = harness::RUST_PROJECT_CALLER
+        .get(start..end)
+        .ok_or("original caller range")?;
+    assert_eq!(nodes["nodes"][0]["source"], original, "{nodes}");
     let workspace = within(
         "workspace resource",
         client.read_resource(rmcp::model::ReadResourceRequestParams::new(
@@ -2248,40 +2234,27 @@ async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() 
     let failure_window = FailureWindow::begin(root);
     let client = proxy_client(root).await?;
     await_workspace_ready(&client).await?;
-    let initial = json!({"query":"SELECT ?symbol { SERVICE :search { ?hit :query 'beacon'; :target :symbol; :limit 1; :symbol ?symbol } ?symbol a :Symbol }"});
-    await_search_population(&client, &initial).await?;
-    let selected = proxied_call(&client, "search", &initial).await?;
-    let [row] = query::rows(&selected)? else {
-        return Err(format!("one original declaration: {selected}").into());
-    };
-    let symbol = query::iri(row, "symbol")?;
-    let view = selected["view"]["id"]
-        .as_str()
-        .ok_or("original proxy query view")?;
-    let statement = format!(
-        "SELECT ?id ?unit ?start ?end ?text {{ SERVICE <urn:rift:result:{view}> {{}} ?node a :Node; :symbol <{symbol}>; :unit ?unit; :id ?id; :range [ :start ?start; :end ?end ] . ?unit :source ?text }} ORDER BY ?start ?end"
-    );
-    let original = proxied_call(&client, "search", &json!({"query":statement})).await?;
+    let request = query::declaration("beacon", "lib.rs");
+    let original = workspace_client::query_after_population(&client, &request).await?;
     let [node] = query::rows(&original)? else {
-        return Err(format!("one original semantic node: {original}").into());
+        return Err(format!("one original declaration node: {original}").into());
     };
-    assert!(!query::literal(node, "id")?.is_empty());
-    let unit = query::iri(node, "unit")?;
-    assert_eq!(query::literal(node, "text")?, LIBRARY);
+    let symbol = query::iri(node, "symbol")?;
+    assert_eq!(query::iri(node, "unit")?, "rift://source/project/lib.rs");
     let start = query::literal(node, "start")?.parse::<usize>()?;
     let end = query::literal(node, "end")?.parse::<usize>()?;
-    let exact = proxied_call(
+    let source = LIBRARY.get(start..end).ok_or("original node range")?;
+    assert_eq!(query::literal(node, "source")?, source);
+    let exact = proxied_call(&client, "get_symbol", &json!({"id":symbol})).await?;
+    assert_eq!(exact["symbol"]["id"], symbol);
+    let nodes = proxied_call(
         &client,
-        "get_symbol",
-        &json!({"id":symbol,"view":view,"include":["source"]}),
+        "nodes",
+        &json!({"symbol":symbol,"revision":exact["revision"]}),
     )
     .await?;
-    assert_eq!(exact["view"], selected["view"]);
-    assert_eq!(exact["symbol"]["id"], symbol);
-    assert_eq!(
-        exact["declarations"][0]["source"],
-        LIBRARY.get(start..end).ok_or("original node range")?
-    );
+    assert_eq!(nodes["nodes"][0]["source"], source);
+    let replay = query::retained_page(&original, 0)?;
     for removed in [false, true] {
         if removed {
             fs::remove_file(root.join("lib.rs"))?;
@@ -2306,56 +2279,14 @@ async fn proxy_query_nodes_and_source_keep_recorded_bytes_after_index_removal() 
             observed,
             "current index must observe the edit or removal before the held read"
         );
-        let held = proxied_call(&client, "search", &json!({"query":statement})).await?;
+        let held = proxied_call(&client, "search", &json!({"query":replay})).await?;
         assert_eq!(
-            query::rows(&held)?,
-            query::rows(&original)?,
-            "Node identity, unit, range and bytes stay captured"
+            held["answer"], original["answer"],
+            "retained node source and range"
         );
-        let source = crate::workspace_client::query::SourceQueryParams {
-            unit: rift_protocol::read::SourceUnitId::parse(unit)?,
-            range: None,
-            view: Some(rift_protocol::symbol_read::CapturedViewId::parse(view)?),
-            rev: None,
-        };
-        let answer = proxied_call(
-            &client,
-            "search",
-            &serde_json::to_value(query::source(&source)?)?,
-        )
-        .await?;
-        assert_original_proxy_source(&answer, &selected, unit, view)?;
+        assert_eq!(held["view"], original["view"], "retained view and expiry");
     }
-    let mixed = proxied_call(&client, "search", &json!({"query":"SELECT ?outcome ?name { ?symbol a :Symbol; :name 'beacon', ?name . SERVICE :source { ?read :unit <rift://source/project/lib.rs>; :outcome ?outcome } }"})).await?;
-    assert!(
-        query::rows(&mixed)?.is_empty(),
-        "removed current domain remains empty beside a typed source result"
-    );
     client.cancel().await?;
     failure_window.passed();
-    Ok(())
-}
-
-fn assert_original_proxy_source(
-    answer: &serde_json::Value,
-    selected: &serde_json::Value,
-    unit: &str,
-    view: &str,
-) -> TestResult {
-    use workspace_client::query;
-    let [row] = query::rows(answer)? else {
-        return Err(format!("one captured proxy source: {answer}").into());
-    };
-    assert_eq!(query::literal(row, "outcome")?, "found");
-    assert_eq!(query::iri(row, "unit")?, unit);
-    assert_eq!(query::literal(row, "text")?, LIBRARY);
-    assert_eq!(query::literal(row, "complete")?, "true");
-    assert_eq!(query::literal(row, "source_view")?, view);
-    assert_eq!(
-        query::literal(row, "source_expiry")?,
-        selected["view"]["expires_at"]
-            .as_str()
-            .ok_or("original proxy expiry")?
-    );
     Ok(())
 }

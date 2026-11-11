@@ -941,11 +941,13 @@ mod tests {
         );
         let service = ().serve(StreamableHttpClientTransport::from_config(config)).await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let lexical = oxrdf::Literal::from(name);
+        let statement = format!("SELECT ?id {{ ?id a :Symbol; :name {lexical} }}");
         let selected = loop {
             let response = service
                 .call_tool(
                     CallToolRequestParams::new("search").with_arguments(
-                        serde_json::json!({"pattern": name, "target": "symbol", "scope": "local"})
+                        serde_json::json!({"query": statement})
                             .as_object()
                             .cloned()
                             .ok_or("tool arguments must be an object")?,
@@ -955,11 +957,11 @@ mod tests {
             let ids = response
                 .structured_content
                 .as_ref()
-                .and_then(|content| content["results"].as_array())
+                .and_then(|content| content["answer"]["bindings"].as_array())
                 .into_iter()
                 .flatten()
-                .filter(|hit| hit["hit"]["symbol"]["name"] == name)
-                .filter_map(|hit| hit["hit"]["symbol"]["id"].as_str())
+                .filter(|row| row["id"]["type"] == "iri")
+                .filter_map(|row| row["id"]["value"].as_str())
                 .collect::<Vec<_>>();
             if let [id] = ids.as_slice() {
                 break rift_protocol::read::SymbolId::parse(id)?;

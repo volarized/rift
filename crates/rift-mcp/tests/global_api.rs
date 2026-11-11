@@ -645,7 +645,6 @@ fn declarations(request: &Value) -> Value {
                     && position["revision"] == named_release(named)
                     && named.line.is_none_or(|line| position["line"] == line)
             });
-            let view = json!({"id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "expires_at": "2099-10-10T10:05:00Z"});
             match named {
                 Some(named) => {
                     json!({
@@ -653,11 +652,10 @@ fn declarations(request: &Value) -> Value {
                         "position": position,
                         "id": named_identity(named),
                         "kind": named.kind,
-                        "revision": named_release(named),
-                        "view": view
+                        "revision": named_release(named)
                     })
                 }
-                None => json!({"outcome": "missing", "position": position, "view": view}),
+                None => json!({"outcome": "missing", "position": position}),
             }
         })
         .collect();

@@ -1242,19 +1242,20 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
         &unprepared,
         "an outgoing walk from a struct",
     );
-    let failure = workspace_client::failed_call(
-        client
-            .call_tool(tools_call_request("search", &unprepared)?)
-            .await,
-    )?;
-    assert_eq!(
-        failure.code,
-        ErrorCode::TemporarilyUnavailable,
-        "{failure:?}"
+    let unavailable = workspace_client::call_retrying_acceptance(
+        &client,
+        tools_call_request("search", &unprepared)?,
+    )
+    .await?;
+    assert_validates(
+        output_validator,
+        &unavailable,
+        "required call hierarchy item is unavailable",
     );
-    assert!(
-        failure.message.contains("prepared no call hierarchy item"),
-        "{failure:?}"
+    assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
+    assert_eq!(
+        unavailable["reason"], "insufficient_coverage",
+        "{unavailable}"
     );
     client.cancel().await?;
 
@@ -1285,12 +1286,12 @@ async fn outgoing_walks_over_scripted_engines_match_the_served_schemas() -> Test
     Ok(())
 }
 
-/// A standard library callee the global API names answers as a hit carrying the global
-/// identity and a `unit` in place of `path`, and a callee it names nothing at drops: the
-/// answer validates against the served output schema.
+/// A global API with declaration lookups but missing relationship coverage returns
+/// typed unavailability in the advertised search result schema.
 #[cfg(unix)]
 #[tokio::test]
-async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> TestResult {
+async fn a_package_walk_with_missing_relationship_coverage_matches_the_served_schema() -> TestResult
+{
     let global = GlobalFixture::start_with(global_api::FixtureOptions {
         python_collection: true,
         ..global_api::FixtureOptions::default()
@@ -1316,7 +1317,7 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         .get("search")
         .ok_or("search must be advertised")?;
     let caller = workspace_client::captured_seed(&client, "caller", "caller.py").await?;
-    let walk = json!({"query":format!("SELECT ?symbol ?name ?unit {{ <{caller}> :calls ?symbol . ?symbol :name ?name . ?node :of ?symbol; :index 0; :range/:unit ?unit }} ORDER BY ?name")});
+    let walk = json!({"query":format!("SELECT ?symbol {{ <{caller}> :calls ?symbol }}")});
     assert_validates(input_validator, &walk, "an outgoing walk");
     let structured = workspace_client::call_retrying_acceptance(
         &client,
@@ -1328,19 +1329,10 @@ async fn an_outgoing_walk_naming_package_callees_matches_the_served_schema() -> 
         &structured,
         "an outgoing walk naming package callees",
     );
-    let units = workspace_client::query::rows(&structured)?
-        .iter()
-        .map(|row| workspace_client::query::iri(row, "unit"))
-        .collect::<TestResult<Vec<_>>>()?;
+    assert_eq!(structured["outcome"], "unavailable", "{structured}");
     assert_eq!(
-        units,
-        [global_api::named_unit(&global_api::NAMED_POSITIONS[0])],
-        "{structured:#}"
-    );
-    assert_eq!(
-        warning_count(&structured, "callees_dropped"),
-        0,
-        "complete package callee: {structured:#}"
+        structured["reason"], "insufficient_coverage",
+        "{structured}"
     );
     client.cancel().await?;
     Ok(())
@@ -1408,7 +1400,7 @@ async fn packages_beside_the_local_scope_or_rev_refuse_naming_packages() -> Test
                 failure.message
             );
         } else {
-            let field = if producer.get("rev").is_some() {
+            let field = if producer.get("revision").is_some() {
                 "field scope"
             } else {
                 "field packages"

@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 
 use oxrdf::{Literal, NamedNode, NamedNodeRef};
 use rift_protocol::query::{QueryLanguage, QueryParams};
-use rift_protocol::read::{SearchParams, SourceUnitId, TextRange};
+use rift_protocol::read::SearchParams;
 use serde_json::Value;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
@@ -30,33 +30,6 @@ pub(crate) fn declaration(name: &str, path: &str) -> QueryParams {
 /// Projects existing producer results through the public SPARQL surface.
 pub(crate) fn retrieval(parameters: &SearchParams) -> TestResult<QueryParams> {
     projected_retrieval(parameters, "", "")
-}
-
-/// A source selection for test cases that compare graph source with authored bytes.
-#[derive(serde::Deserialize)]
-pub(crate) struct SourceQueryParams {
-    pub(crate) unit: SourceUnitId,
-    pub(crate) range: Option<TextRange>,
-    pub(crate) view: Option<rift_protocol::symbol_read::CapturedViewId>,
-    pub(crate) rev: Option<rift_protocol::revision::Revision>,
-}
-
-/// Projects source from a node in the selected graph.
-pub(crate) fn source(parameters: &SourceQueryParams) -> TestResult<QueryParams> {
-    let unit = NamedNodeRef::new(parameters.unit.as_str())?;
-    if parameters.view.is_some() || parameters.rev.is_some() {
-        return Err("use a retained query page or a revision-pinned node read".into());
-    }
-    let range = parameters.range.as_ref().map_or_else(
-        || "FILTER(?start = 0)".to_owned(),
-        |range| format!("FILTER(?start = {} && ?end = {})", range.start, range.end),
-    );
-    Ok(QueryParams {
-        query: format!(
-            "SELECT ?text ?start ?end ?unit {{ ?node :source ?text; :range [ :unit {unit}; :start ?start; :end ?end ] . {range} BIND({unit} AS ?unit) }} ORDER BY DESC(?end) LIMIT 1"
-        ),
-        language: QueryLanguage::Sparql,
-    })
 }
 
 /// Adds explicit projected fields and graph patterns to an existing retrieval request.
@@ -118,34 +91,12 @@ pub(crate) fn retained_page(answer: &Value, page: u64) -> TestResult<String> {
     )?)
 }
 
-/// Projects a graph path and its endpoint names through the public SPARQL surface.
+/// Projects endpoints of a path from one canonical symbol.
 pub(crate) fn path(seed: &str, expression: &str) -> TestResult<QueryParams> {
     let seed = NamedNodeRef::new(seed)?;
     Ok(QueryParams {
         query: format!(
-            "SELECT DISTINCT ?symbol ?name {{ {seed} {expression} ?symbol . ?symbol :name ?name }} ORDER BY ?name"
-        ),
-        language: QueryLanguage::Sparql,
-    })
-}
-
-/// Physical occurrences of one symbol, with useful locations in the same request.
-pub(crate) fn usages(symbol: &str) -> TestResult<QueryParams> {
-    let symbol = NamedNodeRef::new(symbol)?;
-    Ok(QueryParams {
-        query: format!(
-            "SELECT ?usage ?unit ?start ?end {{ {symbol} :usages ?usage . ?usage :range [ :unit ?unit; :start ?start; :end ?end ] }} ORDER BY ?unit ?start ?end"
-        ),
-        language: QueryLanguage::Sparql,
-    })
-}
-
-/// Distinct incoming reference endpoints and their names.
-pub(crate) fn incoming_references(symbol: &str) -> TestResult<QueryParams> {
-    let target = NamedNodeRef::new(symbol)?;
-    Ok(QueryParams {
-        query: format!(
-            "SELECT DISTINCT ?caller ?name {{ ?caller :references {target}; :name ?name }} ORDER BY ?caller"
+            "SELECT DISTINCT ?symbol {{ {seed} {expression} ?symbol }} ORDER BY ?symbol"
         ),
         language: QueryLanguage::Sparql,
     })

@@ -47,7 +47,7 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
         .as_ref()
         .ok_or("the result must carry structured content")?;
     let verdict = match tool {
-        SEARCH_TOOL | NODES_TOOL
+        SEARCH_TOOL
             if structured.get("answer").is_some() || structured["outcome"] == "unavailable" =>
         {
             query_text_states(text, structured)
@@ -57,7 +57,7 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
             canonical_text_states(text, structured)
         }
         GET_SYMBOL_TOOL => layout::text_states(Tool::GetSymbol, text, structured),
-        NODES_TOOL => Err("nodes must carry a query result".to_owned()),
+        NODES_TOOL => layout::text_states(Tool::Nodes, text, structured),
         other => Err(format!("no text check for the tool `{other}`")),
     };
     verdict.map_err(|failure| format!("{failure}\n--- text ---\n{text}"))
@@ -324,7 +324,7 @@ mod tests {
         assert!(text_states(GET_SYMBOL_TOOL, &search).is_err());
         assert!(text_states(NODES_TOOL, &search).is_err());
         let nodes = result_of("0 nodes\n", json!({ "nodes": [], "source": [] }));
-        assert!(text_states(NODES_TOOL, &nodes).is_err());
+        assert_eq!(text_states(NODES_TOOL, &nodes), Ok(()));
         let answer = result_of(
             "true\n",
             json!({
@@ -333,12 +333,12 @@ mod tests {
                 "warnings": []
             }),
         );
-        assert_eq!(text_states(NODES_TOOL, &answer), Ok(()));
+        assert!(text_states(NODES_TOOL, &answer).is_err());
         assert_eq!(text_states(SEARCH_TOOL, &answer), Ok(()));
     }
 
     #[test]
-    fn nodes_query_requires_its_exact_captured_view_and_original_expiry() {
+    fn search_query_requires_its_exact_captured_view_and_original_expiry() {
         let structured = json!({
             "answer": { "result": "boolean", "value": true },
             "pagination": { "page_index": 0, "total_pages": 1 },
@@ -347,7 +347,7 @@ mod tests {
         });
         let original = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
         assert_eq!(
-            text_states(NODES_TOOL, &result_of(original, structured.clone())),
+            text_states(SEARCH_TOOL, &result_of(original, structured.clone())),
             Ok(())
         );
         for text in [
@@ -355,7 +355,7 @@ mod tests {
             "true\nview claims.other · expires 2030-01-01T00:15:00Z\n",
             "true\nview claims.nodes · expires 2030-01-01T00:16:00Z\n",
         ] {
-            assert!(text_states(NODES_TOOL, &result_of(text, structured.clone())).is_err());
+            assert!(text_states(SEARCH_TOOL, &result_of(text, structured.clone())).is_err());
         }
     }
 
@@ -368,10 +368,10 @@ mod tests {
             "view": { "id": "claims.nodes", "expires_at": "2030-01-01T00:15:00Z" }
         });
         let missing = "true\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
-        assert!(text_states(NODES_TOOL, &result_of(missing, structured.clone())).is_err());
+        assert!(text_states(SEARCH_TOOL, &result_of(missing, structured.clone())).is_err());
         let complete = "true\n1 warning\n\tstale_index: index lags\nview claims.nodes · expires 2030-01-01T00:15:00Z\n";
         assert_eq!(
-            text_states(NODES_TOOL, &result_of(complete, structured)),
+            text_states(SEARCH_TOOL, &result_of(complete, structured)),
             Ok(())
         );
     }
