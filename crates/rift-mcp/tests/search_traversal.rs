@@ -1779,23 +1779,6 @@ async fn read_dependency_hit(
             .is_some_and(|source| source.starts_with("def greet(")),
         "{symbol}"
     );
-    let source = call_retrying_acceptance(
-        client,
-        tool_request(
-            "get_source",
-            &json!({
-                "unit":hit["unit"], "view":selected["id"]
-            }),
-        ),
-    )
-    .await?;
-    assert_eq!(source["outcome"], "found", "{source}");
-    assert_eq!(source["view"], *selected, "{source}");
-    assert_eq!(
-        source["source"]["text"],
-        global_api::GREETING_SOURCE,
-        "{source}"
-    );
     Ok(())
 }
 

@@ -913,7 +913,6 @@ fn local_view_input(
 }
 
 mod nodes;
-mod source;
 mod traversal;
 
 #[cfg(test)]

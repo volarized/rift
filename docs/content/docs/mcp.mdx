@@ -474,32 +474,6 @@ A malformed identity is refused before lookup:
 `outcome: "unavailable"` with its typed reason, rather than a definite miss.
 See the [symbol reference](/docs/developer/protocol/mcp#tool-get_symbol) for bounds and refusals.
 
-## Source [#tool-get_source]
-
-`get_source` reads one physical source unit, independently of whether a declaration exists.
-For project documentation, omit `range` to read the whole unit:
-
-<ReadExample name="project-source" />
-
-Pass a half-open UTF-8 byte range to read one section from the same unit:
-
-<ReadExample name="project-section" />
-
-The `view` returned by the preceding named-project symbol read selects that project's
-documentation. The project unit keeps its repository-relative path:
-
-<ReadExample name="named-project-source" />
-
-<ReadExample name="named-project-section" />
-
-The result names the actual unit and range in `source.span`, returns bytes in `source.text`,
-and states `source_complete`. A preceding `view` retains its exact selection. Released
-package and runtime units retain their defining owner:
-
-<ReadExample name="global-source" />
-
-For these units, `rev` selects local Git source alone.
-
 ## Nodes [#tool-nodes]
 
 After reading a declaration, the agent may need to change only its name, body, or one expression.
@@ -533,6 +507,9 @@ In the text response:
 - The function also shows its symbol identity and the ranges of its name and body.
 - The excerpt of the innermost node closes the answer; the structured output carries the excerpt
   of every node.
+
+The outermost node is the file itself, so its excerpt carries the file's source. A declaration's
+own source comes with its `get_symbol` declarations.
 
 The agent chooses the range it needs and applies the change with its own editing tools.
 After the file changes, it should read again before using its ranges for another edit.

@@ -2319,29 +2319,6 @@ impl RiftMcp {
         result
     }
 
-    /// Reads a canonical source unit or a half-open UTF-8 byte range. A preceding `view`
-    /// retains its immutable selection and original expiry; `rev` selects a local Git revision.
-    /// The result returns source bytes, definite absence or typed selection unavailability.
-    #[tool]
-    async fn get_source(
-        &self,
-        Parameters(params): Parameters<rift_protocol::source_read::GetSourceParams>,
-        extensions: rmcp::model::Extensions,
-    ) -> Result<Json<rift_protocol::source_read::GetSourceResult>, ToolFailure> {
-        let captured = extensions.get::<std::sync::Arc<
-            std::sync::Mutex<Option<crate::global::candidates::SavedCandidateBackend>>,
-        >>();
-        let result = self
-            .exact_source_with_context(params, captured.map(std::sync::Arc::as_ref))
-            .await;
-        if let Err(ToolFailure::Registered(failure, _)) = &result
-            && let Some(operation) = extensions.get::<rift_tracing::Span>()
-        {
-            operation.record("error.type", failure.registered().slug().as_str());
-        }
-        result
-    }
-
     /// Searches indexed declarations and source lines by lexical `query`, merged with
     /// full-text matches from included `[search.text]` files and declaration bodies, and by a
     /// bounded relationship `traversal` from one seed symbol: `incoming` reaches the
@@ -4203,11 +4180,8 @@ impl ServerHandler for RiftMcp {
                     .into_call_tool_result();
             }
         };
-        let captured = matches!(
-            request.name.as_ref(),
-            "get_symbol" | "get_source" | "search"
-        )
-        .then(|| std::sync::Arc::new(std::sync::Mutex::new(expected)));
+        let captured = matches!(request.name.as_ref(), "get_symbol" | "search")
+            .then(|| std::sync::Arc::new(std::sync::Mutex::new(expected)));
         if let Some(captured) = &captured {
             let _ = context.extensions.insert(std::sync::Arc::clone(captured));
         }
@@ -7123,22 +7097,6 @@ done
         Ok(())
     }
 
-    fn project_declaration_unit(declaration: &serde_json::Value) -> TestResult<String> {
-        assert!(declaration.get("unit").is_none());
-        let path = rift_core::ProjectPath::new(
-            declaration["path"]
-                .as_str()
-                .ok_or("project declaration path")?,
-        )?;
-        let unit = rift_core::SourceUnitId::new(
-            rift_core::SourceResolverId::new("project")?,
-            rift_core::SourcePath::new(path.as_str())?,
-        )?
-        .to_string();
-        assert_eq!(unit, "rift://source/project/lib.rs");
-        Ok(unit)
-    }
-
     #[tokio::test]
     async fn client_lists_and_calls_exact_read_only_surface() -> TestResult {
         let (_directory, server, id) = canonical_fixture().await?;
@@ -7158,7 +7116,7 @@ done
                 .iter()
                 .map(|tool| tool.name.as_ref())
                 .collect::<Vec<_>>(),
-            ["get_source", "get_symbol", "nodes", "search"]
+            ["get_symbol", "nodes", "search"]
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
 
@@ -7182,23 +7140,6 @@ done
         assert_eq!(declarations[0]["source"], "pub fn beacon() {}");
         assert!(structured.get("declaration_cursor").is_none());
         assert!(structured["view"]["id"].as_str().is_some());
-
-        let unit = project_declaration_unit(&declarations[0])?;
-        let source = client
-            .call_tool(
-                CallToolRequestParams::new("get_source").with_arguments(arguments(&json!({
-                    "unit": unit,
-                    "view": structured["view"]["id"]
-                }))?),
-            )
-            .await?;
-        let source_response = format!("{source:?}");
-        let source = source
-            .structured_content
-            .ok_or_else(|| format!("get_source returns structured content: {source_response}"))?;
-        assert_eq!(source["outcome"], "found");
-        assert_eq!(source["source"]["text"], "pub fn beacon() {}\n");
-        assert_eq!(source["view"], structured["view"]);
 
         let search = client
             .call_tool(

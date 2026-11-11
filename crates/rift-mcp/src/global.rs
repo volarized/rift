@@ -1657,16 +1657,6 @@ fn failure_state(error: &RiftError) -> RouteState {
     RouteState::Unavailable { kind, class }
 }
 
-impl GlobalState {
-    pub(crate) async fn exact_source(
-        &self,
-        configuration: &GlobalConfiguration,
-        params: &rift_protocol::source_read::GetSourceParams,
-    ) -> Result<rift_protocol::source_read::GetSourceResult, RiftError> {
-        self.client(configuration).await?.get_source(params).await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;

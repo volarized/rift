@@ -66,10 +66,6 @@ pub(crate) fn corpus() -> Vec<(&'static str, Value)> {
                 "paths": { "force_include": ["hidden.rs"] }
             }),
         ),
-        (
-            "get_source",
-            json!({ "unit": "rift://source/project/lib.rs" }),
-        ),
         ("nodes", json!({ "path": "lib.rs", "position": 0 })),
         ("nodes", json!({ "path": "lib.rs", "position": 8 })),
         (

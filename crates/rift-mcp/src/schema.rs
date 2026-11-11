@@ -35,7 +35,7 @@ impl RiftMcp {
             if let Some(output) = tool.output_schema.as_mut() {
                 let output = Arc::make_mut(output);
                 rift_protocol::schema::strip_optional_null_arms(output);
-                if matches!(tool.name.as_ref(), "get_source" | "get_symbol" | "search") {
+                if matches!(tool.name.as_ref(), "get_symbol" | "search") {
                     // These result unions contain only objects. Keep their union constraints
                     // while declaring the root type required by earlier MCP clients.
                     output.insert("type".to_owned(), json!("object"));
@@ -96,7 +96,7 @@ mod tests {
     fn object_output_unions_keep_their_original_constraints() {
         let declared = RiftMcp::declared_tool_router().list_all();
         let served = tool_listing();
-        for name in ["get_source", "get_symbol", "search"] {
+        for name in ["get_symbol", "search"] {
             let original = declared
                 .iter()
                 .find(|tool| tool.name == name)

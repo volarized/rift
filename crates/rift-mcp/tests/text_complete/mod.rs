@@ -51,7 +51,6 @@ fn text_states(tool: &str, result: &CallToolResult) -> Result<(), String> {
         GET_SYMBOL_TOOL if structured.get("outcome").is_some() => {
             canonical_text_states(text, structured)
         }
-        "get_source" => source_text_states(text, structured),
         GET_SYMBOL_TOOL => layout::text_states(Tool::GetSymbol, text, structured),
         NODES_TOOL => layout::text_states(Tool::Nodes, text, structured),
         other => Err(format!("no text check for the tool `{other}`")),
@@ -121,28 +120,6 @@ fn canonical_text_states(text: &str, structured: &serde_json::Value) -> Result<(
         }
     } else {
         token(text, &structured["id"], "$.id")?;
-    }
-    view_text(text, structured)
-}
-
-fn source_text_states(text: &str, structured: &serde_json::Value) -> Result<(), String> {
-    if structured["outcome"] == "found" {
-        token(
-            text,
-            &structured["source"]["span"]["unit"],
-            "$.source.span.unit",
-        )?;
-        source_lines(text, &structured["source"]["text"], "\t")?;
-        let range = format!(
-            "{}..{}",
-            structured["source"]["span"]["range"]["start"],
-            structured["source"]["span"]["range"]["end"]
-        );
-        if !text.contains(&range) {
-            return Err("$.source.span.range".to_owned());
-        }
-    } else {
-        token(text, &structured["unit"], "$.unit")?;
     }
     view_text(text, structured)
 }

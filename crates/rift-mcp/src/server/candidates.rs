@@ -1,4 +1,3 @@
-mod source;
 mod symbol;
 mod traversal;
 use std::sync::{Arc, Mutex};

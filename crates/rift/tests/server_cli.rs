@@ -997,7 +997,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let first = lexical_hit_with_validated_view(serving.port, &serving.token, first)?;
+    let first = lexical_hit_without_view(first)?;
 
     stop_foreground_server(root, &mut child, &stderr)?;
     wait_until_port_refuses(serving.port)?;
@@ -1010,7 +1010,7 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
         "amber canoe velvet",
         "notes.md",
     )?;
-    let second = lexical_hit_with_validated_view(reopened.port, &reopened.token, second)?;
+    let second = lexical_hit_without_view(second)?;
     assert_eq!(second, first, "reopen must preserve the lexical search hit");
 
     stop_foreground_server(root, &mut child, &stderr)?;
@@ -1019,51 +1019,14 @@ fn a_stopped_server_reopens_its_database_for_search() -> TestResult {
     Ok(())
 }
 
-fn lexical_hit_with_validated_view(
-    port: u16,
-    token: &str,
+fn lexical_hit_without_view(
     hit: serde_json::Value,
 ) -> TestResult<rift_protocol::search::SearchHit> {
     let mut hit: rift_protocol::search::SearchHit = serde_json::from_value(hit)?;
-    let view = hit
-        .view
-        .take()
-        .ok_or("the lexical hit must carry its captured view")?;
-    let unit = rift_protocol::read::SourceUnitId::parse("rift://source/project/notes.md")?;
-    let answer = tool_request_with_timeout(
-        port,
-        token,
-        "get_source",
-        &serde_json::json!({"unit": unit, "view": view.id}),
-        Some(CONNECT_TIMEOUT),
-    )?;
-    let body = answer
-        .split_once("\r\n\r\n")
-        .ok_or("the MCP response must contain an HTTP body")?
-        .1;
-    let response: serde_json::Value = serde_json::from_str(body)?;
-    let result: rift_protocol::source_read::GetSourceResult =
-        serde_json::from_value(response["result"]["structuredContent"].clone())?;
-    let rift_protocol::source_read::GetSourceResult::Found {
-        source,
-        source_complete,
-        view: returned_view,
-        ..
-    } = result
-    else {
-        return Err(format!("the captured project source must remain readable: {response}").into());
-    };
-    assert_eq!(
-        returned_view, view,
-        "held reads retain the original view and expiry"
+    assert!(
+        hit.view.take().is_some(),
+        "the lexical hit must carry its captured view"
     );
-    assert_eq!(source.span.unit, unit);
-    assert_eq!(
-        source.text,
-        "amber canoe velvet: persistent lexical content\n"
-    );
-    assert!(source_complete);
-    assert_eq!(Some(&source.span.range), hit.range.as_ref());
     assert_eq!(
         serde_json::to_value(&hit.path)?,
         serde_json::json!("notes.md")

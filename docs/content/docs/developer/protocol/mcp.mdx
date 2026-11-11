@@ -437,8 +437,8 @@ A package folder inside the workspace, such as `node_modules` or `.venv`, maps a
 The server then asks the global API which declaration holds each such callee's position, in one
 request per walk, and the walk does not continue from a package callee.
 
-Each dependency hit carries its own immutable `view` for subsequent `get_symbol` and
-`get_source` reads. The caller **MUST** use that hit's view rather than the top-level search
+Each dependency hit carries its own immutable `view` for subsequent `get_symbol` reads.
+The caller **MUST** use that hit's view rather than the top-level search
 view, which retains the project graph and paging selection. Each hit's view expires no later
 than either the project or cloud selection. The proxy retains the originating project and
 global endpoint for those reads and refuses a changed context instead of selecting another
@@ -797,33 +797,6 @@ selection failures. A malformed identity is refused before lookup:
 
 <ReadExample name="malformed-symbol" />
 
-## Source retrieval
-
-<McpTool name="get_source" />
-
-`unit` selects one physical source unit. Omitted `range` requests the whole unit; a supplied
-range is half-open UTF-8 byte offsets. Documentation does not require a symbol declaration:
-
-<ReadExample name="project-source" />
-
-<ReadExample name="project-section" />
-
-The `view` returned by the preceding named-project symbol read selects that project's
-documentation. The project unit keeps its repository-relative path:
-
-<ReadExample name="named-project-source" />
-
-<ReadExample name="named-project-section" />
-
-A released source read uses its physical owner address:
-
-<ReadExample name="global-source" />
-
-`found` returns `source.span`, `source.text`, `source_complete`, and an immutable `view`.
-`missing` requires complete captured coverage; `unavailable` states why presence or absence
-could not be established. A package or runtime source address retains its defining owner.
-`view` retains a preceding selection; `rev` is refused beside `view` and for released sources.
-
 ## Nodes
 
 <McpTool name="nodes" />
@@ -837,6 +810,10 @@ the published prepared files carries [`local_index_preparing`](#reads), includin
 is returned; this read does not advance published progress. Exhausted preparation returns empty
 nodes with that warning.
 
+The first entry of `nodes` is the file's outermost node, and its `source` excerpt carries the
+file's source. A declaration's source is read through the `source` member of its
+[`get_symbol`](#tool-get_symbol) declarations.
+
 This call lists the nodes covering byte 338 of `src/config.rs`, inside the `parse_config` call:
 
 <ReadExample name="local-nodes" />
@@ -848,7 +825,6 @@ Callers read code through these tools:
 | Tool | Result |
 | --- | --- |
 | [`get_symbol`](#tool-get_symbol) | one logical symbol by canonical identity |
-| [`get_source`](#tool-get_source) | one physical source unit or byte range |
 | [`search`](#tool-search) | ranked files and symbols across the workspace tree |
 | [`nodes`](#tool-nodes) | the syntax nodes covering one position, with byte ranges |
 

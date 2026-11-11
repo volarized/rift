@@ -273,3 +273,114 @@ impl super::ReadAnswer for GetSymbolResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    type CountedServer = (
+        tempfile::TempDir,
+        RiftMcp,
+        rift_protocol::read::SymbolId,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    );
+
+    /// A served fixture whose global endpoint counts every request it receives.
+    async fn counted_server() -> Result<CountedServer, Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let port = listener.local_addr()?.port();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        let router = axum::Router::new().fallback(move || {
+            let counted = Arc::clone(&counted);
+            async move {
+                counted.fetch_add(1, Ordering::SeqCst);
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        });
+        let http_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let configuration =
+            format!("[global]\nendpoint='http://127.0.0.1:{port}/rift'\nattempts=1\n");
+        let (directory, server, id) =
+            crate::server::tests::canonical_fixture_with_configuration(&configuration).await?;
+        Ok((directory, server, id, count, http_task))
+    }
+
+    #[tokio::test]
+    async fn held_local_view_refuses_foreign_symbols_before_global_dispatch() -> TestResult {
+        let (_directory, server, id, count, http_task) = counted_server().await?;
+        let request: GetSymbolParams = serde_json::from_value(json!({"id": id}))?;
+        let Json(answer) = server.exact_symbol(request).await?;
+        let GetSymbolResult::Found { view, .. } = answer else {
+            return Err("initial project symbol must be found".into());
+        };
+        let foreign: GetSymbolParams = serde_json::from_value(json!({
+            "id":"rift://symbol/npm/npmjs.org/@types/node@26.6.4/typescript/node/buffer/Buffer",
+            "view":view.id
+        }))?;
+        let Json(answer) = server.exact_symbol(foreign).await?;
+        assert!(matches!(
+            answer,
+            GetSymbolResult::Unavailable {
+                reason: SymbolUnavailableReason::ViewContext,
+                ..
+            }
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        http_task.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_global_context_refuses_endpoint_change_and_expiry_before_io() -> TestResult {
+        let (_directory, server, _, count, http_task) = counted_server().await?;
+        let endpoint = server
+            .published
+            .read()
+            .await
+            .current
+            .configuration
+            .global_configuration()
+            .endpoint;
+        let view: CapturedView = serde_json::from_value(json!({
+            "id":"claims.remote", "expires_at":"2030-01-01T00:10:00Z"
+        }))?;
+        let symbol: GetSymbolParams = serde_json::from_value(json!({
+            "id":"rift://symbol/cargo/crates.io/demo@1.0.0/rust/demo/beacon", "view":view.id
+        }))?;
+        for expired in [false, true] {
+            let mut selected = crate::global::candidates::SavedCandidateBackend {
+                owner: None,
+                backend: "global".to_owned(),
+                root: if expired {
+                    endpoint.clone()
+                } else {
+                    "http://127.0.0.1:1/changed".to_owned()
+                },
+                view: view.clone(),
+                project: None,
+                upstream_view: None,
+            };
+            if expired {
+                selected.view.expires_at = "2000-01-01T00:10:00Z".to_owned();
+            }
+            let context = std::sync::Mutex::new(Some(selected));
+            assert!(
+                server
+                    .exact_symbol_with_context(symbol.clone(), Some(&context))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+        http_task.abort();
+        Ok(())
+    }
+}

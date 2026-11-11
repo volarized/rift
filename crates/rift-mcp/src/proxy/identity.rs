@@ -171,19 +171,6 @@ pub(super) fn qualify_nodes(
     qualify_warnings(&mut result.warnings, backend)
 }
 
-pub(super) fn qualify_source(
-    result: &mut rift_protocol::source_read::GetSourceResult,
-    backend: &str,
-) -> Result<(), RiftError> {
-    use rift_protocol::source_read::GetSourceResult;
-    let warnings = match result {
-        GetSourceResult::Found { warnings, .. }
-        | GetSourceResult::Missing { warnings, .. }
-        | GetSourceResult::Unavailable { warnings, .. } => warnings,
-    };
-    qualify_warnings(warnings, backend)
-}
-
 pub(super) fn qualify_search(
     result: &mut rift_protocol::search_read::SearchReadResult,
     backend: &str,
