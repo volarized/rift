@@ -4,7 +4,7 @@ use oxrdf::NamedNode;
 use rift_error::{RiftError, errors};
 use rift_protocol::read::SymbolId;
 use spargebra::Query;
-use spargebra::algebra::QueryExpression;
+use spargebra::algebra::{AggregateExpression, Expression, OrderExpression, QueryExpression};
 use spargebra::term::TermPattern;
 
 use super::GraphQuery;
@@ -35,9 +35,33 @@ impl GraphQuery {
                 QueryExpression::Project { inner, .. }
                 | QueryExpression::Distinct { inner }
                 | QueryExpression::Reduced { inner }
-                | QueryExpression::Slice { inner, .. }
-                | QueryExpression::Group { inner, .. }
-                | QueryExpression::OrderBy { inner, .. } => pending.push(inner),
+                | QueryExpression::Slice { inner, .. } => pending.push(inner),
+                QueryExpression::Group {
+                    inner, aggregates, ..
+                } if aggregates.iter().all(|(_, aggregate)| {
+                    matches!(
+                        aggregate,
+                        AggregateExpression::CountSolutions { .. }
+                            | AggregateExpression::FunctionCall {
+                                expr: Expression::Variable(_),
+                                ..
+                            }
+                    )
+                }) =>
+                {
+                    pending.push(inner);
+                }
+                QueryExpression::OrderBy { inner, expression }
+                    if expression.iter().all(|order| {
+                        matches!(
+                            order,
+                            OrderExpression::Asc(Expression::Variable(_))
+                                | OrderExpression::Desc(Expression::Variable(_))
+                        )
+                    }) =>
+                {
+                    pending.push(inner);
+                }
                 QueryExpression::Join { left, right } => pending.extend([left.as_mut(), right]),
                 QueryExpression::Bgp { patterns } => {
                     for triple in patterns {
@@ -76,6 +100,18 @@ fn dispatch_failure() -> RiftError {
 mod tests {
     use super::*;
     use crate::sparql::GraphLimits;
+
+    #[test]
+    fn dispatch_refuses_expressions_that_can_observe_backend_identity() {
+        let public = "rift://symbol/local:docs/rust/beacon";
+        let local = SymbolId::parse("rift://symbol/local/rust/beacon").expect("local identity");
+        let statement = format!(
+            "SELECT ?caller {{ ?caller :references <{public}> }} ORDER BY CONTAINS(STR(?caller), 'local:docs')"
+        );
+        let query = GraphQuery::parse(&statement, &GraphLimits::default()).expect("valid query");
+        assert!(query.adjacency_selection().is_some());
+        assert!(query.dispatched_adjacency(&local).is_err());
+    }
 
     #[test]
     fn dispatch_changes_only_the_anchor_iri() {
